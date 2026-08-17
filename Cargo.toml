@@ -1,0 +1,29 @@
+[package]
+name = "grit"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "A sparse-grid stream compaction engine, built on simdr."
+
+[dependencies]
+# The emitter, by path. It declares no dependencies of its own and this does not change that.
+simdr = { path = "../simdr" }
+# Vulkan. `runner` next door uses the same version, and this crate exists because `runner` is a
+# measurement harness rather than a real-time host — see `src/host.rs`.
+ash = "0.38"
+# A window and a framebuffer, for the one thing that has to leave the device.
+minifb = { version = "0.28", default-features = false }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
