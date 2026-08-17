@@ -1,0 +1,852 @@
+//! Buffers that outlive the frame, and every pass that runs over them.
+//!
+//! One descriptor set, shared by every pipeline: each pass sees every buffer, at the binding index
+//! the `simdr` kernel was built against. That is the simplification the whole thing rests on — a
+//! set per pass would be more general and would mean deciding, per pass, which buffers it may see,
+//! and a simulation's answer to that is always *all of them*.
+//!
+//! # One submission a frame
+//!
+//! Every pass is recorded into one command buffer with a memory barrier between, and the whole
+//! thing is submitted once and waited on once. Five kernels a frame is one fence wait, not five —
+//! and a fence wait is where the round trip's hundred microseconds live.
+
+use std::time::{Duration, Instant};
+
+use ash::vk;
+
+use crate::host::{Error, Host};
+
+/// How many workgroups a pass runs, and who decides.
+///
+/// **The whole point of the second one.** A compaction's output is a list whose length the *device*
+/// worked out, and dispatching over it means the workgroup count has to come from a buffer rather
+/// than from a caller who would have to read it back first. Reading it back is a submit and a fence
+/// — about a hundred microseconds by `decisions/DR-0008`'s measurement — to learn a number the
+/// device already had.
+#[derive(Debug, Clone, Copy)]
+pub enum Groups {
+    /// A count the host knows.
+    Fixed(u32),
+    /// Three words at `binding`, from `at`: the x, y and z counts, as Vulkan wants them.
+    From {
+        /// Which buffer holds them.
+        binding: usize,
+        /// Which word of it the three begin at.
+        at: usize,
+    },
+}
+
+/// A buffer and the memory under it.
+struct Held {
+    handle: vk::Buffer,
+    memory: vk::DeviceMemory,
+    bytes: u64,
+}
+
+/// One run of words going somewhere, for [`Resident::write_many`].
+#[derive(Debug, Clone, Copy)]
+pub struct Run<'words> {
+    /// Which binding.
+    pub index: usize,
+    /// How many words into it.
+    pub at: usize,
+    /// What to put there.
+    pub words: &'words [u32],
+}
+
+/// Everything a frame needs, allocated once.
+pub struct Resident<'host> {
+    host: &'host Host,
+    buffers: Vec<Held>,
+    staging: Held,
+    layout: vk::DescriptorSetLayout,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    pipeline_layout: vk::PipelineLayout,
+    shaders: Vec<vk::ShaderModule>,
+    pipelines: Vec<vk::Pipeline>,
+    commands: vk::CommandPool,
+    command: vk::CommandBuffer,
+    fence: vk::Fence,
+}
+
+impl Host {
+    /// Allocate `sizes` buffers in words, and build one pipeline per module over them.
+    ///
+    /// Everything expensive happens here and none of it again: the allocations, the descriptor set,
+    /// and a pipeline per pass. A frame after this is a recording and a submit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoMemory`] if nothing suits, otherwise whatever Vulkan said.
+    pub fn resident<'host>(
+        &'host self,
+        sizes: &[usize],
+        modules: &[&[u32]],
+    ) -> Result<Resident<'host>, Error> {
+        let words = |count: usize| (count.max(1) * size_of::<u32>()) as u64;
+        let largest = sizes.iter().copied().map(words).max().unwrap_or(4);
+
+        // SAFETY: every handle created below is owned by the `Resident` and destroyed in its
+        // `Drop`, which cannot run while a frame is in flight because every frame waits on its
+        // fence before returning.
+        unsafe {
+            let mut buffers = Vec::with_capacity(sizes.len());
+            for &size in sizes {
+                buffers.push(self.allocate(
+                    words(size),
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::TRANSFER_SRC
+                        | vk::BufferUsageFlags::TRANSFER_DST
+                        // Any binding may end up holding a workgroup count. Declaring it on all of
+                        // them costs nothing and saves the caller telling the allocator which.
+                        | vk::BufferUsageFlags::INDIRECT_BUFFER,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )?);
+            }
+
+            let staging = self.allocate(
+                largest,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+
+            let (layout, pool, set) = self.describe(&buffers)?;
+            let (pipeline_layout, shaders, pipelines) = self.compile(layout, modules)?;
+            let (commands, command) = self.record_into()?;
+            let fence = self
+                .device()
+                .create_fence(&vk::FenceCreateInfo::default(), None)?;
+
+            Ok(Resident {
+                host: self,
+                buffers,
+                staging,
+                layout,
+                pool,
+                set,
+                pipeline_layout,
+                shaders,
+                pipelines,
+                commands,
+                command,
+                fence,
+            })
+        }
+    }
+
+    /// One buffer and its memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns what comes back and must destroy it.
+    unsafe fn allocate(
+        &self,
+        bytes: u64,
+        usage: vk::BufferUsageFlags,
+        wanted: vk::MemoryPropertyFlags,
+    ) -> Result<Held, Error> {
+        let create = vk::BufferCreateInfo::default()
+            .size(bytes.max(4))
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: the caller's contract.
+        let handle = unsafe { self.device().create_buffer(&create, None) }?;
+
+        // SAFETY: `handle` was just created by this device.
+        let requirements = unsafe { self.device().get_buffer_memory_requirements(handle) };
+        let Some(kind) = self.suits(requirements, wanted) else {
+            // SAFETY: nothing is bound to it.
+            unsafe { self.device().destroy_buffer(handle, None) };
+            return Err(Error::NoMemory { bytes });
+        };
+
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(kind);
+        // SAFETY: the size and type come from the requirements just queried.
+        let memory = unsafe { self.device().allocate_memory(&allocate, None) }?;
+        // SAFETY: freshly allocated memory of a suitable type, nothing bound yet.
+        unsafe { self.device().bind_buffer_memory(handle, memory, 0) }?;
+
+        Ok(Held {
+            handle,
+            memory,
+            bytes: bytes.max(4),
+        })
+    }
+
+    /// The descriptor set every pipeline shares.
+    ///
+    /// # Safety
+    ///
+    /// As [`Host::allocate`].
+    unsafe fn describe(
+        &self,
+        buffers: &[Held],
+    ) -> Result<
+        (
+            vk::DescriptorSetLayout,
+            vk::DescriptorPool,
+            vk::DescriptorSet,
+        ),
+        Error,
+    > {
+        let count = u32::try_from(buffers.len()).unwrap_or(u32::MAX).max(1);
+
+        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = (0..count)
+            .map(|index| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(index)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect();
+        let create = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        // SAFETY: `create` borrows `bindings`, which outlives the call.
+        let layout = unsafe { self.device().create_descriptor_set_layout(&create, None) }?;
+
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(count)];
+        let create = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&sizes);
+        // SAFETY: as above.
+        let pool = unsafe { self.device().create_descriptor_pool(&create, None) }?;
+
+        let layouts = [layout];
+        let allocate = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&layouts);
+        // SAFETY: the pool was sized for exactly this set.
+        let sets = unsafe { self.device().allocate_descriptor_sets(&allocate) }?;
+        let set = sets.first().copied().unwrap_or_default();
+
+        // Point every binding at its buffer, once. Nothing rebinds after this.
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
+            .iter()
+            .map(|held| {
+                [vk::DescriptorBufferInfo::default()
+                    .buffer(held.handle)
+                    .offset(0)
+                    .range(held.bytes)]
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet<'_>> = infos
+            .iter()
+            .enumerate()
+            .map(|(index, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(u32::try_from(index).unwrap_or(0))
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info)
+            })
+            .collect();
+        // SAFETY: every write names this set and a buffer that outlives the call.
+        unsafe { self.device().update_descriptor_sets(&writes, &[]) };
+
+        Ok((layout, pool, set))
+    }
+
+    /// One shader module and one pipeline per pass.
+    ///
+    /// # Safety
+    ///
+    /// As [`Host::allocate`].
+    unsafe fn compile(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        modules: &[&[u32]],
+    ) -> Result<(vk::PipelineLayout, Vec<vk::ShaderModule>, Vec<vk::Pipeline>), Error> {
+        let layouts = [layout];
+        let create = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
+        // SAFETY: `create` borrows `layouts`, which outlives the call.
+        let pipeline_layout = unsafe { self.device().create_pipeline_layout(&create, None) }?;
+
+        let mut shaders = Vec::with_capacity(modules.len());
+        let mut pipelines = Vec::with_capacity(modules.len());
+        let entry = c"main";
+
+        for words in modules {
+            let create = vk::ShaderModuleCreateInfo::default().code(words);
+            // SAFETY: `words` is SPIR-V this crate emitted and outlives the call.
+            let shader = unsafe { self.device().create_shader_module(&create, None) }?;
+            shaders.push(shader);
+
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(shader)
+                .name(entry);
+            let create = [vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(pipeline_layout)];
+            // SAFETY: the stage names a module just created and a layout that outlives the call.
+            let built = unsafe {
+                self.device()
+                    .create_compute_pipelines(vk::PipelineCache::null(), &create, None)
+            };
+            match built {
+                Ok(made) => pipelines.extend(made),
+                Err((made, code)) => {
+                    pipelines.extend(made);
+                    return Err(code.into());
+                }
+            }
+        }
+
+        Ok((pipeline_layout, shaders, pipelines))
+    }
+
+    /// The command pool and the one buffer every frame is recorded into.
+    ///
+    /// # Safety
+    ///
+    /// As [`Host::allocate`].
+    unsafe fn record_into(&self) -> Result<(vk::CommandPool, vk::CommandBuffer), Error> {
+        let create = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(self.family())
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        // SAFETY: the family is the one the device was created with.
+        let pool = unsafe { self.device().create_command_pool(&create, None) }?;
+
+        let allocate = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: the pool was just created by this device.
+        let buffers = unsafe { self.device().allocate_command_buffers(&allocate) }?;
+        let command = buffers.first().copied().unwrap_or_default();
+
+        Ok((pool, command))
+    }
+}
+
+impl Resident<'_> {
+    /// How many buffers this holds.
+    #[must_use]
+    pub fn bindings(&self) -> usize {
+        self.buffers.len()
+    }
+
+    /// How many passes a frame runs.
+    #[must_use]
+    pub fn passes(&self) -> usize {
+        self.pipelines.len()
+    }
+
+    /// Put `words` into binding `index`, through the staging buffer.
+    ///
+    /// **Once, at the start.** Everything after that stays where it is.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchBinding`] or [`Error::Overrun`], otherwise whatever Vulkan said.
+    pub fn write(&mut self, index: usize, words: &[u32]) -> Result<(), Error> {
+        let held = self.at(index)?;
+        let bytes = size_of_val(words) as u64;
+        if bytes > held.bytes {
+            return Err(Error::Overrun {
+                index,
+                needed: words.len(),
+                held: (held.bytes as usize) / size_of::<u32>(),
+            });
+        }
+        let (handle, staging) = (held.handle, self.staging.memory);
+
+        // SAFETY: the staging memory is host-visible and coherent, and nothing else maps it.
+        unsafe {
+            let mapped = self.host.device().map_memory(
+                staging,
+                0,
+                bytes.max(4),
+                vk::MemoryMapFlags::empty(),
+            )?;
+            std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
+            self.host.device().unmap_memory(staging);
+        }
+
+        let region = [vk::BufferCopy::default().size(bytes.max(4))];
+        // SAFETY: both buffers are live and the region is inside both.
+        unsafe {
+            self.once(|device, command| {
+                device.cmd_copy_buffer(command, self.staging.handle, handle, &region)
+            })
+        }
+    }
+
+    /// Put `words` into binding `index`, starting `at` words in.
+    ///
+    /// **What an interactive frame needs.** The device owns some of a parameter buffer — a frame
+    /// counter it increments itself — and the host owns the rest, which is where a mouse goes.
+    /// Writing from nought would put the host's idea of the frame number back on top of the
+    /// device's every time.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::write`].
+    pub fn write_at(&mut self, index: usize, at: usize, words: &[u32]) -> Result<(), Error> {
+        let held = self.at(index)?;
+        let bytes = size_of_val(words) as u64;
+        let offset = (at * size_of::<u32>()) as u64;
+        if offset + bytes > held.bytes {
+            return Err(Error::Overrun {
+                index,
+                needed: at + words.len(),
+                held: (held.bytes as usize) / size_of::<u32>(),
+            });
+        }
+        let (handle, staging) = (held.handle, self.staging.memory);
+
+        // SAFETY: host-visible coherent memory, and nothing else maps it.
+        unsafe {
+            let mapped = self.host.device().map_memory(
+                staging,
+                0,
+                bytes.max(4),
+                vk::MemoryMapFlags::empty(),
+            )?;
+            std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
+            self.host.device().unmap_memory(staging);
+        }
+
+        let region = [vk::BufferCopy::default()
+            .dst_offset(offset)
+            .size(bytes.max(4))];
+        // SAFETY: both buffers are live and the region is inside both.
+        unsafe {
+            self.once(|device, command| {
+                device.cmd_copy_buffer(command, self.staging.handle, handle, &region);
+            })
+        }
+    }
+
+    /// Put several scattered runs into bindings, in **one submission**.
+    ///
+    /// # What it is worth, and where it is worth nothing
+    ///
+    /// [`Resident::write_at`] maps the staging buffer, copies, unmaps, submits a command buffer and
+    /// **waits on its fence** — a full host-to-device round trip per call. This maps once, copies
+    /// every run into staging back to back, records one region per run, and waits once.
+    ///
+    /// That saves one fixed cost per run, and measurement on an RTX 4080 puts it at about fifty
+    /// microseconds. Which makes the answer entirely a matter of how large a run is:
+    ///
+    /// ```text
+    ///   run size   one at a time      batched   gain
+    ///     1 MiB       7.38 GiB/s   11.90 GiB/s   1.6x
+    ///     4 MiB      10.31 GiB/s   12.13 GiB/s   1.2x
+    ///    32 MiB      10.76 GiB/s   11.01 GiB/s   1.0x
+    /// ```
+    ///
+    /// So this is for **many small runs** and there is no reason to reach for it above a few
+    /// mebibytes, where the copy itself dominates and `write_at` in a loop is already at the bulk
+    /// rate.
+    ///
+    /// It was added believing the gain was two and a half times at 32 MiB, from a twenty-four-sample
+    /// run whose first write faulted in four gibibytes of staging and dominated the median. It did
+    /// not reproduce. The table above is what ninety-six samples say, three times over.
+    ///
+    /// The destinations may be scattered across bindings and offsets; what is not scattered is the
+    /// submission.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchBinding`] or [`Error::Overrun`] for any run, and [`Error::Overrun`] against
+    /// binding nought where the runs together exceed the staging buffer — which is as large as the
+    /// largest binding, so the ceiling is one binding's worth a call.
+    pub fn write_many(&mut self, runs: &[Run<'_>]) -> Result<(), Error> {
+        if runs.is_empty() {
+            return Ok(());
+        }
+
+        // Every run checked before anything is copied, so a bad one cannot leave the staging buffer
+        // half filled and the caller unsure how much of it landed.
+        let mut total = 0_u64;
+        for run in runs {
+            let held = self.at(run.index)?;
+            let bytes = size_of_val(run.words) as u64;
+            let offset = (run.at * size_of::<u32>()) as u64;
+            if offset + bytes > held.bytes {
+                return Err(Error::Overrun {
+                    index: run.index,
+                    needed: run.at + run.words.len(),
+                    held: (held.bytes as usize) / size_of::<u32>(),
+                });
+            }
+            total += bytes;
+        }
+        if total > self.staging.bytes {
+            return Err(Error::Overrun {
+                index: 0,
+                needed: (total as usize) / size_of::<u32>(),
+                held: (self.staging.bytes as usize) / size_of::<u32>(),
+            });
+        }
+
+        let staging = self.staging.memory;
+        // SAFETY: host-visible coherent memory, nothing else maps it, and `total` is inside it by
+        // the check above. Each run is copied to its own stretch, so the writes do not overlap.
+        unsafe {
+            let mapped =
+                self.host
+                    .device()
+                    .map_memory(staging, 0, total.max(4), vk::MemoryMapFlags::empty())?;
+            let mut along = 0_usize;
+            for run in runs {
+                let into = mapped.cast::<u32>().add(along);
+                std::ptr::copy_nonoverlapping(run.words.as_ptr(), into, run.words.len());
+                along += run.words.len();
+            }
+            self.host.device().unmap_memory(staging);
+        }
+
+        // `cmd_copy_buffer` takes one source and one destination, so regions are grouped by
+        // destination. They all go into the same command buffer, which is the point of the exercise.
+        let source = self.staging.handle;
+        let mut grouped: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
+        let mut along = 0_u64;
+        for run in runs {
+            let handle = self.at(run.index)?.handle;
+            let bytes = size_of_val(run.words) as u64;
+            let region = vk::BufferCopy::default()
+                .src_offset(along)
+                .dst_offset((run.at * size_of::<u32>()) as u64)
+                .size(bytes.max(4));
+            along += bytes;
+            match grouped.iter_mut().find(|held| held.0 == handle) {
+                Some(held) => held.1.push(region),
+                None => grouped.push((handle, vec![region])),
+            }
+        }
+
+        // SAFETY: every buffer is live and every region was bounds-checked above.
+        unsafe {
+            self.once(|device, command| {
+                for (handle, regions) in &grouped {
+                    device.cmd_copy_buffer(command, source, *handle, regions);
+                }
+            })
+        }
+    }
+
+    /// Read `count` words back from binding `index`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::write`].
+    pub fn read(&mut self, index: usize, count: usize) -> Result<Vec<u32>, Error> {
+        let held = self.at(index)?;
+        let bytes = (count * size_of::<u32>()) as u64;
+        if bytes > held.bytes {
+            return Err(Error::Overrun {
+                index,
+                needed: count,
+                held: (held.bytes as usize) / size_of::<u32>(),
+            });
+        }
+        let handle = held.handle;
+
+        let region = [vk::BufferCopy::default().size(bytes.max(4))];
+        // SAFETY: as in `write`.
+        unsafe {
+            self.once(|device, command| {
+                device.cmd_copy_buffer(command, handle, self.staging.handle, &region);
+            })
+        }?;
+        // SAFETY: the copy above has completed — `once` waits on its fence.
+        unsafe { self.mapped(count) }
+    }
+
+    /// Run every pass once, in order, with a barrier between.
+    ///
+    /// `groups` is one workgroup count per pass. What comes back is how long the submission took
+    /// on the wall clock, fence wait included — which is what a frame actually costs.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongPasses`] if the counts and the pipelines disagree, otherwise Vulkan's.
+    pub fn frame(&mut self, groups: &[Groups]) -> Result<Duration, Error> {
+        self.run(groups, None).map(|(spent, _)| spent)
+    }
+
+    /// The same, and copy `count` words of binding `index` back inside the same submission.
+    ///
+    /// **One fence for the whole frame.** Reading afterwards with [`Resident::read`] would be a
+    /// second submit and a second wait, which on this machine is another hundred microseconds for
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::frame`].
+    pub fn frame_reading(
+        &mut self,
+        groups: &[Groups],
+        index: usize,
+        count: usize,
+    ) -> Result<(Duration, Vec<u32>), Error> {
+        let held = self.at(index)?;
+        let bytes = (count * size_of::<u32>()) as u64;
+        if bytes > held.bytes {
+            return Err(Error::Overrun {
+                index,
+                needed: count,
+                held: (held.bytes as usize) / size_of::<u32>(),
+            });
+        }
+
+        let (spent, ()) = self.run(groups, Some((held.handle, bytes)))?;
+        // SAFETY: the submission has completed.
+        let words = unsafe { self.mapped(count) }?;
+        Ok((spent, words))
+    }
+
+    /// The buffer at `index`, or the refusal naming both numbers.
+    fn at(&self, index: usize) -> Result<&Held, Error> {
+        self.buffers.get(index).ok_or(Error::NoSuchBinding {
+            index,
+            held: self.buffers.len(),
+        })
+    }
+
+    /// Record every pass and submit, optionally copying a buffer out at the end.
+    fn run(
+        &mut self,
+        groups: &[Groups],
+        out: Option<(vk::Buffer, u64)>,
+    ) -> Result<(Duration, ()), Error> {
+        self.run_times(groups, out, 1)
+    }
+
+    /// Record `times` frames back to back into one command buffer, submit once, and wait once.
+    ///
+    /// # What this is for, and what a single frame cannot tell you
+    ///
+    /// [`Resident::frame`] times a submit and a fence around the work, and on this machine that
+    /// round trip is about a hundred microseconds whatever is inside it — `decisions/DR-0008` in
+    /// `simdr` names that as the unit of cost and it is not an estimate. A frame that does twenty
+    /// microseconds of work and a frame that does eighty both come back at "about a hundred and
+    /// something", and a change that halves the work is invisible.
+    ///
+    /// That is not a flaw in the loop — a viewer submits once a frame and pays it once a frame — but
+    /// it is useless for asking whether a pass got cheaper. Twenty frames in one submission pay the
+    /// round trip once and the work twenty times, so the difference between them **is** the work.
+    ///
+    /// The barrier between the last pass of one frame and the first of the next is the same one that
+    /// sits between passes, for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::frame`].
+    pub fn frames(&mut self, groups: &[Groups], times: u32) -> Result<Duration, Error> {
+        self.run_times(groups, None, times.max(1))
+            .map(|(spent, ())| spent / times.max(1))
+    }
+
+    /// The recording, `times` frames over.
+    fn run_times(
+        &mut self,
+        groups: &[Groups],
+        out: Option<(vk::Buffer, u64)>,
+        times: u32,
+    ) -> Result<(Duration, ()), Error> {
+        if groups.len() != self.pipelines.len() {
+            return Err(Error::WrongPasses {
+                given: groups.len(),
+                held: self.pipelines.len(),
+            });
+        }
+
+        let device = self.host.device();
+        let started = Instant::now();
+
+        // SAFETY: the fence below is waited on before this returns, so nothing recorded here is in
+        // flight when the buffer is reset on the next call.
+        unsafe {
+            device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(self.command, &begin)?;
+
+            device.cmd_bind_descriptor_sets(
+                self.command,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[self.set],
+                &[],
+            );
+
+            for repeat in 0..times {
+                for (pass, (&pipeline, &count)) in self.pipelines.iter().zip(groups).enumerate() {
+                    device.cmd_bind_pipeline(
+                        self.command,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline,
+                    );
+                    match count {
+                        Groups::Fixed(count) => {
+                            device.cmd_dispatch(self.command, count.max(1), 1, 1)
+                        }
+                        Groups::From { binding, at } => {
+                            let held = self.buffers.get(binding).ok_or(Error::NoSuchBinding {
+                                index: binding,
+                                held: self.buffers.len(),
+                            })?;
+                            let offset = (at * size_of::<u32>()) as u64;
+                            device.cmd_dispatch_indirect(self.command, held.handle, offset);
+                        }
+                    }
+
+                    // Between passes only: what the last one wrote, the next one reads. A barrier after
+                    // the final dispatch would order nothing, and the copy below brings its own.
+                    //
+                    // **`DRAW_INDIRECT` is in the destination whether the next pass is indirect or
+                    // not.** A workgroup count is read at that stage rather than in the shader, so a
+                    // barrier that only mentioned `COMPUTE_SHADER` would order the buffer's *contents*
+                    // and not the command that reads them. Naming it always costs nothing and cannot be
+                    // forgotten for the one pass that needs it.
+                    if pass + 1 < self.pipelines.len() || repeat + 1 < times {
+                        let barrier = [vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ
+                                    | vk::AccessFlags::SHADER_WRITE
+                                    | vk::AccessFlags::INDIRECT_COMMAND_READ,
+                            )];
+                        device.cmd_pipeline_barrier(
+                            self.command,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER
+                                | vk::PipelineStageFlags::DRAW_INDIRECT,
+                            vk::DependencyFlags::empty(),
+                            &barrier,
+                            &[],
+                            &[],
+                        );
+                    }
+                }
+            }
+
+            if let Some((handle, bytes)) = out {
+                let barrier = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+                device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &barrier,
+                    &[],
+                    &[],
+                );
+
+                let region = [vk::BufferCopy::default().size(bytes.max(4))];
+                device.cmd_copy_buffer(self.command, handle, self.staging.handle, &region);
+
+                let barrier = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &barrier,
+                    &[],
+                    &[],
+                );
+            }
+
+            device.end_command_buffer(self.command)?;
+
+            let commands = [self.command];
+            let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+            device.reset_fences(&[self.fence])?;
+            device.queue_submit(self.host.queue(), &submit, self.fence)?;
+            device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+
+        Ok((started.elapsed(), ()))
+    }
+
+    /// Record one command, submit it, and wait.
+    ///
+    /// # Safety
+    ///
+    /// `record` may only record into the buffer it is handed.
+    unsafe fn once<F>(&self, record: F) -> Result<(), Error>
+    where
+        F: FnOnce(&ash::Device, vk::CommandBuffer),
+    {
+        let device = self.host.device();
+        // SAFETY: the fence is waited on before returning, so nothing is in flight.
+        unsafe {
+            device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(self.command, &begin)?;
+            record(device, self.command);
+            device.end_command_buffer(self.command)?;
+
+            let commands = [self.command];
+            let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+            device.reset_fences(&[self.fence])?;
+            device.queue_submit(self.host.queue(), &submit, self.fence)?;
+            device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        Ok(())
+    }
+
+    /// The staging buffer's first `count` words.
+    ///
+    /// # Safety
+    ///
+    /// Whatever wrote them must have completed.
+    unsafe fn mapped(&self, count: usize) -> Result<Vec<u32>, Error> {
+        let bytes = ((count * size_of::<u32>()) as u64).max(4);
+        // SAFETY: host-visible coherent memory, nothing else maps it, and the caller's contract
+        // says the copy into it has finished.
+        unsafe {
+            let mapped = self.host.device().map_memory(
+                self.staging.memory,
+                0,
+                bytes,
+                vk::MemoryMapFlags::empty(),
+            )?;
+            let mut out = vec![0_u32; count];
+            std::ptr::copy_nonoverlapping(mapped.cast::<u32>(), out.as_mut_ptr(), count);
+            self.host.device().unmap_memory(self.staging.memory);
+            Ok(out)
+        }
+    }
+}
+
+impl Drop for Resident<'_> {
+    fn drop(&mut self) {
+        let device = self.host.device();
+        // SAFETY: every frame waits on its fence before returning, so nothing is in flight.
+        unsafe {
+            let _ = device.device_wait_idle();
+            device.destroy_fence(self.fence, None);
+            device.destroy_command_pool(self.commands, None);
+            for &pipeline in &self.pipelines {
+                device.destroy_pipeline(pipeline, None);
+            }
+            for &shader in &self.shaders {
+                device.destroy_shader_module(shader, None);
+            }
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_pool(self.pool, None);
+            device.destroy_descriptor_set_layout(self.layout, None);
+            for held in self.buffers.iter().chain(std::iter::once(&self.staging)) {
+                device.destroy_buffer(held.handle, None);
+                device.free_memory(held.memory, None);
+            }
+        }
+    }
+}
