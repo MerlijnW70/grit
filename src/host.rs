@@ -120,6 +120,7 @@ pub struct Host {
     memory: vk::PhysicalDeviceMemoryProperties,
     name: String,
     width: u32,
+    ceiling: u64,
 }
 
 impl Host {
@@ -172,6 +173,20 @@ impl Host {
     #[must_use]
     pub const fn width(&self) -> u32 {
         self.width
+    }
+
+    /// The largest single buffer this device will both allocate and address.
+    ///
+    /// The smaller of `maxMemoryAllocationSize` and `maxStorageBufferRange`: one bounds what
+    /// `vkAllocateMemory` will hand back and the other bounds what one binding can reach, and a
+    /// storage buffer has to satisfy both.
+    ///
+    /// **A caller with more to hold than this has to hold it in pieces**, and the number is not
+    /// guessable — on this machine's parts it is 3.997 GiB and 2.00 GiB, and neither is a round
+    /// fraction of the card. `hyperia::fit` is what turns it into a layout.
+    #[must_use]
+    pub const fn ceiling(&self) -> u64 {
+        self.ceiling
     }
 
     /// Choose a device and create it.
@@ -244,6 +259,8 @@ impl Host {
         let name = unsafe { name_of(&instance, physical) };
         // SAFETY: as above.
         let width = unsafe { subgroup_width(&instance, physical) };
+        // SAFETY: as above.
+        let ceiling = unsafe { allocation_ceiling(&instance, physical) };
 
         let priorities = [1.0_f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
@@ -272,6 +289,7 @@ impl Host {
             memory,
             name,
             width,
+            ceiling,
         })
     }
 
@@ -333,6 +351,20 @@ unsafe fn name_of(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Str
     // SAFETY: Vulkan guarantees this array is NUL-terminated.
     let name = unsafe { CStr::from_ptr(bytes.as_ptr()) };
     name.to_string_lossy().into_owned()
+}
+
+/// The largest single buffer this device will both allocate and address.
+///
+/// # Safety
+///
+/// As [`name_of`].
+unsafe fn allocation_ceiling(instance: &ash::Instance, physical: vk::PhysicalDevice) -> u64 {
+    let mut third = vk::PhysicalDeviceMaintenance3Properties::default();
+    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut third);
+    // SAFETY: the caller's contract, and `properties` borrows `third` for the call.
+    unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+    let addressable = u64::from(properties.properties.limits.max_storage_buffer_range);
+    third.max_memory_allocation_size.min(addressable)
 }
 
 /// How many lanes a subgroup has on this device.

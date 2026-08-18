@@ -92,3 +92,26 @@ fn one_pass_of_several_can_be_run_while_the_others_are_skipped() {
         "no pass ran, so nothing was written"
     );
 }
+
+#[test]
+fn the_allocation_ceiling_is_a_buffer_this_device_will_actually_hand_out() {
+    // Not guessable, and not a round fraction of anything: on this machine's two parts it is
+    // 3.997 GiB and 2.00 GiB. A caller with more to hold than this holds it in pieces, so the
+    // number has to come from the device rather than from a constant somebody typed.
+    let Some(host) = device("the_allocation_ceiling_is_a_buffer_this_device_will_hand_out") else {
+        return;
+    };
+    let ceiling = host.ceiling();
+    assert!(ceiling > 0, "a device that can allocate nothing");
+    assert!(
+        ceiling <= u64::from(u32::MAX),
+        "a binding cannot address more than a u32 of bytes, and this says {ceiling}"
+    );
+
+    // And it is a buffer the device really will give: one word under it, asked for and freed.
+    let words = usize::try_from(ceiling / 4).expect("a count");
+    match host.resident(&[words], &[]) {
+        Ok(held) => drop(held),
+        Err(why) => panic!("the device refused its own ceiling of {ceiling}: {why}"),
+    }
+}
