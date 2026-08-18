@@ -62,6 +62,8 @@ pub struct Run<'words> {
 /// Everything a frame needs, allocated once.
 pub struct Resident<'host> {
     host: &'host Host,
+    /// Whether a write can go straight into a buffer, with no staging and no submission.
+    direct: bool,
     buffers: Vec<Held>,
     staging: Held,
     layout: vk::DescriptorSetLayout,
@@ -89,6 +91,38 @@ impl Host {
         sizes: &[usize],
         modules: &[&[u32]],
     ) -> Result<Resident<'host>, Error> {
+        self.buffers_in(sizes, modules, false)
+    }
+
+    /// The same, with buffers the host can write into **without a submission**.
+    ///
+    /// Asks for memory that is both device-local and host-visible — resizable BAR, where the
+    /// platform has it. A write is then one copy straight into the buffer, with no staging buffer in
+    /// system memory, no command buffer, no queue submission and no fence.
+    ///
+    /// Whether that is *faster* is a different question and belongs to the caller's measurements:
+    /// a copy into device memory across the bus is not the same speed as a copy into system memory,
+    /// and which wins depends on the platform. `hyperia`'s card tier measures both.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoMemory`] where the device offers no such memory, which is the answer rather than a
+    /// quiet fall back to staging — a caller asking for this is asking because it measured.
+    pub fn resident_direct<'host>(
+        &'host self,
+        sizes: &[usize],
+        modules: &[&[u32]],
+    ) -> Result<Resident<'host>, Error> {
+        self.buffers_in(sizes, modules, true)
+    }
+
+    /// Allocate `sizes` buffers and build one pipeline per module over them.
+    fn buffers_in<'host>(
+        &'host self,
+        sizes: &[usize],
+        modules: &[&[u32]],
+        direct: bool,
+    ) -> Result<Resident<'host>, Error> {
         let words = |count: usize| (count.max(1) * size_of::<u32>()) as u64;
         let largest = sizes.iter().copied().map(words).max().unwrap_or(4);
 
@@ -96,6 +130,13 @@ impl Host {
         // `Drop`, which cannot run while a frame is in flight because every frame waits on its
         // fence before returning.
         unsafe {
+            let living = if direct {
+                vk::MemoryPropertyFlags::DEVICE_LOCAL
+                    | vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT
+            } else {
+                vk::MemoryPropertyFlags::DEVICE_LOCAL
+            };
             let mut buffers = Vec::with_capacity(sizes.len());
             for &size in sizes {
                 buffers.push(self.allocate(
@@ -106,7 +147,7 @@ impl Host {
                         // Any binding may end up holding a workgroup count. Declaring it on all of
                         // them costs nothing and saves the caller telling the allocator which.
                         | vk::BufferUsageFlags::INDIRECT_BUFFER,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    living,
                 )?);
             }
 
@@ -125,6 +166,7 @@ impl Host {
 
             Ok(Resident {
                 host: self,
+                direct,
                 buffers,
                 staging,
                 layout,
@@ -359,6 +401,11 @@ impl Resident<'_> {
                 held: (held.bytes as usize) / size_of::<u32>(),
             });
         }
+        if self.direct {
+            // SAFETY: the buffer's memory is host-visible and coherent — `resident_direct` asked
+            // for nothing less — and nothing else maps it for the length of this call.
+            return unsafe { self.poke(held.memory, 0, words) };
+        }
         let (handle, staging) = (held.handle, self.staging.memory);
 
         // SAFETY: the staging memory is host-visible and coherent, and nothing else maps it.
@@ -382,6 +429,40 @@ impl Resident<'_> {
         }
     }
 
+    /// Copy `words` into `memory` at `offset` bytes, with no submission at all.
+    ///
+    /// # Safety
+    ///
+    /// `memory` must be host-visible and coherent, must hold at least `offset + words`, and must not
+    /// be mapped by anything else for the length of the call.
+    unsafe fn poke(
+        &self,
+        memory: vk::DeviceMemory,
+        offset: u64,
+        words: &[u32],
+    ) -> Result<(), Error> {
+        let bytes = (size_of_val(words) as u64).max(4);
+        // SAFETY: the caller's contract.
+        unsafe {
+            let mapped =
+                self.host
+                    .device()
+                    .map_memory(memory, offset, bytes, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
+            self.host.device().unmap_memory(memory);
+        }
+        Ok(())
+    }
+
+    /// Whether a write goes straight into a buffer, with no staging and no submission.
+    ///
+    /// True only for a [`Host::resident_direct`], and worth asking because it is the difference
+    /// between a write costing one copy and a write costing a copy, a submission and a fence.
+    #[must_use]
+    pub const fn direct(&self) -> bool {
+        self.direct
+    }
+
     /// Put `words` into binding `index`, starting `at` words in.
     ///
     /// **What an interactive frame needs.** The device owns some of a parameter buffer — a frame
@@ -402,6 +483,11 @@ impl Resident<'_> {
                 needed: at + words.len(),
                 held: (held.bytes as usize) / size_of::<u32>(),
             });
+        }
+        if self.direct {
+            // SAFETY: as in `write` — host-visible, coherent, and unmapped elsewhere. The offset is
+            // inside the buffer, checked immediately above.
+            return unsafe { self.poke(held.memory, offset, words) };
         }
         let (handle, staging) = (held.handle, self.staging.memory);
 
