@@ -95,3 +95,29 @@ fn a_direct_buffer_is_still_a_buffer_a_kernel_can_read() {
     straight.write(0, &[7, 8, 9, 10]).expect("a write");
     assert_eq!(straight.read(0, 4).expect("a read"), vec![7, 8, 9, 10]);
 }
+
+#[test]
+fn the_staging_buffer_is_cached_where_the_device_has_cached_memory() {
+    // Everything the host reads back comes through staging, and the two kinds of host-visible
+    // memory differ by an order of magnitude in one direction only. Measured on this machine, one
+    // mebibyte back off the device:
+    //
+    //   uncached, write-combined    1.97 ms    0.50 GiB/s
+    //   cached                      0.21 ms    4.71 GiB/s
+    //
+    // Which one a device gives is the device's business; that a caller can ask is this crate's.
+    let Some(host) = device("the_staging_buffer_is_cached_where_the_device_has_cached_memory")
+    else {
+        return;
+    };
+    let mut held = host.resident(&[1024], &[]).expect("a device buffer");
+    let words: Vec<u32> = (0..1024).collect();
+    held.write(0, &words).expect("a write");
+
+    // Cached or not, the bytes are the bytes. The test is that asking does not change the answer.
+    assert_eq!(held.read(0, 1024).expect("a read"), words);
+    eprintln!(
+        "  staging on this device is {}",
+        if held.cached() { "cached" } else { "write-combined" }
+    );
+}

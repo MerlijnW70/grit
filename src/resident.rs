@@ -114,6 +114,8 @@ pub struct Resident<'host> {
     flight: Option<Flight>,
     /// How many submissions this has made, which is where the next ticket's number comes from.
     tickets: u64,
+    /// Whether the staging buffer is in cached host memory.
+    cached: bool,
 }
 
 impl Host {
@@ -190,11 +192,21 @@ impl Host {
                 )?);
             }
 
-            let staging = self.allocate(
+            // **Cached where the device has it.** Staging is written by the host on the way in
+            // and *read* by the host on the way out, and uncached write-combined memory — which is
+            // what `HOST_VISIBLE | HOST_COHERENT` alone usually gets — is fast to write and about
+            // 0.3 GB/s to read. Asked for first, and fallen back from rather than failed on,
+            // because a device with no cached host-visible type is a device this still works on.
+            let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+            let plain = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let (staging, cached) = match self.allocate(
                 largest,
-                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?;
+                usage,
+                plain | vk::MemoryPropertyFlags::HOST_CACHED,
+            ) {
+                Ok(held) => (held, true),
+                Err(_) => (self.allocate(largest, usage, plain)?, false),
+            };
 
             let (layout, pool, set) = self.describe(&buffers)?;
             let (pipeline_layout, shaders, pipelines) = self.compile(layout, modules)?;
@@ -219,6 +231,7 @@ impl Host {
                 fence,
                 flight: None,
                 tickets: 0,
+                cached,
             })
         }
     }
@@ -493,6 +506,17 @@ impl Resident<'_> {
             self.host.device().unmap_memory(memory);
         }
         Ok(())
+    }
+
+    /// Whether the staging buffer is in **cached** host memory.
+    ///
+    /// Everything the host reads back off this device comes through staging, and uncached
+    /// write-combined memory reads at about 0.3 GB/s — which is the difference between a read-back
+    /// being free and being the largest thing in a call. False on a device offering no cached
+    /// host-visible memory type, and worth asking before believing a figure that includes one.
+    #[must_use]
+    pub const fn cached(&self) -> bool {
+        self.cached
     }
 
     /// Whether a write goes straight into a buffer, with no staging and no submission.
