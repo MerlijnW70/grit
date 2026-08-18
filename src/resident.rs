@@ -27,6 +27,10 @@ use crate::host::{Error, Host};
 #[derive(Debug, Clone, Copy)]
 pub enum Groups {
     /// A count the host knows.
+    ///
+    /// **Nought means nought.** The pass is recorded and dispatched over no workgroups, which is a
+    /// legal call that does nothing — and is how a caller holding several passes runs one and skips
+    /// the others.
     Fixed(u32),
     /// Three words at `binding`, from `at`: the x, y and z counts, as Vulkan wants them.
     From {
@@ -688,9 +692,12 @@ impl Resident<'_> {
                         pipeline,
                     );
                     match count {
-                        Groups::Fixed(count) => {
-                            device.cmd_dispatch(self.command, count.max(1), 1, 1)
-                        }
+                        // Not clamped to one. A caller asking for no workgroups means none, and
+                        // `vkCmdDispatch(0, 1, 1)` is a legal call that does nothing — which is how
+                        // a caller holding several passes runs one of them and skips the rest.
+                        // Rounding it up would run a pass that was told not to run, over buffers it
+                        // may have had no reason to size for it.
+                        Groups::Fixed(count) => device.cmd_dispatch(self.command, count, 1, 1),
                         Groups::From { binding, at } => {
                             let held = self.buffers.get(binding).ok_or(Error::NoSuchBinding {
                                 index: binding,
