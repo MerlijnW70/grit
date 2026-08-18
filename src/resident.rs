@@ -59,6 +59,37 @@ pub struct Run<'words> {
     pub words: &'words [u32],
 }
 
+/// A submission on the device, and what landing it owes the caller.
+#[derive(Debug, Clone, Copy)]
+struct Flight {
+    /// Which ticket this is.
+    ticket: u64,
+    /// How many words to hand back, where the caller asked for some.
+    out: Option<usize>,
+    /// When it was submitted, so that a wait can say what the whole round trip cost.
+    began: Instant,
+}
+
+/// A submission that has been started and not yet waited on.
+///
+/// Held by the caller and handed back to [`Resident::wait`]. It carries a number rather than a
+/// borrow so that a caller may do anything at all in between — including writing into a buffer this
+/// device is not reading — which is the whole reason the two halves are separate.
+///
+/// `#[must_use]` because dropping one does not cancel the submission. It leaves the device working
+/// and the next [`Resident::submit`] refusing.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ticket(u64);
+
+impl Ticket {
+    /// The number this ticket is, for a caller keeping its own record.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Everything a frame needs, allocated once.
 pub struct Resident<'host> {
     host: &'host Host,
@@ -75,6 +106,14 @@ pub struct Resident<'host> {
     commands: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
+    /// The submission on the device, if there is one.
+    ///
+    /// `None` when nothing is in flight. A second submission while this is `Some` is refused rather
+    /// than queued: there is one command buffer, and resetting it under a running submission is
+    /// undefined behaviour rather than a slow path.
+    flight: Option<Flight>,
+    /// How many submissions this has made, which is where the next ticket's number comes from.
+    tickets: u64,
 }
 
 impl Host {
@@ -178,6 +217,8 @@ impl Host {
                 commands,
                 command,
                 fence,
+                flight: None,
+                tickets: 0,
             })
         }
     }
@@ -665,7 +706,7 @@ impl Resident<'_> {
     /// [`Error::WrongPasses`] if the counts and the pipelines disagree, otherwise Vulkan's.
     pub fn frame(&mut self, groups: &[Groups]) -> Result<Duration, Error> {
         let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
-        self.run(&stages, None).map(|(spent, _)| spent)
+        self.staged(&stages)
     }
 
     /// Run every pass once, with a barrier only **between** stages and none inside one.
@@ -691,7 +732,80 @@ impl Resident<'_> {
     ///
     /// As [`Resident::frame`].
     pub fn staged(&mut self, stages: &[&[Groups]]) -> Result<Duration, Error> {
-        self.run(stages, None).map(|(spent, _)| spent)
+        let ticket = self.submit(stages)?;
+        self.wait(ticket)
+    }
+
+    /// Start [`Resident::staged`] and **do not wait for it**.
+    ///
+    /// # What this is for
+    ///
+    /// A submission and its fence cost about eighty microseconds on this machine whatever is inside
+    /// them, and [`Resident::frame`] spends that with the host doing nothing. This hands the ticket
+    /// back instead, so the host can spend it: reading the next layer off a disk, writing an expert
+    /// into device memory that this frame is not reading, or anything else that does not touch what
+    /// is in flight.
+    ///
+    /// The device is not idle either way — this does not make the frame faster. It makes the wait
+    /// available.
+    ///
+    /// # What must not happen in between
+    ///
+    /// **Nothing may write a buffer this submission reads, or read one it writes.** Nothing here can
+    /// check that; the ticket is a promise the caller makes. A write to a buffer the frame is not
+    /// touching is fine and is the point — and it becomes visible to the *next* submission, because
+    /// `vkQueueSubmit` carries an implicit host-write barrier.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StillInFlight`] where a submission has not been waited on, otherwise as
+    /// [`Resident::frame`].
+    pub fn submit(&mut self, stages: &[&[Groups]]) -> Result<Ticket, Error> {
+        self.start(stages, None, 1)
+    }
+
+    /// [`Resident::submit`], and copy `count` words of binding `index` out when the work lands.
+    ///
+    /// The words come back from [`Resident::wait_reading`], which is the only thing that may read
+    /// them: before the fence they are whatever the last frame left.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::submit`] and [`Resident::frame_reading`].
+    pub fn submit_reading(
+        &mut self,
+        stages: &[&[Groups]],
+        index: usize,
+        count: usize,
+    ) -> Result<Ticket, Error> {
+        self.bounded(index, count)?;
+        self.start(stages, Some((index, count)), 1)
+    }
+
+    /// Wait for a submission to land, and say how long it took from the submit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchTicket`] for a ticket that is not the one outstanding, otherwise Vulkan's.
+    pub fn wait(&mut self, ticket: Ticket) -> Result<Duration, Error> {
+        self.land(ticket).map(|(spent, _)| spent)
+    }
+
+    /// The same, and hand back the words [`Resident::submit_reading`] asked for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchTicket`] as [`Resident::wait`], and where the ticket was made by
+    /// [`Resident::submit`] rather than [`Resident::submit_reading`] there is nothing to read and
+    /// the words come back empty.
+    pub fn wait_reading(&mut self, ticket: Ticket) -> Result<(Duration, Vec<u32>), Error> {
+        let (spent, count) = self.land(ticket)?;
+        let Some(count) = count else {
+            return Ok((spent, Vec::new()));
+        };
+        // SAFETY: the submission has completed — `land` waited on its fence.
+        let words = unsafe { self.mapped(count) }?;
+        Ok((spent, words))
     }
 
     /// The same, and copy `count` words of binding `index` back inside the same submission.
@@ -725,20 +839,21 @@ impl Resident<'_> {
         index: usize,
         count: usize,
     ) -> Result<(Duration, Vec<u32>), Error> {
+        let ticket = self.submit_reading(stages, index, count)?;
+        self.wait_reading(ticket)
+    }
+
+    /// Refuse a read of more words than the binding holds, before anything is recorded.
+    fn bounded(&self, index: usize, count: usize) -> Result<(), Error> {
         let held = self.at(index)?;
-        let bytes = (count * size_of::<u32>()) as u64;
-        if bytes > held.bytes {
+        if (count * size_of::<u32>()) as u64 > held.bytes {
             return Err(Error::Overrun {
                 index,
                 needed: count,
                 held: (held.bytes as usize) / size_of::<u32>(),
             });
         }
-
-        let (spent, ()) = self.run(stages, Some((held.handle, bytes)))?;
-        // SAFETY: the submission has completed.
-        let words = unsafe { self.mapped(count) }?;
-        Ok((spent, words))
+        Ok(())
     }
 
     /// The buffer at `index`, or the refusal naming both numbers.
@@ -750,12 +865,66 @@ impl Resident<'_> {
     }
 
     /// Record every pass and submit, optionally copying a buffer out at the end.
-    fn run(
+    /// Record and submit, and hand back the ticket.
+    ///
+    /// **The one place a command buffer is recorded.** Everything that runs a frame comes through
+    /// here, so the refusal below is the whole of what stops one submission resetting another's
+    /// command buffer.
+    fn start(
         &mut self,
         stages: &[&[Groups]],
-        out: Option<(vk::Buffer, u64)>,
-    ) -> Result<(Duration, ()), Error> {
-        self.run_times(stages, out, 1)
+        out: Option<(usize, usize)>,
+        times: u32,
+    ) -> Result<Ticket, Error> {
+        if self.flight.is_some() {
+            return Err(Error::StillInFlight);
+        }
+        let copy = match out {
+            Some((index, count)) => {
+                let held = self.at(index)?;
+                Some((held.handle, (count * size_of::<u32>()) as u64))
+            }
+            None => None,
+        };
+
+        let began = Instant::now();
+        self.run_times(stages, copy, times)?;
+        self.tickets = self.tickets.wrapping_add(1);
+        self.flight = Some(Flight {
+            ticket: self.tickets,
+            out: out.map(|(_, count)| count),
+            began,
+        });
+        Ok(Ticket(self.tickets))
+    }
+
+    /// Wait for the outstanding submission, and say how long it took and what it owes.
+    ///
+    /// The duration is from the submit and not from here, so it is the round trip whether the
+    /// caller waited immediately or went away and did something first.
+    fn land(&mut self, ticket: Ticket) -> Result<(Duration, Option<usize>), Error> {
+        let Some(held) = self.flight else {
+            return Err(Error::NoSuchTicket {
+                ticket: ticket.get(),
+                held: None,
+            });
+        };
+        if held.ticket != ticket.get() {
+            return Err(Error::NoSuchTicket {
+                ticket: ticket.get(),
+                held: Some(held.ticket),
+            });
+        }
+
+        // SAFETY: the fence belongs to the submission this is waiting for, and nothing resets the
+        // command buffer until `flight` is cleared below.
+        unsafe {
+            self.host
+                .device()
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        self.flight = None;
+        Ok((held.began.elapsed(), held.out))
     }
 
     /// Record `times` frames back to back into one command buffer, submit once, and wait once.
@@ -780,8 +949,8 @@ impl Resident<'_> {
     /// As [`Resident::frame`].
     pub fn frames(&mut self, groups: &[Groups], times: u32) -> Result<Duration, Error> {
         let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
-        self.run_times(&stages, None, times.max(1))
-            .map(|(spent, ())| spent / times.max(1))
+        let ticket = self.start(&stages, None, times.max(1))?;
+        self.wait(ticket).map(|spent| spent / times.max(1))
     }
 
     /// The recording, `times` frames over.
@@ -790,7 +959,7 @@ impl Resident<'_> {
         stages: &[&[Groups]],
         out: Option<(vk::Buffer, u64)>,
         times: u32,
-    ) -> Result<(Duration, ()), Error> {
+    ) -> Result<(), Error> {
         let given: usize = stages.iter().map(|one| one.len()).sum();
         if given != self.pipelines.len() {
             return Err(Error::WrongPasses {
@@ -800,10 +969,9 @@ impl Resident<'_> {
         }
 
         let device = self.host.device();
-        let started = Instant::now();
 
-        // SAFETY: the fence below is waited on before this returns, so nothing recorded here is in
-        // flight when the buffer is reset on the next call.
+        // SAFETY: nothing is in flight — `start` is the only caller and it refuses while something
+        // is — so resetting the command buffer here cannot touch a running submission.
         unsafe {
             device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())?;
             let begin = vk::CommandBufferBeginInfo::default()
@@ -941,10 +1109,12 @@ impl Resident<'_> {
             let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
             device.reset_fences(&[self.fence])?;
             device.queue_submit(self.host.queue(), &submit, self.fence)?;
-            device.wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
 
-        Ok((started.elapsed(), ()))
+        // **Submitted, not landed.** Whoever called this waits on the fence — `run` immediately,
+        // `start` whenever its caller asks. Waiting here is what made a frame cost its round trip
+        // with the host doing nothing.
+        Ok(())
     }
 
     /// Record one command, submit it, and wait.

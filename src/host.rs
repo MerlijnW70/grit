@@ -67,6 +67,21 @@ pub enum Error {
         /// Words the buffer has.
         held: usize,
     },
+    /// A submission was started while one was still in flight.
+    ///
+    /// One command buffer and one fence, so one at a time. Waiting here instead of saying so would
+    /// make a caller's overlap silently disappear the day it stopped fitting — which is the failure
+    /// this is for, since nothing else about it is visible.
+    StillInFlight,
+    /// Waited on a submission that was not the one outstanding.
+    ///
+    /// A ticket is only good until it is waited on, and only for the submission that made it.
+    NoSuchTicket {
+        /// What was waited on.
+        ticket: u64,
+        /// What is outstanding, if anything is.
+        held: Option<u64>,
+    },
     /// A pass count that does not match the pipelines held.
     WrongPasses {
         /// Workgroup counts given.
@@ -97,6 +112,11 @@ impl std::fmt::Display for Error {
             Self::WrongPasses { given, held } => {
                 write!(out, "{given} workgroup counts for {held} passes")
             }
+            Self::StillInFlight => write!(out, "a submission is still in flight"),
+            Self::NoSuchTicket { ticket, held } => match held {
+                Some(one) => write!(out, "waited on {ticket}, and {one} is outstanding"),
+                None => write!(out, "waited on {ticket}, and nothing is outstanding"),
+            },
         }
     }
 }
