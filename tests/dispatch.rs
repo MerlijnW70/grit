@@ -164,3 +164,70 @@ fn a_skipped_pass_does_not_take_the_ordering_with_it() {
         "the second pass did not see what the first wrote"
     );
 }
+
+#[test]
+fn a_stage_is_ordered_against_the_next_and_not_against_itself() {
+    // Six bumps of the same word. As six stages every one sees what the last wrote, so the answer
+    // is six. As one stage nothing is ordered — and what that comes back as is the device's
+    // business, not this crate's, so what is checked is the shape either side of it rather than a
+    // number a racing kernel happened to produce.
+    let Some(host) = device("a_stage_is_ordered_against_the_next_and_not_against_itself") else {
+        return;
+    };
+    let module = bump(host.width()).expect("a kernel");
+    let every: Vec<&[u32]> = vec![&module; 6];
+    let mut held = host.resident(&[4], &every).expect("a device buffer");
+
+    let all = [Groups::Fixed(1); 6];
+    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    held.frame(&all).expect("a frame");
+    assert_eq!(
+        held.read(0, 1).expect("a read"),
+        vec![6],
+        "six ordered bumps are six"
+    );
+
+    // The same six as three stages of two: each stage reads what the stage before it wrote, so the
+    // three stages are ordered even though the pairs inside them are not.
+    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    let stages: Vec<&[Groups]> = all.chunks(2).collect();
+    held.staged(&stages).expect("a staged frame");
+    let paired = held.read(0, 1).expect("a read");
+    assert!(
+        paired[0] >= 3 && paired[0] <= 6,
+        "three ordered stages of two unordered bumps came back as {}",
+        paired[0]
+    );
+
+    // And the stages laid end to end still have to be the passes, or it is refused rather than
+    // running some of them.
+    let short: Vec<&[Groups]> = all[..4].chunks(2).collect();
+    assert!(
+        held.staged(&short).is_err(),
+        "four passes were accepted for a frame of six"
+    );
+}
+
+#[test]
+fn a_stage_with_nothing_in_it_orders_nothing() {
+    // The card's case: a stage per step, and the steps a given call does not use are given no
+    // workgroups. A skipped stage must not leave a barrier behind it, and must not break the
+    // ordering of the stages either side.
+    let Some(host) = device("a_stage_with_nothing_in_it_orders_nothing") else {
+        return;
+    };
+    let module = bump(host.width()).expect("a kernel");
+    let every: Vec<&[u32]> = vec![&module; 4];
+    let mut held = host.resident(&[4], &every).expect("a device buffer");
+
+    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    let first = [Groups::Fixed(1)];
+    let none = [Groups::Fixed(0), Groups::Fixed(0)];
+    let last = [Groups::Fixed(1)];
+    held.staged(&[&first, &none, &last]).expect("a staged frame");
+    assert_eq!(
+        held.read(0, 1).expect("a read"),
+        vec![2],
+        "the two stages that ran did not see each other"
+    );
+}

@@ -656,11 +656,42 @@ impl Resident<'_> {
     /// `groups` is one workgroup count per pass. What comes back is how long the submission took
     /// on the wall clock, fence wait included — which is what a frame actually costs.
     ///
+    /// **Every pass is ordered against every other**, which is the safe reading of a flat list and
+    /// is what a chain of passes wants. A caller whose passes are not all a chain says so with
+    /// [`Resident::staged`] and pays for fewer barriers.
+    ///
     /// # Errors
     ///
     /// [`Error::WrongPasses`] if the counts and the pipelines disagree, otherwise Vulkan's.
     pub fn frame(&mut self, groups: &[Groups]) -> Result<Duration, Error> {
-        self.run(groups, None).map(|(spent, _)| spent)
+        let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
+        self.run(&stages, None).map(|(spent, _)| spent)
+    }
+
+    /// Run every pass once, with a barrier only **between** stages and none inside one.
+    ///
+    /// The stages laid end to end are the passes, in order. Passes in one stage may run at the same
+    /// time as each other and are ordered against every pass in every later stage.
+    ///
+    /// # What this is for
+    ///
+    /// A caller holding one pass per *thing* rather than one pass per *step*. `hyperia`'s card runs
+    /// four steps over each of several experts, and the experts have nothing to say to one another:
+    /// as a flat list that is one barrier between every pair, and as four stages it is three
+    /// barriers however many experts there are.
+    ///
+    /// A barrier here is a full memory barrier — the same one [`Resident::frame`] emits — so
+    /// dropping one is not a weaker guarantee within a stage. It is the statement that there was
+    /// nothing to order.
+    ///
+    /// **A stage whose passes do depend on each other is a wrong answer, not a slow one**, and
+    /// nothing here can check it. What is in a stage is the caller's claim.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::frame`].
+    pub fn staged(&mut self, stages: &[&[Groups]]) -> Result<Duration, Error> {
+        self.run(stages, None).map(|(spent, _)| spent)
     }
 
     /// The same, and copy `count` words of binding `index` back inside the same submission.
@@ -678,6 +709,22 @@ impl Resident<'_> {
         index: usize,
         count: usize,
     ) -> Result<(Duration, Vec<u32>), Error> {
+        let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
+        self.staged_reading(&stages, index, count)
+    }
+
+    /// [`Resident::staged`], and copy `count` words of binding `index` back inside the same
+    /// submission.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::frame_reading`].
+    pub fn staged_reading(
+        &mut self,
+        stages: &[&[Groups]],
+        index: usize,
+        count: usize,
+    ) -> Result<(Duration, Vec<u32>), Error> {
         let held = self.at(index)?;
         let bytes = (count * size_of::<u32>()) as u64;
         if bytes > held.bytes {
@@ -688,7 +735,7 @@ impl Resident<'_> {
             });
         }
 
-        let (spent, ()) = self.run(groups, Some((held.handle, bytes)))?;
+        let (spent, ()) = self.run(stages, Some((held.handle, bytes)))?;
         // SAFETY: the submission has completed.
         let words = unsafe { self.mapped(count) }?;
         Ok((spent, words))
@@ -705,10 +752,10 @@ impl Resident<'_> {
     /// Record every pass and submit, optionally copying a buffer out at the end.
     fn run(
         &mut self,
-        groups: &[Groups],
+        stages: &[&[Groups]],
         out: Option<(vk::Buffer, u64)>,
     ) -> Result<(Duration, ()), Error> {
-        self.run_times(groups, out, 1)
+        self.run_times(stages, out, 1)
     }
 
     /// Record `times` frames back to back into one command buffer, submit once, and wait once.
@@ -732,20 +779,22 @@ impl Resident<'_> {
     ///
     /// As [`Resident::frame`].
     pub fn frames(&mut self, groups: &[Groups], times: u32) -> Result<Duration, Error> {
-        self.run_times(groups, None, times.max(1))
+        let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
+        self.run_times(&stages, None, times.max(1))
             .map(|(spent, ())| spent / times.max(1))
     }
 
     /// The recording, `times` frames over.
     fn run_times(
         &mut self,
-        groups: &[Groups],
+        stages: &[&[Groups]],
         out: Option<(vk::Buffer, u64)>,
         times: u32,
     ) -> Result<(Duration, ()), Error> {
-        if groups.len() != self.pipelines.len() {
+        let given: usize = stages.iter().map(|one| one.len()).sum();
+        if given != self.pipelines.len() {
             return Err(Error::WrongPasses {
-                given: groups.len(),
+                given,
                 held: self.pipelines.len(),
             });
         }
@@ -776,55 +825,63 @@ impl Resident<'_> {
             // on this machine a card holding sixty-four passes to run two of them spent about
             // 2.3 µs a pass on exactly that. `Groups::From` is never skipped: its count is read on
             // the device and is not knowable here.
-            let running: Vec<usize> = groups
-                .iter()
-                .enumerate()
-                .filter(|(_, count)| !matches!(count, Groups::Fixed(0)))
-                .map(|(pass, _)| pass)
-                .collect();
+            //
+            // The stages that have nothing running are dropped whole, so the barriers go between
+            // the stages that do — a stage that is entirely skipped orders nothing either side of
+            // it.
+            let mut pass = 0;
+            let mut running: Vec<Vec<(usize, Groups)>> = Vec::with_capacity(stages.len());
+            for stage in stages {
+                let mut held = Vec::new();
+                for &count in *stage {
+                    if !matches!(count, Groups::Fixed(0)) {
+                        held.push((pass, count));
+                    }
+                    pass += 1;
+                }
+                if !held.is_empty() {
+                    running.push(held);
+                }
+            }
 
             for repeat in 0..times {
-                for (nth, &pass) in running.iter().enumerate() {
-                    let (&pipeline, &count) = (
-                        self.pipelines.get(pass).ok_or(Error::WrongPasses {
-                            given: groups.len(),
+                for (nth, stage) in running.iter().enumerate() {
+                    for &(pass, count) in stage {
+                        let &pipeline = self.pipelines.get(pass).ok_or(Error::WrongPasses {
+                            given: pass,
                             held: self.pipelines.len(),
-                        })?,
-                        groups.get(pass).ok_or(Error::WrongPasses {
-                            given: groups.len(),
-                            held: self.pipelines.len(),
-                        })?,
-                    );
-                    device.cmd_bind_pipeline(
-                        self.command,
-                        vk::PipelineBindPoint::COMPUTE,
-                        pipeline,
-                    );
-                    match count {
-                        // Not clamped to one. A caller asking for no workgroups means none, and
-                        // rounding it up would run a pass that was told not to run, over buffers it
-                        // may have had no reason to size for it. Such a pass never reaches here —
-                        // it is filtered out above — and this arm stays honest about what a count
-                        // of nothing means rather than relying on that filter to enforce it.
-                        Groups::Fixed(count) => device.cmd_dispatch(self.command, count, 1, 1),
-                        Groups::From { binding, at } => {
-                            let held = self.buffers.get(binding).ok_or(Error::NoSuchBinding {
-                                index: binding,
-                                held: self.buffers.len(),
-                            })?;
-                            let offset = (at * size_of::<u32>()) as u64;
-                            device.cmd_dispatch_indirect(self.command, held.handle, offset);
+                        })?;
+                        device.cmd_bind_pipeline(
+                            self.command,
+                            vk::PipelineBindPoint::COMPUTE,
+                            pipeline,
+                        );
+                        match count {
+                            // Not clamped to one. A caller asking for no workgroups means none, and
+                            // rounding it up would run a pass that was told not to run, over buffers
+                            // it may have had no reason to size for it. Such a pass never reaches
+                            // here — it is filtered out above — and this arm stays honest about what
+                            // a count of nothing means rather than relying on that filter.
+                            Groups::Fixed(count) => device.cmd_dispatch(self.command, count, 1, 1),
+                            Groups::From { binding, at } => {
+                                let held = self.buffers.get(binding).ok_or(Error::NoSuchBinding {
+                                    index: binding,
+                                    held: self.buffers.len(),
+                                })?;
+                                let offset = (at * size_of::<u32>()) as u64;
+                                device.cmd_dispatch_indirect(self.command, held.handle, offset);
+                            }
                         }
                     }
 
-                    // Between passes only: what the last one wrote, the next one reads. A barrier after
-                    // the final dispatch would order nothing, and the copy below brings its own.
+                    // Between stages only: what one wrote, the next reads. A barrier after the last
+                    // one would order nothing, and the copy below brings its own.
                     //
                     // **`DRAW_INDIRECT` is in the destination whether the next pass is indirect or
                     // not.** A workgroup count is read at that stage rather than in the shader, so a
-                    // barrier that only mentioned `COMPUTE_SHADER` would order the buffer's *contents*
-                    // and not the command that reads them. Naming it always costs nothing and cannot be
-                    // forgotten for the one pass that needs it.
+                    // barrier that only mentioned `COMPUTE_SHADER` would order the buffer's
+                    // *contents* and not the command that reads them. Naming it always costs nothing
+                    // and cannot be forgotten for the one pass that needs it.
                     if nth + 1 < running.len() || repeat + 1 < times {
                         let barrier = [vk::MemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
