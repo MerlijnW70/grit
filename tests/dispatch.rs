@@ -29,6 +29,18 @@ fn mark(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     kernel.finish()
 }
 
+/// A kernel that adds one to the word at binding 0 — it reads what a pass before it wrote.
+fn bump(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 1))?;
+    let uint = kernel.index_type();
+    let head = kernel.module().constant_u32(0)?;
+    let one = kernel.module().constant_u32(1)?;
+    let held = kernel.load_at(0, head)?;
+    let next = kernel.module().i_add(uint, held, one)?;
+    kernel.store_at(0, head, next)?;
+    kernel.finish()
+}
+
 /// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
@@ -114,4 +126,41 @@ fn the_allocation_ceiling_is_a_buffer_this_device_will_actually_hand_out() {
         Ok(held) => drop(held),
         Err(why) => panic!("the device refused its own ceiling of {ceiling}: {why}"),
     }
+}
+
+#[test]
+fn a_skipped_pass_does_not_take_the_ordering_with_it() {
+    // The failure a cheaper command buffer could introduce. A pass told to run nothing is not
+    // recorded at all, so neither is the barrier that would have followed it — and if the barriers
+    // were counted off the pass list rather than off what actually runs, the two passes either side
+    // of a skipped one would go unordered. Both read the word the other wrote, so an unordered pair
+    // reads a stale one and the answer comes back short.
+    let Some(host) = device("a_skipped_pass_does_not_take_the_ordering_with_it") else {
+        return;
+    };
+    let module = bump(host.width()).expect("a kernel");
+    let mut held = host
+        .resident(&[4], &[&module, &module, &module, &module, &module])
+        .expect("a device buffer");
+
+    // Every pass runs: five bumps of one workgroup, one lane of which stores, so the word is five.
+    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    held.frame(&[Groups::Fixed(1); 5]).expect("a frame");
+    assert_eq!(held.read(0, 1).expect("a read"), vec![5]);
+
+    // Now with three of them skipped, and the two that run are no longer neighbours in the list.
+    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    held.frame(&[
+        Groups::Fixed(1),
+        Groups::Fixed(0),
+        Groups::Fixed(0),
+        Groups::Fixed(0),
+        Groups::Fixed(1),
+    ])
+    .expect("a frame");
+    assert_eq!(
+        held.read(0, 1).expect("a read"),
+        vec![2],
+        "the second pass did not see what the first wrote"
+    );
 }

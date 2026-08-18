@@ -770,8 +770,31 @@ impl Resident<'_> {
                 &[],
             );
 
+            // A pass told to run no workgroups does nothing and writes nothing, so recording it —
+            // a pipeline bind and the barrier that would follow it — buys an ordering guarantee
+            // over an empty set. Skipping it is the same frame with less in the command buffer, and
+            // on this machine a card holding sixty-four passes to run two of them spent about
+            // 2.3 µs a pass on exactly that. `Groups::From` is never skipped: its count is read on
+            // the device and is not knowable here.
+            let running: Vec<usize> = groups
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| !matches!(count, Groups::Fixed(0)))
+                .map(|(pass, _)| pass)
+                .collect();
+
             for repeat in 0..times {
-                for (pass, (&pipeline, &count)) in self.pipelines.iter().zip(groups).enumerate() {
+                for (nth, &pass) in running.iter().enumerate() {
+                    let (&pipeline, &count) = (
+                        self.pipelines.get(pass).ok_or(Error::WrongPasses {
+                            given: groups.len(),
+                            held: self.pipelines.len(),
+                        })?,
+                        groups.get(pass).ok_or(Error::WrongPasses {
+                            given: groups.len(),
+                            held: self.pipelines.len(),
+                        })?,
+                    );
                     device.cmd_bind_pipeline(
                         self.command,
                         vk::PipelineBindPoint::COMPUTE,
@@ -779,10 +802,10 @@ impl Resident<'_> {
                     );
                     match count {
                         // Not clamped to one. A caller asking for no workgroups means none, and
-                        // `vkCmdDispatch(0, 1, 1)` is a legal call that does nothing — which is how
-                        // a caller holding several passes runs one of them and skips the rest.
-                        // Rounding it up would run a pass that was told not to run, over buffers it
-                        // may have had no reason to size for it.
+                        // rounding it up would run a pass that was told not to run, over buffers it
+                        // may have had no reason to size for it. Such a pass never reaches here —
+                        // it is filtered out above — and this arm stays honest about what a count
+                        // of nothing means rather than relying on that filter to enforce it.
                         Groups::Fixed(count) => device.cmd_dispatch(self.command, count, 1, 1),
                         Groups::From { binding, at } => {
                             let held = self.buffers.get(binding).ok_or(Error::NoSuchBinding {
@@ -802,7 +825,7 @@ impl Resident<'_> {
                     // barrier that only mentioned `COMPUTE_SHADER` would order the buffer's *contents*
                     // and not the command that reads them. Naming it always costs nothing and cannot be
                     // forgotten for the one pass that needs it.
-                    if pass + 1 < self.pipelines.len() || repeat + 1 < times {
+                    if nth + 1 < running.len() || repeat + 1 < times {
                         let barrier = [vk::MemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                             .dst_access_mask(
