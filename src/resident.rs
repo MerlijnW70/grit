@@ -1126,6 +1126,13 @@ impl Resident<'_> {
     where
         F: FnOnce(&ash::Device, vk::CommandBuffer),
     {
+        // **The one command buffer again.** A staged write records and submits, so it cannot happen
+        // while a frame is in flight. A *direct* write does not come through here at all — it is a
+        // copy into mapped device memory with nothing submitted — which is why a caller with
+        // resizable BAR may upload during a frame and a caller without it may not.
+        if self.flight.is_some() {
+            return Err(Error::StillInFlight);
+        }
         let device = self.host.device();
         // SAFETY: the fence is waited on before returning, so nothing is in flight.
         unsafe {
