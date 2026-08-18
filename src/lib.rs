@@ -28,4 +28,4 @@ pub mod sand;
 pub mod sweep;
 
 pub use host::{Error, Host};
-pub use resident::{Groups, Resident, Run};
+pub use resident::{Groups, Resident, Run, Ticket};
