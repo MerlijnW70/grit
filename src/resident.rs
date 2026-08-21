@@ -642,11 +642,12 @@ impl Resident<'_> {
         self.cached
     }
 
-    /// Whether a write goes straight into a buffer, with no staging and no submission.
+    /// Whether **every** buffer of this `Resident` is one the host can write without a submission.
     ///
-    /// True only for a [`Host::resident_direct`], and worth asking because it is the difference
-    /// between a write costing one copy and a write costing a copy, a submission and a fence.
-    #[must_use]
+    /// True only for a [`Host::resident_direct`]. False for a [`Host::resident_near`] even where
+    /// most of its buffers got that memory — the small ones written every frame usually do and the
+    /// large ones cannot — so this is a question about the whole allocation and not about any one
+    /// write. What a given write did is [`Resident::pushing`], which counts them.
     pub const fn direct(&self) -> bool {
         self.direct
     }
