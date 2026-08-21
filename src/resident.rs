@@ -46,6 +46,12 @@ struct Held {
     handle: vk::Buffer,
     memory: vk::DeviceMemory,
     bytes: u64,
+    /// Whether the host can write into it without a submission.
+    ///
+    /// Decided per buffer rather than per `Resident`: a window of device-local host-visible memory
+    /// is a few hundred megabytes where a model's weights are gigabytes, and asking for all of them
+    /// at once turns a token of 8 KiB into a staged copy because an expert slot would not fit.
+    visible: bool,
 }
 
 /// One run of words going somewhere, for [`Resident::write_many`].
@@ -141,6 +147,8 @@ pub struct Resident<'host> {
     pushing: Duration,
     /// How many writes that was.
     pushes: u64,
+    /// How many of them went straight into device memory rather than through a submission.
+    poked: u64,
 }
 
 impl Host {
@@ -157,7 +165,7 @@ impl Host {
         sizes: &[usize],
         modules: &[&[u32]],
     ) -> Result<Resident<'host>, Error> {
-        self.buffers_in(sizes, modules, false)
+        self.buffers_in(sizes, modules, false, 0)
     }
 
     /// The same, with buffers the host can write into **without a submission**.
@@ -179,7 +187,36 @@ impl Host {
         sizes: &[usize],
         modules: &[&[u32]],
     ) -> Result<Resident<'host>, Error> {
-        self.buffers_in(sizes, modules, true)
+        self.buffers_in(sizes, modules, true, 0)
+    }
+
+    /// Buffers the host can write into without a submission **where they fit**, and device-local
+    /// memory for the rest.
+    ///
+    /// # Why this rather than [`Host::resident_direct`]
+    ///
+    /// Because that asks for every buffer at once and fails if any of them will not fit. Memory
+    /// that is both device-local and host-visible is a window of a few hundred megabytes on most
+    /// cards; a model's weights are gigabytes. So a caller holding one large buffer and a handful
+    /// of small ones is refused, falls back, and pays a submission and a fence for **every** write
+    /// — including the small ones written on every frame, which would have fitted the window a
+    /// thousand times over.
+    ///
+    /// `window` is the largest buffer worth asking for. Anything above it goes device-local without
+    /// asking; anything at or below it is asked for and falls back quietly where the window is
+    /// full. Nought asks for nothing, which is [`Host::resident`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Host::resident`]. A buffer that will not fit the window is not an error — it is the
+    /// ordinary case, and it is what the fallback is for.
+    pub fn resident_near<'host>(
+        &'host self,
+        sizes: &[usize],
+        modules: &[&[u32]],
+        window: u64,
+    ) -> Result<Resident<'host>, Error> {
+        self.buffers_in(sizes, modules, false, window)
     }
 
     /// Allocate `sizes` buffers and build one pipeline per module over them.
@@ -188,6 +225,7 @@ impl Host {
         sizes: &[usize],
         modules: &[&[u32]],
         direct: bool,
+        window: u64,
     ) -> Result<Resident<'host>, Error> {
         let words = |count: usize| (count.max(1) * size_of::<u32>()) as u64;
         let largest = sizes.iter().copied().map(words).max().unwrap_or(4);
@@ -203,18 +241,40 @@ impl Host {
             } else {
                 vk::MemoryPropertyFlags::DEVICE_LOCAL
             };
+            let usage_of = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST
+                // Any binding may end up holding a workgroup count. Declaring it on all of
+                // them costs nothing and saves the caller telling the allocator which.
+                | vk::BufferUsageFlags::INDIRECT_BUFFER;
+            let near = vk::MemoryPropertyFlags::DEVICE_LOCAL
+                | vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT;
+
             let mut buffers = Vec::with_capacity(sizes.len());
             for &size in sizes {
-                buffers.push(self.allocate(
-                    words(size),
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::TRANSFER_SRC
-                        | vk::BufferUsageFlags::TRANSFER_DST
-                        // Any binding may end up holding a workgroup count. Declaring it on all of
-                        // them costs nothing and saves the caller telling the allocator which.
-                        | vk::BufferUsageFlags::INDIRECT_BUFFER,
-                    living,
-                )?);
+                let bytes = words(size);
+
+                // **Small enough to be worth the window, and asked for one at a time.** A buffer
+                // written every frame wants memory the host can poke; a buffer holding an expert
+                // does not, and there is not enough of the first kind for both. Where `window` is
+                // nought this asks nothing and every buffer is `living`, which is what `resident`
+                // and `resident_direct` want.
+                let held = if bytes <= window {
+                    match self.allocate(bytes, usage_of, near) {
+                        Ok(held) => Some(Held { visible: true, ..held }),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                buffers.push(match held {
+                    Some(held) => held,
+                    None => Held {
+                        visible: direct,
+                        ..self.allocate(bytes, usage_of, living)?
+                    },
+                });
             }
 
             // **Cached where the device has it.** Staging is written by the host on the way in
@@ -247,6 +307,7 @@ impl Host {
                 copies: 0,
                 pushing: Duration::ZERO,
                 pushes: 0,
+                poked: 0,
                 host: self,
                 direct,
                 buffers,
@@ -305,6 +366,8 @@ impl Host {
             handle,
             memory,
             bytes: bytes.max(4),
+            // Whatever the caller asked for; `buffers_in` says which it settled on.
+            visible: wanted.contains(vk::MemoryPropertyFlags::HOST_VISIBLE),
         })
     }
 
@@ -471,11 +534,12 @@ impl Resident<'_> {
 
     /// How long has gone into writing buffers, how many writes, and whether they went straight in.
     ///
-    /// A direct write maps, copies and unmaps; a staged one records a copy, submits it and waits.
-    /// Neither is a frame, so a caller timing its frames sees neither.
+    /// The third is how many of them went straight into device memory. A direct write maps, copies
+    /// and unmaps; a staged one records a copy, submits it and waits on a fence, which is a whole
+    /// round trip for a transfer. Neither is a frame, so a caller timing its frames sees neither.
     #[must_use]
-    pub const fn pushing(&self) -> (Duration, u64, bool) {
-        (self.pushing, self.pushes, self.direct)
+    pub const fn pushing(&self) -> (Duration, u64, u64) {
+        (self.pushing, self.pushes, self.poked)
     }
 
     /// Put `words` into binding `index`, through the staging buffer.
@@ -487,9 +551,11 @@ impl Resident<'_> {
     /// [`Error::NoSuchBinding`] or [`Error::Overrun`], otherwise whatever Vulkan said.
     pub fn write(&mut self, index: usize, words: &[u32]) -> Result<(), Error> {
         let began = std::time::Instant::now();
+        let near = self.at(index).is_ok_and(|held| held.visible);
         let out = self.written(index, words);
         self.pushing += began.elapsed();
         self.pushes += 1;
+        self.poked += u64::from(near);
         out
     }
 
@@ -504,9 +570,10 @@ impl Resident<'_> {
                 held: (held.bytes as usize) / size_of::<u32>(),
             });
         }
-        if self.direct {
-            // SAFETY: the buffer's memory is host-visible and coherent — `resident_direct` asked
-            // for nothing less — and nothing else maps it for the length of this call.
+        if held.visible {
+            // SAFETY: this buffer's memory is host-visible and coherent — it was allocated asking
+            // for nothing less, which is what `visible` records — and nothing else maps it for the
+            // length of this call.
             return unsafe { self.poke(held.memory, 0, words) };
         }
         let (handle, staging) = (held.handle, self.staging.memory);
@@ -598,7 +665,7 @@ impl Resident<'_> {
                 held: (held.bytes as usize) / size_of::<u32>(),
             });
         }
-        if self.direct {
+        if held.visible {
             // SAFETY: as in `write` — host-visible, coherent, and unmapped elsewhere. The offset is
             // inside the buffer, checked immediately above.
             return unsafe { self.poke(held.memory, offset, words) };
