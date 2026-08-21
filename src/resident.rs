@@ -133,6 +133,14 @@ pub struct Resident<'host> {
     copying: Duration,
     /// How many of those there were.
     copies: u64,
+    /// How long has gone into writing buffers, and how many writes that was.
+    ///
+    /// A write is either a map, a copy and an unmap — which is `direct` — or a staged copy with a
+    /// submit and a fence behind it, which is not. Neither is a frame, so neither shows up in a
+    /// caller's frame timings, and the two differ by about fifty microseconds a call.
+    pushing: Duration,
+    /// How many writes that was.
+    pushes: u64,
 }
 
 impl Host {
@@ -237,6 +245,8 @@ impl Host {
                 recorded: 0,
                 copying: Duration::ZERO,
                 copies: 0,
+                pushing: Duration::ZERO,
+                pushes: 0,
                 host: self,
                 direct,
                 buffers,
@@ -459,6 +469,15 @@ impl Resident<'_> {
         self.pipelines.len()
     }
 
+    /// How long has gone into writing buffers, how many writes, and whether they went straight in.
+    ///
+    /// A direct write maps, copies and unmaps; a staged one records a copy, submits it and waits.
+    /// Neither is a frame, so a caller timing its frames sees neither.
+    #[must_use]
+    pub const fn pushing(&self) -> (Duration, u64, bool) {
+        (self.pushing, self.pushes, self.direct)
+    }
+
     /// Put `words` into binding `index`, through the staging buffer.
     ///
     /// **Once, at the start.** Everything after that stays where it is.
@@ -467,6 +486,15 @@ impl Resident<'_> {
     ///
     /// [`Error::NoSuchBinding`] or [`Error::Overrun`], otherwise whatever Vulkan said.
     pub fn write(&mut self, index: usize, words: &[u32]) -> Result<(), Error> {
+        let began = std::time::Instant::now();
+        let out = self.written(index, words);
+        self.pushing += began.elapsed();
+        self.pushes += 1;
+        out
+    }
+
+    /// The write itself, with the clock around it in [`Resident::write`].
+    fn written(&mut self, index: usize, words: &[u32]) -> Result<(), Error> {
         let held = self.at(index)?;
         let bytes = size_of_val(words) as u64;
         if bytes > held.bytes {
