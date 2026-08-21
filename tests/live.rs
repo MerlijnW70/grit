@@ -270,3 +270,27 @@ fn counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
     kernel.store_at(PARAMS, slot, next)?;
     kernel.finish()
 }
+
+/// What the device says it has, against what it says it will allocate at once.
+///
+/// `Host::heap` and `Host::ceiling` answer different questions and a caller sizing a cache wants
+/// the first. They are far apart on a real card — about four gigabytes against sixteen — and a
+/// caller that reached for the ceiling because there was no heap to ask would size its cache to a
+/// quarter of the card without knowing it.
+#[test]
+fn a_host_says_how_much_memory_it_has() {
+    let Some(host) = device("a_host_says_how_much_memory_it_has") else {
+        return;
+    };
+    let (heap, ceiling) = (host.heap(), host.ceiling());
+    eprintln!("  {} — heap {heap} bytes, ceiling {ceiling} bytes", host.name());
+
+    assert!(heap > 0, "a device with no device-local heap at all");
+    assert!(
+        heap >= ceiling,
+        "the largest allocation {ceiling} is bigger than the heap {heap} it comes out of"
+    );
+    // A device this can run a compute pass on has more than a token's worth of memory. Loose on
+    // purpose: the point is that the number is the heap's and not a placeholder.
+    assert!(heap >= 64 * 1024 * 1024, "a heap of {heap} bytes is not a device this runs on");
+}

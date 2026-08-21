@@ -209,6 +209,30 @@ impl Host {
         self.width
     }
 
+    /// How much memory this device has of its own, in bytes.
+    ///
+    /// The largest `DEVICE_LOCAL` heap it reports. On a discrete card that is its memory; on an
+    /// integrated one it is a share of the system's, and the number is the driver's claim either
+    /// way rather than a measurement.
+    ///
+    /// # Why this is not [`Host::ceiling`]
+    ///
+    /// Because they answer different questions and are far apart. The ceiling is the largest single
+    /// *allocation* — about four gigabytes on the card this was written against, where the heap is
+    /// sixteen. A caller sizing a cache wants this one; a caller sizing a buffer wants the other.
+    /// `hyperia` was choosing a slot count from a constant because there was no way to ask.
+    #[must_use]
+    pub fn heap(&self) -> u64 {
+        let held = &self.memory;
+        held.memory_heaps
+            .iter()
+            .take(held.memory_heap_count as usize)
+            .filter(|one| one.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|one| one.size)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The largest single buffer this device will both allocate and address.
     ///
     /// The smaller of `maxMemoryAllocationSize` and `maxStorageBufferRange`: one bounds what
