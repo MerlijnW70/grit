@@ -66,12 +66,15 @@ pub struct Run<'words> {
 }
 
 /// A submission on the device, and what landing it owes the caller.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Flight {
     /// Which ticket this is.
     ticket: u64,
-    /// How many words to hand back, where the caller asked for some.
-    out: Option<usize>,
+    /// How many words to hand back from the staging buffer, in the order they were copied into it.
+    ///
+    /// Two, where a caller asked a frame for two buffers — see [`Resident::submit_reading_both`].
+    /// Empty where it asked for none.
+    out: Vec<usize>,
     /// When it was submitted, so that a wait can say what the whole round trip cost.
     began: Instant,
 }
@@ -551,16 +554,19 @@ impl Resident<'_> {
     /// [`Error::NoSuchBinding`] or [`Error::Overrun`], otherwise whatever Vulkan said.
     pub fn write(&mut self, index: usize, words: &[u32]) -> Result<(), Error> {
         let began = std::time::Instant::now();
-        let near = self.at(index).is_ok_and(|held| held.visible);
         let out = self.written(index, words);
         self.pushing += began.elapsed();
         self.pushes += 1;
-        self.poked += u64::from(near);
-        out
+        // Said by the write itself rather than looked up again: `written` already has the buffer in
+        // hand, and asking `at` a second time is a second bounds check for a counter.
+        self.poked += u64::from(*out.as_ref().unwrap_or(&false));
+        out.map(|_| ())
     }
 
     /// The write itself, with the clock around it in [`Resident::write`].
-    fn written(&mut self, index: usize, words: &[u32]) -> Result<(), Error> {
+    ///
+    /// True where it went straight into device memory, false where it was staged.
+    fn written(&mut self, index: usize, words: &[u32]) -> Result<bool, Error> {
         let held = self.at(index)?;
         let bytes = size_of_val(words) as u64;
         if bytes > held.bytes {
@@ -574,7 +580,7 @@ impl Resident<'_> {
             // SAFETY: this buffer's memory is host-visible and coherent — it was allocated asking
             // for nothing less, which is what `visible` records — and nothing else maps it for the
             // length of this call.
-            return unsafe { self.poke(held.memory, 0, words) };
+            return unsafe { self.poke(held.memory, 0, words) }.map(|()| true);
         }
         let (handle, staging) = (held.handle, self.staging.memory);
 
@@ -596,6 +602,7 @@ impl Resident<'_> {
             self.once(|device, command| {
                 device.cmd_copy_buffer(command, self.staging.handle, handle, &region)
             })
+            .map(|()| false)
         }
     }
 
@@ -913,7 +920,7 @@ impl Resident<'_> {
     /// [`Error::StillInFlight`] where a submission has not been waited on, otherwise as
     /// [`Resident::frame`].
     pub fn submit(&mut self, stages: &[&[Groups]]) -> Result<Ticket, Error> {
-        self.start(stages, None, 1)
+        self.start(stages, &[], 1)
     }
 
     /// [`Resident::submit`], and copy `count` words of binding `index` out when the work lands.
@@ -931,7 +938,46 @@ impl Resident<'_> {
         count: usize,
     ) -> Result<Ticket, Error> {
         self.bounded(index, count)?;
-        self.start(stages, Some((index, count)), 1)
+        self.start(stages, &[(index, count)], 1)
+    }
+
+    /// [`Resident::submit_reading`], and copy a **second** binding out in the same submission.
+    ///
+    /// # Why two and not a read afterwards
+    ///
+    /// Because a read afterwards is a second submit and a second fence, which this file already
+    /// says is a hundred microseconds for nothing — and a caller whose frame produces two answers
+    /// was paying it on every frame. Both copies land in the staging buffer one after the other and
+    /// come back together from [`Resident::wait_reading_both`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::submit_reading`], and [`Error::Overrun`] where the two together will not fit
+    /// the staging buffer.
+    pub fn submit_reading_both(
+        &mut self,
+        stages: &[&[Groups]],
+        first: (usize, usize),
+        second: (usize, usize),
+    ) -> Result<Ticket, Error> {
+        self.bounded(first.0, first.1)?;
+        self.bounded(second.0, second.1)?;
+        self.start(stages, &[first, second], 1)
+    }
+
+    /// Record every pass, submit, and copy two bindings out when the work lands.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::submit_reading_both`].
+    pub fn staged_reading_both(
+        &mut self,
+        stages: &[&[Groups]],
+        first: (usize, usize),
+        second: (usize, usize),
+    ) -> Result<(Duration, Vec<u32>, Vec<u32>), Error> {
+        let ticket = self.submit_reading_both(stages, first, second)?;
+        self.wait_reading_both(ticket)
     }
 
     /// Wait for a submission to land, and say how long it took from the submit.
@@ -951,13 +997,42 @@ impl Resident<'_> {
     /// [`Resident::submit`] rather than [`Resident::submit_reading`] there is nothing to read and
     /// the words come back empty.
     pub fn wait_reading(&mut self, ticket: Ticket) -> Result<(Duration, Vec<u32>), Error> {
-        let (spent, count) = self.land(ticket)?;
-        let Some(count) = count else {
-            return Ok((spent, Vec::new()));
-        };
-        // SAFETY: the submission has completed — `land` waited on its fence.
-        let words = unsafe { self.mapped(count) }?;
-        Ok((spent, words))
+        let (spent, mut every) = self.landed(ticket)?;
+        Ok((spent, if every.is_empty() { Vec::new() } else { every.swap_remove(0) }))
+    }
+
+    /// The same, for a frame that asked for two buffers — see [`Resident::submit_reading_both`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::wait_reading`], and [`Error::NoSuchTicket`] where the frame asked for fewer.
+    pub fn wait_reading_both(
+        &mut self,
+        ticket: Ticket,
+    ) -> Result<(Duration, Vec<u32>, Vec<u32>), Error> {
+        let (spent, mut every) = self.landed(ticket)?;
+        if every.len() < 2 {
+            return Err(Error::WrongOutputs {
+                asked: every.len(),
+                wanted: 2,
+            });
+        }
+        let second = every.swap_remove(1);
+        Ok((spent, every.swap_remove(0), second))
+    }
+
+    /// Wait, and take every buffer the frame asked for out of the staging buffer in order.
+    fn landed(&mut self, ticket: Ticket) -> Result<(Duration, Vec<Vec<u32>>), Error> {
+        let (spent, counts) = self.land(ticket)?;
+        let mut every = Vec::with_capacity(counts.len());
+        let mut at = 0_usize;
+        for count in counts {
+            // SAFETY: the submission has completed — `land` waited on its fence — and the copies
+            // were recorded into the staging buffer at these offsets in this order.
+            every.push(unsafe { self.mapped_at(at, count) }?);
+            at += count.max(1);
+        }
+        Ok((spent, every))
     }
 
     /// The same, and copy `count` words of binding `index` back inside the same submission.
@@ -1025,26 +1100,37 @@ impl Resident<'_> {
     fn start(
         &mut self,
         stages: &[&[Groups]],
-        out: Option<(usize, usize)>,
+        out: &[(usize, usize)],
         times: u32,
     ) -> Result<Ticket, Error> {
         if self.flight.is_some() {
             return Err(Error::StillInFlight);
         }
-        let copy = match out {
-            Some((index, count)) => {
-                let held = self.at(index)?;
-                Some((held.handle, (count * size_of::<u32>()) as u64))
-            }
-            None => None,
-        };
+        let mut copy = Vec::with_capacity(out.len());
+        let mut wanted = 0_u64;
+        for &(index, count) in out {
+            let held = self.at(index)?;
+            let bytes = (count * size_of::<u32>()) as u64;
+            copy.push((held.handle, bytes));
+            wanted += bytes.max(4);
+        }
+        // Both copies land in the one staging buffer, one after the other, so together they have to
+        // fit it. Refused here rather than overrunning it, which would be the second copy quietly
+        // landing on top of the first.
+        if wanted > self.staging.bytes {
+            return Err(Error::Overrun {
+                index: out.len(),
+                needed: (wanted as usize) / size_of::<u32>(),
+                held: (self.staging.bytes as usize) / size_of::<u32>(),
+            });
+        }
 
         let began = Instant::now();
-        self.run_times(stages, copy, times)?;
+        self.run_times(stages, &copy, times)?;
         self.tickets = self.tickets.wrapping_add(1);
         self.flight = Some(Flight {
             ticket: self.tickets,
-            out: out.map(|(_, count)| count),
+            out: out.iter().map(|&(_, count)| count).collect(),
             began,
         });
         Ok(Ticket(self.tickets))
@@ -1054,19 +1140,24 @@ impl Resident<'_> {
     ///
     /// The duration is from the submit and not from here, so it is the round trip whether the
     /// caller waited immediately or went away and did something first.
-    fn land(&mut self, ticket: Ticket) -> Result<(Duration, Option<usize>), Error> {
-        let Some(held) = self.flight else {
-            return Err(Error::NoSuchTicket {
-                ticket: ticket.get(),
-                held: None,
-            });
+    fn land(&mut self, ticket: Ticket) -> Result<(Duration, Vec<usize>), Error> {
+        // Read out of the flight rather than moved out of it: a mismatched ticket leaves the real
+        // submission outstanding, and taking it here would forget a frame that is still running.
+        let (began, out) = {
+            let Some(held) = self.flight.as_ref() else {
+                return Err(Error::NoSuchTicket {
+                    ticket: ticket.get(),
+                    held: None,
+                });
+            };
+            if held.ticket != ticket.get() {
+                return Err(Error::NoSuchTicket {
+                    ticket: ticket.get(),
+                    held: Some(held.ticket),
+                });
+            }
+            (held.began, held.out.clone())
         };
-        if held.ticket != ticket.get() {
-            return Err(Error::NoSuchTicket {
-                ticket: ticket.get(),
-                held: Some(held.ticket),
-            });
-        }
 
         // SAFETY: the fence belongs to the submission this is waiting for, and nothing resets the
         // command buffer until `flight` is cleared below.
@@ -1076,7 +1167,7 @@ impl Resident<'_> {
                 .wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
         self.flight = None;
-        Ok((held.began.elapsed(), held.out))
+        Ok((began.elapsed(), out))
     }
 
     /// Record `times` frames back to back into one command buffer, submit once, and wait once.
@@ -1101,7 +1192,7 @@ impl Resident<'_> {
     /// As [`Resident::frame`].
     pub fn frames(&mut self, groups: &[Groups], times: u32) -> Result<Duration, Error> {
         let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
-        let ticket = self.start(&stages, None, times.max(1))?;
+        let ticket = self.start(&stages, &[], times.max(1))?;
         self.wait(ticket).map(|spent| spent / times.max(1))
     }
 
@@ -1119,7 +1210,7 @@ impl Resident<'_> {
     fn run_times(
         &mut self,
         stages: &[&[Groups]],
-        out: Option<(vk::Buffer, u64)>,
+        out: &[(vk::Buffer, u64)],
         times: u32,
     ) -> Result<(), Error> {
         let given: usize = stages.iter().map(|one| one.len()).sum();
@@ -1236,7 +1327,8 @@ impl Resident<'_> {
                 }
             }
 
-            if let Some((handle, bytes)) = out {
+            let mut into = 0_u64;
+            for &(handle, bytes) in out {
                 let barrier = [vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
@@ -1250,8 +1342,11 @@ impl Resident<'_> {
                     &[],
                 );
 
-                let region = [vk::BufferCopy::default().size(bytes.max(4))];
+                let region = [vk::BufferCopy::default()
+                    .dst_offset(into)
+                    .size(bytes.max(4))];
                 device.cmd_copy_buffer(self.command, handle, self.staging.handle, &region);
+                into += bytes.max(4);
 
                 let barrier = [vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1326,13 +1421,25 @@ impl Resident<'_> {
     ///
     /// Whatever wrote them must have completed.
     unsafe fn mapped(&self, count: usize) -> Result<Vec<u32>, Error> {
+        // SAFETY: the caller's contract, with nothing before it in the staging buffer.
+        unsafe { self.mapped_at(0, count) }
+    }
+
+    /// The same, `at` words into the staging buffer.
+    ///
+    /// # Safety
+    ///
+    /// As [`Resident::mapped`], and the words at that offset must be the ones the caller means —
+    /// which for a frame is the order its copies were recorded in.
+    unsafe fn mapped_at(&self, at: usize, count: usize) -> Result<Vec<u32>, Error> {
+        let from = (at * size_of::<u32>()) as u64;
         let bytes = ((count * size_of::<u32>()) as u64).max(4);
         // SAFETY: host-visible coherent memory, nothing else maps it, and the caller's contract
         // says the copy into it has finished.
         unsafe {
             let mapped = self.host.device().map_memory(
                 self.staging.memory,
-                0,
+                from,
                 bytes,
                 vk::MemoryMapFlags::empty(),
             )?;

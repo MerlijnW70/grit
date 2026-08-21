@@ -82,6 +82,17 @@ pub enum Error {
         /// What is outstanding, if anything is.
         held: Option<u64>,
     },
+    /// A frame's answers asked for in a shape it was not submitted with.
+    ///
+    /// A frame copies out the bindings it was started with and no others, so waiting for two out of
+    /// one is a caller's mistake rather than a device's — and handing back an empty second would be
+    /// a wrong answer that reads like a right one.
+    WrongOutputs {
+        /// How many the frame copied.
+        asked: usize,
+        /// How many were wanted.
+        wanted: usize,
+    },
     /// A pass count that does not match the pipelines held.
     WrongPasses {
         /// Workgroup counts given.
@@ -113,6 +124,9 @@ impl std::fmt::Display for Error {
                 write!(out, "{given} workgroup counts for {held} passes")
             }
             Self::StillInFlight => write!(out, "a submission is still in flight"),
+            Self::WrongOutputs { asked, wanted } => {
+                write!(out, "the frame copied {asked} buffer(s) and {wanted} were wanted")
+            }
             Self::NoSuchTicket { ticket, held } => match held {
                 Some(one) => write!(out, "waited on {ticket}, and {one} is outstanding"),
                 None => write!(out, "waited on {ticket}, and nothing is outstanding"),
