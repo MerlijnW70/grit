@@ -125,6 +125,14 @@ pub struct Resident<'host> {
     recording: Duration,
     /// How many frames that was over.
     recorded: u64,
+    /// How long has gone into one-off copies on and off the card, and how many there were.
+    ///
+    /// A `write` that cannot go straight into device memory, and **every** `read`, records a copy,
+    /// submits it and waits on its fence. That is a whole round trip for a transfer, and it does
+    /// not appear in the frame timings a caller sees because it is not a frame.
+    copying: Duration,
+    /// How many of those there were.
+    copies: u64,
 }
 
 impl Host {
@@ -227,6 +235,8 @@ impl Host {
             Ok(Resident {
                 recording: Duration::ZERO,
                 recorded: 0,
+                copying: Duration::ZERO,
+                copies: 0,
                 host: self,
                 direct,
                 buffers,
@@ -699,6 +709,15 @@ impl Resident<'_> {
         }
     }
 
+    /// How long has gone into one-off copies on and off the card, and how many there were.
+    ///
+    /// Every `read` is a recorded copy, a submit and a fence wait — a round trip for a transfer,
+    /// spent outside any frame. A caller timing its frames does not see it.
+    #[must_use]
+    pub const fn copying(&self) -> (Duration, u64) {
+        (self.copying, self.copies)
+    }
+
     /// Read `count` words back from binding `index`.
     ///
     /// # Errors
@@ -717,12 +736,15 @@ impl Resident<'_> {
         let handle = held.handle;
 
         let region = [vk::BufferCopy::default().size(bytes.max(4))];
+        let began = std::time::Instant::now();
         // SAFETY: as in `write`.
         unsafe {
             self.once(|device, command| {
                 device.cmd_copy_buffer(command, handle, self.staging.handle, &region);
             })
         }?;
+        self.copying += began.elapsed();
+        self.copies += 1;
         // SAFETY: the copy above has completed — `once` waits on its fence.
         unsafe { self.mapped(count) }
     }
