@@ -116,6 +116,15 @@ pub struct Resident<'host> {
     tickets: u64,
     /// Whether the staging buffer is in cached host memory.
     cached: bool,
+    /// How long has gone into recording command buffers, and over how many frames.
+    ///
+    /// A frame's passes are recorded afresh on every call — reset, begin, bind, and a dispatch and
+    /// a barrier apiece. The structure does not change between calls; only what the parameters
+    /// buffer holds does. So this is the part of a frame's cost that is repetition, measured rather
+    /// than reasoned about, because a caller's own clock cannot separate it from the submit.
+    recording: Duration,
+    /// How many frames that was over.
+    recorded: u64,
 }
 
 impl Host {
@@ -216,6 +225,8 @@ impl Host {
                 .create_fence(&vk::FenceCreateInfo::default(), None)?;
 
             Ok(Resident {
+                recording: Duration::ZERO,
+                recorded: 0,
                 host: self,
                 direct,
                 buffers,
@@ -977,6 +988,16 @@ impl Resident<'_> {
         self.wait(ticket).map(|spent| spent / times.max(1))
     }
 
+    /// How long has gone into recording command buffers, and over how many frames.
+    ///
+    /// The passes of a frame are recorded afresh on every call. Their structure does not change
+    /// between calls — only the parameters buffer does — so this is the part of a frame's cost that
+    /// is repetition, and a caller's own clock cannot tell it from the submit.
+    #[must_use]
+    pub const fn recording(&self) -> (Duration, u64) {
+        (self.recording, self.recorded)
+    }
+
     /// The recording, `times` frames over.
     fn run_times(
         &mut self,
@@ -993,6 +1014,8 @@ impl Resident<'_> {
         }
 
         let device = self.host.device();
+        let began = std::time::Instant::now();
+        let took;
 
         // SAFETY: nothing is in flight — `start` is the only caller and it refuses while something
         // is — so resetting the command buffer here cannot touch a running submission.
@@ -1128,12 +1151,16 @@ impl Resident<'_> {
             }
 
             device.end_command_buffer(self.command)?;
+            took = began.elapsed();
 
             let commands = [self.command];
             let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
             device.reset_fences(&[self.fence])?;
             device.queue_submit(self.host.queue(), &submit, self.fence)?;
         }
+
+        self.recording += took;
+        self.recorded += 1;
 
         // **Submitted, not landed.** Whoever called this waits on the fence — `run` immediately,
         // `start` whenever its caller asks. Waiting here is what made a frame cost its round trip
