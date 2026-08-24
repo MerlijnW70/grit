@@ -569,14 +569,22 @@ impl Resident<'_> {
     /// # Why this is bounded when it used to wait forever
     ///
     /// A dispatch that never signals its fence parks the calling thread inside the driver, and a
-    /// thread parked there does not come back promptly when the process is told to die. The kill is
-    /// issued and the process is still there afterwards, holding its own image file; it does go
-    /// away eventually, but not before whatever wanted to reuse that file has given up on it.
+    /// thread parked there has no way out: the wait cannot be cancelled and the submission cannot
+    /// be taken back. Bounding it turns a thread with no remaining move into an error a caller can
+    /// act on, which is worth having whether or not anything has hit it yet.
     ///
-    /// That is measured rather than reasoned about — it is how `hyperia`'s mutation gate lost
-    /// twenty-eight sandboxes in a single run over `src/gemv.rs`, each one a mutant that hung here
-    /// and a build that could not relink past it. What is established is that the process outlives
-    /// the gate's patience, not that it can never be killed at all.
+    /// # What this was written for, and did not fix
+    ///
+    /// `hyperia`'s mutation gate lost twenty-eight sandboxes in one run over `src/gemv.rs` to test
+    /// processes that outlived their kill, and an unbounded wait here was the obvious suspect. It
+    /// was the wrong one. With this bound merged the very next run quarantined a sandbox anyway,
+    /// and the mutant caught in the act was `strips = wide / subgroup` turned into `wide *
+    /// subgroup` — a kernel about a thousand times larger, which is slow rather than stuck. Those
+    /// processes escape `taskkill /T` because the `cargo` between them and the killer has already
+    /// exited, which is a fact about process trees and nothing to do with fences.
+    ///
+    /// So: a real bug, fixed, and not the one it was reached for. Kept because an unbounded wait is
+    /// indefensible on its own terms, not because it bought anything back.
     ///
     /// A timeout does not rescue the submission. Nothing can: it stays the device's. What it
     /// rescues is the *thread*, which can now return an error and let the process end.

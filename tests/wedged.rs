@@ -20,10 +20,13 @@
 //! frame with real work in it, that is not a race, and it reaches `await_fence`'s timeout branch by
 //! exactly the return code a hung dispatch reaches it by.
 //!
-//! What that does **not** reach is the thing the bound exists for: a process that outlives the kill
-//! sent to it and holds its image file past the point anything else can use it. Nothing in a test
-//! suite can assert on that, because the failure is the absence of a return. It is asserted on by
-//! the mutation gate next door not losing sandboxes any more.
+//! What that does **not** reach is a fence that never signals at all. Nothing in a test suite can
+//! assert on that, because the failure is the absence of a return — a test that hangs reports
+//! nothing, which is the whole reason the bound exists.
+//!
+//! It is worth saying plainly that no observed failure has needed this yet. It was written for the
+//! sandboxes `hyperia`'s mutation gate was losing, and those turned out to be slow mutants escaping
+//! a process-tree kill rather than anything waiting on a fence. See `Resident::await_fence`.
 //!
 //! # Why this is its own file
 //!

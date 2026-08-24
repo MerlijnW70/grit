@@ -104,11 +104,15 @@ pub enum Error {
     /// later call on it says this again, and both teardowns leak rather than destroy resources a
     /// submission still holds.
     ///
-    /// It exists because the alternative is worse. A fence waited on with no timeout parks the
-    /// calling thread inside the driver, and a thread parked there does not come back promptly when
-    /// the process is told to die: the kill is issued, and the process is still there afterwards
-    /// holding its own image file. It does go away eventually. What it outlives is whatever was
-    /// waiting to reuse that file.
+    /// It exists because a fence waited on with no timeout is a wait with no way out: if the
+    /// submission never signals, the calling thread parks inside the driver and the process has no
+    /// remaining move. Bounding it turns that into an error a caller can act on.
+    ///
+    /// **It was first written for a failure it turned out not to explain.** `hyperia`'s mutation
+    /// gate was losing sandboxes to test processes that outlived their kill, and this looked like
+    /// the cause. It was not: those processes were building kernels a thousand times too large
+    /// after a `/`→`*` mutant, and escaping `taskkill /T` because their intermediate parent had
+    /// already exited. The bound is still right, and it fixed none of that.
     Wedged {
         /// How long the fence was waited on before it was given up on.
         after: Duration,
