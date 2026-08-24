@@ -27,6 +27,8 @@
 //! Presentation is where this would go next if the frame time ever needs it.
 
 use std::ffi::{CStr, c_char};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use ash::vk;
 
@@ -93,6 +95,24 @@ pub enum Error {
         /// How many were wanted.
         wanted: usize,
     },
+    /// A submission did not land inside the patience, so the device is presumed lost.
+    ///
+    /// Vulkan offers no way to cancel a submission or to take a fence back. Work handed to the
+    /// queue is the device's until it finishes, and where it never finishes the command buffer, the
+    /// fence and every buffer bound to them stay the device's for good. So this is not an error a
+    /// caller retries past: the [`Resident`](crate::Resident) that raised it is poisoned, every
+    /// later call on it says this again, and both teardowns leak rather than destroy resources a
+    /// submission still holds.
+    ///
+    /// It exists because the alternative is worse. A fence waited on with no timeout parks the
+    /// calling thread inside the driver, and a thread parked there does not come back promptly when
+    /// the process is told to die: the kill is issued, and the process is still there afterwards
+    /// holding its own image file. It does go away eventually. What it outlives is whatever was
+    /// waiting to reuse that file.
+    Wedged {
+        /// How long the fence was waited on before it was given up on.
+        after: Duration,
+    },
     /// A pass count that does not match the pipelines held.
     WrongPasses {
         /// Workgroup counts given.
@@ -124,6 +144,10 @@ impl std::fmt::Display for Error {
                 write!(out, "{given} workgroup counts for {held} passes")
             }
             Self::StillInFlight => write!(out, "a submission is still in flight"),
+            Self::Wedged { after } => write!(
+                out,
+                "a submission did not land in {after:?}; the device is presumed lost"
+            ),
             Self::WrongOutputs { asked, wanted } => {
                 write!(out, "the frame copied {asked} buffer(s) and {wanted} were wanted")
             }
@@ -155,6 +179,12 @@ pub struct Host {
     name: String,
     width: u32,
     ceiling: u64,
+    /// Whether a submission has been given up on, which nothing ever takes back.
+    ///
+    /// One flag on the host rather than one per `Resident`, because what it guards is the device:
+    /// a queue with work on it that will never finish is not a thing one resident can be poisoned
+    /// about while its neighbours carry on.
+    wedged: AtomicBool,
 }
 
 impl Host {
@@ -348,7 +378,18 @@ impl Host {
             name,
             width,
             ceiling,
+            wedged: AtomicBool::new(false),
         })
+    }
+
+    /// Say that a submission was given up on. Nothing takes this back.
+    pub(crate) fn wedge(&self) {
+        self.wedged.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a submission has been given up on.
+    pub(crate) fn wedged(&self) -> bool {
+        self.wedged.load(Ordering::SeqCst)
     }
 
     /// The device, for the layer that allocates over it.
@@ -386,6 +427,14 @@ impl Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
+        // **A wedged device is leaked on purpose.** `device_wait_idle` waits for every queue to
+        // drain and a wedged one never does, so this is the second place a process would park in
+        // the driver and never come out — and `destroy_device` while work is still outstanding is
+        // undefined behaviour rather than a tidy-up. Leaking an instance the process is about to
+        // drop anyway is the only ending here that is neither a hang nor undefined. `Error::Wedged`.
+        if self.wedged() {
+            return;
+        }
         // SAFETY: every `Resident` borrows the `Host`, so none can be alive here.
         unsafe {
             let _ = self.device.device_wait_idle();

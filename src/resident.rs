@@ -152,6 +152,8 @@ pub struct Resident<'host> {
     pushes: u64,
     /// How many of them went straight into device memory rather than through a submission.
     poked: u64,
+    /// How long a fence is waited on before the device is presumed lost.
+    patience: Duration,
 }
 
 impl Host {
@@ -327,6 +329,7 @@ impl Host {
                 flight: None,
                 tickets: 0,
                 cached,
+                patience: Resident::PATIENCE,
             })
         }
     }
@@ -523,6 +526,81 @@ impl Host {
 }
 
 impl Resident<'_> {
+    /// How long a fence is waited on, by default, before the device is presumed lost.
+    ///
+    /// This is not an estimate of how long work takes. `simdr`'s `decisions/DR-0008` prices a round
+    /// trip at about a hundred microseconds, so ten seconds is five orders of magnitude of
+    /// headroom: it is the point past which work is not coming back, not the point past which it is
+    /// slow. Windows resets a *graphics* device that misses its watchdog in about two seconds; a
+    /// compute queue has no such watchdog, which is the whole reason this number has to exist.
+    pub const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// How long this one waits before giving up on a submission.
+    pub const fn patience(&self) -> Duration {
+        self.patience
+    }
+
+    /// Wait a different length of time before giving up.
+    ///
+    /// For a caller whose submissions are genuinely longer than [`Resident::PATIENCE`] — a batch
+    /// sized so that one frame is seconds of arithmetic rather than milliseconds.
+    pub fn set_patience(&mut self, patience: Duration) {
+        self.patience = patience;
+    }
+
+    /// Refuse to touch the device once a submission has been given up on.
+    ///
+    /// Every entry point that reaches the queue or maps memory asks this first. A wedged device
+    /// still owns the command buffer, the fence and every buffer bound to them, so recording into
+    /// them again is undefined behaviour, and mapping them reads whatever the dispatch that never
+    /// finished is still doing.
+    fn live(&self) -> Result<(), Error> {
+        if self.host.wedged() {
+            return Err(Error::Wedged {
+                after: self.patience,
+            });
+        }
+        Ok(())
+    }
+
+    /// Wait on the fence for at most [`Resident::patience`], and poison the host if it does not
+    /// come back.
+    ///
+    /// # Why this is bounded when it used to wait forever
+    ///
+    /// A dispatch that never signals its fence parks the calling thread inside the driver, and a
+    /// thread parked there does not come back promptly when the process is told to die. The kill is
+    /// issued and the process is still there afterwards, holding its own image file; it does go
+    /// away eventually, but not before whatever wanted to reuse that file has given up on it.
+    ///
+    /// That is measured rather than reasoned about — it is how `hyperia`'s mutation gate lost
+    /// twenty-eight sandboxes in a single run over `src/gemv.rs`, each one a mutant that hung here
+    /// and a build that could not relink past it. What is established is that the process outlives
+    /// the gate's patience, not that it can never be killed at all.
+    ///
+    /// A timeout does not rescue the submission. Nothing can: it stays the device's. What it
+    /// rescues is the *thread*, which can now return an error and let the process end.
+    fn await_fence(&self) -> Result<(), Error> {
+        let patience = u64::try_from(self.patience.as_nanos()).unwrap_or(u64::MAX);
+        // SAFETY: the fence belongs to this resident, and the caller has established that the
+        // submission it belongs to is the one outstanding.
+        let waited = unsafe {
+            self.host
+                .device()
+                .wait_for_fences(&[self.fence], true, patience)
+        };
+        match waited {
+            Ok(()) => Ok(()),
+            Err(vk::Result::TIMEOUT) => {
+                self.host.wedge();
+                Err(Error::Wedged {
+                    after: self.patience,
+                })
+            }
+            Err(code) => Err(code.into()),
+        }
+    }
+
     /// How many buffers this holds.
     #[must_use]
     pub fn bindings(&self) -> usize {
@@ -553,6 +631,7 @@ impl Resident<'_> {
     ///
     /// [`Error::NoSuchBinding`] or [`Error::Overrun`], otherwise whatever Vulkan said.
     pub fn write(&mut self, index: usize, words: &[u32]) -> Result<(), Error> {
+        self.live()?;
         let began = std::time::Instant::now();
         let out = self.written(index, words);
         self.pushing += began.elapsed();
@@ -663,6 +742,7 @@ impl Resident<'_> {
     ///
     /// As [`Resident::write`].
     pub fn write_at(&mut self, index: usize, at: usize, words: &[u32]) -> Result<(), Error> {
+        self.live()?;
         let held = self.at(index)?;
         let bytes = size_of_val(words) as u64;
         let offset = (at * size_of::<u32>()) as u64;
@@ -738,6 +818,7 @@ impl Resident<'_> {
     /// binding nought where the runs together exceed the staging buffer — which is as large as the
     /// largest binding, so the ceiling is one binding's worth a call.
     pub fn write_many(&mut self, runs: &[Run<'_>]) -> Result<(), Error> {
+        self.live()?;
         if runs.is_empty() {
             return Ok(());
         }
@@ -827,6 +908,7 @@ impl Resident<'_> {
     ///
     /// As [`Resident::write`].
     pub fn read(&mut self, index: usize, count: usize) -> Result<Vec<u32>, Error> {
+        self.live()?;
         let held = self.at(index)?;
         let bytes = (count * size_of::<u32>()) as u64;
         if bytes > held.bytes {
@@ -1104,6 +1186,11 @@ impl Resident<'_> {
         out: &[(usize, usize)],
         times: u32,
     ) -> Result<Ticket, Error> {
+        // **Ahead of the in-flight check, not behind it.** A wedged resident has a submission that
+        // never landed, so `flight` is still `Some` and this would otherwise answer `StillInFlight`
+        // — true in its way, and the wrong thing to tell a caller whose device is gone. A poisoned
+        // device says so before it says anything else.
+        self.live()?;
         if self.flight.is_some() {
             return Err(Error::StillInFlight);
         }
@@ -1142,6 +1229,7 @@ impl Resident<'_> {
     /// The duration is from the submit and not from here, so it is the round trip whether the
     /// caller waited immediately or went away and did something first.
     fn land(&mut self, ticket: Ticket) -> Result<(Duration, Vec<usize>), Error> {
+        self.live()?;
         // Read out of the flight rather than moved out of it: a mismatched ticket leaves the real
         // submission outstanding, and taking it here would forget a frame that is still running.
         let (began, out) = {
@@ -1160,13 +1248,9 @@ impl Resident<'_> {
             (held.began, held.out.clone())
         };
 
-        // SAFETY: the fence belongs to the submission this is waiting for, and nothing resets the
-        // command buffer until `flight` is cleared below.
-        unsafe {
-            self.host
-                .device()
-                .wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
+        // **`flight` is cleared only on the way out.** Where the fence does not come back the
+        // submission really is still outstanding, so leaving it recorded is the true statement.
+        self.await_fence()?;
         self.flight = None;
         Ok((began.elapsed(), out))
     }
@@ -1214,6 +1298,7 @@ impl Resident<'_> {
         out: &[(vk::Buffer, u64)],
         times: u32,
     ) -> Result<(), Error> {
+        self.live()?;
         let given: usize = stages.iter().map(|one| one.len()).sum();
         if given != self.pipelines.len() {
             return Err(Error::WrongPasses {
@@ -1394,6 +1479,7 @@ impl Resident<'_> {
         // while a frame is in flight. A *direct* write does not come through here at all — it is a
         // copy into mapped device memory with nothing submitted — which is why a caller with
         // resizable BAR may upload during a frame and a caller without it may not.
+        self.live()?;
         if self.flight.is_some() {
             return Err(Error::StillInFlight);
         }
@@ -1411,9 +1497,8 @@ impl Resident<'_> {
             let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
             device.reset_fences(&[self.fence])?;
             device.queue_submit(self.host.queue(), &submit, self.fence)?;
-            device.wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
-        Ok(())
+        self.await_fence()
     }
 
     /// The staging buffer's first `count` words.
@@ -1454,6 +1539,14 @@ impl Resident<'_> {
 
 impl Drop for Resident<'_> {
     fn drop(&mut self) {
+        // **A wedged device is leaked on purpose.** Every handle below is still the device's: a
+        // submission that never landed still owns its command buffer, its fence and every buffer
+        // bound to them, and destroying those is undefined behaviour rather than a tidy-up.
+        // `device_wait_idle` would not get past it either — it waits for a queue that never
+        // drains. So this hands the memory to the operating system and returns. `Error::Wedged`.
+        if self.host.wedged() {
+            return;
+        }
         let device = self.host.device();
         // SAFETY: every frame waits on its fence before returning, so nothing is in flight.
         unsafe {

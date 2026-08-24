@@ -1,0 +1,228 @@
+//! What happens when a submission does not come back.
+//!
+//! # Why the patience is the seam, and there is no test-only door
+//!
+//! Poisoning needs a fence that does not signal, and the honest way to get one is a dispatch that
+//! hangs — which is a thing no test can ask a device for on purpose and then recover from. The
+//! alternative usually reached for is a hidden method that sets the flag directly, and it tests the
+//! wrong thing: it proves the *guards* work while stepping over the code that decides to raise
+//! them.
+//!
+//! [`Resident::set_patience`] is already public and does the whole job — but the bound has to be
+//! **zero**, and the first version of this file used a nanosecond and was wrong about why that was
+//! safe. A Vulkan timeout is a floor and not a ceiling: the implementation may wait longer, and on
+//! Windows the timer granularity is about a millisecond. So a nanosecond bound let a 253 µs frame
+//! land and the wait came back `Ok`. Two of these four tests failed the first time they were run,
+//! and that is what they were saying.
+//!
+//! Zero is the one value the specification pins down — it does not wait at all, and reports
+//! `VK_TIMEOUT` if the fence is not already signalled. Asked immediately after `queue_submit` on a
+//! frame with real work in it, that is not a race, and it reaches `await_fence`'s timeout branch by
+//! exactly the return code a hung dispatch reaches it by.
+//!
+//! What that does **not** reach is the thing the bound exists for: a process that outlives the kill
+//! sent to it and holds its image file past the point anything else can use it. Nothing in a test
+//! suite can assert on that, because the failure is the absence of a return. It is asserted on by
+//! the mutation gate next door not losing sandboxes any more.
+//!
+//! # Why this is its own file
+//!
+//! Every test here ends with a device nobody destroys — that is what `Error::Wedged` promises and
+//! `tests/waiting.rs` already establishes one test to a binary as this crate's answer to tests
+//! sharing a process. Each opens its own [`Host`], so a poisoned one is contained to the test that
+//! poisoned it.
+
+// A test may panic — that is how it reports.
+#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+
+use std::time::Duration;
+
+use grit::{Error, Groups, Host};
+use simdr::kernel::{Kernel, Shape};
+use simdr::lanes::{LaneError, U32};
+
+/// How many words the kernel below walks.
+///
+/// Small on purpose. The frame here is not being measured, only made to exist, and a frame that is
+/// over quickly is a frame whose leaked buffers are small.
+const WORDS: usize = 1 << 16;
+
+/// How many words each invocation adds up.
+const PER_LANE: u32 = 4;
+
+/// The bound the tests set when they want the wait to give up.
+///
+/// Zero rather than some small number: a bound under the platform's timer granularity is a bound
+/// the driver is free to overshoot, and it did. See the note at the top of this file for the run
+/// that established it.
+const IMPATIENT: Duration = Duration::ZERO;
+
+/// A kernel that sums a run of binding 0 into binding 1, so a frame has real work in it.
+fn walk(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 2))?;
+    let uint = kernel.index_type();
+
+    let block = kernel.workgroup_index();
+    let lane = kernel.local_index();
+    let wide = kernel.module().constant_u32(subgroup)?;
+    let run = kernel.module().constant_u32(PER_LANE)?;
+
+    let first = kernel.module().i_mul(uint, block, wide)?;
+    let first = kernel.module().i_add(uint, first, lane)?;
+    let first = kernel.module().i_mul(uint, first, run)?;
+
+    let mut running = kernel.load_at(0, first)?;
+    for step in 1..PER_LANE {
+        let along = kernel.module().constant_u32(step)?;
+        let at = kernel.module().i_add(uint, first, along)?;
+        let value = kernel.load_at(0, at)?;
+        running = kernel.module().i_add(uint, running, value)?;
+    }
+
+    let zero = kernel.module().constant_u32(0)?;
+    let _ = kernel.atomic_add_at(1, zero, running)?;
+    kernel.finish()
+}
+
+/// Open a device, or say why not and hand back nothing.
+fn device(label: &str) -> Option<Host> {
+    match Host::open() {
+        Ok(Some(host)) => Some(host),
+        Ok(None) => {
+            eprintln!("SKIPPED {label}: no Vulkan device");
+            None
+        }
+        Err(why) => {
+            eprintln!("SKIPPED {label}: {why}");
+            None
+        }
+    }
+}
+
+/// How many workgroups cover [`WORDS`] at this subgroup width.
+fn over(width: u32) -> u32 {
+    u32::try_from(WORDS / (width as usize * PER_LANE as usize)).unwrap_or(1)
+}
+
+#[test]
+fn a_fence_that_does_not_come_back_in_time_presumes_the_device_lost() {
+    let Some(host) = device("a_fence_that_does_not_come_back_in_time_presumes_the_device_lost")
+    else {
+        return;
+    };
+    let module = walk(host.width()).expect("a kernel");
+    let every: Vec<&[u32]> = vec![&module];
+    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
+    held.write(0, &vec![1; WORDS]).expect("a fill");
+
+    // The default is what a caller gets and it is not what is being tested here.
+    assert_eq!(
+        held.patience(),
+        Duration::from_secs(10),
+        "the default patience is ten seconds"
+    );
+
+    held.set_patience(IMPATIENT);
+    let groups = [Groups::Fixed(over(host.width()))];
+
+    // **The bound is reported, not the wait.** A caller who set a nanosecond is told a nanosecond,
+    // so the error says which bound was crossed rather than how long the driver actually took.
+    match held.frame(&groups) {
+        Err(Error::Wedged { after }) => assert_eq!(after, IMPATIENT, "the bound that was crossed"),
+        other => panic!("expected the device to be presumed lost, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_wedged_device_refuses_everything_afterwards() {
+    let Some(host) = device("a_wedged_device_refuses_everything_afterwards") else {
+        return;
+    };
+    let module = walk(host.width()).expect("a kernel");
+    let every: Vec<&[u32]> = vec![&module];
+    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
+    held.write(0, &vec![1; WORDS]).expect("a fill");
+
+    held.set_patience(IMPATIENT);
+    let groups = [Groups::Fixed(over(host.width()))];
+    assert!(
+        matches!(held.frame(&groups), Err(Error::Wedged { .. })),
+        "the frame is what poisons it"
+    );
+
+    // **Every door, not the one that was walked through.** The submission still owns the command
+    // buffer and every buffer bound to it, so a later call must not record into them, map them or
+    // wait on them — and the patience is spent once, not again on each of these.
+    assert!(
+        matches!(held.frame(&groups), Err(Error::Wedged { .. })),
+        "a second frame"
+    );
+    assert!(
+        matches!(held.write(0, &[7]), Err(Error::Wedged { .. })),
+        "a write"
+    );
+    assert!(
+        matches!(held.write_at(0, 1, &[7]), Err(Error::Wedged { .. })),
+        "a write at an offset"
+    );
+    assert!(
+        matches!(held.read(1, 1), Err(Error::Wedged { .. })),
+        "a read, which stages and waits"
+    );
+    assert!(
+        matches!(held.submit(&[&groups]), Err(Error::Wedged { .. })),
+        "a submission that would be waited for later"
+    );
+}
+
+#[test]
+fn a_wedged_device_is_dropped_rather_than_waited_for() {
+    // The reason the bound exists at all, as near as a test can get to it. `device_wait_idle` on a
+    // queue that never drains is the second place a process parks in the driver for good, and both
+    // teardowns are supposed to step over it. If they do not, this test does not fail — it hangs,
+    // which is the symptom being removed.
+    let Some(host) = device("a_wedged_device_is_dropped_rather_than_waited_for") else {
+        return;
+    };
+    let module = walk(host.width()).expect("a kernel");
+    let every: Vec<&[u32]> = vec![&module];
+    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
+    held.write(0, &vec![1; WORDS]).expect("a fill");
+
+    held.set_patience(IMPATIENT);
+    let groups = [Groups::Fixed(over(host.width()))];
+    assert!(
+        matches!(held.frame(&groups), Err(Error::Wedged { .. })),
+        "poisoned"
+    );
+
+    drop(held);
+    drop(host);
+
+    // There is no assertion after this on purpose: returning *is* the assertion, and the failure
+    // this guards against cannot be caught by one — a teardown that waits on a wedged queue never
+    // reaches a line that could fail.
+}
+
+#[test]
+fn the_bound_does_not_get_in_the_way_of_ordinary_work() {
+    // The other half, and the one that would catch a bound set too low: at the default patience a
+    // frame lands and answers, exactly as it did when the wait had no bound at all.
+    let Some(host) = device("the_bound_does_not_get_in_the_way_of_ordinary_work") else {
+        return;
+    };
+    let module = walk(host.width()).expect("a kernel");
+    let every: Vec<&[u32]> = vec![&module];
+    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
+    held.write(0, &vec![1; WORDS]).expect("a fill");
+
+    let groups = [Groups::Fixed(over(host.width()))];
+    held.frame(&groups).expect("a frame at the default patience");
+
+    let summed = held.read(1, 1).expect("the answer");
+    assert_eq!(
+        summed.first().copied(),
+        Some(WORDS as u32),
+        "every word was one and every one of them was added"
+    );
+}
