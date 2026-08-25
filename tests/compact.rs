@@ -20,7 +20,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::Host;
-use grit::compact::{self, Plan};
+use grit::compact::{self, Over, Plan, Tier};
 use grit::sweep;
 
 /// Blocks in the check. Enough that there is more than one tile at every width here.
@@ -66,8 +66,8 @@ fn the_work_list_is_every_awake_cell_once_and_in_block_order() {
         sweep::sweep(width).expect("sweep"),
         compact::scan(width, sweep::COUNTS, compact::BASES, compact::TOTALS).expect("counts"),
         compact::scan(width, compact::TOTALS, compact::TOTALS, compact::GRAND).expect("totals"),
-        compact::gather(width).expect("gather"),
-        compact::prepare(width, sweep::cells(width)).expect("prepare"),
+        compact::gather(width, Tier::FINE, Over::Every, plan.dump()).expect("gather"),
+        compact::prepare(width, sweep::cells(width), Tier::FINE).expect("prepare"),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let words: usize = passes.iter().map(Vec::len).sum();

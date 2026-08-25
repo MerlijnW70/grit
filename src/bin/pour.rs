@@ -1,19 +1,24 @@
 //! `cargo run --release --bin pour` — sixteen million cells of sand, seen through a window.
 //!
-//! # Eleven passes, one submission, and six words from the host
+//! # Seventeen passes, one submission, and six words from the host
 //!
 //! ```text
 //!   tick     1              the frame number, and the partition's phase
-//!   decay    every quad     every wake counter, one closer to nothing
-//!   wipe     1              the tile totals, back to nothing
+//!   decay    the hot list   every wake counter, one closer to nothing
+//!   wipe     1              both tile totals and the tally, back to nothing
+//!   wipe     tiles          every block's count, back to nothing
 //!   brush    a box          what the pointer holds, and the quads it touched
 //!   settle   the work list  one Margolus step over what the last frame woke
-//!   mark     every quad     the counters, scanned into buckets and counts
+//!   hot ×5   tiles          which blocks hold anything, compacted into a list
+//!   mark     the hot list   the counters, scanned into buckets and counts
 //!   scan ×2                 the blocks against each other
-//!   gather   every block    the buckets into one contiguous list
+//!   gather   the hot list   the buckets into one contiguous list
 //!   prepare  1              how many workgroups the *next* settle runs
 //!   paint    the window     the visible cells, as colours
 //! ```
+//!
+//! **Nothing in that list is the size of the world.** `live::wired` says why the five coarse passes
+//! sit where they do, which is a correctness matter rather than a preference.
 //!
 //! The only thing crossing to the device per frame is six words: where the pointer is, how wide and
 //! what of, and which corner of the world the window is at. **The size of the settle never crosses
@@ -53,11 +58,8 @@
 
 use std::time::{Duration, Instant};
 
-use grit::compact::{self, Plan};
-use grit::layout::{
-    AWAKE, BINDINGS, BRUSH, COARSE, DENSE, GRAND, HOT, INDIRECT, LOOKING, PARAMS, PIXELS, STATE,
-    TALLY, TALLY_WORDS,
-};
+use grit::compact::Plan;
+use grit::layout::{BRUSH, COARSE, GRAND, LOOKING, PARAMS, PIXELS, STATE, TALLY, TALLY_WORDS};
 use grit::sand::{self, AIR, Grid, SAND, View, WALL, WATER};
 use grit::sweep;
 use grit::{Groups, Host};
@@ -95,38 +97,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         view.deep
     );
 
-    let passes = [
-        counter(width)?,
-        grit::live::decay(width)?,
-        grit::live::wipe(width)?,
-        sand::brush(width, grid, true)?,
-        grit::live::settle(width, grid)?,
-        grit::live::mark(width)?,
-        compact::scan(width, sweep::COUNTS, compact::BASES, compact::TOTALS)?,
-        compact::scan(width, compact::TOTALS, compact::TOTALS, compact::GRAND)?,
-        compact::gather(width)?,
-        compact::prepare(width, width)?,
-        sand::paint(width, grid, view)?,
-    ];
+    // The loop, in the order `live::wired` insists on — and the picture on the end, because how
+    // much of the world is being looked at is this program's business and not the loop's.
+    let (mut passes, mut groups) = grit::live::wired(width, grid, &plan)?;
+    passes.push(sand::paint(width, grid, view)?);
+    groups.push(Groups::Fixed(
+        u32::try_from(view.pixels())
+            .unwrap_or(u32::MAX)
+            .div_ceil(width),
+    ));
     let words: usize = passes.iter().map(Vec::len).sum();
-
-    let over_quads = plan.blocks;
-    let over_view = u32::try_from(view.pixels())
-        .unwrap_or(u32::MAX)
-        .div_ceil(width);
-    let groups = [
-        Groups::Fixed(1),
-        Groups::Fixed(over_quads),
-        Groups::Fixed(1),
-        Groups::Fixed(sand::BOX * sand::BOX / width),
-        Plan::listed(),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(plan.tiles),
-        Groups::Fixed(1),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(1),
-        Groups::Fixed(over_view),
-    ];
 
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.showing(view);
@@ -150,14 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // whatever a discarded write was avoiding.
     resident.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
 
-    // **Seeded, because the first frame has been told nothing.** Every quad awake and the list the
-    // identity, which is what "look at everything" means before anything has said otherwise.
-    resident.write(AWAKE as usize, &vec![2_u32; quads as usize])?;
-    resident.write(DENSE as usize, &(0..quads).collect::<Vec<u32>>())?;
-    resident.write(GRAND as usize, &[quads])?;
-    resident.write(INDIRECT as usize, &[quads.div_ceil(width), 1, 1])?;
-    // The coarse flags with them: every block hot, because every quad is awake.
-    resident.write(HOT as usize, &vec![2_u32; plan.blocks as usize])?;
+    // **Seeded, because the first frame has been told nothing.** Every quad awake, every block hot,
+    // and both lists the identity — which is what "look at everything" means before anything has
+    // said otherwise.
+    grit::live::seed(&mut resident, grid, &plan)?;
 
     let mut window = minifb::Window::new(
         "grit — left button pours sand, right pours water, WASD flies, F follows",
@@ -360,20 +336,4 @@ fn room(grid: Grid) -> Vec<u32> {
         }
     }
     cells
-}
-
-/// One word, incremented on the device.
-fn counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
-    use simdr::kernel::{Kernel, Shape};
-    use simdr::lanes::U32;
-
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
-    let slot = kernel.module().constant_u32(0)?;
-    let one = kernel.module().constant_u32(1)?;
-    let element = kernel.element();
-
-    let now = kernel.load_at(PARAMS, slot)?;
-    let next = kernel.module().i_add(element, now, one)?;
-    kernel.store_at(PARAMS, slot, next)?;
-    kernel.finish()
 }

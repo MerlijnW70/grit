@@ -26,13 +26,11 @@
 // A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::compact::{self, Plan};
-use grit::layout::{
-    AWAKE, BINDINGS, BRUSH, COARSE, DENSE, GRAND, HOT, INDIRECT, PARAMS, STATE, TALLY, TALLY_WORDS,
-};
-use grit::sand::{self, AIR, Grid, SAND, WALL, WATER, material_of};
+use grit::compact::Plan;
+use grit::layout::{BRUSH, COARSE, DENSE, GRAND, PARAMS, STATE, TALLY, TALLY_WORDS};
+use grit::sand::{AIR, Grid, SAND, WALL, WATER, material_of};
 use grit::sweep;
-use grit::{Groups, Host};
+use grit::Host;
 
 /// The world under test.
 const WIDE: u32 = 512;
@@ -109,30 +107,7 @@ fn the_reduction_says_what_a_count_by_hand_says() {
         grid.deep
     );
 
-    let passes = [
-        counter(width).expect("counter"),
-        grit::live::decay(width).expect("decay"),
-        grit::live::wipe(width).expect("wipe"),
-        sand::brush(width, grid, true).expect("brush"),
-        grit::live::settle(width, grid).expect("settle"),
-        grit::live::mark(width).expect("mark"),
-        compact::scan(width, sweep::COUNTS, compact::BASES, compact::TOTALS).expect("counts"),
-        compact::scan(width, compact::TOTALS, compact::TOTALS, compact::GRAND).expect("totals"),
-        compact::gather(width).expect("gather"),
-        compact::prepare(width, width).expect("prepare"),
-    ];
-    let groups = [
-        Groups::Fixed(1),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(1),
-        Groups::Fixed(sand::BOX * sand::BOX / width),
-        Plan::listed(),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(plan.tiles),
-        Groups::Fixed(1),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(1),
-    ];
+    let (passes, groups) = grit::live::wired(width, grid, &plan).expect("wired");
 
     let sizes = plan.sizes();
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
@@ -143,15 +118,7 @@ fn the_reduction_says_what_a_count_by_hand_says() {
     live.write(STATE as usize, &room(grid)).expect("state");
     live.write(PARAMS as usize, &[u32::MAX, plan.dump()])
         .expect("params");
-    live.write(AWAKE as usize, &vec![2_u32; quads as usize])
-        .expect("awake");
-    live.write(DENSE as usize, &(0..quads).collect::<Vec<u32>>())
-        .expect("dense");
-    live.write(GRAND as usize, &[quads]).expect("grand");
-    live.write(INDIRECT as usize, &[quads.div_ceil(width), 1, 1])
-        .expect("indirect");
-    live.write(HOT as usize, &vec![2_u32; plan.blocks as usize])
-        .expect("hot");
+    grit::live::seed(&mut live, grid, &plan).expect("seeded");
 
     let mut busiest = 0_u32;
     let mut ever_moved = 0_u64;
@@ -245,20 +212,4 @@ fn the_reduction_says_what_a_count_by_hand_says() {
         busiest > 0,
         "nothing ever moved, so the agreement is between two zeroes"
     );
-}
-
-/// One word, incremented on the device.
-fn counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
-    use simdr::kernel::{Kernel, Shape};
-    use simdr::lanes::U32;
-
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
-    let slot = kernel.module().constant_u32(0)?;
-    let one = kernel.module().constant_u32(1)?;
-    let element = kernel.element();
-
-    let now = kernel.load_at(PARAMS, slot)?;
-    let next = kernel.module().i_add(element, now, one)?;
-    kernel.store_at(PARAMS, slot, next)?;
-    kernel.finish()
 }

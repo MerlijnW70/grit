@@ -18,8 +18,8 @@
 // A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::compact::{self, Plan};
-use grit::layout::{AWAKE, BINDINGS, BRUSH, DENSE, GRAND, HOT, INDIRECT, PARAMS, PIXELS, STATE};
+use grit::compact::Plan;
+use grit::layout::{AWAKE, BINDINGS, BRUSH, DENSE, GRAND, PARAMS, PIXELS, STATE};
 use grit::sand::{self, AIR, Grid, SAND, WALL};
 use grit::sweep;
 use grit::{Groups, Host, Resident};
@@ -94,37 +94,13 @@ fn the_list_is_shorter_and_never_different() {
         plan.blocks
     );
 
-    // The wired loop.
-    let wired = [
-        counter(width).expect("counter"),
-        grit::live::decay(width).expect("decay"),
-        grit::live::wipe(width).expect("wipe"),
-        sand::brush(width, grid, true).expect("brush"),
-        grit::live::settle(width, grid).expect("settle"),
-        grit::live::mark(width).expect("mark"),
-        compact::scan(width, sweep::COUNTS, compact::BASES, compact::TOTALS).expect("counts"),
-        compact::scan(width, compact::TOTALS, compact::TOTALS, compact::GRAND).expect("totals"),
-        compact::gather(width).expect("gather"),
-        compact::prepare(width, width).expect("prepare"),
-    ];
-    let over_quads = plan.blocks;
+    // The wired loop — both hierarchies, in the order `live::wired` insists on.
+    let (wired, wired_groups) = grit::live::wired(width, grid, &plan).expect("wired");
     let over_box = sand::BOX * sand::BOX / width;
-    let wired_groups = [
-        Groups::Fixed(1),
-        Groups::Fixed(over_quads),
-        Groups::Fixed(1),
-        Groups::Fixed(over_box),
-        Plan::listed(),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(plan.tiles),
-        Groups::Fixed(1),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(1),
-    ];
 
     // The whole grid, which knows nothing about waking.
     let whole = [
-        counter(width).expect("counter"),
+        grit::live::tick(width).expect("tick"),
         sand::brush(width, grid, false).expect("brush"),
         sand::settle(width, grid).expect("settle"),
     ];
@@ -152,17 +128,10 @@ fn the_list_is_shorter_and_never_different() {
             .expect("params");
     }
 
-    // **Seeded, because the first frame has been told nothing.** Every quad is awake and the list is
-    // the identity — which is what "look at everything" means when nothing has said otherwise yet.
-    let everything: Vec<u32> = (0..quads).collect();
-    live.write(AWAKE as usize, &vec![1_u32; quads as usize])
-        .expect("awake");
-    live.write(DENSE as usize, &everything).expect("dense");
-    live.write(GRAND as usize, &[quads]).expect("grand");
-    live.write(INDIRECT as usize, &[quads.div_ceil(width), 1, 1])
-        .expect("indirect");
-    live.write(HOT as usize, &vec![2_u32; plan.blocks as usize])
-        .expect("hot");
+    // **Seeded, because the first frame has been told nothing.** Every quad awake, every block hot,
+    // and both lists the identity — which is what "look at everything" means when nothing has said
+    // otherwise yet.
+    grit::live::seed(&mut live, grid, &plan).expect("seeded");
 
     let mut listed_total = 0_u64;
     let mut smallest = u32::MAX;
@@ -253,22 +222,6 @@ fn clear_all(held: &mut Resident<'_>, sizes: &[usize; BINDINGS as usize]) {
         }
         held.write(binding, &vec![0_u32; words]).expect("cleared");
     }
-}
-
-/// One word, incremented on the device — the phase both runs step in.
-fn counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
-    use simdr::kernel::{Kernel, Shape};
-    use simdr::lanes::U32;
-
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
-    let slot = kernel.module().constant_u32(0)?;
-    let one = kernel.module().constant_u32(1)?;
-    let element = kernel.element();
-
-    let now = kernel.load_at(PARAMS, slot)?;
-    let next = kernel.module().i_add(element, now, one)?;
-    kernel.store_at(PARAMS, slot, next)?;
-    kernel.finish()
 }
 
 /// What the device says it has, against what it says it will allocate at once.

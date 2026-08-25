@@ -4,15 +4,18 @@
 //! predicate that had nothing to do with it. This is the loop that makes them one.
 //!
 //! ```text
-//!   decay    every quad     every wake counter, one closer to nothing
+//!   decay    the hot list   every wake counter, one closer to nothing
 //!   brush    a small box    what the pointer holds, and the quads it touched, woken
 //!   settle   the work list  one Margolus step over what moved last frame
-//!   mark     every quad     the flags, scanned into buckets and counts
+//!   hot ×5   tiles          which blocks hold anything, compacted into a list
+//!   mark     the hot list   the flags, scanned into buckets and counts
 //!   scan ×2                 the blocks against each other
-//!   gather   every block    the buckets, into one contiguous work list
+//!   gather   the hot list   the buckets, into one contiguous work list
 //!   prepare  1              how many workgroups the *next* settle runs
 //!   paint    every pixel    the cells the window is over, as colours
 //! ```
+//!
+//! [`wired`] is that table as code, and the one place the order is decided.
 //!
 //! # Waking, and why nine writes race with nothing
 //!
@@ -46,22 +49,165 @@
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 
+use crate::compact::{Over, Tier, owned};
 use crate::layout::{AWAKE, BINDINGS, DENSE, GRAND, HOT, PARAMS, STATE};
 use crate::sand::{self, Grid};
 
-/// Run `body` only in the workgroups whose block has something awake in it.
+/// The frame number, one higher, on the device.
 ///
-/// [`crate::gate`] carries the argument; this is the one line of it that names [`HOT`].
-fn if_hot<const LANES: u32, F>(
-    kernel: &mut Kernel<U32>,
-    block: simdr::module::Id,
-    body: F,
-) -> Result<(), LaneError>
-where
-    F: FnOnce(&mut Kernel<U32>) -> Result<(), LaneError>,
-{
-    let held = kernel.load_at(HOT, block)?;
-    crate::gate::if_any::<LANES, _>(kernel, held, body)
+/// The one word the host never writes after the first frame — the partition's phase is its low bit,
+/// so a host that incremented it would be deciding the phase, and that is the device's business.
+///
+/// Every invocation of the single workgroup writes the same word, which is the case
+/// `Kernel::store_at` documents as safe.
+///
+/// # Errors
+///
+/// As [`settle`].
+pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let slot = kernel.module().constant_u32(0)?;
+    let one = kernel.module().constant_u32(1)?;
+    let element = kernel.element();
+
+    let now = kernel.load_at(PARAMS, slot)?;
+    let next = kernel.module().i_add(element, now, one)?;
+    kernel.store_at(PARAMS, slot, next)?;
+    kernel.finish()
+}
+
+/// Every pass of the loop, and how many workgroups each runs, in the order they have to run in.
+///
+/// # Why this is a function and not a list in four callers
+///
+/// Because one of the orderings is a correctness property that a flat list does not show. The
+/// coarse hierarchy — the five passes that compact [`HOT`] into a list of the blocks with something
+/// in them — has to sit **after the settle and before the mark**:
+///
+/// * after, because `brush` and `settle` are what write [`HOT`], and a list built before them would
+///   miss every block woken this frame. Those blocks' quads would never reach the work list, and a
+///   grain would stop where the whole-grid run keeps falling — which is the failure `tests/live.rs`
+///   exists to catch;
+/// * before, because `mark` and `gather` are dispatched over that list and want this frame's.
+///
+/// [`decay`] reads the same list one frame later, which is sound for the reason that function
+/// gives: nothing writes [`HOT`] between the list being built and the next frame's decay.
+///
+/// Getting that wrong in one of four wirings and right in the other three is exactly the bug this
+/// repository writes tests against, so there is one wiring.
+///
+/// ```text
+///    0  tick             1            the frame number, and the partition's phase
+///    1  decay            hot list     every wake counter, one closer to nothing
+///    2  wipe             1            both tile totals and the tally, back to nothing
+///    3  wipe_counts      tiles        every block's count, back to nothing
+///    4  brush            a box        what the pointer holds, and the quads it touched
+///    5  settle           work list    one Margolus step over what the last frame woke
+///    6  hot_mark         tiles      ┐
+///    7  hot_scan_counts  hot_tiles  │ the coarse hierarchy: which blocks have
+///    8  hot_scan_totals  1          │ anything in them, compacted into a list
+///    9  hot_gather       tiles      │
+///   10  hot_prepare      1          ┘ and how many workgroups that list is worth
+///   11  mark             hot list     the counters, scanned into buckets and counts
+///   12  scan_counts      tiles        the blocks against each other
+///   13  scan_totals      1
+///   14  gather           hot list     the buckets into one contiguous list
+///   15  prepare          1            how many workgroups the *next* settle runs
+/// ```
+///
+/// The picture is not here: a caller that wants one appends [`sand::paint`], because how much of
+/// the world is being looked at is not the loop's business. `src/bin/scale.rs` appends nothing.
+///
+/// # Errors
+///
+/// As [`settle`], for whichever pass could not be built.
+pub fn wired(
+    subgroup: u32,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+) -> Result<(Vec<Vec<u32>>, Vec<crate::Groups>), LaneError> {
+    use crate::Groups;
+    use crate::layout::{HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_TOTALS};
+    use crate::sweep::COUNTS;
+
+    let listed = Over::Listed(HOT_DENSE);
+    let passes = vec![
+        tick(subgroup)?,
+        decay(subgroup, listed)?,
+        wipe(subgroup)?,
+        wipe_counts(subgroup, COUNTS)?,
+        sand::brush(subgroup, grid, true)?,
+        settle(subgroup, grid)?,
+        mark(subgroup, Tier::COARSE, Over::Every)?,
+        crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
+        crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
+        crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
+        // **Divided by one**, because this list is dispatched a workgroup an entry rather than a
+        // workgroup a subgroup's worth. Dividing by the wrong one is a pass that silently covers
+        // part of the list.
+        crate::compact::prepare(subgroup, 1, Tier::COARSE)?,
+        mark(subgroup, Tier::FINE, listed)?,
+        crate::compact::scan(subgroup, COUNTS, crate::layout::BASES, crate::layout::TOTALS)?,
+        crate::compact::scan(
+            subgroup,
+            crate::layout::TOTALS,
+            crate::layout::TOTALS,
+            crate::layout::GRAND,
+        )?,
+        crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
+        crate::compact::prepare(subgroup, subgroup, Tier::FINE)?,
+    ];
+
+    let hot = crate::compact::Plan::hot_listed();
+    let groups = vec![
+        Groups::Fixed(1),
+        hot,
+        Groups::Fixed(1),
+        Groups::Fixed(plan.tiles),
+        Groups::Fixed(sand::BOX * sand::BOX / subgroup),
+        crate::compact::Plan::listed(),
+        Groups::Fixed(plan.tiles),
+        Groups::Fixed(plan.hot_tiles),
+        Groups::Fixed(1),
+        Groups::Fixed(plan.tiles),
+        Groups::Fixed(1),
+        hot,
+        Groups::Fixed(plan.tiles),
+        Groups::Fixed(1),
+        hot,
+        Groups::Fixed(1),
+    ];
+
+    Ok((passes, groups))
+}
+
+/// Seed every buffer the loop reads before it has written it, for the first frame.
+///
+/// **The first frame has been told nothing**, so "look at everything" has to be said out loud: every
+/// quad awake, every block hot, and both lists the identity. Without the coarse half of this the
+/// first `decay` is dispatched over a list of nothing, no block is ever marked, and the world sits
+/// perfectly still — which looks exactly like a simulation that does not work.
+///
+/// # Errors
+///
+/// As [`crate::Resident::write`].
+pub fn seed(
+    held: &mut crate::Resident<'_>,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+) -> Result<(), crate::Error> {
+    use crate::layout::{HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT};
+
+    let quads = grid.quads();
+    held.write(AWAKE as usize, &vec![2_u32; quads as usize])?;
+    held.write(DENSE as usize, &(0..quads).collect::<Vec<u32>>())?;
+    held.write(GRAND as usize, &[quads])?;
+    held.write(INDIRECT as usize, &[quads.div_ceil(plan.subgroup), 1, 1])?;
+
+    held.write(HOT as usize, &vec![2_u32; plan.blocks as usize])?;
+    held.write(HOT_DENSE as usize, &(0..plan.blocks).collect::<Vec<u32>>())?;
+    held.write(HOT_GRAND as usize, &[plan.blocks])?;
+    held.write(HOT_INDIRECT as usize, &[plan.blocks, 1, 1])
 }
 
 /// Every wake counter, one closer to nothing.
@@ -86,16 +232,27 @@ where
 /// One invocation a quad, its own slot, so nothing races. The dump past the counters is left alone —
 /// nothing reads it, so nothing has to clear it.
 ///
+/// # Why the list this runs over is the *previous* frame's
+///
+/// [`Over::Listed`] hands this a list of the blocks with something in them, and it is built after
+/// the settle — which is after this pass has already run. That is not a mistake and not a
+/// compromise: between the moment the list is built and the moment this reads it, the only thing
+/// that runs is the frame counter. **Nothing writes [`HOT`] in between**, so a list one frame old
+/// is the current set exactly.
+///
+/// A block that is not in it holds nought, and `max(0, 1) − 1` is nought, so the pass that was
+/// skipped was the pass that would have changed nothing.
+///
 /// # Errors
 ///
 /// As [`sand::settle`].
-pub fn decay(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+pub fn decay(subgroup: u32, over: Over) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => decayed::<4>(subgroup),
-        8 => decayed::<8>(subgroup),
-        16 => decayed::<16>(subgroup),
-        32 => decayed::<32>(subgroup),
-        64 => decayed::<64>(subgroup),
+        4 => decayed::<4>(subgroup, over),
+        8 => decayed::<8>(subgroup, over),
+        16 => decayed::<16>(subgroup, over),
+        32 => decayed::<32>(subgroup, over),
+        64 => decayed::<64>(subgroup, over),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -104,15 +261,16 @@ pub fn decay(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 }
 
 /// The decay, at a width the caller has matched to the device.
-fn decayed<const LANES: u32>(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
 
-    // **A workgroup a block, not a lane a quad**, so the coarse flag has something to gate. The
-    // block is the same one `mark` sweeps, which is what keeps the two in step.
-    let block = kernel.workgroup_index();
+    // **A workgroup a block, not a lane a quad**, and which block comes from the hot-block list
+    // rather than from the workgroup's own number. The block is the same one `mark` sweeps, which
+    // is what keeps the two in step.
+    let block = owned(&mut kernel, over)?;
     let lane = kernel.local_index();
     let span = kernel.module().constant_u32(sweep::cells(subgroup))?;
     let start = kernel.module().i_mul(uint, block, span)?;
@@ -130,21 +288,22 @@ fn decayed<const LANES: u32>(subgroup: u32) -> Result<Vec<u32>, LaneError> {
         Ok::<_, LaneError>(lanes.add(floored, back)?.id())
     };
 
-    if_hot::<LANES, _>(&mut kernel, block, |kernel| {
-        for offset in 0..PER_LANE {
-            let along = kernel.module().constant_u32(offset)?;
-            let quad = kernel.module().i_add(uint, mine, along)?;
-            let held = kernel.load_at(AWAKE, quad)?;
-            let lower = step(kernel, held)?;
-            kernel.store_at(AWAKE, quad, lower)?;
-        }
+    // **No gate any more.** Every block this is dispatched over is one the list said had something
+    // in it, so the vote that used to stand here would pass every time. The saving moved from
+    // skipping the body to not being dispatched at all.
+    for offset in 0..PER_LANE {
+        let along = kernel.module().constant_u32(offset)?;
+        let quad = kernel.module().i_add(uint, mine, along)?;
+        let held = kernel.load_at(AWAKE, quad)?;
+        let lower = step(&mut kernel, held)?;
+        kernel.store_at(AWAKE, quad, lower)?;
+    }
 
-        // And the block's own counter, written by every lane because every lane has the same
-        // answer — the argument `layout::HOT` makes about identical writes, one level up.
-        let held = kernel.load_at(HOT, block)?;
-        let lower = step(kernel, held)?;
-        kernel.store_at(HOT, block, lower)
-    })?;
+    // And the block's own counter, written by every lane because every lane has the same answer —
+    // the argument `layout::HOT` makes about identical writes, one level up.
+    let held = kernel.load_at(HOT, block)?;
+    let lower = step(&mut kernel, held)?;
+    kernel.store_at(HOT, block, lower)?;
     kernel.finish()
 }
 
@@ -163,7 +322,7 @@ fn decayed<const LANES: u32>(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 ///
 /// As [`settle`].
 pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
-    use crate::layout::{TALLY, TALLY_WORDS, TOTALS};
+    use crate::layout::{HOT_TOTALS, TALLY, TALLY_WORDS, TOTALS};
     use crate::sweep::PER_LANE;
 
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
@@ -173,10 +332,14 @@ pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mine = kernel.module().i_mul(uint, lane, run)?;
     let nothing = kernel.module().constant_u32(0)?;
 
+    // **Both hierarchies' tile totals**, because both are scanned in place and both would otherwise
+    // carry last frame's prefix into this frame's reduction. The coarse one is the same array with
+    // one entry where the fine one has a tile, and it goes wrong in exactly the same way.
     for step in 0..PER_LANE {
         let along = kernel.module().constant_u32(step)?;
         let at = kernel.module().i_add(uint, mine, along)?;
         kernel.store_at(TOTALS, at, nothing)?;
+        kernel.store_at(HOT_TOTALS, at, nothing)?;
     }
 
     // **The tally is accumulated with atomics, so it has to start at nothing every frame** — for
@@ -189,6 +352,50 @@ pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
             .module()
             .constant_u32(u32::try_from(word).unwrap_or(0))?;
         kernel.store_at(TALLY, at, nothing)?;
+    }
+    kernel.finish()
+}
+
+/// Every block's count, back to nothing.
+///
+/// # The pass the hot-block list made necessary
+///
+/// [`mark`] used to write `counts[block] = 0` before its gate, so a block it skipped said *nothing*
+/// rather than last frame's *something*. That worked because it was dispatched for every block
+/// whether it was hot or not. Dispatched over the hot list instead, a cold block is not visited at
+/// all — and nobody writes its count.
+///
+/// Which matters because `scan_counts` reads **every** block: it is a prefix, and a prefix has to
+/// see the zeros. One stale count inflates every base after it and the grand total with them, and
+/// the settle then runs over a list whose tail is whatever the buckets happened to hold. That is
+/// the same failure `wipe` exists for, arriving by a different road.
+///
+/// One workgroup a tile, [`PER_LANE`](crate::sweep::PER_LANE) stores a lane, over the padded array
+/// — sixty-four workgroups at sixteen million cells, against the forty-nine thousand this whole
+/// change is about.
+///
+/// # Errors
+///
+/// As [`settle`].
+pub fn wipe_counts(subgroup: u32, counts: u32) -> Result<Vec<u32>, LaneError> {
+    use crate::sweep::{self, PER_LANE};
+
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let uint = kernel.index_type();
+
+    let block = kernel.workgroup_index();
+    let lane = kernel.local_index();
+    let span = kernel.module().constant_u32(sweep::cells(subgroup))?;
+    let start = kernel.module().i_mul(uint, block, span)?;
+    let run = kernel.module().constant_u32(PER_LANE)?;
+    let along = kernel.module().i_mul(uint, lane, run)?;
+    let mine = kernel.module().i_add(uint, start, along)?;
+    let nothing = kernel.module().constant_u32(0)?;
+
+    for step in 0..PER_LANE {
+        let at = kernel.module().constant_u32(step)?;
+        let at = kernel.module().i_add(uint, mine, at)?;
+        kernel.store_at(counts, at, nothing)?;
     }
     kernel.finish()
 }
@@ -587,10 +794,14 @@ pub(crate) fn wake<const LANES: u32>(
             let coarse = {
                 let mut lanes = kernel.lanes()?;
                 let none = lanes.splat_bits::<U32, LANES>(0)?;
-                let by = lanes
-                    .splat_bits::<U32, LANES>(crate::sweep::cells(subgroup).trailing_zeros())?;
-                let blocks = grid.quads().div_ceil(crate::sweep::cells(subgroup));
-                let cold = lanes.splat_bits::<U32, LANES>(blocks)?;
+                let per_block = crate::sweep::cells(subgroup);
+                let by = lanes.splat_bits::<U32, LANES>(per_block.trailing_zeros())?;
+                // **Past the padding, not past the last block.** The coarse sweep reads whole
+                // tiles, so `HOT` is rounded up to `tiles × per_block` — and a dump slot inside
+                // that would be a hot block no quad ever woke, listed every frame for ever.
+                // `compact::Plan::cold` is the same number, arrived at from the other side.
+                let blocks = grid.quads().div_ceil(per_block);
+                let cold = lanes.splat_bits::<U32, LANES>(blocks.div_ceil(per_block) * per_block)?;
 
                 let which = lanes.shift_right_logical(slot, by)?;
                 let both = lanes.mul(holding, inside)?;
@@ -605,20 +816,28 @@ pub(crate) fn wake<const LANES: u32>(
 
 /// The wake flags, scanned into buckets and counts — the compaction's first tier.
 ///
-/// [`crate::sweep`] without the simulation in front of it: the predicate is already in [`AWAKE`],
-/// so this reads it, scans it in three tiers, and writes the quad indices that survive. Everything
-/// after it — the two scans, the gather, the count — is `crate::compact` unchanged.
+/// [`crate::sweep`] without the simulation in front of it: the predicate is already in the tier's
+/// flags, so this reads it, scans it in three tiers, and writes the indices that survive.
+/// Everything after it — the two scans, the gather, the count — is `crate::compact` unchanged.
+///
+/// # One kernel, both hierarchies
+///
+/// Over [`Tier::FINE`] the flags are one word a quad and this writes the quad indices the settle
+/// will step. Over [`Tier::COARSE`] they are one word a *block* and it writes the block indices
+/// this pass will itself be dispatched over next frame. Nothing in the body knows which — a
+/// countdown above nought is a live entry either way, and the index it writes is the index it read
+/// at.
 ///
 /// # Errors
 ///
 /// As [`settle`].
-pub fn mark(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+pub fn mark(subgroup: u32, tier: Tier, over: Over) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => marked::<4>(subgroup),
-        8 => marked::<8>(subgroup),
-        16 => marked::<16>(subgroup),
-        32 => marked::<32>(subgroup),
-        64 => marked::<64>(subgroup),
+        4 => marked::<4>(subgroup, tier, over),
+        8 => marked::<8>(subgroup, tier, over),
+        16 => marked::<16>(subgroup, tier, over),
+        32 => marked::<32>(subgroup, tier, over),
+        64 => marked::<64>(subgroup, tier, over),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -627,14 +846,13 @@ pub fn mark(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 }
 
 /// The mark, at a width the caller has matched to the device.
-fn marked<const LANES: u32>(subgroup: u32) -> Result<Vec<u32>, LaneError> {
-    use crate::layout::COUNTS;
+fn marked<const LANES: u32>(subgroup: u32, tier: Tier, over: Over) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
 
-    let block = kernel.workgroup_index();
+    let block = owned(&mut kernel, over)?;
     let lane = kernel.local_index();
     let span = kernel.module().constant_u32(sweep::cells(subgroup))?;
     let start = kernel.module().i_mul(uint, block, span)?;
@@ -650,23 +868,21 @@ fn marked<const LANES: u32>(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 
     // Blocked, not striped: the two scan tiers add up to a prefix only when (lane, then step) is
     // index order. `tests/compact.rs` found that out the hard way.
-    // **Before the gate, so a block that is skipped still says nothing rather than last frame's
-    // something.** `gather` reads this count and takes that many entries out of the bucket; a stale
-    // one would gather quads that are no longer awake, from a region nobody has written.
-    let nothing = kernel.module().constant_u32(0)?;
-    kernel.store_at(COUNTS, block, nothing)?;
-
-    if_hot::<LANES, _>(&mut kernel, block, |kernel| {
-        swept::<LANES>(
-            kernel,
-            Sweeping {
-                mine,
-                region,
-                dump_mine,
-                block,
-            },
-        )
-    })?;
+    //
+    // **The gate is gone and so is the zeroing that stood in front of it.** Every block this is
+    // dispatched over is one the hot list named, so the vote would pass every time — and the zero
+    // that used to be written here for a skipped block is now [`wipe_counts`]'s job, because a
+    // block this never visits is a block this cannot write anything for.
+    swept::<LANES>(
+        &mut kernel,
+        Sweeping {
+            mine,
+            region,
+            dump_mine,
+            block,
+            tier,
+        },
+    )?;
     kernel.finish()
 }
 
@@ -680,11 +896,12 @@ struct Sweeping {
     dump_mine: simdr::module::Id,
     /// Which block this is.
     block: simdr::module::Id,
+    /// Which hierarchy's flags are being read and whose buckets are being written.
+    tier: Tier,
 }
 
-/// The sweep itself, run only for blocks that have something awake in them.
+/// The sweep itself, over the blocks the caller was dispatched for.
 fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Result<(), LaneError> {
-    use crate::layout::{BUCKETS, COUNTS};
     use crate::sweep::PER_LANE;
 
     let Sweeping {
@@ -692,6 +909,7 @@ fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Resu
         region,
         dump_mine,
         block,
+        tier,
     } = where_at;
     let uint = kernel.index_type();
 
@@ -700,7 +918,7 @@ fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Resu
     for step in 0..PER_LANE {
         let along = kernel.module().constant_u32(step)?;
         let at = kernel.module().i_add(uint, mine, along)?;
-        flags.push(kernel.load_at(AWAKE, at)?);
+        flags.push(kernel.load_at(tier.flags, at)?);
         quads.push(at);
     }
 
@@ -728,7 +946,7 @@ fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Resu
         let total = lanes.reduce_sum::<U32, LANES>(carried)?;
         (before, total)
     };
-    kernel.store_at(COUNTS, block, total)?;
+    kernel.store_at(tier.counts, block, total)?;
 
     for (index, quad) in quads.iter().enumerate() {
         let (Some(flag), Some(earlier)) = (flags.get(index), serial.get(index).copied()) else {
@@ -747,7 +965,7 @@ fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Resu
             let listed = lanes.greater_than(awake, none)?;
             lanes.select(listed, bucket, elsewhere)?
         };
-        kernel.store_at(BUCKETS, slot.id(), *quad)?;
+        kernel.store_at(tier.buckets, slot.id(), *quad)?;
     }
 
     Ok(())

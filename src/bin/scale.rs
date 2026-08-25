@@ -19,16 +19,25 @@
 //! on that evidence.
 //!
 //! `Resident::frames` records twenty frames into one command buffer. The round trip is paid once
-//! and the work twenty times, so what comes back is the work. What it measured, with the gate off
-//! and on:
+//! and the work twenty times, so what comes back is the work. Three arrangements, measured:
 //!
 //! ```text
-//!         cells     ungated       gated
-//!       262 144       66 us       79 us
-//!     1 048 576       92 us       79 us
-//!     4 194 304      161 us       79 us
-//!    16 777 216      323 us      144 us
+//!         cells     ungated       gated      listed
+//!       262 144       66 us       79 us       57 us
+//!     1 048 576       92 us       79 us       57 us
+//!     4 194 304      161 us       79 us       59 us
+//!    16 777 216      323 us      144 us       60 us
 //! ```
+//!
+//! *Ungated* is a workgroup a block, every block. *Gated* is the same dispatch with a vote that
+//! lets a cold block exit early — which flattens the middle and leaves the largest size paying for
+//! 3 × 16 384 workgroups that do one load and then nothing. *Listed* is the coarse hierarchy: those
+//! three passes dispatched over a compacted list of the blocks that hold something, so a cold block
+//! is not launched at all.
+//!
+//! **The last column is the claim.** Sixty-four times the world for three microseconds more — and
+//! lower than the gated floor at every size, because the blocks that were being launched and
+//! dismissed were never free, only cheap.
 //!
 //! # The pour is the same at every size
 //!
@@ -39,10 +48,10 @@
 
 use std::time::Duration;
 
-use grit::compact::{self, Plan};
-use grit::layout::{AWAKE, BINDINGS, BRUSH, DENSE, GRAND, HOT, INDIRECT, PARAMS, STATE};
-use grit::sand::{self, AIR, Grid, SAND, WALL};
-use grit::{Groups, Host, sweep};
+use grit::compact::Plan;
+use grit::layout::{BRUSH, GRAND, PARAMS, STATE};
+use grit::sand::{AIR, Grid, SAND, WALL};
+use grit::{Host, sweep};
 
 /// How many frames each size runs.
 const FRAMES: u32 = 300;
@@ -92,18 +101,8 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
         }
     };
 
-    let passes = [
-        counter(width)?,
-        grit::live::decay(width)?,
-        grit::live::wipe(width)?,
-        sand::brush(width, grid, true)?,
-        grit::live::settle(width, grid)?,
-        grit::live::mark(width)?,
-        compact::scan(width, sweep::COUNTS, compact::BASES, compact::TOTALS)?,
-        compact::scan(width, compact::TOTALS, compact::TOTALS, compact::GRAND)?,
-        compact::gather(width)?,
-        compact::prepare(width, width)?,
-    ];
+    // No picture: this measures the loop, and what looking costs is `loop_cost`'s question.
+    let (passes, groups) = grit::live::wired(width, grid, &plan)?;
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
     let words: usize = sizes.iter().sum();
@@ -114,24 +113,7 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
     }
     resident.write(STATE as usize, &room(grid))?;
     resident.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
-    resident.write(AWAKE as usize, &vec![2_u32; quads as usize])?;
-    resident.write(DENSE as usize, &(0..quads).collect::<Vec<u32>>())?;
-    resident.write(GRAND as usize, &[quads])?;
-    resident.write(INDIRECT as usize, &[quads.div_ceil(width), 1, 1])?;
-    resident.write(HOT as usize, &vec![2_u32; plan.blocks as usize])?;
-
-    let groups = [
-        Groups::Fixed(1),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(1),
-        Groups::Fixed(sand::BOX * sand::BOX / width),
-        Plan::listed(),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(plan.tiles),
-        Groups::Fixed(1),
-        Groups::Fixed(plan.blocks),
-        Groups::Fixed(1),
-    ];
+    grit::live::seed(&mut resident, grid, &plan)?;
 
     // A discarded frame: the first submission of a pipeline pays for its compile.
     resident.frame(&groups)?;
@@ -183,20 +165,4 @@ fn room(grid: Grid) -> Vec<u32> {
         }
     }
     cells
-}
-
-/// One word, incremented on the device.
-fn counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
-    use simdr::kernel::{Kernel, Shape};
-    use simdr::lanes::U32;
-
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
-    let slot = kernel.module().constant_u32(0)?;
-    let one = kernel.module().constant_u32(1)?;
-    let element = kernel.element();
-
-    let now = kernel.load_at(PARAMS, slot)?;
-    let next = kernel.module().i_add(element, now, one)?;
-    kernel.store_at(PARAMS, slot, next)?;
-    kernel.finish()
 }

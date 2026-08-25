@@ -1,6 +1,6 @@
 # grit
 
-Sixteen million cells of falling sand and water, simulated in **144 µs a frame**, on a work list
+Sixteen million cells of falling sand and water, simulated in **60 µs a frame**, on a work list
 that never learns how long it is.
 
 Built on [`simdr`](../simdr) — a SPIR-V emitter written in stable Rust with an empty dependency
@@ -26,14 +26,16 @@ touch.** A 4096×4096 grid holds 4 194 304 quads. A frame steps about **seven hu
 
 ```
        cells      quads      frame     stepped    of grid
-      262 144     65 536      79 µs        768        85×
-    1 048 576    262 144      79 µs        768       341×
-    4 194 304  1 048 576      79 µs        768      1365×
-   16 777 216  4 194 304     144 µs        768      5461×
+      262 144     65 536      57 µs        768        85×
+    1 048 576    262 144      57 µs        768       341×
+    4 194 304  1 048 576      59 µs        768      1365×
+   16 777 216  4 194 304      60 µs        768      5461×
 ```
 
 The last column is the ratio between what was stepped and what exists. It is the number this
-repository was written to print.
+repository was written to print. The fourth column is the one that had to be earned twice: sixty-four
+times the world for three microseconds more, with **nothing in the frame proportional to the grid**
+— not the settle, and no longer the passes that build the list it runs on.
 
 **The size of that list never crosses the bus.** A pass called `prepare` divides the count and
 writes three words into a buffer; Vulkan reads them at dispatch time. The host does not learn how
@@ -43,17 +45,19 @@ much work there was unless it asks, which the title bar does twice a second.
 
 ## How it is put together
 
-Eleven passes, one submission, six words from the host.
+Seventeen passes, one submission, six words from the host.
 
 ```
   tick     1              the frame number, and the partition's phase
-  decay    a block        every wake counter, one closer to nothing        gated
-  wipe     1              the tile totals and the tally, back to nothing
+  decay    the hot list   every wake counter, one closer to nothing        indirect
+  wipe     1              both tile totals and the tally, back to nothing
+  wipe     a tile         every block's count, back to nothing
   brush    a box          what the pointer holds, and the quads it touched
   settle   the work list  one Margolus step over what the last frame woke  indirect
-  mark     a block        the counters, scanned into buckets and counts    gated
+  hot ×5   a tile         which blocks hold anything, compacted into a list
+  mark     the hot list   the counters, scanned into buckets and counts    indirect
   scan ×2                 the blocks against each other
-  gather   a block        the buckets into one contiguous list             gated
+  gather   the hot list   the buckets into one contiguous list             indirect
   prepare  1              how many workgroups the *next* settle runs
   paint    the window     the visible cells, as colours
 ```
@@ -97,11 +101,36 @@ refuses **by name** rather than scanning the first tier and silently dropping th
 The work list makes the settle proportional to what is moving. It does nothing for the passes that
 *produce* it, and at sixteen million cells those were most of the frame. So the same trick one level
 up: `layout::HOT` holds one word a block, written by exactly the code that writes the per-quad
-flags, and `decay`, `mark` and `gather` skip a cold block without looking at it.
+flags, so a block reading nought provably has no awake quad in it.
 
-Skipping is a real branch, which `simdr`'s DR-0003 permits precisely here — the condition is one word
+**Skipping a block was not enough, because a skipped workgroup is still a launched one.** `decay`,
+`mark` and `gather` each ran one per block — 3 × 16 384 of them at the largest size, doing a load and
+a vote before they exited — and that was the whole of the frame's growth from four million cells to
+sixteen. So the compaction is applied to itself: the same four passes over `HOT` that they run over
+`AWAKE`, producing a list of the blocks that hold something, and the three of them are dispatched
+over *that*.
+
+```
+  hot_mark     a tile × per_block blocks  →  hot_counts[tile]  and a bucket each
+  hot_scan ×2                                the tiles against each other
+  hot_gather   a tile × per_block slots   →  hot_dense[], the hot-block list
+  hot_prepare  1                          →  how many workgroups the three run
+```
+
+This level needs no third tier and never will: `Plan::over` already refuses past `per_block²` blocks,
+so there are at most `per_block` tiles and one workgroup scans them all. The whole hierarchy costs
+about a hundred and thirty workgroups to remove forty-nine thousand.
+
+The gate is still there in `gather`, where it is free — the count it votes on was loaded anyway — and
+`crate::gate` still carries the argument for why a branch is allowed at all: the condition is one word
 loaded at the *workgroup's* index, so every lane has the same answer by construction, and
 `any_uniform` is how a program says so in a form the branch will accept.
+
+Two things had to move with it. `mark` used to write `counts[block] = 0` before its gate so a skipped
+block said nothing rather than last frame's something — a block that is never dispatched cannot write
+that, so it is a pass of its own now, one workgroup a tile. And `HOT` is padded to whole tiles,
+because the coarse sweep reads a tile at a time and a dump slot inside the padding would be a hot
+block that no quad ever woke.
 
 ### The reduction
 
@@ -142,6 +171,7 @@ Every one of them is aimed at a failure that a convincing picture survives.
 | --- | --- |
 | `sweep.rs` | the first tier's offsets are the ones the host computes |
 | `compact.rs` | the work list is every awake quad, once, in block order |
+| `hot.rs` | and the hot-block list is every hot block, once, in order, across several tiles |
 | `sand.rs` | conservation, the host step for step, and that it actually falls |
 | `sand.rs` | water reaches all 62 columns of a basin where sand heaps at 22 |
 | `sand.rs` | the window shows the cells it is pointed at, from four corners, two wrapping |
@@ -171,14 +201,19 @@ Every test is run at subgroup **32** (RTX 4080), **64** (integrated Radeon) and 
   128 cells do not divide by 62 columns — paces about looking for somewhere to be. No rule reading
   one 2×2 block can know where it belongs; whether there is somewhere lower is a property of the
   whole surface. `tests/sand.rs` bounds it rather than pretending it is nought.
-* **Three passes still dispatch one workgroup a block.** 49 152 of them at the largest size, each
-  doing one load and a vote before it exits. That is what is left of the growth from four million
-  cells to sixteen. Making it proportional needs a compaction of the hot blocks — the same three
-  tiers again, one level up.
 * **A frame's wall clock is a submit and a fence**, about a hundred microseconds on this machine
   whatever is inside it. The table above was measured with `Resident::frames`, which records twenty
   frames into one command buffer and divides. Measured the other way, the coarse level *appeared to
-  make things slower* and nearly went in the bin on that evidence.
+  make things slower* and nearly went in the bin on that evidence — and the hot-block list that came
+  after it would have been invisible too, because what it saves at the largest size is 84 µs and a
+  round trip costs more than that.
+* **The frame is now bounded below by the passes that are one workgroup whatever happens.** Six of
+  the seventeen are `Fixed(1)`, and a few more are one per tile — 64 at the largest size. Nothing
+  there grows with the world, but 57 µs at a quarter of a million cells is what they cost, and a
+  smaller world does not get a smaller frame.
+* **`paint` is the largest fixed dispatch left**, at one invocation a pixel — 16 384 workgroups for
+  a 1024×512 window. It is priced by the window rather than by the world, so it does not break the
+  claim above; it is simply what `pour` pays and `scale` does not measure.
 * **A column of sand takes a long time to fall**, and that is the rule rather than a fault. A full
   2×2 block has nowhere for anything to move, so a wide column erodes only from its two edges, a
   cell a frame each side, and drains from the outside in.

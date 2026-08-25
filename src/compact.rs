@@ -44,9 +44,97 @@ use simdr::module::Id;
 
 use crate::Groups;
 pub use crate::layout::{BASES, BINDINGS, DENSE, GRAND, INDIRECT, TOTALS};
-use crate::layout::{BUCKETS, COUNTS, PARAMS, PIXELS};
+use crate::layout::{
+    AWAKE, BUCKETS, COUNTS, HOT, HOT_BASES, HOT_BUCKETS, HOT_COUNTS, HOT_DENSE, HOT_GRAND,
+    HOT_INDIRECT, HOT_TOTALS, PIXELS,
+};
 use crate::sand::View;
 use crate::sweep::{self, PER_LANE};
+
+/// The seven bindings one compaction hierarchy runs over.
+///
+/// **There are two of them, and they are the same code.** The fine tier compacts one word a quad
+/// into the list the settle steps; the coarse tier compacts one word a *block* into the list that
+/// decides how many workgroups the fine tier's own passes are dispatched over. Naming the bindings
+/// rather than hard-coding them is the whole of what lets the second exist — see
+/// [`crate::layout::HOT_BUCKETS`].
+#[derive(Debug, Clone, Copy)]
+pub struct Tier {
+    /// One word an item: whether it wants looking at. A countdown, so anything above nought counts.
+    pub flags: u32,
+    /// One region a block: its compacted indices, then its dump.
+    pub buckets: u32,
+    /// One word a block: how many of its items are live.
+    pub counts: u32,
+    /// Where the exclusive prefix of each block lands.
+    pub bases: u32,
+    /// One word a tile: the sum of its blocks, then that made exclusive.
+    pub totals: u32,
+    /// The list itself, contiguous, with a dump past the end.
+    pub dense: u32,
+    /// One word: how long the list turned out to be.
+    pub grand: u32,
+    /// Three words Vulkan reads as a workgroup count.
+    pub indirect: u32,
+}
+
+impl Tier {
+    /// One word a quad, compacted into the list the settle steps.
+    pub const FINE: Self = Self {
+        flags: AWAKE,
+        buckets: BUCKETS,
+        counts: COUNTS,
+        bases: BASES,
+        totals: TOTALS,
+        dense: DENSE,
+        grand: GRAND,
+        indirect: INDIRECT,
+    };
+
+    /// One word a block, compacted into the list the passes above are dispatched over.
+    pub const COARSE: Self = Self {
+        flags: HOT,
+        buckets: HOT_BUCKETS,
+        counts: HOT_COUNTS,
+        bases: HOT_BASES,
+        totals: HOT_TOTALS,
+        dense: HOT_DENSE,
+        grand: HOT_GRAND,
+        indirect: HOT_INDIRECT,
+    };
+}
+
+/// Which blocks a pass runs over, and therefore where a workgroup learns which one it owns.
+///
+/// # The whole of the saving, in one enum
+///
+/// [`Over::Every`] is a workgroup a block whether the block holds anything or not — which is what
+/// `decay`, `mark` and `gather` did, and what cost 3 × 16 384 dispatches at sixteen million cells.
+/// [`Over::Listed`] is a workgroup per *listed* block, over a list the device compacted and a count
+/// the host never learns. The kernel is otherwise identical: only the first line differs.
+#[derive(Debug, Clone, Copy)]
+pub enum Over {
+    /// One workgroup a block, indexed by the workgroup's own number.
+    Every,
+    /// One workgroup a listed block, indexed by the word this binding holds at that number.
+    Listed(u32),
+}
+
+/// Which block this workgroup owns.
+///
+/// # Errors
+///
+/// As the module builder.
+pub(crate) fn owned(kernel: &mut Kernel<U32>, over: Over) -> Result<Id, LaneError> {
+    let group = kernel.workgroup_index();
+    match over {
+        Over::Every => Ok(group),
+        // **No bound to check.** `prepare` divides the count by one for a list dispatched a
+        // workgroup an entry, so the ceiling is exact and there is no last workgroup reading past
+        // the end — which is the one thing the settle has to guard against and this does not.
+        Over::Listed(binding) => kernel.load_at(binding, group),
+    }
+}
 
 /// What a hierarchy of this shape can and cannot hold.
 #[derive(Debug)]
@@ -82,8 +170,18 @@ pub struct Plan {
     pub per_block: u32,
     /// How many blocks of cells there are.
     pub blocks: u32,
-    /// How many blocks of *blocks* — one per `scan_counts` workgroup.
+    /// How many blocks of *blocks* — one per `scan_counts` workgroup, and one per coarse workgroup.
+    ///
+    /// **One number for both hierarchies.** A tile is `per_block` blocks, which is exactly what one
+    /// workgroup of the coarse `mark` and `gather` sweeps. They are the same division of the same
+    /// array rather than two that happen to agree.
     pub tiles: u32,
+    /// How many workgroups the coarse `scan_counts` runs. Always one, and provably so.
+    ///
+    /// [`Plan::over`] refuses past `per_block²` blocks, so there are at most `per_block` tiles, and
+    /// one workgroup scans `per_block` entries. Carried as a field anyway, so the arithmetic is in
+    /// one place rather than in a comment beside a literal.
+    pub hot_tiles: u32,
     /// Cells altogether — four to a quad.
     pub grid: usize,
     /// Quads altogether, which is what the compaction runs over.
@@ -102,14 +200,25 @@ impl Plan {
         if blocks > limit {
             return Err(TooBig::Blocks { blocks, limit });
         }
+        let tiles = blocks.div_ceil(per_block);
         Ok(Self {
             subgroup,
             per_block,
             blocks,
-            tiles: blocks.div_ceil(per_block),
+            tiles,
+            hot_tiles: tiles.div_ceil(per_block),
             quads: per_block as usize * blocks as usize,
             grid: per_block as usize * blocks as usize * 4,
         })
+    }
+
+    /// How many blocks the coarse hierarchy actually sweeps: the blocks, padded to whole tiles.
+    ///
+    /// A coarse workgroup covers a tile, so a partial one would read past the end of
+    /// [`crate::layout::HOT`]. The padding is zeros, which is a block nothing woke.
+    #[must_use]
+    pub const fn padded(&self) -> u32 {
+        self.tiles * self.per_block
     }
 
     /// The words each binding needs, in binding order — what `Host::resident` is handed.
@@ -119,6 +228,7 @@ impl Plan {
     #[must_use]
     pub fn sizes(&self) -> [usize; BINDINGS as usize] {
         let padded = self.tiles as usize * self.per_block as usize;
+        let hot_padded = self.hot_tiles as usize * self.per_block as usize;
         let spare = self.blocks as usize * self.subgroup as usize;
         [
             8,
@@ -145,16 +255,51 @@ impl Plan {
             // cells is sixty-seven megabytes it was allocating and never reading.
             1,
             crate::layout::TALLY_WORDS,
-            // One a block, and one more for everything that was not a block — `layout::HOT` says
-            // why a single slot is enough for all of it.
-            self.blocks as usize + 1,
+            // One a block, padded to whole tiles because the coarse sweep covers a tile at a time,
+            // and one more for everything that was not a block — `layout::HOT` says why a single
+            // slot is enough for all of it.
+            self.padded() as usize + 1,
+            // The coarse hierarchy, which is the fine one over one word a block instead of one a
+            // quad. Every size below is the line above it with `blocks` where that had `quads` and
+            // `tiles` where that had `blocks`.
+            self.tiles as usize * sweep::stride(self.subgroup) as usize,
+            hot_padded,
+            hot_padded,
+            self.per_block as usize,
+            // Every block could be hot, and the dump has to fit the widest dispatch that writes
+            // into it — which is the coarse gather, one invocation a slot over `tiles` workgroups.
+            self.padded() as usize + self.tiles as usize * self.subgroup as usize,
+            1,
+            3,
         ]
     }
 
-    /// Where the coarse flags' dump is: one word past the last block.
+    /// Where the coarse flags' dump is: one word past the **padding**, not past the last block.
+    ///
+    /// A slot inside the padding would be a hot block that no quad ever woke, and the coarse sweep
+    /// reads the padding — see [`crate::layout::HOT`].
     #[must_use]
     pub const fn cold(&self) -> u32 {
-        self.blocks
+        self.padded()
+    }
+
+    /// Where the coarse gather's dump begins in [`crate::layout::HOT_DENSE`].
+    #[must_use]
+    pub const fn hot_dump(&self) -> u32 {
+        self.padded()
+    }
+
+    /// What the three passes driven by the hot-block list ask for: the count `hot_prepare` wrote.
+    ///
+    /// **The host never learns this one either.** It is how many blocks turned out to have
+    /// something in them, which is the number `decay`, `mark` and `gather` used to be dispatched
+    /// over the whole world to avoid asking for.
+    #[must_use]
+    pub const fn hot_listed() -> Groups {
+        Groups::From {
+            binding: HOT_INDIRECT as usize,
+            at: 0,
+        }
     }
 
     /// The same sizes, with room for a picture of `view`.
@@ -300,13 +445,13 @@ fn scanned<const LANES: u32>(
 /// # Errors
 ///
 /// As [`scan`].
-pub fn gather(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+pub fn gather(subgroup: u32, tier: Tier, over: Over, dump: u32) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => gathered::<4>(subgroup),
-        8 => gathered::<8>(subgroup),
-        16 => gathered::<16>(subgroup),
-        32 => gathered::<32>(subgroup),
-        64 => gathered::<64>(subgroup),
+        4 => gathered::<4>(subgroup, tier, over, dump),
+        8 => gathered::<8>(subgroup, tier, over, dump),
+        16 => gathered::<16>(subgroup, tier, over, dump),
+        32 => gathered::<32>(subgroup, tier, over, dump),
+        64 => gathered::<64>(subgroup, tier, over, dump),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -315,11 +460,16 @@ pub fn gather(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 }
 
 /// The gather, at a width the caller has matched to the device.
-fn gathered<const LANES: u32>(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+fn gathered<const LANES: u32>(
+    subgroup: u32,
+    tier: Tier,
+    over: Over,
+    dump: u32,
+) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
 
-    let block = kernel.workgroup_index();
+    let block = owned(&mut kernel, over)?;
     let lane = kernel.local_index();
     let per_block = sweep::cells(subgroup);
 
@@ -332,9 +482,9 @@ fn gathered<const LANES: u32>(subgroup: u32) -> Result<Vec<u32>, LaneError> {
         lanes.shift_right_logical(which, by)?
     };
 
-    let tile_base = kernel.load_at(TOTALS, tile.id())?;
-    let block_base = kernel.load_at(BASES, block)?;
-    let live = kernel.load_at(COUNTS, block)?;
+    let tile_base = kernel.load_at(tier.totals, tile.id())?;
+    let block_base = kernel.load_at(tier.bases, block)?;
+    let live = kernel.load_at(tier.counts, block)?;
 
     // Where this block's bucket starts, and where its dump slot is.
     let wide = kernel.module().constant_u32(sweep::stride(subgroup))?;
@@ -343,8 +493,10 @@ fn gathered<const LANES: u32>(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let along_lane = kernel.module().i_mul(uint, lane, run)?;
     let source = kernel.module().i_add(uint, region, along_lane)?;
 
-    let second = kernel.module().constant_u32(1)?;
-    let dump_base = kernel.load_at(PARAMS, second)?;
+    // **A constant, where this used to be a word of `PARAMS`.** There are two hierarchies now and
+    // their dumps are in different buffers at different offsets, so the one shared parameter word
+    // could not name both — and the module is built for a plan already, so a load bought nothing.
+    let dump_base = kernel.module().constant_u32(dump)?;
     let dump_span = kernel.module().constant_u32(subgroup)?;
     let dump_block = kernel.module().i_mul(uint, block, dump_span)?;
     let dump_start = kernel.module().i_add(uint, dump_base, dump_block)?;
@@ -363,6 +515,7 @@ fn gathered<const LANES: u32>(subgroup: u32) -> Result<Vec<u32>, LaneError> {
             live,
             tile_base,
             block_base,
+            tier,
         };
         taking::<LANES>(kernel, where_at)
     })?;
@@ -383,6 +536,8 @@ struct Gathering {
     tile_base: Id,
     /// And this block's, within the tile.
     block_base: Id,
+    /// Which hierarchy's buckets are being read and whose list is being written.
+    tier: Tier,
 }
 
 /// The gather itself, run only for blocks that contributed something.
@@ -397,6 +552,7 @@ fn taking<const LANES: u32>(
         live,
         tile_base,
         block_base,
+        tier,
     } = where_at;
     let uint = kernel.index_type();
 
@@ -405,7 +561,7 @@ fn taking<const LANES: u32>(
     for step in 0..PER_LANE {
         let along = kernel.module().constant_u32(step)?;
         let at = kernel.module().i_add(uint, source, along)?;
-        taken.push(kernel.load_at(BUCKETS, at)?);
+        taken.push(kernel.load_at(tier.buckets, at)?);
     }
 
     for (step, value) in taken.iter().enumerate() {
@@ -428,7 +584,7 @@ fn taking<const LANES: u32>(
             let inside = lanes.greater_than(count, within)?;
             lanes.select(inside, there, elsewhere)?
         };
-        kernel.store_at(DENSE, slot.id(), *value)?;
+        kernel.store_at(tier.dense, slot.id(), *value)?;
     }
 
     Ok(())
@@ -469,6 +625,10 @@ pub fn dense_reference(plan: &Plan, counts: &[u32], buckets: &[u32]) -> (Vec<u32
 /// the list — which is exactly what `tests/live.rs` caught, as sand that fell in one run and not the
 /// other.
 ///
+/// **One is a legal value and the coarse tier uses it.** A pass dispatched a workgroup per listed
+/// block divides by one, and the ceiling is then exact — which is what lets [`Over::Listed`] skip
+/// the bound check the settle needs.
+///
 /// The rounding up is a shift and an add, because there is no division and none is needed: both
 /// counts are powers of two.
 ///
@@ -478,13 +638,13 @@ pub fn dense_reference(plan: &Plan, counts: &[u32], buckets: &[u32]) -> (Vec<u32
 /// # Errors
 ///
 /// As [`scan`].
-pub fn prepare(subgroup: u32, per_group: u32) -> Result<Vec<u32>, LaneError> {
+pub fn prepare(subgroup: u32, per_group: u32, tier: Tier) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => prepared::<4>(subgroup, per_group),
-        8 => prepared::<8>(subgroup, per_group),
-        16 => prepared::<16>(subgroup, per_group),
-        32 => prepared::<32>(subgroup, per_group),
-        64 => prepared::<64>(subgroup, per_group),
+        4 => prepared::<4>(subgroup, per_group, tier),
+        8 => prepared::<8>(subgroup, per_group, tier),
+        16 => prepared::<16>(subgroup, per_group, tier),
+        32 => prepared::<32>(subgroup, per_group, tier),
+        64 => prepared::<64>(subgroup, per_group, tier),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -493,12 +653,16 @@ pub fn prepare(subgroup: u32, per_group: u32) -> Result<Vec<u32>, LaneError> {
 }
 
 /// The count, at a width the caller has matched to the device.
-fn prepared<const LANES: u32>(subgroup: u32, per_group: u32) -> Result<Vec<u32>, LaneError> {
+fn prepared<const LANES: u32>(
+    subgroup: u32,
+    per_group: u32,
+    tier: Tier,
+) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let per_block = per_group.max(1);
 
     let head = kernel.module().constant_u32(0)?;
-    let grand = kernel.load_at(GRAND, head)?;
+    let grand = kernel.load_at(tier.grand, head)?;
 
     let groups = {
         let mut lanes = kernel.lanes()?;
@@ -514,8 +678,8 @@ fn prepared<const LANES: u32>(subgroup: u32, per_group: u32) -> Result<Vec<u32>,
 
     let one = kernel.module().constant_u32(1)?;
     let two = kernel.module().constant_u32(2)?;
-    kernel.store_at(INDIRECT, head, groups.id())?;
-    kernel.store_at(INDIRECT, one, one)?;
-    kernel.store_at(INDIRECT, two, one)?;
+    kernel.store_at(tier.indirect, head, groups.id())?;
+    kernel.store_at(tier.indirect, one, one)?;
+    kernel.store_at(tier.indirect, two, one)?;
     kernel.finish()
 }
