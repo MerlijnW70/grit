@@ -1,10 +1,32 @@
-//! What the wait is worth, timed alone.
+//! What the wait is worth, timed against a busy machine.
 //!
-//! # Why this is its own file
+//! # Why this is its own file, and why that was never the fix it was written as
 //!
 //! Tests in one binary run at the same time. With this beside the three in `tests/overlap.rs` the
 //! same frame measured 4.25 ms and 9.32 ms depending on what else had started, and the overlap it
-//! is here to show disappeared into the noise. One test to a binary is the whole of the fix.
+//! is here to show disappeared into the noise. So it was given a binary of its own, and this note
+//! used to say that was the whole of the fix.
+//!
+//! **It was not, and the file said so for months without anybody running it enough times to notice.**
+//! Cargo runs *test binaries* in parallel too, so a file of its own buys nothing once the crate has
+//! eleven of them. Measured on an RTX 4080 while vendoring this file into `hyperia`, in its own
+//! binary exactly as designed: **two runs in three failed.**
+//!
+//! Two things were wrong, and neither was the harness.
+//!
+//! * **The margin was thinner than the host clock.** The claim is that `overlapped` lands nearer
+//!   the longer of the two halves than their sum, so what the test has to work with is half the
+//!   *shorter* half — 0.45 ms, where the device half was 0.9 ms against a host half of 4 ms. And
+//!   `thread::sleep` on Windows quantises to the global timer resolution, which any process on the
+//!   machine may change, and which moves a 4 ms sleep by two or three tenths of a millisecond. The
+//!   test was being decided by the clock rather than by the overlap. [`WORDS`] is four times what it
+//!   was, which makes the device half comparable to the host half and the margin about 1.7 ms.
+//! * **One reading is not a measurement.** Each of the three durations is now taken [`TRIES`] times,
+//!   each trial judged against **its own** two halves, and the test passes if any trial shows the
+//!   overlap — because contention can only ever hide one, never invent one.
+//!
+//! It was not the command recording, which was the first suspect and is printed below for that
+//! reason: about 40 µs of a four-millisecond frame.
 //!
 //! # Why the host waits rather than works
 //!
@@ -20,14 +42,21 @@
 // A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use grit::{Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
+/// How many times each trial is run, of which any one showing the overlap is enough.
+///
+/// Contention can hide an overlap and cannot invent one, so a trial where nothing else was in the
+/// way is the one that answers the question. Five is enough that such a trial turns up and cheap
+/// enough not to matter.
+const TRIES: usize = 5;
+
 /// How many words the kernel below walks.
-const WORDS: usize = 8 << 20;
+const WORDS: usize = 32 << 20;
 
 /// How many times a frame walks them.
 ///
@@ -114,32 +143,55 @@ fn the_wait_is_time_the_host_gets_back() {
     held.frame(&groups).expect("a frame");
     elsewhere();
 
-    // The two halves alone, so the claim below is about the overlap and not about their sizes.
-    let clock = Instant::now();
-    held.frame(&groups).expect("a frame");
-    let device_alone = clock.elapsed();
-    let clock = Instant::now();
-    elsewhere();
-    let host_alone = clock.elapsed();
+    // **Each trial judged against its own two halves, and the claim is that one of them shows it.**
+    //
+    // Taking the best of several for each of the three *separately* is worse than useless, and was
+    // the first thing tried: `device_alone` at its smallest comes from the quietest moment, which
+    // lowers the line `overlapped` has to get under. The three have to come from the same trial or
+    // they are not being compared with each other.
+    let mut showed = false;
+    let mut best = None;
 
-    let clock = Instant::now();
-    let ticket = held.submit(&stages).expect("a submission");
-    elsewhere();
-    held.wait(ticket).expect("a landing");
-    let overlapped = clock.elapsed();
+    for _ in 0..TRIES {
+        let clock = Instant::now();
+        held.frame(&groups).expect("a frame");
+        let device_alone = clock.elapsed();
 
+        let clock = Instant::now();
+        elsewhere();
+        let host_alone = clock.elapsed();
+
+        let clock = Instant::now();
+        let ticket = held.submit(&stages).expect("a submission");
+        elsewhere();
+        held.wait(ticket).expect("a landing");
+        let overlapped = clock.elapsed();
+
+        // Nearer the longer of the two than their sum. Halfway is the line: anything below it is an
+        // overlap that happened, and anything above it is one that did not.
+        let sum = device_alone + host_alone;
+        let longer = device_alone.max(host_alone);
+        let halfway = longer + (sum - longer) / 2;
+        showed |= overlapped < halfway;
+
+        if best.is_none_or(|(_, _, held): (_, _, Duration)| overlapped < held) {
+            best = Some((device_alone, host_alone, overlapped));
+        }
+    }
+
+    // The recording, printed because it is *not* the answer — see the note at the top of this file.
+    let (recorded, frames) = held.recording();
+    let per_frame = recorded / u32::try_from(frames.max(1)).unwrap_or(u32::MAX);
+    let (device_alone, host_alone, overlapped) = best.unwrap_or_default();
     eprintln!(
-        "  device {device_alone:?}, host {host_alone:?}, overlapped {overlapped:?}",
+        "  best of {TRIES}: device {device_alone:?} (of which {per_frame:?} is the host recording \
+         it), host {host_alone:?}, overlapped {overlapped:?}"
     );
 
-    // Nearer the longer of the two than their sum. Halfway is the line: anything below it is an
-    // overlap that happened, and anything above it is one that did not.
-    let sum = device_alone + host_alone;
-    let longer = device_alone.max(host_alone);
-    let halfway = longer + (sum - longer) / 2;
     assert!(
-        overlapped < halfway,
-        "device {device_alone:?} and host {host_alone:?} overlapped to {overlapped:?}, which is \
-         nearer their sum than the longer of them"
+        showed,
+        "in {TRIES} tries the wait was never given back: the best was device {device_alone:?} and \
+         host {host_alone:?} overlapping to {overlapped:?}, which is nearer their sum than the \
+         longer of them"
     );
 }
