@@ -48,12 +48,13 @@ use grit::{Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
-/// How many times each trial is run, of which any one showing the overlap is enough.
+/// How many trials are run, of which any one showing the overlap is enough.
 ///
 /// Contention can hide an overlap and cannot invent one, so a trial where nothing else was in the
-/// way is the one that answers the question. Five is enough that such a trial turns up and cheap
-/// enough not to matter.
-const TRIES: usize = 5;
+/// way is the one that answers the question — and this is how many chances it gets. Twelve, because
+/// five was measured failing one full-suite run in ten where this file is vendored, in a harness of
+/// two hundred and sixteen tests on one card. It costs the test 160 ms.
+const TRIES: usize = 12;
 
 /// How many words the kernel below walks.
 const WORDS: usize = 32 << 20;
