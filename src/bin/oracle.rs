@@ -18,7 +18,7 @@
 //!   weigh dynamic   add the answers up by sum, by the weakest of them, or by weight
 //!   slack 1         read the answer as a number and accept it within one
 //!   ladder 1        reveal one output bit at a time, widening when it is mastered
-//!   gates and or maj   the gates it draws from; wire is always in
+//!   gates and or sum   the gates it draws from; wire is always in
 //!   noise 16        break one gate in sixteen each generation
 //!   lean wires      among equally right chips prefer the cheaper: 1 by gates, wires by wires
 //!   steps 4         cut the word into four, one piece a step — time
@@ -167,6 +167,21 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # A gate that adds, which is the half of an adder that was missing
+//!
+//! `maj` of the wire above, the wire below and the wire straight ahead is the carry out of a full
+//! adder. `sum` is the exclusive-or of the same three, which is the other output, so a cell of each
+//! is one bit of addition and nothing in the kit before this could add at all.
+//!
+//! Counting is adding, and it shows. Six starts, `count` asked all at once, 16 384 chips:
+//! `and or xor not maj` gives 43.0 of 48 and the same kit with `sum` gives 44.3, which is the most
+//! this exam has ever given without being cut into steps. Twelve starts on the sequential counter
+//! give 14.1 of 16 inputs entirely right against 13.0 for the four-gate kit — and no perfect chip
+//! in the twelve, where the four-gate kit found one.
+//!
+//! **It does nothing for the multiplier.** Six starts on `times` give 59.5 of 64 with it and 59.5
+//! without. Multiplying is not adding three wires together, whatever counting is.
 //!
 //! # Stretching the memory, which turns out not to be one
 //!
@@ -676,7 +691,7 @@ const SETTLED: u32 = 64;
 const MIGRATE: u32 = 64;
 
 /// How many kinds of gate there are.
-const KINDS: u32 = 7;
+const KINDS: u32 = 8;
 
 /// How many gates a mutation turns over at once.
 const MUTATIONS: u32 = 1;
@@ -1226,6 +1241,14 @@ fn propagate(
     } else {
         None
     };
+    // **The other half of a full adder.** `maj` of the same three wires is the carry out, so a cell
+    // of each is one bit of addition, and nothing before this could add.
+    let carried = if allowed.contains(&7) {
+        let two = kernel.module().i_add(uint, sum, straight)?;
+        Some(low_bits(&mut kernel, two, 1)?)
+    } else {
+        None
+    };
 
     let span = kernel.module().constant_u32(CELLS)?;
     let mine_at = kernel.module().i_mul(uint, chip, span)?;
@@ -1236,7 +1259,7 @@ fn propagate(
 
     let mut answer = straight;
     let arms = [(1, Some(both)), (2, Some(either)), (3, Some(odd)), (4, Some(inverted)), (5, most),
-        (6, chosen)];
+        (6, chosen), (7, carried)];
     for (number, value) in arms.into_iter().filter_map(|(at, held)| {
         held.filter(|_| allowed.contains(&at)).map(|held| (at, held))
     }) {
@@ -1665,8 +1688,9 @@ fn read(text: &str) -> Result<Exam, String> {
                         "xor" => 3,
                         "maj" => 5,
                         "mux" => 6,
+                        "sum" => 7,
                         "not" => 4,
-                        _ => return Err(say("a gate is wire, and, or, xor, not, maj or mux")),
+                        _ => return Err(say("a gate is wire, and, or, xor, not, maj, mux or sum")),
                     };
                     if !kinds.contains(&kind) {
                         kinds.push(kind);
@@ -1912,6 +1936,7 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
                                 down
                             }
                         }
+                        Some(7) => (up + down + straight) & 1,
                         _ => straight,
                     }
                 })
@@ -2044,6 +2069,7 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<u32> {
                                 down
                             }
                         }
+                        Some(7) => (up + down + straight) & 1,
                         _ => straight,
                     }
                 })
@@ -2084,7 +2110,7 @@ fn price(kind: u32) -> u32 {
 fn reads(kind: u32, row: u32) -> Vec<u32> {
     match kind {
         0 | 4 => vec![row],
-        5 | 6 => vec![row + ROWS - 1, row, row + 1],
+        5..=7 => vec![row + ROWS - 1, row, row + 1],
         _ => vec![row + ROWS - 1, row + 1],
     }
 }
@@ -2290,6 +2316,7 @@ fn drawn(genome: &[u32], bits: u32, outputs: u32, apart: u32, alive: &[bool]) ->
                 Some(4) => '!',
                 Some(5) => '#',
                 Some(6) => '?',
+                Some(7) => '+',
                 _ => '-',
             });
         }
@@ -2533,7 +2560,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let alive = live(genome, &exam);
     println!("\n{}", drawn(genome, exam.bits, exam.outputs, exam.apart, &alive));
     println!(
-        "    - wire  & and  v or  ^ xor  ! not  # maj  ? mux  · dead  (<- marks an answer wire)"
+        "    - wire  & and  v or  ^ xor  ! not  # maj  ? mux  + sum  · dead  (<- an answer wire)"
     );
     if exam.outputs > 1 {
         let apiece = each(genome, &exam);
