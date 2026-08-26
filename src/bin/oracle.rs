@@ -34,6 +34,7 @@
 //!   equal           fill the table: every input the same
 //!   count           fill the table: how many ones there are, in binary
 //!   times           fill the table: the low half of the word times the high half
+//!   shift           fill the table: the low half shifted left by the high half
 //!   add             fill the table: the first half plus the second
 //!   10-1 -> 01      the inputs that pattern stands for, and what they answer
 //!   ---- -> --1     a dash on the left is every value; a dash on the right is not asked
@@ -275,6 +276,31 @@
 //! What it does cost is its passes, which are the whole of the frame: 48 passes a tick at 212.8 us
 //! on the device, 96 at 400.4 and 240 at 970.0, the lowest of three starts each.
 //!
+//! # Asking for the product a bit at a time, and for a shift instead
+//!
+//! Fewer answer bits than a filler needs is now the low bits of the answer rather than an error, so
+//! `times` can be asked for one bit of the product, or two, or three. `shift` is the low half of
+//! the word shifted left by the high half, which is the other thing a multiplier is made of.
+//! Six starts each, 16 384 chips, `and or xor not sum` with `renew 8`:
+//!
+//! ```text
+//!                      of its perfect   perfect chips
+//!   times, outputs 1   16.0 of 16       6 of 6
+//!   times, outputs 2   30.6 of 32       2
+//!   times, outputs 3   44.0 of 48       0
+//!   times, outputs 4   59.5 of 64       0
+//!   shift, outputs 2   30.5 of 32       1
+//!   shift, outputs 3   44.6 of 48       0
+//!   shift, outputs 5   70.1 of 80       0
+//! ```
+//!
+//! **Shifting is not the easier half.** It is within a bit of multiplying at every width, so the
+//! detour is not a detour.
+//!
+//! And 65 536 chips do not change it: `times` at four outputs gives 59.1 of 64 there against 59.5
+//! at 16 384. What breaks is not any one bit — each of the four is worth 16 of 16 on its own — but
+//! asking for more than about two of them at once.
+//!
 //! # The price of the third wire, which is nothing on the card and something in silicon
 //!
 //! A gate that reads three wires is more expensive than one that reads two, everywhere except
@@ -331,9 +357,25 @@
 //! `[16, 12, 16, 16]` on start after start, and the short one is bit one, which is
 //! `a0·b1` exclusive-or `a1·b0` — the only one of the four that is two levels deep.
 //!
-//! Asked entirely alone, one output and 16 384 chips, that bit comes out at 15 of 16 on all eight
-//! starts. Not 14 and not 16, eight times out of eight: the search walks to the same one-input-wrong
-//! circuit every time and there is nothing next to it that is better.
+//! This file then said that bit, asked entirely alone, comes out at 15 of 16 on all eight starts,
+//! and called it a wall. **It is not a wall, it is the kit.** Eight starts, that bit alone:
+//!
+//! ```text
+//!                            renew 0   renew 8
+//!   and or xor not           15.8      16.0
+//!   and or xor not maj       15.0      15.2
+//!   and or xor not sum       16.0
+//!   and or xor not maj sum   16.0      16.0
+//! ```
+//!
+//! The four-gate kit was already getting seven perfect chips in eight. **Adding `maj` to it takes
+//! that to none**, and adding `sum` — or drawing the colony again — takes it to eight of eight. A
+//! gate that can only widen what is reachable made a solved exam unsolvable, and the eight starts
+//! that all said 15 were eight starts run with it in the kit.
+//!
+//! Each of the four product bits alone comes out at 16 of 16 on all six starts with
+//! `and or xor not sum` and `renew 8`. Every part of the multiplier is solved; the multiplier is
+//! not.
 //!
 //! # Widening the kit, where what matters is the third wire and not the gate
 //!
@@ -352,6 +394,9 @@
 //!   all seven                    41.1           14.0
 //!   maj alone                    33.0           10.0
 //! ```
+//!
+//! **`maj` can also be a trap.** On one product bit of `times` the same kit without it gets seven
+//! perfect chips in eight and with it none — see the multiplier below.
 //!
 //! **The two macro gates are worth the same, which says it is not the gate.** A cell could always
 //! read the wire straight ahead and it could always read the two diagonals; what it could not do is
@@ -1941,17 +1986,23 @@ fn read(text: &str) -> Result<Exam, String> {
                 ask = vec![0; 1 << how];
             }
             (Some(_), None) => return Err(say("`inputs` has to come first")),
-            (Some(filler @ ("parity" | "majority" | "equal" | "count" | "add" | "times")), Some(how)) => {
+            (Some(filler @ ("parity" | "majority" | "equal" | "count" | "add" | "times" | "shift")), Some(how)) => {
                 let widest = match filler {
                     "count" => u32::BITS - how.leading_zeros(),
                     "add" => how / 2 + 1,
                     "times" => how,
+                    "shift" => how / 2 + (1 << (how / 2)) - 1,
                     _ => 1,
                 };
-                if outputs < widest {
-                    return Err(say(&format!("`{filler}` wants `outputs {widest}` or more")));
+                // **Fewer answer bits than the table needs is the low bits of it.** That is what
+                // the packing already does, and asking for two bits of a product instead of four
+                // is a smaller exam rather than a broken one.
+                if outputs == 0 || outputs > widest {
+                    return Err(say(&format!(
+                        "`{filler}` has {widest} answer bits and `outputs {outputs}` asks for more"
+                    )));
                 }
-                if (filler == "add" || filler == "times") && how % 2 != 0 {
+                if matches!(filler, "add" | "times" | "shift") && how % 2 != 0 {
                     return Err(say(&format!("`{filler}` wants an even number of inputs")));
                 }
                 name = filler.to_owned();
@@ -1965,7 +2016,8 @@ fn read(text: &str) -> Result<Exam, String> {
                         "equal" => u32::from(ones == 0 || ones == how),
                         "count" => ones,
                         "add" => (case & ((1 << half) - 1)) + (case >> half),
-                        _ => (case & ((1 << half) - 1)) * (case >> half),
+                        "times" => (case & ((1 << half) - 1)) * (case >> half),
+                        _ => (case & ((1 << half) - 1)) << (case >> half),
                     };
                     if let (Some(a), Some(b)) =
                         (want.get_mut(case as usize), ask.get_mut(case as usize))
