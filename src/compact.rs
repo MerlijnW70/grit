@@ -12,6 +12,18 @@
 //!   gather       blocks × per_block slots   →  dense[]           the work list, contiguous
 //! ```
 //!
+//! # When a work list is worth anything
+//!
+//! Not always, and the condition is a number rather than a judgement. A list makes a pass run over
+//! fewer things; it does not make any one of them shorter. So it buys time where a pass is many
+//! short independent steps and the device was full of them, and it buys almost nothing where the
+//! cost is the length of one chain of dependent steps — `decisions/DR-0009` puts that at 0 to 9% of
+//! the time for 56 to 69% of the work taken away, on a pass that was 96% of what it sat in.
+//!
+//! The sand is the first case. A quad's step is short, it waits on nothing, and there are millions
+//! of them, so cutting their number cuts the time — which is what `src/bin/scale.rs` measures and
+//! what this module exists for.
+//!
 //! # Three passes and not four
 //!
 //! The obvious arrangement has a fourth: after `scan_totals` makes the tile bases absolute,

@@ -106,7 +106,7 @@ builds `scale` and `loop_cost` but not the two that need a window.
 | `src/live.rs` | the loop — `wired` is the one place its order is decided |
 | `src/sand.rs` | the Margolus rule, four ordered swaps, and what a cell word holds |
 | `src/layout.rs` | which buffer is which |
-| `decisions/` | eight records, four headings each: measurement, decision, rejected route, limit |
+| `decisions/` | nine records, four headings each: measurement, decision, rejected route, limit |
 
 Start at `src/live.rs`'s `wired` if you want the loop, `src/resident.rs` if you want the Vulkan, and
 `decisions/DR-0002` if you want to know which of this repository's claims have been checked.
