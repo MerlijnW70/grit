@@ -23,6 +23,7 @@
 //!   lean wires      among equally right chips prefer the cheaper: 1 by gates, wires by wires
 //!   steps 4         cut the word into four, one piece a step — time
 //!   state 2         rows wired from the last column back to the first — memory
+//!   hold 4          four more steps after the word, with nothing arriving
 //!   colony 65536    how many chips search at once — the way out of a local optimum
 //!   island 256      how many of them share an arena — the colony if left out
 //!   seed 1234       where the random grids start, which decides more than it looks
@@ -166,6 +167,30 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # Stretching the memory, which turns out not to be one
+//!
+//! `hold N` runs N further steps after the word has arrived, with the input rows at nought, so
+//! whatever the chip still knows has to be in the state rows. Six starts on the sequential counter:
+//!
+//! ```text
+//!   hold      0     1     2     4     8    16
+//!   of 48  44.3  42.8  44.0  43.5  43.3  43.5
+//!   exact  13.1  12.1  12.8  12.6  12.3  12.6   of 16 inputs
+//! ```
+//!
+//! **Sixteen empty steps cost nothing measurable**, and that is 176 columns of gates the answer
+//! passes through after the last bit of the word. It is not monotone and `hold 1` is the worst of
+//! the six, which is the spread of the starts rather than anything about holding.
+//!
+//! **And the reason is that nothing is being held.** The report now says when the state rows stop
+//! changing: after step 4 of 8 at `hold 4` and after step 4 of 20 at `hold 16`, on every one of the
+//! sixteen inputs. Three ones arriving reads 9, 12, 13, 15 and then 15 for as long as you like. The
+//! search built a latch at a fixed point, so the hold is free for any length rather than for the
+//! ones that were measured — and it is not a memory that could have decayed.
+//!
+//! What it does cost is its passes, which are the whole of the frame: 48 passes a tick at 212.8 us
+//! on the device, 96 at 400.4 and 240 at 970.0, the lowest of three starts each.
 //!
 //! # The price of the third wire, which is nothing on the card and something in silicon
 //!
@@ -1086,22 +1111,28 @@ fn feed(
     cases: u32,
     colony: u32,
     step: u32,
-    fan: u32,
-    state: u32,
-    first: bool,
+    exam: &Exam,
 ) -> Result<Vec<u32>, LaneError> {
+    let (fan, state) = (exam.bits / exam.steps, exam.state);
+    let (first, blank) = (step == 0, step >= exam.steps);
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let none = kernel.module().constant_u32(0)?;
     let one = kernel.module().constant_u32(1)?;
     let held = kernel.load_at(COUNTS, none)?;
     let (chip, row, case) = wire_at(&mut kernel, subgroup, cases, colony, held)?;
 
-    // This step's slice of the word: bit `step * fan + row` of the input.
-    let along = kernel.module().constant_u32(step * fan)?;
+    // This step's slice of the word: bit `step * fan + row` of the input. **After `hold` has
+    // started there is no slice left**, and the input rows arrive at nought so that everything the
+    // chip still knows is in the state rows and nowhere else.
     let uint = kernel.index_type();
-    let reach = kernel.module().i_add(uint, row, along)?;
-    let shifted = shift_down(&mut kernel, case, reach)?;
-    let arriving = low_bits(&mut kernel, shifted, 1)?;
+    let arriving = if blank {
+        none
+    } else {
+        let along = kernel.module().constant_u32(step * fan)?;
+        let reach = kernel.module().i_add(uint, row, along)?;
+        let shifted = shift_down(&mut kernel, case, reach)?;
+        low_bits(&mut kernel, shifted, 1)?
+    };
 
     // What was on this row when the last step finished, or nought where there was no last step.
     let carried = if first {
@@ -1451,6 +1482,11 @@ struct Exam {
     lean: u32,
     /// How many pieces the input word is cut into, one arriving a step.
     steps: u32,
+    /// How many further steps run after the word has arrived, with the input rows at nought.
+    ///
+    /// **This is the only thing that asks the memory to hold rather than to work.** During a hold
+    /// nothing arrives, so whatever the chip still knows is in the state rows.
+    hold: u32,
     /// How many rows are wired from the last column back to the first, which is all the memory there
     /// is.
     state: u32,
@@ -1570,6 +1606,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut ladder = false;
     let mut weigh = 0;
     let mut slack = 0;
+    let mut hold = 0;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
     let mut lean = 0;
@@ -1600,6 +1637,12 @@ fn read(text: &str) -> Result<Exam, String> {
                     .next()
                     .and_then(|it| it.parse::<u32>().ok())
                     .ok_or_else(|| say("`slack` wants a number"))?;
+            }
+            (Some("hold"), _) => {
+                hold = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .ok_or_else(|| say("`hold` wants a number"))?;
             }
             (Some("ladder"), _) => {
                 ladder = word.next() != Some("0");
@@ -1801,6 +1844,9 @@ fn read(text: &str) -> Result<Exam, String> {
     if weigh != 0 && outputs < 2 {
         return Err("`weigh` needs more than one answer to weigh".to_string());
     }
+    if hold != 0 && state == 0 {
+        return Err("`hold` with no `state` holds nothing: the rows are the only memory".to_string());
+    }
     if slack != 0 && weigh != 0 {
         return Err("`slack` scores a whole answer at a time, so there is nothing to weigh".to_string());
     }
@@ -1813,8 +1859,8 @@ fn read(text: &str) -> Result<Exam, String> {
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, state, colony,
-        island, seed, want, ask, name,
+        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, hold, state,
+        colony, island, seed, want, ask, name,
     })
 }
 
@@ -1833,12 +1879,12 @@ fn stirred(seed: &mut u32) -> u32 {
 fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
     let fan = exam.bits / exam.steps;
     let mut last: Vec<u32> = vec![0; ROWS as usize];
-    for step in 0..exam.steps {
+    for step in 0..exam.steps + exam.hold {
         let keep = |row: u32| last.get(row as usize).copied().unwrap_or(0);
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
                 if row < fan {
-                    (case >> (step * fan + row)) & 1
+                    if step >= exam.steps { 0 } else { (case >> (step * fan + row)) & 1 }
                 } else if row < fan + exam.state {
                     if step == 0 { 0 } else { keep(row) }
                 } else if row == ROWS - 1 {
@@ -1911,6 +1957,27 @@ fn scored(genome: &[u32], exam: &Exam) -> u32 {
         .sum()
 }
 
+/// After which step the state rows stop changing, and on how many inputs they never do.
+///
+/// **A hold that costs nothing is a hold that is not being asked for anything.** If the state
+/// settles while the word is still arriving, everything after that is a latch holding a fixed
+/// point, and it would hold for any number of steps rather than for the ones that were measured.
+fn settles(genome: &[u32], exam: &Exam) -> (u32, u32) {
+    let (mut latest, mut never) = (0, 0);
+    for case in 0..exam.cases() {
+        let seen = remembers(genome, case, exam);
+        let last = seen.last().copied().unwrap_or(0);
+        match seen.iter().rposition(|&it| it != last) {
+            Some(at) if at + 1 < seen.len() => {
+                latest = latest.max(u32::try_from(at).unwrap_or(0) + 1);
+            }
+            Some(_) => never += 1,
+            None => {}
+        }
+    }
+    (latest, never)
+}
+
 /// On how many inputs every marked bit of the answer is right, and how far wrong it is when it is
 /// not.
 ///
@@ -1944,12 +2011,12 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<u32> {
     let fan = exam.bits / exam.steps;
     let mut last: Vec<u32> = vec![0; ROWS as usize];
     let mut seen = Vec::with_capacity(exam.steps as usize);
-    for step in 0..exam.steps {
+    for step in 0..exam.steps + exam.hold {
         let keep = |row: u32| last.get(row as usize).copied().unwrap_or(0);
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
                 if row < fan {
-                    (case >> (step * fan + row)) & 1
+                    if step >= exam.steps { 0 } else { (case >> (step * fan + row)) & 1 }
                 } else if row < fan + exam.state {
                     if step == 0 { 0 } else { keep(row) }
                 } else if row == ROWS - 1 {
@@ -2292,14 +2359,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // **One pass through the grid a step, and as many steps as the exam asks for.** The state rows
     // carry across the seam between them and nothing else does.
-    let fan = exam.bits / exam.steps;
     let mut modules = vec![
         advance(width)?,
         select(width, colony, exam.island, &exam.allowed)?,
         ready(width, cases)?,
     ];
-    for step in 0..exam.steps {
-        modules.push(feed(width, cases, colony, step, fan, exam.state, step == 0)?);
+    for step in 0..exam.steps + exam.hold {
+        modules.push(feed(width, cases, colony, step, &exam)?);
         for column in 1..COLUMNS {
             modules.push(propagate(width, column, cases, colony, exam.noise, &exam.allowed)?);
         }
@@ -2314,7 +2380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![Groups::Fixed(colony / width)],
         vec![Groups::Counting(1)],
     ];
-    for _ in 0..exam.steps {
+    for _ in 0..exam.steps + exam.hold {
         for _ in 0..COLUMNS {
             stages.push(vec![wires]);
         }
@@ -2569,6 +2635,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let again = scored(genome, &exam);
     let (whole, worst) = exactly(genome, &exam);
+    if exam.state > 0 {
+        let (latest, never) = settles(genome, &exam);
+        let of = exam.steps + exam.hold;
+        if never == 0 {
+            println!("  the state stops changing after step {latest} of {of}, on every input");
+        } else {
+            println!(
+                "  the state stops changing after step {latest} of {of}, but never on {never} \
+                 inputs"
+            );
+        }
+    }
     // The card's own count, from the plain total under `sum` and from the answers written down
     // apart under the other two, because there the score is not a count of right answers.
     let card = if exam.weigh == 0 {
