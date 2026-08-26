@@ -350,17 +350,31 @@ fn water_goes_flat_where_sand_heaps_up() {
         "the water lies {shallowest} deep in one place and {deepest} in another, which is not level"
     );
 
-    // **And what does not stop, said plainly.** A hundred and twenty-eight cells do not divide into
-    // sixty-two columns, so some of the water has no level place to be. Those cells pace back and
-    // forth until they meet another of their kind and block each other — over four thousand frames
-    // this falls from four to two, and it does not reach nought. No rule that reads one 2×2 block
-    // could make it: whether there is somewhere lower to go is a property of the whole surface.
-    //
-    // What is bounded is how much of it there is, which is what the work list cares about.
-    assert!(
-        moving * 16 < poured as usize,
-        "{moving} of {poured} cells are still moving, which is more than a remainder"
-    );
+    // **And that it stops, which it used not to.** A hundred and twenty-eight cells do not divide
+    // into sixty-two columns, so four of them have no level place to be — and they used to pace back
+    // and forth for ever, because a rule reading one 2×2 block cannot tell them from water that
+    // ought to flow. What it can read is its own past, and `sand::TIRED` is three bits of it: at
+    // `sand::PATIENCE` a cell stops asking for a direction. This bound was `moving * 16 < poured`
+    // and is now nought.
+    assert_eq!(moving, 0, "{moving} of {poured} cells are still running");
+
+    // The same claim without the loophole. No direction is a snapshot: a cell may be about to be
+    // given one on the very next frame, and counting words would not see it. So step the settled
+    // grid again on the host — **in both phases**, because the partition's origin alternates and a
+    // cell with nowhere to go this frame may have somewhere the next — and demand it come back
+    // unchanged. Nothing that cannot move is the whole of what "the work list reaches nought" means.
+    for phase in 0..2 {
+        let again = sand::settle_reference(grid, phase, &settled);
+        let differs = again
+            .iter()
+            .zip(&settled)
+            .position(|(there, here)| there != here);
+        assert!(
+            differs.is_none(),
+            "a further step in phase {phase} moved cell {:?}, so the water has not come to rest",
+            differs.unwrap_or(0)
+        );
+    }
 }
 
 #[test]

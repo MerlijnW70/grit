@@ -20,7 +20,7 @@
 
 use grit::compact::Plan;
 use grit::layout::{AWAKE, BINDINGS, BRUSH, DENSE, GRAND, PARAMS, PIXELS, STATE};
-use grit::sand::{self, AIR, Grid, SAND, WALL};
+use grit::sand::{self, AIR, Grid, SAND, WALL, WATER};
 use grit::sweep;
 use grit::{Groups, Host, Resident};
 
@@ -29,10 +29,19 @@ const WIDE: u32 = 512;
 const DEEP: u32 = 256;
 
 /// How many frames the two runs are compared over.
-const FRAMES: u32 = 700;
+///
+/// **Enough that the list reaches nought**, which is what the last assertion here demands and what a
+/// scene with water in it takes a while to do: a runner moves one cell a frame, and levelling a pool
+/// five hundred columns wide is thousands of them. Measured on this scene — the list fell to nine at
+/// four thousand frames and to nought between four thousand and four and a half. Six is that with
+/// margin, and costs the test about four seconds.
+const FRAMES: u32 = 6000;
 
 /// How long the pour lasts, in frames.
 const POURING: u32 = 90;
+
+/// And how long the water lasts after it, in frames.
+const WETTING: u32 = 180;
 
 /// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
@@ -65,8 +74,20 @@ fn room(grid: Grid) -> Vec<u32> {
 }
 
 /// The brush the two runs share, so the only difference between them is the dispatch.
+///
+/// **Sand first and then water**, because they fail differently and this test used to see only one
+/// of them. Sand is what proves the list can reach nothing: a heap stops, and a wake rule keyed to
+/// movement stops with it. Water is what proves the list is never *wrong*: a runner crosses the
+/// world sideways through cells that are not changing, which is exactly the case a movement-keyed
+/// rule would lose — and, since `sand::TIRED` went in, the case where a cell's own history decides
+/// whether it moves. A rule that reads history is a rule with state, and state is the thing a
+/// listed run and a whole-grid run can disagree about.
 fn brushing(frame: u32) -> [u32; 4] {
-    let material = if frame < POURING { SAND } else { AIR };
+    let material = match frame {
+        0..POURING => SAND,
+        POURING..WETTING => WATER,
+        _ => AIR,
+    };
     [190, 30, 36, material]
 }
 

@@ -188,7 +188,9 @@ identical every frame.
 
 Sand proves the list can reach nothing. Water proves the list is never wrong: a runner crosses the
 world sideways through cells that are not changing, which is exactly what a wake rule keyed to
-movement would lose.
+movement would lose. **Both are poured in the same run** — sand, then water, then nothing — because
+`sand::TIRED` made the rule depend on a cell's own history, and history is the thing a listed run and
+a whole-grid run can disagree about. Six thousand frames, cell for cell, ending at a list of nought.
 
 Every test is run at subgroup **32** (RTX 4080), **64** (integrated Radeon) and **8** and **4**
 (Mesa lavapipe). `GRIT_DEVICE` picks by substring.
@@ -197,10 +199,14 @@ Every test is run at subgroup **32** (RTX 4080), **64** (integrated Radeon) and 
 
 ## Things that are true and unflattering
 
-* **Water does not entirely stop.** A pool levels to what fits in a whole layer, and the remainder —
-  128 cells do not divide by 62 columns — paces about looking for somewhere to be. No rule reading
-  one 2×2 block can know where it belongs; whether there is somewhere lower is a property of the
-  whole surface. `tests/sand.rs` bounds it rather than pretending it is nought.
+* **Water takes a long time to stop, and a cell has to be allowed to give up.** A pool levels to what
+  fits in a whole layer, and the remainder — 128 cells do not divide by 62 columns — used to pace
+  about looking for somewhere to be, for ever. No rule reading one 2×2 block can know where it
+  belongs: whether there is somewhere lower is a property of the whole surface. What a rule *can*
+  read is the cell's own past, and `sand::TIRED` is three bits of it — how many times this cell has
+  taken a direction without ever descending. At `sand::PATIENCE` it stops asking, and `fall` clears
+  the count because *what lands is bare*. `tests/sand.rs` now demands nought rather than bounding it,
+  and demands a further step in both phases change nothing at all.
 * **A frame's wall clock is a submit and a fence**, about a hundred microseconds on this machine
   whatever is inside it. The table above was measured with `Resident::frames`, which records twenty
   frames into one command buffer and divides. Measured the other way, the coarse level *appeared to

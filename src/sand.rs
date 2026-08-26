@@ -148,6 +148,63 @@ const CARRIED_BITS: u32 = 4;
 /// the middle that never moved again, on either flank, for four thousand frames.
 pub const HELD: u32 = 1 << CARRIED_BITS;
 
+/// How many bits count the times a cell has taken a direction and got nowhere.
+const TIRED_BITS: u32 = 3;
+
+/// One step of that counter: the bit above [`HELD`].
+///
+/// # Why a fluid needs to be able to give up
+///
+/// [`start`] fires on the one thing a 2×2 block can see — water directly underneath — and that
+/// stands in for "there is somewhere lower to go" almost everywhere. Where it fails is the
+/// remainder: a hundred and twenty-eight cells do not divide into sixty-two columns, and the four
+/// left over sit on a level surface with air beside them, which is indistinguishable from water that
+/// *should* flow. So they take a direction, run until something stops them, and are handed the same
+/// direction again next frame. For ever.
+///
+/// **That is not a cosmetic fault.** The claim this repository exists to make is that the work list
+/// reaches nought when nothing is happening, and a few dozen quads kept awake by cells pacing about
+/// is that claim being false in the only case anyone would check.
+///
+/// No rule reading one block can tell those four cells from the rest — whether there is somewhere
+/// lower is a property of the whole surface. What a rule *can* see is its own history, and this is
+/// that history in three bits: how many times this cell has been given a direction without ever
+/// descending. At [`PATIENCE`] it stops asking, the word stops changing, and the quad goes to sleep.
+///
+/// # What clears it
+///
+/// [`fall`] does, and nothing else has to: *what lands is bare*. A cell that moves down has got
+/// somewhere, which is the whole of what the counter was measuring the absence of — so the rule that
+/// strips a landing cell's direction and memory strips this with them, and it was already written
+/// that way before there was anything here to strip.
+pub const TIRED: u32 = HELD << 1;
+
+/// How many times a cell may take a direction before it stops asking.
+///
+/// The counter saturates rather than wraps, and it does so by never being incremented past this:
+/// [`start`] refuses a cell that has reached it, so the add below it can only ever see a value one
+/// short. A counter that wrapped would make a cell fresh again and the pacing would resume.
+///
+/// # What the number was chosen from
+///
+/// Too small and a cell gives up while the surface under it is still moving, which is not a fluid
+/// that has come to rest but one that has been stopped mid-level. Measured on the basin in
+/// `tests/sand.rs` — a hundred and twenty-eight cells poured into sixty-two columns:
+///
+/// ```text
+///   bits  patience   water lies      still running
+///      1         1   1 to 7 deep                 0     not level, and the test says so
+///      2         3   2 to 3 deep                 0
+///      3         7   2 to 3 deep                 0
+/// ```
+///
+/// So **two bits is the measured minimum and three is what is here**, because what the third buys is
+/// headroom that nothing measures: a cell restarts when something stops it, and how often that
+/// happens over a basin sixty-two columns wide says little about one four thousand wide. The bit
+/// costs nothing — the word uses seven of its thirty-two — and being stopped mid-level is the
+/// failure that a picture does not show and this test does.
+pub const PATIENCE: u32 = (1 << TIRED_BITS) - 1;
+
 /// What [`running`] gives back for [`RUNNING_LEFT`]. Nought is water going nowhere.
 const LEFTWARD: u32 = 1;
 /// What [`running`] gives back for [`RUNNING_RIGHT`].
@@ -199,16 +256,39 @@ pub fn hold<const LANES: u32>(
     let both = lanes.mul(wet, standing)?;
     let carried = low_bits::<LANES>(lanes, cell, CARRIED_BITS)?;
     let set = lanes.mul(both, bit)?;
-    lanes.add(carried, set)
+    let kept = lanes.add(carried, set)?;
+
+    // **And the fatigue rides through.** This rebuilds the word from its low bits up, so anything
+    // above the memory has to be put back by hand or a cell would arrive fresh every second frame —
+    // which is exactly how often this is called, and would have made [`TIRED`] count nothing.
+    let step = lanes.splat_bits::<U32, LANES>(TIRED)?;
+    let worn = tired::<LANES>(lanes, cell)?;
+    let worn = lanes.mul(worn, step)?;
+    lanes.add(kept, worn)
 }
 
 /// Whether a cell remembers standing on water.
+///
+/// **One bit, and it has to say so.** This used to be the whole of the word above the direction,
+/// which was the same thing right up until [`TIRED`] went in above it — and then every cell that had
+/// ever tried to run would have read as standing on water whatever it was standing on.
 pub fn held<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     cell: Vector<U32, LANES>,
 ) -> Result<Vector<U32, LANES>, LaneError> {
     let by = lanes.splat_bits::<U32, LANES>(CARRIED_BITS)?;
-    lanes.shift_right_logical(cell, by)
+    let above = lanes.shift_right_logical(cell, by)?;
+    low_bits::<LANES>(lanes, above, 1)
+}
+
+/// How many times this cell has taken a direction without ever getting lower. See [`TIRED`].
+pub fn tired<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    cell: Vector<U32, LANES>,
+) -> Result<Vector<U32, LANES>, LaneError> {
+    let by = lanes.splat_bits::<U32, LANES>(CARRIED_BITS + 1)?;
+    let above = lanes.shift_right_logical(cell, by)?;
+    low_bits::<LANES>(lanes, above, TIRED_BITS)
 }
 
 /// The same things on the host, so the reference and the kernel cannot drift apart.
@@ -223,20 +303,27 @@ pub const fn running_of(word: u32) -> u32 {
     (word >> MATERIAL_BITS) % (1 << MATERIAL_BITS)
 }
 
-/// The host's [`held`].
+/// The host's [`held`]. One bit, for the reason that function gives.
 #[must_use]
 pub const fn held_of(word: u32) -> u32 {
-    word >> CARRIED_BITS
+    (word >> CARRIED_BITS) % 2
+}
+
+/// The host's [`tired`].
+#[must_use]
+pub const fn tired_of(word: u32) -> u32 {
+    (word >> (CARRIED_BITS + 1)) % (1 << TIRED_BITS)
 }
 
 /// The host's [`hold`].
 #[must_use]
 pub const fn hold_of(word: u32, under: u32) -> u32 {
     let carried = word % HELD;
+    let worn = tired_of(word) * TIRED;
     if material_of(word) == WATER && material_of(under) == WATER {
-        carried + HELD
+        carried + HELD + worn
     } else {
-        carried
+        carried + worn
     }
 }
 
@@ -505,10 +592,16 @@ pub fn course<const LANES: u32>(
     // Blocked is stopped, and stopping drops the direction and keeps the memory: a runner that has
     // been brought up short is standing on whatever it was standing on a moment ago.
     let bit = lanes.splat_bits::<U32, LANES>(HELD)?;
+    let step = lanes.splat_bits::<U32, LANES>(TIRED)?;
     let halt = |lanes: &mut Lanes<'_>, cell: Vector<U32, LANES>, kind: Vector<U32, LANES>| {
         let memory = held::<LANES>(lanes, cell)?;
         let up = lanes.mul(memory, bit)?;
-        lanes.add(kind, up)
+        let stilled = lanes.add(kind, up)?;
+        // The fatigue too, and this is the one place it matters most: being brought up short is
+        // what the counter is counting, so a halt that dropped it would count nothing at all.
+        let worn = tired::<LANES>(lanes, cell)?;
+        let worn = lanes.mul(worn, step)?;
+        lanes.add(stilled, worn)
     };
     let stops_here = lanes.mul(wants_right, right_shut)?;
     let stops_there = lanes.mul(wants_left, left_shut)?;
@@ -598,10 +691,29 @@ pub fn start<const LANES: u32>(
     let c_free = is(lanes, c, air)?;
     let d_free = is(lanes, d, air)?;
 
+    // **And a fourth condition: that this cell has not already tried and got nowhere.** See
+    // [`TIRED`] for what that is for. It is a condition on the cell's own past rather than on its
+    // neighbourhood, which is the only kind of thing left for a rule that has read every cell it is
+    // allowed to read and still cannot tell a runner from a remainder.
+    let willing = |lanes: &mut Lanes<'_>, cell: Vector<U32, LANES>| {
+        let worn = tired::<LANES>(lanes, cell)?;
+        let done = lanes.splat_bits::<U32, LANES>(PATIENCE)?;
+        let spare = lanes.greater_than(done, worn)?;
+        lanes.select(spare, one, none)
+    };
+    let a_spare = willing(lanes, a)?;
+    let b_spare = willing(lanes, b)?;
+    let c_spare = willing(lanes, c)?;
+    let d_spare = willing(lanes, d)?;
+
     let a_goes = all(lanes, a_idle, a_held, b_free)?;
     let b_goes = all(lanes, b_idle, b_held, a_free)?;
     let c_goes = all(lanes, c_idle, c_held, d_free)?;
     let d_goes = all(lanes, d_idle, d_held, c_free)?;
+    let a_goes = lanes.mul(a_goes, a_spare)?;
+    let b_goes = lanes.mul(b_goes, b_spare)?;
+    let c_goes = lanes.mul(c_goes, c_spare)?;
+    let d_goes = lanes.mul(d_goes, d_spare)?;
 
     let goes = |lanes: &mut Lanes<'_>,
                 cell: Vector<U32, LANES>,
@@ -614,6 +726,16 @@ pub fn start<const LANES: u32>(
         let up = lanes.splat_bits::<U32, LANES>(HELD)?;
         let kept = lanes.mul(bit, up)?;
         let running = lanes.add(way, kept)?;
+
+        // **One higher, and it cannot wrap.** A cell only reaches here with fewer than [`PATIENCE`]
+        // behind it, because that is the fourth condition above — so this add tops out at the
+        // largest value the counter holds and stays there. A counter that wrapped would hand the
+        // cell its patience back and the pacing would start again.
+        let step = lanes.splat_bits::<U32, LANES>(TIRED)?;
+        let worn = tired::<LANES>(lanes, cell)?;
+        let worn = lanes.add(worn, one)?;
+        let worn = lanes.mul(worn, step)?;
+        let running = lanes.add(running, worn)?;
         lanes.select(fires, running, cell)
     };
     Ok([
@@ -703,7 +825,9 @@ pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
             let right_free = material_of(there) == AIR;
             let left_free = material_of(here) == AIR;
 
-            let halt = |word: u32| material_of(word) + held_of(word) * HELD;
+            let halt = |word: u32| {
+                material_of(word) + held_of(word) * HELD + tired_of(word) * TIRED
+            };
             let kept_left = if goes_right && !right_free {
                 halt(here)
             } else {
@@ -732,18 +856,21 @@ pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
         let (a, b) = (read(&cells, 0), read(&cells, 1));
         let (c, d) = (read(&cells, 2), read(&cells, 3));
         let idle = |word: u32| material_of(word) == WATER && running_of(word) == 0;
-        let ready = |word: u32| idle(word) && held_of(word) != 0;
+        // `held_of` is one or nought and `tired_of` is below `PATIENCE` here, so the words written
+        // below are the whole of what the rule produces rather than a common case of it.
+        let ready = |word: u32| idle(word) && held_of(word) != 0 && tired_of(word) < PATIENCE;
+        let started = |word: u32, way: u32| way + HELD + (tired_of(word) + 1) * TIRED;
         if ready(a) && material_of(b) == AIR {
-            put(&mut cells, 0, RUNNING_RIGHT + HELD);
+            put(&mut cells, 0, started(a, RUNNING_RIGHT));
         }
         if ready(b) && material_of(a) == AIR {
-            put(&mut cells, 1, RUNNING_LEFT + HELD);
+            put(&mut cells, 1, started(b, RUNNING_LEFT));
         }
         if ready(c) && material_of(d) == AIR {
-            put(&mut cells, 2, RUNNING_RIGHT + HELD);
+            put(&mut cells, 2, started(c, RUNNING_RIGHT));
         }
         if ready(d) && material_of(c) == AIR {
-            put(&mut cells, 3, RUNNING_LEFT + HELD);
+            put(&mut cells, 3, started(d, RUNNING_LEFT));
         }
 
         along(&mut cells, 0, 1);

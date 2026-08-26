@@ -50,11 +50,13 @@
 //! million. Pour sand, and it climbs into the hundreds; stop, and it falls to *nought* once the pile
 //! stops moving — while the grid it is not looking at stays four million quads the whole time.
 //!
-//! Water is the other half of that. It runs sideways until it is level, so a pool keeps a few dozen
-//! quads awake long after it looks still: a hundred and twenty-eight cells do not divide evenly into
-//! sixty-two columns, and the remainder paces about looking for somewhere to be. `tests/sand.rs`
-//! measures exactly how much of it there is and says why no rule reading one 2×2 block can do
-//! better.
+//! Water is the other half of that, and it takes far longer. It runs sideways one cell a frame until
+//! it is level, so a pool five hundred columns wide keeps quads awake for thousands of frames after
+//! it looks still. It does reach nought: the cells that have nowhere to be — a hundred and twenty-
+//! eight do not divide evenly into sixty-two columns — give up after `sand::PATIENCE` tries rather
+//! than pacing about for ever, which is the one thing a rule reading a single 2×2 block can do about
+//! a question that is really about the whole surface. `tests/sand.rs` demands it reach nought and
+//! that a further step move nothing.
 
 use std::time::{Duration, Instant};
 
