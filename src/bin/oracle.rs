@@ -14,6 +14,7 @@
 //!   # a comment
 //!   inputs 4        how many inputs, one to six
 //!   outputs 3       how many answer bits — one if left out
+//!   apart 3         read the answers three rows apart instead of next to each other
 //!   ladder 1        reveal one output bit at a time, widening when it is mastered
 //!   gates and or not   the gates it draws from; wire is always in
 //!   noise 16        break one gate in sixteen each generation
@@ -82,9 +83,27 @@
 //! comes. And the three interfere: separately they are worth 16, 14.5 and 16, which is 46.5, and
 //! together they are worth 42.5. Four bits go missing in the sharing.
 //!
-//! The outputs are read off adjacent rows of the last column and the wiring is diagonal, so three
-//! answers on rows nought, one and two are computed out of very nearly the same cells. That is a
-//! guess at the interference and it is not measured.
+//! # Where the four bits go, which is not where this file said
+//!
+//! This file used to guess that the answers were read off adjacent rows and so came out of very
+//! nearly the same cells. Both halves of that are now measured and the second one is wrong.
+//!
+//! `apart` moves the answers onto rows nought, three and six instead of nought, one and two. Over
+//! eight starts it is worth 41.6, 42.5 and 42.1 of 48 at one, two and three rows apart, which is
+//! not monotone and inside the spread of the starts. Spacing them changes nothing.
+//!
+//! Sharing is real and it is not the cost. Tracing each answer's cone back from the row it is read
+//! off with the three of them three rows apart, they share 89% of their gates at twelve columns,
+//! 68% at eight and 20% at five, because a cone widens a row a column on each side and eleven
+//! columns is wider than eight rows. The grids that share
+//! least score worst: 42, 42, 43, 41 at twelve columns against 36, 38, 36, 37 at five. The shared
+//! cone is what the answers are made of, not what they lose.
+//!
+//! What the four bits are spent on is the score itself. Trying every gate in every allowed kind on
+//! the finished chip and scoring each answer alone, bit one is short on all four starts — 10, 13,
+//! 12 and 12 of 16 while the outer two sit at 14 to 16 — and of the changes that raise it, 24 of
+//! 26, 1 of 2, 1 of 1 and 1 of 1 are refused by the total, because the same change costs an outer
+//! bit. The interference is in the adding up, not in the silicon.
 //!
 //! # Making it work under faults, which costs more than it buys
 //!
@@ -1008,6 +1027,7 @@ fn tally(
     outputs: u32,
     colony: u32,
     lean: bool,
+    apart: u32,
 ) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -1024,7 +1044,7 @@ fn tally(
         let want = kernel.load_at(TARGET, which)?;
         let asked = kernel.load_at(KEEP, which)?;
         for output in 0..outputs {
-            let row = kernel.module().constant_u32(output)?;
+            let row = kernel.module().constant_u32(output * apart)?;
             let at = wire(&mut kernel, chip, COLUMNS - 1, row, which, cases)?;
             let said = kernel.load_at(WIRE, at)?;
             // **Both sides carry a mask.** A bit the exam left out counts for nothing either way, on
@@ -1073,6 +1093,11 @@ struct Exam {
     /// ten times the generations changes nothing and the same starts still fail; four times the
     /// colony takes three starts in eight to six, and sixteen times takes it to eight.
     colony: u32,
+    /// How many rows apart the answers are read. One is next to each other, which is what it was.
+    ///
+    /// **It is worth nothing and it is kept for saying so.** Eight starts on `count` give 41.6,
+    /// 42.5 and 42.1 of 48 at one, two and three apart.
+    apart: u32,
     /// Whether the exam is revealed one output bit at a time instead of all at once.
     ladder: bool,
     /// Which gates the search draws from. Wire is always in it, because a grid needs somewhere
@@ -1159,6 +1184,7 @@ fn spread_of(pattern: &str) -> Vec<u32> {
 ///   # a comment
 ///   inputs 4        how many inputs, one to six
 ///   outputs 3       how many answer bits — one if left out
+///   apart 3         read the answers three rows apart instead of next to each other
 ///   ladder 1        reveal one output bit at a time, widening when it is mastered
 ///   gates and or not   the gates it draws from; wire is always in
 ///   noise 16        break one gate in sixteen each generation
@@ -1185,6 +1211,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut outputs = 1_u32;
     let mut seed = 0x0AC1_E000_u32;
     let mut colony = 1_u32 << 12;
+    let mut apart = 1_u32;
     let mut ladder = false;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
@@ -1204,6 +1231,13 @@ fn read(text: &str) -> Result<Exam, String> {
         let say = |what: &str| format!("line {}: {what}", number + 1);
         let mut word = line.split_whitespace();
         match (word.next(), bits) {
+            (Some("apart"), _) => {
+                apart = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .filter(|&it| (1..ROWS).contains(&it))
+                    .ok_or_else(|| say("`apart` wants a number from one to seven"))?;
+            }
             (Some("ladder"), _) => {
                 ladder = word.next() != Some("0");
             }
@@ -1374,9 +1408,17 @@ fn read(text: &str) -> Result<Exam, String> {
             bits / steps
         ));
     }
+    if outputs > 0 && (outputs - 1) * apart >= ROWS - 1 {
+        return Err(format!(
+            "{outputs} answers {apart} rows apart do not fit above the bottom row"
+        ));
+    }
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
-    Ok(Exam { bits, outputs, ladder, allowed, noise, lean, steps, state, colony, island, seed, want, ask, name })
+    Ok(Exam {
+        bits, outputs, apart, ladder, allowed, noise, lean, steps, state, colony, island, seed,
+        want, ask, name,
+    })
 }
 
 // ---------- the host, which lays out the arena and then asks almost nothing ----------
@@ -1429,7 +1471,7 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
     }
     // The answer is the top `outputs` wires after the last step, packed as the exam packs it.
     (0..exam.outputs)
-        .filter(|&at| last.get(at as usize).copied().unwrap_or(0) == 1)
+        .filter(|&at| last.get((at * exam.apart) as usize).copied().unwrap_or(0) == 1)
         .fold(0_u32, |held, at| held | (1 << at))
 }
 /// How many of the marked answer bits this chip gets right, worked out on the host.
@@ -1514,6 +1556,42 @@ fn unpack(score: u32, lean: bool) -> (u32, u32) {
     }
 }
 
+/// The cells one answer alone depends on, traced back from the row it is read off.
+///
+/// **As [`live`], but for a single output.** Two answers that share most of their cells are two
+/// answers computed by the same circuit, and a change that helps one moves the other whether or not
+/// that was wanted. Counting the sharing is what says whether that is happening.
+fn cone(genome: &[u32], exam: &Exam, output: u32) -> Vec<bool> {
+    let mut wanted = vec![false; (COLUMNS * ROWS) as usize];
+    let at = |column: u32, row: u32| (column * ROWS + row % ROWS) as usize;
+    if let Some(slot) = wanted.get_mut(at(COLUMNS - 1, output * exam.apart)) {
+        *slot = true;
+    }
+    let mut used = vec![false; CELLS as usize];
+    for column in (1..COLUMNS).rev() {
+        for row in 0..ROWS {
+            if !wanted.get(at(column, row)).copied().unwrap_or(false) {
+                continue;
+            }
+            let cell = ((column - 1) * ROWS + row) as usize;
+            let kind = genome.get(cell).copied().unwrap_or(0);
+            if let Some(slot) = used.get_mut(cell) {
+                *slot = kind != 0;
+            }
+            let reaches: [u32; 2] = if kind == 0 || kind == 4 {
+                [row, row]
+            } else {
+                [row + ROWS - 1, row + 1]
+            };
+            for back in reaches {
+                if let Some(slot) = wanted.get_mut(at(column - 1, back)) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    used
+}
 /// Which cells the answer actually depends on, traced backwards from the wires it is read off.
 ///
 /// # Opening the box
@@ -1528,7 +1606,8 @@ fn live(genome: &[u32], exam: &Exam) -> Vec<bool> {
     let mut wanted = vec![false; (COLUMNS * ROWS) as usize];
     let at = |column: u32, row: u32| (column * ROWS + row % ROWS) as usize;
     for row in 0..exam.outputs.max(fan + exam.state) {
-        let reads_it = row < exam.outputs || (row >= fan && row < fan + exam.state);
+        let reads_it = (row % exam.apart == 0 && row / exam.apart < exam.outputs)
+            || (row >= fan && row < fan + exam.state);
         if let Some(slot) = wanted.get_mut(at(COLUMNS - 1, row)).filter(|_| reads_it) {
             *slot = true;
         }
@@ -1587,11 +1666,79 @@ fn faults(genome: &[u32], exam: &Exam) -> (u32, u32, u32) {
     }
     (counted, survived, whole)
 }
+/// How many marked bits each answer gets right on its own.
+fn each(genome: &[u32], exam: &Exam) -> Vec<u32> {
+    let mut held = vec![0_u32; exam.outputs as usize];
+    for case in 0..exam.cases() {
+        let said = runs(genome, case, exam);
+        let want = exam.want.get(case as usize).copied().unwrap_or(0);
+        let ask = exam.ask.get(case as usize).copied().unwrap_or(0);
+        for at in 0..exam.outputs {
+            let right = (ask >> at) & 1 == 1 && (said >> at) & 1 == (want >> at) & 1;
+            if let (true, Some(slot)) = (right, held.get_mut(at as usize)) {
+                *slot += 1;
+            }
+        }
+    }
+    held
+}
+
+/// What every single-gate change would do to each answer separately.
+///
+/// # Where the missing bits went
+///
+/// The three answers of `count` score forty-six and a half asked one at a time and forty-two and a
+/// half asked together, and the four bits between those numbers had to go somewhere. Sharing cells
+/// is not where: the answers share ninety per cent of their gates and the ones that share least
+/// score worst. This counts the other candidate — a change that raises one answer and lowers
+/// another — by trying every gate in every allowed kind on the chip the search finished with, and
+/// scoring each answer on its own before and after.
+fn pulls(genome: &[u32], exam: &Exam) -> (u32, u32, u32, u32, usize, u32, u32) {
+    let was = each(genome, exam);
+    let (mut trades, mut gains, mut losses, mut flat) = (0, 0, 0, 0);
+    let (mut lifts, mut refused) = (0, 0);
+    let weakest = (0..exam.outputs as usize)
+        .min_by_key(|&at| was.get(at).copied().unwrap_or(0))
+        .unwrap_or(0);
+    let mut tried = genome.to_vec();
+    for cell in 0..CELLS as usize {
+        let held = genome.get(cell).copied().unwrap_or(0);
+        for &kind in &exam.allowed {
+            if kind == held {
+                continue;
+            }
+            if let Some(slot) = tried.get_mut(cell) {
+                *slot = kind;
+            }
+            let now = each(&tried, exam);
+            let up = (0..exam.outputs as usize).any(|at| now.get(at) > was.get(at));
+            let down = (0..exam.outputs as usize).any(|at| now.get(at) < was.get(at));
+            match (up, down) {
+                (true, true) => trades += 1,
+                (true, false) => gains += 1,
+                (false, true) => losses += 1,
+                (false, false) => flat += 1,
+            }
+            if now.get(weakest) > was.get(weakest) {
+                lifts += 1;
+                let sum = |held: &[u32]| held.iter().sum::<u32>();
+                if sum(&now) < sum(&was) {
+                    refused += 1;
+                }
+            }
+        }
+        if let Some(slot) = tried.get_mut(cell) {
+            *slot = held;
+        }
+    }
+    (trades, gains, losses, flat, weakest, lifts, refused)
+}
+
 /// The chip as something to look at: one letter a gate, the inputs down the left.
 ///
 /// **An arrow marks an answer wire.** Output nought is the top row of the last column, output one
 /// the row under it, and the exam says how many there are.
-fn drawn(genome: &[u32], bits: u32, outputs: u32, alive: &[bool]) -> String {
+fn drawn(genome: &[u32], bits: u32, outputs: u32, apart: u32, alive: &[bool]) -> String {
     let mut out = String::new();
     for row in 0..ROWS {
         out.push_str("    ");
@@ -1617,9 +1764,9 @@ fn drawn(genome: &[u32], bits: u32, outputs: u32, alive: &[bool]) -> String {
                 _ => '-',
             });
         }
-        if row < outputs {
+        if row % apart == 0 && row / apart < outputs {
             out.push_str(" <- ");
-            out.push(char::from(b'0' + u8::try_from(row).unwrap_or(0)));
+            out.push(char::from(b'0' + u8::try_from(row / apart).unwrap_or(0)));
         }
         out.push('\n');
     }
@@ -1695,7 +1842,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             modules.push(propagate(width, column, cases, colony, exam.noise)?);
         }
     }
-    modules.push(tally(width, cases, exam.outputs, colony, exam.lean)?);
+    modules.push(tally(width, cases, exam.outputs, colony, exam.lean, exam.apart)?);
     let held: Vec<&[u32]> = modules.iter().map(Vec::as_slice).collect();
 
     let wires = Groups::From { binding: COUNTS as usize, at: 1 };
@@ -1813,8 +1960,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(winner * CELLS as usize..(winner + 1) * CELLS as usize)
         .unwrap_or(&[]);
     let alive = live(genome, &exam);
-    println!("\n{}", drawn(genome, exam.bits, exam.outputs, &alive));
+    println!("\n{}", drawn(genome, exam.bits, exam.outputs, exam.apart, &alive));
     println!("    - wire   & and   v or   ^ xor   ! not   · dead   (<- marks an answer wire)");
+    if exam.outputs > 1 {
+        let apiece = each(genome, &exam);
+        let (trades, gains, losses, flat, weakest, lifts, refused) = pulls(genome, &exam);
+        println!("  what each answer is worth on its own: {apiece:?}");
+        println!(
+            "  of every single-gate change: {trades} pull two answers apart, {gains} help at \
+             no cost, {losses} only hurt, {flat} change nothing"
+        );
+        println!(
+            "  answer {weakest} is the short one: {lifts} changes raise it, {refused} of \
+             those the total score refuses"
+        );
+
+        let cones: Vec<Vec<bool>> = (0..exam.outputs).map(|it| cone(genome, &exam, it)).collect();
+        println!("  what each answer is built from:");
+        for (which, held) in cones.iter().enumerate() {
+            let own = held.iter().filter(|&&it| it).count();
+            let shared = held
+                .iter()
+                .enumerate()
+                .filter(|&(cell, &it)| {
+                    it && cones.iter().enumerate().any(|(other, that)| {
+                        other != which && that.get(cell).copied().unwrap_or(false)
+                    })
+                })
+                .count();
+            println!("    answer {which}: {own} gates, {shared} of them shared with another answer");
+        }
+        println!();
+    }
     let (live_gates, survived, whole) = faults(genome, &exam);
     println!(
         "\n  {live_gates} of {CELLS} gates carry the answer; the rest are scenery."
