@@ -81,6 +81,46 @@ fn line(points: &[(f64, f64)]) -> (f64, f64) {
     (mean_y - slope * mean_x, slope)
 }
 
+/// How many indirect passes the switch sweep covers.
+const SWITCHED: [usize; 6] = [1, 2, 4, 8, 16, 32];
+
+/// The best of [`TRIES`] frames of `n` indirect passes in one stage, in device nanoseconds.
+///
+/// Every pass reads its own workgroup count out of binding 1, three words apart, exactly as
+/// [`grit::compact::Plan::listed`] does. `live` is what the host puts there — but the recording
+/// cannot tell, which is the point: the command buffer is the same either way.
+fn switched(host: &Host, width: u32, n: usize, live: bool) -> f64 {
+    let module = nothing(width).expect("a kernel");
+    let modules: Vec<&[u32]> = vec![&module; n];
+    let mut held = host
+        .resident(&[4, 3 * n], &modules)
+        .expect("two device buffers");
+    let mut counts = vec![0_u32; 3 * n];
+    for i in 0..n {
+        counts[3 * i] = u32::from(live);
+        counts[3 * i + 1] = 1;
+        counts[3 * i + 2] = 1;
+    }
+    held.write(1, &counts).expect("the switches");
+
+    let groups: Vec<Groups> = (0..n)
+        .map(|i| Groups::From {
+            binding: 1,
+            at: 3 * i,
+        })
+        .collect();
+    let stages: Vec<&[Groups]> = vec![&groups];
+
+    let mut best = f64::MAX;
+    for _ in 0..TRIES {
+        held.staged_frames(&stages, 20).expect("frames");
+        if let Some(card) = held.on_device() {
+            best = best.min(card.as_nanos() as f64);
+        }
+    }
+    best
+}
+
 #[test]
 fn what_a_submission_costs_before_it_holds_anything() {
     let Some(host) = device("floor") else {
@@ -215,5 +255,50 @@ fn what_a_submission_costs_before_it_holds_anything() {
     assert!(
         fused_each > empty_each,
         "eight dispatches cost {fused_each} ns and none cost {empty_each} ns, so a dispatch is free"
+    );
+
+    // **What a pass costs when the device decided it should not run**, which is the one price this
+    // file had never taken. `Groups::Fixed(0)` is not recorded at all — `Resident` drops it and
+    // `tests/dispatch.rs` checks that it does. A `Groups::From` whose count the device wrote *is*
+    // recorded, because the host does not know what the count says: the command buffer holds a
+    // dispatch that turns out to launch nothing.
+    //
+    // It is the price of a branch not taken. The count buffer can be written by a kernel, so a
+    // frame that records every path it could take and lets the device choose pays this once per
+    // path per frame. Against a barrier's thousand nanoseconds that would be a few paths at most.
+    //
+    // **In one stage, not eight**, so what the slope holds is dispatches and not barriers.
+    println!("\n  {:>7}  {:>12}  {:>12}", "passes", "off (ns)", "on (ns)");
+    let mut off = Vec::new();
+    let mut on = Vec::new();
+    for count in SWITCHED {
+        let dead = switched(&host, width, count, false);
+        let alive = switched(&host, width, count, true);
+        println!("  {count:>7}  {dead:>12.0}  {alive:>12.0}");
+        off.push((count as f64, dead));
+        on.push((count as f64, alive));
+    }
+    let (off_once, off_each) = line(&off);
+    let (on_once, on_each) = line(&on);
+    println!(
+        "  a pass the device switched off is {off_each:.0} ns; one it left on {on_each:.0} ns \
+         (intercepts {off_once:.0} and {on_once:.0})"
+    );
+
+    assert!(
+        off_each > 0.0 && on_each > 0.0,
+        "a pass costing nothing at all means the sweep measured something other than passes: \
+         {off_each:.0} and {on_each:.0} ns"
+    );
+    assert!(
+        off_each < on_each,
+        "a pass the device switched off cost {off_each:.0} ns against {on_each:.0} for one it left \
+         on, so what the count buffer holds is not reaching the dispatch"
+    );
+    assert!(
+        off_each < (split_each - fused_each) / (PASSES - 1) as f64,
+        "a pass the device switched off cost {off_each:.0} ns against {:.0} for a barrier, so \
+         recording a path not taken is not the cheap half of the arrangement",
+        (split_each - fused_each) / (PASSES - 1) as f64
     );
 }
