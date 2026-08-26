@@ -15,6 +15,7 @@
 //!   inputs 4        how many inputs, one to six
 //!   outputs 3       how many answer bits — one if left out
 //!   colony 65536    how many chips search at once — the way out of a local optimum
+//!   island 256      how many of them share an arena — the colony if left out
 //!   seed 1234       where the random grids start, which decides more than it looks
 //!   parity          fill the table: the parity of the inputs
 //!   majority        fill the table: more ones than noughts
@@ -120,6 +121,35 @@
 //!    8x24    65 536    8 of 8      2 261 µs
 //! ```
 //!
+//! # Arenas, which turned out not to matter
+//!
+//! If a bigger colony helps because it is more independent climbs, then splitting one colony into
+//! arenas that barely talk should help at the same size. `island` says how many chips share one,
+//! and every `MIGRATE` ticks the partner is drawn from the whole colony instead so a find can
+//! travel. It does nothing:
+//!
+//! ```text
+//!   colony    island   solved
+//!    4 096     4 096   0 of 8      one arena, which is what this was before
+//!    4 096     1 024   0 of 8
+//!    4 096       256   0 of 8
+//!    4 096        64   0 of 8
+//!    4 096   256, no migration at all   0 of 8
+//!
+//!   16 384    16 384   6 of 8
+//!   16 384     4 096   6 of 8
+//!   16 384     1 024   5 of 8
+//!   16 384       256   6 of 8
+//! ```
+//!
+//! **So the colony helps by how many chips there are and not by how they are arranged.** Sixty-four
+//! arenas of sixty-four search no better than one arena of four thousand, and cutting the migration
+//! entirely changes nothing either. Whatever a bigger colony is buying, it is not the diversity that
+//! isolation preserves.
+//!
+//! The knob stays because these numbers are the finding, and a finding is worth retesting on the
+//! next exam rather than believing about it.
+//!
 //! Four times the colony on the narrow grid beats twice the depth, and sixteen times solves it
 //! every start. It costs fourteen times as much a generation, which is the trade stated rather
 //! than hidden — and `colony` is a line in the exam, so it is the writer's to make.
@@ -199,14 +229,15 @@ const ROWS: u32 = 8;
 const COLUMNS: u32 = 12;
 /// How many gates a chip holds, which is the length of a genome.
 const CELLS: u32 = (COLUMNS - 1) * ROWS;
+/// How many ticks between one migration and the next. A power of two.
+const MIGRATE: u32 = 64;
+
 /// How many kinds of gate there are.
 const KINDS: u32 = 5;
 
 /// How many gates a mutation turns over at once.
 const MUTATIONS: u32 = 1;
 
-/// How many chips are in the arena. A power of two: the wrap is a shift.
-const COLONY: u32 = 1 << 12;
 /// How many generations to run.
 const GENERATIONS: u32 = 4_000;
 /// How many go into one submission.
@@ -391,7 +422,7 @@ fn advance(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 ///
 /// **Half the colony at a time**, as the other two demonstrations do and for the same reason: a
 /// genome is read while others are written, so the ones being read from stand still.
-fn select(subgroup: u32, colony: u32) -> Result<Vec<u32>, LaneError> {
+fn select(subgroup: u32, colony: u32, island: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let who = mine(&mut kernel, subgroup)?;
@@ -403,18 +434,36 @@ fn select(subgroup: u32, colony: u32) -> Result<Vec<u32>, LaneError> {
     let turn = low_bits(&mut kernel, who, 1)?;
     let my_turn = is(&mut kernel, turn, parity)?;
 
-    // **A different partner every generation, and always one of the other parity.** Measuring against
-    // the chip next door only is an island of two: a good genome never travels and a bad one loses
-    // to the same opponent for ever. The stride comes from the tick and is odd, so the partner is
-    // the parity that is standing still this turn.
+    // **A different partner every generation, and always one of the other parity.** Measuring
+    // against the chip next door only is an island of two: a good genome never travels and a bad
+    // one loses to the same opponent for ever. The stride comes from the tick and is odd, so the
+    // partner is the parity that is standing still this turn.
+    //
+    // **And it stays inside the island.** `island` is how many chips share an arena; the colony is
+    // that many arenas side by side in the same buffer, and a genome crosses from one to the next
+    // only on a migration tick. An island the size of the colony is one arena, which is what this
+    // did before there were any.
+    //
+    // The parity guarantee survives the split: an island is a power of two, so wrapping inside one
+    // keeps the parity that an odd stride flipped.
     let at_tick = kernel.module().constant_u32(0)?;
     let tick = kernel.load_at(PARAMS, at_tick)?;
-    let spread = low_bits(&mut kernel, tick, COLONY.trailing_zeros())?;
+    let spread = low_bits(&mut kernel, tick, island.trailing_zeros())?;
     let two = kernel.module().constant_u32(2)?;
     let doubled = kernel.module().i_mul(uint, spread, two)?;
     let stride = kernel.module().i_add(uint, doubled, one)?;
     let raised = kernel.module().i_add(uint, who, stride)?;
-    let neighbour = low_bits(&mut kernel, raised, colony.trailing_zeros())?;
+    let inside = low_bits(&mut kernel, who, island.trailing_zeros())?;
+    let shore = minus(&mut kernel, who, inside)?;
+    let walked = low_bits(&mut kernel, raised, island.trailing_zeros())?;
+    let near = kernel.module().i_add(uint, shore, walked)?;
+    // Every `MIGRATE` ticks the partner is drawn from the whole colony instead, so an island that
+    // found something can hand it on and one that is stuck can be handed something.
+    let far = low_bits(&mut kernel, raised, colony.trailing_zeros())?;
+    let season = low_bits(&mut kernel, tick, MIGRATE.trailing_zeros())?;
+    let none_yet = kernel.module().constant_u32(0)?;
+    let crossing = is(&mut kernel, season, none_yet)?;
+    let neighbour = pick(&mut kernel, crossing, far, near)?;
     let ours = kernel.load_at(SCORE, who)?;
     let theirs = kernel.load_at(SCORE, neighbour)?;
     let better = above(&mut kernel, theirs, ours)?;
@@ -688,6 +737,8 @@ struct Exam {
     /// ten times the generations changes nothing and the same starts still fail; four times the
     /// colony takes three starts in eight to six, and sixteen times takes it to eight.
     colony: u32,
+    /// How many chips share an arena. The colony is this many arenas side by side.
+    island: u32,
     /// Where the random grids start.
     ///
     /// **It matters more than anything else in this file.** Five starts on the parity of six inputs
@@ -759,6 +810,7 @@ fn spread_of(pattern: &str) -> Vec<u32> {
 ///   inputs 4        how many inputs, one to six
 ///   outputs 3       how many answer bits — one if left out
 ///   colony 65536    how many chips search at once — the way out of a local optimum
+///   island 256      how many of them share an arena — the colony if left out
 ///   seed 1234       where the random grids start, which decides more than it looks
 ///   parity          fill the table: the parity of the inputs
 ///   majority        fill the table: more ones than noughts
@@ -777,6 +829,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut outputs = 1_u32;
     let mut seed = 0x0AC1_E000_u32;
     let mut colony = 1_u32 << 12;
+    let mut island = None;
     let mut want: Vec<u32> = Vec::new();
     let mut ask: Vec<u32> = Vec::new();
     let mut name = String::from("an exam");
@@ -795,6 +848,14 @@ fn read(text: &str) -> Result<Exam, String> {
                     .and_then(|it| it.parse::<u32>().ok())
                     .filter(|it| it.is_power_of_two() && (64..=1 << 17).contains(it))
                     .ok_or_else(|| say("`colony` wants a power of two from 64 to 131072"))?;
+            }
+            (Some("island"), _) => {
+                island = Some(
+                    word.next()
+                        .and_then(|it| it.parse::<u32>().ok())
+                        .filter(|it| it.is_power_of_two() && (2..=1 << 17).contains(it))
+                        .ok_or_else(|| say("`island` wants a power of two of at least two"))?,
+                );
             }
             (Some("seed"), _) => {
                 seed = word
@@ -895,7 +956,8 @@ fn read(text: &str) -> Result<Exam, String> {
         }
     }
     let bits = bits.ok_or_else(|| String::from("the exam says nothing about `inputs`"))?;
-    Ok(Exam { bits, outputs, colony, seed, want, ask, name })
+    let island = island.unwrap_or(colony).min(colony);
+    Ok(Exam { bits, outputs, colony, island, seed, want, ask, name })
 }
 
 // ---------- the host, which lays out the arena and then asks almost nothing ----------
@@ -1043,7 +1105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut modules = vec![
         advance(width)?,
-        select(width, colony)?,
+        select(width, colony, exam.island)?,
         ready(width, cases)?,
         feed(width, cases, colony)?,
     ];
