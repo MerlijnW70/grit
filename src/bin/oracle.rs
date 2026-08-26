@@ -14,6 +14,8 @@
 //!   # a comment
 //!   inputs 4        how many inputs, one to six
 //!   outputs 3       how many answer bits — one if left out
+//!   gates and or not   the gates it draws from; wire is always in
+//!   noise 16        break one gate in sixteen each generation
 //!   lean 1          among equally right chips, prefer the one with fewer gates
 //!   steps 4         cut the word into four, one piece a step — time
 //!   state 2         rows wired from the last column back to the first — memory
@@ -47,6 +49,67 @@
 //! A grid of gates, drawn, and a number: how many of the marked cases it gets right. That number is
 //! worked out twice, once by the card while it was evolving and once by the host afterwards from the
 //! genome alone, and the report prints both. They have to agree.
+//!
+//! # Making it work under faults, which costs more than it buys
+//!
+//! Measuring a fault afterwards says what a circuit happens to survive. `noise 32` breaks one gate
+//! in thirty-two while it evolves, so surviving is something to be selected for. Which gates are
+//! broken comes from the tick and the cell — the same fault for every chip, so nobody is judged
+//! against an easier grid — and it holds for `SETTLED` generations, because a score measured under
+//! one pattern and compared under another selects for having been lucky. Drawing a fresh pattern
+//! every generation did exactly that: it took eight starts in eight down to none.
+//!
+//! Held still, parity of four bits, eight starts, with the survey run afterwards on a clean grid:
+//!
+//! ```text
+//!   noise    right     faults survived
+//!       0    8 of 8    118 of 348   33%
+//!      32    5 of 8    139 of 354   39%
+//!      16    2 of 8    118 of 322   36%
+//! ```
+//!
+//! **Six points of robustness for three of the eight answers.** It is a real effect and a poor
+//! trade, and more noise is worse at both. Fault tolerance here is something to be paid for, not
+//! something that emerges.
+//!
+//! # What the gate set decides, which is not what is expressible
+//!
+//! `gates` says which kinds the search draws from — the starting grids as well as the mutations,
+//! because restricting one and not the other is not a restriction. Eight starts:
+//!
+//! ```text
+//!                        every gate   xor only   and or not
+//!   parity of four          8 of 8     8 of 8      0 of 8
+//!   detect 1110             8 of 8     0 of 8      0 of 8
+//! ```
+//!
+//! **And, or and not is functionally complete**: every one of these answers exists in that set, and
+//! parity is a textbook construction in it. The search never arrives — 9 of 16 against a chance of
+//! 8. Exclusive-or alone finds parity every start and never finds an *and* of three inputs.
+//!
+//! So the gate set decides what is findable rather than what is expressible, and which restriction
+//! hurts depends on the task rather than on how complete the set is.
+//!
+//! # Reading the memory
+//!
+//! The state rows are the only thing crossing from one step to the next, so what a chip remembers is
+//! in them and nowhere else. The report writes them down after every step. Parity of four bits, one
+//! bit at a time, one row of state:
+//!
+//! ```text
+//!   0000   state 1 -> 0 -> 1 -> 0
+//!   1000   state 0 -> 1 -> 0 -> 1
+//!   0110   state 1 -> 1 -> 1 -> 0
+//!   1110   state 0 -> 0 -> 0 -> 1
+//! ```
+//!
+//! **It is a parity counter and it is not the one anybody would write.** All-noughts goes 1, 0, 1, 0
+//! — the state turns over every step whether or not it was shown a one. What it holds is the parity
+//! so far *exclusive-or the step number*, and the gates that read it undo the alternation. Every row
+//! above fits that and so does every row not shown.
+//!
+//! Nothing asked for a tidy encoding, so nothing produced one. What the state means has to be read
+//! off the machine rather than assumed from what it is for.
 //!
 //! # Opening the box, pressing on it, and breaking it
 //!
@@ -342,6 +405,9 @@ const ROWS: u32 = 8;
 const COLUMNS: u32 = 12;
 /// How many gates a chip holds, which is the length of a genome.
 const CELLS: u32 = (COLUMNS - 1) * ROWS;
+/// How many generations one fault pattern stands before another is drawn. A power of two.
+const SETTLED: u32 = 64;
+
 /// How many ticks between one migration and the next. A power of two.
 const MIGRATE: u32 = 64;
 
@@ -535,7 +601,12 @@ fn advance(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 ///
 /// **Half the colony at a time**, as the other two demonstrations do and for the same reason: a
 /// genome is read while others are written, so the ones being read from stand still.
-fn select(subgroup: u32, colony: u32, island: u32) -> Result<Vec<u32>, LaneError> {
+fn select(
+    subgroup: u32,
+    colony: u32,
+    island: u32,
+    allowed: &[u32],
+) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let who = mine(&mut kernel, subgroup)?;
@@ -605,8 +676,18 @@ fn select(subgroup: u32, colony: u32, island: u32) -> Result<Vec<u32>, LaneError
         let drawn = low_bits(&mut kernel, seed, CELLS.next_power_of_two().trailing_zeros())?;
         let spot = at_most(&mut kernel, drawn, CELLS - 1)?;
         seed = stir(&mut kernel, seed)?;
-        let rolled = low_bits(&mut kernel, seed, KINDS.next_power_of_two().trailing_zeros())?;
-        let fresh = at_most(&mut kernel, rolled, KINDS - 1)?;
+        // **Drawn from what the exam allows, not from every gate there is.** The index is picked
+        // and then turned into a kind, so a set of three is three kinds and never a fourth.
+        let wide = u32::try_from(allowed.len().max(1)).unwrap_or(1);
+        let rolled = low_bits(&mut kernel, seed, wide.next_power_of_two().trailing_zeros())?;
+        let which = at_most(&mut kernel, rolled, wide - 1)?;
+        let mut fresh = kernel.module().constant_u32(allowed.first().copied().unwrap_or(0))?;
+        for (index, &kind) in allowed.iter().enumerate().skip(1) {
+            let want = kernel.module().constant_u32(u32::try_from(index).unwrap_or(0))?;
+            let hit = is(&mut kernel, which, want)?;
+            let value = kernel.module().constant_u32(kind)?;
+            fresh = pick(&mut kernel, hit, value, fresh)?;
+        }
         spots.push((spot, fresh));
     }
     let again = seed;
@@ -785,7 +866,13 @@ fn feed(
 /// **Eleven of these are generated**, one a column, which is what an emitter buys over a shader
 /// language. Every gate is computed and the genome picks which answer is kept: a `Predicate` is not
 /// a value, and `decisions/DR-0003` has no branches.
-fn propagate(subgroup: u32, column: u32, cases: u32, colony: u32) -> Result<Vec<u32>, LaneError> {
+fn propagate(
+    subgroup: u32,
+    column: u32,
+    cases: u32,
+    colony: u32,
+    noise: u32,
+) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let none = kernel.module().constant_u32(0)?;
@@ -835,6 +922,31 @@ fn propagate(subgroup: u32, column: u32, cases: u32, colony: u32) -> Result<Vec<
         let want = kernel.module().constant_u32(number)?;
         let hit = is(&mut kernel, kind, want)?;
         answer = pick(&mut kernel, hit, value, answer)?;
+    }
+
+    // **A gate that is broken this generation passes its left neighbour through**, which is the
+    // cheapest fault there is. Which gates are broken comes from the tick and the cell, so it is the
+    // same fault for every chip — nobody is scored against an easier grid than anybody else — and a
+    // different one next generation. A chip that leans on one gate is punished the generation that
+    // gate is out; one that does not, is not.
+    if noise > 0 {
+        let at_tick = kernel.module().constant_u32(0)?;
+        let tick = kernel.load_at(PARAMS, at_tick)?;
+        // **The fault pattern holds for `SETTLED` generations.** Drawing a new one every generation
+        // makes a chip carry a score measured under one pattern into a tournament judged under
+        // another, which selects for having been lucky. Held still, the scores inside an epoch are
+        // about the same grid, and it is over epochs that leaning on one gate is punished.
+        let epoch = down_by(&mut kernel, tick, SETTLED.trailing_zeros())?;
+        let apart = kernel.module().constant_u32(2_654_435_761)?;
+        let spread = kernel.module().i_mul(uint, epoch, apart)?;
+        let cell_at = kernel.module().constant_u32((column - 1) * ROWS)?;
+        let placed = kernel.module().i_add(uint, cell_at, row)?;
+        let mixed = kernel.module().i_add(uint, spread, placed)?;
+        let drawn = stir(&mut kernel, mixed)?;
+        let narrowed = low_bits(&mut kernel, drawn, noise.trailing_zeros())?;
+        let none_left = kernel.module().constant_u32(0)?;
+        let broken = is(&mut kernel, narrowed, none_left)?;
+        answer = pick(&mut kernel, broken, straight, answer)?;
     }
     let at = wire(&mut kernel, chip, column, row, case, cases)?;
     kernel.store_at(WIRE, at, answer)?;
@@ -922,6 +1034,11 @@ struct Exam {
     /// ten times the generations changes nothing and the same starts still fail; four times the
     /// colony takes three starts in eight to six, and sixteen times takes it to eight.
     colony: u32,
+    /// Which gates the search draws from. Wire is always in it, because a grid needs somewhere
+    /// for a signal to go.
+    allowed: Vec<u32>,
+    /// One gate in this many is broken each generation, or nought for none. A power of two.
+    noise: u32,
     /// Whether a chip with fewer gates beats an equally correct one with more.
     lean: bool,
     /// How many pieces the input word is cut into, one arriving a step.
@@ -1001,6 +1118,8 @@ fn spread_of(pattern: &str) -> Vec<u32> {
 ///   # a comment
 ///   inputs 4        how many inputs, one to six
 ///   outputs 3       how many answer bits — one if left out
+///   gates and or not   the gates it draws from; wire is always in
+///   noise 16        break one gate in sixteen each generation
 ///   lean 1          among equally right chips, prefer the one with fewer gates
 ///   steps 4         cut the word into four, one piece a step — time
 ///   state 2         rows wired from the last column back to the first — memory
@@ -1024,6 +1143,8 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut outputs = 1_u32;
     let mut seed = 0x0AC1_E000_u32;
     let mut colony = 1_u32 << 12;
+    let mut allowed: Option<Vec<u32>> = None;
+    let mut noise = 0_u32;
     let mut lean = false;
     let mut steps = 1_u32;
     let mut state = 0_u32;
@@ -1040,6 +1161,33 @@ fn read(text: &str) -> Result<Exam, String> {
         let say = |what: &str| format!("line {}: {what}", number + 1);
         let mut word = line.split_whitespace();
         match (word.next(), bits) {
+            (Some("gates"), _) => {
+                let mut kinds = vec![0_u32];
+                for name in word.by_ref() {
+                    let kind = match name {
+                        "wire" => 0,
+                        "and" => 1,
+                        "or" => 2,
+                        "xor" => 3,
+                        "not" => 4,
+                        _ => return Err(say("a gate is wire, and, or, xor or not")),
+                    };
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+                if kinds.len() < 2 {
+                    return Err(say("`gates` wants at least one gate besides wire"));
+                }
+                allowed = Some(kinds);
+            }
+            (Some("noise"), _) => {
+                noise = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .filter(|&it| it == 0 || it.is_power_of_two())
+                    .ok_or_else(|| say("`noise` wants nought or a power of two"))?;
+            }
             (Some("lean"), _) => {
                 lean = word.next() != Some("0");
             }
@@ -1181,7 +1329,8 @@ fn read(text: &str) -> Result<Exam, String> {
         ));
     }
     let island = island.unwrap_or(colony).min(colony);
-    Ok(Exam { bits, outputs, lean, steps, state, colony, island, seed, want, ask, name })
+    let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
+    Ok(Exam { bits, outputs, allowed, noise, lean, steps, state, colony, island, seed, want, ask, name })
 }
 
 // ---------- the host, which lays out the arena and then asks almost nothing ----------
@@ -1256,6 +1405,57 @@ fn scored(genome: &[u32], exam: &Exam) -> u32 {
         .sum()
 }
 
+/// What the state rows hold after each step, for one input.
+///
+/// # Reading a machine off a grid
+///
+/// The state rows are the only thing that crosses from one step to the next, so whatever the chip
+/// remembers is in them and nowhere else. Running an input and writing the rows down after every
+/// step is the state machine, in the encoding the search happened to pick — which is nobody's idea
+/// of a good one and is still the whole of it.
+fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<u32> {
+    let fan = exam.bits / exam.steps;
+    let mut last: Vec<u32> = vec![0; ROWS as usize];
+    let mut seen = Vec::with_capacity(exam.steps as usize);
+    for step in 0..exam.steps {
+        let keep = |row: u32| last.get(row as usize).copied().unwrap_or(0);
+        let mut column: Vec<u32> = (0..ROWS)
+            .map(|row| {
+                if row < fan {
+                    (case >> (step * fan + row)) & 1
+                } else if row < fan + exam.state {
+                    if step == 0 { 0 } else { keep(row) }
+                } else if row == ROWS - 1 {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect();
+        for at in 1..COLUMNS {
+            let read = |row: u32| column.get((row % ROWS) as usize).copied().unwrap_or(0);
+            let next: Vec<u32> = (0..ROWS)
+                .map(|row| {
+                    let (up, down, straight) = (read(row + ROWS - 1), read(row + 1), read(row));
+                    match genome.get(((at - 1) * ROWS + row) as usize).copied() {
+                        Some(1) => up.min(down),
+                        Some(2) => up.max(down),
+                        Some(3) => (up + down) & 1,
+                        Some(4) => 1 - straight,
+                        _ => straight,
+                    }
+                })
+                .collect();
+            column = next;
+        }
+        let held = (fan..fan + exam.state)
+            .filter(|&row| column.get(row as usize).copied().unwrap_or(0) == 1)
+            .fold(0_u32, |bits, row| bits | (1 << (row - fan)));
+        seen.push(held);
+        last = column;
+    }
+    seen
+}
 /// Take a score apart: how much of it is being right, and how many gates were spent.
 ///
 /// With `lean` off a score is the answer bits and nothing else. With it on the gates are packed
@@ -1440,13 +1640,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fan = exam.bits / exam.steps;
     let mut modules = vec![
         advance(width)?,
-        select(width, colony, exam.island)?,
+        select(width, colony, exam.island, &exam.allowed)?,
         ready(width, cases)?,
     ];
     for step in 0..exam.steps {
         modules.push(feed(width, cases, colony, step, fan, exam.state, step == 0)?);
         for column in 1..COLUMNS {
-            modules.push(propagate(width, column, cases, colony)?);
+            modules.push(propagate(width, column, cases, colony, exam.noise)?);
         }
     }
     modules.push(tally(width, cases, exam.outputs, colony, exam.lean)?);
@@ -1490,7 +1690,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     arena.write(TARGET as usize, &exam.want)?;
     arena.write(KEEP as usize, &exam.ask)?;
     let mut seed = exam.seed;
-    let genes: Vec<u32> = (0..colony * CELLS).map(|_| stirred(&mut seed) % KINDS).collect();
+    // **Drawn from what the exam allows**, or the restriction is only half a restriction: the grids
+    // would start full of gates the mutation is never allowed to put back.
+    let genes: Vec<u32> = (0..colony * CELLS)
+        .map(|_| {
+            let at = stirred(&mut seed) as usize % exam.allowed.len().max(1);
+            exam.allowed.get(at).copied().unwrap_or(0)
+        })
+        .collect();
     arena.write(GENE as usize, &genes)?;
     let seeds: Vec<u32> = (0..=colony).map(|_| stirred(&mut seed)).collect();
     arena.write(SEED as usize, &seeds)?;
@@ -1544,6 +1751,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // bits and is free on the rest, so the table below is the difference between the exam and the
     // answer — and it is where an encoding that collapses to one wire shows itself.
     if cases <= 16 {
+        if exam.state > 0 {
+            println!("  what it remembers, step by step:");
+            for case in 0..cases.min(8) {
+                let pattern: String = (0..exam.bits)
+                    .map(|at| if (case >> at) & 1 == 1 { '1' } else { '0' })
+                    .collect();
+                let held: Vec<String> = remembers(genome, case, &exam)
+                    .iter()
+                    .map(|it| format!("{it}"))
+                    .collect();
+                println!("    {pattern}   state {}", held.join(" -> "));
+            }
+            println!();
+        }
         println!("  every input, and what it answers:");
         for case in 0..cases {
             let pattern: String = (0..exam.bits)
