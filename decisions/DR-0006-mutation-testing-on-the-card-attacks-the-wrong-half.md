@@ -26,4 +26,4 @@ execution went to nought — against 2.86× for removing the build.
 
 These figures are `hyperia`'s gate and say nothing about a codebase whose test execution is
 arithmetic rather than process startup, and the SPIR-V mutator that `simdr`'s `src/decode.rs` makes
-reachable is NIET GEMETEN.
+reachable is NOT MEASURED.
