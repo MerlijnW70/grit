@@ -19,6 +19,16 @@
 
 #![deny(missing_docs)]
 
+/// The front page, pulled in so that `cargo test` compiles the snippet in it.
+///
+/// `cfg(doctest)` rather than `doc`: this adds no public surface and no second copy of the README on
+/// the crate's own page. What it adds is that a snippet which stops compiling stops the build —
+/// which is the same arrangement `simdr` uses for its `USING.md`, and the same failure this
+/// repository has been finding all week in prose that nothing ran.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct Readme;
+
 pub mod compact;
 pub mod gate;
 pub mod host;
