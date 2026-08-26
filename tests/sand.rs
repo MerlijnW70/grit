@@ -19,7 +19,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::layout::{LOOKING, PARAMS, PIXELS, STATE};
-use grit::sand::BINDINGS;
+use grit::sand::{BINDINGS, WEIGHTS};
 use grit::sand::{
     self, AIR, Grid, RUNNING_RIGHT, SAND, View, WALL, WATER, material_of, running_of,
 };
@@ -466,4 +466,38 @@ fn frame_counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
     let next = kernel.module().i_add(element, now, one)?;
     kernel.store_at(0, slot, next)?;
     kernel.finish()
+}
+
+/// [`WEIGHTS`] is in weight order, which is the whole of why `fall` is one comparison.
+///
+/// # What was wrong with it before
+///
+/// Nothing read it. It was a `pub const` two doc comments pointed at to explain why the rule works
+/// — "a material's properties have to *be* its number" — and the property it asserts was checked by
+/// no line of code anywhere. Renumbering `WATER` above `SAND` would have left every doc in
+/// `src/sand.rs` describing an ordering the constants no longer had, and the simulation would have
+/// gone on running with water sinking through sand.
+///
+/// So the array is load-bearing now: it holds every material this crate has, and it holds them
+/// heaviest last.
+#[test]
+fn the_materials_are_in_the_order_the_rule_needs() {
+    assert_eq!(
+        WEIGHTS,
+        [AIR, WATER, SAND, WALL],
+        "a material was added or moved without the order being restated"
+    );
+    for pair in WEIGHTS.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "{} is not lighter than {}, so `fall`'s one comparison is not the rule it says it is",
+            pair[0],
+            pair[1]
+        );
+    }
+    assert_eq!(
+        *WEIGHTS.last().expect("four materials"),
+        WALL,
+        "WALL is not heaviest, so something can sit above it and sink it"
+    );
 }
