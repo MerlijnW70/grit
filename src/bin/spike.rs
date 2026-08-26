@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Pass one: the frame number, incremented on the device.
 ///
 /// **The whole point of the spike in four instructions.** A host that wrote this each frame would
-/// pay a submit and a fence for one word — about a hundred microseconds by `decisions/DR-0008`'s
+/// pay a submit and a fence for one word — 41 µs by `tests/floor.rs`.s
 /// measurement, for four bytes. The device already has the number; it can add to it.
 ///
 /// Every invocation of the one workgroup writes the same value to the same slot, which is the case

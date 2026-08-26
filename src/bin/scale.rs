@@ -12,8 +12,8 @@
 //!
 //! # The timing is twenty frames to a submission, and that is not a detail
 //!
-//! `Resident::frame` times a submit and a fence around the work, and on this machine that round
-//! trip is about a hundred microseconds whatever is inside it. Measured that way every size looked
+//! `Resident::frame` times a submit and a fence around the work, and on this machine that costs
+//! 37 µs whatever is inside it — `tests/floor.rs` prices it. Measured that way every size looked
 //! like "a hundred and something", and a change that halved the work was invisible — worse,
 //! the first version of the coarse gate *appeared to make things slower* and nearly went in the bin
 //! on that evidence.
@@ -35,12 +35,16 @@
 //! three passes dispatched over a compacted list of the blocks that hold something, so a cold block
 //! is not launched at all.
 //!
-//! **The last column is not about work at all.** By then the frame was sixteen passes with a barrier
-//! between each, and a barrier is a full pipeline flush. Priced by taking five passes out at a size
-//! where none of them had anything to do — 60.2 µs to 41.2 µs — which is about 3.8 µs a barrier, and
-//! sixteen of those is very nearly the whole frame. *Staged* is the same sixteen passes in eleven
-//! stages, which is `crate::live::wired` saying which of them do not read what their neighbours
-//! write.
+//! **The last three columns are not about work at all.** By then the frame was sixteen passes with a
+//! barrier between each, and a barrier is a full pipeline flush. Priced by taking five passes out at
+//! a size where none of them had anything to do — 60.2 µs to 41.2 µs, so about 3.8 µs a barrier —
+//! and sixteen of those is very nearly the whole frame. *Staged* is the same sixteen passes in
+//! eleven stages, which is `crate::live::wired` saying which of them do not read what their
+//! neighbours write.
+//!
+//! That 3.8 µs was a **wide** barrier, and the next column is why it is not the number any more:
+//! `tests/floor.rs` prices a narrowed one at 1004 ns and a dispatch at 224 ns, on an apparatus that
+//! has no simulation in it at all.
 //!
 //! *Narrowed* is the same eleven stages with `DRAW_INDIRECT` named only in the four barriers that
 //! precede a dispatch reading its count from a buffer. `Resident` had it in all ten, on the written
@@ -146,7 +150,7 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
         let (x, y) = (grid.wide / 2, grid.deep / 8);
         resident.write_at(PARAMS as usize, BRUSH, &[x, y, 49, material])?;
         // **Twenty frames a submission, and the timing divided by twenty.** One frame's wall clock
-        // is a hundred microseconds of submit and fence whatever is inside it, so it cannot tell a
+        // is 37 µs of submit and fence whatever is inside it, so it cannot tell a
         // pass that got cheaper from one that did not. See `Resident::frames`.
         spent += resident.staged_frames(&groups, BATCH)?;
 

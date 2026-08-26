@@ -27,9 +27,9 @@
 //!
 //! # The window is the point of this pass
 //!
-//! The world is 4096×4096. Simulating it costs a couple of hundred microseconds; *painting* all of it
-//! would cost sixty-seven megabytes of readback a frame, about thirty-eight milliseconds — two
-//! hundred times the simulation. So `paint` runs one invocation a **pixel** rather than a cell, and
+//! The world is 4096×4096. Simulating it costs 27 µs; *painting* all of it would cost sixty-seven
+//! megabytes of readback a frame, about thirty-eight milliseconds — **fourteen hundred times the
+//! simulation**, and that ratio has only grown as the frame came down. So `paint` runs one invocation a **pixel** rather than a cell, and
 //! WASD moves the corner. Looking is now priced by the window and the world is free to be enormous.
 //!
 //! # The numbers in the title bar, and where they come from

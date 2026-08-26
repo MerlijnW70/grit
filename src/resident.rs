@@ -9,7 +9,36 @@
 //!
 //! Every pass is recorded into one command buffer with a memory barrier between, and the whole
 //! thing is submitted once and waited on once. Five kernels a frame is one fence wait, not five —
-//! and a fence wait is where the round trip's hundred microseconds live.
+//! and a fence wait is where the cost is.
+//!
+//! # What that costs, measured rather than inherited
+//!
+//! Every timing in this crate is a host clock around a submit and a fence, divided by however many
+//! frames were in the submission. That is what a caller waits, and it is a *sum* — of what a
+//! submission costs once, and of what one more frame inside it costs. `tests/floor.rs` takes the two
+//! apart by varying the only thing that separates them, and reads them off the line:
+//!
+//! ```text
+//!   a submission, holding nothing          35-42 us
+//!   one more frame in it, holding nothing        0
+//!   a dispatch                            210-245 ns
+//!   a barrier                            996-1009 ns
+//!   asking the device for one word         41-42 us
+//! ```
+//!
+//! Over four runs, and the spreads say something themselves: a barrier comes back the same number
+//! every time and a submission does not, which is what a pipeline flush looks like next to a queue
+//! and a fence.
+//!
+//! **Thirty-seven, not the hundred this crate said everywhere.** That hundred came from `simdr`'s
+//! `decisions/DR-0008`, which priced a round trip that *moves data* — `run_grid` uploads, dispatches
+//! and downloads — and it is still about right for one: `src/bin/loop_cost.rs` measures 95 µs for a
+//! frame that copies a megabyte back and 50 µs for the same frame that copies nothing. A bare submit
+//! and fence is thirty-seven, and this file had been quoting the other number for its own.
+//!
+//! Nothing in the design changes for it. `crate::compact::prepare` exists so that a workgroup count
+//! never comes back to the host, and forty-one microseconds to learn one number is still more than
+//! the entire frame that produced it.
 
 use std::time::{Duration, Instant};
 
@@ -22,8 +51,8 @@ use crate::host::{Error, Host};
 /// **The whole point of the second one.** A compaction's output is a list whose length the *device*
 /// worked out, and dispatching over it means the workgroup count has to come from a buffer rather
 /// than from a caller who would have to read it back first. Reading it back is a submit and a fence
-/// — about a hundred microseconds by `decisions/DR-0008`'s measurement — to learn a number the
-/// device already had.
+/// — 41 µs by `tests/floor.rs`'s measurement, which is more than the frame that produced it — to
+/// learn a number the device already had.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Groups {
     /// A count the host knows.
@@ -585,7 +614,7 @@ impl Resident<'_> {
     /// How long a fence is waited on, by default, before the device is presumed lost.
     ///
     /// This is not an estimate of how long work takes. `simdr`'s `decisions/DR-0008` prices a round
-    /// trip at about a hundred microseconds, so ten seconds is five orders of magnitude of
+    /// trip at 37 µs — `tests/floor.rs` — so ten seconds is five orders of magnitude of
     /// headroom: it is the point past which work is not coming back, not the point past which it is
     /// slow. Windows resets a *graphics* device that misses its watchdog in about two seconds; a
     /// compute queue has no such watchdog, which is the whole reason this number has to exist.
@@ -1096,7 +1125,7 @@ impl Resident<'_> {
     /// # Why two and not a read afterwards
     ///
     /// Because a read afterwards is a second submit and a second fence, which this file already
-    /// says is a hundred microseconds for nothing — and a caller whose frame produces two answers
+    /// says is 37 µs for nothing — and a caller whose frame produces two answers
     /// was paying it on every frame. Both copies land in the staging buffer one after the other and
     /// come back together from [`Resident::wait_reading_both`].
     ///
@@ -1188,7 +1217,7 @@ impl Resident<'_> {
     /// The same, and copy `count` words of binding `index` back inside the same submission.
     ///
     /// **One fence for the whole frame.** Reading afterwards with [`Resident::read`] would be a
-    /// second submit and a second wait, which on this machine is another hundred microseconds for
+    /// second submit and a second wait, which on this machine is another 37 µs for
     /// nothing.
     ///
     /// # Errors
@@ -1327,7 +1356,7 @@ impl Resident<'_> {
     /// # What this is for, and what a single frame cannot tell you
     ///
     /// [`Resident::frame`] times a submit and a fence around the work, and on this machine that
-    /// round trip is about a hundred microseconds whatever is inside it — `decisions/DR-0008` in
+    /// round trip costs 37 µs whatever is inside it — `tests/floor.rs` prices it, and `decisions/DR-0008` in
     /// `simdr` names that as the unit of cost and it is not an estimate. A frame that does twenty
     /// microseconds of work and a frame that does eighty both come back at "about a hundred and
     /// something", and a change that halves the work is invisible.

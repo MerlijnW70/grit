@@ -48,10 +48,25 @@ much work there was unless it asks, which the title bar does twice a second.
 ## How it is put together
 
 Seventeen passes in **eleven stages**, one submission, six words from the host. A barrier sits
-between stages and not inside one, and at about 3.8 µs each that grouping is a fifth of the frame —
-`live::wired` is where it is decided, and the argument for every seam is beside it. Four of the ten
+between stages and not inside one, and it is the largest thing left in a frame — `live::wired` is
+where the grouping is decided, and the argument for every seam is beside it. Four of the ten
 barriers are followed by a dispatch that reads its workgroup count out of a buffer, and only those
-four name `DRAW_INDIRECT`; naming it in the other six cost another fifth.
+four name `DRAW_INDIRECT`; naming it in the other six cost a fifth of the frame.
+
+`tests/floor.rs` prices what is underneath all of it, on an apparatus with no simulation in it —
+kernels that write one word, and the only thing varied is how many frames go into one submission, so
+that the intercept and the slope come apart:
+
+```
+  a submission, holding nothing        35–42 µs
+  one more frame in it, holding nothing     0
+  a dispatch                          210–245 ns
+  a barrier                           996–1009 ns
+  asking the device for one word       41–42 µs
+```
+
+Over four runs, and the spreads are the point: the barrier is the same number every time and the
+submission is not, which is what a queue and a fence look like next to a pipeline flush.
 
 ```
   tick     1              the frame number, and the partition's phase
@@ -185,6 +200,7 @@ Every one of them is aimed at a failure that a convincing picture survives.
 | `tally.rs` | the reduction says what a count done by hand says |
 | `dispatch.rs` | a workgroup count one stage wrote is the one the next stage is dispatched over |
 | `dispatch.rs` | a frame is recorded once, and a write between two of them does not undo that |
+| `floor.rs` | a submission costs more than a frame in it, and a barrier more than a dispatch |
 
 `live.rs` is the one that matters. Everything else compares a device against a host computing the
 same thing a different way; that cannot work for a wake set, because a host reference would derive
@@ -215,12 +231,16 @@ Every test is run at subgroup **32** (RTX 4080), **64** (integrated Radeon) and 
   taken a direction without ever descending. At `sand::PATIENCE` it stops asking, and `fall` clears
   the count because *what lands is bare*. `tests/sand.rs` now demands nought rather than bounding it,
   and demands a further step in both phases change nothing at all.
-* **A frame's wall clock is a submit and a fence**, about a hundred microseconds on this machine
+* **A frame's wall clock is a submit and a fence**, 37 µs on this machine
   whatever is inside it. The table above was measured with `Resident::frames`, which records twenty
   frames into one command buffer and divides. Measured the other way, the coarse level *appeared to
   make things slower* and nearly went in the bin on that evidence — and the hot-block list that came
   after it would have been invisible too, because what it saves at the largest size is 84 µs and a
-  round trip costs more than that.
+  round trip is a third of that again. **The hundred microseconds this repository quoted for years
+  was a round trip that moves data**, inherited from `simdr`'s `DR-0008` and used for a bare submit
+  and fence; `tests/floor.rs` prices them apart. Nothing in the design changes for it — 41 µs to ask
+  the device for one number is still more than the whole frame that produced it, which is why
+  `prepare` exists.
 * **What is left of the frame is mostly the barriers, and there are ten of them.** Priced by adding
   idle passes rather than removing real ones, so the simulation is unchanged: five of them in five
   stages costs 7.5 µs and five inside one stage costs 1.1 µs, which is **1.3 µs a barrier and 0.2 µs

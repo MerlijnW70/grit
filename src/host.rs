@@ -13,6 +13,11 @@
 //! about a hundred microseconds before any arithmetic, and every one of those entry points exists
 //! to put that price where a caller can see it.
 //!
+//! **That hundred is a round trip that moves data**, which is what `runner`'s entry points all do,
+//! and this crate quoted it for years as the price of a bare submit and fence. `tests/floor.rs`
+//! prices the two apart: a submission holding nothing is 35-42 µs here, one that copies a megabyte back
+//! is 95. Both make the same argument, and only one of them is what a resident frame pays.
+//!
 //! A simulation is the other shape. Sixteen million cells of state, five kernels a frame, sixty
 //! frames a second — the state must **never** cross the bus, and only the picture may. That is one
 //! primitive `runner` does not have, and it is this file: *N pipelines, one descriptor set, buffers

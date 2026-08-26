@@ -617,7 +617,8 @@ pub fn dense_reference(plan: &Plan, counts: &[u32], buckets: &[u32]) -> (Vec<u32
 ///
 /// **The pass that makes the saving real.** Without it the host must read [`GRAND`] back to know how
 /// many workgroups to ask for — a submit and a fence to learn a number the device already had, and
-/// `decisions/DR-0008` prices that at about a hundred microseconds. With it the count never leaves.
+/// `tests/floor.rs` prices that at **41 µs** on this machine — more than the whole frame that
+/// produced the number. With this pass the count never leaves.
 ///
 /// `per_group` is how many entries the pass that reads this count covers with one workgroup, and it is
 /// a parameter because the passes disagree. A scan covers [`PER_LANE`] entries a lane; a settle over
