@@ -14,6 +14,7 @@
 //!   # a comment
 //!   inputs 4        how many inputs, one to six
 //!   outputs 3       how many answer bits — one if left out
+//!   lean 1          among equally right chips, prefer the one with fewer gates
 //!   steps 4         cut the word into four, one piece a step — time
 //!   state 2         rows wired from the last column back to the first — memory
 //!   colony 65536    how many chips search at once — the way out of a local optimum
@@ -46,6 +47,47 @@
 //! A grid of gates, drawn, and a number: how many of the marked cases it gets right. That number is
 //! worked out twice, once by the card while it was evolving and once by the host afterwards from the
 //! genome alone, and the report prints both. They have to agree.
+//!
+//! # Opening the box, pressing on it, and breaking it
+//!
+//! The report walks back from the wires the answer is read off — and from the state rows, which are
+//! outputs into the next step — and marks every cell the answer can have come through. What is not
+//! marked is drawn as a dot, and there is a great deal of it:
+//!
+//! ```text
+//!     a !v!!!·^·v·^ <- 0
+//!     b ^^·v·&·!·&·
+//!     c ^·^·v!··^··
+//!     d v^·v···v···
+//!     0 ^&^·^······
+//! ```
+//!
+//! Then every marked gate is turned into a wire in turn and the answer re-scored, which is the
+//! cheapest fault there is and the one a dead transistor most resembles.
+//!
+//! **Two counts, and they are not the same count.** Reachable is structure: the answer *could* come
+//! through here. Costly is function: breaking it *does* change the answer. On the parity of four
+//! bits, eight starts:
+//!
+//! ```text
+//!            reachable   costly   slack
+//!   lean 0        43.5     28.8    14.8
+//!   lean 1        32.0     23.5     8.5
+//!   the leanest     13       13       0
+//! ```
+//!
+//! `lean 1` scores `correct × (CELLS + 1) + (CELLS − used)`, so between two chips that are equally
+//! right the one with fewer gates wins. It works, and it varies: the best run under pressure found
+//! thirteen gates where the best without found thirty-three, and a hand-written parity of four bits
+//! is three exclusive-ors. So it is smaller and it is not small.
+//!
+//! **There is no self-healing, and the numbers say what there is instead.** A gate that costs
+//! nothing to break was reachable and masked — never doing anything — rather than a spare standing
+//! by. Break one that matters and the answer breaks, every time, in every run. Pressure takes the
+//! slack out and the leanest circuit has none at all: thirteen gates, thirteen of them costly.
+//!
+//! So minimisation and surviving a fault pull against each other here, and pressing on the gate
+//! count presses on both.
 //!
 //! # The exam is the specification, and a partial one stays partial
 //!
@@ -800,7 +842,22 @@ fn propagate(subgroup: u32, column: u32, cases: u32, colony: u32) -> Result<Vec<
 }
 
 /// How many of the inputs the top-right wire got right.
-fn tally(subgroup: u32, cases: u32, outputs: u32, colony: u32) -> Result<Vec<u32>, LaneError> {
+/// How many marked answer bits this chip gets right, and — where the exam asks for it — how few
+/// gates it took.
+///
+/// # Pressing on the gate count
+///
+/// Nothing selects against a gate that does nothing, so a grid that answers keeps every gate it was
+/// born with. `lean` makes the score `correct × (CELLS + 1) + (CELLS − used)`: correctness still
+/// decides, and between two chips that are equally right the one with fewer gates wins. The host
+/// takes it apart again for the report.
+fn tally(
+    subgroup: u32,
+    cases: u32,
+    outputs: u32,
+    colony: u32,
+    lean: bool,
+) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let none = kernel.module().constant_u32(0)?;
@@ -829,7 +886,25 @@ fn tally(subgroup: u32, cases: u32, outputs: u32, colony: u32) -> Result<Vec<u32
             fit = kernel.module().i_add(uint, fit, counted)?;
         }
     }
-    kernel.store_at(SCORE, chip, fit)?;
+    let final_score = if lean {
+        let span = kernel.module().constant_u32(CELLS)?;
+        let base = kernel.module().i_mul(uint, chip, span)?;
+        let mut spare = kernel.module().constant_u32(0)?;
+        for cell in 0..CELLS {
+            let off = kernel.module().constant_u32(cell)?;
+            let at = kernel.module().i_add(uint, base, off)?;
+            let kind = kernel.load_at(GENE, at)?;
+            // A wire is not a gate, so it is what is left over rather than what is spent.
+            let idle = is(&mut kernel, kind, none)?;
+            spare = kernel.module().i_add(uint, spare, idle)?;
+        }
+        let weight = kernel.module().constant_u32(CELLS + 1)?;
+        let scaled = kernel.module().i_mul(uint, fit, weight)?;
+        kernel.module().i_add(uint, scaled, spare)?
+    } else {
+        fit
+    };
+    kernel.store_at(SCORE, chip, final_score)?;
     kernel.finish()
 }
 
@@ -847,6 +922,8 @@ struct Exam {
     /// ten times the generations changes nothing and the same starts still fail; four times the
     /// colony takes three starts in eight to six, and sixteen times takes it to eight.
     colony: u32,
+    /// Whether a chip with fewer gates beats an equally correct one with more.
+    lean: bool,
     /// How many pieces the input word is cut into, one arriving a step.
     steps: u32,
     /// How many rows are wired from the last column back to the first, which is all the memory there
@@ -924,6 +1001,7 @@ fn spread_of(pattern: &str) -> Vec<u32> {
 ///   # a comment
 ///   inputs 4        how many inputs, one to six
 ///   outputs 3       how many answer bits — one if left out
+///   lean 1          among equally right chips, prefer the one with fewer gates
 ///   steps 4         cut the word into four, one piece a step — time
 ///   state 2         rows wired from the last column back to the first — memory
 ///   colony 65536    how many chips search at once — the way out of a local optimum
@@ -946,6 +1024,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut outputs = 1_u32;
     let mut seed = 0x0AC1_E000_u32;
     let mut colony = 1_u32 << 12;
+    let mut lean = false;
     let mut steps = 1_u32;
     let mut state = 0_u32;
     let mut island = None;
@@ -961,6 +1040,9 @@ fn read(text: &str) -> Result<Exam, String> {
         let say = |what: &str| format!("line {}: {what}", number + 1);
         let mut word = line.split_whitespace();
         match (word.next(), bits) {
+            (Some("lean"), _) => {
+                lean = word.next() != Some("0");
+            }
             (Some("steps"), _) => {
                 steps = word
                     .next()
@@ -1099,7 +1181,7 @@ fn read(text: &str) -> Result<Exam, String> {
         ));
     }
     let island = island.unwrap_or(colony).min(colony);
-    Ok(Exam { bits, outputs, steps, state, colony, island, seed, want, ask, name })
+    Ok(Exam { bits, outputs, lean, steps, state, colony, island, seed, want, ask, name })
 }
 
 // ---------- the host, which lays out the arena and then asks almost nothing ----------
@@ -1174,11 +1256,96 @@ fn scored(genome: &[u32], exam: &Exam) -> u32 {
         .sum()
 }
 
+/// Take a score apart: how much of it is being right, and how many gates were spent.
+///
+/// With `lean` off a score is the answer bits and nothing else. With it on the gates are packed
+/// underneath, low enough that being right always outranks being small.
+fn unpack(score: u32, lean: bool) -> (u32, u32) {
+    if lean {
+        (score / (CELLS + 1), CELLS - (score % (CELLS + 1)))
+    } else {
+        (score, 0)
+    }
+}
+
+/// Which cells the answer actually depends on, traced backwards from the wires it is read off.
+///
+/// # Opening the box
+///
+/// A grid of 88 gates answers with a handful of them and the rest are scenery: nothing selects
+/// against a gate that does nothing, so nothing removes it. This walks back from the output rows of
+/// the last column — and from the state rows, which are outputs into the next step — and marks every
+/// wire an answer can have come through. A gate reads its two diagonals, or the cell straight left
+/// where it is a wire or a not, so which cells it wants depends on what it is.
+fn live(genome: &[u32], exam: &Exam) -> Vec<bool> {
+    let fan = exam.bits / exam.steps;
+    let mut wanted = vec![false; (COLUMNS * ROWS) as usize];
+    let at = |column: u32, row: u32| (column * ROWS + row % ROWS) as usize;
+    for row in 0..exam.outputs.max(fan + exam.state) {
+        let reads_it = row < exam.outputs || (row >= fan && row < fan + exam.state);
+        if let Some(slot) = wanted.get_mut(at(COLUMNS - 1, row)).filter(|_| reads_it) {
+            *slot = true;
+        }
+    }
+    let mut used = vec![false; (CELLS) as usize];
+    for column in (1..COLUMNS).rev() {
+        for row in 0..ROWS {
+            if !wanted.get(at(column, row)).copied().unwrap_or(false) {
+                continue;
+            }
+            let cell = ((column - 1) * ROWS + row) as usize;
+            let kind = genome.get(cell).copied().unwrap_or(0);
+            if let Some(slot) = used.get_mut(cell) {
+                *slot = kind != 0;
+            }
+            let reaches: [u32; 2] = if kind == 0 || kind == 4 {
+                [row, row]
+            } else {
+                [row + ROWS - 1, row + 1]
+            };
+            for back in reaches {
+                if let Some(slot) = wanted.get_mut(at(column - 1, back)) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    used
+}
+
+/// What one gate failing costs, over every gate there is.
+///
+/// # What self-healing would look like
+///
+/// A gate is broken by turning it into a wire — the cheapest fault there is, and the one a dead
+/// transistor most resembles. A circuit with nothing spare loses a point for every live gate broken
+/// and nothing for a dead one; a circuit with something spare keeps its score through a fault that
+/// should have cost it. The count of faults survived is the difference.
+fn faults(genome: &[u32], exam: &Exam) -> (u32, u32, u32) {
+    let whole = scored(genome, exam);
+    let alive = live(genome, exam);
+    let mut survived = 0;
+    let mut counted = 0;
+    for (cell, &on) in alive.iter().enumerate() {
+        if !on {
+            continue;
+        }
+        counted += 1;
+        let mut broken = genome.to_vec();
+        if let Some(slot) = broken.get_mut(cell) {
+            *slot = 0;
+        }
+        if scored(&broken, exam) == whole {
+            survived += 1;
+        }
+    }
+    (counted, survived, whole)
+}
 /// The chip as something to look at: one letter a gate, the inputs down the left.
 ///
 /// **An arrow marks an answer wire.** Output nought is the top row of the last column, output one
 /// the row under it, and the exam says how many there are.
-fn drawn(genome: &[u32], bits: u32, outputs: u32) -> String {
+fn drawn(genome: &[u32], bits: u32, outputs: u32, alive: &[bool]) -> String {
     let mut out = String::new();
     for row in 0..ROWS {
         out.push_str("    ");
@@ -1191,7 +1358,12 @@ fn drawn(genome: &[u32], bits: u32, outputs: u32) -> String {
         });
         out.push(' ');
         for at in 1..COLUMNS {
-            out.push(match genome.get(((at - 1) * ROWS + row) as usize).copied() {
+            // **A dead gate is drawn as nothing**, because that is what it does. What is left is the
+            // circuit the answer travels through, and it is a great deal smaller than the grid.
+            let cell = ((at - 1) * ROWS + row) as usize;
+            let on = alive.get(cell).copied().unwrap_or(false);
+            out.push(match genome.get(cell).copied() {
+                _ if !on => '·',
                 Some(1) => '&',
                 Some(2) => 'v',
                 Some(3) => '^',
@@ -1277,7 +1449,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             modules.push(propagate(width, column, cases, colony)?);
         }
     }
-    modules.push(tally(width, cases, exam.outputs, colony)?);
+    modules.push(tally(width, cases, exam.outputs, colony, exam.lean)?);
     let held: Vec<&[u32]> = modules.iter().map(Vec::as_slice).collect();
 
     let wires = Groups::From { binding: COUNTS as usize, at: 1 };
@@ -1331,7 +1503,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for batch in 0..batches {
         ran = batch + 1;
         spent += arena.staged_frames(&groups, BATCH)?;
-        let scores = arena.read(SCORE as usize, colony as usize)?;
+        let held = arena.read(SCORE as usize, colony as usize)?;
+        let scores: Vec<u32> = held.iter().map(|&it| unpack(it, exam.lean).0).collect();
         best = scores.iter().copied().max().unwrap_or(0);
         // Densely at the start, where the colony is actually moving, and thinly after.
         if batch < 8 || batch % (batches / 8).max(1) == 0 || best == perfect || batch + 1 == batches {
@@ -1342,19 +1515,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 arena.on_device().unwrap_or_default().as_secs_f64() * 1e6
             );
         }
-        if best == perfect {
+        // With `lean` on, being right is where the work starts rather than where it stops.
+        if best == perfect && !exam.lean {
             break;
         }
     }
 
-    let scores = arena.read(SCORE as usize, colony as usize)?;
+    let raw = arena.read(SCORE as usize, colony as usize)?;
     let genes = arena.read(GENE as usize, (colony * CELLS) as usize)?;
-    let (winner, _) = scores.iter().enumerate().max_by_key(|&(_, s)| *s).unwrap_or((0, &0));
+    let (winner, _) = raw.iter().enumerate().max_by_key(|&(_, s)| *s).unwrap_or((0, &0));
     let genome = genes
         .get(winner * CELLS as usize..(winner + 1) * CELLS as usize)
         .unwrap_or(&[]);
-    println!("\n{}", drawn(genome, exam.bits, exam.outputs));
-    println!("    - wire   & and   v or   ^ xor   ! not   (<- marks an answer wire)");
+    let alive = live(genome, &exam);
+    println!("\n{}", drawn(genome, exam.bits, exam.outputs, &alive));
+    println!("    - wire   & and   v or   ^ xor   ! not   · dead   (<- marks an answer wire)");
+    let (live_gates, survived, whole) = faults(genome, &exam);
+    println!(
+        "\n  {live_gates} of {CELLS} gates carry the answer; the rest are scenery."
+    );
+    println!(
+        "  Breaking one live gate into a wire: {} of {live_gates} faults change nothing, {} cost the answer.",
+        survived,
+        live_gates - survived
+    );
+    let _ = whole;
     // **What it does with everything, not only what was asked.** A circuit is judged on the marked
     // bits and is free on the rest, so the table below is the difference between the exam and the
     // answer — and it is where an encoding that collapses to one wire shows itself.
@@ -1389,7 +1574,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let again = scored(genome, &exam);
     println!(
         "\n  worked out on the host it gets {again} of {perfect} — the card said {}{}",
-        scores.get(winner).copied().unwrap_or(0),
+        unpack(raw.get(winner).copied().unwrap_or(0), exam.lean).0,
         if again == perfect { ", and that is every case the exam asked about" } else { "" }
     );
     println!(
