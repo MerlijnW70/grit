@@ -42,17 +42,23 @@
 //! Four thousand generations of 4096 chips, and the winner is drawn at the end for reading:
 //!
 //! ```text
-//!   inputs   cases   best
-//!        3       8    8      solved
-//!        4      16   16      solved
-//!        5      32   30
-//!        6      64   56
+//!   inputs   cases   three starts
+//!        3       8    8   8   8     solved every time
+//!        4      16   16  16  16     solved every time
+//!        5      32   32  32  30     usually
+//!        6      64   62  52  64     sometimes
 //! ```
 //!
 //! **Parity is the hard case in evolving circuits, and how hard is a lottery.** Five starts on six
-//! inputs, changing nothing but where the random grids begin, came out at 50, 52, 56, 60 and 64 of
+//! inputs, changing nothing but where the random grids begin, came out at 52, 60, 62, 62 and 64 of
 //! 64 — measured in `src/bin/oracle.rs`, which takes the start from its exam. So it solves six-input
-//! parity about one run in five, and the table above is one run a size rather than a ceiling.
+//! parity about one run in five, and every row above is three runs rather than one.
+//!
+//! **These are not the numbers this file first carried.** Those were taken with a race in `select`:
+//! a chip that did *not* change wrote to slot nought of the changed list, read-modify-write, against
+//! whichever chip actually belonged there — so a changed chip could be erased from the list and keep
+//! a stale score, and the same seed stopped giving the same answer. The ones that did not change go
+//! past the end of the list now, and four runs of one seed give one number.
 //!
 //! **Which means the four selection schemes tried here were compared on one run each**, reading 48
 //! to 56, and that spread sits inside the spread of the starts. It says nothing about the schemes.
@@ -346,11 +352,15 @@ fn select(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let last = stir(&mut kernel, again)?;
     kernel.store_at(SEED, who, last)?;
 
+    // **The ones that did not change go to a slot past the end of the list.** Sending them to slot
+    // nought instead makes every one of them read that slot and write it back, which races with the
+    // one entry that belongs there: a chip that did change is erased from the list, keeps last
+    // generation's score, and the same seed stops giving the same answer. It did.
     let slot = kernel.atomic_add_at(COUNTS, none, restless)?;
     let safe = at_most(&mut kernel, slot, COLONY - 1)?;
-    let landing = pick(&mut kernel, restless, safe, none)?;
-    let standing = kernel.load_at(CHANGED, landing)?;
-    let keeping = pick(&mut kernel, restless, who, standing)?;
+    let past = kernel.module().constant_u32(COLONY)?;
+    let landing = pick(&mut kernel, restless, safe, past)?;
+    let keeping = pick(&mut kernel, restless, who, past)?;
     kernel.store_at(CHANGED, landing, keeping)?;
     kernel.finish()
 }
@@ -656,7 +666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ((COLONY + 1) * COLUMNS * ROWS * CASES) as usize,
         (COLONY + 1) as usize,
         (COLONY + 1) as usize,
-        COLONY as usize,
+        (COLONY + 1) as usize,
         7,
     ];
     let mut arena = host.resident(&sizes, &held)?;

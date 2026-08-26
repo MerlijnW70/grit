@@ -50,16 +50,38 @@
 //! Four exams, 4096 chips, at most four thousand generations, on an RTX 4080:
 //!
 //! ```text
-//!   exam                                    marked   reached
-//!   inputs 4, parity                            16        16
-//!   inputs 4, outputs 2, one output = input a   16        16
-//!   inputs 4, outputs 3, add                    48        40
-//!   inputs 4, outputs 3, count                  48        41
+//!   exam                                    marked   three starts
+//!   inputs 4, parity                            16    16  16  16
+//!   inputs 4, outputs 2, one output = input a   16    16  16  16
+//!   inputs 4, outputs 3, add                    48    40  40  41
+//!   inputs 4, outputs 3, count                  48    41  43  43
 //! ```
 //!
-//! The first two arrive inside twenty generations. The last two do not arrive at all, and the score
-//! is what it is: 41 of 48 is a chip right about most of the bits of most of the answers, which the
-//! host confirms from the genome afterwards.
+//! The first two arrive inside twenty generations, every start. The last two do not arrive at all,
+//! and the score is what it is: 43 of 48 is a chip right about most of the bits of most of the
+//! answers, which the host confirms from the genome afterwards.
+//!
+//! # The grid, measured
+//!
+//! `ROWS` and `COLUMNS` say how much room a chip has. `count` again, four starts a size:
+//!
+//! ```text
+//!   grid    gates   four starts        a generation
+//!    8x8       56   41  39  39  40           51 us
+//!    8x12      88   41  43  43  43           78 us
+//!    8x16     120   43  41  42  43           99 us
+//!    8x24     184   43  40  43  43          138 us
+//!   16x12     176   39  41  40  41          133 us
+//!   16x24     368   40  43  43  41          256 us
+//! ```
+//!
+//! **Fifty-six gates is too few and eighty-eight is enough.** Past that the spreads sit on top of
+//! one another and more room does not raise the ceiling — 368 gates reach what 88 reach and cost
+//! three times as much. Sixteen rows are worse than eight at the same width, which is the diagonal
+//! wiring having further to travel through rows holding nothing. So the shape is 8 by 12, and what
+//! stops `count` at 43 is not the area.
+//!
+//! `ROWS` has to be a power of two: the invocation index is taken apart with shifts.
 //!
 //! # What this is not
 //!
@@ -363,11 +385,15 @@ fn select(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let last = stir(&mut kernel, again)?;
     kernel.store_at(SEED, who, last)?;
 
+    // **The ones that did not change go to a slot past the end of the list.** Sending them to slot
+    // nought instead makes every one of them read that slot and write it back, which races with the
+    // one entry that belongs there: a chip that did change is erased from the list, keeps last
+    // generation's score, and the same seed stops giving the same answer. It did.
     let slot = kernel.atomic_add_at(COUNTS, none, restless)?;
     let safe = at_most(&mut kernel, slot, COLONY - 1)?;
-    let landing = pick(&mut kernel, restless, safe, none)?;
-    let standing = kernel.load_at(CHANGED, landing)?;
-    let keeping = pick(&mut kernel, restless, who, standing)?;
+    let past = kernel.module().constant_u32(COLONY)?;
+    let landing = pick(&mut kernel, restless, safe, past)?;
+    let keeping = pick(&mut kernel, restless, who, past)?;
     kernel.store_at(CHANGED, landing, keeping)?;
     kernel.finish()
 }
@@ -574,7 +600,11 @@ struct Exam {
     /// Where the random grids start.
     ///
     /// **It matters more than anything else in this file.** Five starts on the parity of six inputs
-    /// came out at 50, 52, 56, 60 and 64 of 64, so one run says nothing on its own.
+    /// came out at 52, 60, 62, 62 and 64 of 64, so one run says nothing on its own.
+    ///
+    /// The numbers this file first carried were taken with a race in `select`, where a chip that
+    /// did not change wrote to slot nought of the changed list against whichever chip belonged
+    /// there. The same seed now gives the same answer four runs out of four.
     seed: u32,
     /// The wanted answer for every input, its bits packed one an output.
     want: Vec<u32>,
@@ -948,7 +978,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ((COLONY + 1) * COLUMNS * ROWS * cases) as usize,
         (COLONY + 1) as usize,
         (COLONY + 1) as usize,
-        COLONY as usize,
+        (COLONY + 1) as usize,
         7,
         cases as usize,
     ];

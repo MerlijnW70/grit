@@ -339,11 +339,15 @@ fn select(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     kernel.store_at(SEED, who, last)?;
 
     // Anything that changed goes on the list, and nothing else does.
+    // **The ones that did not change go to a slot past the end of the list.** Sending them to slot
+    // nought instead makes every one of them read that slot and write it back, which races with the
+    // one entry that belongs there: a chip that did change is erased from the list, keeps last
+    // generation's score, and the same seed stops giving the same answer. It did.
     let slot = kernel.atomic_add_at(COUNTS, none, restless)?;
     let safe = at_most(&mut kernel, slot, COLONY - 1)?;
-    let landing = pick(&mut kernel, restless, safe, none)?;
-    let standing = kernel.load_at(CHANGED, landing)?;
-    let keeping = pick(&mut kernel, restless, who, standing)?;
+    let past = kernel.module().constant_u32(COLONY)?;
+    let landing = pick(&mut kernel, restless, safe, past)?;
+    let keeping = pick(&mut kernel, restless, who, past)?;
     kernel.store_at(CHANGED, landing, keeping)?;
     kernel.finish()
 }
@@ -537,7 +541,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ((COLONY + 1) * EDGES) as usize,
         (COLONY + 1) as usize,
         (COLONY + 1) as usize,
-        COLONY as usize,
+        (COLONY + 1) as usize,
         1,
         3,
     ];
