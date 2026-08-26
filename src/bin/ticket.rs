@@ -8,35 +8,38 @@
 //! subnetwork which works with **no weight ever changed** — is Ramanujan and others, and they find
 //! the mask with gradients.
 //!
-//! This finds one without them. A matrix of 513 weights is drawn once and never touched again.
+//! This finds one without them. A matrix of 1281 weights is drawn once and never touched again.
 //! Every organism carries one bit a connection, and selection alone decides which bits stay on. No
-//! derivative is computed anywhere. It is a search over 2⁵¹³ masks by mutation and tournament, which
-//! is not training and does not pretend to be.
+//! derivative is computed anywhere. It is a search over 2¹²⁸¹ masks by mutation and tournament,
+//! which is not training and does not pretend to be.
 //!
 //! # What it finds
 //!
 //! ```text
-//!   6 inputs and a bias  →  64 hidden  →  1 output
+//!   8 inputs and a bias  →  128 hidden  →  1 output
 //! ```
 //!
-//! The task is *at least four of the six inputs are one*, on all 64 inputs there are — so the score
-//! is exhaustive rather than sampled, and 64 means it. In a thousand generations of 65 536 masks,
-//! about eight seconds, one comes out that is right about all 64, keeping 256 of the 513
-//! connections. The host works the same mask out again from the same matrix and agrees.
+//! The task is *at least five of the eight inputs are one*, on all 256 inputs there are — so the
+//! score is exhaustive rather than sampled, and 256 means it. Six thousand generations of 16 384
+//! masks, about two minutes, produces one that is right about all 256, keeping 636 of the 1281
+//! connections. It first reaches 256 at around generation 4400. The host works the same mask out
+//! again from the same matrix and agrees.
 //!
-//! **A wider random network holds a better ticket**, which is the hypothesis's own intuition and is
-//! measurable here. Ten thousand generations of 4096 masks, best of 64 reached:
+//! **A wider random network holds a better ticket**, which is the hypothesis's own intuition. That
+//! shows cleanly at six inputs, where the narrow ones converge and stay put — ten thousand
+//! generations of 4096 masks, and forty thousand at 257 connections does not move off 62:
 //!
 //! ```text
-//!   hidden   connections   best   a generation
-//!       16           129     58        129.9 µs
-//!       32           257     62        307.6 µs
-//!       64           513     64       1307.7 µs
-//!      128          1025     64       3954.0 µs
+//!   hidden   connections   best of 64   a generation
+//!       16           129           58        129.9 µs
+//!       32           257           62        307.6 µs
+//!       64           513           64       1307.7 µs
+//!      128          1025           64       3954.0 µs
 //! ```
 //!
-//! At 129 and 257 connections the search plateaus and stays there — forty thousand generations at
-//! 257 does not move off 62. Widening is what raises the ceiling, not patience.
+//! At eight inputs the same sweep does **not** separate them, because none of them has converged
+//! inside a fixed budget: two thousand generations give 247, 253 and 251 at 321, 641 and 1281
+//! connections. The width that matters here is the one that gets there at all, and 1281 does.
 //!
 //! # The one thing here that is grit's, and what it turned out to be worth
 //!
@@ -45,18 +48,29 @@
 //! length into a workgroup count (`Groups::Counting`), and `evaluate` is dispatched over it
 //! (`Groups::From`). The host never learns how long the list is.
 //!
-//! **It is worth nine per cent, and that is the honest figure.** At 65 536 masks, 28 545 of them
-//! change in a generation — 44% — and the generation runs in 5273 µs against 5819 with the same
-//! kernel forced over all of them. Two reasons it is not 44%:
+//! **It is worth two to nine per cent, and the reason is worth more than the demonstration.**
 //!
-//! * `select` has to touch every mask, because each decides for itself, and it is the expensive
-//!   pass. Shortening `evaluate` shortens the smaller half.
-//! * At 4096 masks it saves **nothing at all** — 1254 µs either way — because 1780 masks is 56
-//!   workgroups and a card this size runs 56 as fast as 128. A work list buys nothing on a device
-//!   that was not full.
+//! ```text
+//!   inputs   masks    changed   with the list   over all of them
+//!        6    4 096      1 780       1 254 µs           1 254 µs
+//!        6   65 536     28 545       5 273 µs           5 819 µs
+//!        8   16 384      5 156      22 365 µs          22 770 µs
+//!        8   65 536     27 902     245 895 µs         261 225 µs
+//! ```
 //!
-//! That second one is worth more than the demonstration: it is the condition under which
-//! `crate::compact` is worth anything, stated as a number rather than assumed.
+//! A third of the organisms, a fiftieth of the saving. `evaluate` is 96% of the generation — with
+//! its dispatch set to nought a generation takes 884 µs against 22 365 — so the list is shortening
+//! the pass that matters, and it still buys almost nothing.
+//!
+//! **Because the cost is the length of one chain, not the number of them.** An invocation here walks
+//! 256 inputs by 1281 connections, and every step waits on the one before it: a rolled loop carrying
+//! a running total, over an unrolled sum. Sixteen thousand of those chains and five thousand of them
+//! take nearly the same time, because a card hides latency by holding more of them and never had
+//! enough. `crate::compact` makes fewer chains. It does not make them shorter.
+//!
+//! That is the condition under which a work list is worth anything, as a number rather than an
+//! assumption — and it is exactly what the sand has and this does not: a quad's step is short and
+//! independent, so cutting their number cuts the time.
 //!
 //! # How a unit fires
 //!
@@ -64,8 +78,8 @@
 //! outweighs the masked negative one — two unsigned sums and one comparison, because the lane API
 //! has no signed compare and `decisions/DR-0003` has no branches.
 //!
-//! `evaluate` is a **rolled** loop over the 64 inputs rather than an unrolled one: 64 × 513 is
-//! 32 832 operations, and `Kernel::repeat_rolled` emits one body for all of them.
+//! `evaluate` is a **rolled** loop over the 256 inputs rather than an unrolled one: 256 × 1281 is
+//! 328 000 operations, and `Kernel::repeat_rolled` emits one body for all of them.
 //!
 //! Nothing else in the repository refers to this file. `rm src/bin/ticket.rs` removes it whole.
 
@@ -77,11 +91,11 @@ use simdr::lanes::{LaneError, U32};
 use simdr::module::Id;
 
 /// How many inputs the task has.
-const BITS: u32 = 6;
+const BITS: u32 = 8;
 /// Inputs plus the bias, which is always one.
 const FAN: u32 = BITS + 1;
 /// How wide the hidden layer is.
-const HIDDEN: u32 = 64;
+const HIDDEN: u32 = 128;
 /// Connections in the whole network: the hidden layer, then the output and its bias.
 const EDGES: u32 = FAN * HIDDEN + HIDDEN + 1;
 /// Every input there is, so the score is exhaustive.
@@ -89,12 +103,12 @@ const CASES: u32 = 1 << BITS;
 /// What a mask has to score to be right about all of them.
 const PERFECT: u32 = CASES;
 /// How many of the inputs have to be one for the answer to be one.
-const WANTED: u32 = 4;
+const WANTED: u32 = 5;
 
 /// How many masks are in the arena. A power of two: the wrap is a shift.
-const COLONY: u32 = 1 << 16;
+const COLONY: u32 = 1 << 14;
 /// How many generations to run.
-const GENERATIONS: u32 = 1_000;
+const GENERATIONS: u32 = 6_000;
 /// How many go into one submission.
 const BATCH: u32 = 200;
 
