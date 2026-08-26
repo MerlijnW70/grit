@@ -177,6 +177,23 @@ fn what_a_submission_costs_before_it_holds_anything() {
         empty_once / 1000.0
     );
 
+    // **The check that the device clock measures the device.** A submission holding nothing takes
+    // 35-42 us of host time and does no work at all, so its timestamps have to say so; the same
+    // submission with eight dispatches and seven barriers in it has to say more. If the two came
+    // back alike, the query would be measuring the round trip -- which the host clock already did.
+    held.staged_frames(&none, 20).expect("a warm");
+    let idle_card = held.on_device();
+    held.staged_frames(&apart, 20).expect("a warm");
+    let busy_card = held.on_device();
+    println!("  on the device: nothing {idle_card:?} a frame, eight in eight stages {busy_card:?}");
+    if let (Some(idle), Some(busy)) = (idle_card, busy_card) {
+        assert!(
+            busy > idle,
+            "the device clock reports {busy:?} for eight dispatches and {idle:?} for none, so it is \
+             not measuring the device"
+        );
+    }
+
     // **The claims, and they are shapes rather than numbers.** A number from this machine on this
     // day is not a thing to assert on; that a submission costs more than a frame inside it, and
     // that a barrier costs more than a dispatch, are.

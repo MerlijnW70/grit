@@ -358,3 +358,61 @@ fn a_frame_is_recorded_once_and_a_write_between_two_does_not_undo_it() {
         held.recording().1
     );
 }
+
+/// A pattern matching nothing names every device that is here.
+///
+/// # Why the pattern is an argument and not `GRIT_DEVICE`
+///
+/// Because that variable is process-wide and every test in this binary shares the process, so a test
+/// that set it would be choosing a device for the seven beside it. `Host::matching` takes the
+/// pattern, which is also what a caller holding two devices at once needs.
+///
+/// # What it is for
+///
+/// `Error::NoSuchDevice` carries what *is* present, and that list is how anybody finds out which
+/// subgroup widths they can run this crate's tests at. Every kernel here has an arm for 4, 8, 16, 32
+/// and 64 and refuses the rest by name; which of those a machine can exercise is a property of the
+/// machine, and this is the one call that says so.
+///
+/// The machine this was written on answers `["NVIDIA GeForce RTX 4080", "AMD Radeon(TM) Graphics"]`
+/// — subgroup 32 and 64, and the whole suite passes on both. That is not asserted: a device list is
+/// not a thing to pin a test to.
+#[test]
+fn a_pattern_matching_nothing_names_the_devices_that_are_here() {
+    let present = match Host::matching(Some("zzz-no-device-is-called-this")) {
+        Err(Error::NoSuchDevice { wanted, present }) => {
+            assert_eq!(wanted, "zzz-no-device-is-called-this", "the pattern is echoed back");
+            present
+        }
+        Ok(None) => {
+            eprintln!("SKIPPED a_pattern_matching_nothing: no Vulkan loader");
+            return;
+        }
+        Ok(Some(taken)) => panic!("a pattern matching nothing opened {:?}", taken.name()),
+        Err(other) => panic!("a pattern matching nothing gave {other:?}"),
+    };
+
+    eprintln!("  devices here: {present:?}");
+    assert!(
+        !present.is_empty(),
+        "the refusal named no devices, so the machine has none and `Ok(None)` was the answer"
+    );
+
+    // And a pattern that does match opens one, which is the other half of the same call.
+    let first = present.first().cloned().unwrap_or_default();
+    let taken = Host::matching(Some(&first)).expect("the device it just named");
+    let Some(taken) = taken else {
+        panic!("a device named in the refusal could not then be opened");
+    };
+    assert!(
+        taken.name().to_lowercase().contains(&first.to_lowercase()),
+        "asked for {first:?} and got {:?}",
+        taken.name()
+    );
+    assert!(
+        [4, 8, 16, 32, 64].contains(&taken.width()),
+        "{} reports subgroup {}, which no kernel here has an arm for",
+        taken.name(),
+        taken.width()
+    );
+}

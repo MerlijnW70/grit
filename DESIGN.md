@@ -37,12 +37,18 @@ the frame, not about `Resident`, so `live::wired` answers it and names every sea
 varying only how many frames go into one submission, so the intercept and the slope come apart.
 
 ```text
-  a submission, holding nothing        35–42 µs
-  one more frame in it, holding nothing     0
-  a dispatch                          210–245 ns
-  a barrier                           996–1009 ns
-  asking the device for one word       41–42 µs
+                                        host clock    device clock
+  a submission, holding nothing          35–42 µs           33 ns
+  one more frame in it, holding nothing        0
+  a dispatch                            210–245 ns
+  a barrier                            996–1009 ns
+  eight passes in eight stages                            8.84 µs
+  asking the device for one word         41–42 µs
 ```
+
+**The two clocks agree.** 8 × 0.23 + 7 × 1.00 is 8.84, which is what the device says for eight
+dispatches and seven barriers — and a submission holding nothing is 33 ns on the card against 40 µs
+of host clock, which is the round trip measured from both ends at once.
 
 Four runs. The barrier returns the same number every time and the submission does not — a pipeline
 flush next to a queue and a fence.

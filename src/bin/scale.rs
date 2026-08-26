@@ -60,11 +60,16 @@
 //! reused nought* before; two and fourteen after, and the two are the warm-up and the first batch,
 //! which differ in how many frames they hold.
 //!
-//! **The last column is a range and the other five are not, and that is a caveat about the table
-//! rather than about the change.** Five runs of this file put *kept* at 27–29 µs and the largest
-//! size at 29–32; a single figure taken on the day read 25 to 27, which is below every one of those
-//! five. The other columns were each measured when they went in and have not been taken again, so
-//! they carry whatever the machine was doing then. Comparing across them is comparing days.
+//! **Every column here is a host clock, and the file now prints a device one beside it.** `Resident`
+//! writes two timestamps around the recorded work, and three runs put the frame at 24–26 µs on the
+//! card against 27–31 µs of wall — so the difference is the submission and the fence, and the card
+//! figure is both smaller and flatter.
+//!
+//! **The last column is a range and the other five are not.** Five runs put *kept* at 27–29 µs and
+//! the largest size at 29–32; a single figure taken on the day read 25 to 27, which is below every
+//! one of those five. The other columns were each measured when they went in and have not been taken
+//! again, so they carry whatever the machine was doing then. Comparing across them is comparing
+//! days.
 //!
 //! **What the table is for** is the flatness rather than any one number: sixty-four times the world
 //! for two microseconds more, with nothing in the frame proportional to the grid.
@@ -100,8 +105,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = host.width();
     println!("{} — subgroup {width}\n", host.name());
     println!(
-        "  {:>10}  {:>9}  {:>7}  {:>9}  {:>9}  {:>8}  {:>7}",
-        "cells", "quads", "blocks", "frame", "listed", "memory", "of grid"
+        "  {:>10}  {:>9}  {:>7}  {:>10}  {:>10}  {:>8}  {:>8}  {:>7}",
+        "cells", "quads", "blocks", "wall", "on card", "listed", "memory", "of grid"
     );
 
     for power in [9_u32, 10, 11, 12] {
@@ -171,6 +176,8 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
         }
     }
 
+    let card = resident.on_device();
+
     let asked = u64::from(FRAMES.div_ceil(BATCH * 2));
     // **`listed` is the canary on any timing taken from this file, and it is necessary rather than
     // sufficient.** A change that alters what the loop computes hands back a timing that belongs to
@@ -185,10 +192,11 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
     let listed = listed_total / asked.max(1);
     let share = f64::from(quads) / (listed.max(1) as f64);
     println!(
-        "  {:>10}  {quads:>9}  {:>7}  {:>9.3?}  {listed:>9}  {:>6} MB  {share:>6.0}×",
+        "  {:>10}  {quads:>9}  {:>7}  {:>10.3?}  {:>10.3?}  {listed:>8}  {:>5} MB  {share:>6.0}×",
         grid.cells(),
         plan.blocks,
         spent / FRAMES.div_ceil(BATCH),
+        card.unwrap_or_default(),
         words * 4 / (1 << 20),
     );
     Ok(Some(()))

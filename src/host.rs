@@ -188,6 +188,10 @@ pub struct Host {
     name: String,
     width: u32,
     ceiling: u64,
+    /// Nanoseconds a timestamp tick is worth on this device.
+    tick: f32,
+    /// Whether this queue family counts timestamps at all.
+    timing: bool,
     /// Whether a submission has been given up on, which nothing ever takes back.
     ///
     /// One flag on the host rather than one per `Resident`, because what it guards is the device:
@@ -206,6 +210,24 @@ impl Host {
     /// [`Error::NoComputeDevice`] if nothing offers a compute queue, [`Error::NoSuchDevice`] if a
     /// pattern matched nothing, otherwise whatever Vulkan said.
     pub fn open() -> Result<Option<Self>, Error> {
+        Self::matching(std::env::var("GRIT_DEVICE").ok().as_deref())
+    }
+
+    /// The same, with the pattern given rather than read from the environment.
+    ///
+    /// **`GRIT_DEVICE` is process-wide and tests in one binary share a process**, so a test that
+    /// wanted a particular device by setting it would be setting it for every test beside it. This
+    /// takes the pattern as an argument, which is also what a caller holding two devices at once
+    /// needs.
+    ///
+    /// `None` is what [`Host::open`] passes when the variable is unset: no pattern, so the discrete
+    /// part wins.
+    ///
+    /// # Errors
+    ///
+    /// As [`Host::open`] — and [`Error::NoSuchDevice`], carrying every device that *is* here, when
+    /// the pattern matches none.
+    pub fn matching(pattern: Option<&str>) -> Result<Option<Self>, Error> {
         // SAFETY: `Entry::load` reads the loader the platform installed. Nothing else has run yet.
         let entry = match unsafe { ash::Entry::load() } {
             Ok(entry) => entry,
@@ -224,13 +246,7 @@ impl Host {
 
         // SAFETY: the instance is live for the rest of this function, and is destroyed on every
         // path that does not hand it to a `Host`.
-        match unsafe {
-            Self::on(
-                entry,
-                instance,
-                std::env::var("GRIT_DEVICE").ok().as_deref(),
-            )
-        } {
+        match unsafe { Self::on(entry, instance, pattern) } {
             Ok(host) => Ok(Some(host)),
             Err(why) => Err(why),
         }
@@ -358,6 +374,8 @@ impl Host {
         let width = unsafe { subgroup_width(&instance, physical) };
         // SAFETY: as above.
         let ceiling = unsafe { allocation_ceiling(&instance, physical) };
+        // SAFETY: as above, and `family` came from this device's own enumeration.
+        let (tick, timing) = unsafe { timestamps(&instance, physical, family) };
 
         let priorities = [1.0_f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
@@ -387,6 +405,8 @@ impl Host {
             name,
             width,
             ceiling,
+            tick,
+            timing,
             wedged: AtomicBool::new(false),
         })
     }
@@ -399,6 +419,14 @@ impl Host {
     /// Whether a submission has been given up on.
     pub(crate) fn wedged(&self) -> bool {
         self.wedged.load(Ordering::SeqCst)
+    }
+
+    /// How many nanoseconds one timestamp tick is worth here, and whether the queue counts them.
+    ///
+    /// `crate::Resident` asks before it creates a query pool: a queue family reporting no valid
+    /// timestamp bits does not support them, whatever the period says.
+    pub(crate) const fn ticking(&self) -> (f32, bool) {
+        (self.tick, self.timing)
     }
 
     /// The device, for the layer that allocates over it.
@@ -494,4 +522,28 @@ unsafe fn subgroup_width(instance: &ash::Instance, physical: vk::PhysicalDevice)
     // SAFETY: the caller's contract, and `properties` borrows `subgroup` for the call.
     unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
     subgroup.subgroup_size
+}
+
+/// How many nanoseconds one timestamp tick is, and whether this queue counts them at all.
+///
+/// `timestampPeriod` is a device limit; `timestampValidBits` is a property of the **queue family**,
+/// and a family reporting nought does not support timestamps however good the limit looks. Both are
+/// needed before a query pool is worth creating.
+///
+/// # Safety
+///
+/// As [`name_of`], and `family` must be a family index that device reports.
+unsafe fn timestamps(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    family: u32,
+) -> (f32, bool) {
+    // SAFETY: the caller's contract.
+    let properties = unsafe { instance.get_physical_device_properties(physical) };
+    // SAFETY: as above.
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+    let bits = families
+        .get(family as usize)
+        .map_or(0, |one| one.timestamp_valid_bits);
+    (properties.limits.timestamp_period, bits > 0)
 }

@@ -223,6 +223,16 @@ pub struct Resident<'host> {
     poked: u64,
     /// How long a fence is waited on before the device is presumed lost.
     patience: Duration,
+    /// Two timestamps a submission, where the queue counts them at all.
+    ///
+    /// **The only number in this crate that comes from the device's own clock.** Everything else is
+    /// a host clock around a submit and a fence, which `tests/floor.rs` shows is 35-42 us before any
+    /// work happens -- so what a frame spends *on the card* was a subtraction until this.
+    ///
+    /// `None` where the queue family reports no valid timestamp bits.
+    queries: Option<vk::QueryPool>,
+    /// What the last submission measured on the device, per frame.
+    device: Option<Duration>,
     /// What the command buffer holds, if it holds a frame. See [`Recorded`].
     held: Option<Recorded>,
     /// How many submissions went out over a recording that was already there.
@@ -385,6 +395,18 @@ impl Host {
                 .device()
                 .create_fence(&vk::FenceCreateInfo::default(), None)?;
 
+            // Two timestamps: one before the first pass and one after the last. Asked for only
+            // where the queue counts them, so a device without them costs nothing here and answers
+            // `None` rather than a wrong number.
+            let queries = if self.ticking().1 {
+                let create = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2);
+                self.device().create_query_pool(&create, None).ok()
+            } else {
+                None
+            };
+
             Ok(Resident {
                 recording: Duration::ZERO,
                 recorded: 0,
@@ -413,6 +435,8 @@ impl Host {
                 patience: Resident::PATIENCE,
                 held: None,
                 reused: 0,
+                queries,
+                device: None,
             })
         }
     }
@@ -1362,6 +1386,7 @@ impl Resident<'_> {
         // submission really is still outstanding, so leaving it recorded is the true statement.
         self.await_fence()?;
         self.flight = None;
+        self.device = self.timed();
         Ok((began.elapsed(), out))
     }
 
@@ -1427,7 +1452,6 @@ impl Resident<'_> {
     /// A frame is recorded once and submitted again while the passes, their grouping and the frame
     /// count match the last call. What decides that is `Recorded` in `src/resident.rs`, which is
     /// private — a caller cannot reach it, and does not need to.
-    ///
     /// Against [`Resident::recording`]'s second number, this is the hit rate: a caller that hands
     /// over the same passes and the same grouping every frame records once and reuses for ever,
     /// and one that varies a workgroup count between calls records every time.
@@ -1438,6 +1462,37 @@ impl Resident<'_> {
     #[must_use]
     pub const fn reused(&self) -> u64 {
         self.reused
+    }
+
+    /// What the last submission spent on the device, per frame, from the device's own clock.
+    ///
+    /// `None` where the queue family counts no timestamps, or where the query has not landed.
+    ///
+    /// **This is the only figure in this crate that is not a host clock.** Everything else brackets
+    /// a submit and a fence, and `tests/floor.rs` shows that is 35–42 µs before any work happens —
+    /// so what a frame spends on the card was a subtraction until this existed.
+    #[must_use]
+    pub const fn on_device(&self) -> Option<Duration> {
+        self.device
+    }
+
+    /// Read the two stamps and turn the difference into a duration a frame at a time.
+    fn timed(&self) -> Option<Duration> {
+        let pool = self.queries?;
+        let times = self.held.as_ref().map_or(1, |held| held.times).max(1);
+        let mut stamps = [0_u64; 2];
+        // SAFETY: the fence has been waited on, so both writes have landed.
+        unsafe {
+            self.host
+                .device()
+                .get_query_pool_results(pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64)
+                .ok()?;
+        }
+        let [first, last] = stamps;
+        let ticks = last.checked_sub(first)?;
+        let (tick, _) = self.host.ticking();
+        let nanos = ticks as f64 * f64::from(tick) / f64::from(times);
+        Some(Duration::from_nanos(nanos as u64))
     }
 
     /// The recording, `times` frames over.
@@ -1497,6 +1552,20 @@ impl Resident<'_> {
             // one fence and `start` refuses a second while the first is outstanding.
             let begin = vk::CommandBufferBeginInfo::default();
             device.begin_command_buffer(self.command, &begin)?;
+
+            // **Reset and first stamp before anything is bound.** The reset has to be inside the
+            // command buffer rather than on the host, because the recording is kept and replayed:
+            // a pool reset done once at record time would leave every later submission writing into
+            // slots that already hold an answer.
+            if let Some(pool) = self.queries {
+                device.cmd_reset_query_pool(self.command, pool, 0, 2);
+                device.cmd_write_timestamp(
+                    self.command,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    pool,
+                    0,
+                );
+            }
 
             device.cmd_bind_descriptor_sets(
                 self.command,
@@ -1654,6 +1723,15 @@ impl Resident<'_> {
                 );
             }
 
+            if let Some(pool) = self.queries {
+                device.cmd_write_timestamp(
+                    self.command,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    1,
+                );
+            }
+
             device.end_command_buffer(self.command)?;
             took = began.elapsed();
 
@@ -1763,6 +1841,9 @@ impl Drop for Resident<'_> {
             let _ = device.device_wait_idle();
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.commands, None);
+            if let Some(pool) = self.queries {
+                device.destroy_query_pool(pool, None);
+            }
             for &pipeline in &self.pipelines {
                 device.destroy_pipeline(pipeline, None);
             }

@@ -8,10 +8,10 @@ status: prose-only
 
 On an RTX 4080 at subgroup 32, `tests/floor.rs` fits a line through six submission sizes over eight
 passes that write one word each: a submission is 35–42 µs, one more frame inside it 0 µs, a dispatch
-210–245 ns, a barrier 996–1009 ns, one word read back 41–42 µs. In `src/bin/scale.rs`'s loop, five
-passes that write one word cost +7.5 µs as five stages and +1.1 µs as one stage, which is 1.28 µs a
-barrier and 0.22 µs a dispatch, against a frame that five runs of that file put at 27–29 µs at
-262 144 cells and 29–32 µs at 16 777 216.
+210–245 ns, a barrier 996–1009 ns, one word read back 41–42 µs. The same file's device clock puts a
+submission holding nothing at **33 ns** and those eight passes in eight stages at **8.84 µs**, which
+is 8 × 0.23 + 7 × 1.00 to three digits — the host clock and the device clock, by different means,
+agreeing on the same price list.
 
 ## The Decision
 
@@ -26,6 +26,7 @@ at one barrier plus one dispatch, 1.2 µs of 27.
 
 ## The Limit
 
-These figures do not measure device execution: the 11 µs that is left after subtracting ten barriers,
-seventeen dispatches and a twentieth of a submission from 27 µs is a subtraction, and no timestamp
-query was issued.
+These figures do not say what any one pass costs: `Resident` writes two timestamps a submission and
+puts the frame at 24–26 µs on the device against 27–31 µs of host clock, but the 11 µs left after
+subtracting ten barriers and seventeen dispatches from that is still a subtraction over seventeen
+passes, and no per-pass query was issued.
