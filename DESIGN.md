@@ -2,10 +2,14 @@
 
 The [README](README.md) is what it does and how to run it. This is why it is shaped this way.
 
-Seventeen passes in **eleven stages**, one submission, six words from the host. A barrier sits
-between stages and not inside one, and `tests/floor.rs` prices one at 996–1009 ns against 210–245 ns
-for a dispatch — so which passes are ordered against which is worth stating, and `live::wired` is
-where it is stated, with the argument for every seam beside it.
+Each answer here is short on purpose: the full argument lives beside the code that makes it, and the
+last column says where.
+
+---
+
+## The frame
+
+Seventeen passes, **eleven stages**, one submission, six words from the host.
 
 ```text
   tick     1              the frame number, and the partition's phase
@@ -22,12 +26,15 @@ where it is stated, with the argument for every seam beside it.
   paint    the window     the visible cells, as colours
 ```
 
-Four of the ten barriers are followed by a dispatch that reads its workgroup count out of a buffer,
-and only those four name `DRAW_INDIRECT`; naming it in the other six cost a fifth of the frame.
+A barrier sits between stages and not inside one. Which passes may share a stage is a question about
+the frame, not about `Resident`, so `live::wired` answers it and names every seam.
 
-`tests/floor.rs` prices what is underneath all of it, on an apparatus with no simulation in it —
-kernels that write one word, and the only thing varied is how many frames go into one submission, so
-that the intercept and the slope come apart:
+---
+
+## What Vulkan charges
+
+`tests/floor.rs` prices it on an apparatus with no simulation in it — kernels that write one word,
+varying only how many frames go into one submission, so the intercept and the slope come apart.
 
 ```text
   a submission, holding nothing        35–42 µs
@@ -37,100 +44,101 @@ that the intercept and the slope come apart:
   asking the device for one word       41–42 µs
 ```
 
-Over four runs, and the spreads are the point: the barrier is the same number every time and the
-submission is not, which is what a queue and a fence look like next to a pipeline flush. **The last
-line is why `prepare` exists** — asking the device for one number costs more than the whole frame
-that produced it, so the count is written into a buffer and Vulkan reads it at dispatch time.
+Four runs. The barrier returns the same number every time and the submission does not — a pipeline
+flush next to a queue and a fence.
+
+**Two lines of that table are the whole design.** Asking the device for one number costs more than
+the frame that produced it, so `prepare` writes the count into a buffer and Vulkan reads it at
+dispatch time. And ten barriers at ~1 µs are most of what is left, which is why the stages exist.
 
 ---
 
-### The partition, and why there is no race to resolve
+## Why there is no race
 
-Two cells want to move into the same empty one. On a CPU the loop order decides; on a GPU nothing
-does, and the usual answers — atomics, a priority pass, double buffering with a tie-break — all cost
-more than the physics.
+| | |
+| --- | --- |
+| **The rule** | No invocation writes outside its own 2×2 block. The partition's origin alternates between frames, so material crosses a boundary on the next step. |
+| **What it buys** | Conservation falls out of the arrangement instead of being enforced on top of it — no atomics, no priority pass, no double buffering. |
+| **The corollary** | *Reading* outside a block is a race too. `tests/live.rs` caught it as one presents: frame nought, disagreement at subgroup 8, agreement at 32. |
+| **The fix** | One bit. `sand::HELD` — the cell writes down what it is standing on, refreshed every second frame by the invocation entitled to write it. |
+| **Read** | `src/sand.rs` module doc |
 
-This has no race because **no invocation writes outside its own 2×2 block**. The grid is partitioned
-into blocks, each is read and rewritten by one invocation, and the partition's origin alternates
-between frames so material can cross a boundary on the next step. That is the Margolus
-neighbourhood, and conservation falls out of the arrangement rather than being enforced on top of
-it.
+---
 
-*The corollary bit me anyway.* Reading outside a block is not free either: that row belongs to
-another invocation and is being rewritten at the same moment. `tests/live.rs` caught it exactly as a
-race presents — frame nought, disagreement on an eight-wide part, agreement on a thirty-two-wide
-one. See `sand::HELD` for the fix, which is one bit.
+## How the work list is built
 
-### The compaction, in three tiers
+A quad's offset is a sum over three tiers, and each is a different thing in `simdr`.
 
-A quad's offset in the work list is the sum of three terms: how many awake quads sit before it in
-its own block, how many its earlier blocks hold, and how many earlier *tiles* hold. The first is a
-subgroup prefix sum and is free — it rides along with the pass that reads the flags. The second and
-third are two more dispatches over a hundred and a thousandth of the data.
-
-```
-  sweep        blocks × per_block quads  →  counts[block]  and a bucket each
-  scan_counts  tiles  × per_block counts →  bases[block]   and totals[tile]
-  scan_totals  1      × per_block totals →  totals[tile] exclusive, and the grand total
-  gather       blocks × per_block slots  →  dense[], the work list, contiguous
+```text
+  serial   earlier cells in this lane      a Rust loop over registers      free
+  before   earlier lanes of this subgroup  prefix_sum_exclusive            one instruction
+  base     earlier blocks and tiles        two later dispatches            one load
 ```
 
-Two levels reach `per_block²` blocks — 16.7 million quads on a 32-lane part. Past that `Plan::over`
-refuses **by name** rather than scanning the first tier and silently dropping the rest.
+The fusion is not in merging kernels. It is that the step and the running count **share a register**,
+so the first tier costs no memory traffic — the state is read once, stepped, written once, and the
+number deciding where it goes was added on the way.
 
-### Two levels of "is anything happening here"
+The third tier cannot exist until every block has run, so it is a second dispatch — and because there
+are more blocks than one block can scan, a third:
 
-The work list makes the settle proportional to what is moving. It does nothing for the passes that
-*produce* it, and at sixteen million cells those were most of the frame. So the same trick one level
-up: `layout::HOT` holds one word a block, written by exactly the code that writes the per-quad
-flags, so a block reading nought provably has no awake quad in it.
-
-**Skipping a block was not enough, because a skipped workgroup is still a launched one.** `decay`,
-`mark` and `gather` each ran one per block — 3 × 16 384 of them at the largest size, doing a load and
-a vote before they exited — and that was the whole of the frame's growth from four million cells to
-sixteen. So the compaction is applied to itself: the same four passes over `HOT` that they run over
-`AWAKE`, producing a list of the blocks that hold something, and the three of them are dispatched
-over *that*.
-
+```text
+  sweep        blocks × per_block cells   →  counts[block]  and a bucket each
+  scan_counts  tiles  × per_block counts  →  bases[block]   and totals[tile]
+  scan_totals  1      × per_block totals  →  totals[tile] exclusive, and the grand total
+  gather       blocks × per_block slots   →  dense[], the work list, contiguous
 ```
+
+Two levels reach `per_block²` blocks. Past that `Plan::over` refuses **by name** rather than scanning
+the first tier and dropping the rest.
+
+**Read:** `src/sweep.rs`, `src/compact.rs`.
+
+---
+
+## Why there is a second hierarchy
+
+The work list makes the settle proportional to what moves. It did nothing for the three passes that
+*produce* it — `decay`, `mark` and `gather` ran one workgroup a block, gated on `layout::HOT`.
+
+**A gate makes a workgroup cheap. It does not stop it being launched.** At 16 777 216 cells that was
+3 × 16 384 workgroups doing one load and a vote, and it was the whole of the frame's growth.
+
+So the compaction is applied to itself — the same four passes over `HOT` that they run over `AWAKE`:
+
+```text
   hot_mark     a tile × per_block blocks  →  hot_counts[tile]  and a bucket each
   hot_scan ×2                                the tiles against each other
   hot_gather   a tile × per_block slots   →  hot_dense[], the hot-block list
   hot_prepare  1                          →  how many workgroups the three run
 ```
 
-This level needs no third tier and never will: `Plan::over` already refuses past `per_block²` blocks,
-so there are at most `per_block` tiles and one workgroup scans them all. The whole hierarchy costs
-about a hundred and thirty workgroups to remove forty-nine thousand.
+About 130 workgroups to remove 49 152, and 144 µs to 60. It needs no third tier and never will:
+`Plan::over` already bounds the tiles at `per_block`, so one workgroup scans them all.
 
-The gate is still there in `gather`, where it is free — the count it votes on was loaded anyway — and
-`crate::gate` still carries the argument for why a branch is allowed at all: the condition is one word
-loaded at the *workgroup's* index, so every lane has the same answer by construction, and
-`any_uniform` is how a program says so in a form the branch will accept.
-
-Two things had to move with it. `mark` used to write `counts[block] = 0` before its gate so a skipped
-block said nothing rather than last frame's something — a block that is never dispatched cannot write
-that, so it is a pass of its own now, one workgroup a tile. And `HOT` is padded to whole tiles,
-because the coarse sweep reads a tile at a time and a dump slot inside the padding would be a hot
-block that no quad ever woke.
-
-### The reduction
-
-Everything above compacts: a prefix sum, to know *which* and in what order. The telemetry is the
-other half of the lane model — a reduction, which does not care which, only how many, and hands one
-answer back for the whole device. Six numbers a frame, summed inside the settle because the settle
-already has the cells in registers. One `reduce_sum` and one atomic a workgroup.
-
-Press **F** and the window steers itself to the centre of the motion. Nothing else in the loop knows
-where anything is.
+**Read:** `layout::HOT_BUCKETS`, `decisions/DR-0003`.
 
 ---
 
-## Working against an engine with no subtraction
+## The one reduction
 
-`simdr`'s lane API has no exclusive-or, no subtraction, no division, and no bitwise and on vectors.
-That is not an omission — it is what makes every operation map to something a subgroup can do. It
-means the code says what it means:
+Everything else here compacts — a prefix sum, to know *which* and in what order. The telemetry wants
+the opposite: not which, but how many, and one answer for the whole device.
+
+Six numbers a frame, folded into the settle because it already has the cells in registers. One
+`reduce_sum` and one atomic a workgroup. **The telemetry is not a pass.**
+
+Press **F** in `pour` and the window steers to the centre of the motion — the same reduction,
+weighted. Nothing else in the loop knows where anything is.
+
+**Read:** `layout::TALLY`.
+
+---
+
+## Writing for an engine with no subtraction
+
+`simdr`'s lane API has no exclusive-or, no subtraction, no division and no bitwise and on vectors.
+That is not an omission — it is what makes every operation map to something a subgroup can do.
 
 | wanted | written |
 | --- | --- |
@@ -139,44 +147,31 @@ means the code says what it means:
 | `v ÷ 2ᵏ` | `shift_right_logical(v, k)` |
 | `p && q` | `mul(select(p,1,0), select(q,1,0))` — a `Predicate` is not a value |
 
-The grid's sides are powers of two for exactly this reason, and a material's *number is its weight*
+The grid's sides are powers of two for exactly this reason, and a material's **number is its weight**
 so that "heavier above lighter swaps" is one comparison rather than one per pair of materials. Sand
-sinking through water falls out for free.
+sinking through water falls out of that.
 
 ---
+
+## What is still true and unflattering
+
+| | |
+| --- | --- |
+| **Water takes thousands of frames to stop.** A runner moves one cell a frame, so levelling a pool 500 columns wide is thousands of them. It does reach nought: cells with nowhere to be give up after `sand::PATIENCE` tries. | `DR-0004` |
+| **Fatigue clears on falling and on nothing else.** Pour into a basin that has come to rest and a tired cell far from the disturbance stays tired, so the surface can keep a step. Bounded at one cell in the scene `tests/sand.rs` runs; not proved in another. | `DR-0004` |
+| **A smaller world does not get a smaller frame.** Ten barriers and seventeen dispatches are paid whatever the grid is. Fusing the coarse `scan ×2` would buy one of each — 1.2 µs of 25 — for a kernel that breaks the symmetry where `compact::scan` serves both tiers. Priced and declined. | `DR-0001` |
+| **`paint` is the largest fixed dispatch left**, at one invocation a pixel — 16 384 workgroups for a 1024×512 window. Priced by the window rather than by the world, so it does not break the claim above; `scale` does not measure it. | — |
+| **A column of sand takes a long time to fall.** A full 2×2 block has nowhere for anything to move, so a wide column erodes from its two edges, a cell a frame each side, and drains from the outside in. That is the rule rather than a fault. | — |
+| **The frame was measured one way and could have been abandoned on it.** `Resident::frame` is a submit and a fence whatever is inside it, and measured that way the coarse level *appeared to make things slower*. `Resident::frames` records twenty frames into one submission and divides. | `DR-0001` |
+
 ---
 
-## Things that are true and unflattering
+## Where the arguments live
 
-* **Water takes a long time to stop, and a cell has to be allowed to give up.** A pool levels to what
-  fits in a whole layer, and the remainder — 128 cells do not divide by 62 columns — used to pace
-  about looking for somewhere to be, for ever. No rule reading one 2×2 block can know where it
-  belongs: whether there is somewhere lower is a property of the whole surface. What a rule *can*
-  read is the cell's own past, and `sand::TIRED` is three bits of it — how many times this cell has
-  taken a direction without ever descending. At `sand::PATIENCE` it stops asking, and `fall` clears
-  the count because *what lands is bare*. `tests/sand.rs` now demands nought rather than bounding it,
-  and demands a further step in both phases change nothing at all.
-* **A frame's wall clock is a submit and a fence**, 37 µs on this machine
-  whatever is inside it. The table above was measured with `Resident::frames`, which records twenty
-  frames into one command buffer and divides. Measured the other way, the coarse level *appeared to
-  make things slower* and nearly went in the bin on that evidence — and the hot-block list that came
-  after it would have been invisible too, because what it saves at the largest size is 84 µs and a
-  round trip is a third of that again. **The hundred microseconds this repository quoted for years
-  was a round trip that moves data**, inherited from `simdr`'s `DR-0008` and used for a bare submit
-  and fence; `tests/floor.rs` prices them apart. Nothing in the design changes for it — 41 µs to ask
-  the device for one number is still more than the whole frame that produced it, which is why
-  `prepare` exists.
-* **What is left of the frame is mostly the barriers, and there are ten of them.** Priced by adding
-  idle passes rather than removing real ones, so the simulation is unchanged: five of them in five
-  stages costs 7.5 µs and five inside one stage costs 1.1 µs, which is **1.3 µs a barrier and 0.2 µs
-  a dispatch**. The ten are a genuine dependency chain — the two hierarchies are serial by
-  construction — so the obvious remaining merge, fusing the coarse `scan ×2` into one kernel, buys
-  one barrier and one dispatch: 1.5 µs of 25, for a coarse-only kernel that breaks the symmetry
-  where `compact::scan` serves both tiers. Priced and declined. A smaller world still does not get a
-  smaller frame.
-* **`paint` is the largest fixed dispatch left**, at one invocation a pixel — 16 384 workgroups for
-  a 1024×512 window. It is priced by the window rather than by the world, so it does not break the
-  claim above; it is simply what `pour` pays and `scale` does not measure.
-* **A column of sand takes a long time to fall**, and that is the rule rather than a fault. A full
-  2×2 block has nowhere for anything to move, so a wide column erodes only from its two edges, a
-  cell a frame each side, and drains from the outside in.
+| | |
+| --- | --- |
+| `decisions/` | six records: measurement, decision, rejected route, limit — four headings, no prose |
+| `src/live.rs` | `wired`, the one place the loop's order and grouping are decided |
+| `src/resident.rs` | stages, the barrier mask, the kept recording |
+| `src/sand.rs` | the Margolus rule and what a cell word holds |
+| `tests/live.rs` | the same pour through the list and over the whole grid, six thousand frames |
