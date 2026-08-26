@@ -14,6 +14,7 @@
 //!   # a comment
 //!   inputs 4        how many inputs, one to six
 //!   outputs 3       how many answer bits — one if left out
+//!   ladder 1        reveal one output bit at a time, widening when it is mastered
 //!   gates and or not   the gates it draws from; wire is always in
 //!   noise 16        break one gate in sixteen each generation
 //!   lean 1          among equally right chips, prefer the one with fewer gates
@@ -49,6 +50,41 @@
 //! A grid of gates, drawn, and a number: how many of the marked cases it gets right. That number is
 //! worked out twice, once by the card while it was evolving and once by the host afterwards from the
 //! genome alone, and the report prints both. They have to agree.
+//!
+//! # A curriculum, and what it did not move
+//!
+//! `ladder 1` asks about output nought only to begin with and adds another when the colony has
+//! mastered what it has — or when it has stopped improving for `PATIENCE` batches, because waiting
+//! for mastery leaves a run stranded on a rung that is itself a wall. When the rung moves the whole
+//! colony is re-scored: a chip that did not change carries a score measured against the easier exam,
+//! and comparing that against the harder one hands the rung to whoever was asked less.
+//!
+//! It climbs, and it does not help:
+//!
+//! ```text
+//!   count, of 48        colony 4 096   colony 16 384
+//!   ladder 0                      42              42
+//!   ladder 1                      42              42
+//! ```
+//!
+//! Neither does the colony, which was the lever everywhere else. So something in `count` is not
+//! what any of these knobs are for, and taking it apart says what:
+//!
+//! ```text
+//!   asked on its own          eight starts
+//!   bit 0, the parity         16 16 16 16 16 16 16 16   solved every time
+//!   bit 1                     14 14 14 14 15 14 15 14   never
+//!   bit 2, all four ones      16 16 16 16 16 16 16 16   solved every time
+//! ```
+//!
+//! **Two things, and the ladder addresses neither.** One output bit is a wall on its own — bit one
+//! of a count of four is *two or three of them*, which is neither monotone nor a parity and never
+//! comes. And the three interfere: separately they are worth 16, 14.5 and 16, which is 46.5, and
+//! together they are worth 42.5. Four bits go missing in the sharing.
+//!
+//! The outputs are read off adjacent rows of the last column and the wiring is diagonal, so three
+//! answers on rows nought, one and two are computed out of very nearly the same cells. That is a
+//! guess at the interference and it is not measured.
 //!
 //! # Making it work under faults, which costs more than it buys
 //!
@@ -405,6 +441,9 @@ const ROWS: u32 = 8;
 const COLUMNS: u32 = 12;
 /// How many gates a chip holds, which is the length of a genome.
 const CELLS: u32 = (COLUMNS - 1) * ROWS;
+/// How many batches without improvement before the ladder moves on anyway.
+const PATIENCE: u32 = 20;
+
 /// How many generations one fault pattern stands before another is drawn. A power of two.
 const SETTLED: u32 = 64;
 
@@ -1034,6 +1073,8 @@ struct Exam {
     /// ten times the generations changes nothing and the same starts still fail; four times the
     /// colony takes three starts in eight to six, and sixteen times takes it to eight.
     colony: u32,
+    /// Whether the exam is revealed one output bit at a time instead of all at once.
+    ladder: bool,
     /// Which gates the search draws from. Wire is always in it, because a grid needs somewhere
     /// for a signal to go.
     allowed: Vec<u32>,
@@ -1118,6 +1159,7 @@ fn spread_of(pattern: &str) -> Vec<u32> {
 ///   # a comment
 ///   inputs 4        how many inputs, one to six
 ///   outputs 3       how many answer bits — one if left out
+///   ladder 1        reveal one output bit at a time, widening when it is mastered
 ///   gates and or not   the gates it draws from; wire is always in
 ///   noise 16        break one gate in sixteen each generation
 ///   lean 1          among equally right chips, prefer the one with fewer gates
@@ -1143,6 +1185,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut outputs = 1_u32;
     let mut seed = 0x0AC1_E000_u32;
     let mut colony = 1_u32 << 12;
+    let mut ladder = false;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
     let mut lean = false;
@@ -1161,6 +1204,9 @@ fn read(text: &str) -> Result<Exam, String> {
         let say = |what: &str| format!("line {}: {what}", number + 1);
         let mut word = line.split_whitespace();
         match (word.next(), bits) {
+            (Some("ladder"), _) => {
+                ladder = word.next() != Some("0");
+            }
             (Some("gates"), _) => {
                 let mut kinds = vec![0_u32];
                 for name in word.by_ref() {
@@ -1330,7 +1376,7 @@ fn read(text: &str) -> Result<Exam, String> {
     }
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
-    Ok(Exam { bits, outputs, allowed, noise, lean, steps, state, colony, island, seed, want, ask, name })
+    Ok(Exam { bits, outputs, ladder, allowed, noise, lean, steps, state, colony, island, seed, want, ask, name })
 }
 
 // ---------- the host, which lays out the arena and then asks almost nothing ----------
@@ -1688,7 +1734,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         arena.write(binding, &vec![0_u32; *words])?;
     }
     arena.write(TARGET as usize, &exam.want)?;
-    arena.write(KEEP as usize, &exam.ask)?;
+    // **The ladder.** With it, only the low output bits are asked about to begin with and another is
+    // added when the colony has the ones it has. Without it, everything is asked at once, which is
+    // what this was.
+    let mut rung = if exam.ladder { 1 } else { exam.outputs };
+    let masked = |rung: u32| -> Vec<u32> {
+        let keep = if rung >= 32 { u32::MAX } else { (1 << rung) - 1 };
+        exam.ask.iter().map(|it| it & keep).collect()
+    };
+    let asked_at = |rung: u32| -> u32 { masked(rung).iter().map(|it| it.count_ones()).sum() };
+    arena.write(KEEP as usize, &masked(rung))?;
     let mut seed = exam.seed;
     // **Drawn from what the exam allows**, or the restriction is only half a restriction: the grids
     // would start full of gates the mutation is never allowed to put back.
@@ -1706,6 +1761,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut spent = Duration::ZERO;
     println!("  {:>10}  {:>5}  {:>24}  {:>10}", "generation", "best", "the colony", "us a tick");
     let mut best;
+    let mut high = 0;
+    let mut stuck = 0;
     let mut ran = 0;
     for batch in 0..batches {
         ran = batch + 1;
@@ -1722,8 +1779,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 arena.on_device().unwrap_or_default().as_secs_f64() * 1e6
             );
         }
+        // **Or when it has stopped moving.** Waiting for mastery leaves the run on a rung that is
+        // itself a wall — rung two of `count` never came, so the whole run was spent on two thirds of
+        // the exam and then judged on all of it.
+        if best > high {
+            high = best;
+            stuck = 0;
+        } else {
+            stuck += 1;
+        }
+        if (best == asked_at(rung) || stuck >= PATIENCE) && rung < exam.outputs {
+            // **Everyone is re-scored when the rung moves.** A chip that did not change is carrying a
+            // score measured against the easier exam, and comparing that against a score measured
+            // against the harder one hands the rung to whoever was asked less. Setting the tick back
+            // to nought puts the whole colony on the changed list next tick.
+            rung += 1;
+            high = 0;
+            stuck = 0;
+            arena.write(KEEP as usize, &masked(rung))?;
+            arena.write_at(PARAMS as usize, 0, &[0])?;
+            println!("  {:>10}  {:>5}  rung {rung} of {}: {} bits asked", (batch + 1) * BATCH, best, exam.outputs, asked_at(rung));
+        }
         // With `lean` on, being right is where the work starts rather than where it stops.
-        if best == perfect && !exam.lean {
+        if best == perfect && rung == exam.outputs && !exam.lean {
             break;
         }
     }
