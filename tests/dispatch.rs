@@ -296,7 +296,12 @@ fn a_workgroup_count_written_by_one_stage_is_read_by_the_next() {
     held.write(0, &[0]).expect("a tally");
     held.write(1, &[1, 1, 1]).expect("a seeded count");
 
-    let first = [Groups::Fixed(1)];
+    // **`Counting`, not `Fixed`, and that is the whole of what this test now says.** The barrier
+    // naming `DRAW_INDIRECT` follows the stage that wrote the count, and `Resident` cannot tell
+    // which stage that was — a kernel's writes are not in its stage list. Marked `Fixed(1)` here
+    // instead, this comes back with 32 invocations against 1184: the dispatch reads the seeded 1
+    // rather than the written 37, three runs out of three. Not a race — a wrong answer, every time.
+    let first = [Groups::Counting(1)];
     let second = [Groups::From { binding: 1, at: 0 }];
     held.staged(&[&first, &second]).expect("two stages");
 

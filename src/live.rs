@@ -90,7 +90,7 @@ pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 /// The hierarchy shortens `decay`, `mark` and `gather` from a workgroup a block to a workgroup a
 /// *listed* block, and building it is five passes that cost 6.2–6.7 µs of device clock at every
 /// size. Below this many blocks the three are short enough that the five are not worth running:
-/// at 256 blocks the arrangement costs 10 µs of 24, and at 16 384 it saves 84 µs of 109.
+/// at 256 blocks the arrangement costs 7.5 µs of 22, and at 4096 it saves 15 µs of 37.
 ///
 /// `tests/coarse.rs` measures both arrangements either side of this number, and
 /// `decisions/DR-0003` carries the figures.
@@ -145,8 +145,8 @@ pub const fn coarse_pays(blocks: u32) -> bool {
 ///
 /// # What comes back is stages, not passes
 ///
-/// A barrier sits between stages and not inside one, and `tests/floor.rs` prices one at 980–1014 ns
-/// against 221–244 ns for a dispatch. At a size where no pass has any work to do, ten of them are
+/// A barrier sits between stages and not inside one, and `tests/floor.rs` prices one at 981–1013 ns
+/// against 224–232 ns for a dispatch. At a size where no pass has any work to do, ten of them are
 /// most of the frame. So the second half of this function is a dependency argument: sixteen passes
 /// in eleven stages, or eleven in seven without the coarse hierarchy, and the comment beside them
 /// names every seam. [`crate::Resident::staged`] and [`crate::Resident::staged_frames`] are what
@@ -263,7 +263,10 @@ pub fn arranged(
             // **Divided by one**, because this list is dispatched a workgroup an entry rather than a
             // workgroup a subgroup's worth. Dividing by the wrong one is a pass that silently covers
             // part of the list.
-            (crate::compact::prepare(subgroup, 1, Tier::COARSE)?, one),
+            (
+                crate::compact::prepare(subgroup, 1, Tier::COARSE)?,
+                Groups::Counting(1),
+            ),
         ]
     } else {
         Vec::new()
@@ -304,7 +307,10 @@ pub fn arranged(
                 crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
                 hot,
             ),
-            (crate::compact::prepare(subgroup, subgroup, Tier::FINE)?, one),
+            (
+                crate::compact::prepare(subgroup, subgroup, Tier::FINE)?,
+                Groups::Counting(1),
+            ),
         ],
     ];
 

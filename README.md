@@ -1,6 +1,6 @@
 # grit
 
-**Sixteen million cells of falling sand and water, stepped in 25 µs on the card.**
+**Sixteen million cells of falling sand and water, stepped in 22 µs on the card.**
 
 A frame touches about seven hundred of the world's four million quads, and the host never learns how
 many — the device writes the count into a buffer and Vulkan reads it at dispatch time. That is what
@@ -9,14 +9,14 @@ this repository is: a sparse-grid stream compaction engine, built on
 
 ```text
        cells      quads        on card           wall     stepped    of grid
-      262 144     65 536  14.3 - 14.5 µs  17.0 - 17.9 µs      768        85×
-    1 048 576    262 144  19.0 - 19.3 µs  21.7 - 22.4 µs      768       341×
-    4 194 304  1 048 576  24.8 - 26.2 µs  28.1 - 31.2 µs      768      1365×
-   16 777 216  4 194 304  24.8 - 25.2 µs  29.3 - 31.0 µs      768      5461×
+      262 144     65 536  14.3 - 14.4 µs  16.9 - 17.9 µs      768        85×
+    1 048 576    262 144  19.1 - 19.4 µs  21.9 - 23.1 µs      768       341×
+    4 194 304  1 048 576  22.3 - 22.4 µs  25.4 - 27.4 µs      768      1365×
+   16 777 216  4 194 304  22.4 - 22.6 µs  26.9 - 29.4 µs      768      5461×
 ```
 
-**Four times the world, and the frame does not grow**: 24.8–26.2 µs at 4 194 304 cells against
-24.8–25.2 at 16 777 216, over nineteen runs. Below four million it gets *smaller* rather than flat,
+**Four times the world, and the frame does not grow**: 22.3–22.4 µs at 4 194 304 cells against
+22.4–22.6 at 16 777 216, over eighteen runs. Below four million it gets *smaller* rather than flat,
 because the machinery that keeps it flat costs more than it saves there and `live::wired` leaves it
 out.
 
@@ -106,7 +106,7 @@ builds `scale` and `loop_cost` but not the two that need a window.
 | `src/live.rs` | the loop — `wired` is the one place its order is decided |
 | `src/sand.rs` | the Margolus rule, four ordered swaps, and what a cell word holds |
 | `src/layout.rs` | which buffer is which |
-| `decisions/` | seven records, four headings each: measurement, decision, rejected route, limit |
+| `decisions/` | eight records, four headings each: measurement, decision, rejected route, limit |
 
 Start at `src/live.rs`'s `wired` if you want the loop, `src/resident.rs` if you want the Vulkan, and
 `decisions/DR-0002` if you want to know which of this repository's claims have been checked.

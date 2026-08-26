@@ -27,10 +27,10 @@
 //!
 //! ```text
 //!         cells       gated      listed      staged    narrowed        kept         now
-//!       262 144   36.6–36.8   57.9–61.8   43.3–44.3   33.9–34.3   27.4–27.6   17.0–17.9
-//!     1 048 576   37.0–37.4   57.6–63.6   42.9–44.0   34.1–36.6   27.5–29.5   21.7–22.4
-//!     4 194 304   41.4–42.7   58.0–58.7   43.6–44.8   34.4–36.3   27.9–28.2   28.1–31.2
-//!    16 777 216   60.3–61.5   59.4–62.0   45.3–46.8   36.2–36.3   29.5–29.5   29.3–31.0
+//!       262 144   36.6–36.8   57.9–61.8   43.3–44.3   33.9–34.3   27.4–27.6   16.9–17.9
+//!     1 048 576   37.0–37.4   57.6–63.6   42.9–44.0   34.1–36.6   27.5–29.5   21.9–23.1
+//!     4 194 304   41.4–42.7   58.0–58.7   43.6–44.8   34.4–36.3   27.9–28.2   25.4–27.4
+//!    16 777 216   60.3–61.5   59.4–62.0   45.3–46.8   36.2–36.3   29.5–29.5   26.9–29.4
 //! ```
 //!
 //! *Gated* is `47cf09a`: a workgroup a block, every block, with a vote that lets a cold one exit
@@ -61,11 +61,11 @@
 //!
 //! ```text
 //!        blocks   over the list   over every block
-//!           256     24.29–24.40        14.37–14.41
-//!           512     24.76–24.83        15.62–15.69
-//!          1024     24.78–24.85        19.16–19.20
-//!          2048     24.53–24.86        24.81–25.44
-//!          4096     24.49–24.87        36.84–37.61
+//!           256     21.88–21.89        14.34–14.35
+//!           512     22.30–23.06        15.58–15.58
+//!          1024     22.37–22.40        19.08–19.11
+//!          2048     22.33–22.39        25.32–25.42
+//!          4096     22.30–22.40        37.37–37.50
 //! ```
 //!
 //! **Building the list costs 6.2–6.7 µs at every size** — a constant, because `Plan::over` bounds
@@ -73,10 +73,10 @@
 //! arrangement, the list built and not used, which `live::arranged` cannot produce and which was
 //! measured on a patched build that is not in the tree.
 //!
-//! **Using it costs 10 µs of 24 at 256 blocks and saves 12 µs of 37 at 4096.** The two cross at
-//! 2048, where the ranges overlap and the order changes between runs — so `live::COARSE_FROM` is
-//! 2048, and `live::wired` picks the arrangement instead of always taking the list.
-//! `decisions/DR-0003` carries the figures.
+//! **Using it costs 7.5 µs of 22 at 256 blocks and saves 15 µs of 37 at 4096.** The two cross
+//! between 1024 and 2048, and no block count lies between them at this width — so
+//! `live::COARSE_FROM` is 2048, the first size at which the list wins, and `live::wired` picks the
+//! arrangement instead of always taking it. `decisions/DR-0003` carries the figures.
 //!
 //! # The stages, the barriers and the recording
 //!

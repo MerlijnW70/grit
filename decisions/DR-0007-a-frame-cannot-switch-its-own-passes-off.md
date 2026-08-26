@@ -7,9 +7,10 @@ status: prose-only
 ## The Measurement
 
 On an RTX 4080 at subgroup 32, five runs of `tests/floor.rs` put a pass whose count the device set to
-nought at 48–51 ns against 120–123 ns for one it left on, and a stage before a count read from a
-buffer at 2408–2443 ns against 1085–1099 ns for one before a count the host wrote. Gating a pass
-moves it from the second pair to the first, which is 69–75 ns saved against 1309–1358 ns spent.
+nought at 46–47 ns against 117–118 ns for one it left on, and a stage that wrote a workgroup count at
+2373–2401 ns against 1097–1098 ns for one that did not. Gating the seven passes of
+`crate::live::wired` whose counts the host now fixes saves 490–504 ns, and the one barrier behind the
+kernel that would write those counts costs 1275–1304.
 
 ## The Decision
 
@@ -19,10 +20,9 @@ already write, and a frame runs the same passes whether anything moved or not.
 ## The Rejected Route
 
 A frame reading `layout::TALLY` and switching its own passes off for the rounds after the world came
-to rest was rejected at 1309–1358 ns of barrier for 69–75 ns of dispatch a pass.
+to rest was rejected at 1275–1304 ns of barrier against 490–504 ns of dispatch.
 
 ## The Limit
 
-Whether the barrier has to widen in front of every gated pass was not measured: Vulkan makes a write
-visible to every later indirect read, and `Resident` names `DRAW_INDIRECT` before each reader rather
-than after each writer.
+The kernel that writes the gate is a further pass, and a further stage wherever nothing else can
+share one with it, and neither of those was measured.

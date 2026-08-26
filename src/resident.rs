@@ -57,10 +57,28 @@ use crate::host::{Error, Host};
 pub enum Groups {
     /// A count the host knows.
     ///
-    /// **Nought means nought.** The pass is recorded and dispatched over no workgroups, which is a
-    /// legal call that does nothing — and is how a caller holding several passes runs one and skips
-    /// the others.
+    /// **Nought means nought, and a pass told nought is not recorded at all.** It is how a caller
+    /// holding several passes runs one and skips the others, and a skipped pass costs no dispatch
+    /// and takes no barrier with it — `tests/dispatch.rs` holds both halves of that.
     Fixed(u32),
+    /// A count the host knows, from a pass that **writes** a workgroup count for a later one.
+    ///
+    /// # Why this is a variant and not a flag somewhere else
+    ///
+    /// Because a count the device wrote has to be made visible to the command that reads it, and
+    /// that is a barrier naming `DRAW_INDIRECT`. `tests/floor.rs` prices a stage that wrote one at
+    /// 2373–2401 ns against 1097–1098 ns for a stage that did not, so naming it where it is not
+    /// needed is most of a barrier thrown away.
+    ///
+    /// `Resident` cannot work out where it is needed: it sees which binding a `From` reads and has
+    /// no idea which binding a kernel writes. So the caller says, the way it already says which
+    /// passes may share a stage — `decisions/DR-0005`. This marks the *writer*; every later stage
+    /// reads what it wrote through the one barrier that follows it, because Vulkan makes a write
+    /// visible to every subsequent indirect read rather than to the next one only.
+    ///
+    /// **Nought is not recorded either**, and a pass that did not run wrote no count, so it takes no
+    /// barrier with it.
+    Counting(u32),
     /// Three words at `binding`, from `at`: the x, y and z counts, as Vulkan wants them.
     From {
         /// Which buffer holds them.
@@ -1420,7 +1438,7 @@ impl Resident<'_> {
     ///
     /// **The measurement that made this worth having.** [`Resident::frames`] puts every pass in a
     /// stage of its own, which is a barrier between each of them, and `tests/floor.rs` prices a
-    /// barrier at 980–1014 ns against 221–244 ns for a dispatch. Ten of them are most of a frame at
+    /// barrier at 981–1013 ns against 224–232 ns for a dispatch. Ten of them are most of a frame at
     /// a size where no pass has any work to do.
     ///
     /// It was 3.8 µs a barrier when this went in, measured by taking five passes out of `grit`'s
@@ -1470,7 +1488,7 @@ impl Resident<'_> {
     /// `None` where the queue family counts no timestamps, or where the query has not landed.
     ///
     /// **This is the only figure in this crate that is not a host clock.** Everything else brackets
-    /// a submit and a fence, and `tests/floor.rs` shows that is 43.2–44.3 µs before any work happens —
+    /// a submit and a fence, and `tests/floor.rs` shows that is 41.1–43.9 µs before any work happens —
     /// so what a frame spends on the card was a subtraction until this existed.
     #[must_use]
     pub const fn on_device(&self) -> Option<Duration> {
@@ -1592,7 +1610,7 @@ impl Resident<'_> {
             for stage in stages {
                 let mut held = Vec::new();
                 for &count in *stage {
-                    if !matches!(count, Groups::Fixed(0)) {
+                    if !matches!(count, Groups::Fixed(0) | Groups::Counting(0)) {
                         held.push((pass, count));
                     }
                     pass += 1;
@@ -1620,7 +1638,9 @@ impl Resident<'_> {
                             // it may have had no reason to size for it. Such a pass never reaches
                             // here — it is filtered out above — and this arm stays honest about what
                             // a count of nothing means rather than relying on that filter.
-                            Groups::Fixed(count) => device.cmd_dispatch(self.command, count, 1, 1),
+                            Groups::Fixed(count) | Groups::Counting(count) => {
+                                device.cmd_dispatch(self.command, count, 1, 1);
+                            }
                             Groups::From { binding, at } => {
                                 let held = self.buffers.get(binding).ok_or(Error::NoSuchBinding {
                                     index: binding,
@@ -1635,18 +1655,22 @@ impl Resident<'_> {
                     // Between stages only: what one wrote, the next reads. A barrier after the last
                     // one would order nothing, and the copy below brings its own.
                     //
-                    // **`DRAW_INDIRECT` only where the next stage actually dispatches from a
-                    // buffer.** A workgroup count is read at that stage rather than in the shader, so
-                    // a barrier that only mentioned `COMPUTE_SHADER` would order the buffer's
-                    // *contents* and not the command that reads them — and this used to name it
+                    // **`DRAW_INDIRECT` after the stage that wrote a count, not before every stage
+                    // that reads one.** A workgroup count is read at that pipeline stage rather than
+                    // in the shader, so a barrier naming only `COMPUTE_SHADER` would order the
+                    // buffer's *contents* and not the command that reads them. This once named it
                     // everywhere, on the grounds that doing so "costs nothing and cannot be
-                    // forgotten".
+                    // forgotten"; that was worth a fifth of the frame, and it then named it in front
+                    // of every reader, which is worth two barriers more.
                     //
-                    // It is not free. Measured on `grit`'s frame — sixteen passes in eleven stages,
-                    // ten barriers, four of which precede an indirect dispatch — naming it on the
-                    // other six is worth about a fifth of the frame. So it is asked for, once, of
-                    // the stage that is about to run: `Groups::From` is the whole of the question and
-                    // the answer cannot go stale, because the stage list is what is being recorded.
+                    // Vulkan makes a write visible to every *later* indirect read, not to the next
+                    // one only. So one barrier behind the writer covers every reader after it, and
+                    // asking again in front of each of them buys nothing —
+                    // `tests/floor.rs` prices the difference at about 1300 ns a stage.
+                    //
+                    // Which pass wrote a count is the one thing `Resident` cannot see: it knows
+                    // which binding a `Groups::From` reads and nothing about what a kernel writes.
+                    // `Groups::Counting` is the caller saying so, as `decisions/DR-0005` has it.
                     let next = if nth + 1 < running.len() {
                         running.get(nth + 1)
                     } else if repeat + 1 < times {
@@ -1654,10 +1678,10 @@ impl Resident<'_> {
                     } else {
                         None
                     };
-                    if let Some(next) = next {
-                        let counted = next
+                    if next.is_some() {
+                        let counted = stage
                             .iter()
-                            .any(|&(_, count)| matches!(count, Groups::From { .. }));
+                            .any(|&(_, count)| matches!(count, Groups::Counting(_)));
                         let (reach, stage) = if counted {
                             (
                                 vk::AccessFlags::INDIRECT_COMMAND_READ,

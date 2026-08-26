@@ -44,30 +44,30 @@ varying only how many frames go into one submission, so the intercept and the sl
 
 ```text
                                              host clock    device clock
-  a submission, holding nothing            43.2–44.3 µs          32 ns
+  a submission, holding nothing            41.1–43.9 µs       32–40 ns
   one more frame in it, holding nothing         0.05 µs
-  a dispatch                                 221–244 ns
-  a barrier                                 980–1014 ns
-  eight passes in eight stages                              8.32–8.34 µs
-  a pass the device switched off               48–51 ns
-  a pass it left on                          120–123 ns
-  a stage before a count read from a buffer 2408–2443 ns
-  a stage before a count the host wrote     1085–1099 ns
-  asking the device for one word           40.1–42.4 µs
+  a dispatch                                 224–232 ns
+  a barrier                                  981–1013 ns
+  eight passes in eight stages                              8.32–8.36 µs
+  a pass the device switched off               46–47 ns
+  a pass it left on                          117–118 ns
+  a stage that wrote a workgroup count      2373–2401 ns
+  a stage that did not                      1097–1098 ns
+  asking the device for one word           39.7–41.7 µs
 ```
 
 **The two clocks do not quite agree, and this page used to say they did.** Eight dispatches and
-seven barriers is 8.6–9.1 µs at the host's own prices against 8.32–8.34 on the card: no overlap,
-about 4% apart. What both ends do agree on is the round trip — a submission holding nothing is 32 ns
-on the card against 43 µs of host clock, measured from both sides at once.
+seven barriers is 8.7–9.0 µs at the host's own prices against 8.32–8.36 on the card: no overlap,
+about 5% apart. What both ends do agree on is the round trip — a submission holding nothing is
+32–40 ns on the card against 41–44 µs of host clock, measured from both sides at once.
 
 Five runs. Nothing in the table returns the same number twice; the barrier moves by 3% between runs
 and the submission by 2%.
 
-**Two more lines say what this cannot become.** A pass the device switched off costs 48–51 ns, so a
-frame could record every path it might take. But the barrier in front of a count read from a buffer
-costs about 1300 ns more than one in front of a count the host wrote, and gating a pass moves it
-across that line — 69–75 ns saved for 1309–1358 spent. `decisions/DR-0007`.
+**Two more lines say what this cannot become.** A pass the device switched off costs 46–47 ns, so a
+frame could record every path it might take. But a stage that wrote a workgroup count costs about
+1300 ns more than one that did not, and a gate is a kernel writing counts — 490–504 ns saved across
+seven gated passes for 1275–1304 spent on the one barrier behind it. `decisions/DR-0007`.
 
 **Two lines of that table are the whole design.** Asking the device for one number costs more than
 the frame that produced it, so `prepare` writes the count into a buffer and Vulkan reads it at
@@ -136,8 +136,8 @@ So the compaction is applied to itself — the same four passes over `HOT` that 
 ```
 
 About 130 workgroups to remove 49 152 — 6.2–6.7 µs on the device, the same at every size. That buys
-37 µs down to 25 at 4096 blocks and costs 10 µs of 24 at 256, so it is not run at every size: the
-two cross at 2048 blocks, which is `live::COARSE_FROM`, and `wired` picks. It needs no third tier and never will: `Plan::over` already bounds the tiles at `per_block`,
+37 µs down to 22 at 4096 blocks and costs 7.5 µs of 22 at 256, so it is not run at every size: the
+two cross between 1024 and 2048 blocks, and `live::COARSE_FROM` is 2048. It needs no third tier and never will: `Plan::over` already bounds the tiles at `per_block`,
 so one workgroup scans them all.
 
 **Read:** `layout::HOT_BUCKETS`, `live::COARSE_FROM`, `tests/coarse.rs`, `decisions/DR-0003`.
@@ -183,7 +183,7 @@ sinking through water falls out of that.
 | --- | --- |
 | **Water takes thousands of frames to stop.** A runner moves one cell a frame, so levelling a pool 500 columns wide is thousands of them. It does reach nought: cells with nowhere to be give up after `sand::PATIENCE` tries. | `DR-0004` |
 | **Fatigue clears on falling and on nothing else.** Pour into a basin that has come to rest and a tired cell far from the disturbance stays tired, so the surface can keep a step. Bounded at one cell in the scene `tests/sand.rs` runs; not proved in another. | `DR-0004` |
-| **A frame has a floor the world's size does not reach.** At 262 144 cells `scale` runs eleven passes in seven stages for 14.3–14.5 µs on the device, of which six barriers and eleven dispatches are 8.5 at `tests/floor.rs`'s prices. Fusing the coarse `scan ×2` would buy one barrier and one dispatch — 1.2 µs of 25 — for a kernel that breaks the symmetry where `compact::scan` serves both tiers. Priced and declined. | `DR-0001` |
+| **A frame has a floor the world's size does not reach.** At 262 144 cells `scale` runs eleven passes in seven stages for 14.3–14.4 µs on the device, of which one wide barrier, six narrow ones and eleven dispatches are 11.5 at `tests/floor.rs`'s prices. Fusing the coarse `scan ×2` would buy one barrier and one dispatch — 1.2 µs of 22 — for a kernel that breaks the symmetry where `compact::scan` serves both tiers. Priced and declined. | `DR-0001` |
 | **`paint` is the largest fixed dispatch left**, at one invocation a pixel — 16 384 workgroups for a 1024×512 window. Priced by the window rather than by the world, so it does not break the claim above; `scale` does not measure it. | — |
 | **A column of sand takes a long time to fall.** A full 2×2 block has nowhere for anything to move, so a wide column erodes from its two edges, a cell a frame each side, and drains from the outside in. That is the rule rather than a fault. | — |
 | **The frame was measured one way and could have been abandoned on it.** `Resident::frame` is a submit and a fence whatever is inside it, and measured that way the coarse level *appeared to make things slower*. `Resident::frames` records twenty frames into one submission and divides. | `DR-0001` |
@@ -194,7 +194,7 @@ sinking through water falls out of that.
 
 | | |
 | --- | --- |
-| `decisions/` | seven records: measurement, decision, rejected route, limit — four headings, no prose |
+| `decisions/` | eight records: measurement, decision, rejected route, limit — four headings, no prose |
 | `src/live.rs` | `wired`, the one place the loop's order and grouping are decided |
 | `src/resident.rs` | stages, the barrier mask, the kept recording |
 | `src/sand.rs` | the Margolus rule and what a cell word holds |

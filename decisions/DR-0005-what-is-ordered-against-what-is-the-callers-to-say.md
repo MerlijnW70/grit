@@ -15,9 +15,9 @@ stage.
 ## The Decision
 
 `crate::live::wired` returns sixteen passes in eleven stages, `Resident` names `DRAW_INDIRECT` in
-the four barriers whose next stage holds a `Groups::From`, and the command buffer is kept when the
-stages, the copy-out list and the frame count match the last call — taking 58–62 µs to 43–44,
-to 34, to 27–28 at 262 144 cells.
+the barrier behind each stage holding a `Groups::Counting` rather than in front of each one holding
+a `Groups::From`, and the command buffer is kept when the stages, the copy-out list and the frame
+count match the last call — taking 58–62 µs to 43–44, to 34, to 27–28 at 262 144 cells.
 
 ## The Rejected Route
 

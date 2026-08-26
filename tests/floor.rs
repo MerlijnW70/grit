@@ -123,10 +123,10 @@ fn switched(host: &Host, width: u32, n: usize, live: bool) -> f64 {
 
 /// The best of [`TRIES`] frames of `n` passes in `n` stages, in device nanoseconds.
 ///
-/// One pass a stage, so what the slope holds is a barrier and a dispatch together. `counted` is
-/// whether the count comes out of a buffer — which is what makes `Resident` name `DRAW_INDIRECT`
-/// in the barrier before it, and is the only difference between the two sweeps.
-fn spread(host: &Host, width: u32, n: usize, counted: bool) -> f64 {
+/// One pass a stage, so what the slope holds is a barrier and a dispatch together. `writes` is
+/// whether the pass is marked `Groups::Counting` — which is what makes `Resident` name
+/// `DRAW_INDIRECT` in the barrier *after* it, and is the only difference between the two sweeps.
+fn spread(host: &Host, width: u32, n: usize, writes: bool) -> f64 {
     let module = nothing(width).expect("a kernel");
     let modules: Vec<&[u32]> = vec![&module; n];
     let mut held = host
@@ -141,12 +141,9 @@ fn spread(host: &Host, width: u32, n: usize, counted: bool) -> f64 {
     held.write(1, &counts).expect("the switches");
 
     let apart: Vec<Vec<Groups>> = (0..n)
-        .map(|i| {
-            vec![if counted {
-                Groups::From {
-                    binding: 1,
-                    at: 3 * i,
-                }
+        .map(|_| {
+            vec![if writes {
+                Groups::Counting(1)
             } else {
                 Groups::Fixed(1)
             }]
@@ -346,14 +343,14 @@ fn what_a_submission_costs_before_it_holds_anything() {
     );
 
     // **And what it costs to let the device write that count**, which is not the dispatch but the
-    // barrier in front of it. `Resident` names `DRAW_INDIRECT` in a barrier whose next stage holds
-    // a `Groups::From`, because a count the device wrote has to be visible to the command that
-    // reads it. Both sweeps below run one workgroup a pass, one pass a stage; the only difference
-    // is where the count came from.
+    // barrier behind it. `Resident` names `DRAW_INDIRECT` in the barrier after a stage holding a
+    // `Groups::Counting`, because a count the device wrote has to be made visible to the commands
+    // that read it. Both sweeps below run one workgroup a pass, one pass a stage; the only
+    // difference is whether the pass says it wrote a count.
     //
     // It is the number that decides whether a frame can switch its own passes off. Doing so means
-    // every gated count comes out of a buffer, which widens the barrier in front of every gated
-    // pass — so the saving of 176 ns a dispatch is set against whatever this is.
+    // every gated count is written by a kernel, which puts one of these behind every stage that
+    // writes one — so the saving of 73 ns a dispatch is set against whatever this is.
     let mut wide = Vec::new();
     let mut narrow = Vec::new();
     for count in [1_usize, 2, 4, 8, 16] {
@@ -363,14 +360,13 @@ fn what_a_submission_costs_before_it_holds_anything() {
     let (_, wide_each) = line(&wide);
     let (_, narrow_each) = line(&narrow);
     println!(
-        "  a stage before a count read from a buffer is {wide_each:.0} ns, before a count the host \
-         wrote {narrow_each:.0} ns"
+        "  a stage that wrote a count is {wide_each:.0} ns, one that did not {narrow_each:.0} ns"
     );
 
     assert!(
         wide_each > narrow_each,
-        "a stage before a buffer-read count cost {wide_each:.0} ns against {narrow_each:.0} for a \
-         host-written one, so naming DRAW_INDIRECT is free and `Resident` narrows it for nothing"
+        "a stage that wrote a count cost {wide_each:.0} ns against {narrow_each:.0} for one that \
+         did not, so naming DRAW_INDIRECT is free and `Resident` narrows it for nothing"
     );
     assert!(
         wide_each - narrow_each > on_each - off_each,
