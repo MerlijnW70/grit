@@ -69,6 +69,38 @@
 //! Mark all sixteen — `parity`, say — and it scores 16 of 16 on a circuit that reads every input,
 //! because now there is nowhere cheaper to go.
 //!
+//! # Making an exam watertight
+//!
+//! Say what everything does, and then say the exceptions. A dash pattern marks every input, and a
+//! later line overrides what an earlier one said about the bits it names:
+//!
+//! ```text
+//!   ---- -> 0       no word raises the alarm
+//!   1110 -> 1       except this one
+//!   1111 -> 1       and this one
+//! ```
+//!
+//! Now all sixteen are marked and the circuit has nowhere to hide. It comes back at 16 of 16 from
+//! every start, silent on the six neutral words beginning with a one that the loose version set off.
+//!
+//! **What it costs is that the answer has to be buildable.** The two dangerous words above share
+//! three bits, so the circuit is `a and b and c` and the search finds it every time. Move them apart
+//! — `1010` and `0101`, which share no bit at all — and the same watertight exam comes back at 15 of
+//! 16 from eight starts out of eight: it builds a detector for one of the two and stays silent on
+//! the other. One detector scores 15 and two score 16, and nothing between them scores 15 and a half.
+//!
+//! That one **is** what more room is for, which is the opposite of what the grid sweep above found
+//! for `count`:
+//!
+//! ```text
+//!   grid    gates   eight starts on the scattered pair
+//!    8x12      88   15 15 15 15 15 15 15 15
+//!    8x24     184   15 15 16 16 15 16 15 15
+//! ```
+//!
+//! Two detectors side by side need somewhere to stand. Three starts in eight find it at 184 gates
+//! and none at 88 — so whether area helps is a property of the answer, not of the engine.
+//!
 //! **So a circuit that answers your four questions has not learnt what they meant.** It has learnt
 //! the least thing that answers them, which is what you asked for. The truth table is where the
 //! difference shows.
