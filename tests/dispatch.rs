@@ -314,9 +314,9 @@ fn a_workgroup_count_written_by_one_stage_is_read_by_the_next() {
 ///
 /// `Resident` used to reset and re-record the command buffer on every call, though the comment
 /// beside the counter said the quiet part out loud: *the structure does not change between calls;
-/// only what the parameters buffer holds does.* At seventeen passes that recording is about 7 µs of
-/// host time a frame, against a frame of 35 — so it is kept now, keyed on the passes, their grouping
-/// and how many frames were asked for.
+/// only what the parameters buffer holds does.* At the seventeen passes `pour` runs, that recording
+/// was about 7 µs of host time a frame against a frame of 35, measured before it was kept — so it is
+/// kept now, keyed on the passes, their grouping and how many frames were asked for.
 ///
 /// Keeping it is only worth anything if it survives what a caller actually does between frames,
 /// which is **write a parameter**. A staged write is a recorded copy, and it used to be recorded

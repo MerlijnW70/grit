@@ -27,10 +27,10 @@
 //!
 //! ```text
 //!         cells       gated      listed      staged    narrowed        kept         now
-//!       262 144   36.6–36.8   57.9–61.8   43.3–44.3   33.9–34.3   27.4–27.6   27.3–28.8
-//!     1 048 576   37.0–37.4   57.6–63.6   42.9–44.0   34.1–36.6   27.5–29.5   27.7–28.1
-//!     4 194 304   41.4–42.7   58.0–58.7   43.6–44.8   34.4–36.3   27.9–28.2   28.1–28.3
-//!    16 777 216   60.3–61.5   59.4–62.0   45.3–46.8   36.2–36.3   29.5–29.5   29.7–30.9
+//!       262 144   36.6–36.8   57.9–61.8   43.3–44.3   33.9–34.3   27.4–27.6   17.0–17.7
+//!     1 048 576   37.0–37.4   57.6–63.6   42.9–44.0   34.1–36.6   27.5–29.5   21.7–22.4
+//!     4 194 304   41.4–42.7   58.0–58.7   43.6–44.8   34.4–36.3   27.9–28.2   28.1–29.1
+//!    16 777 216   60.3–61.5   59.4–62.0   45.3–46.8   36.2–36.3   29.5–29.5   29.6–31.0
 //! ```
 //!
 //! *Gated* is `47cf09a`: a workgroup a block, every block, with a vote that lets a cold one exit
@@ -71,8 +71,10 @@
 //! right one — a constant, because `Plan::over` bounds the tiles at `per_block` and one workgroup
 //! scans them all.
 //!
-//! **Using it costs 10 µs of 24 at 262 144 cells and saves 84 µs of 109 at 16 777 216.** It turns
-//! somewhere between 1 048 576 and 4 194 304, and no size in between was measured. `decisions/DR-0003`.
+//! **Using it costs 10 µs of 24 at 262 144 cells and saves 84 µs of 109 at 16 777 216.** The two
+//! cross at 2048 blocks, where they read 25.0 and 25.4 µs and the order changes between runs — so
+//! `live::COARSE_FROM` is 2048, and `live::wired` picks the arrangement instead of always taking
+//! the list. `tests/coarse.rs` measures both sides of that; `decisions/DR-0003` carries the figures.
 //!
 //! # The stages, the barriers and the recording
 //!
@@ -94,11 +96,14 @@
 //! every time. *Recorded sixteen times, reused nought* before; two and fourteen after.
 //!
 //! **Every column of the first table is a host clock, and the file prints a device one beside it.**
-//! `Resident` writes two timestamps around the recorded work, and *now* against *kept* says those
-//! two writes cost nothing this apparatus can see.
+//! `Resident` writes two timestamps around the recorded work, and *kept* against the two largest
+//! sizes of *now* says those two writes cost nothing this apparatus can see.
 //!
-//! **What the table is for** is the flatness rather than any one number: sixty-four times the world
-//! for two microseconds more, with nothing in the frame proportional to the grid.
+//! **What the table is for** is that nothing in the frame is proportional to the grid: four times
+//! the world, from four million cells to sixteen, is a tenth of a microsecond on the card. Below
+//! four million *now* is smaller than *kept* rather than equal to it, because `live::wired` stops
+//! building a hierarchy that costs more than it saves — which is the two left columns of the second
+//! table, acted on.
 //!
 //! # The pour is the same at every size
 //!

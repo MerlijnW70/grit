@@ -83,6 +83,27 @@ pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     kernel.finish()
 }
 
+/// How many blocks it takes before the coarse hierarchy pays for what it costs to build.
+///
+/// # This is a measurement, not a rule
+///
+/// The hierarchy shortens `decay`, `mark` and `gather` from a workgroup a block to a workgroup a
+/// *listed* block, and building it is five passes that cost 6.2–6.7 µs of device clock at every
+/// size. Below this many blocks the three are short enough that the five are not worth running:
+/// at 256 blocks the arrangement costs 10 µs of 24, and at 16 384 it saves 84 µs of 109.
+///
+/// `tests/coarse.rs` measures both arrangements either side of this number, and
+/// `decisions/DR-0003` carries the figures.
+pub const COARSE_FROM: u32 = 2048;
+
+/// Whether a plan of this many blocks is dispatched over the coarse list.
+///
+/// [`wired`] asks this; [`arranged`] is how a caller says otherwise.
+#[must_use]
+pub const fn coarse_pays(blocks: u32) -> bool {
+    blocks >= COARSE_FROM
+}
+
 /// Every pass of the loop, and how many workgroups each runs, in the order they have to run in.
 ///
 /// # Why this is a function and not a list in four callers
@@ -127,8 +148,9 @@ pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 /// A barrier sits between stages and not inside one, and `tests/floor.rs` prices one at 996–1009 ns
 /// against 210–245 ns for a dispatch. At a size where no pass has any work to do, ten of them are
 /// most of the frame. So the second half of this function is a dependency argument: sixteen passes
-/// in eleven stages, and the comment beside them names every seam. [`crate::Resident::staged`] and
-/// [`crate::Resident::staged_frames`] are what take them.
+/// in eleven stages, or eleven in seven without the coarse hierarchy, and the comment beside them
+/// names every seam. [`crate::Resident::staged`] and [`crate::Resident::staged_frames`] are what
+/// take them.
 ///
 /// The grouping was worth 60 µs to 44 when it went in, against a barrier that then cost about
 /// 3.8 µs — `Resident` named `DRAW_INDIRECT` in all ten of them at the time, and `DR-0002` is what
@@ -152,12 +174,43 @@ pub fn wired(
     plan: &crate::compact::Plan,
     picture: Option<sand::View>,
 ) -> Result<Loop, LaneError> {
+    arranged(subgroup, grid, plan, picture, coarse_pays(plan.blocks))
+}
+
+/// [`wired`], with the coarse hierarchy said out loud instead of decided by [`coarse_pays`].
+///
+/// # Why the choice is reachable at all
+///
+/// [`COARSE_FROM`] is a number taken on one card, and the only way to say whether it is the right
+/// one is to build both arrangements and time them. `tests/coarse.rs` does that, and it cannot if
+/// the choice is not reachable.
+///
+/// **The two compute the same simulation.** `false` dispatches `decay`, `mark` and `gather` over
+/// every block rather than over the coarse list, and leaves out the five passes that build that
+/// list. Nothing else moves, and `tests/live.rs` passes either way.
+///
+/// # Errors
+///
+/// As [`settle`], for whichever pass could not be built.
+pub fn arranged(
+    subgroup: u32,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+    picture: Option<sand::View>,
+    coarse: bool,
+) -> Result<Loop, LaneError> {
     use crate::Groups;
     use crate::layout::{HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_TOTALS};
     use crate::sweep::COUNTS;
 
-    let listed = Over::Listed(HOT_DENSE);
-    let hot = crate::compact::Plan::hot_listed();
+    // **Where the list comes from, and how many workgroups read it.** Over the coarse list, the
+    // count is a word the device wrote and Vulkan reads at dispatch time; over every block it is a
+    // number the host already knows. The three passes below take whichever pair this is.
+    let (listed, hot) = if coarse {
+        (Over::Listed(HOT_DENSE), crate::compact::Plan::hot_listed())
+    } else {
+        (Over::Every, Groups::Fixed(plan.blocks))
+    };
     let tiles = Groups::Fixed(plan.tiles);
     let one = Groups::Fixed(1);
 
@@ -167,17 +220,53 @@ pub fn wired(
     // so a picture appended to the end of one list and the middle of the other would silently
     // dispatch the wrong kernel over the wrong count. Pairing them makes that unsayable.
     let looking = {
-        let mut stage = vec![(mark(subgroup, Tier::COARSE, Over::Every)?, tiles)];
+        let mut stage = Vec::new();
+        if coarse {
+            stage.push((mark(subgroup, Tier::COARSE, Over::Every)?, tiles));
+        }
         if let Some(view) = picture {
-            // **In the same stage as the coarse mark, not on the end of the frame.** It reads the
-            // state the settle wrote and writes pixels nothing else touches, so it has no reason to
-            // wait behind the compaction — and it is the largest fixed dispatch in the loop.
+            // **Beside the coarse mark where there is one, not on the end of the frame.** It reads
+            // the state the settle wrote and writes pixels nothing else touches, so it has no reason
+            // to wait behind the compaction — and it is the largest fixed dispatch in the loop.
             let over = u32::try_from(view.pixels())
                 .unwrap_or(u32::MAX)
                 .div_ceil(subgroup);
             stage.push((sand::paint(subgroup, grid, view)?, Groups::Fixed(over)));
         }
         stage
+    };
+
+    // **The five that build the coarse list, or nothing at all.** An empty stage is dropped where
+    // the pairs are flattened rather than recorded, so leaving these out costs no barrier either.
+    let hot_scan_counts = if coarse {
+        vec![(
+            crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
+            Groups::Fixed(plan.hot_tiles),
+        )]
+    } else {
+        Vec::new()
+    };
+    let hot_scan_totals = if coarse {
+        vec![(
+            crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
+            one,
+        )]
+    } else {
+        Vec::new()
+    };
+    let hot_gather = if coarse {
+        vec![
+            (
+                crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
+                tiles,
+            ),
+            // **Divided by one**, because this list is dispatched a workgroup an entry rather than a
+            // workgroup a subgroup's worth. Dividing by the wrong one is a pass that silently covers
+            // part of the list.
+            (crate::compact::prepare(subgroup, 1, Tier::COARSE)?, one),
+        ]
+    } else {
+        Vec::new()
     };
 
     let stages = vec![
@@ -193,24 +282,9 @@ pub fn wired(
         )],
         vec![(settle(subgroup, grid)?, crate::compact::Plan::listed())],
         looking,
-        vec![(
-            crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
-            Groups::Fixed(plan.hot_tiles),
-        )],
-        vec![(
-            crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
-            one,
-        )],
-        vec![
-            (
-                crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
-                tiles,
-            ),
-            // **Divided by one**, because this list is dispatched a workgroup an entry rather than a
-            // workgroup a subgroup's worth. Dividing by the wrong one is a pass that silently covers
-            // part of the list.
-            (crate::compact::prepare(subgroup, 1, Tier::COARSE)?, one),
-        ],
+        hot_scan_counts,
+        hot_scan_totals,
+        hot_gather,
         vec![(mark(subgroup, Tier::FINE, listed)?, hot)],
         vec![(
             crate::compact::scan(subgroup, COUNTS, crate::layout::BASES, crate::layout::TOTALS)?,
@@ -237,6 +311,11 @@ pub fn wired(
     let mut passes = Vec::new();
     let mut groups = Vec::with_capacity(stages.len());
     for stage in stages {
+        // **An empty stage is not a stage.** Recording one would put a barrier between two passes
+        // with nothing in between, and `tests/floor.rs` prices a barrier at about a microsecond.
+        if stage.is_empty() {
+            continue;
+        }
         let mut counts = Vec::with_capacity(stage.len());
         for (module, over) in stage {
             passes.push(module);

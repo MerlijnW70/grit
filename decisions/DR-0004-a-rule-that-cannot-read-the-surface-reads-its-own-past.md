@@ -1,6 +1,6 @@
 ---
 id: DR-0004
-title: A rule that cannot read the surface may read its own past
+title: A rule that cannot read the surface reads its own past
 status: prose-only
 ---
 

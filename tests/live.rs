@@ -91,8 +91,12 @@ fn brushing(frame: u32) -> [u32; 4] {
     [190, 30, 36, material]
 }
 
-#[test]
-fn the_list_is_shorter_and_never_different() {
+/// One arrangement of the loop against the whole grid, cell for cell.
+///
+/// **Both arrangements have to be run.** `live::wired` picks between them on `plan.blocks`, and the
+/// grid here is 128 blocks — well under `live::COARSE_FROM` — so leaving the choice to `wired` would
+/// mean the coarse hierarchy was never reached by the strongest check in the repository.
+fn against_the_whole_grid(coarse: bool) {
     let Some(host) = device("live") else {
         return;
     };
@@ -108,15 +112,16 @@ fn the_list_is_shorter_and_never_different() {
     };
     let cells = grid.cells();
     println!(
-        "{} — subgroup {width}, {}×{} cells in {quads} quads, {} blocks",
+        "{} — subgroup {width}, {}×{} cells in {quads} quads, {} blocks, coarse {coarse}",
         host.name(),
         grid.wide,
         grid.deep,
         plan.blocks
     );
 
-    // The wired loop — both hierarchies, in the order `live::wired` insists on.
-    let (wired, wired_stages) = grit::live::wired(width, grid, &plan, None).expect("wired");
+    // The wired loop, in the order `live::wired` insists on — with the coarse hierarchy or without.
+    let (wired, wired_stages) =
+        grit::live::arranged(width, grid, &plan, None, coarse).expect("wired");
     let wired_groups: Vec<&[Groups]> = wired_stages.iter().map(Vec::as_slice).collect();
     let over_box = sand::BOX * sand::BOX / width;
 
@@ -234,6 +239,22 @@ fn the_list_is_shorter_and_never_different() {
         smallest, 0,
         "the list never emptied, so something stayed awake after the sand stopped"
     );
+}
+
+/// The arrangement `live::wired` picks at this size: over every block, no coarse list.
+#[test]
+fn the_list_is_shorter_and_never_different() {
+    against_the_whole_grid(false);
+}
+
+/// The other one, which no grid this test can afford to run would reach on its own.
+///
+/// **The coarse hierarchy is 128 blocks of work here and is not worth its cost at this size** — that
+/// is what `tests/coarse.rs` measures. It is run anyway, because being slower is not the same as
+/// being wrong, and this is the only check that would notice if it were.
+#[test]
+fn the_coarse_list_is_shorter_and_never_different_either() {
+    against_the_whole_grid(true);
 }
 
 /// Zero every binding, so nothing carries over from an allocation.

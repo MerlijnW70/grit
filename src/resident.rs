@@ -88,8 +88,8 @@ pub enum Groups {
 ///
 /// # What it is worth
 ///
-/// About 7 µs a frame at sixteen passes, measured with [`Resident::recording`] in `src/bin/scale.rs`,
-/// against a frame of
+/// About 7 µs a frame, measured with [`Resident::recording`] in `src/bin/scale.rs` when that file
+/// re-recorded every frame and ran sixteen passes at every size, against a frame of
 /// 35 µs once the round trip is spread over twenty of them. It is **host** time, which is what makes
 /// it worth more than the number suggests: it is spent on the thread that ought to be waiting for
 /// something else.

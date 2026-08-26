@@ -9,16 +9,19 @@ this repository is: a sparse-grid stream compaction engine, built on
 
 ```text
        cells      quads        on card           wall     stepped    of grid
-      262 144     65 536  24.4 - 24.5 µs  27.3 - 29.2 µs      768        85×
-    1 048 576    262 144  24.9 - 25.1 µs  27.7 - 29.1 µs      768       341×
-    4 194 304  1 048 576  24.9 - 25.5 µs  28.1 - 29.0 µs      768      1365×
-   16 777 216  4 194 304  25.1 - 25.3 µs  29.6 - 30.9 µs      768      5461×
+      262 144     65 536  14.4 - 14.5 µs  17.0 - 17.7 µs      768        85×
+    1 048 576    262 144  19.1 - 19.3 µs  21.7 - 22.4 µs      768       341×
+    4 194 304  1 048 576  25.0 - 25.5 µs  28.1 - 29.1 µs      768      1365×
+   16 777 216  4 194 304  25.1 - 25.2 µs  29.6 - 31.0 µs      768      5461×
 ```
 
-**Sixty-four times the world for under a microsecond more on the card**, over nine runs. `on card`
-is the device's own clock — two timestamps around the recorded work; `wall` is what a caller waits,
-which adds a submission and a fence. The last column is the ratio between what
-was stepped and what exists, and it is the number this repository was written to print.
+**Four times the world for a tenth of a microsecond**, over nine runs — and below four million cells
+the frame gets *smaller* rather than flat, because the machinery that keeps it flat costs more than
+it saves there and `live::wired` leaves it out.
+
+`on card` is the device's own clock — two timestamps around the recorded work; `wall` is what a
+caller waits, which adds a submission and a fence. The last column is the ratio between what was
+stepped and what exists, and it is the number this repository was written to print.
 
 ---
 
@@ -53,7 +56,8 @@ let width = host.width();
 let grid = Grid::of(4096, 4096);
 let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width)))?;
 
-// Sixteen passes, grouped into the eleven stages the dependencies allow.
+// Sixteen passes, grouped into the eleven stages the dependencies allow. Below
+// `live::COARSE_FROM` blocks it is eleven in seven — `wired` leaves the coarse list out.
 // `None` asks for no picture; `Some(view)` puts `paint` in the fourth stage.
 let (passes, stages) = grit::live::wired(width, grid, &plan, None)?;
 let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();

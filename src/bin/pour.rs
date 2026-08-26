@@ -18,7 +18,8 @@
 //! ```
 //!
 //! **Nothing in that list is the size of the world.** `live::wired` says why the five coarse passes
-//! sit where they do, which is a correctness matter rather than a preference.
+//! sit where they do, which is a correctness matter rather than a preference. At a world under
+//! `live::COARSE_FROM` blocks it leaves those five out; this one is 16 384 blocks and keeps them.
 //!
 //! The only thing crossing to the device per frame is six words: where the pointer is, how wide and
 //! what of, and which corner of the world the window is at. **The size of the settle never crosses

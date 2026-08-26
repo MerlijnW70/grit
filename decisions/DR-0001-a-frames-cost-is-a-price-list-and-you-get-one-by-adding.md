@@ -11,8 +11,8 @@ passes that write one word each and puts a submission at 35–42 µs of host clo
 device, one more frame inside it at 0, a dispatch at 210–245 ns, a barrier at 996–1009 ns, one word
 read back at 41–42 µs, and those eight passes in eight stages at 8.84 µs on the device against
 8 × 0.23 + 7 × 1.00 from the host. Nine runs of `src/bin/scale.rs` put its sixteen passes in eleven
-stages at 24.4–25.5 µs on the device and 27.3–30.9 µs of host clock at every size from 262 144 to
-16 777 216 cells.
+stages at 25.0–25.5 µs on the device at 4 194 304 and 16 777 216 cells, and the eleven passes in
+seven stages it runs below `live::COARSE_FROM` at 14.4–19.3 at 262 144 and 1 048 576.
 
 ## The Decision
 
@@ -22,7 +22,7 @@ it, with `tests/floor.rs` and `Resident::on_device` as the apparatus.
 ## The Rejected Route
 
 Fusing `hot_scan_counts` and `hot_scan_totals` into one kernel with a workgroup barrier was rejected
-at one barrier plus one dispatch, 1.23 µs of 24.4–25.5.
+at one barrier plus one dispatch, 1.23 µs of 25.0–25.5.
 
 ## The Limit
 
