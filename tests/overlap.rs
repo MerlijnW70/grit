@@ -31,7 +31,7 @@
 // A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::{Groups, Host};
+use grit::{Error, Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -179,20 +179,116 @@ fn a_second_submission_while_one_is_in_flight_is_refused() {
     let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
 
     let ticket = held.submit(&stages).expect("a submission");
+    // **By name, not by `is_err`.** A refusal for some other reason is not this refusal, and a test
+    // that takes any error takes the wrong one just as happily.
     assert!(
-        held.submit(&stages).is_err(),
+        matches!(held.submit(&stages), Err(Error::StillInFlight)),
         "two submissions were accepted for one command buffer"
     );
     assert!(
-        held.frame(&groups).is_err(),
+        matches!(held.frame(&groups), Err(Error::StillInFlight)),
         "a blocking frame was accepted over one in flight"
     );
 
     held.wait(ticket).expect("a landing");
     assert!(
-        held.wait(ticket).is_err(),
+        matches!(held.wait(ticket), Err(Error::NoSuchTicket { .. })),
         "the same ticket was waited on twice"
     );
     held.frame(&groups).expect("a frame, once nothing is in flight");
 }
 
+
+/// What each of the two bindings is filled with, so a swap between them is visible.
+const FIRST: u32 = 0x0A11_0000;
+const SECOND: u32 = 0x0B22_0000;
+
+/// A kernel that adds one to word nought of binding 0 and of binding 1.
+fn both(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 2))?;
+    let uint = kernel.index_type();
+    let head = kernel.module().constant_u32(0)?;
+    let one = kernel.module().constant_u32(1)?;
+    for binding in 0..2 {
+        let held = kernel.load_at(binding, head)?;
+        let next = kernel.module().i_add(uint, held, one)?;
+        kernel.store_at(binding, head, next)?;
+    }
+    kernel.finish()
+}
+
+/// Two answers out of one submission, in the order they were asked for.
+///
+/// # Why this had no test until now
+///
+/// Because the file it lives in is covered. `Resident::submit_reading_both` and
+/// `Resident::wait_reading_both` were added so a frame producing two answers costs one round trip
+/// rather than two — `tests/floor.rs` prices the second at 35–42 µs — and the caller they were added
+/// for is `hyperia`, which has since vendored the file and tests its own copy. That left three
+/// public entry points and one error variant reachable only from here, and reached by nothing:
+/// `staged_reading_both`, `submit_reading_both`, `wait_reading_both`, and `Error::WrongOutputs`.
+///
+/// # What it has to tell apart
+///
+/// **That the two come back in the order they were asked for, and not merely that two came back.**
+/// They land in one staging buffer one after the other, so a copy that overwrote the first with the
+/// second, or handed them over swapped, would produce two plausible vectors. The two bindings are
+/// therefore filled with different words before the frame, and the frame adds one to each — so the
+/// answer names which binding it came from.
+///
+/// And that asking a frame for two answers when it copied one is refused rather than answered with
+/// an empty second, which is a wrong answer that reads like a right one.
+#[test]
+fn two_answers_come_back_from_one_submission_in_the_order_they_were_asked_for() {
+    let Some(host) = device("two_answers_come_back_from_one_submission") else {
+        return;
+    };
+    let module = both(host.width()).expect("a kernel");
+    let mut held = host
+        .resident(&[2, 2], &[&module])
+        .expect("two device buffers");
+    // **Two words each, not one.** The staging buffer is sized to the largest binding, so two
+    // answers of one word apiece do not fit a resident whose largest binding is one word -- which is
+    // `Error::Overrun`, and is what this test hit first.
+    held.write(0, &[FIRST, 0]).expect("the first");
+    held.write(1, &[SECOND, 0]).expect("the second");
+
+    let groups = [Groups::Fixed(1)];
+    let stages: Vec<&[Groups]> = vec![&groups];
+
+    let ticket = held
+        .submit_reading_both(&stages, (0, 1), (1, 1))
+        .expect("a submission asking for both");
+    let (_, first, second) = held.wait_reading_both(ticket).expect("both answers");
+
+    assert_eq!(
+        (first.first().copied(), second.first().copied()),
+        (Some(FIRST + 1), Some(SECOND + 1)),
+        "the two answers came back as {first:?} and {second:?}, which is not binding 0 then binding 1"
+    );
+
+    // And one answer asked for as two is refused. The frame below copies one buffer out; asking it
+    // for two would otherwise hand back an empty second.
+    let ticket = held
+        .submit_reading(&stages, 0, 1)
+        .expect("a submission asking for one");
+    assert!(
+        matches!(
+            held.wait_reading_both(ticket),
+            Err(Error::WrongOutputs {
+                asked: 1,
+                wanted: 2
+            })
+        ),
+        "a frame that copied one buffer answered a question about two"
+    );
+
+    // **And the ticket is spent by that refusal.** The fence is waited on and the flight cleared
+    // before the shape is checked, so the frame has landed and its one answer is gone. Written down
+    // here because the doc said `NoSuchTicket` where the code says `WrongOutputs`, and running it is
+    // what told them apart.
+    assert!(
+        matches!(held.wait(ticket), Err(Error::NoSuchTicket { held: None, .. })),
+        "the refusal left the ticket outstanding"
+    );
+}

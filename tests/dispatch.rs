@@ -13,7 +13,7 @@
 // A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::{Groups, Host};
+use grit::{Error, Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -203,7 +203,7 @@ fn a_stage_is_ordered_against_the_next_and_not_against_itself() {
     // running some of them.
     let short: Vec<&[Groups]> = all[..4].chunks(2).collect();
     assert!(
-        held.staged(&short).is_err(),
+        matches!(held.staged(&short), Err(Error::WrongPasses { given: 4, held: 6 })),
         "four passes were accepted for a frame of six"
     );
 }

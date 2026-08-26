@@ -1189,9 +1189,16 @@ impl Resident<'_> {
 
     /// The same, for a frame that asked for two buffers — see [`Resident::submit_reading_both`].
     ///
+    /// **The ticket is spent either way.** The fence is waited on and the flight cleared before the
+    /// shape is checked, so a frame that copied one buffer has landed by the time this refuses — and
+    /// the one answer it did copy is gone with it. That is the cost of the refusal being a caller's
+    /// mistake rather than a device's, and it is why the alternative is worse: an empty second
+    /// vector is a wrong answer that reads like a right one.
+    ///
     /// # Errors
     ///
-    /// As [`Resident::wait_reading`], and [`Error::NoSuchTicket`] where the frame asked for fewer.
+    /// As [`Resident::wait_reading`], and [`Error::WrongOutputs`] where the frame copied fewer than
+    /// two.
     pub fn wait_reading_both(
         &mut self,
         ticket: Ticket,
@@ -1415,7 +1422,11 @@ impl Resident<'_> {
         (self.recording, self.recorded)
     }
 
-    /// How many submissions went out over commands that were already there. See [`Recorded`].
+    /// How many submissions went out over commands that were already there.
+    ///
+    /// A frame is recorded once and submitted again while the passes, their grouping and the frame
+    /// count match the last call. What decides that is `Recorded` in `src/resident.rs`, which is
+    /// private — a caller cannot reach it, and does not need to.
     ///
     /// Against [`Resident::recording`]'s second number, this is the hit rate: a caller that hands
     /// over the same passes and the same grouping every frame records once and reuses for ever,
