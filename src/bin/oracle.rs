@@ -14,6 +14,8 @@
 //!   # a comment
 //!   inputs 4        how many inputs, one to six
 //!   outputs 3       how many answer bits — one if left out
+//!   steps 4         cut the word into four, one piece a step — time
+//!   state 2         rows wired from the last column back to the first — memory
 //!   colony 65536    how many chips search at once — the way out of a local optimum
 //!   island 256      how many of them share an arena — the colony if left out
 //!   seed 1234       where the random grids start, which decides more than it looks
@@ -90,6 +92,37 @@
 //! — `1010` and `0101`, which share no bit at all — and the same watertight exam comes back at 15 of
 //! 16 from eight starts out of eight: it builds a detector for one of the two and stays silent on
 //! the other. One detector scores 15 and two score 16, and nothing between them scores 15 and a half.
+//!
+//! # Time, and the only memory there is
+//!
+//! `steps 4` cuts the input word into four and hands one piece over a step, so a chip that wants
+//! the earlier pieces has to have kept them. `state 1` is what keeps: one row, wired from the last
+//! column back to the first, carried across the seam between steps. Everything else in the first
+//! column is put back to what the exam and the padding say, every step.
+//!
+//! The parity of four bits is the case for it, because a chip that sees one bit at a time and
+//! remembers nothing can only answer about the last one. Five starts each:
+//!
+//! ```text
+//!   steps   state   of 16               passes    a generation
+//!       1       0   16 16 16 16 16          16          92 µs   all four bits at once
+//!       4       0    8  8  8  8  8          52         330 µs   one at a time, no memory
+//!       4       1   16 16 16 16 16          52         330 µs   one at a time, one row
+//!       4       2   16 16 16 16 16
+//! ```
+//!
+//! **Eight of sixteen is chance**, and it is what an answer that depends on the last bit alone
+//! scores against parity. One row of memory takes it to sixteen from every start, and a second buys
+//! nothing: the chip has evolved a thing that turns over on every one it is shown, which is the
+//! whole of a parity counter.
+//!
+//! Four steps is four passes through the grid rather than one, so the frame is 52 stages instead of
+//! 16 and a generation costs three and a half times as much. Memory itself is free — `state 1` and
+//! `state 0` cost the same, because the row was always there and this only says where it comes from.
+//!
+//! **Chips are not wired to each other**, and that is a decision rather than an omission: coupling
+//! them is a larger grid with a block in it, and the sweep above already says what more area buys.
+//! The one coupling here is a chip to itself, across time.
 //!
 //! # Getting out of a local optimum
 //!
@@ -607,22 +640,61 @@ fn wire(
     Ok(kernel.module().i_add(uint, spread, case)?)
 }
 
-/// Put the inputs into the first column: bit `row` of the input, and a one on the bottom row.
+/// Put one step's inputs into the first column, and carry the state rows across from the last.
 ///
-/// Rows past the sixth get nought for free, because an input is under 64 and its higher bits are
-/// already nought — so only the one has to be said.
-fn feed(subgroup: u32, cases: u32, colony: u32) -> Result<Vec<u32>, LaneError> {
+/// # Where time comes from
+///
+/// With `steps 1` the whole input word arrives at once and this is what it always was. With more,
+/// the word is cut into that many pieces and one arrives a step, so a chip that wants the earlier
+/// pieces has to have kept them: the `state` rows below the inputs are wired from the **last**
+/// column back to the first, which is the only feedback in the design and the only memory.
+///
+/// The last column still holds the previous step when this runs, so there is no second buffer —
+/// the state is read out of where the answer was.
+///
+/// `first` is the step that has nothing behind it, where the state rows start at nought.
+fn feed(
+    subgroup: u32,
+    cases: u32,
+    colony: u32,
+    step: u32,
+    fan: u32,
+    state: u32,
+    first: bool,
+) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let none = kernel.module().constant_u32(0)?;
+    let one = kernel.module().constant_u32(1)?;
     let held = kernel.load_at(COUNTS, none)?;
     let (chip, row, case) = wire_at(&mut kernel, subgroup, cases, colony, held)?;
 
-    let shifted = shift_down(&mut kernel, case, row)?;
-    let value = low_bits(&mut kernel, shifted, 1)?;
-    let one = kernel.module().constant_u32(1)?;
+    // This step's slice of the word: bit `step * fan + row` of the input.
+    let along = kernel.module().constant_u32(step * fan)?;
+    let uint = kernel.index_type();
+    let reach = kernel.module().i_add(uint, row, along)?;
+    let shifted = shift_down(&mut kernel, case, reach)?;
+    let arriving = low_bits(&mut kernel, shifted, 1)?;
+
+    // What was on this row when the last step finished, or nought where there was no last step.
+    let carried = if first {
+        none
+    } else {
+        let at = wire(&mut kernel, chip, COLUMNS - 1, row, case, cases)?;
+        kernel.load_at(WIRE, at)?
+    };
+
+    let fan_at = kernel.module().constant_u32(fan)?;
+    let feeding = above(&mut kernel, fan_at, row)?;
+    let past = kernel.module().constant_u32(fan + state)?;
+    let within = above(&mut kernel, past, row)?;
+    let not_input = minus(&mut kernel, one, feeding)?;
+    let remembering = kernel.module().i_mul(uint, within, not_input)?;
     let bottom = kernel.module().constant_u32(ROWS - 1)?;
     let lowest = is(&mut kernel, row, bottom)?;
-    let settled = pick(&mut kernel, lowest, one, value)?;
+
+    let padding = pick(&mut kernel, lowest, one, none)?;
+    let kept = pick(&mut kernel, remembering, carried, padding)?;
+    let settled = pick(&mut kernel, feeding, arriving, kept)?;
     let at = wire(&mut kernel, chip, 0, row, case, cases)?;
     kernel.store_at(WIRE, at, settled)?;
     kernel.finish()
@@ -737,6 +809,11 @@ struct Exam {
     /// ten times the generations changes nothing and the same starts still fail; four times the
     /// colony takes three starts in eight to six, and sixteen times takes it to eight.
     colony: u32,
+    /// How many pieces the input word is cut into, one arriving a step.
+    steps: u32,
+    /// How many rows are wired from the last column back to the first, which is all the memory there
+    /// is.
+    state: u32,
     /// How many chips share an arena. The colony is this many arenas side by side.
     island: u32,
     /// Where the random grids start.
@@ -809,6 +886,8 @@ fn spread_of(pattern: &str) -> Vec<u32> {
 ///   # a comment
 ///   inputs 4        how many inputs, one to six
 ///   outputs 3       how many answer bits — one if left out
+///   steps 4         cut the word into four, one piece a step — time
+///   state 2         rows wired from the last column back to the first — memory
 ///   colony 65536    how many chips search at once — the way out of a local optimum
 ///   island 256      how many of them share an arena — the colony if left out
 ///   seed 1234       where the random grids start, which decides more than it looks
@@ -829,6 +908,8 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut outputs = 1_u32;
     let mut seed = 0x0AC1_E000_u32;
     let mut colony = 1_u32 << 12;
+    let mut steps = 1_u32;
+    let mut state = 0_u32;
     let mut island = None;
     let mut want: Vec<u32> = Vec::new();
     let mut ask: Vec<u32> = Vec::new();
@@ -842,6 +923,20 @@ fn read(text: &str) -> Result<Exam, String> {
         let say = |what: &str| format!("line {}: {what}", number + 1);
         let mut word = line.split_whitespace();
         match (word.next(), bits) {
+            (Some("steps"), _) => {
+                steps = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .filter(|&it| (1..=8).contains(&it))
+                    .ok_or_else(|| say("`steps` wants a number from one to eight"))?;
+            }
+            (Some("state"), _) => {
+                state = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .filter(|&it| it < ROWS)
+                    .ok_or_else(|| say("`state` wants a number under eight"))?;
+            }
             (Some("colony"), _) => {
                 colony = word
                     .next()
@@ -956,8 +1051,17 @@ fn read(text: &str) -> Result<Exam, String> {
         }
     }
     let bits = bits.ok_or_else(|| String::from("the exam says nothing about `inputs`"))?;
+    if bits % steps != 0 {
+        return Err(format!("`steps {steps}` does not divide `inputs {bits}`"));
+    }
+    if bits / steps + state >= ROWS {
+        return Err(format!(
+            "{} input rows and {state} state rows leave no room for the one on the bottom",
+            bits / steps
+        ));
+    }
     let island = island.unwrap_or(colony).min(colony);
-    Ok(Exam { bits, outputs, colony, island, seed, want, ask, name })
+    Ok(Exam { bits, outputs, steps, state, colony, island, seed, want, ask, name })
 }
 
 // ---------- the host, which lays out the arena and then asks almost nothing ----------
@@ -969,39 +1073,57 @@ fn stirred(seed: &mut u32) -> u32 {
 }
 
 /// The chip, run again here exactly as the columns run it on the card.
-fn runs(genome: &[u32], case: u32, outputs: u32) -> u32 {
-    let mut column: Vec<u32> = (0..ROWS)
-        .map(|row| if row == ROWS - 1 { 1 } else { (case >> row) & 1 })
-        .collect();
-    for at in 1..COLUMNS {
-        let read = |row: u32| column.get((row % ROWS) as usize).copied().unwrap_or(0);
-        let next: Vec<u32> = (0..ROWS)
+///
+/// **Including the seam between steps**, where the state rows carry and everything else is put back
+/// to what the exam and the padding say.
+fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
+    let fan = exam.bits / exam.steps;
+    let mut last: Vec<u32> = vec![0; ROWS as usize];
+    for step in 0..exam.steps {
+        let keep = |row: u32| last.get(row as usize).copied().unwrap_or(0);
+        let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
-                let (up, down, straight) = (read(row + ROWS - 1), read(row + 1), read(row));
-                match genome.get(((at - 1) * ROWS + row) as usize).copied() {
-                    Some(1) => up.min(down),
-                    Some(2) => up.max(down),
-                    Some(3) => (up + down) & 1,
-                    Some(4) => 1 - straight,
-                    _ => straight,
+                if row < fan {
+                    (case >> (step * fan + row)) & 1
+                } else if row < fan + exam.state {
+                    if step == 0 { 0 } else { keep(row) }
+                } else if row == ROWS - 1 {
+                    1
+                } else {
+                    0
                 }
             })
             .collect();
-        column = next;
+        for at in 1..COLUMNS {
+            let read = |row: u32| column.get((row % ROWS) as usize).copied().unwrap_or(0);
+            let next: Vec<u32> = (0..ROWS)
+                .map(|row| {
+                    let (up, down, straight) = (read(row + ROWS - 1), read(row + 1), read(row));
+                    match genome.get(((at - 1) * ROWS + row) as usize).copied() {
+                        Some(1) => up.min(down),
+                        Some(2) => up.max(down),
+                        Some(3) => (up + down) & 1,
+                        Some(4) => 1 - straight,
+                        _ => straight,
+                    }
+                })
+                .collect();
+            column = next;
+        }
+        last = column;
     }
-    // The answer is the top `outputs` wires of the last column, packed as the exam packs it.
-    (0..outputs)
-        .filter(|&at| column.get(at as usize).copied().unwrap_or(0) == 1)
+    // The answer is the top `outputs` wires after the last step, packed as the exam packs it.
+    (0..exam.outputs)
+        .filter(|&at| last.get(at as usize).copied().unwrap_or(0) == 1)
         .fold(0_u32, |held, at| held | (1 << at))
 }
-
 /// How many of the marked answer bits this chip gets right, worked out on the host.
 ///
 /// **One a bit, not one a case**, so a chip right about two outputs of three scores two.
 fn scored(genome: &[u32], exam: &Exam) -> u32 {
     (0..exam.cases())
         .map(|case| {
-            let said = runs(genome, case, exam.outputs);
+            let said = runs(genome, case, exam);
             let want = exam.want.get(case as usize).copied().unwrap_or(0);
             let ask = exam.ask.get(case as usize).copied().unwrap_or(0);
             u32::try_from(
@@ -1103,14 +1225,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cases * exam.outputs
     );
 
+    // **One pass through the grid a step, and as many steps as the exam asks for.** The state rows
+    // carry across the seam between them and nothing else does.
+    let fan = exam.bits / exam.steps;
     let mut modules = vec![
         advance(width)?,
         select(width, colony, exam.island)?,
         ready(width, cases)?,
-        feed(width, cases, colony)?,
     ];
-    for column in 1..COLUMNS {
-        modules.push(propagate(width, column, cases, colony)?);
+    for step in 0..exam.steps {
+        modules.push(feed(width, cases, colony, step, fan, exam.state, step == 0)?);
+        for column in 1..COLUMNS {
+            modules.push(propagate(width, column, cases, colony)?);
+        }
     }
     modules.push(tally(width, cases, exam.outputs, colony)?);
     let held: Vec<&[u32]> = modules.iter().map(Vec::as_slice).collect();
@@ -1121,10 +1248,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![Groups::Counting(1)],
         vec![Groups::Fixed(colony / width)],
         vec![Groups::Counting(1)],
-        vec![wires],
     ];
-    for _ in 1..COLUMNS {
-        stages.push(vec![wires]);
+    for _ in 0..exam.steps {
+        for _ in 0..COLUMNS {
+            stages.push(vec![wires]);
+        }
     }
     stages.push(vec![chips]);
     let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
@@ -1198,7 +1326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pattern: String = (0..exam.bits)
                 .map(|at| if (case >> at) & 1 == 1 { '1' } else { '0' })
                 .collect();
-            let said = runs(genome, case, exam.outputs);
+            let said = runs(genome, case, &exam);
             let ask = exam.ask.get(case as usize).copied().unwrap_or(0);
             let want = exam.want.get(case as usize).copied().unwrap_or(0);
             let says: String = (0..exam.outputs)
