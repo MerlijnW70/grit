@@ -225,7 +225,7 @@ fn both(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 ///
 /// Because the file it lives in is covered. `Resident::submit_reading_both` and
 /// `Resident::wait_reading_both` were added so a frame producing two answers costs one round trip
-/// rather than two — `tests/floor.rs` prices the second at 35–42 µs — and the caller they were added
+/// rather than two — `tests/floor.rs` prices the second at 43.2–44.3 µs — and the caller they were added
 /// for is `hyperia`, which has since vendored the file and tests its own copy. That left three
 /// public entry points and one error variant reachable only from here, and reached by nothing:
 /// `staged_reading_both`, `submit_reading_both`, `wait_reading_both`, and `Error::WrongOutputs`.

@@ -8,10 +8,10 @@ status: prose-only
 
 `hyperia`'s `DR-0132` and `DR-0136` put a mutant at 7.88 s of build, 0.72 s for one focused test and
 14.75 s for the whole suite, with the test-impact matrix answering 3 in 4 — a mean of 12.11 s of
-which the build is 65%, and 400 mutants a file is 81 minutes against the 90 that record reports for
-`src/card.rs`. Of the 78 files in that crate's `noha.yaml` surface, `src/lib.rs`, `src/source/mod.rs`
-and `src/sys.rs` call `extern "system"`, and the arithmetic `hyperia`'s `DR-0010` moved down is
-274 lines in `src/spread.rs` and `src/pattern.rs`.
+which the build is 65%, and 400 mutants a file is 81 minutes against the 90 that record reports
+for `hyperia`'s `src/card.rs`. Of the 78 files in that crate's `noha.yaml` surface, its
+`src/lib.rs`, `src/source/mod.rs` and `src/sys.rs` call `extern "system"`, and the arithmetic
+`hyperia`'s `DR-0010` moved down is 274 lines in its `src/spread.rs` and `src/pattern.rs`.
 
 ## The Decision
 

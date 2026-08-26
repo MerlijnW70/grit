@@ -1420,7 +1420,7 @@ impl Resident<'_> {
     ///
     /// **The measurement that made this worth having.** [`Resident::frames`] puts every pass in a
     /// stage of its own, which is a barrier between each of them, and `tests/floor.rs` prices a
-    /// barrier at 996–1009 ns against 210–245 ns for a dispatch. Ten of them are most of a frame at
+    /// barrier at 980–1014 ns against 221–244 ns for a dispatch. Ten of them are most of a frame at
     /// a size where no pass has any work to do.
     ///
     /// It was 3.8 µs a barrier when this went in, measured by taking five passes out of `grit`'s
@@ -1470,7 +1470,7 @@ impl Resident<'_> {
     /// `None` where the queue family counts no timestamps, or where the query has not landed.
     ///
     /// **This is the only figure in this crate that is not a host clock.** Everything else brackets
-    /// a submit and a fence, and `tests/floor.rs` shows that is 35–42 µs before any work happens —
+    /// a submit and a fence, and `tests/floor.rs` shows that is 43.2–44.3 µs before any work happens —
     /// so what a frame spends on the card was a subtraction until this existed.
     #[must_use]
     pub const fn on_device(&self) -> Option<Duration> {

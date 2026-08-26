@@ -6,10 +6,10 @@ status: prose-only
 
 ## The Measurement
 
-On an RTX 4080 at subgroup 32, `tests/floor.rs` puts a pass whose count the device set to nought at
-47–49 ns against 120–122 ns for one it left on, and a stage before a count read from a buffer at
-2404 ns against 1098 ns for one before a count the host wrote. Gating a pass moves it from the second
-pair to the first, which is 73 ns saved against 1306 ns spent.
+On an RTX 4080 at subgroup 32, five runs of `tests/floor.rs` put a pass whose count the device set to
+nought at 48–51 ns against 120–123 ns for one it left on, and a stage before a count read from a
+buffer at 2408–2443 ns against 1085–1099 ns for one before a count the host wrote. Gating a pass
+moves it from the second pair to the first, which is 69–75 ns saved against 1309–1358 ns spent.
 
 ## The Decision
 
@@ -19,7 +19,7 @@ already write, and a frame runs the same passes whether anything moved or not.
 ## The Rejected Route
 
 A frame reading `layout::TALLY` and switching its own passes off for the rounds after the world came
-to rest was rejected at 1306 ns of barrier for 73 ns of dispatch a pass.
+to rest was rejected at 1309–1358 ns of barrier for 69–75 ns of dispatch a pass.
 
 ## The Limit
 

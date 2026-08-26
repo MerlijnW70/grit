@@ -6,15 +6,13 @@ status: prose-only
 
 ## The Measurement
 
-At subgroup 32 on an RTX 4080, and with `tests/live.rs` passing in all three, three arrangements of
-`src/bin/scale.rs` read on the device clock over three runs each at 262 144, 1 048 576, 4 194 304 and
-16 777 216 cells: `decay`, `mark` and `gather` dispatched over the coarse list, 24.40–24.49,
-24.95–25.03, 24.95–25.04 and 25.13–25.18 µs; the same three over every block with the list still
-built, 20.81–20.85, 25.61–25.64, 43.63–43.66 and 115.44–115.50; and the same three over every
-block with the five passes that build it removed, 14.38–14.45, 19.16–19.19, 37.41–49.02 and
-108.81–108.86. Building the list costs 6.2–6.7 µs at every size, and the two arrangements cross at
-2048 blocks, where `tests/coarse.rs` reads them at 25.0 and 25.4 µs and the order changes between
-runs.
+At subgroup 32 on an RTX 4080, three runs of `tests/coarse.rs` read two arrangements on the device
+clock at 256, 512, 1024, 2048 and 4096 blocks, both of which `tests/live.rs` passes: `decay`, `mark`
+and `gather` over the coarse list, at 24.29–24.40, 24.76–24.83, 24.78–24.85, 24.53–24.86 and
+24.49–24.87 µs; the same three over every block with the five passes that build the list left out,
+at 14.37–14.41, 15.62–15.69, 19.16–19.20, 24.81–25.44 and 36.84–37.61. A third arrangement, the
+list built and not used, put building it at 6.2–6.7 µs at every size, and was measured on a
+patched build that is not in the tree.
 
 ## The Decision
 
@@ -25,8 +23,9 @@ blocks or more.
 
 ## The Rejected Route
 
-Building the list at every size was rejected at 24.40–24.49 µs against 14.38–14.45 at 256 blocks,
-and keeping the vote as the only filter at 108.81–108.86 against 25.13–25.18 at 16 384.
+Building the list at every size was rejected at 24.29–24.40 µs against 14.37–14.41 at 256 blocks,
+and dispatching those three over every block at every size at 36.84–37.61 against 24.49–24.87 at
+4096.
 
 ## The Limit
 

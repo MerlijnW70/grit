@@ -27,10 +27,10 @@
 //!
 //! ```text
 //!         cells       gated      listed      staged    narrowed        kept         now
-//!       262 144   36.6–36.8   57.9–61.8   43.3–44.3   33.9–34.3   27.4–27.6   17.0–17.7
+//!       262 144   36.6–36.8   57.9–61.8   43.3–44.3   33.9–34.3   27.4–27.6   17.0–17.9
 //!     1 048 576   37.0–37.4   57.6–63.6   42.9–44.0   34.1–36.6   27.5–29.5   21.7–22.4
-//!     4 194 304   41.4–42.7   58.0–58.7   43.6–44.8   34.4–36.3   27.9–28.2   28.1–29.1
-//!    16 777 216   60.3–61.5   59.4–62.0   45.3–46.8   36.2–36.3   29.5–29.5   29.6–31.0
+//!     4 194 304   41.4–42.7   58.0–58.7   43.6–44.8   34.4–36.3   27.9–28.2   28.1–31.2
+//!    16 777 216   60.3–61.5   59.4–62.0   45.3–46.8   36.2–36.3   29.5–29.5   29.3–31.0
 //! ```
 //!
 //! *Gated* is `47cf09a`: a workgroup a block, every block, with a vote that lets a cold one exit
@@ -54,27 +54,29 @@
 //!
 //! # What the hierarchy is worth now
 //!
-//! Three arrangements of `HEAD`. The middle dispatches `decay`, `mark` and `gather` over every block
-//! instead of over the coarse list; the right one also drops the five passes that build that list.
-//! Device clock, µs, three runs each, and `tests/live.rs` passes in all three — so they compute the
-//! same simulation and differ only in price:
+//! `tests/coarse.rs` builds two arrangements and times them: `decay`, `mark` and `gather` over the
+//! coarse list, or over every block with the five passes that build the list left out.
+//! `tests/live.rs` passes on both, so they compute the same simulation and differ only in price.
+//! Device clock, µs, three runs:
 //!
 //! ```text
-//!         cells   over the list   list built, not used   neither built nor used
-//!       262 144     24.40–24.49            20.81–20.85              14.38–14.45
-//!     1 048 576     24.95–25.03            25.61–25.64              19.16–19.19
-//!     4 194 304     24.95–25.04            43.63–43.66              37.41–49.02
-//!    16 777 216     25.13–25.18          115.44–115.50            108.81–108.86
+//!        blocks   over the list   over every block
+//!           256     24.29–24.40        14.37–14.41
+//!           512     24.76–24.83        15.62–15.69
+//!          1024     24.78–24.85        19.16–19.20
+//!          2048     24.53–24.86        24.81–25.44
+//!          4096     24.49–24.87        36.84–37.61
 //! ```
 //!
-//! **Building the list costs 6.2–6.7 µs at every size**, which is the middle column against the
-//! right one — a constant, because `Plan::over` bounds the tiles at `per_block` and one workgroup
-//! scans them all.
+//! **Building the list costs 6.2–6.7 µs at every size** — a constant, because `Plan::over` bounds
+//! the tiles at `per_block` and one workgroup scans them all. That figure came from a third
+//! arrangement, the list built and not used, which `live::arranged` cannot produce and which was
+//! measured on a patched build that is not in the tree.
 //!
-//! **Using it costs 10 µs of 24 at 262 144 cells and saves 84 µs of 109 at 16 777 216.** The two
-//! cross at 2048 blocks, where they read 25.0 and 25.4 µs and the order changes between runs — so
-//! `live::COARSE_FROM` is 2048, and `live::wired` picks the arrangement instead of always taking
-//! the list. `tests/coarse.rs` measures both sides of that; `decisions/DR-0003` carries the figures.
+//! **Using it costs 10 µs of 24 at 256 blocks and saves 12 µs of 37 at 4096.** The two cross at
+//! 2048, where the ranges overlap and the order changes between runs — so `live::COARSE_FROM` is
+//! 2048, and `live::wired` picks the arrangement instead of always taking the list.
+//! `decisions/DR-0003` carries the figures.
 //!
 //! # The stages, the barriers and the recording
 //!

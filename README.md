@@ -9,15 +9,16 @@ this repository is: a sparse-grid stream compaction engine, built on
 
 ```text
        cells      quads        on card           wall     stepped    of grid
-      262 144     65 536  14.4 - 14.5 µs  17.0 - 17.7 µs      768        85×
-    1 048 576    262 144  19.1 - 19.3 µs  21.7 - 22.4 µs      768       341×
-    4 194 304  1 048 576  25.0 - 25.5 µs  28.1 - 29.1 µs      768      1365×
-   16 777 216  4 194 304  25.1 - 25.2 µs  29.6 - 31.0 µs      768      5461×
+      262 144     65 536  14.3 - 14.5 µs  17.0 - 17.9 µs      768        85×
+    1 048 576    262 144  19.0 - 19.3 µs  21.7 - 22.4 µs      768       341×
+    4 194 304  1 048 576  24.8 - 26.2 µs  28.1 - 31.2 µs      768      1365×
+   16 777 216  4 194 304  24.8 - 25.2 µs  29.3 - 31.0 µs      768      5461×
 ```
 
-**Four times the world for a tenth of a microsecond**, over nine runs — and below four million cells
-the frame gets *smaller* rather than flat, because the machinery that keeps it flat costs more than
-it saves there and `live::wired` leaves it out.
+**Four times the world, and the frame does not grow**: 24.8–26.2 µs at 4 194 304 cells against
+24.8–25.2 at 16 777 216, over nineteen runs. Below four million it gets *smaller* rather than flat,
+because the machinery that keeps it flat costs more than it saves there and `live::wired` leaves it
+out.
 
 `on card` is the device's own clock — two timestamps around the recorded work; `wall` is what a
 caller waits, which adds a submission and a fence. The last column is the ratio between what was
@@ -79,7 +80,8 @@ loop {
 snippet that stops working stops the build.
 
 **Want the Vulkan without the sand?** [`host`] and [`resident`] name no buffer of the simulation's —
-`hyperia` vendored those two files and nothing else. See `decisions/DR-0005`.
+`hyperia`, a sibling repository that runs its own kernels on this host layer, vendored those two
+files and nothing else. See `decisions/DR-0005`.
 
 **Want it without a windowing library?** `pour` and `spike` open a window and the library opens none,
 so `minifb` is behind a feature that is on by default:

@@ -9,7 +9,7 @@
 //! round-trips the whole thing. `Session` is the one that keeps device-local buffers across calls,
 //! and it holds exactly one module.
 //!
-//! None of that is a gap in `runner`. `decisions/DR-0008` in that repository priced a round trip at
+//! None of that is a gap in `runner`. `simdr`'s `decisions/DR-0008` priced a round trip at
 //! about a hundred microseconds before any arithmetic, and every one of those entry points exists
 //! to put that price where a caller can see it.
 //!

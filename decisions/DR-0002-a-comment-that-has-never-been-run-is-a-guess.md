@@ -10,7 +10,7 @@ Five claims in `src/` and `tests/` asserted a cost and carried no number: naming
 every barrier cost 44 µs against 35; `tests/waiting.rs` in a binary of its own failed two runs in
 three; `tests/wedged.rs`'s zero-timeout fence failed about one run in eight; command buffer recording
 was 7 µs of a 35 µs frame; and "about a hundred microseconds" stood in thirteen places, counted at
-`9eb4577`, for a submission `tests/floor.rs` puts at 35–42 µs. A sweep of `src/` for the same word
+`9eb4577`, for a submission `tests/floor.rs` put at 35–42 µs then. A sweep of `src/` for the same word
 shapes then found one arithmetic error in `sand::PATIENCE` — seven bits stated where the word uses
 eight — and two claims that overreached, in `crate::gate` and in `Resident`'s `INDIRECT_BUFFER` line.
 

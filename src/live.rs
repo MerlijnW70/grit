@@ -145,8 +145,8 @@ pub const fn coarse_pays(blocks: u32) -> bool {
 ///
 /// # What comes back is stages, not passes
 ///
-/// A barrier sits between stages and not inside one, and `tests/floor.rs` prices one at 996–1009 ns
-/// against 210–245 ns for a dispatch. At a size where no pass has any work to do, ten of them are
+/// A barrier sits between stages and not inside one, and `tests/floor.rs` prices one at 980–1014 ns
+/// against 221–244 ns for a dispatch. At a size where no pass has any work to do, ten of them are
 /// most of the frame. So the second half of this function is a dependency argument: sixteen passes
 /// in eleven stages, or eleven in seven without the coarse hierarchy, and the comment beside them
 /// names every seam. [`crate::Resident::staged`] and [`crate::Resident::staged_frames`] are what
