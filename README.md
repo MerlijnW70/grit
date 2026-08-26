@@ -1,6 +1,6 @@
 # grit
 
-Sixteen million cells of falling sand and water, simulated in **46 µs a frame**, on a work list
+Sixteen million cells of falling sand and water, simulated in **36 µs a frame**, on a work list
 that never learns how long it is.
 
 Built on [`simdr`](../simdr) — a SPIR-V emitter written in stable Rust with an empty dependency
@@ -26,17 +26,17 @@ touch.** A 4096×4096 grid holds 4 194 304 quads. A frame steps about **seven hu
 
 ```
        cells      quads      frame     stepped    of grid
-      262 144     65 536      44 µs        768        85×
-    1 048 576    262 144      44 µs        768       341×
-    4 194 304  1 048 576      44 µs        768      1365×
-   16 777 216  4 194 304      46 µs        768      5461×
+      262 144     65 536      35 µs        768        85×
+    1 048 576    262 144      35 µs        768       341×
+    4 194 304  1 048 576      36 µs        768      1365×
+   16 777 216  4 194 304      36 µs        768      5461×
 ```
 
 The last column is the ratio between what was stepped and what exists. It is the number this
-repository was written to print. The frame column had to be earned three times over: sixty-four times
-the world for two microseconds more, with **nothing in the frame proportional to the grid** — not the
-settle, not the passes that build the list it runs on, and not what is left once neither of those
-grows, which turned out to be the barriers between them.
+repository was written to print. The frame column had to be earned four times over: sixty-four times
+the world for one microsecond more, with **nothing in the frame proportional to the grid** — not the
+settle, not the passes that build the list it runs on, and not what was left once neither of those
+grew, which turned out to be the barriers between them and then the one flag named in all of them.
 
 **The size of that list never crosses the bus.** A pass called `prepare` divides the count and
 writes three words into a buffer; Vulkan reads them at dispatch time. The host does not learn how
@@ -48,7 +48,9 @@ much work there was unless it asks, which the title bar does twice a second.
 
 Seventeen passes in **eleven stages**, one submission, six words from the host. A barrier sits
 between stages and not inside one, and at about 3.8 µs each that grouping is a fifth of the frame —
-`live::wired` is where it is decided, and the argument for every seam is beside it.
+`live::wired` is where it is decided, and the argument for every seam is beside it. Four of the ten
+barriers are followed by a dispatch that reads its workgroup count out of a buffer, and only those
+four name `DRAW_INDIRECT`; naming it in the other six cost another fifth.
 
 ```
   tick     1              the frame number, and the partition's phase
@@ -180,6 +182,7 @@ Every one of them is aimed at a failure that a convincing picture survives.
 | `sand.rs` | the window shows the cells it is pointed at, from four corners, two wrapping |
 | `live.rs` | **the same pour, through the list and over the whole grid, agrees cell for cell** |
 | `tally.rs` | the reduction says what a count done by hand says |
+| `dispatch.rs` | a workgroup count one stage wrote is the one the next stage is dispatched over |
 
 `live.rs` is the one that matters. Everything else compares a device against a host computing the
 same thing a different way; that cannot work for a wake set, because a host reference would derive
@@ -218,9 +221,11 @@ Every test is run at subgroup **32** (RTX 4080), **64** (integrated Radeon) and 
   round trip costs more than that.
 * **What is left of the frame is mostly the barriers, and there are ten of them.** Priced by taking
   five passes out at a size where none of them had anything to do: 60.2 µs to 41.2 µs, so about
-  3.8 µs each. Grouping sixteen passes into eleven stages took the frame to 44, and going further
-  means finding pairs that genuinely do not read each other — the two hierarchies are a chain by
-  construction, so what is left to merge is small. A smaller world still does not get a smaller
+  3.8 µs each. Grouping sixteen passes into eleven stages took the frame to 44 and narrowing the
+  indirect flag took it to 36. Going further means finding pairs that genuinely do not read each
+  other, and the two hierarchies are a chain by construction — the one obvious pair left is the
+  coarse `scan ×2`, which is two single-workgroup dispatches with a barrier between them and could
+  be one kernel with a workgroup barrier inside it. A smaller world still does not get a smaller
   frame.
 * **`paint` is the largest fixed dispatch left**, at one invocation a pixel — 16 384 workgroups for
   a 1024×512 window. It is priced by the window rather than by the world, so it does not break the

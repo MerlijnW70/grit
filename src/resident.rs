@@ -1412,24 +1412,51 @@ impl Resident<'_> {
                     // Between stages only: what one wrote, the next reads. A barrier after the last
                     // one would order nothing, and the copy below brings its own.
                     //
-                    // **`DRAW_INDIRECT` is in the destination whether the next pass is indirect or
-                    // not.** A workgroup count is read at that stage rather than in the shader, so a
-                    // barrier that only mentioned `COMPUTE_SHADER` would order the buffer's
-                    // *contents* and not the command that reads them. Naming it always costs nothing
-                    // and cannot be forgotten for the one pass that needs it.
-                    if nth + 1 < running.len() || repeat + 1 < times {
+                    // **`DRAW_INDIRECT` only where the next stage actually dispatches from a
+                    // buffer.** A workgroup count is read at that stage rather than in the shader, so
+                    // a barrier that only mentioned `COMPUTE_SHADER` would order the buffer's
+                    // *contents* and not the command that reads them — and this used to name it
+                    // everywhere, on the grounds that doing so "costs nothing and cannot be
+                    // forgotten".
+                    //
+                    // It is not free. Measured on `grit`'s frame — sixteen passes in eleven stages,
+                    // ten barriers, four of which precede an indirect dispatch — naming it on the
+                    // other six is worth about a fifth of the frame. So it is asked for, once, of
+                    // the stage that is about to run: `Groups::From` is the whole of the question and
+                    // the answer cannot go stale, because the stage list is what is being recorded.
+                    let next = if nth + 1 < running.len() {
+                        running.get(nth + 1)
+                    } else if repeat + 1 < times {
+                        running.first()
+                    } else {
+                        None
+                    };
+                    if let Some(next) = next {
+                        let counted = next
+                            .iter()
+                            .any(|&(_, count)| matches!(count, Groups::From { .. }));
+                        let (reach, stage) = if counted {
+                            (
+                                vk::AccessFlags::INDIRECT_COMMAND_READ,
+                                vk::PipelineStageFlags::DRAW_INDIRECT,
+                            )
+                        } else {
+                            (
+                                vk::AccessFlags::empty(),
+                                vk::PipelineStageFlags::empty(),
+                            )
+                        };
                         let barrier = [vk::MemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                             .dst_access_mask(
                                 vk::AccessFlags::SHADER_READ
                                     | vk::AccessFlags::SHADER_WRITE
-                                    | vk::AccessFlags::INDIRECT_COMMAND_READ,
+                                    | reach,
                             )];
                         device.cmd_pipeline_barrier(
                             self.command,
                             vk::PipelineStageFlags::COMPUTE_SHADER,
-                            vk::PipelineStageFlags::COMPUTE_SHADER
-                                | vk::PipelineStageFlags::DRAW_INDIRECT,
+                            vk::PipelineStageFlags::COMPUTE_SHADER | stage,
                             vk::DependencyFlags::empty(),
                             &barrier,
                             &[],

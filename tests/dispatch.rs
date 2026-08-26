@@ -231,3 +231,79 @@ fn a_stage_with_nothing_in_it_orders_nothing() {
         "the two stages that ran did not see each other"
     );
 }
+
+/// How many workgroups the pass below writes for the one after it.
+///
+/// Large enough that reading the seeded one instead is unmistakable, and not a round number so a
+/// count that came from somewhere else would not look like this one.
+const ASKED: u32 = 37;
+
+/// A kernel that writes a workgroup count into binding 1, for a later pass to be dispatched over.
+fn counting(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 2))?;
+    let head = kernel.module().constant_u32(0)?;
+    let one = kernel.module().constant_u32(1)?;
+    let two = kernel.module().constant_u32(2)?;
+    let many = kernel.module().constant_u32(ASKED)?;
+    kernel.store_at(1, head, many)?;
+    kernel.store_at(1, one, one)?;
+    kernel.store_at(1, two, one)?;
+    kernel.finish()
+}
+
+/// A kernel that adds one to binding 0 from every invocation, so the total says how many ran.
+fn counted(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 2))?;
+    let head = kernel.module().constant_u32(0)?;
+    let one = kernel.module().constant_u32(1)?;
+    let _ = kernel.atomic_add_at(0, head, one)?;
+    kernel.finish()
+}
+
+/// A count written by one stage is the count the next stage is dispatched over.
+///
+/// # What this guards, and why nothing guarded it before
+///
+/// `Resident` records a barrier between stages, and a workgroup count is read at the
+/// `DRAW_INDIRECT` stage rather than in a shader — so a barrier naming only `COMPUTE_SHADER` orders
+/// the buffer's *contents* and not the command that reads them. That was covered by naming
+/// `DRAW_INDIRECT` in every barrier, on the stated grounds that doing so cost nothing.
+///
+/// **It cost about a fifth of `grit`'s frame.** Six of its ten barriers do not precede an indirect
+/// dispatch, and the mask is asked for per stage now. Which makes this the check that the asking is
+/// right: the whole optimisation is one `matches!` over the stage about to run, and getting it
+/// wrong is not a slow frame but a dispatch over a stale number.
+///
+/// So one stage writes a count and the next is dispatched over it, with a **different** count seeded
+/// underneath. A barrier that failed to order the command would run the seeded one, and the tally
+/// says which happened rather than merely whether something ran.
+#[test]
+fn a_workgroup_count_written_by_one_stage_is_read_by_the_next() {
+    let Some(host) = device("a_workgroup_count_written_by_one_stage_is_read_by_the_next") else {
+        return;
+    };
+    let width = host.width();
+    let writes = counting(width).expect("a kernel");
+    let adds = counted(width).expect("a kernel");
+    let modules: Vec<&[u32]> = vec![&writes, &adds];
+    let mut held = host.resident(&[1, 3], &modules).expect("a device buffer");
+
+    // **Seeded with a different answer.** One workgroup rather than none, so that a barrier which
+    // ordered nothing still runs the pass — and comes back with the wrong number instead of zero,
+    // which is the failure worth telling apart.
+    held.write(0, &[0]).expect("a tally");
+    held.write(1, &[1, 1, 1]).expect("a seeded count");
+
+    let first = [Groups::Fixed(1)];
+    let second = [Groups::From { binding: 1, at: 0 }];
+    held.staged(&[&first, &second]).expect("two stages");
+
+    let ran = held.read(0, 1).expect("the tally").first().copied().unwrap_or(0);
+    let want = ASKED * width;
+    assert_eq!(
+        ran, want,
+        "{ran} invocations ran and {want} were asked for — the dispatch read {} workgroups, not \
+         {ASKED}",
+        ran / width.max(1)
+    );
+}

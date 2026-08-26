@@ -19,14 +19,14 @@
 //! on that evidence.
 //!
 //! `Resident::frames` records twenty frames into one command buffer. The round trip is paid once
-//! and the work twenty times, so what comes back is the work. Four arrangements, measured:
+//! and the work twenty times, so what comes back is the work. Five arrangements, measured:
 //!
 //! ```text
-//!         cells     ungated       gated      listed      staged
-//!       262 144       66 us       79 us       57 us       44 us
-//!     1 048 576       92 us       79 us       57 us       44 us
-//!     4 194 304      161 us       79 us       59 us       44 us
-//!    16 777 216      323 us      144 us       60 us       46 us
+//!         cells     ungated       gated      listed      staged     narrowed
+//!       262 144       66 us       79 us       57 us       44 us        35 us
+//!     1 048 576       92 us       79 us       57 us       44 us        35 us
+//!     4 194 304      161 us       79 us       59 us       44 us        36 us
+//!    16 777 216      323 us      144 us       60 us       46 us        36 us
 //! ```
 //!
 //! *Ungated* is a workgroup a block, every block. *Gated* is the same dispatch with a vote that
@@ -42,8 +42,13 @@
 //! stages, which is `crate::live::wired` saying which of them do not read what their neighbours
 //! write.
 //!
+//! *Narrowed* is the same eleven stages with `DRAW_INDIRECT` named only in the four barriers that
+//! precede a dispatch reading its count from a buffer. `Resident` had it in all ten, on the written
+//! grounds that naming it "costs nothing and cannot be forgotten" — the second half was true and the
+//! first was not, by a fifth of the frame.
+//!
 //! **What the table is for** is the flatness rather than any one number: sixty-four times the world
-//! for two microseconds more, with nothing in the frame proportional to the grid.
+//! for one microsecond more, with nothing in the frame proportional to the grid.
 //!
 //! # The pour is the same at every size
 //!
