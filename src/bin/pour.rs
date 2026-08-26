@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 
 use grit::compact::Plan;
 use grit::layout::{BRUSH, COARSE, GRAND, LOOKING, PARAMS, PIXELS, STATE, TALLY, TALLY_WORDS};
-use grit::sand::{self, AIR, Grid, SAND, View, WALL, WATER};
+use grit::sand::{AIR, Grid, SAND, View, WALL, WATER};
 use grit::sweep;
 use grit::{Groups, Host};
 
@@ -99,15 +99,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         view.deep
     );
 
-    // The loop, in the order `live::wired` insists on — and the picture on the end, because how
-    // much of the world is being looked at is this program's business and not the loop's.
-    let (mut passes, mut groups) = grit::live::wired(width, grid, &plan)?;
-    passes.push(sand::paint(width, grid, view)?);
-    groups.push(Groups::Fixed(
-        u32::try_from(view.pixels())
-            .unwrap_or(u32::MAX)
-            .div_ceil(width),
-    ));
+    // The loop, in the order and the grouping `live::wired` insists on — and the picture among it
+    // rather than after it, which is that function's argument to make and not this one's.
+    let (passes, stages) = grit::live::wired(width, grid, &plan, Some(view))?;
+    let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
     let words: usize = passes.iter().map(Vec::len).sum();
 
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
@@ -156,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print!("waking the driver... ");
     let warm = Instant::now();
-    drop(resident.frame_reading(&groups, PIXELS as usize, view.pixels())?);
+    drop(resident.staged_reading(&groups, PIXELS as usize, view.pixels())?);
     println!("{:?}", warm.elapsed());
 
     let mut frames = 0_u32;
@@ -207,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[column, row, REACH * REACH, material],
         )?;
 
-        let (spent, picture) = resident.frame_reading(&groups, PIXELS as usize, view.pixels())?;
+        let (spent, picture) = resident.staged_reading(&groups, PIXELS as usize, view.pixels())?;
         cost += spent;
         window.update_with_buffer(&picture, view.wide as usize, view.deep as usize)?;
 

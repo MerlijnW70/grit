@@ -116,7 +116,8 @@ fn the_list_is_shorter_and_never_different() {
     );
 
     // The wired loop — both hierarchies, in the order `live::wired` insists on.
-    let (wired, wired_groups) = grit::live::wired(width, grid, &plan).expect("wired");
+    let (wired, wired_stages) = grit::live::wired(width, grid, &plan, None).expect("wired");
+    let wired_groups: Vec<&[Groups]> = wired_stages.iter().map(Vec::as_slice).collect();
     let over_box = sand::BOX * sand::BOX / width;
 
     // The whole grid, which knows nothing about waking.
@@ -163,7 +164,7 @@ fn the_list_is_shorter_and_never_different() {
             held.write_at(PARAMS as usize, BRUSH, &brushing(frame))
                 .expect("brush");
         }
-        live.frame(&wired_groups).expect("wired");
+        live.staged(&wired_groups).expect("wired");
         full.frame(&whole_groups).expect("whole");
 
         let there = live.read(STATE as usize, cells).expect("wired state");

@@ -1,6 +1,6 @@
 # grit
 
-Sixteen million cells of falling sand and water, simulated in **60 µs a frame**, on a work list
+Sixteen million cells of falling sand and water, simulated in **46 µs a frame**, on a work list
 that never learns how long it is.
 
 Built on [`simdr`](../simdr) — a SPIR-V emitter written in stable Rust with an empty dependency
@@ -26,16 +26,17 @@ touch.** A 4096×4096 grid holds 4 194 304 quads. A frame steps about **seven hu
 
 ```
        cells      quads      frame     stepped    of grid
-      262 144     65 536      57 µs        768        85×
-    1 048 576    262 144      57 µs        768       341×
-    4 194 304  1 048 576      59 µs        768      1365×
-   16 777 216  4 194 304      60 µs        768      5461×
+      262 144     65 536      44 µs        768        85×
+    1 048 576    262 144      44 µs        768       341×
+    4 194 304  1 048 576      44 µs        768      1365×
+   16 777 216  4 194 304      46 µs        768      5461×
 ```
 
 The last column is the ratio between what was stepped and what exists. It is the number this
-repository was written to print. The fourth column is the one that had to be earned twice: sixty-four
-times the world for three microseconds more, with **nothing in the frame proportional to the grid**
-— not the settle, and no longer the passes that build the list it runs on.
+repository was written to print. The frame column had to be earned three times over: sixty-four times
+the world for two microseconds more, with **nothing in the frame proportional to the grid** — not the
+settle, not the passes that build the list it runs on, and not what is left once neither of those
+grows, which turned out to be the barriers between them.
 
 **The size of that list never crosses the bus.** A pass called `prepare` divides the count and
 writes three words into a buffer; Vulkan reads them at dispatch time. The host does not learn how
@@ -45,7 +46,9 @@ much work there was unless it asks, which the title bar does twice a second.
 
 ## How it is put together
 
-Seventeen passes, one submission, six words from the host.
+Seventeen passes in **eleven stages**, one submission, six words from the host. A barrier sits
+between stages and not inside one, and at about 3.8 µs each that grouping is a fifth of the frame —
+`live::wired` is where it is decided, and the argument for every seam is beside it.
 
 ```
   tick     1              the frame number, and the partition's phase
@@ -213,10 +216,12 @@ Every test is run at subgroup **32** (RTX 4080), **64** (integrated Radeon) and 
   make things slower* and nearly went in the bin on that evidence — and the hot-block list that came
   after it would have been invisible too, because what it saves at the largest size is 84 µs and a
   round trip costs more than that.
-* **The frame is now bounded below by the passes that are one workgroup whatever happens.** Six of
-  the seventeen are `Fixed(1)`, and a few more are one per tile — 64 at the largest size. Nothing
-  there grows with the world, but 57 µs at a quarter of a million cells is what they cost, and a
-  smaller world does not get a smaller frame.
+* **What is left of the frame is mostly the barriers, and there are ten of them.** Priced by taking
+  five passes out at a size where none of them had anything to do: 60.2 µs to 41.2 µs, so about
+  3.8 µs each. Grouping sixteen passes into eleven stages took the frame to 44, and going further
+  means finding pairs that genuinely do not read each other — the two hierarchies are a chain by
+  construction, so what is left to merge is small. A smaller world still does not get a smaller
+  frame.
 * **`paint` is the largest fixed dispatch left**, at one invocation a pixel — 16 384 workgroups for
   a 1024×512 window. It is priced by the window rather than by the world, so it does not break the
   claim above; it is simply what `pour` pays and `scale` does not measure.

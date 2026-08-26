@@ -53,6 +53,13 @@ use crate::compact::{Over, Tier, owned};
 use crate::layout::{AWAKE, BINDINGS, DENSE, GRAND, HOT, PARAMS, STATE};
 use crate::sand::{self, Grid};
 
+/// What [`wired`] hands back: one module a pass, and the workgroup counts grouped into stages.
+///
+/// The two are separate lists and have to stay in one order — `Resident` counts a pass index through
+/// the flattened stages — which is why [`wired`] builds them as pairs and splits them only on the
+/// way out.
+pub type Loop = (Vec<Vec<u32>>, Vec<Vec<crate::Groups>>);
+
 /// The frame number, one higher, on the device.
 ///
 /// The one word the host never writes after the first frame — the partition's phase is its low bit,
@@ -115,8 +122,22 @@ pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 ///   15  prepare          1            how many workgroups the *next* settle runs
 /// ```
 ///
-/// The picture is not here: a caller that wants one appends [`sand::paint`], because how much of
-/// the world is being looked at is not the loop's business. `src/bin/scale.rs` appends nothing.
+/// # What comes back is stages, not passes
+///
+/// A barrier sits between stages and not inside one, and it costs about 3.8 µs on this machine —
+/// which at a size where no pass has any work to do is very nearly the whole frame. So the second
+/// half of this function is a dependency argument: sixteen passes in eleven stages, and the comment
+/// beside them names every seam. [`crate::Resident::staged`] and
+/// [`crate::Resident::staged_frames`] are what take them.
+///
+/// # And why the picture is an argument rather than something a caller appends
+///
+/// Because `Resident` counts a pass index straight through the flattened stages, so the modules and
+/// the counts have to be in one order and not two. A caller appending [`sand::paint`] to the end of
+/// the module list and to the *middle* of the stage list — which is where it belongs, beside the
+/// coarse mark — would dispatch the wrong kernel over the wrong count, and nothing in either list
+/// would look wrong. So the two travel as pairs in here and are split apart only on the way out, and
+/// `picture` is how a caller says it wants one. `src/bin/scale.rs` passes `None`.
 ///
 /// # Errors
 ///
@@ -125,58 +146,100 @@ pub fn wired(
     subgroup: u32,
     grid: Grid,
     plan: &crate::compact::Plan,
-) -> Result<(Vec<Vec<u32>>, Vec<crate::Groups>), LaneError> {
+    picture: Option<sand::View>,
+) -> Result<Loop, LaneError> {
     use crate::Groups;
     use crate::layout::{HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_TOTALS};
     use crate::sweep::COUNTS;
 
     let listed = Over::Listed(HOT_DENSE);
-    let passes = vec![
-        tick(subgroup)?,
-        decay(subgroup, listed)?,
-        wipe(subgroup)?,
-        wipe_counts(subgroup, COUNTS)?,
-        sand::brush(subgroup, grid, true)?,
-        settle(subgroup, grid)?,
-        mark(subgroup, Tier::COARSE, Over::Every)?,
-        crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
-        crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
-        crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
-        // **Divided by one**, because this list is dispatched a workgroup an entry rather than a
-        // workgroup a subgroup's worth. Dividing by the wrong one is a pass that silently covers
-        // part of the list.
-        crate::compact::prepare(subgroup, 1, Tier::COARSE)?,
-        mark(subgroup, Tier::FINE, listed)?,
-        crate::compact::scan(subgroup, COUNTS, crate::layout::BASES, crate::layout::TOTALS)?,
-        crate::compact::scan(
-            subgroup,
-            crate::layout::TOTALS,
-            crate::layout::TOTALS,
-            crate::layout::GRAND,
-        )?,
-        crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
-        crate::compact::prepare(subgroup, subgroup, Tier::FINE)?,
+    let hot = crate::compact::Plan::hot_listed();
+    let tiles = Groups::Fixed(plan.tiles);
+    let one = Groups::Fixed(1);
+
+    // **A pass and how many workgroups it runs, together.** They used to be two lists that had to
+    // stay in the same order, and now that the order is *stages* rather than passes the two could
+    // disagree without looking wrong: `Resident` counts a pass index through the flattened stages,
+    // so a picture appended to the end of one list and the middle of the other would silently
+    // dispatch the wrong kernel over the wrong count. Pairing them makes that unsayable.
+    let looking = {
+        let mut stage = vec![(mark(subgroup, Tier::COARSE, Over::Every)?, tiles)];
+        if let Some(view) = picture {
+            // **In the same stage as the coarse mark, not on the end of the frame.** It reads the
+            // state the settle wrote and writes pixels nothing else touches, so it has no reason to
+            // wait behind the compaction — and it is the largest fixed dispatch in the loop.
+            let over = u32::try_from(view.pixels())
+                .unwrap_or(u32::MAX)
+                .div_ceil(subgroup);
+            stage.push((sand::paint(subgroup, grid, view)?, Groups::Fixed(over)));
+        }
+        stage
+    };
+
+    let stages = vec![
+        vec![
+            (tick(subgroup)?, one),
+            (decay(subgroup, listed)?, hot),
+            (wipe(subgroup)?, one),
+            (wipe_counts(subgroup, COUNTS)?, tiles),
+        ],
+        vec![(
+            sand::brush(subgroup, grid, true)?,
+            Groups::Fixed(sand::BOX * sand::BOX / subgroup),
+        )],
+        vec![(settle(subgroup, grid)?, crate::compact::Plan::listed())],
+        looking,
+        vec![(
+            crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
+            Groups::Fixed(plan.hot_tiles),
+        )],
+        vec![(
+            crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
+            one,
+        )],
+        vec![
+            (
+                crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
+                tiles,
+            ),
+            // **Divided by one**, because this list is dispatched a workgroup an entry rather than a
+            // workgroup a subgroup's worth. Dividing by the wrong one is a pass that silently covers
+            // part of the list.
+            (crate::compact::prepare(subgroup, 1, Tier::COARSE)?, one),
+        ],
+        vec![(mark(subgroup, Tier::FINE, listed)?, hot)],
+        vec![(
+            crate::compact::scan(subgroup, COUNTS, crate::layout::BASES, crate::layout::TOTALS)?,
+            tiles,
+        )],
+        vec![(
+            crate::compact::scan(
+                subgroup,
+                crate::layout::TOTALS,
+                crate::layout::TOTALS,
+                crate::layout::GRAND,
+            )?,
+            one,
+        )],
+        vec![
+            (
+                crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
+                hot,
+            ),
+            (crate::compact::prepare(subgroup, subgroup, Tier::FINE)?, one),
+        ],
     ];
 
-    let hot = crate::compact::Plan::hot_listed();
-    let groups = vec![
-        Groups::Fixed(1),
-        hot,
-        Groups::Fixed(1),
-        Groups::Fixed(plan.tiles),
-        Groups::Fixed(sand::BOX * sand::BOX / subgroup),
-        crate::compact::Plan::listed(),
-        Groups::Fixed(plan.tiles),
-        Groups::Fixed(plan.hot_tiles),
-        Groups::Fixed(1),
-        Groups::Fixed(plan.tiles),
-        Groups::Fixed(1),
-        hot,
-        Groups::Fixed(plan.tiles),
-        Groups::Fixed(1),
-        hot,
-        Groups::Fixed(1),
-    ];
+    let mut passes = Vec::new();
+    let mut groups = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let mut counts = Vec::with_capacity(stage.len());
+        for (module, over) in stage {
+            passes.push(module);
+            counts.push(over);
+        }
+        groups.push(counts);
+    }
 
     Ok((passes, groups))
 }

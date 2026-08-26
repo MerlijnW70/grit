@@ -19,14 +19,14 @@
 //! on that evidence.
 //!
 //! `Resident::frames` records twenty frames into one command buffer. The round trip is paid once
-//! and the work twenty times, so what comes back is the work. Three arrangements, measured:
+//! and the work twenty times, so what comes back is the work. Four arrangements, measured:
 //!
 //! ```text
-//!         cells     ungated       gated      listed
-//!       262 144       66 us       79 us       57 us
-//!     1 048 576       92 us       79 us       57 us
-//!     4 194 304      161 us       79 us       59 us
-//!    16 777 216      323 us      144 us       60 us
+//!         cells     ungated       gated      listed      staged
+//!       262 144       66 us       79 us       57 us       44 us
+//!     1 048 576       92 us       79 us       57 us       44 us
+//!     4 194 304      161 us       79 us       59 us       44 us
+//!    16 777 216      323 us      144 us       60 us       46 us
 //! ```
 //!
 //! *Ungated* is a workgroup a block, every block. *Gated* is the same dispatch with a vote that
@@ -35,9 +35,15 @@
 //! three passes dispatched over a compacted list of the blocks that hold something, so a cold block
 //! is not launched at all.
 //!
-//! **The last column is the claim.** Sixty-four times the world for three microseconds more — and
-//! lower than the gated floor at every size, because the blocks that were being launched and
-//! dismissed were never free, only cheap.
+//! **The last column is not about work at all.** By then the frame was sixteen passes with a barrier
+//! between each, and a barrier is a full pipeline flush. Priced by taking five passes out at a size
+//! where none of them had anything to do — 60.2 µs to 41.2 µs — which is about 3.8 µs a barrier, and
+//! sixteen of those is very nearly the whole frame. *Staged* is the same sixteen passes in eleven
+//! stages, which is `crate::live::wired` saying which of them do not read what their neighbours
+//! write.
+//!
+//! **What the table is for** is the flatness rather than any one number: sixty-four times the world
+//! for two microseconds more, with nothing in the frame proportional to the grid.
 //!
 //! # The pour is the same at every size
 //!
@@ -51,7 +57,7 @@ use std::time::Duration;
 use grit::compact::Plan;
 use grit::layout::{BRUSH, GRAND, PARAMS, STATE};
 use grit::sand::{AIR, Grid, SAND, WALL};
-use grit::{Host, sweep};
+use grit::{Groups, Host, sweep};
 
 /// How many frames each size runs.
 const FRAMES: u32 = 300;
@@ -102,7 +108,8 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
     };
 
     // No picture: this measures the loop, and what looking costs is `loop_cost`'s question.
-    let (passes, groups) = grit::live::wired(width, grid, &plan)?;
+    let (passes, stages) = grit::live::wired(width, grid, &plan, None)?;
+    let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
     let words: usize = sizes.iter().sum();
@@ -116,7 +123,7 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
     grit::live::seed(&mut resident, grid, &plan)?;
 
     // A discarded frame: the first submission of a pipeline pays for its compile.
-    resident.frame(&groups)?;
+    resident.staged(&groups)?;
 
     let mut spent = Duration::ZERO;
     let mut listed_total = 0_u64;
@@ -127,7 +134,7 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
         // **Twenty frames a submission, and the timing divided by twenty.** One frame's wall clock
         // is a hundred microseconds of submit and fence whatever is inside it, so it cannot tell a
         // pass that got cheaper from one that did not. See `Resident::frames`.
-        spent += resident.frames(&groups, BATCH)?;
+        spent += resident.staged_frames(&groups, BATCH)?;
 
         // Twice over the run, because asking is a submit and a fence.
         if frame % (BATCH * 2) == 0 {

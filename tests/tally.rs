@@ -30,7 +30,7 @@ use grit::compact::Plan;
 use grit::layout::{BRUSH, COARSE, DENSE, GRAND, PARAMS, STATE, TALLY, TALLY_WORDS};
 use grit::sand::{AIR, Grid, SAND, WALL, WATER, material_of};
 use grit::sweep;
-use grit::Host;
+use grit::{Groups, Host};
 
 /// The world under test.
 const WIDE: u32 = 512;
@@ -107,7 +107,8 @@ fn the_reduction_says_what_a_count_by_hand_says() {
         grid.deep
     );
 
-    let (passes, groups) = grit::live::wired(width, grid, &plan).expect("wired");
+    let (passes, stages) = grit::live::wired(width, grid, &plan, None).expect("wired");
+    let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
 
     let sizes = plan.sizes();
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
@@ -145,7 +146,7 @@ fn the_reduction_says_what_a_count_by_hand_says() {
         };
         live.write_at(PARAMS as usize, BRUSH, &[190, 30, 36, material])
             .expect("brush");
-        live.frame(&groups).expect("dispatched");
+        live.staged(&groups).expect("dispatched");
 
         let state = live.read(STATE as usize, cells).expect("state");
         let tally = live.read(TALLY as usize, TALLY_WORDS).expect("tally");

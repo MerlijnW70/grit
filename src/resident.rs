@@ -1285,7 +1285,25 @@ impl Resident<'_> {
     /// As [`Resident::frame`].
     pub fn frames(&mut self, groups: &[Groups], times: u32) -> Result<Duration, Error> {
         let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
-        let ticket = self.start(&stages, &[], times.max(1))?;
+        self.staged_frames(&stages, times)
+    }
+
+    /// The same, over passes a caller has said are not all ordered against each other.
+    ///
+    /// **The measurement that made this worth having.** [`Resident::frames`] puts every pass in a
+    /// stage of its own, which is a barrier between each of them — and a barrier is not free. Five
+    /// passes taken out of `grit`'s seventeen took the frame from 60.2 µs to 41.2 µs at a size where
+    /// none of them had any work to do, which prices a barrier at about 3.8 µs and the whole
+    /// arrangement at very nearly the frame.
+    ///
+    /// So the passes that do not read what their neighbours write want saying so, and this is the
+    /// batched timing for them. `crate::live::wired` is where that grouping is decided.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::frames`].
+    pub fn staged_frames(&mut self, stages: &[&[Groups]], times: u32) -> Result<Duration, Error> {
+        let ticket = self.start(stages, &[], times.max(1))?;
         self.wait(ticket).map(|spent| spent / times.max(1))
     }
 
