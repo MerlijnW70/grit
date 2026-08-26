@@ -13,22 +13,53 @@
 //! ```text
 //!   # a comment
 //!   inputs 4        how many inputs, one to six
+//!   outputs 3       how many answer bits — one if left out
 //!   seed 1234       where the random grids start, which decides more than it looks
 //!   parity          fill the table: the parity of the inputs
 //!   majority        fill the table: more ones than noughts
 //!   equal           fill the table: every input the same
-//!   1010 -> 1       one case, which overrides whatever a filler said
+//!   count           fill the table: how many ones there are, in binary
+//!   add             fill the table: the first half plus the second
+//!   10-1 -> 01      the inputs that pattern stands for, and what they answer
+//!   ---- -> --1     a dash on the left is every value; a dash on the right is not asked
 //! ```
 //!
-//! **A case nobody names is not scored.** Four lines is an exam of four cases and the answer is
-//! judged on those; `parity` is an exam of all of them. What is left out is left out rather than
-//! assumed, so a partial specification gives a partial score rather than a wrong one.
+//! **A dash on the left is both.** `10-1` is two inputs at once and `----` is all sixteen, so one
+//! line says what otherwise takes a table.
+//!
+//! **A dash on the right is silence.** The score counts answer *bits*, not cases, and a bit nobody
+//! named counts for nothing either way — so `1--- -> 1-` asks about one output and leaves the other
+//! alone, and the report says `16 answer bits marked of 32` rather than pretending to judge 32.
+//!
+//! **The answer comes out down the right-hand edge**, output nought on the top wire of the last
+//! column and the rest under it, and the drawing marks them.
+//!
+//! What is left out is left out rather than assumed, which is what makes a partial exam a partial
+//! score instead of a wrong one.
 //!
 //! # What comes back
 //!
 //! A grid of gates, drawn, and a number: how many of the marked cases it gets right. That number is
 //! worked out twice, once by the card while it was evolving and once by the host afterwards from the
 //! genome alone, and the report prints both. They have to agree.
+//!
+//! # What this is not
+//!
+//! # What it does, measured
+//!
+//! Four exams, 4096 chips, at most four thousand generations, on an RTX 4080:
+//!
+//! ```text
+//!   exam                                    marked   reached
+//!   inputs 4, parity                            16        16
+//!   inputs 4, outputs 2, one output = input a   16        16
+//!   inputs 4, outputs 3, add                    48        40
+//!   inputs 4, outputs 3, count                  48        41
+//! ```
+//!
+//! The first two arrive inside twenty generations. The last two do not arrive at all, and the score
+//! is what it is: 41 of 48 is a chip right about most of the bits of most of the answers, which the
+//! host confirms from the genome afterwards.
 //!
 //! # What this is not
 //!
@@ -183,6 +214,12 @@ fn shift_down(kernel: &mut Kernel<U32>, held: Id, by: Id) -> Result<Id, LaneErro
 fn down_by(kernel: &mut Kernel<U32>, held: Id, by: u32) -> Result<Id, LaneError> {
     let much = kernel.module().constant_u32(by)?;
     shift_down(kernel, held, much)
+}
+
+/// Bit `at` of `held`.
+fn bit(kernel: &mut Kernel<U32>, held: Id, at: u32) -> Result<Id, LaneError> {
+    let shifted = down_by(kernel, held, at)?;
+    low_bits(kernel, shifted, 1)
 }
 
 /// One where `a` is above `b`, nought where it is not.
@@ -493,7 +530,7 @@ fn propagate(subgroup: u32, column: u32, cases: u32) -> Result<Vec<u32>, LaneErr
 }
 
 /// How many of the inputs the top-right wire got right.
-fn tally(subgroup: u32, cases: u32) -> Result<Vec<u32>, LaneError> {
+fn tally(subgroup: u32, cases: u32, outputs: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let none = kernel.module().constant_u32(0)?;
@@ -501,18 +538,26 @@ fn tally(subgroup: u32, cases: u32) -> Result<Vec<u32>, LaneError> {
     let slot = mine(&mut kernel, subgroup)?;
     let chip = listed(&mut kernel, slot, held)?;
 
+    // **One tap a row, down the right-hand edge.** Output nought is the top wire of the last column,
+    // output one the wire under it, and so on — the same place a one-bit exam reads, extended.
     let mut fit = kernel.module().constant_u32(0)?;
     for case in 0..cases {
         let which = kernel.module().constant_u32(case)?;
-        let at = wire(&mut kernel, chip, COLUMNS - 1, none, which, cases)?;
-        let said = kernel.load_at(WIRE, at)?;
         let want = kernel.load_at(TARGET, which)?;
-        let hit = is(&mut kernel, said, want)?;
-        // **Only what the exam asked about.** A case the writer left out counts for nothing either
-        // way, so a partial specification gives a partial score rather than a wrong one.
         let asked = kernel.load_at(KEEP, which)?;
-        let counted = kernel.module().i_mul(uint, hit, asked)?;
-        fit = kernel.module().i_add(uint, fit, counted)?;
+        for output in 0..outputs {
+            let row = kernel.module().constant_u32(output)?;
+            let at = wire(&mut kernel, chip, COLUMNS - 1, row, which, cases)?;
+            let said = kernel.load_at(WIRE, at)?;
+            // **Both sides carry a mask.** A bit the exam left out counts for nothing either way, on
+            // the input side and the output side alike, so a partial specification gives a partial
+            // score rather than a wrong one.
+            let wanted = bit(&mut kernel, want, output)?;
+            let marked = bit(&mut kernel, asked, output)?;
+            let hit = is(&mut kernel, said, wanted)?;
+            let counted = kernel.module().i_mul(uint, hit, marked)?;
+            fit = kernel.module().i_add(uint, fit, counted)?;
+        }
     }
     kernel.store_at(SCORE, chip, fit)?;
     kernel.finish()
@@ -524,14 +569,16 @@ fn tally(subgroup: u32, cases: u32) -> Result<Vec<u32>, LaneError> {
 struct Exam {
     /// How many inputs, one to six.
     bits: u32,
+    /// How many answer bits. Output nought is the top wire of the last column.
+    outputs: u32,
     /// Where the random grids start.
     ///
     /// **It matters more than anything else in this file.** Five starts on the parity of six inputs
     /// came out at 50, 52, 56, 60 and 64 of 64, so one run says nothing on its own.
     seed: u32,
-    /// The wanted answer for every input.
+    /// The wanted answer for every input, its bits packed one an output.
     want: Vec<u32>,
-    /// Whether the exam asks about that input at all.
+    /// Which of those bits the exam asks about, packed the same way.
     ask: Vec<u32>,
     /// What to call it in the report.
     name: String,
@@ -543,14 +590,44 @@ impl Exam {
         1 << self.bits
     }
 
-    /// How many of them are marked, which is what a perfect score is.
+    /// How many answer bits are marked, which is what a perfect score is.
     fn asked(&self) -> u32 {
-        self.ask.iter().sum()
+        self.ask.iter().map(|it| it.count_ones()).sum()
     }
 }
 
 /// The example, printed and used when no file is named.
-const WRITTEN: &str = "# The exam. Everything the machine is told, and nothing about how.\ninputs 4\nparity\n";
+const WRITTEN: &str =
+    "# The exam. Everything the machine is told, and nothing about how.\ninputs 4\noutputs 3\ncount\n";
+
+/// Every input a pattern of noughts, ones and dashes stands for.
+///
+/// **A dash is both.** `10-1` is two inputs and `----` is all sixteen, so one line can say what
+/// otherwise takes a table — and the leftmost character is input nought, the row it enters on.
+fn spread_of(pattern: &str) -> Vec<u32> {
+    let free: Vec<u32> = pattern
+        .chars()
+        .enumerate()
+        .filter(|&(_, it)| it == '-')
+        .filter_map(|(at, _)| u32::try_from(at).ok())
+        .collect();
+    let fixed = pattern
+        .chars()
+        .enumerate()
+        .filter(|&(_, it)| it == '1')
+        .filter_map(|(at, _)| u32::try_from(at).ok())
+        .fold(0_u32, |held, at| held | (1 << at));
+    (0..1_u32 << free.len())
+        .map(|combination| {
+            free.iter()
+                .enumerate()
+                .filter_map(|(which, &at)| u32::try_from(which).ok().map(|it| (it, at)))
+                .fold(fixed, |held, (which, at)| {
+                    held | (((combination >> which) & 1) << at)
+                })
+        })
+        .collect()
+}
 
 /// Read an exam.
 ///
@@ -559,22 +636,27 @@ const WRITTEN: &str = "# The exam. Everything the machine is told, and nothing a
 /// ```text
 ///   # a comment
 ///   inputs 4        how many inputs, one to six
+///   outputs 3       how many answer bits — one if left out
 ///   seed 1234       where the random grids start, which decides more than it looks
 ///   parity          fill the table: the parity of the inputs
 ///   majority        fill the table: more ones than noughts
 ///   equal           fill the table: every input the same
-///   1010 -> 1       one case, which overrides whatever a filler said
+///   count           fill the table: how many ones there are, in binary
+///   add             fill the table: the first half plus the second
+///   10-1 -> 01      the inputs that pattern stands for, and what they answer
+///   ---- -> --1     a dash on the left is every value; a dash on the right is not asked
 /// ```
 ///
-/// **A case nobody names is not scored.** Write four lines and the answer is judged on four inputs;
-/// write `parity` and it is judged on all of them. What is left out is left out rather than assumed,
-/// which is what makes a partial exam a partial score instead of a wrong one.
+/// **A bit nobody names is not scored**, on either side. Write four lines and the answer is judged
+/// on those; write `count` and it is judged on everything. What is left out is left out rather than
+/// assumed, which is what makes a partial exam a partial score instead of a wrong one.
 fn read(text: &str) -> Result<Exam, String> {
     let mut bits = None;
+    let mut outputs = 1_u32;
+    let mut seed = 0x0AC1_E000_u32;
     let mut want: Vec<u32> = Vec::new();
     let mut ask: Vec<u32> = Vec::new();
     let mut name = String::from("an exam");
-    let mut seed = 0x0AC1_E000_u32;
 
     for (number, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -590,6 +672,13 @@ fn read(text: &str) -> Result<Exam, String> {
                     .and_then(|it| it.parse::<u32>().ok())
                     .ok_or_else(|| say("`seed` wants a number"))?;
             }
+            (Some("outputs"), _) => {
+                outputs = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .filter(|&it| (1..ROWS).contains(&it))
+                    .ok_or_else(|| say("`outputs` wants a number from one to seven"))?;
+            }
             (Some("inputs"), _) => {
                 let how = word
                     .next()
@@ -601,47 +690,72 @@ fn read(text: &str) -> Result<Exam, String> {
                 ask = vec![0; 1 << how];
             }
             (Some(_), None) => return Err(say("`inputs` has to come first")),
-            (Some(filler @ ("parity" | "majority" | "equal")), Some(how)) => {
+            (Some(filler @ ("parity" | "majority" | "equal" | "count" | "add")), Some(how)) => {
+                let widest = match filler {
+                    "count" => u32::BITS - how.leading_zeros(),
+                    "add" => how / 2 + 1,
+                    _ => 1,
+                };
+                if outputs < widest {
+                    return Err(say(&format!("`{filler}` wants `outputs {widest}` or more")));
+                }
+                if filler == "add" && how % 2 != 0 {
+                    return Err(say("`add` wants an even number of inputs"));
+                }
                 name = filler.to_owned();
+                let full = (1_u32 << outputs) - 1;
+                let half = how / 2;
                 for case in 0..1_u32 << how {
                     let ones = case.count_ones();
                     let answer = match filler {
                         "parity" => ones & 1,
                         "majority" => u32::from(ones * 2 > how),
-                        _ => u32::from(ones == 0 || ones == how),
+                        "equal" => u32::from(ones == 0 || ones == how),
+                        "count" => ones,
+                        _ => (case & ((1 << half) - 1)) + (case >> half),
                     };
                     if let (Some(a), Some(b)) =
                         (want.get_mut(case as usize), ask.get_mut(case as usize))
                     {
                         *a = answer;
-                        *b = 1;
+                        *b = full;
                     }
                 }
             }
             (Some(pattern), Some(how)) => {
-                if pattern.len() != how as usize || pattern.chars().any(|it| it != '0' && it != '1')
-                {
-                    return Err(say("expected a pattern of noughts and ones, `inputs` long"));
+                if pattern.len() != how as usize || pattern.chars().any(|it| !"01-".contains(it)) {
+                    return Err(say("expected a pattern of noughts, ones and dashes"));
                 }
                 if word.next() != Some("->") {
                     return Err(say("expected `->` after the pattern"));
                 }
-                let answer = match word.next() {
-                    Some("0") => 0,
-                    Some("1") => 1,
-                    _ => return Err(say("expected a nought or a one after `->`")),
-                };
-                // The leftmost character is input nought, which is the row it enters on.
-                let case = pattern
-                    .chars()
-                    .enumerate()
-                    .filter(|&(_, it)| it == '1')
-                    .fold(0_u32, |held, (at, _)| held | (1 << at));
-                if let (Some(a), Some(b)) =
-                    (want.get_mut(case as usize), ask.get_mut(case as usize))
-                {
-                    *a = answer;
-                    *b = 1;
+                let answer = word
+                    .next()
+                    .filter(|it| it.len() == outputs as usize)
+                    .filter(|it| it.chars().all(|c| "01-".contains(c)))
+                    .ok_or_else(|| {
+                        say("expected an answer of noughts, ones and dashes, `outputs` long")
+                    })?;
+                let (mut wants, mut asks) = (0_u32, 0_u32);
+                for (at, it) in answer.chars().enumerate() {
+                    let Ok(at) = u32::try_from(at) else { continue };
+                    match it {
+                        '1' => {
+                            wants |= 1 << at;
+                            asks |= 1 << at;
+                        }
+                        '0' => asks |= 1 << at,
+                        _ => {}
+                    }
+                }
+                for case in spread_of(pattern) {
+                    if let (Some(a), Some(b)) =
+                        (want.get_mut(case as usize), ask.get_mut(case as usize))
+                    {
+                        // What a line says replaces what it says about, and leaves the rest alone.
+                        *a = (*a & !asks) | wants;
+                        *b |= asks;
+                    }
                 }
                 if name == "an exam" {
                     name = String::from("a table");
@@ -651,7 +765,7 @@ fn read(text: &str) -> Result<Exam, String> {
         }
     }
     let bits = bits.ok_or_else(|| String::from("the exam says nothing about `inputs`"))?;
-    Ok(Exam { bits, seed, want, ask, name })
+    Ok(Exam { bits, outputs, seed, want, ask, name })
 }
 
 // ---------- the host, which lays out the arena and then asks almost nothing ----------
@@ -663,7 +777,7 @@ fn stirred(seed: &mut u32) -> u32 {
 }
 
 /// The chip, run again here exactly as the columns run it on the card.
-fn runs(genome: &[u32], case: u32) -> u32 {
+fn runs(genome: &[u32], case: u32, outputs: u32) -> u32 {
     let mut column: Vec<u32> = (0..ROWS)
         .map(|row| if row == ROWS - 1 { 1 } else { (case >> row) & 1 })
         .collect();
@@ -683,23 +797,36 @@ fn runs(genome: &[u32], case: u32) -> u32 {
             .collect();
         column = next;
     }
-    column.first().copied().unwrap_or(0)
+    // The answer is the top `outputs` wires of the last column, packed as the exam packs it.
+    (0..outputs)
+        .filter(|&at| column.get(at as usize).copied().unwrap_or(0) == 1)
+        .fold(0_u32, |held, at| held | (1 << at))
 }
 
-/// How many of the marked cases this chip gets right, worked out on the host.
+/// How many of the marked answer bits this chip gets right, worked out on the host.
+///
+/// **One a bit, not one a case**, so a chip right about two outputs of three scores two.
 fn scored(genome: &[u32], exam: &Exam) -> u32 {
     (0..exam.cases())
-        .filter(|&case| {
-            exam.ask.get(case as usize).copied().unwrap_or(0) == 1
-                && runs(genome, case) == exam.want.get(case as usize).copied().unwrap_or(0)
+        .map(|case| {
+            let said = runs(genome, case, exam.outputs);
+            let want = exam.want.get(case as usize).copied().unwrap_or(0);
+            let ask = exam.ask.get(case as usize).copied().unwrap_or(0);
+            u32::try_from(
+                (0..exam.outputs)
+                    .filter(|&at| (ask >> at) & 1 == 1 && (said >> at) & 1 == (want >> at) & 1)
+                    .count(),
+            )
+            .unwrap_or(0)
         })
-        .count()
-        .try_into()
-        .unwrap_or(0)
+        .sum()
 }
 
 /// The chip as something to look at: one letter a gate, the inputs down the left.
-fn drawn(genome: &[u32], bits: u32) -> String {
+///
+/// **An arrow marks an answer wire.** Output nought is the top row of the last column, output one
+/// the row under it, and the exam says how many there are.
+fn drawn(genome: &[u32], bits: u32, outputs: u32) -> String {
     let mut out = String::new();
     for row in 0..ROWS {
         out.push_str("    ");
@@ -720,11 +847,14 @@ fn drawn(genome: &[u32], bits: u32) -> String {
                 _ => '-',
             });
         }
+        if row < outputs {
+            out.push_str(" <- ");
+            out.push(char::from(b'0' + u8::try_from(row).unwrap_or(0)));
+        }
         out.push('\n');
     }
     out
 }
-
 /// The colony's scores as a row of bars, so the collapse can be watched rather than read.
 fn spread(scores: &[u32], perfect: u32) -> String {
     const BINS: usize = 24;
@@ -773,8 +903,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = host.width();
     println!("{} — subgroup {width}", host.name());
     println!(
-        "  {}: {} inputs, {perfect} of {cases} cases marked",
-        exam.name, exam.bits
+        "  {}: {} inputs, {} outputs, {perfect} answer bits marked of {}",
+        exam.name,
+        exam.bits,
+        exam.outputs,
+        cases * exam.outputs
     );
 
     let mut modules = vec![
@@ -786,7 +919,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for column in 1..COLUMNS {
         modules.push(propagate(width, column, cases)?);
     }
-    modules.push(tally(width, cases)?);
+    modules.push(tally(width, cases, exam.outputs)?);
     let held: Vec<&[u32]> = modules.iter().map(Vec::as_slice).collect();
 
     let wires = Groups::From { binding: COUNTS as usize, at: 1 };
@@ -861,8 +994,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let genome = genes
         .get(winner * CELLS as usize..(winner + 1) * CELLS as usize)
         .unwrap_or(&[]);
-    println!("\n{}", drawn(genome, exam.bits));
-    println!("    - wire   & and   v or   ^ xor   ! not   (the answer is the top right)");
+    println!("\n{}", drawn(genome, exam.bits, exam.outputs));
+    println!("    - wire   & and   v or   ^ xor   ! not   (<- marks an answer wire)");
     let again = scored(genome, &exam);
     println!(
         "\n  worked out on the host it gets {again} of {perfect} — the card said {}{}",
