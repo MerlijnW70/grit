@@ -121,6 +121,49 @@ fn switched(host: &Host, width: u32, n: usize, live: bool) -> f64 {
     best
 }
 
+/// The best of [`TRIES`] frames of `n` passes in `n` stages, in device nanoseconds.
+///
+/// One pass a stage, so what the slope holds is a barrier and a dispatch together. `counted` is
+/// whether the count comes out of a buffer — which is what makes `Resident` name `DRAW_INDIRECT`
+/// in the barrier before it, and is the only difference between the two sweeps.
+fn spread(host: &Host, width: u32, n: usize, counted: bool) -> f64 {
+    let module = nothing(width).expect("a kernel");
+    let modules: Vec<&[u32]> = vec![&module; n];
+    let mut held = host
+        .resident(&[4, 3 * n.max(1)], &modules)
+        .expect("two device buffers");
+    let mut counts = vec![0_u32; 3 * n];
+    for i in 0..n {
+        counts[3 * i] = 1;
+        counts[3 * i + 1] = 1;
+        counts[3 * i + 2] = 1;
+    }
+    held.write(1, &counts).expect("the switches");
+
+    let apart: Vec<Vec<Groups>> = (0..n)
+        .map(|i| {
+            vec![if counted {
+                Groups::From {
+                    binding: 1,
+                    at: 3 * i,
+                }
+            } else {
+                Groups::Fixed(1)
+            }]
+        })
+        .collect();
+    let stages: Vec<&[Groups]> = apart.iter().map(Vec::as_slice).collect();
+
+    let mut best = f64::MAX;
+    for _ in 0..TRIES {
+        held.staged_frames(&stages, 20).expect("frames");
+        if let Some(card) = held.on_device() {
+            best = best.min(card.as_nanos() as f64);
+        }
+    }
+    best
+}
+
 #[test]
 fn what_a_submission_costs_before_it_holds_anything() {
     let Some(host) = device("floor") else {
@@ -300,5 +343,40 @@ fn what_a_submission_costs_before_it_holds_anything() {
         "a pass the device switched off cost {off_each:.0} ns against {:.0} for a barrier, so \
          recording a path not taken is not the cheap half of the arrangement",
         (split_each - fused_each) / (PASSES - 1) as f64
+    );
+
+    // **And what it costs to let the device write that count**, which is not the dispatch but the
+    // barrier in front of it. `Resident` names `DRAW_INDIRECT` in a barrier whose next stage holds
+    // a `Groups::From`, because a count the device wrote has to be visible to the command that
+    // reads it. Both sweeps below run one workgroup a pass, one pass a stage; the only difference
+    // is where the count came from.
+    //
+    // It is the number that decides whether a frame can switch its own passes off. Doing so means
+    // every gated count comes out of a buffer, which widens the barrier in front of every gated
+    // pass — so the saving of 176 ns a dispatch is set against whatever this is.
+    let mut wide = Vec::new();
+    let mut narrow = Vec::new();
+    for count in [1_usize, 2, 4, 8, 16] {
+        wide.push((count as f64, spread(&host, width, count, true)));
+        narrow.push((count as f64, spread(&host, width, count, false)));
+    }
+    let (_, wide_each) = line(&wide);
+    let (_, narrow_each) = line(&narrow);
+    println!(
+        "  a stage before a count read from a buffer is {wide_each:.0} ns, before a count the host \
+         wrote {narrow_each:.0} ns"
+    );
+
+    assert!(
+        wide_each > narrow_each,
+        "a stage before a buffer-read count cost {wide_each:.0} ns against {narrow_each:.0} for a \
+         host-written one, so naming DRAW_INDIRECT is free and `Resident` narrows it for nothing"
+    );
+    assert!(
+        wide_each - narrow_each > on_each - off_each,
+        "widening a barrier costs {:.0} ns and switching a pass off saves {:.0}, so a frame could \
+         gate its own passes and come out ahead — which `decisions/DR-0007` says it cannot",
+        wide_each - narrow_each,
+        on_each - off_each
     );
 }

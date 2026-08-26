@@ -185,7 +185,7 @@ sinking through water falls out of that.
 
 | | |
 | --- | --- |
-| `decisions/` | six records: measurement, decision, rejected route, limit — four headings, no prose |
+| `decisions/` | seven records: measurement, decision, rejected route, limit — four headings, no prose |
 | `src/live.rs` | `wired`, the one place the loop's order and grouping are decided |
 | `src/resident.rs` | stages, the barrier mask, the kept recording |
 | `src/sand.rs` | the Margolus rule and what a cell word holds |
