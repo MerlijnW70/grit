@@ -16,6 +16,7 @@
 //!   outputs 3       how many answer bits — one if left out
 //!   apart 3         read the answers three rows apart instead of next to each other
 //!   weigh dynamic   add the answers up by sum, by the weakest of them, or by weight
+//!   slack 1         read the answer as a number and accept it within one
 //!   ladder 1        reveal one output bit at a time, widening when it is mastered
 //!   gates and or not   the gates it draws from; wire is always in
 //!   noise 16        break one gate in sixteen each generation
@@ -164,6 +165,37 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # The exam solved, once in twelve
+//!
+//! With `lean` on, being right is where the search starts rather than where it stops, and on one
+//! start in twelve that is enough. `inputs 4 / outputs 3 / apart 3 / steps 4 / state 4 / lean 1 /
+//! count` came out at 48 of 48 — every one of the sixteen inputs, all three answer bits, the host's
+//! count and the card's agreeing — in 48 gates. The state rows read 6, 4, 2 as the ones arrive, so
+//! what the search built is a counter, in an encoding nobody would have chosen.
+//!
+//! Twelve starts give 14, 14, 16, 12, 11, 14, 13, 13, 12, 14, 12, 12 inputs entirely right, which
+//! is 13.0 of 16 and one perfect. Sixteen thousand chips instead of four gives 13.6 and still one.
+//!
+//! # Embracing the error, which buys a guarantee and not a saving
+//!
+//! A score of one a bit does not care how wrong it is. `slack 1` reads both answers as binary
+//! numbers and counts an input when they are within one of each other, so the exam stops asking
+//! for right and starts asking for close. Six starts each, same grid:
+//!
+//! ```text
+//!                       entirely right   the worst it was ever out
+//!   one a bit           13.1 of 16       2.8
+//!   slack 1              5.1             1 on every start
+//!   slack 2              6.1             2 on every start
+//! ```
+//!
+//! **The bound is the thing that was bought.** A chip scored a bit at a time is right more often
+//! and, when it is wrong, is wrong by nearly three — a count of four reported as one. A chip scored
+//! within one is never once more than one out, on any input, on any start.
+//!
+//! It is a little cheaper too, and less than the usual claim: with `lean` on, 46.8 gates against
+//! 54.8, for 6.3 inputs entirely right against 13.5.
 //!
 //! # Making it work under faults, which costs more than it buys
 //!
@@ -607,6 +639,14 @@ fn smallest(kernel: &mut Kernel<U32>, a: Id, b: Id) -> Result<Id, LaneError> {
     let one = lanes.splat_id::<U32, 1>(a)?;
     let other = lanes.splat_id::<U32, 1>(b)?;
     Ok(lanes.min(one, other)?.id())
+}
+
+/// Whichever of the two is more.
+fn largest(kernel: &mut Kernel<U32>, a: Id, b: Id) -> Result<Id, LaneError> {
+    let mut lanes = kernel.lanes()?;
+    let one = lanes.splat_id::<U32, 1>(a)?;
+    let other = lanes.splat_id::<U32, 1>(b)?;
+    Ok(lanes.max(one, other)?.id())
 }
 
 /// The low `bits` of `held`: a modulo by a power of two, done in shifts.
@@ -1101,15 +1141,8 @@ fn propagate(
 /// born with. `lean` makes the score `correct × (CELLS + 1) + (CELLS − used)`: correctness still
 /// decides, and between two chips that are equally right the one with fewer gates wins. The host
 /// takes it apart again for the report.
-fn tally(
-    subgroup: u32,
-    cases: u32,
-    outputs: u32,
-    colony: u32,
-    lean: bool,
-    apart: u32,
-    weigh: u32,
-) -> Result<Vec<u32>, LaneError> {
+fn tally(subgroup: u32, cases: u32, colony: u32, exam: &Exam) -> Result<Vec<u32>, LaneError> {
+    let Exam { outputs, lean, apart, weigh, slack, .. } = *exam;
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let none = kernel.module().constant_u32(0)?;
@@ -1150,6 +1183,34 @@ fn tally(
     for &got in &apiece {
         summed = kernel.module().i_add(uint, summed, got)?;
     }
+    // **Approximate computing.** Above nought `slack` reads both answers as binary numbers and
+    // counts the case when they are within it of each other, so a chip that is never exactly right
+    // and never far wrong scores where an exact one scores nothing.
+    let mut near = kernel.module().constant_u32(0)?;
+    if slack > 0 {
+        let ceiling = kernel.module().constant_u32(slack)?;
+        for case in 0..cases {
+            let which = kernel.module().constant_u32(case)?;
+            let want = kernel.load_at(TARGET, which)?;
+            let mut says = kernel.module().constant_u32(0)?;
+            for output in 0..outputs {
+                let row = kernel.module().constant_u32(output * apart)?;
+                let at = wire(&mut kernel, chip, COLUMNS - 1, row, which, cases)?;
+                let said = kernel.load_at(WIRE, at)?;
+                let place = kernel.module().constant_u32(1 << output)?;
+                let scaled = kernel.module().i_mul(uint, said, place)?;
+                says = kernel.module().i_add(uint, says, scaled)?;
+            }
+            let wanted = low_bits(&mut kernel, want, outputs)?;
+            let over = minus(&mut kernel, says, wanted)?;
+            let under = minus(&mut kernel, wanted, says)?;
+            let gap = largest(&mut kernel, over, under)?;
+            // `min(gap, slack) == gap` is `gap <= slack`, which is the comparison the lanes have.
+            let held = smallest(&mut kernel, gap, ceiling)?;
+            let within = is(&mut kernel, held, gap)?;
+            near = kernel.module().i_add(uint, near, within)?;
+        }
+    }
     let fit = match weigh {
         // **The weakest link.** The lowest answer decides and the total only breaks ties, so a
         // change that lifts the answer nobody can do is taken even when it costs one that works.
@@ -1176,6 +1237,7 @@ fn tally(
             }
             held
         }
+        _ if slack > 0 => near,
         _ => summed,
     };
     let final_score = if lean {
@@ -1233,6 +1295,12 @@ struct Exam {
     /// **What they buy is a redistribution.** Over twelve starts `weakest` is worth +0.08 on the
     /// short answer and −0.33 on the total, and `dynamic` +0.67 and −0.58.
     weigh: u32,
+    /// How far off the answer may be and still count, as a number rather than as bits.
+    ///
+    /// **Nought is exact and is what it was.** Above nought the score is one a case instead of one
+    /// a bit: the chip's answer and the wanted answer are read as binary numbers and the case
+    /// counts when they are within this of each other.
+    slack: u32,
     /// Whether the exam is revealed one output bit at a time instead of all at once.
     ladder: bool,
     /// Which gates the search draws from. Wire is always in it, because a grid needs somewhere
@@ -1272,8 +1340,12 @@ impl Exam {
         1 << self.bits
     }
 
-    /// How many answer bits are marked, which is what a perfect score is.
+    /// How many answer bits are marked, which is what a perfect score is — or how many cases there
+    /// are, when `slack` scores a whole answer at a time instead of a bit at a time.
     fn asked(&self) -> u32 {
+        if self.slack > 0 {
+            return self.cases();
+        }
         self.ask.iter().map(|it| it.count_ones()).sum()
     }
 }
@@ -1349,6 +1421,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut apart = 1_u32;
     let mut ladder = false;
     let mut weigh = 0;
+    let mut slack = 0;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
     let mut lean = false;
@@ -1373,6 +1446,12 @@ fn read(text: &str) -> Result<Exam, String> {
                     .and_then(|it| it.parse::<u32>().ok())
                     .filter(|&it| (1..ROWS).contains(&it))
                     .ok_or_else(|| say("`apart` wants a number from one to seven"))?;
+            }
+            (Some("slack"), _) => {
+                slack = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .ok_or_else(|| say("`slack` wants a number"))?;
             }
             (Some("ladder"), _) => {
                 ladder = word.next() != Some("0");
@@ -1566,11 +1645,20 @@ fn read(text: &str) -> Result<Exam, String> {
     if weigh != 0 && outputs < 2 {
         return Err("`weigh` needs more than one answer to weigh".to_string());
     }
+    if slack != 0 && weigh != 0 {
+        return Err("`slack` scores a whole answer at a time, so there is nothing to weigh".to_string());
+    }
+    if slack != 0 && ask.iter().any(|it| it.count_ones() != outputs) {
+        return Err("`slack` reads the answer as a number, so every bit of it has to be asked for".to_string());
+    }
+    if slack >= 1 << outputs {
+        return Err(format!("`slack {slack}` is wider than the {outputs} bits of the answer"));
+    }
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, ladder, weigh, allowed, noise, lean, steps, state, colony, island,
-        seed, want, ask, name,
+        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, state, colony,
+        island, seed, want, ask, name,
     })
 }
 
@@ -1631,6 +1719,19 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
 ///
 /// **One a bit, not one a case**, so a chip right about two outputs of three scores two.
 fn scored(genome: &[u32], exam: &Exam) -> u32 {
+    if exam.slack > 0 {
+        let mask = (1 << exam.outputs) - 1;
+        return u32::try_from(
+            (0..exam.cases())
+                .filter(|&case| {
+                    let said = runs(genome, case, exam);
+                    let want = exam.want.get(case as usize).copied().unwrap_or(0) & mask;
+                    said.abs_diff(want) <= exam.slack
+                })
+                .count(),
+        )
+        .unwrap_or(0);
+    }
     (0..exam.cases())
         .map(|case| {
             let said = runs(genome, case, exam);
@@ -1644,6 +1745,27 @@ fn scored(genome: &[u32], exam: &Exam) -> u32 {
             .unwrap_or(0)
         })
         .sum()
+}
+
+/// On how many inputs every marked bit of the answer is right, and how far wrong it is when it is
+/// not.
+///
+/// **A score of one a bit does not say this.** A chip right about two bits of three on every input
+/// scores two thirds and is never once right, and one that is entirely right on two inputs in three
+/// scores the same. Where the answer is a number, how far off it is is the thing worth knowing.
+fn exactly(genome: &[u32], exam: &Exam) -> (u32, u32) {
+    let mask = (1 << exam.outputs) - 1;
+    let (mut whole, mut worst) = (0, 0);
+    for case in 0..exam.cases() {
+        let said = runs(genome, case, exam);
+        let want = exam.want.get(case as usize).copied().unwrap_or(0) & mask;
+        let ask = exam.ask.get(case as usize).copied().unwrap_or(0);
+        if said & ask == want & ask {
+            whole += 1;
+        }
+        worst = worst.max(said.abs_diff(want));
+    }
+    (whole, worst)
 }
 
 /// What the state rows hold after each step, for one input.
@@ -1848,6 +1970,7 @@ fn each(genome: &[u32], exam: &Exam) -> Vec<u32> {
 /// scoring each answer on its own before and after.
 fn pulls(genome: &[u32], exam: &Exam) -> (u32, u32, u32, u32, usize, u32, u32) {
     let was = each(genome, exam);
+    let whole = scored(genome, exam);
     let (mut trades, mut gains, mut losses, mut flat) = (0, 0, 0, 0);
     let (mut lifts, mut refused) = (0, 0);
     let weakest = (0..exam.outputs as usize)
@@ -1874,8 +1997,9 @@ fn pulls(genome: &[u32], exam: &Exam) -> (u32, u32, u32, u32, usize, u32, u32) {
             }
             if now.get(weakest) > was.get(weakest) {
                 lifts += 1;
-                let sum = |held: &[u32]| held.iter().sum::<u32>();
-                if sum(&now) < sum(&was) {
+                // **The exam's own total, not the sum of the parts**, because `slack` scores a
+                // whole answer at a time and the parts do not add up to it.
+                if scored(&tried, exam) < whole {
                     refused += 1;
                 }
             }
@@ -1995,7 +2119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             modules.push(propagate(width, column, cases, colony, exam.noise)?);
         }
     }
-    modules.push(tally(width, cases, exam.outputs, colony, exam.lean, exam.apart, exam.weigh)?);
+    modules.push(tally(width, cases, colony, &exam)?);
     let held: Vec<&[u32]> = modules.iter().map(Vec::as_slice).collect();
 
     let wires = Groups::From { binding: COUNTS as usize, at: 1 };
@@ -2244,6 +2368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
     let again = scored(genome, &exam);
+    let (whole, worst) = exactly(genome, &exam);
     // The card's own count, from the plain total under `sum` and from the answers written down
     // apart under the other two, because there the score is not a count of right answers.
     let card = if exam.weigh == 0 {
@@ -2258,6 +2383,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n  worked out on the host it gets {again} of {perfect} — the card said {card}{}",
         if again == perfect { ", and that is every case the exam asked about" } else { "" }
+    );
+    println!(
+        "  entirely right on {whole} of {} inputs, and never more than {worst} out",
+        exam.cases()
     );
     println!(
         "  {:.3} us a generation of host clock",
