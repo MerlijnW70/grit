@@ -17,6 +17,10 @@ cargo test  --release                # every claim below, checked
 
 Left button pours sand, right pours water, **WASD** flies, **F** follows the action, Escape leaves.
 
+`decisions/` holds what was decided and why, in the form `simdr` and `hyperia` use next door.
+`DR-0002` is the one to read first if you are here to trust anything below: five claims that had sat
+in comments looking like measurements, and what happened when each was finally run.
+
 ---
 
 ## What is actually being demonstrated
