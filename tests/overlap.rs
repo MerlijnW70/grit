@@ -31,6 +31,8 @@
 // A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
+use std::time::Duration;
+
 use grit::{Error, Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
@@ -266,6 +268,22 @@ fn two_answers_come_back_from_one_submission_in_the_order_they_were_asked_for() 
         (Some(FIRST + 1), Some(SECOND + 1)),
         "the two answers came back as {first:?} and {second:?}, which is not binding 0 then binding 1"
     );
+
+    // **And the blocking form of the same question**, which this file's own doc claimed to cover
+    // and did not: `staged_reading_both` is `submit_reading_both` and `wait_reading_both` in one
+    // call, and until a coverage run said so, nothing had ever entered it. The buffers are put back
+    // first, because the kernel above has already added one to each.
+    held.write(0, &[FIRST, 0]).expect("the first, again");
+    held.write(1, &[SECOND, 0]).expect("the second, again");
+    let (spent, first, second) = held
+        .staged_reading_both(&stages, (0, 1), (1, 1))
+        .expect("both answers in one call");
+    assert_eq!(
+        (first.first().copied(), second.first().copied()),
+        (Some(FIRST + 1), Some(SECOND + 1)),
+        "the blocking form answered {first:?} and {second:?}, which the submitting form did not"
+    );
+    assert!(spent > Duration::ZERO, "a submission that took no time at all");
 
     // And one answer asked for as two is refused. The frame below copies one buffer out; asking it
     // for two would otherwise hand back an empty second.
