@@ -124,6 +124,44 @@
 //! them is a larger grid with a block in it, and the sweep above already says what more area buys.
 //! The one coupling here is a chip to itself, across time.
 //!
+//! # How much memory a task needs, measured against what it should need
+//!
+//! A chip that has to answer about a sequence needs enough state to be a machine with as many
+//! states as the sequence has positions to be in. Three tasks, five starts each, and the row the
+//! answer needs against the row the arithmetic says:
+//!
+//! ```text
+//!   task                          machine   needs   0    1    2    3    4
+//!   parity, 4 steps of 1 bit     2 states     1     -    5/5  -    -    -
+//!   detect 1011, 4 steps of 1    5 states     3     0/5  0/5  1/5  5/5  5/5
+//!   detect 101101, 3 steps of 2  4 states     2     0/5  0/5  2/5  5/5  5/5
+//! ```
+//!
+//! **The arithmetic is right about the floor and one row short of reliable.** Parity is a thing that
+//! turns over, which is one bit, and one row does it every start. A four-symbol pattern is a
+//! five-state machine, which is three bits, and three rows do it every start while two do it once in
+//! five. A three-symbol pattern over a two-bit alphabet is a four-state machine, which is two bits —
+//! and two rows manage it two starts in five where three manage it every time.
+//!
+//! Nothing makes the search pack its states densely, so the floor is where it starts working and one
+//! row above is where it stops being luck.
+//!
+//! # Width and time together
+//!
+//! The last row above is both at once: six inputs cut into three steps of two, so each step is a
+//! comparison against a two-bit symbol *and* a move along the pattern. It is harder than the
+//! four-by-one that has more steps and fewer bits, and not because of the state:
+//!
+//! ```text
+//!   colony   detect 101101, state 3
+//!    4 096   1 of 5
+//!   16 384   2 of 5
+//!   65 536   5 of 5
+//! ```
+//!
+//! The colony is the lever here as it was on the flat exams, and it costs what it costs: 40 stages
+//! and 11 ms a generation at 65 536 chips against 40 stages and under a millisecond at 4 096.
+//!
 //! # Getting out of a local optimum
 //!
 //! That 15 is a trap rather than a slow start, and three levers were measured against it, eight
