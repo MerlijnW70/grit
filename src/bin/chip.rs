@@ -49,12 +49,16 @@
 //!        6      64   56
 //! ```
 //!
-//! **Parity is the hard case in evolving circuits and this does not pretend otherwise.** At six
-//! inputs four different selection schemes all stopped at 56 of 64: mutating whenever a chip is not
-//! ahead of its partner, mutating only when it lost, three gates at a time instead of one, and a
-//! partner drawn afresh every generation. The last two are in the code because they are better —
-//! one gate at a time beats three, and a partner that changes beats the chip next door — but none of
-//! them is what gets past 56.
+//! **Parity is the hard case in evolving circuits, and how hard is a lottery.** Five starts on six
+//! inputs, changing nothing but where the random grids begin, came out at 50, 52, 56, 60 and 64 of
+//! 64 — measured in `src/bin/oracle.rs`, which takes the start from its exam. So it solves six-input
+//! parity about one run in five, and the table above is one run a size rather than a ceiling.
+//!
+//! **Which means the four selection schemes tried here were compared on one run each**, reading 48
+//! to 56, and that spread sits inside the spread of the starts. It says nothing about the schemes.
+//! The two that are kept — one gate a mutation rather than three, and a partner drawn afresh rather
+//! than the chip next door — are kept on the argument for them, and the numbers that looked like
+//! evidence were not.
 //!
 //! Two of those attempts failed in ways worth keeping: mutating only what lost froze the whole
 //! colony at nought, because on the first tick no score beats any other and so nothing was ever put
