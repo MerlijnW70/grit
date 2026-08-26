@@ -232,7 +232,7 @@
 //! **It does nothing for the multiplier.** Six starts on `times` give 59.5 of 64 with it and 59.5
 //! without. Multiplying is not adding three wires together, whatever counting is.
 //!
-//! # Stretching the memory, which costs its passes and nothing else
+//! # Stretching the memory, and why its length is free
 //!
 //! `hold N` runs N further steps after the word has arrived, with the input rows at nought, so
 //! whatever the chip still knows has to be in the state rows. Six starts on the sequential counter:
@@ -247,15 +247,30 @@
 //! passes through after the last bit of the word. It is not monotone and `hold 1` is the worst of
 //! the six, which is the spread of the starts rather than anything about holding.
 //!
-//! **On most starts nothing is being held.** The report says when the state rows stop changing, and
-//! at `hold 16` eight starts give 4, 19, 3, 19, 3, 4, 19 and 3 of 20. On five of the eight the
-//! search built a latch: three ones arriving reads 9, 12, 13, 15 and then 15 for as long as it is
-//! asked to, on every one of the sixteen inputs, so that hold would hold for any length rather than
-//! for the length measured.
+//! **Because after the first empty step there is nothing left to do.** The report says when the
+//! state rows stop changing and when the answer rows do, and on eight starts at `hold 16` the two
+//! are the same step every time — 4/4, 3/3, 3/3, 3/3, 3/4, 4/4, 19/19, 3/3 of 20. There is no
+//! answer sitting parked while the state churns under it.
 //!
-//! **On the other three it does not, and holding is free anyway.** This file first read the latch
-//! off one start and wrote it down as the reason. It is not the reason: whatever the state is doing
-//! during the empty steps, the score does not notice.
+//! The report also scores the winner under holds it was never selected under, which is host
+//! arithmetic on the same genome. Bred at `hold 16`, four starts:
+//!
+//! ```text
+//!   hold           0    1    2    3    4   16   32
+//!   seed 3        28   42   42   42   42   42   42
+//!   seed 7        42   42   42   42   42   42   42
+//!   seed 11       44   44   44   44   44   44   44
+//!   seed 31       41   39   43   39   43   43   43
+//! ```
+//!
+//! **The length of a hold is worth nothing and its existence is worth up to fourteen of 48.** One
+//! empty step puts the chip on a fixed point of the blank-input map and every further step is the
+//! identity, so two, four, sixteen and thirty-two are the same exam — and nought is a different
+//! one, which start 3 loses 42 to 28 on.
+//!
+//! Start 31 is the exception that names the rule. It is the one whose state was still moving at the
+//! last step, and what it found is not a fixed point but a cycle of two: 39 at every odd hold and
+//! 43 at every even one. It was bred at sixteen.
 //!
 //! What it does cost is its passes, which are the whole of the frame: 48 passes a tick at 212.8 us
 //! on the device, 96 at 400.4 and 240 at 970.0, the lowest of three starts each.
@@ -1585,6 +1600,7 @@ fn tally(subgroup: u32, cases: u32, colony: u32, exam: &Exam) -> Result<Vec<u32>
 // ---------- the exam, which is the only thing the user writes ----------
 
 /// What the user asked for: which inputs matter and what each should answer.
+#[derive(Clone)]
 struct Exam {
     /// How many inputs, one to six.
     bits: u32,
@@ -2169,10 +2185,11 @@ fn scored(genome: &[u32], exam: &Exam) -> u32 {
 /// **A hold that costs nothing is a hold that is not being asked for anything.** If the state
 /// settles while the word is still arriving, everything after that is a latch holding a fixed
 /// point, and it would hold for any number of steps rather than for the ones that were measured.
-fn settles(genome: &[u32], exam: &Exam) -> (u32, u32) {
+fn settles(genome: &[u32], exam: &Exam, answers: bool) -> (u32, u32) {
     let (mut latest, mut never) = (0, 0);
     for case in 0..exam.cases() {
-        let seen = remembers(genome, case, exam);
+        let watched = |held: (u32, u32)| if answers { held.1 } else { held.0 };
+        let seen: Vec<u32> = remembers(genome, case, exam).into_iter().map(watched).collect();
         let last = seen.last().copied().unwrap_or(0);
         match seen.iter().rposition(|&it| it != last) {
             Some(at) if at + 1 < seen.len() => {
@@ -2214,7 +2231,7 @@ fn exactly(genome: &[u32], exam: &Exam) -> (u32, u32) {
 /// remembers is in them and nowhere else. Running an input and writing the rows down after every
 /// step is the state machine, in the encoding the search happened to pick — which is nobody's idea
 /// of a good one and is still the whole of it.
-fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<u32> {
+fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
     let fan = exam.bits / exam.steps;
     let mut last: Vec<u32> = vec![0; ROWS as usize];
     let mut seen = Vec::with_capacity(exam.steps as usize);
@@ -2261,7 +2278,12 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<u32> {
         let held = (fan..fan + exam.state)
             .filter(|&row| column.get(row as usize).copied().unwrap_or(0) == 1)
             .fold(0_u32, |bits, row| bits | (1 << (row - fan)));
-        seen.push(held);
+        // **And what the answer rows say at the same moment**, which is a different question: the
+        // state can churn under an answer that has already arrived and stopped moving.
+        let saying = (0..exam.outputs)
+            .filter(|&at| column.get((at * exam.apart) as usize).copied().unwrap_or(0) == 1)
+            .fold(0_u32, |bits, at| bits | (1 << at));
+        seen.push((held, saying));
         last = column;
     }
     seen
@@ -2844,11 +2866,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pattern: String = (0..exam.bits)
                     .map(|at| if (case >> at) & 1 == 1 { '1' } else { '0' })
                     .collect();
-                let held: Vec<String> = remembers(genome, case, &exam)
-                    .iter()
-                    .map(|it| format!("{it}"))
-                    .collect();
+                let seen = remembers(genome, case, &exam);
+                let held: Vec<String> = seen.iter().map(|it| format!("{}", it.0)).collect();
+                let says: Vec<String> = seen.iter().map(|it| format!("{}", it.1)).collect();
                 println!("    {pattern}   state {}", held.join(" -> "));
+                println!("           saying {}", says.join(" -> "));
             }
             println!();
         }
@@ -2881,16 +2903,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let again = scored(genome, &exam);
     let (whole, worst) = exactly(genome, &exam);
+    // **Is the hold a perturbation or part of the exam?** The same genome, worked out on the host
+    // under a hold it was never selected under, is what says which.
+    if exam.hold > 0 {
+        let elsewhere: Vec<String> = [0, 1, 2, 3, 4, exam.hold * 2]
+            .into_iter()
+            .filter(|it| *it != exam.hold)
+            .map(|hold| {
+                let asked = Exam { hold, ..exam.clone() };
+                format!("{} at hold {hold}", scored(genome, &asked))
+            })
+            .collect();
+        println!("  the same chip scores {}", elsewhere.join(", "));
+    }
     if exam.state > 0 {
-        let (latest, never) = settles(genome, &exam);
         let of = exam.steps + exam.hold;
-        if never == 0 {
-            println!("  the state stops changing after step {latest} of {of}, on every input");
-        } else {
-            println!(
-                "  the state stops changing after step {latest} of {of}, but never on {never} \
-                 inputs"
-            );
+        for (what, answers) in [("state", false), ("answer", true)] {
+            let (latest, never) = settles(genome, &exam, answers);
+            let but = if never == 0 {
+                "on every input".to_string()
+            } else {
+                format!("but never on {never} inputs")
+            };
+            println!("  the {what} stops changing after step {latest} of {of}, {but}");
         }
     }
     // The card's own count, from the plain total under `sum` and from the answers written down
