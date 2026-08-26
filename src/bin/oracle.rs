@@ -15,6 +15,7 @@
 //!   inputs 4        how many inputs, one to six
 //!   outputs 3       how many answer bits — one if left out
 //!   apart 3         read the answers three rows apart instead of next to each other
+//!   weigh dynamic   add the answers up by sum, by the weakest of them, or by weight
 //!   ladder 1        reveal one output bit at a time, widening when it is mastered
 //!   gates and or not   the gates it draws from; wire is always in
 //!   noise 16        break one gate in sixteen each generation
@@ -104,6 +105,32 @@
 //! 12 and 12 of 16 while the outer two sit at 14 to 16 — and of the changes that raise it, 24 of
 //! 26, 1 of 2, 1 of 1 and 1 of 1 are refused by the total, because the same change costs an outer
 //! bit. The interference is in the adding up, not in the silicon.
+//!
+//! # Three ways of adding the answers up, and what each is worth
+//!
+//! If the total refuses the repair, the thing to change is the total. `weigh` takes `sum`, which is
+//! what it was, `weakest`, where the lowest answer decides and the total only breaks ties, and
+//! `dynamic`, where the host writes a weight an answer each batch from how far behind the colony is
+//! on it. All three were run on the same twelve starts of `count`, and the card's count and the
+//! host's agree on all thirty-six.
+//!
+//! ```text
+//!               bit one       the total     against sum, start by start
+//!   sum         12.08 of 16   41.75 of 48
+//!   weakest     12.17         41.42         bit one better in 3, worse in 4, level in 5
+//!   dynamic     12.75         41.17         bit one better in 4, worse in 1, level in 7
+//! ```
+//!
+//! **`weakest` does nothing measurable.** **`dynamic` moves bits and does not make them**: two
+//! thirds of a bit onto the short answer, and rather more than half a bit off the total, which is
+//! the same bits arriving somewhere else. It is the only one of the three that ever reached 14 on
+//! bit one, and it did it twice — and on one of those starts bit *nought* came out at 10 and the
+//! short answer was a different one. The weighting moves which answer is starved.
+//!
+//! And the ceiling is not the score's to lift. Asked entirely alone — one output, one job, the
+//! whole grid and the whole colony — bit one comes out at 14, 14, 14, 14, 15, 14, 15, 14 of 16 on
+//! eight starts. It never reaches 16 with nothing else on the chip at all, and no way of adding the
+//! three up gets it past 14 with the other two there.
 //!
 //! # Making it work under faults, which costs more than it buys
 //!
@@ -481,10 +508,13 @@ const GENERATIONS: u32 = 4_000;
 const BATCH: u32 = 20;
 
 /// How many words every kernel declares.
-const BINDINGS: u32 = 9;
+const BINDINGS: u32 = 10;
 
 /// Four words: the tick and the parity.
 const PARAMS: u32 = 0;
+
+/// Where in [`PARAMS`] the per-answer weights start, after the tick and the parity.
+const WEIGHTS: u32 = 4;
 /// [`CELLS`] words a chip: what kind of gate sits in each.
 const GENE: u32 = 1;
 /// One word an input: what the answer should be. As many as the exam has inputs.
@@ -499,6 +529,12 @@ const SEED: u32 = 5;
 const CHANGED: u32 = 6;
 /// One word an input: whether the exam asks about it at all.
 const KEEP: u32 = 8;
+
+/// What each answer alone is worth, one word an answer a chip.
+///
+/// **The score is one number and the three answers behind it are not.** Anything that weighs the
+/// answers against each other has to see them apart, and so does anything that reports on one.
+const SPLIT: u32 = 9;
 
 /// Seven words: how many chips changed, then two workgroup counts of three words — one for a pass
 /// over every wire of them, one for a pass over the chips themselves.
@@ -527,6 +563,17 @@ fn minus(kernel: &mut Kernel<U32>, held: Id, off: Id) -> Result<Id, LaneError> {
     let ones = lanes.splat_bits::<U32, 1>(u32::MAX)?;
     let back = lanes.mul(take, ones)?;
     Ok(lanes.add(floored, back)?.id())
+}
+
+/// Whichever of the two is less.
+///
+/// `min` is on the lane API where subtraction is not, so this is the one comparison that needs no
+/// working around.
+fn smallest(kernel: &mut Kernel<U32>, a: Id, b: Id) -> Result<Id, LaneError> {
+    let mut lanes = kernel.lanes()?;
+    let one = lanes.splat_id::<U32, 1>(a)?;
+    let other = lanes.splat_id::<U32, 1>(b)?;
+    Ok(lanes.min(one, other)?.id())
 }
 
 /// The low `bits` of `held`: a modulo by a power of two, done in shifts.
@@ -1028,6 +1075,7 @@ fn tally(
     colony: u32,
     lean: bool,
     apart: u32,
+    weigh: u32,
 ) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -1038,13 +1086,14 @@ fn tally(
 
     // **One tap a row, down the right-hand edge.** Output nought is the top wire of the last column,
     // output one the wire under it, and so on — the same place a one-bit exam reads, extended.
-    let mut fit = kernel.module().constant_u32(0)?;
-    for case in 0..cases {
-        let which = kernel.module().constant_u32(case)?;
-        let want = kernel.load_at(TARGET, which)?;
-        let asked = kernel.load_at(KEEP, which)?;
-        for output in 0..outputs {
-            let row = kernel.module().constant_u32(output * apart)?;
+    let mut apiece = Vec::with_capacity(outputs as usize);
+    for output in 0..outputs {
+        let row = kernel.module().constant_u32(output * apart)?;
+        let mut got = kernel.module().constant_u32(0)?;
+        for case in 0..cases {
+            let which = kernel.module().constant_u32(case)?;
+            let want = kernel.load_at(TARGET, which)?;
+            let asked = kernel.load_at(KEEP, which)?;
             let at = wire(&mut kernel, chip, COLUMNS - 1, row, which, cases)?;
             let said = kernel.load_at(WIRE, at)?;
             // **Both sides carry a mask.** A bit the exam left out counts for nothing either way, on
@@ -1054,9 +1103,48 @@ fn tally(
             let marked = bit(&mut kernel, asked, output)?;
             let hit = is(&mut kernel, said, wanted)?;
             let counted = kernel.module().i_mul(uint, hit, marked)?;
-            fit = kernel.module().i_add(uint, fit, counted)?;
+            got = kernel.module().i_add(uint, got, counted)?;
         }
+        // Written down apart as well as added up, because the host reports on them one at a time.
+        let lane = kernel.module().constant_u32(outputs)?;
+        let base = kernel.module().i_mul(uint, chip, lane)?;
+        let off = kernel.module().constant_u32(output)?;
+        let where_ = kernel.module().i_add(uint, base, off)?;
+        kernel.store_at(SPLIT, where_, got)?;
+        apiece.push(got);
     }
+    let mut summed = kernel.module().constant_u32(0)?;
+    for &got in &apiece {
+        summed = kernel.module().i_add(uint, summed, got)?;
+    }
+    let fit = match weigh {
+        // **The weakest link.** The lowest answer decides and the total only breaks ties, so a
+        // change that lifts the answer nobody can do is taken even when it costs one that works.
+        1 => {
+            let mut worst = apiece.first().copied().unwrap_or(summed);
+            for &got in apiece.iter().skip(1) {
+                worst = smallest(&mut kernel, worst, got)?;
+            }
+            let span = kernel.module().constant_u32(cases * outputs + 1)?;
+            let raised = kernel.module().i_mul(uint, worst, span)?;
+            kernel.module().i_add(uint, raised, summed)?
+        }
+        // **Dynamic weighting.** The host writes a weight an answer each batch, from how far behind
+        // the colony is on it, so what the score is made of moves while the search runs.
+        2 => {
+            let mut held = kernel.module().constant_u32(0)?;
+            for (output, &got) in apiece.iter().enumerate() {
+                let at = kernel
+                    .module()
+                    .constant_u32(WEIGHTS + u32::try_from(output).unwrap_or(0))?;
+                let weight = kernel.load_at(PARAMS, at)?;
+                let scaled = kernel.module().i_mul(uint, got, weight)?;
+                held = kernel.module().i_add(uint, held, scaled)?;
+            }
+            held
+        }
+        _ => summed,
+    };
     let final_score = if lean {
         let span = kernel.module().constant_u32(CELLS)?;
         let base = kernel.module().i_mul(uint, chip, span)?;
@@ -1098,6 +1186,16 @@ struct Exam {
     /// **It is worth nothing and it is kept for saying so.** Eight starts on `count` give 41.6,
     /// 42.5 and 42.1 of 48 at one, two and three apart.
     apart: u32,
+    /// How the answers are added into one score: nought the plain total, one the weakest of them,
+    /// two a weight an answer the host rewrites each batch.
+    ///
+    /// **The total is what refuses the repair.** Of the changes that raise the short answer of
+    /// `count`, 24 of 26, 1 of 2, 1 of 1 and 1 of 1 lower the total on the four starts measured, so
+    /// the other two ask a different question of the same colony.
+    ///
+    /// **What they buy is a redistribution.** Over twelve starts `weakest` is worth +0.08 on the
+    /// short answer and −0.33 on the total, and `dynamic` +0.67 and −0.58.
+    weigh: u32,
     /// Whether the exam is revealed one output bit at a time instead of all at once.
     ladder: bool,
     /// Which gates the search draws from. Wire is always in it, because a grid needs somewhere
@@ -1213,6 +1311,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut colony = 1_u32 << 12;
     let mut apart = 1_u32;
     let mut ladder = false;
+    let mut weigh = 0;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
     let mut lean = false;
@@ -1240,6 +1339,14 @@ fn read(text: &str) -> Result<Exam, String> {
             }
             (Some("ladder"), _) => {
                 ladder = word.next() != Some("0");
+            }
+            (Some("weigh"), _) => {
+                weigh = match word.next() {
+                    Some("sum") => 0,
+                    Some("weakest") => 1,
+                    Some("dynamic") => 2,
+                    _ => return Err(say("`weigh` wants sum, weakest or dynamic")),
+                };
             }
             (Some("gates"), _) => {
                 let mut kinds = vec![0_u32];
@@ -1413,11 +1520,20 @@ fn read(text: &str) -> Result<Exam, String> {
             "{outputs} answers {apart} rows apart do not fit above the bottom row"
         ));
     }
+    if weigh != 0 && ladder {
+        return Err(
+            "`weigh` and `ladder` ask opposite things: one levels the answers, the other hides one"
+                .to_string(),
+        );
+    }
+    if weigh != 0 && outputs < 2 {
+        return Err("`weigh` needs more than one answer to weigh".to_string());
+    }
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, ladder, allowed, noise, lean, steps, state, colony, island, seed,
-        want, ask, name,
+        bits, outputs, apart, ladder, weigh, allowed, noise, lean, steps, state, colony, island,
+        seed, want, ask, name,
     })
 }
 
@@ -1842,7 +1958,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             modules.push(propagate(width, column, cases, colony, exam.noise)?);
         }
     }
-    modules.push(tally(width, cases, exam.outputs, colony, exam.lean, exam.apart)?);
+    modules.push(tally(width, cases, exam.outputs, colony, exam.lean, exam.apart, exam.weigh)?);
     let held: Vec<&[u32]> = modules.iter().map(Vec::as_slice).collect();
 
     let wires = Groups::From { binding: COUNTS as usize, at: 1 };
@@ -1866,7 +1982,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let sizes = [
-        4,
+        (WEIGHTS + exam.outputs) as usize,
         (colony * CELLS) as usize,
         cases as usize,
         ((colony + 1) * COLUMNS * ROWS * cases) as usize,
@@ -1875,6 +1991,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (colony + 1) as usize,
         7,
         cases as usize,
+        ((colony + 1) * exam.outputs) as usize,
     ];
     let mut arena = host.resident(&sizes, &held)?;
     for (binding, words) in sizes.iter().enumerate() {
@@ -1904,6 +2021,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seeds: Vec<u32> = (0..=colony).map(|_| stirred(&mut seed)).collect();
     arena.write(SEED as usize, &seeds)?;
 
+    // One each to begin with, so `dynamic` starts as the plain total and moves off it.
+    arena.write_at(PARAMS as usize, WEIGHTS as usize, &vec![1_u32; exam.outputs as usize])?;
     let batches = GENERATIONS / BATCH;
     let mut spent = Duration::ZERO;
     println!("  {:>10}  {:>5}  {:>24}  {:>10}", "generation", "best", "the colony", "us a tick");
@@ -1915,7 +2034,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ran = batch + 1;
         spent += arena.staged_frames(&groups, BATCH)?;
         let held = arena.read(SCORE as usize, colony as usize)?;
-        let scores: Vec<u32> = held.iter().map(|&it| unpack(it, exam.lean).0).collect();
+        // **What the card selects on is not always a count of right answers.** `weakest` packs the
+        // lowest answer above the total and `dynamic` multiplies each by a weight, so the number to
+        // report on is added up again here from the answers written down apart.
+        let split = if exam.weigh == 0 {
+            Vec::new()
+        } else {
+            arena.read(SPLIT as usize, (colony * exam.outputs) as usize)?
+        };
+        let scores: Vec<u32> = if exam.weigh == 0 {
+            held.iter().map(|&it| unpack(it, exam.lean).0).collect()
+        } else {
+            split.chunks(exam.outputs as usize).map(|it| it.iter().sum()).collect()
+        };
+        // **The weight is how far behind the colony is.** An answer nobody has yet is worth the most
+        // and one everybody has is worth one, so the score keeps moving towards what is missing.
+        if exam.weigh == 2 {
+            let weights: Vec<u32> = (0..exam.outputs as usize)
+                .map(|at| {
+                    let far = split
+                        .iter()
+                        .skip(at)
+                        .step_by(exam.outputs as usize)
+                        .copied()
+                        .max()
+                        .unwrap_or(0);
+                    cases + 1 - far.min(cases)
+                })
+                .collect();
+            arena.write_at(PARAMS as usize, WEIGHTS as usize, &weights)?;
+        }
         best = scores.iter().copied().max().unwrap_or(0);
         // Densely at the start, where the colony is actually moving, and thinly after.
         if batch < 8 || batch % (batches / 8).max(1) == 0 || best == perfect || batch + 1 == batches {
@@ -1955,7 +2103,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let raw = arena.read(SCORE as usize, colony as usize)?;
     let genes = arena.read(GENE as usize, (colony * CELLS) as usize)?;
-    let (winner, _) = raw.iter().enumerate().max_by_key(|&(_, s)| *s).unwrap_or((0, &0));
+    // **`dynamic`'s last score was taken in the last batch's weights**, which are nobody's idea of
+    // a ranking, so the winner is picked by working the exam out again on the host.
+    let winner = if exam.weigh == 2 {
+        (0..colony as usize)
+            .max_by_key(|&chip| {
+                let held = genes.get(chip * CELLS as usize..(chip + 1) * CELLS as usize);
+                held.map_or(0, |it| scored(it, &exam))
+            })
+            .unwrap_or(0)
+    } else {
+        raw.iter().enumerate().max_by_key(|&(_, s)| *s).map_or(0, |(at, _)| at)
+    };
     let genome = genes
         .get(winner * CELLS as usize..(winner + 1) * CELLS as usize)
         .unwrap_or(&[]);
@@ -2048,9 +2207,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
     let again = scored(genome, &exam);
+    // The card's own count, from the plain total under `sum` and from the answers written down
+    // apart under the other two, because there the score is not a count of right answers.
+    let card = if exam.weigh == 0 {
+        unpack(raw.get(winner).copied().unwrap_or(0), exam.lean).0
+    } else {
+        let split = arena.read(SPLIT as usize, (colony * exam.outputs) as usize)?;
+        split
+            .chunks(exam.outputs as usize)
+            .nth(winner)
+            .map_or(0, |it| it.iter().sum())
+    };
     println!(
-        "\n  worked out on the host it gets {again} of {perfect} — the card said {}{}",
-        unpack(raw.get(winner).copied().unwrap_or(0), exam.lean).0,
+        "\n  worked out on the host it gets {again} of {perfect} — the card said {card}{}",
         if again == perfect { ", and that is every case the exam asked about" } else { "" }
     );
     println!(
