@@ -25,6 +25,7 @@
 //!   state 2         rows wired from the last column back to the first — memory
 //!   hold 4          four more steps after the word, with nothing arriving
 //!   fold 1          read the answers off one row, one a step, instead of one row each
+//!   renew 8         after eight batches with no gain, draw the colony again but for the best
 //!   colony 65536    how many chips search at once — the way out of a local optimum
 //!   island 256      how many of them share an arena — the colony if left out
 //!   seed 1234       where the random grids start, which decides more than it looks
@@ -351,7 +352,42 @@
 //! It buys nothing on the sequential counter: twelve starts give 13.4 of 16 inputs entirely right
 //! with all seven gates against 13.0 with four, and the perfect chip came from the four.
 //!
-//! # The exam solved, once in twelve
+//! # The exam solved, eleven times in twelve
+//!
+//! A run is over long before it stops. On the sequential counter the best reaches 46 of 48 by
+//! generation 40 and does not move for the remaining 3960, so what a run is worth is one draw from
+//! the starting grids — not the four thousand generations it then spends on it.
+//!
+//! `renew N` draws the whole colony again after N batches with no improvement, and keeps the best.
+//! Two things had to be right before it kept anything:
+//!
+//! - **The scores go with the genomes.** `select` runs at the top of a frame and reads the scores
+//!   the last one left, so fresh grids carrying their predecessors' numbers were copied over the
+//!   one chip worth keeping. 46 of 48 became 42.
+//! - **One copy of the best does not survive a generation.** Every chip is a mutant of itself or
+//!   its neighbour and the best is no exception. 46 became 43 until `KEPT` copies were spread
+//!   across the colony instead of one.
+//!
+//! With both right, eight starts at 4096 chips:
+//!
+//! ```text
+//!   renew        0      2      4      8
+//!   redraws      0     85     42     20
+//!   of 16     14.3   14.7   14.8   15.0     inputs entirely right
+//!   perfect    1/8    1/8    1/8    1/8
+//! ```
+//!
+//! **It lifts the floor and not the ceiling**, and the ceiling is one input: on four starts of five
+//! the single input a near-perfect chip gets wrong is `1111`, four ones, the one input of sixteen
+//! where the count has to reach four. Which answer bit goes wrong there varies by start.
+//!
+//! The colony is what gets past it. `renew 8` at 4096, 16 384 and 65 536 chips gives 1, 2 and 7
+//! perfect chips in eight starts, and twelve starts at 65 536 give **eleven perfect and one at 15
+//! of 16** — mean 15.9 — with the host's count and the card's agreeing on all twelve.
+//!
+//! It costs 2198 us a generation of host clock at that colony against about 220 at 4096.
+//!
+//! # The one that was found first, once in twelve
 //!
 //! With `lean` on, being right is where the search starts rather than where it stops, and on one
 //! start in twelve that is enough. `inputs 4 / outputs 3 / apart 3 / steps 4 / state 4 / lean 1 /
@@ -756,6 +792,12 @@ const MUTATIONS: u32 = 1;
 const GENERATIONS: u32 = 4_000;
 /// How many go into one submission.
 const BATCH: u32 = 20;
+
+/// How many copies of the best chip a redraw spreads across the colony.
+///
+/// **One is not enough.** Every chip is a mutant of itself or its neighbour, the best included, so
+/// a single copy is gone the generation after it is made.
+const KEPT: u32 = 64;
 
 /// How many words every kernel declares.
 const BINDINGS: u32 = 11;
@@ -1596,6 +1638,13 @@ struct Exam {
     lean: u32,
     /// How many pieces the input word is cut into, one arriving a step.
     steps: u32,
+    /// After how many batches with no improvement the colony is drawn again, or nought for never.
+    ///
+    /// **A run is over long before it stops.** On the sequential counter the best reaches 46 of 48
+    /// by generation 40 and does not move for the remaining 3960, so what a run is worth is one
+    /// draw from the starting grids and not the four thousand generations it then spends.
+    /// Redrawing everything but the best turns the one draw into many without losing the best.
+    renew: u32,
     /// Whether the answers come off one row a step instead of off one row each.
     ///
     /// **Folded, the chip has to know which step it is on.** Answer `k` is whatever the top wire of
@@ -1728,6 +1777,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut slack = 0;
     let mut hold = 0;
     let mut fold = false;
+    let mut renew = 0;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
     let mut lean = 0;
@@ -1758,6 +1808,12 @@ fn read(text: &str) -> Result<Exam, String> {
                     .next()
                     .and_then(|it| it.parse::<u32>().ok())
                     .ok_or_else(|| say("`slack` wants a number"))?;
+            }
+            (Some("renew"), _) => {
+                renew = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .ok_or_else(|| say("`renew` wants a number of batches"))?;
             }
             (Some("fold"), _) => {
                 fold = word.next() != Some("0");
@@ -1992,7 +2048,8 @@ fn read(text: &str) -> Result<Exam, String> {
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, hold, fold, state,
+        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, hold, fold, renew,
+        state,
         colony, island, seed, want, ask, name,
     })
 }
@@ -2576,12 +2633,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seed = exam.seed;
     // **Drawn from what the exam allows**, or the restriction is only half a restriction: the grids
     // would start full of gates the mutation is never allowed to put back.
-    let genes: Vec<u32> = (0..colony * CELLS)
-        .map(|_| {
-            let at = stirred(&mut seed) as usize % exam.allowed.len().max(1);
-            exam.allowed.get(at).copied().unwrap_or(0)
-        })
-        .collect();
+    let draw = |seed: &mut u32| -> Vec<u32> {
+        (0..colony * CELLS)
+            .map(|_| {
+                let at = stirred(seed) as usize % exam.allowed.len().max(1);
+                exam.allowed.get(at).copied().unwrap_or(0)
+            })
+            .collect()
+    };
+    let genes = draw(&mut seed);
     arena.write(GENE as usize, &genes)?;
     let seeds: Vec<u32> = (0..=colony).map(|_| stirred(&mut seed)).collect();
     arena.write(SEED as usize, &seeds)?;
@@ -2594,6 +2654,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut best;
     let mut high = 0;
     let mut stuck = 0;
+    let mut drawn_again = 0;
     let mut ran = 0;
     for batch in 0..batches {
         ran = batch + 1;
@@ -2659,6 +2720,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             arena.write(KEEP as usize, &masked(rung))?;
             arena.write_at(PARAMS as usize, 0, &[0])?;
             println!("  {:>10}  {:>5}  rung {rung} of {}: {} bits asked", (batch + 1) * BATCH, best, exam.outputs, asked_at(rung));
+        }
+        // **A run is one draw, so draw again.** Everything but the best chip is replaced with fresh
+        // grids, which costs one write of the genome and keeps whatever the run has found.
+        if exam.renew > 0 && stuck >= exam.renew && best < perfect {
+            let genome = arena.read(GENE as usize, (colony * CELLS) as usize)?;
+            let at = scores.iter().enumerate().max_by_key(|&(_, it)| *it).map_or(0, |(at, _)| at);
+            let mut fresh = draw(&mut seed);
+            let span = CELLS as usize;
+            // **One copy of the best does not survive a generation**, because every chip is a
+            // mutant of itself or its neighbour and the best is no exception. Spreading `KEPT`
+            // copies across the colony is what makes the redraw keep anything at all.
+            let mut blank = vec![0_u32; (colony + 1) as usize];
+            let step = (colony / KEPT).max(1) as usize;
+            for slot in (0..colony as usize).step_by(step) {
+                if let (Some(was), Some(now)) = (
+                    genome.get(at * span..(at + 1) * span),
+                    fresh.get_mut(slot * span..(slot + 1) * span),
+                ) {
+                    now.copy_from_slice(was);
+                }
+                if let (Some(held), Some(now)) = (held.get(at), blank.get_mut(slot)) {
+                    *now = *held;
+                }
+            }
+            arena.write(GENE as usize, &fresh)?;
+            // **The scores have to go with the genomes.** `select` runs at the top of a frame and
+            // reads the scores the last one left, so a fresh grid carrying the number its
+            // predecessor earned would be copied over the one chip that was worth keeping.
+            arena.write(SCORE as usize, &blank)?;
+            arena.write_at(PARAMS as usize, 0, &[0])?;
+            stuck = 0;
+            drawn_again += 1;
         }
         // With `lean` on, being right is where the work starts rather than where it stops.
         if best == perfect && rung == exam.outputs && exam.lean == 0 {
@@ -2818,6 +2911,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  entirely right on {whole} of {} inputs, and never more than {worst} out",
         exam.cases()
+    );
+    println!(
+        "  the colony was drawn again {drawn_again} times",
     );
     println!(
         "  {:.3} us a generation of host clock",
