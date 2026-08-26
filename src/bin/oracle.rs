@@ -132,6 +132,39 @@
 //! eight starts. It never reaches 16 with nothing else on the chip at all, and no way of adding the
 //! three up gets it past 14 with the other two there.
 //!
+//! # Time as space, which is where the wall gives
+//!
+//! Counting four bits at once is one function of four inputs. Counting them one at a time is an
+//! increment done four times, and the grid already has both halves of that: `steps` cuts the word
+//! into pieces that arrive a step apart, and `state` wires rows from the last column back to the
+//! first. Nothing here is new code. All of it is the same twelve-by-eight grid.
+//!
+//! ```text
+//!   steps  state  apart              the total       bit one
+//!       1      0      3   at once     42.0 of 48     12.3 of 16
+//!       2      2      3               42.0           11.0
+//!       4      2      3               43.3           12.6
+//!       4      3      3               43.8           13.5
+//!       4      4      3               44.3           14.0
+//!       4      5      3               43.8           13.8
+//! ```
+//!
+//! Six starts each. **Four memory rows is where it stops helping**, and a fifth is worth less than
+//! the row it costs.
+//!
+//! **`apart` turns out to have a job after all.** The answers are read off the last column and the
+//! memory rows are wired back from the last column, so at `apart 1` two of the three answers *are*
+//! memory bits and have to be an accumulator and a result at once. On `steps 4 state 2` that is
+//! 37.0 of 48 against 42.8 with one answer shared and 43.3 with none.
+//!
+//! **And with a colony behind it the wall goes.** At `steps 4 state 4 apart 3` and 16 384 chips the
+//! total is 45.6 and bit one is 15.0 of 16 over six starts; at 65 536 it is 46.2 and 15.2 over
+//! four, with one start at 47 of 48. Bit one asked entirely alone never beat 15. Asked together
+//! with two others, one piece of the word at a time, it does better than it ever did by itself.
+//!
+//! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
+//! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
 //! # Making it work under faults, which costs more than it buys
 //!
 //! Measuring a fault afterwards says what a circuit happens to survive. `noise 32` breaks one gate
@@ -1183,8 +1216,12 @@ struct Exam {
     colony: u32,
     /// How many rows apart the answers are read. One is next to each other, which is what it was.
     ///
-    /// **It is worth nothing and it is kept for saying so.** Eight starts on `count` give 41.6,
+    /// **It is worth nothing while the chip has no memory.** Eight starts on `count` give 41.6,
     /// 42.5 and 42.1 of 48 at one, two and three apart.
+    ///
+    /// **With memory it is the difference between an answer and an accumulator.** The state rows
+    /// are wired back from the last column, which is where the answers are read, so on
+    /// `steps 4 state 2` the three spacings give 37.0, 42.8 and 43.3 of 48.
     apart: u32,
     /// How the answers are added into one score: nought the plain total, one the weakest of them,
     /// two a weight an answer the host rewrites each batch.
