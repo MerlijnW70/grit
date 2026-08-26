@@ -77,6 +77,32 @@ what stopped anybody looking for four of these.
 Where a number is given, it says what produced it. `tests/floor.rs` exists so that the ones about
 Vulkan have somewhere to come from.
 
+## The sweep, once the rule existed
+
+The five above were found by walking into them. A rule that is only applied where somebody happens
+to look is not a rule, so the source was swept for the shape — *costs nothing*, *is free*, *cheap*,
+*negligible*, *for nothing* — and every hit read.
+
+Most were noise: `free_diagonal`, `right_free`, a variable name. Of what was left:
+
+* **One was a plain error, and mine.** `sand::PATIENCE` said the cell word "uses seven of its
+  thirty-two" bits. It is eight — two of material, two of direction, one of memory, three of
+  fatigue. It had already been corrected in `DR-0004` and not in the source, which is the same
+  failure this record is about wearing different clothes.
+* **One overreached.** `crate::gate` said the gather's gate "costs nothing at all" because the count
+  it votes on was already loaded. The load is free; the vote and the branch are not, and nothing has
+  measured them. It now says that.
+* **One is the same claim as the worst of the five, about the same feature, in the same file.**
+  `Resident` declares `INDIRECT_BUFFER` on every buffer because any of them may end up holding a
+  workgroup count, and said doing so "costs nothing". It is a creation-time flag and cannot reach a
+  recorded dispatch — but it can reach `vkGetBufferMemoryRequirements`, and that has not been looked
+  at. It now says *that*, rather than either measuring it or claiming it.
+* **The rest were true in context.** `live::tally`'s "adding nought is free" is about the *value*
+  being added, and the paragraph under it already prices the instruction at one atomic a workgroup.
+
+So the sweep found one error and two overreaches, and no second `DRAW_INDIRECT`. That is the useful
+outcome either way: the five were the ones that mattered, and now it is known rather than hoped.
+
 ## The cost, stated
 
 None of the five changed a design. `compact::prepare` still exists so a workgroup count never comes

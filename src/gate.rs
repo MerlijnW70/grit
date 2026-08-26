@@ -24,7 +24,9 @@
 //!   [`crate::layout::AWAKE`], with the same countdown and the same nine-neighbour dilation, so a
 //!   block reading nought provably has no awake quad in it.
 //! * [`crate::layout::COUNTS`] — how many quads did this block contribute to the list? `gather` has
-//!   already loaded it before it needs to decide, so its gate costs nothing at all.
+//!   already loaded it before it needs to decide, so the *load* is free. The vote and the branch are
+//!   not, and nothing here has measured them: they are below what `tests/floor.rs` can see, which
+//!   prices a whole dispatch at about 224 ns.
 //!
 //! # And why a branch is allowed here when `select` is the rule everywhere else
 //!

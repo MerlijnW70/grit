@@ -200,9 +200,10 @@ pub const TIRED: u32 = HELD << 1;
 ///
 /// So **two bits is the measured minimum and three is what is here**, because what the third buys is
 /// headroom that nothing measures: a cell restarts when something stops it, and how often that
-/// happens over a basin sixty-two columns wide says little about one four thousand wide. The bit
-/// costs nothing — the word uses seven of its thirty-two — and being stopped mid-level is the
-/// failure that a picture does not show and this test does.
+/// happens over a basin sixty-two columns wide says little about one four thousand wide. The bit is
+/// there to be had — two of material, two of direction, one of memory and three of this is **eight
+/// of the word's thirty-two** — and being stopped mid-level is the failure that a picture does not
+/// show and this test does.
 pub const PATIENCE: u32 = (1 << TIRED_BITS) - 1;
 
 /// What [`running`] gives back for [`RUNNING_LEFT`]. Nought is water going nowhere.

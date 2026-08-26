@@ -322,8 +322,15 @@ impl Host {
             let usage_of = vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::TRANSFER_DST
-                // Any binding may end up holding a workgroup count. Declaring it on all of
-                // them costs nothing and saves the caller telling the allocator which.
+                // Any binding may end up holding a workgroup count, and declaring it here saves the
+                // caller telling the allocator which.
+                //
+                // **This used to say it costs nothing, and nothing has measured that.** It is a
+                // creation-time flag, so it cannot reach a recorded dispatch — what it could reach
+                // is `vkGetBufferMemoryRequirements`, in size, alignment or which memory types
+                // suit. That has not been looked at. The reason for saying so rather than assuming
+                // is thirty lines below: the same file said naming `DRAW_INDIRECT` in a barrier
+                // "costs nothing", and it cost a fifth of the frame.
                 | vk::BufferUsageFlags::INDIRECT_BUFFER;
             let near = vk::MemoryPropertyFlags::DEVICE_LOCAL
                 | vk::MemoryPropertyFlags::HOST_VISIBLE
