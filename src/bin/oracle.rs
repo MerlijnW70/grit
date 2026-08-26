@@ -43,6 +43,36 @@
 //! worked out twice, once by the card while it was evolving and once by the host afterwards from the
 //! genome alone, and the report prints both. They have to agree.
 //!
+//! # The exam is the specification, and a partial one stays partial
+//!
+//! **A circuit is judged on the bits you marked and is free on the rest**, so what you get back is
+//! the cheapest thing that fits what you said. That is not a flaw and it is not obvious, so the
+//! report prints the whole truth table of the winner — every input, not only the asked ones.
+//!
+//! Take a four-bit vocabulary where `0000` and `0001` are safe and `1110` and `1111` are dangerous,
+//! and ask only about those:
+//!
+//! ```text
+//!   000- -> 0
+//!   111- -> 1
+//! ```
+//!
+//! It scores 4 of 4 inside twenty generations, and the table shows why: the answer is bit nought,
+//! for all sixteen inputs. Every safe word begins with a nought and every dangerous one with a one,
+//! so a wire passes the exam. The six neutral words that begin with a one set off the alarm too.
+//!
+//! Scatter them so no single bit separates safe from dangerous — `1100` and `0011` safe, `1010` and
+//! `0101` dangerous — and it scores 4 of 4 again, on `xnor(a, c)`. Two of the four inputs, one gate,
+//! and `b` and `d` are not read at all. Four constraints out of sixteen leave twelve free, and the
+//! search spends none of its effort on what was not asked.
+//!
+//! Mark all sixteen — `parity`, say — and it scores 16 of 16 on a circuit that reads every input,
+//! because now there is nowhere cheaper to go.
+//!
+//! **So a circuit that answers your four questions has not learnt what they meant.** It has learnt
+//! the least thing that answers them, which is what you asked for. The truth table is where the
+//! difference shows.
+//!
 //! # What this is not
 //!
 //! # What it does, measured
@@ -1026,6 +1056,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(&[]);
     println!("\n{}", drawn(genome, exam.bits, exam.outputs));
     println!("    - wire   & and   v or   ^ xor   ! not   (<- marks an answer wire)");
+    // **What it does with everything, not only what was asked.** A circuit is judged on the marked
+    // bits and is free on the rest, so the table below is the difference between the exam and the
+    // answer — and it is where an encoding that collapses to one wire shows itself.
+    if cases <= 16 {
+        println!("  every input, and what it answers:");
+        for case in 0..cases {
+            let pattern: String = (0..exam.bits)
+                .map(|at| if (case >> at) & 1 == 1 { '1' } else { '0' })
+                .collect();
+            let said = runs(genome, case, exam.outputs);
+            let ask = exam.ask.get(case as usize).copied().unwrap_or(0);
+            let want = exam.want.get(case as usize).copied().unwrap_or(0);
+            let says: String = (0..exam.outputs)
+                .map(|at| if (said >> at) & 1 == 1 { '1' } else { '0' })
+                .collect();
+            let asked: String = (0..exam.outputs)
+                .map(|at| {
+                    if (ask >> at) & 1 == 0 {
+                        '-'
+                    } else if (want >> at) & 1 == 1 {
+                        '1'
+                    } else {
+                        '0'
+                    }
+                })
+                .collect();
+            let mark = if ask == 0 { "not asked" } else { "" };
+            println!("    {pattern} -> {says}   exam said {asked}  {mark}");
+        }
+        println!();
+    }
     let again = scored(genome, &exam);
     println!(
         "\n  worked out on the host it gets {again} of {perfect} — the card said {}{}",
