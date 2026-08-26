@@ -20,7 +20,7 @@
 //!   ladder 1        reveal one output bit at a time, widening when it is mastered
 //!   gates and or maj   the gates it draws from; wire is always in
 //!   noise 16        break one gate in sixteen each generation
-//!   lean 1          among equally right chips, prefer the one with fewer gates
+//!   lean wires      among equally right chips prefer the cheaper: 1 by gates, wires by wires
 //!   steps 4         cut the word into four, one piece a step — time
 //!   state 2         rows wired from the last column back to the first — memory
 //!   colony 65536    how many chips search at once — the way out of a local optimum
@@ -166,6 +166,30 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # The price of the third wire, which is nothing on the card and something in silicon
+//!
+//! A gate that reads three wires is more expensive than one that reads two, everywhere except
+//! here. `propagate` works out every arm for every cell of every chip and then picks one, so the
+//! arms are the cheap part and the three loads and the store are not.
+//!
+//! Restricting the kit now stops the forbidden arms being emitted at all, and it makes no
+//! difference that can be measured. `gates and` against all six, the lowest device figure of five
+//! starts each: 201.42 us a generation against 201.05. The widest kit is not the slower one.
+//!
+//! So if the third wire is to cost anything the exam has to charge for it. `lean wires` prices a
+//! gate at the number of wires it reads — nought for a wire, one for `not`, two for `and`, `or` and
+//! `xor`, three for `maj` and `mux` — where `lean 1` charges one for any gate at all. Six starts on
+//! the sequential counter with all seven gates in the kit:
+//!
+//! ```text
+//!                 wires read   three-wire gates   inputs entirely right
+//!   lean 1        153.0        24.3               13.6 of 16
+//!   lean wires    144.5        20.8               13.6
+//! ```
+//!
+//! **Both are down on every one of the six starts and correctness does not move.** The wiring comes
+//! in about six per cent cheaper and the three-wire gates about fourteen, for nothing.
 //!
 //! # Growing a multiplier, which comes out three quarters right
 //!
@@ -1115,6 +1139,7 @@ fn propagate(
     cases: u32,
     colony: u32,
     noise: u32,
+    allowed: &[u32],
 ) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -1154,13 +1179,22 @@ fn propagate(
     let inverted = minus(&mut kernel, one, straight)?;
     // **The two that read three wires.** Everything above is a gate of the wire above and the wire
     // below; these two also read the wire straight ahead, which was only ever a thing to invert.
-    let most = {
+    // **A gate the exam forbids is not emitted at all.** Every arm here is worked out for every
+    // cell of every chip whether the genome asks for it or not, so an arm nothing can select is
+    // the whole grid's time spent on nothing.
+    let most = if allowed.contains(&5) {
         let with_a = smallest(&mut kernel, a, straight)?;
         let with_b = smallest(&mut kernel, b, straight)?;
         let either_with = largest(&mut kernel, with_a, with_b)?;
-        largest(&mut kernel, both, either_with)?
+        Some(largest(&mut kernel, both, either_with)?)
+    } else {
+        None
     };
-    let chosen = pick(&mut kernel, straight, a, b)?;
+    let chosen = if allowed.contains(&6) {
+        Some(pick(&mut kernel, straight, a, b)?)
+    } else {
+        None
+    };
 
     let span = kernel.module().constant_u32(CELLS)?;
     let mine_at = kernel.module().i_mul(uint, chip, span)?;
@@ -1170,7 +1204,11 @@ fn propagate(
     let kind = kernel.load_at(GENE, gene_at)?;
 
     let mut answer = straight;
-    for (number, value) in [(1, both), (2, either), (3, odd), (4, inverted), (5, most), (6, chosen)] {
+    let arms = [(1, Some(both)), (2, Some(either)), (3, Some(odd)), (4, Some(inverted)), (5, most),
+        (6, chosen)];
+    for (number, value) in arms.into_iter().filter_map(|(at, held)| {
+        held.filter(|_| allowed.contains(&at)).map(|held| (at, held))
+    }) {
         let want = kernel.module().constant_u32(number)?;
         let hit = is(&mut kernel, kind, want)?;
         answer = pick(&mut kernel, hit, value, answer)?;
@@ -1314,19 +1352,40 @@ fn tally(subgroup: u32, cases: u32, colony: u32, exam: &Exam) -> Result<Vec<u32>
         _ if slack > 0 => near,
         _ => summed,
     };
-    let final_score = if lean {
+    let final_score = if lean > 0 {
+        let budget = if lean == 2 { CELLS * price(5) } else { CELLS };
         let span = kernel.module().constant_u32(CELLS)?;
         let base = kernel.module().i_mul(uint, chip, span)?;
-        let mut spare = kernel.module().constant_u32(0)?;
+        let one_ = kernel.module().constant_u32(1)?;
+        let three = kernel.module().constant_u32(price(5))?;
+        let five = kernel.module().constant_u32(5)?;
+        let two = kernel.module().constant_u32(2)?;
+        let mut spent = kernel.module().constant_u32(0)?;
         for cell in 0..CELLS {
             let off = kernel.module().constant_u32(cell)?;
             let at = kernel.module().i_add(uint, base, off)?;
             let kind = kernel.load_at(GENE, at)?;
             // A wire is not a gate, so it is what is left over rather than what is spent.
-            let idle = is(&mut kernel, kind, none)?;
-            spare = kernel.module().i_add(uint, spare, idle)?;
+            let held = smallest(&mut kernel, kind, one_)?;
+            let a_gate = is(&mut kernel, held, one_)?;
+            let cost = if lean == 2 {
+                // Two wires for `and`, `or` and `xor`, one for `not`, three for `maj` and `mux`.
+                let capped = smallest(&mut kernel, kind, three)?;
+                let low = is(&mut kernel, capped, kind)?;
+                let second = kernel.module().i_mul(uint, a_gate, low)?;
+                let far = smallest(&mut kernel, kind, five)?;
+                let wide = is(&mut kernel, far, five)?;
+                let third = kernel.module().i_mul(uint, wide, two)?;
+                let held = kernel.module().i_add(uint, a_gate, second)?;
+                kernel.module().i_add(uint, held, third)?
+            } else {
+                a_gate
+            };
+            spent = kernel.module().i_add(uint, spent, cost)?;
         }
-        let weight = kernel.module().constant_u32(CELLS + 1)?;
+        let ceiling = kernel.module().constant_u32(budget)?;
+        let spare = minus(&mut kernel, ceiling, spent)?;
+        let weight = kernel.module().constant_u32(budget + 1)?;
         let scaled = kernel.module().i_mul(uint, fit, weight)?;
         kernel.module().i_add(uint, scaled, spare)?
     } else {
@@ -1382,8 +1441,14 @@ struct Exam {
     allowed: Vec<u32>,
     /// One gate in this many is broken each generation, or nought for none. A power of two.
     noise: u32,
-    /// Whether a chip with fewer gates beats an equally correct one with more.
-    lean: bool,
+    /// What a chip is charged for, among equally correct ones: nought nothing, one a gate a gate,
+    /// two a wire a wire.
+    ///
+    /// **A three-wire gate is free on the card and it is not free in silicon.** One gate in the kit
+    /// and six give the same floor, 201.42 against 201.05 us a generation on the device, because
+    /// the pass is bound by the three loads and the store and not by which arm it picks. Charging
+    /// by wires is the only place the difference can be made to exist.
+    lean: u32,
     /// How many pieces the input word is cut into, one arriving a step.
     steps: u32,
     /// How many rows are wired from the last column back to the first, which is all the memory there
@@ -1409,6 +1474,15 @@ struct Exam {
 }
 
 impl Exam {
+    /// The most a chip can be charged, which is what the score is packed above.
+    fn budget(&self) -> u32 {
+        match self.lean {
+            0 => 0,
+            2 => CELLS * price(5),
+            _ => CELLS,
+        }
+    }
+
     /// How many inputs there are altogether.
     fn cases(&self) -> u32 {
         1 << self.bits
@@ -1498,7 +1572,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut slack = 0;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
-    let mut lean = false;
+    let mut lean = 0;
     let mut steps = 1_u32;
     let mut state = 0_u32;
     let mut island = None;
@@ -1568,7 +1642,11 @@ fn read(text: &str) -> Result<Exam, String> {
                     .ok_or_else(|| say("`noise` wants nought or a power of two"))?;
             }
             (Some("lean"), _) => {
-                lean = word.next() != Some("0");
+                lean = match word.next() {
+                    Some("0") => 0,
+                    Some("wires") => 2,
+                    _ => 1,
+                };
             }
             (Some("steps"), _) => {
                 steps = word
@@ -1917,12 +1995,19 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<u32> {
 ///
 /// With `lean` off a score is the answer bits and nothing else. With it on the gates are packed
 /// underneath, low enough that being right always outranks being small.
-fn unpack(score: u32, lean: bool) -> (u32, u32) {
-    if lean {
-        (score / (CELLS + 1), CELLS - (score % (CELLS + 1)))
+fn unpack(score: u32, budget: u32) -> (u32, u32) {
+    if budget > 0 {
+        (score / (budget + 1), budget - (score % (budget + 1)))
     } else {
         (score, 0)
     }
+}
+
+/// What a gate of this kind costs, which is how many wires it reads.
+///
+/// **A wire is not a gate**, so it is free, and the two that read three cost three.
+fn price(kind: u32) -> u32 {
+    u32::try_from(reads(kind, 0).len()).unwrap_or(0) * u32::from(kind != 0)
 }
 
 /// Which wires of the column before a gate of this kind reads.
@@ -2216,7 +2301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for step in 0..exam.steps {
         modules.push(feed(width, cases, colony, step, fan, exam.state, step == 0)?);
         for column in 1..COLUMNS {
-            modules.push(propagate(width, column, cases, colony, exam.noise)?);
+            modules.push(propagate(width, column, cases, colony, exam.noise, &exam.allowed)?);
         }
     }
     modules.push(tally(width, cases, colony, &exam)?);
@@ -2304,7 +2389,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             arena.read(SPLIT as usize, (colony * exam.outputs) as usize)?
         };
         let scores: Vec<u32> = if exam.weigh == 0 {
-            held.iter().map(|&it| unpack(it, exam.lean).0).collect()
+            held.iter().map(|&it| unpack(it, exam.budget()).0).collect()
         } else {
             split.chunks(exam.outputs as usize).map(|it| it.iter().sum()).collect()
         };
@@ -2357,7 +2442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {:>10}  {:>5}  rung {rung} of {}: {} bits asked", (batch + 1) * BATCH, best, exam.outputs, asked_at(rung));
         }
         // With `lean` on, being right is where the work starts rather than where it stops.
-        if best == perfect && rung == exam.outputs && !exam.lean {
+        if best == perfect && rung == exam.outputs && exam.lean == 0 {
             break;
         }
     }
@@ -2415,8 +2500,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
     let (live_gates, survived, whole) = faults(genome, &exam);
+    let wide = alive
+        .iter()
+        .enumerate()
+        .filter(|&(cell, &it)| it && price(genome.get(cell).copied().unwrap_or(0)) == price(5))
+        .count();
+    let wires: u32 = alive
+        .iter()
+        .enumerate()
+        .filter(|&(_, &it)| it)
+        .map(|(cell, _)| price(genome.get(cell).copied().unwrap_or(0)))
+        .sum();
     println!(
-        "\n  {live_gates} of {CELLS} gates carry the answer; the rest are scenery."
+        "\n  {live_gates} of {CELLS} gates carry the answer and read {wires} wires, {wide} of\
+         them three at a time; the rest\
+         are scenery."
     );
     println!(
         "  Breaking one live gate into a wire: {} of {live_gates} faults change nothing, {} cost the answer.",
@@ -2474,7 +2572,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The card's own count, from the plain total under `sum` and from the answers written down
     // apart under the other two, because there the score is not a count of right answers.
     let card = if exam.weigh == 0 {
-        unpack(raw.get(winner).copied().unwrap_or(0), exam.lean).0
+        unpack(raw.get(winner).copied().unwrap_or(0), exam.budget()).0
     } else {
         let split = arena.read(SPLIT as usize, (colony * exam.outputs) as usize)?;
         split
