@@ -16,9 +16,10 @@
 //!
 //! Not always, and the condition is a number rather than a judgement. A list makes a pass run over
 //! fewer things; it does not make any one of them shorter. So it buys time where a pass is many
-//! short independent steps and the device was full of them, and it buys almost nothing where the
-//! cost is the length of one chain of dependent steps — `decisions/DR-0009` puts that at 0 to 9% of
-//! the time for 56 to 69% of the work taken away, on a pass that was 96% of what it sat in.
+//! short independent steps and the device was full of them, and almost nothing where the cost is the
+//! length of one chain of dependent steps. `decisions/DR-0009` has both sides: 44% of the work for
+//! 47 to 49% of the time where an invocation is a few loads and a store, and 31 to 69% of the work
+//! for 98 to 100% of it where an invocation is a carried loop over a thousand connections.
 //!
 //! The sand is the first case. A quad's step is short, it waits on nothing, and there are millions
 //! of them, so cutting their number cuts the time — which is what `src/bin/scale.rs` measures and
