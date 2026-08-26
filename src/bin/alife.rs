@@ -7,63 +7,69 @@
 //! time. Put those together and the *shape* of a frame can be decided on the card: a command buffer
 //! holding every instruction there is, of which the device picks the few that run.
 //!
-//! So this is an instruction set of fifteen kernels and a colony of programs written in them. Each
-//! organism holds sixteen instruction numbers — that is its whole genome — and every tick it appends
-//! its own index to the list belonging to the instruction it is on. One pass turns the fifteen list
-//! lengths into fifteen workgroup counts. Fifteen kernels are then dispatched over those lists, and
-//! the ones nobody chose cost 47 ns each.
+//! So this is an instruction set of twenty-eight kernels and a colony of programs written in them.
+//! Each organism holds thirty-two instruction numbers — that is its whole genome — and every tick it
+//! appends its own index to the list belonging to the instruction it is on. One pass turns the
+//! twenty-eight list lengths into twenty-eight workgroup counts. Twenty-eight kernels are then
+//! dispatched over those lists, and the ones nobody chose cost 47 ns.
 //!
 //! **The host never learns which instruction anything chose.** It submits one recorded command
-//! buffer over and over and asks for a number eleven times in twenty thousand generations, so that
-//! the numbers can be seen to exist. What changes between submissions is what the buffers hold.
+//! buffer over and over and asks for a number eleven times in five hundred generations, so that the
+//! numbers can be seen to exist. What changes between submissions is what the buffers hold.
 //!
 //! # The task, and why this one
 //!
-//! Sort six numbers. The fifteen instructions are the fifteen compare-exchanges on six elements —
-//! `swap(0,1)`, `swap(0,2)` … `swap(4,5)` — one kernel apiece, generated rather than written, which
-//! is what `simdr` being an emitter rather than a language buys.
+//! Sort eight numbers. The twenty-eight instructions are the twenty-eight compare-exchanges on eight
+//! elements — `swap(0,1)`, `swap(0,2)` … `swap(6,7)` — one kernel apiece, **generated rather than
+//! written**, which is what `simdr` being an emitter rather than a language buys: the instruction
+//! set is a `for` loop in Rust.
 //!
-//! **Six is chosen because the answer is checkable.** A comparator network sorts everything if and
-//! only if it sorts every input of noughts and ones, of which there are sixty-four; so fitness here
-//! is not a sample and not luck, and 320 — five adjacent pairs over sixty-four inputs — means a
-//! sorting network. The host then checks the winner a second way, over all 720 orderings of six
-//! distinct numbers, and the two answers have to agree.
+//! **The answer is checkable, which is the point.** A comparator network sorts everything if and
+//! only if it sorts every input of noughts and ones, of which there are 256; so fitness here is not
+//! a sample and not luck, and 1792 — seven adjacent pairs over 256 inputs — means a sorting network.
+//! The host then checks the winner a second way, over all 40 320 orderings of eight distinct
+//! numbers, and the two answers have to agree.
 //!
 //! # What it does, measured
 //!
-//! It finds one. Twenty thousand generations of four thousand organisms takes about seventy
-//! milliseconds of host clock, and the genome that comes out sorts 720 of 720. **It does not find
-//! the shortest one**: twelve comparators is the proved minimum on six elements, the genome here has
-//! room for sixteen, and at twelve the colony stalls two points short of 320 — those networks are
-//! rare enough in 15¹² that a local search from a random start does not reach them.
+//! It finds one. Five hundred generations of sixteen thousand organisms is about five seconds of
+//! card time, and the genome that comes out sorts 40 320 of 40 320. **It does not find the shortest
+//! one**: nineteen comparators is the proved minimum on eight elements, the genome here has room for
+//! thirty-two, and a local search from a random start does not reach nineteen. At six elements and a
+//! genome of twelve — also the proved minimum there — it stalls two points short of a perfect score.
 //!
 //! # What the tick costs, and what does not scale
 //!
-//! A tick is twenty-one passes in six stages. Two barriers are wide, because two passes write
+//! A tick is thirty-four passes in six stages. Two barriers are wide, because two passes write
 //! workgroup counts, and `tests/floor.rs` prices those at 2373–2401 ns against 1097–1098 for the
-//! other four.
+//! other four. On an RTX 4080 at subgroup 32, on the device clock:
 //!
 //! ```text
 //!   colony    a tick
-//!     1024   20.3 µs
-//!     4096   32.6 µs
-//!    16384   89.4 µs
+//!     4 096   96.7 µs
+//!     8 192  170.4 µs
+//!    16 384  330.4 µs
+//!    32 768  735.9 µs
 //! ```
 //!
-//! **The scheduling is flat and the work is not.** A line through those three puts about 16 µs on
-//! the arrangement — the barriers, the twenty-one dispatches, the fifteen lists — and 4.5 ns on each
-//! organism, because a comparator moves sixty-four words for every one of them. Sixteen times the
-//! colony costs four and a half times the tick.
+//! **The scheduling is flat and the work is not.** Doubling the colony doubles the tick, and past
+//! sixteen thousand it more than doubles: an organism carries 8 × 256 words, so thirty-two thousand
+//! of them is 268 MB of working set and the card is moving memory rather than deciding anything. The
+//! whole arrangement — six barriers, thirty-four dispatches, twenty-eight lists — is a few
+//! microseconds of that.
 //!
-//! That is worth saying plainly, because it is not what the sand shows. There, the frame is flat
+//! That is worth saying plainly, because it is not what the sand shows. There the frame is flat
 //! because the *work* is proportional to what moves rather than to what exists. Here every organism
-//! works every tick, so only the half of the cost that is Vulkan stays still.
+//! works every tick, so only the part of the cost that is Vulkan stays still.
 //!
 //! # What it is not
 //!
 //! It appends with an atomic rather than a prefix sum, which is the thing `crate::compact` exists to
 //! avoid. One atomic an organism against one scan a block is the trade `src/sweep.rs` argues, and
 //! for showing who decides a workgroup count the atomic is the shortest road.
+//!
+//! Most of the wall clock is neither: twenty-eight kernels of 256 unrolled compare-exchanges are a
+//! lot of SPIR-V, and building them takes longer than running five hundred generations does.
 //!
 //! Nothing else in the repository refers to this file. `rm src/bin/alife.rs` removes it whole.
 
@@ -75,7 +81,7 @@ use simdr::lanes::{LaneError, U32};
 use simdr::module::Id;
 
 /// How many numbers an organism sorts.
-const VALUES: u32 = 6;
+const VALUES: u32 = 8;
 
 /// How many inputs every organism is tested on at once.
 ///
@@ -93,18 +99,36 @@ const INPUTS: u32 = 1 << VALUES;
 /// The most a genome can score: every adjacent pair in order, on every input.
 const PERFECT: u32 = (VALUES - 1) * INPUTS;
 
+/// How many bits the mutation draws from, which has to cover both a place in the genome and an
+/// instruction to put there.
+const SPREAD: u32 = {
+    let most = if GENOME > INSTRUCTIONS { GENOME } else { INSTRUCTIONS };
+    most.next_power_of_two().trailing_zeros()
+};
+
+/// How many orderings of [`VALUES`] distinct numbers the host checks the winner against.
+const ORDERINGS: u32 = {
+    let mut all = 1;
+    let mut at = 2;
+    while at <= VALUES {
+        all *= at;
+        at += 1;
+    }
+    all
+};
+
 /// How many compare-exchanges there are on [`VALUES`] elements, and so how many instructions.
 const INSTRUCTIONS: u32 = VALUES * (VALUES - 1) / 2;
 
 /// How many instructions a genome holds.
 ///
-/// **Four more than it needs.** Twelve comparators is the proved shortest network on six elements,
-/// and at twelve this colony stalls at 318 of 320: those genomes are too rare in 15¹² for a local
-/// search to land on one. Sixteen is enough room to find a network at all.
-const GENOME: u32 = 16;
+/// **Well over what a network needs.** Nineteen comparators is the proved shortest on eight
+/// elements and twelve on six, and at those lengths this search does not arrive: at six and twelve
+/// it stalls at 318 of 320. Room to be wasteful is what makes finding a network at all possible.
+const GENOME: u32 = 32;
 
 /// How many organisms the colony holds. A power of two: the wrap is a shift.
-const COLONY: u32 = 1 << 12;
+const COLONY: u32 = 1 << 14;
 
 /// How many words every kernel declares.
 const BINDINGS: u32 = 8;
@@ -134,7 +158,7 @@ const SCORE_AT: u32 = RESET_AT + 3;
 const SELECT_AT: u32 = SCORE_AT + 3;
 
 /// How many generations to run.
-const GENERATIONS: u32 = 20_000;
+const GENERATIONS: u32 = 500;
 
 /// How many ticks go into one submission. A whole number of generations, so a batch never lands
 /// halfway through one.
@@ -511,10 +535,10 @@ fn choose(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 
     let seed = kernel.load_at(SEED, who)?;
     let spun = stir(&mut kernel, seed)?;
-    let picked = low_bits(&mut kernel, spun, 4)?;
+    let picked = low_bits(&mut kernel, spun, SPREAD)?;
     let spot = at_most(&mut kernel, picked, GENOME - 1)?;
     let again = stir(&mut kernel, spun)?;
-    let drawn = low_bits(&mut kernel, again, 4)?;
+    let drawn = low_bits(&mut kernel, again, SPREAD)?;
     let fresh = at_most(&mut kernel, drawn, INSTRUCTIONS - 1)?;
 
     let span = kernel.module().constant_u32(GENOME)?;
@@ -598,7 +622,7 @@ fn zero_one(genome: &[u32], wiring: &[(u32, u32)]) -> u32 {
     ordered
 }
 
-/// How many of the 720 orderings of six distinct numbers this genome sorts.
+/// How many of the [`ORDERINGS`] orderings of distinct numbers this genome sorts.
 ///
 /// **This is the check the whole thing is for.** Fitness on the card is one puzzle a generation, so
 /// a genome can be lucky; a network either sorts every permutation or it is not a sorting network.
@@ -752,18 +776,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         zero_one(genome, &wiring)
     );
     println!(
-        "\n  it sorts {all} of 720 orderings — {}",
-        if all == 720 {
-            "a sorting network. The shortest on six elements is twelve comparators, and this is not
-  that: the genome has room for sixteen and a colony this size does not find the twelve"
+        "\n  it sorts {all} of {ORDERINGS} orderings — {}",
+        if all == ORDERINGS {
+            "a sorting network"
         } else {
             "not a sorting network"
         }
     );
+    // `staged_frames` divides by the frames in the submission, so this is already a tick.
     println!(
-        "  {batches} submissions, {:.1?} of host clock, {:.3} us a tick",
-        spent,
-        spent.as_secs_f64() * 1e6 / f64::from(batches * BATCH)
+        "  {GENOME} comparators, against the {} a network on {VALUES} elements needs at least",
+        if VALUES == 6 { "twelve" } else { "nineteen" }
+    );
+    println!(
+        "  {batches} submissions, {:.3} us a tick of host clock",
+        spent.as_secs_f64() * 1e6 / f64::from(batches)
     );
     Ok(())
 }
