@@ -125,6 +125,8 @@ Each is aimed at a failure that a convincing picture survives.
 | `tally.rs` | the reduction says what a count done by hand says |
 | `dispatch.rs` | a stage's workgroup count is read by the next, and a frame is recorded once |
 | `floor.rs` | a submission costs more than a frame in it, and a barrier more than a dispatch |
+| `coarse.rs` | the coarse hierarchy is worth its cost above `COARSE_FROM` blocks and not below |
+| `saying.rs` | every refusal carries the numbers it holds |
 | `direct.rs`, `overlap.rs`, `waiting.rs`, `wedged.rs` | the host layer: direct writes, tickets, the fence bound |
 
 `live.rs` is the one that matters. A host reference for a wake set would derive it from the same rule

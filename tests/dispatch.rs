@@ -13,7 +13,9 @@
 // A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::{Error, Groups, Host};
+use std::time::Duration;
+
+use grit::{Error, Groups, Host, Run};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -414,5 +416,135 @@ fn a_pattern_matching_nothing_names_the_devices_that_are_here() {
         "{} reports subgroup {}, which no kernel here has an arm for",
         taken.name(),
         taken.width()
+    );
+}
+
+/// What a resident holds, and what its transfers cost.
+///
+/// **A coverage run found these four reachable from outside and called by nothing**, which reading
+/// the suite did not: `bindings`, `passes`, `pushing` and `copying` each return a field, and a
+/// getter naming the wrong one is a plausible bug that no amount of frame timing would show.
+#[test]
+fn a_resident_says_what_it_holds_and_what_its_transfers_cost() {
+    let Some(host) = device("counters") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).expect("a kernel");
+    let mut held = host
+        .resident(&[4, 8], &[&module, &module])
+        .expect("a device buffer");
+
+    assert_eq!(held.bindings(), 2, "two sizes were asked for");
+    assert_eq!(held.passes(), 2, "two modules were asked for");
+    assert_eq!(
+        held.pushing(),
+        (Duration::ZERO, 0, 0),
+        "nothing has been written and the counter says otherwise"
+    );
+    assert_eq!(
+        held.copying(),
+        (Duration::ZERO, 0),
+        "nothing has been read and the counter says otherwise"
+    );
+
+    held.write(0, &[7]).expect("a write");
+    let (spent, writes, straight) = held.pushing();
+    assert_eq!(writes, 1, "one write went in and the counter says {writes}");
+    assert!(spent > Duration::ZERO, "a write that took no time at all");
+    assert!(
+        straight <= writes,
+        "{straight} writes went straight into device memory out of {writes} that went in at all"
+    );
+
+    assert_eq!(held.read(0, 1).expect("a read"), vec![7]);
+    let (spent, reads) = held.copying();
+    assert_eq!(reads, 1, "one read came back and the counter says {reads}");
+    assert!(spent > Duration::ZERO, "a read that took no time at all");
+}
+
+/// [`Resident::frames`] runs the passes that many times in one submission.
+///
+/// The kernel adds one to a word, so the word afterwards **is** the frame count. That is the whole
+/// check: a submission that ran the passes once and returned a fifth of the time would pass a
+/// timing assertion and fail this one.
+#[test]
+fn a_frame_asked_for_five_times_runs_five_times() {
+    let Some(host) = device("frames") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).expect("a kernel");
+    let mut held = host.resident(&[4], &[&module]).expect("a device buffer");
+    held.write(0, &[0]).expect("a write");
+
+    let each = held.frames(&[Groups::Fixed(1)], 5).expect("five frames");
+    assert_eq!(
+        held.read(0, 1).expect("a read"),
+        vec![5],
+        "five frames of a kernel that adds one did not add five"
+    );
+    assert!(each > Duration::ZERO, "five frames took no time at all");
+}
+
+/// [`Resident::write_many`] puts scattered runs in through one submission — or none of them.
+///
+/// **The second half is the point.** Every run is checked before anything is copied, so a call
+/// holding one bad run leaves the staging buffer alone and the caller certain nothing landed. A
+/// version that copied as it went would pass the first half of this test and fail the last line.
+#[test]
+fn many_runs_go_in_together_and_a_refused_call_puts_nothing_in() {
+    let Some(host) = device("write_many") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).expect("a kernel");
+    let mut held = host
+        .resident(&[4, 4], &[&module])
+        .expect("a device buffer");
+
+    held.write_many(&[
+        Run {
+            index: 0,
+            at: 0,
+            words: &[11],
+        },
+        Run {
+            index: 1,
+            at: 1,
+            words: &[22],
+        },
+    ])
+    .expect("two runs");
+    assert_eq!(held.read(0, 1).expect("a read"), vec![11]);
+    assert_eq!(
+        held.read(1, 2).expect("a read"),
+        vec![0, 22],
+        "the second run went in at the wrong offset"
+    );
+
+    // A run past the end of its binding, with a good one beside it.
+    let refused = held.write_many(&[
+        Run {
+            index: 0,
+            at: 0,
+            words: &[99],
+        },
+        Run {
+            index: 1,
+            at: 100,
+            words: &[99],
+        },
+    ]);
+    match refused {
+        Err(Error::Overrun { index, .. }) => {
+            assert_eq!(index, 1, "the wrong binding was named as overrun");
+        }
+        other => panic!("a run past the end of a binding was not refused: {other:?}"),
+    }
+    assert_eq!(
+        held.read(0, 1).expect("a read"),
+        vec![11],
+        "the good run in a refused call landed anyway, so the check is not before the copy"
     );
 }

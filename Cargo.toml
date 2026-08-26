@@ -23,6 +23,11 @@ ash = "0.38"
 #   grit = { path = "../grit", default-features = false }
 minifb = { version = "0.28", default-features = false, optional = true }
 
+[dev-dependencies]
+# The same version the crate already links. `tests/saying.rs` needs it to build the two `Error`
+# variants that wrap a Vulkan type, which nothing else can reach without a device that fails.
+ash = "0.38"
+
 [features]
 default = ["window"]
 # What `pour` and `spike` need. `required-features` on both binaries is what stops them being built

@@ -218,8 +218,9 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
     //
     // It does not catch everything. Setting five passes to `Groups::Fixed(0)` left `listed` at 768
     // and was still a different program — without those passes the hot-block list is never rebuilt
-    // and three passes fall back to a workgroup a block, which changes how many workgroups run and
-    // not how many quads are listed. `decisions/DR-0001`.
+    // and three passes go on reading a stale one. That is *not* what `live::arranged(.., false)`
+    // does: that switches those three to `Over::Every` as well, which `tests/live.rs` proves is the
+    // same program cell for cell. `decisions/DR-0001`.
     let listed = listed_total / asked.max(1);
     let share = f64::from(quads) / (listed.max(1) as f64);
     println!(

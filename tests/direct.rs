@@ -121,3 +121,52 @@ fn the_staging_buffer_is_cached_where_the_device_has_cached_memory() {
         if held.cached() { "cached" } else { "write-combined" }
     );
 }
+
+/// [`Host::resident_near`] asks for the buffers that fit the window and not for the ones that do not.
+///
+/// **The point is what it does not do.** [`Host::resident_direct`] asks for every buffer at once and
+/// refuses if any will not fit, which sends a caller holding one large buffer and several small ones
+/// back to a submission and a fence for every write — including the small ones. So the check is that
+/// a mixed set is accepted, and that the buffer above the window did not go straight in anyway: a
+/// version ignoring `window` would report two direct writes here rather than at most one.
+///
+/// `window` is bytes. Four words is sixteen of them, and the second binding is four kibibytes.
+#[test]
+fn a_window_takes_the_buffers_that_fit_and_leaves_the_rest_device_local() {
+    let Some(host) = device("near") else {
+        return;
+    };
+    let Ok(mut near) = host.resident_near(&[4, 1024], &[], 16) else {
+        eprintln!("SKIPPED near: no device-local host-visible memory");
+        return;
+    };
+
+    near.write(0, &[1, 2, 3, 4]).expect("the small one");
+    near.write(1, &vec![9_u32; 1024]).expect("the large one");
+    assert_eq!(near.read(0, 4).expect("a read"), vec![1, 2, 3, 4]);
+    assert_eq!(near.read(1, 2).expect("a read"), vec![9, 9]);
+
+    let (_, writes, straight) = near.pushing();
+    assert_eq!(writes, 2, "two writes went in and the counter says {writes}");
+    assert!(
+        straight <= 1,
+        "{straight} of two writes went straight into device memory, so the 4 KiB binding was asked \
+         for against a window of 16 bytes"
+    );
+}
+
+/// A window of nought asks for nothing, which is what [`Host::resident`] is.
+#[test]
+fn a_window_of_nothing_asks_for_nothing() {
+    let Some(host) = device("near nought") else {
+        return;
+    };
+    let mut plain = host.resident_near(&[4], &[], 0).expect("a device buffer");
+    plain.write(0, &[5]).expect("a write");
+    assert_eq!(plain.read(0, 1).expect("a read"), vec![5]);
+    assert_eq!(
+        plain.pushing().2,
+        0,
+        "a window of nought asked for device-local host-visible memory anyway"
+    );
+}

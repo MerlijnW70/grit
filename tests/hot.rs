@@ -221,3 +221,37 @@ fn the_hot_list_is_every_hot_block_once_and_in_order() {
     );
 
 }
+
+/// [`Plan::cold`] is the number `live::mark` computes for itself, at every width.
+///
+/// # Why this is worth a test of its own
+///
+/// The kernel does not call it. `live.rs` works the dump slot out in lanes — `blocks.div_ceil(
+/// per_block) * per_block` — and a comment there says `compact::Plan::cold` is "the same number,
+/// arrived at from the other side". That was an assertion in prose and nothing checked it: `cold`
+/// is `tiles × per_block`, so the two agree only while `tiles` is `blocks` rounded up to a whole
+/// number of them. A `tiles` derived from quads instead would leave the host and the device naming
+/// different slots, and the symptom would be one hot block listed every frame for ever.
+///
+/// **This is arithmetic on the host**, so it covers the widths this machine has no device to run —
+/// four, eight, sixteen and sixty-four lanes are checked here and nowhere else.
+#[test]
+fn the_dump_slot_is_the_same_number_the_kernel_works_out() {
+    for width in [4_u32, 8, 16, 32, 64] {
+        let mut checked = 0;
+        for blocks in [1_u32, 2, 7, 63, 64, 65, 255, 256, 257, 1000, 4096] {
+            let Ok(plan) = Plan::over(width, blocks) else {
+                continue;
+            };
+            let theirs = plan.blocks.div_ceil(plan.per_block) * plan.per_block;
+            assert_eq!(
+                plan.cold(),
+                theirs,
+                "at subgroup {width} with {blocks} blocks the host says {} and the kernel {theirs}",
+                plan.cold()
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no plan at subgroup {width} was checkable");
+    }
+}
