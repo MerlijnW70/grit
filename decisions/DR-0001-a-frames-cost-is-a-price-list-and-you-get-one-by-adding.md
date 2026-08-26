@@ -10,7 +10,8 @@ On an RTX 4080 at subgroup 32, `tests/floor.rs` fits a line through six submissi
 passes that write one word each: a submission is 35–42 µs, one more frame inside it 0 µs, a dispatch
 210–245 ns, a barrier 996–1009 ns, one word read back 41–42 µs. In `src/bin/scale.rs`'s loop, five
 passes that write one word cost +7.5 µs as five stages and +1.1 µs as one stage, which is 1.28 µs a
-barrier and 0.22 µs a dispatch, against 25 µs a frame at 262 144 cells and 27 µs at 16 777 216.
+barrier and 0.22 µs a dispatch, against a frame that five runs of that file put at 27–29 µs at
+262 144 cells and 29–32 µs at 16 777 216.
 
 ## The Decision
 
@@ -21,10 +22,10 @@ removing passes from it.
 ## The Rejected Route
 
 Fusing `hot_scan_counts` and `hot_scan_totals` into one kernel with a workgroup barrier was rejected
-at one barrier plus one dispatch, 1.2 µs of 25.
+at one barrier plus one dispatch, 1.2 µs of 27.
 
 ## The Limit
 
-These figures do not measure device execution: the 9 µs that is left after subtracting ten barriers,
-seventeen dispatches and a twentieth of a submission from 25 µs is a subtraction, and no timestamp
+These figures do not measure device execution: the 11 µs that is left after subtracting ten barriers,
+seventeen dispatches and a twentieth of a submission from 27 µs is a subtraction, and no timestamp
 query was issued.

@@ -22,11 +22,11 @@
 //! and the work twenty times, so what comes back is the work. Six arrangements, measured:
 //!
 //! ```text
-//!         cells     ungated       gated      listed      staged     narrowed        kept
-//!       262 144       66 us       79 us       57 us       44 us        35 us       25 us
-//!     1 048 576       92 us       79 us       57 us       44 us        35 us       26 us
-//!     4 194 304      161 us       79 us       59 us       44 us        36 us       26 us
-//!    16 777 216      323 us      144 us       60 us       46 us        36 us       27 us
+//!         cells     ungated       gated      listed      staged     narrowed          kept
+//!       262 144       66 us       79 us       57 us       44 us        35 us   27 - 29 us
+//!     1 048 576       92 us       79 us       57 us       44 us        35 us   28 - 29 us
+//!     4 194 304      161 us       79 us       59 us       44 us        36 us   28 - 29 us
+//!    16 777 216      323 us      144 us       60 us       46 us        36 us   29 - 32 us
 //! ```
 //!
 //! *Ungated* is a workgroup a block, every block. *Gated* is the same dispatch with a vote that
@@ -59,6 +59,12 @@
 //! this file writes between batches threw the frame away every time. *Recorded sixteen times,
 //! reused nought* before; two and fourteen after, and the two are the warm-up and the first batch,
 //! which differ in how many frames they hold.
+//!
+//! **The last column is a range and the other five are not, and that is a caveat about the table
+//! rather than about the change.** Five runs of this file put *kept* at 27–29 µs and the largest
+//! size at 29–32; a single figure taken on the day read 25 to 27, which is below every one of those
+//! five. The other columns were each measured when they went in and have not been taken again, so
+//! they carry whatever the machine was doing then. Comparing across them is comparing days.
 //!
 //! **What the table is for** is the flatness rather than any one number: sixty-four times the world
 //! for two microseconds more, with nothing in the frame proportional to the grid.

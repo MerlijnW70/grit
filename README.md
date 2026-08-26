@@ -1,6 +1,6 @@
 # grit
 
-**Sixteen million cells of falling sand and water, stepped in 27 µs a frame.**
+**Sixteen million cells of falling sand and water, stepped in about 30 µs a frame.**
 
 A frame touches about seven hundred of the world's four million quads, and the host never learns how
 many — the device writes the count into a buffer and Vulkan reads it at dispatch time. That is what
@@ -8,14 +8,14 @@ this repository is: a sparse-grid stream compaction engine, built on
 [`simdr`](../simdr), with a sand simulation on top of it to prove the claim.
 
 ```text
-       cells      quads      frame     stepped    of grid
-      262 144     65 536      25 µs        768        85×
-    1 048 576    262 144      25 µs        768       341×
-    4 194 304  1 048 576      26 µs        768      1365×
-   16 777 216  4 194 304      27 µs        768      5461×
+       cells      quads         frame     stepped    of grid
+      262 144     65 536    27 - 29 µs        768        85×
+    1 048 576    262 144    28 - 29 µs        768       341×
+    4 194 304  1 048 576    28 - 29 µs        768      1365×
+   16 777 216  4 194 304    29 - 32 µs        768      5461×
 ```
 
-**Sixty-four times the world for two microseconds more.** The last column is the ratio between what
+**Sixty-four times the world for two or three microseconds more**, over five runs. The last column is the ratio between what
 was stepped and what exists, and it is the number this repository was written to print.
 
 ---
