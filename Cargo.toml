@@ -13,7 +13,21 @@ simdr = { path = "../simdr" }
 # measurement harness rather than a real-time host — see `src/host.rs`.
 ash = "0.38"
 # A window and a framebuffer, for the one thing that has to leave the device.
-minifb = { version = "0.28", default-features = false }
+#
+# **Optional, and on by default.** Two of the four binaries open a window -- `pour` and `spike` --
+# and the library opens none: `grep -rl minifb src/` names those two files and no other. So a caller
+# that wants the engine can take it without a windowing library and the two crates under it
+# (`raw-window-handle`, `winapi`), and the documented `cargo run --bin pour` keeps working because
+# the feature is default.
+#
+#   grit = { path = "../grit", default-features = false }
+minifb = { version = "0.28", default-features = false, optional = true }
+
+[features]
+default = ["window"]
+# What `pour` and `spike` need. `required-features` on both binaries is what stops them being built
+# without it, rather than a link error somewhere further in.
+window = ["dep:minifb"]
 
 [lints.rust]
 missing_docs = "deny"
@@ -27,3 +41,11 @@ indexing_slicing = "deny"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[[bin]]
+name = "pour"
+required-features = ["window"]
+
+[[bin]]
+name = "spike"
+required-features = ["window"]

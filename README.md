@@ -75,6 +75,16 @@ snippet that stops working stops the build.
 **Want the Vulkan without the sand?** [`host`] and [`resident`] name no buffer of the simulation's —
 `hyperia` vendored those two files and nothing else. See `decisions/DR-0005`.
 
+**Want it without a windowing library?** `pour` and `spike` open a window and the library opens none,
+so `minifb` is behind a feature that is on by default:
+
+```toml
+grit = { path = "../grit", default-features = false }
+```
+
+That drops `minifb`, `raw-window-handle` and `winapi` — eight lines of `cargo tree` to five — and
+builds `scale` and `loop_cost` but not the two that need a window.
+
 ---
 
 ## Where things are
