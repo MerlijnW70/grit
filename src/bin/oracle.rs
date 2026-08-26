@@ -30,6 +30,7 @@
 //!   majority        fill the table: more ones than noughts
 //!   equal           fill the table: every input the same
 //!   count           fill the table: how many ones there are, in binary
+//!   times           fill the table: the low half of the word times the high half
 //!   add             fill the table: the first half plus the second
 //!   10-1 -> 01      the inputs that pattern stands for, and what they answer
 //!   ---- -> --1     a dash on the left is every value; a dash on the right is not asked
@@ -165,6 +166,38 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # Growing a multiplier, which comes out three quarters right
+//!
+//! `times` fills the table with the low half of the word multiplied by the high half. At
+//! `inputs 4` that is two bits by two bits, sixteen inputs and a four-bit product, and `1111` is
+//! three times three is nine.
+//!
+//! ```text
+//!                                              of 64      inputs entirely right
+//!   and or xor not, 4096 chips                 58.6       10.8 of 16
+//!   all seven, 4096                            58.3       11.0
+//!   and or xor not maj, 4096                   58.8       11.0
+//!   and or xor not maj, 16 384                 59.5       11.5
+//!   the same with lean                         59.3       11.3
+//!   the same over 18 columns                   59.6       11.6
+//!   the same over 24 columns                   59.8       11.8
+//!   steps 2 state 2, 16 384                    56.3        8.8
+//!   steps 4 state 2, 16 384                    55.1        8.0
+//! ```
+//!
+//! Six starts each. **It does not come out, and neither more depth nor more time is why.** Twice
+//! the columns is worth 0.3 of 64. Counting in time is what solved `count` and here it loses three
+//! of 64: four answers, two input rows and the bottom row are seven of the eight, so the state has
+//! nowhere to be that is not already an answer.
+//!
+//! **Three of the four product bits come out perfect and one never does.** The report reads
+//! `[16, 12, 16, 16]` on start after start, and the short one is bit one, which is
+//! `a0·b1` exclusive-or `a1·b0` — the only one of the four that is two levels deep.
+//!
+//! Asked entirely alone, one output and 16 384 chips, that bit comes out at 15 of 16 on all eight
+//! starts. Not 14 and not 16, eight times out of eight: the search walks to the same one-input-wrong
+//! circuit every time and there is nothing next to it that is better.
 //!
 //! # Widening the kit, where what matters is the third wire and not the gate
 //!
@@ -1590,17 +1623,18 @@ fn read(text: &str) -> Result<Exam, String> {
                 ask = vec![0; 1 << how];
             }
             (Some(_), None) => return Err(say("`inputs` has to come first")),
-            (Some(filler @ ("parity" | "majority" | "equal" | "count" | "add")), Some(how)) => {
+            (Some(filler @ ("parity" | "majority" | "equal" | "count" | "add" | "times")), Some(how)) => {
                 let widest = match filler {
                     "count" => u32::BITS - how.leading_zeros(),
                     "add" => how / 2 + 1,
+                    "times" => how,
                     _ => 1,
                 };
                 if outputs < widest {
                     return Err(say(&format!("`{filler}` wants `outputs {widest}` or more")));
                 }
-                if filler == "add" && how % 2 != 0 {
-                    return Err(say("`add` wants an even number of inputs"));
+                if (filler == "add" || filler == "times") && how % 2 != 0 {
+                    return Err(say(&format!("`{filler}` wants an even number of inputs")));
                 }
                 name = filler.to_owned();
                 let full = (1_u32 << outputs) - 1;
@@ -1612,7 +1646,8 @@ fn read(text: &str) -> Result<Exam, String> {
                         "majority" => u32::from(ones * 2 > how),
                         "equal" => u32::from(ones == 0 || ones == how),
                         "count" => ones,
-                        _ => (case & ((1 << half) - 1)) + (case >> half),
+                        "add" => (case & ((1 << half) - 1)) + (case >> half),
+                        _ => (case & ((1 << half) - 1)) * (case >> half),
                     };
                     if let (Some(a), Some(b)) =
                         (want.get_mut(case as usize), ask.get_mut(case as usize))
