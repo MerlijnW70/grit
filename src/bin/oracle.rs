@@ -18,7 +18,7 @@
 //!   weigh dynamic   add the answers up by sum, by the weakest of them, or by weight
 //!   slack 1         read the answer as a number and accept it within one
 //!   ladder 1        reveal one output bit at a time, widening when it is mastered
-//!   gates and or not   the gates it draws from; wire is always in
+//!   gates and or maj   the gates it draws from; wire is always in
 //!   noise 16        break one gate in sixteen each generation
 //!   lean 1          among equally right chips, prefer the one with fewer gates
 //!   steps 4         cut the word into four, one piece a step — time
@@ -165,6 +165,38 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # Widening the kit, where what matters is the third wire and not the gate
+//!
+//! Every gate up to here read two wires: `and`, `or` and `xor` take the diagonal above and the
+//! diagonal below, and `not` and `wire` take the one straight ahead. None of them mixed the two.
+//! `maj` is the majority of all three and `mux` passes one diagonal or the other depending on the
+//! wire straight ahead, and both of them do.
+//!
+//! On the exam solved by nothing — `count` at once, `apart 3`, 4096 chips, eight starts:
+//!
+//! ```text
+//!                                the total      bit one
+//!   and or xor not               42.1 of 48     12.3 of 16
+//!   and or xor not maj           42.2           14.2
+//!   and or xor not mux           41.6           14.1
+//!   all seven                    41.1           14.0
+//!   maj alone                    33.0           10.0
+//! ```
+//!
+//! **The two macro gates are worth the same, which says it is not the gate.** A cell could always
+//! read the wire straight ahead and it could always read the two diagonals; what it could not do is
+//! use them together, and doing that is worth about two bits on the answer nothing else moved. The
+//! total does not move with it, which is the redistribution the score always makes.
+//!
+//! At 16 384 chips `and or xor not maj` gives 43.0 and bit one 14.8, past the 14.25 that bit one
+//! managed with a whole grid and a whole colony to itself.
+//!
+//! **`maj` alone is 33.0 of 48 on every one of the eight starts.** Majority is monotone, so parity
+//! is not among the things it can build and every start walks to the same place.
+//!
+//! It buys nothing on the sequential counter: twelve starts give 13.4 of 16 inputs entirely right
+//! with all seven gates against 13.0 with four, and the perfect chip came from the four.
 //!
 //! # The exam solved, once in twelve
 //!
@@ -562,7 +594,7 @@ const SETTLED: u32 = 64;
 const MIGRATE: u32 = 64;
 
 /// How many kinds of gate there are.
-const KINDS: u32 = 5;
+const KINDS: u32 = 7;
 
 /// How many gates a mutation turns over at once.
 const MUTATIONS: u32 = 1;
@@ -1087,6 +1119,15 @@ fn propagate(
     let sum = kernel.module().i_add(uint, a, b)?;
     let odd = low_bits(&mut kernel, sum, 1)?;
     let inverted = minus(&mut kernel, one, straight)?;
+    // **The two that read three wires.** Everything above is a gate of the wire above and the wire
+    // below; these two also read the wire straight ahead, which was only ever a thing to invert.
+    let most = {
+        let with_a = smallest(&mut kernel, a, straight)?;
+        let with_b = smallest(&mut kernel, b, straight)?;
+        let either_with = largest(&mut kernel, with_a, with_b)?;
+        largest(&mut kernel, both, either_with)?
+    };
+    let chosen = pick(&mut kernel, straight, a, b)?;
 
     let span = kernel.module().constant_u32(CELLS)?;
     let mine_at = kernel.module().i_mul(uint, chip, span)?;
@@ -1096,7 +1137,7 @@ fn propagate(
     let kind = kernel.load_at(GENE, gene_at)?;
 
     let mut answer = straight;
-    for (number, value) in [(1, both), (2, either), (3, odd), (4, inverted)] {
+    for (number, value) in [(1, both), (2, either), (3, odd), (4, inverted), (5, most), (6, chosen)] {
         let want = kernel.module().constant_u32(number)?;
         let hit = is(&mut kernel, kind, want)?;
         answer = pick(&mut kernel, hit, value, answer)?;
@@ -1472,8 +1513,10 @@ fn read(text: &str) -> Result<Exam, String> {
                         "and" => 1,
                         "or" => 2,
                         "xor" => 3,
+                        "maj" => 5,
+                        "mux" => 6,
                         "not" => 4,
-                        _ => return Err(say("a gate is wire, and, or, xor or not")),
+                        _ => return Err(say("a gate is wire, and, or, xor, not, maj or mux")),
                     };
                     if !kinds.contains(&kind) {
                         kinds.push(kind);
@@ -1702,6 +1745,14 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
                         Some(2) => up.max(down),
                         Some(3) => (up + down) & 1,
                         Some(4) => 1 - straight,
+                        Some(5) => (up + down + straight) / 2,
+                        Some(6) => {
+                            if straight == 1 {
+                                up
+                            } else {
+                                down
+                            }
+                        }
                         _ => straight,
                     }
                 })
@@ -1805,6 +1856,14 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<u32> {
                         Some(2) => up.max(down),
                         Some(3) => (up + down) & 1,
                         Some(4) => 1 - straight,
+                        Some(5) => (up + down + straight) / 2,
+                        Some(6) => {
+                            if straight == 1 {
+                                up
+                            } else {
+                                down
+                            }
+                        }
                         _ => straight,
                     }
                 })
@@ -1831,6 +1890,18 @@ fn unpack(score: u32, lean: bool) -> (u32, u32) {
     }
 }
 
+/// Which wires of the column before a gate of this kind reads.
+///
+/// **Two of the seven read three.** `maj` and `mux` take the wire straight ahead as well as the two
+/// diagonals, so a cone traced back through one of them is a row wider than through the others.
+fn reads(kind: u32, row: u32) -> Vec<u32> {
+    match kind {
+        0 | 4 => vec![row],
+        5 | 6 => vec![row + ROWS - 1, row, row + 1],
+        _ => vec![row + ROWS - 1, row + 1],
+    }
+}
+
 /// The cells one answer alone depends on, traced back from the row it is read off.
 ///
 /// **As [`live`], but for a single output.** Two answers that share most of their cells are two
@@ -1853,11 +1924,7 @@ fn cone(genome: &[u32], exam: &Exam, output: u32) -> Vec<bool> {
             if let Some(slot) = used.get_mut(cell) {
                 *slot = kind != 0;
             }
-            let reaches: [u32; 2] = if kind == 0 || kind == 4 {
-                [row, row]
-            } else {
-                [row + ROWS - 1, row + 1]
-            };
+            let reaches = reads(kind, row);
             for back in reaches {
                 if let Some(slot) = wanted.get_mut(at(column - 1, back)) {
                     *slot = true;
@@ -1898,11 +1965,7 @@ fn live(genome: &[u32], exam: &Exam) -> Vec<bool> {
             if let Some(slot) = used.get_mut(cell) {
                 *slot = kind != 0;
             }
-            let reaches: [u32; 2] = if kind == 0 || kind == 4 {
-                [row, row]
-            } else {
-                [row + ROWS - 1, row + 1]
-            };
+            let reaches = reads(kind, row);
             for back in reaches {
                 if let Some(slot) = wanted.get_mut(at(column - 1, back)) {
                     *slot = true;
@@ -2038,6 +2101,8 @@ fn drawn(genome: &[u32], bits: u32, outputs: u32, apart: u32, alive: &[bool]) ->
                 Some(2) => 'v',
                 Some(3) => '^',
                 Some(4) => '!',
+                Some(5) => '#',
+                Some(6) => '?',
                 _ => '-',
             });
         }
@@ -2281,7 +2346,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(&[]);
     let alive = live(genome, &exam);
     println!("\n{}", drawn(genome, exam.bits, exam.outputs, exam.apart, &alive));
-    println!("    - wire   & and   v or   ^ xor   ! not   · dead   (<- marks an answer wire)");
+    println!(
+        "    - wire  & and  v or  ^ xor  ! not  # maj  ? mux  · dead  (<- marks an answer wire)"
+    );
     if exam.outputs > 1 {
         let apiece = each(genome, &exam);
         let (trades, gains, losses, flat, weakest, lifts, refused) = pulls(genome, &exam);
