@@ -14,6 +14,7 @@
 //!   # a comment
 //!   inputs 4        how many inputs, one to six
 //!   outputs 3       how many answer bits — one if left out
+//!   colony 65536    how many chips search at once — the way out of a local optimum
 //!   seed 1234       where the random grids start, which decides more than it looks
 //!   parity          fill the table: the parity of the inputs
 //!   majority        fill the table: more ones than noughts
@@ -89,19 +90,40 @@
 //! 16 from eight starts out of eight: it builds a detector for one of the two and stays silent on
 //! the other. One detector scores 15 and two score 16, and nothing between them scores 15 and a half.
 //!
-//! That one **is** what more room is for, which is the opposite of what the grid sweep above found
-//! for `count`:
+//! # Getting out of a local optimum
+//!
+//! That 15 is a trap rather than a slow start, and three levers were measured against it, eight
+//! starts each.
+//!
+//! **Room helps once.** More columns give the two detectors somewhere to stand side by side:
 //!
 //! ```text
-//!   grid    gates   eight starts on the scattered pair
-//!    8x12      88   15 15 15 15 15 15 15 15
-//!    8x24     184   15 15 16 16 15 16 15 15
+//!    8x12    88 gates   0 of 8
+//!    8x24   184 gates   3 of 8
+//!    8x36   280 gates   2 of 8
+//!    8x48   376 gates   2 of 8
 //! ```
 //!
-//! Two detectors side by side need somewhere to stand. Three starts in eight find it at 184 gates
-//! and none at 88 — so whether area helps is a property of the answer, not of the engine.
+//! **Patience buys nothing at all.** Ten times the generations — forty thousand against four —
+//! gives the same eight answers from the same eight starts. A lineage that is trapped is trapped,
+//! and waiting is not what gets it out.
 //!
-//! **So a circuit that answers your four questions has not learnt what they meant.** It has learnt
+//! **The colony is the lever.** It is many independent hill-climbs, so what a trapped one cannot do
+//! with more time, more of them can do at once:
+//!
+//! ```text
+//!    grid    colony   solved   a generation
+//!    8x12     4 096    0 of 8        160 µs
+//!    8x12    16 384    6 of 8        557 µs
+//!    8x24     4 096    3 of 8
+//!    8x24    16 384    6 of 8
+//!    8x24    65 536    8 of 8      2 261 µs
+//! ```
+//!
+//! Four times the colony on the narrow grid beats twice the depth, and sixteen times solves it
+//! every start. It costs fourteen times as much a generation, which is the trade stated rather
+//! than hidden — and `colony` is a line in the exam, so it is the writer's to make.
+//!//! **So a circuit that answers your four questions has not learnt what they meant.** It has learnt
 //! the least thing that answers them, which is what you asked for. The truth table is where the
 //! difference shows.
 //!
@@ -273,8 +295,8 @@ fn stir(kernel: &mut Kernel<U32>, seed: Id) -> Result<Id, LaneError> {
 /// **The dump is the whole of the bounds check.** A dispatch is rounded up to whole workgroups, so
 /// the last one holds lanes past the end of the list; they read a clamped slot, write into the chip
 /// at `COLONY`, and nothing reads it. `crate::compact` calls the same slot a dump.
-fn listed(kernel: &mut Kernel<U32>, slot: Id, held: Id) -> Result<Id, LaneError> {
-    let safe = at_most(kernel, slot, COLONY - 1)?;
+fn listed(kernel: &mut Kernel<U32>, slot: Id, held: Id, colony: u32) -> Result<Id, LaneError> {
+    let safe = at_most(kernel, slot, colony - 1)?;
     let who = kernel.load_at(CHANGED, safe)?;
 
     let mut lanes = kernel.lanes()?;
@@ -282,7 +304,7 @@ fn listed(kernel: &mut Kernel<U32>, slot: Id, held: Id) -> Result<Id, LaneError>
     let length = lanes.splat_id::<U32, 1>(held)?;
     let inside = lanes.greater_than(length, index)?;
     let real = lanes.splat_id::<U32, 1>(who)?;
-    let dump = lanes.splat_bits::<U32, 1>(COLONY)?;
+    let dump = lanes.splat_bits::<U32, 1>(colony)?;
     Ok(lanes.select(inside, real, dump)?.id())
 }
 
@@ -369,7 +391,7 @@ fn advance(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 ///
 /// **Half the colony at a time**, as the other two demonstrations do and for the same reason: a
 /// genome is read while others are written, so the ones being read from stand still.
-fn select(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+fn select(subgroup: u32, colony: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let who = mine(&mut kernel, subgroup)?;
@@ -392,7 +414,7 @@ fn select(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let doubled = kernel.module().i_mul(uint, spread, two)?;
     let stride = kernel.module().i_add(uint, doubled, one)?;
     let raised = kernel.module().i_add(uint, who, stride)?;
-    let neighbour = low_bits(&mut kernel, raised, COLONY.trailing_zeros())?;
+    let neighbour = low_bits(&mut kernel, raised, colony.trailing_zeros())?;
     let ours = kernel.load_at(SCORE, who)?;
     let theirs = kernel.load_at(SCORE, neighbour)?;
     let better = above(&mut kernel, theirs, ours)?;
@@ -452,8 +474,8 @@ fn select(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     // one entry that belongs there: a chip that did change is erased from the list, keeps last
     // generation's score, and the same seed stops giving the same answer. It did.
     let slot = kernel.atomic_add_at(COUNTS, none, restless)?;
-    let safe = at_most(&mut kernel, slot, COLONY - 1)?;
-    let past = kernel.module().constant_u32(COLONY)?;
+    let safe = at_most(&mut kernel, slot, colony - 1)?;
+    let past = kernel.module().constant_u32(colony)?;
     let landing = pick(&mut kernel, restless, safe, past)?;
     let keeping = pick(&mut kernel, restless, who, past)?;
     kernel.store_at(CHANGED, landing, keeping)?;
@@ -502,6 +524,7 @@ fn wire_at(
     kernel: &mut Kernel<U32>,
     subgroup: u32,
     cases: u32,
+    colony: u32,
     held: Id,
 ) -> Result<(Id, Id, Id), LaneError> {
     let index = mine(kernel, subgroup)?;
@@ -509,7 +532,7 @@ fn wire_at(
     let rest = down_by(kernel, index, cases.trailing_zeros())?;
     let row = low_bits(kernel, rest, ROWS.trailing_zeros())?;
     let slot = down_by(kernel, rest, ROWS.trailing_zeros())?;
-    let chip = listed(kernel, slot, held)?;
+    let chip = listed(kernel, slot, held, colony)?;
     Ok((chip, row, case))
 }
 
@@ -539,11 +562,11 @@ fn wire(
 ///
 /// Rows past the sixth get nought for free, because an input is under 64 and its higher bits are
 /// already nought — so only the one has to be said.
-fn feed(subgroup: u32, cases: u32) -> Result<Vec<u32>, LaneError> {
+fn feed(subgroup: u32, cases: u32, colony: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let none = kernel.module().constant_u32(0)?;
     let held = kernel.load_at(COUNTS, none)?;
-    let (chip, row, case) = wire_at(&mut kernel, subgroup, cases, held)?;
+    let (chip, row, case) = wire_at(&mut kernel, subgroup, cases, colony, held)?;
 
     let shifted = shift_down(&mut kernel, case, row)?;
     let value = low_bits(&mut kernel, shifted, 1)?;
@@ -561,13 +584,13 @@ fn feed(subgroup: u32, cases: u32) -> Result<Vec<u32>, LaneError> {
 /// **Eleven of these are generated**, one a column, which is what an emitter buys over a shader
 /// language. Every gate is computed and the genome picks which answer is kept: a `Predicate` is not
 /// a value, and `decisions/DR-0003` has no branches.
-fn propagate(subgroup: u32, column: u32, cases: u32) -> Result<Vec<u32>, LaneError> {
+fn propagate(subgroup: u32, column: u32, cases: u32, colony: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let none = kernel.module().constant_u32(0)?;
     let one = kernel.module().constant_u32(1)?;
     let held = kernel.load_at(COUNTS, none)?;
-    let (chip, row, case) = wire_at(&mut kernel, subgroup, cases, held)?;
+    let (chip, row, case) = wire_at(&mut kernel, subgroup, cases, colony, held)?;
 
     let up = {
         let back = kernel.module().constant_u32(ROWS - 1)?;
@@ -618,13 +641,13 @@ fn propagate(subgroup: u32, column: u32, cases: u32) -> Result<Vec<u32>, LaneErr
 }
 
 /// How many of the inputs the top-right wire got right.
-fn tally(subgroup: u32, cases: u32, outputs: u32) -> Result<Vec<u32>, LaneError> {
+fn tally(subgroup: u32, cases: u32, outputs: u32, colony: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let none = kernel.module().constant_u32(0)?;
     let held = kernel.load_at(COUNTS, none)?;
     let slot = mine(&mut kernel, subgroup)?;
-    let chip = listed(&mut kernel, slot, held)?;
+    let chip = listed(&mut kernel, slot, held, colony)?;
 
     // **One tap a row, down the right-hand edge.** Output nought is the top wire of the last column,
     // output one the wire under it, and so on — the same place a one-bit exam reads, extended.
@@ -659,6 +682,12 @@ struct Exam {
     bits: u32,
     /// How many answer bits. Output nought is the top wire of the last column.
     outputs: u32,
+    /// How many chips are in the arena, a power of two.
+    ///
+    /// **This is the way out of a local optimum, and patience is not.** On the scattered pair below,
+    /// ten times the generations changes nothing and the same starts still fail; four times the
+    /// colony takes three starts in eight to six, and sixteen times takes it to eight.
+    colony: u32,
     /// Where the random grids start.
     ///
     /// **It matters more than anything else in this file.** Five starts on the parity of six inputs
@@ -729,6 +758,7 @@ fn spread_of(pattern: &str) -> Vec<u32> {
 ///   # a comment
 ///   inputs 4        how many inputs, one to six
 ///   outputs 3       how many answer bits — one if left out
+///   colony 65536    how many chips search at once — the way out of a local optimum
 ///   seed 1234       where the random grids start, which decides more than it looks
 ///   parity          fill the table: the parity of the inputs
 ///   majority        fill the table: more ones than noughts
@@ -746,6 +776,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut bits = None;
     let mut outputs = 1_u32;
     let mut seed = 0x0AC1_E000_u32;
+    let mut colony = 1_u32 << 12;
     let mut want: Vec<u32> = Vec::new();
     let mut ask: Vec<u32> = Vec::new();
     let mut name = String::from("an exam");
@@ -758,6 +789,13 @@ fn read(text: &str) -> Result<Exam, String> {
         let say = |what: &str| format!("line {}: {what}", number + 1);
         let mut word = line.split_whitespace();
         match (word.next(), bits) {
+            (Some("colony"), _) => {
+                colony = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .filter(|it| it.is_power_of_two() && (64..=1 << 17).contains(it))
+                    .ok_or_else(|| say("`colony` wants a power of two from 64 to 131072"))?;
+            }
             (Some("seed"), _) => {
                 seed = word
                     .next()
@@ -857,7 +895,7 @@ fn read(text: &str) -> Result<Exam, String> {
         }
     }
     let bits = bits.ok_or_else(|| String::from("the exam says nothing about `inputs`"))?;
-    Ok(Exam { bits, outputs, seed, want, ask, name })
+    Ok(Exam { bits, outputs, colony, seed, want, ask, name })
 }
 
 // ---------- the host, which lays out the arena and then asks almost nothing ----------
@@ -983,6 +1021,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let exam = read(&text).map_err(|why| format!("the exam does not read: {why}"))?;
     let cases = exam.cases();
+    let colony = exam.colony;
     let perfect = exam.asked();
     if perfect == 0 {
         return Err("the exam asks about nothing".into());
@@ -1004,21 +1043,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut modules = vec![
         advance(width)?,
-        select(width)?,
+        select(width, colony)?,
         ready(width, cases)?,
-        feed(width, cases)?,
+        feed(width, cases, colony)?,
     ];
     for column in 1..COLUMNS {
-        modules.push(propagate(width, column, cases)?);
+        modules.push(propagate(width, column, cases, colony)?);
     }
-    modules.push(tally(width, cases, exam.outputs)?);
+    modules.push(tally(width, cases, exam.outputs, colony)?);
     let held: Vec<&[u32]> = modules.iter().map(Vec::as_slice).collect();
 
     let wires = Groups::From { binding: COUNTS as usize, at: 1 };
     let chips = Groups::From { binding: COUNTS as usize, at: 4 };
     let mut stages: Vec<Vec<Groups>> = vec![
         vec![Groups::Counting(1)],
-        vec![Groups::Fixed(COLONY / width)],
+        vec![Groups::Fixed(colony / width)],
         vec![Groups::Counting(1)],
         vec![wires],
     ];
@@ -1028,19 +1067,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stages.push(vec![chips]);
     let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
     println!(
-        "  {COLONY} chips of {COLUMNS}×{ROWS} gates — {} passes in {} stages\n",
+        "  {colony} chips of {COLUMNS}×{ROWS} gates — {} passes in {} stages\n",
         modules.len(),
         stages.len()
     );
 
     let sizes = [
         4,
-        (COLONY * CELLS) as usize,
+        (colony * CELLS) as usize,
         cases as usize,
-        ((COLONY + 1) * COLUMNS * ROWS * cases) as usize,
-        (COLONY + 1) as usize,
-        (COLONY + 1) as usize,
-        (COLONY + 1) as usize,
+        ((colony + 1) * COLUMNS * ROWS * cases) as usize,
+        (colony + 1) as usize,
+        (colony + 1) as usize,
+        (colony + 1) as usize,
         7,
         cases as usize,
     ];
@@ -1051,9 +1090,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     arena.write(TARGET as usize, &exam.want)?;
     arena.write(KEEP as usize, &exam.ask)?;
     let mut seed = exam.seed;
-    let genes: Vec<u32> = (0..COLONY * CELLS).map(|_| stirred(&mut seed) % KINDS).collect();
+    let genes: Vec<u32> = (0..colony * CELLS).map(|_| stirred(&mut seed) % KINDS).collect();
     arena.write(GENE as usize, &genes)?;
-    let seeds: Vec<u32> = (0..=COLONY).map(|_| stirred(&mut seed)).collect();
+    let seeds: Vec<u32> = (0..=colony).map(|_| stirred(&mut seed)).collect();
     arena.write(SEED as usize, &seeds)?;
 
     let batches = GENERATIONS / BATCH;
@@ -1064,7 +1103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for batch in 0..batches {
         ran = batch + 1;
         spent += arena.staged_frames(&groups, BATCH)?;
-        let scores = arena.read(SCORE as usize, COLONY as usize)?;
+        let scores = arena.read(SCORE as usize, colony as usize)?;
         best = scores.iter().copied().max().unwrap_or(0);
         // Densely at the start, where the colony is actually moving, and thinly after.
         if batch < 8 || batch % (batches / 8).max(1) == 0 || best == perfect || batch + 1 == batches {
@@ -1080,8 +1119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let scores = arena.read(SCORE as usize, COLONY as usize)?;
-    let genes = arena.read(GENE as usize, (COLONY * CELLS) as usize)?;
+    let scores = arena.read(SCORE as usize, colony as usize)?;
+    let genes = arena.read(GENE as usize, (colony * CELLS) as usize)?;
     let (winner, _) = scores.iter().enumerate().max_by_key(|&(_, s)| *s).unwrap_or((0, &0));
     let genome = genes
         .get(winner * CELLS as usize..(winner + 1) * CELLS as usize)
