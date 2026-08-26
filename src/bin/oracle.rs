@@ -24,6 +24,7 @@
 //!   steps 4         cut the word into four, one piece a step — time
 //!   state 2         rows wired from the last column back to the first — memory
 //!   hold 4          four more steps after the word, with nothing arriving
+//!   fold 1          read the answers off one row, one a step, instead of one row each
 //!   colony 65536    how many chips search at once — the way out of a local optimum
 //!   island 256      how many of them share an arena — the colony if left out
 //!   seed 1234       where the random grids start, which decides more than it looks
@@ -168,6 +169,28 @@
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
 //!
+//! # Folding the answers into time, which costs more than the rows it frees
+//!
+//! Three answers need three rows of the last column. `fold` takes them off one row instead, one a
+//! step, over the last `outputs` steps — so the chip has to know which step it is on, and nothing
+//! but the state rows can tell it. `feed` already reads the last column at the top of every step,
+//! so catching an answer on its way past costs one store and no pass of its own.
+//!
+//! Six starts on `count`, `steps 4`, the kit with `maj` and `sum`, at the same number of passes on
+//! both sides:
+//!
+//! ```text
+//!                                        of 48    inputs entirely right
+//!   hold 3, state 4, apart 3             44.1     13.1 of 16
+//!   hold 3, state 4, folded              38.0      6.5
+//!   hold 3, state 6, folded              38.3      8.1
+//!   hold 6, state 4, folded              37.6      7.5
+//! ```
+//!
+//! **It works and it is a bad trade here.** The host's count and the card's agree on every run, so
+//! the answers are being caught where they are meant to be; it costs six of 48 and buys two rows,
+//! and two more state rows give back half a bit of that.
+//!
 //! # Sixteen rows, which cost half as much again and buy nothing
 //!
 //! `ROWS` is the one number the whole file is derived from, so doubling it is a constant. It
@@ -208,7 +231,7 @@
 //! **It does nothing for the multiplier.** Six starts on `times` give 59.5 of 64 with it and 59.5
 //! without. Multiplying is not adding three wires together, whatever counting is.
 //!
-//! # Stretching the memory, which turns out not to be one
+//! # Stretching the memory, which costs its passes and nothing else
 //!
 //! `hold N` runs N further steps after the word has arrived, with the input rows at nought, so
 //! whatever the chip still knows has to be in the state rows. Six starts on the sequential counter:
@@ -223,11 +246,15 @@
 //! passes through after the last bit of the word. It is not monotone and `hold 1` is the worst of
 //! the six, which is the spread of the starts rather than anything about holding.
 //!
-//! **And the reason is that nothing is being held.** The report now says when the state rows stop
-//! changing: after step 4 of 8 at `hold 4` and after step 4 of 20 at `hold 16`, on every one of the
-//! sixteen inputs. Three ones arriving reads 9, 12, 13, 15 and then 15 for as long as you like. The
-//! search built a latch at a fixed point, so the hold is free for any length rather than for the
-//! ones that were measured — and it is not a memory that could have decayed.
+//! **On most starts nothing is being held.** The report says when the state rows stop changing, and
+//! at `hold 16` eight starts give 4, 19, 3, 19, 3, 4, 19 and 3 of 20. On five of the eight the
+//! search built a latch: three ones arriving reads 9, 12, 13, 15 and then 15 for as long as it is
+//! asked to, on every one of the sixteen inputs, so that hold would hold for any length rather than
+//! for the length measured.
+//!
+//! **On the other three it does not, and holding is free anyway.** This file first read the latch
+//! off one start and wrote it down as the reason. It is not the reason: whatever the state is doing
+//! during the empty steps, the score does not notice.
 //!
 //! What it does cost is its passes, which are the whole of the frame: 48 passes a tick at 212.8 us
 //! on the device, 96 at 400.4 and 240 at 970.0, the lowest of three starts each.
@@ -731,7 +758,7 @@ const GENERATIONS: u32 = 4_000;
 const BATCH: u32 = 20;
 
 /// How many words every kernel declares.
-const BINDINGS: u32 = 10;
+const BINDINGS: u32 = 11;
 
 /// Four words: the tick and the parity.
 const PARAMS: u32 = 0;
@@ -758,6 +785,13 @@ const KEEP: u32 = 8;
 /// **The score is one number and the three answers behind it are not.** Anything that weighs the
 /// answers against each other has to see them apart, and so does anything that reports on one.
 const SPLIT: u32 = 9;
+
+/// The answer bits a folded exam caught on their way past, one a step.
+///
+/// **The last chip's block is where the writes that are not answers go.** Every row of a step
+/// stores here and only the answer row's value is wanted, so the others are addressed past the end
+/// rather than made conditional, which would be a read-modify-write between them.
+const SAID: u32 = 10;
 
 /// Seven words: how many chips changed, then two workgroup counts of three words — one for a pass
 /// over every wire of them, one for a pass over the chips themselves.
@@ -1186,6 +1220,25 @@ fn feed(
         kernel.load_at(WIRE, at)?
     };
 
+    // **Folded, this step's read of the last column is also an answer.** `feed` already has it, so
+    // catching it here costs one store and no pass of its own.
+    let total = exam.steps + exam.hold;
+    let caught = step.checked_sub(1).filter(|_| exam.fold).and_then(|was| {
+        was.checked_sub(total - exam.outputs).filter(|slot| *slot + 1 < exam.outputs)
+    });
+    if let Some(slot) = caught {
+        let uint = kernel.index_type();
+        let wide = kernel.module().constant_u32(exam.outputs * cases)?;
+        let base = kernel.module().i_mul(uint, chip, wide)?;
+        let along = kernel.module().constant_u32(slot * cases)?;
+        let held = kernel.module().i_add(uint, base, along)?;
+        let mine = kernel.module().i_add(uint, held, case)?;
+        let spare = kernel.module().constant_u32(colony * exam.outputs * cases)?;
+        let top = is(&mut kernel, row, none)?;
+        let at = pick(&mut kernel, top, mine, spare)?;
+        kernel.store_at(SAID, at, carried)?;
+    }
+
     let fan_at = kernel.module().constant_u32(fan)?;
     let feeding = above(&mut kernel, fan_at, row)?;
     let past = kernel.module().constant_u32(fan + state)?;
@@ -1337,7 +1390,7 @@ fn propagate(
 /// decides, and between two chips that are equally right the one with fewer gates wins. The host
 /// takes it apart again for the report.
 fn tally(subgroup: u32, cases: u32, colony: u32, exam: &Exam) -> Result<Vec<u32>, LaneError> {
-    let Exam { outputs, lean, apart, weigh, slack, .. } = *exam;
+    let Exam { outputs, lean, apart, weigh, slack, fold, .. } = *exam;
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let none = kernel.module().constant_u32(0)?;
@@ -1349,14 +1402,23 @@ fn tally(subgroup: u32, cases: u32, colony: u32, exam: &Exam) -> Result<Vec<u32>
     // output one the wire under it, and so on — the same place a one-bit exam reads, extended.
     let mut apiece = Vec::with_capacity(outputs as usize);
     for output in 0..outputs {
-        let row = kernel.module().constant_u32(output * apart)?;
+        let row = kernel.module().constant_u32(if fold { 0 } else { output * apart })?;
         let mut got = kernel.module().constant_u32(0)?;
         for case in 0..cases {
             let which = kernel.module().constant_u32(case)?;
             let want = kernel.load_at(TARGET, which)?;
             let asked = kernel.load_at(KEEP, which)?;
-            let at = wire(&mut kernel, chip, COLUMNS - 1, row, which, cases)?;
-            let said = kernel.load_at(WIRE, at)?;
+            // Folded, every answer but the last was caught by `feed` on the step it went past.
+            let said = if fold && output + 1 < outputs {
+                let wide = kernel.module().constant_u32(outputs * cases)?;
+                let base = kernel.module().i_mul(uint, chip, wide)?;
+                let along = kernel.module().constant_u32(output * cases + case)?;
+                let at = kernel.module().i_add(uint, base, along)?;
+                kernel.load_at(SAID, at)?
+            } else {
+                let at = wire(&mut kernel, chip, COLUMNS - 1, row, which, cases)?;
+                kernel.load_at(WIRE, at)?
+            };
             // **Both sides carry a mask.** A bit the exam left out counts for nothing either way, on
             // the input side and the output side alike, so a partial specification gives a partial
             // score rather than a wrong one.
@@ -1534,6 +1596,12 @@ struct Exam {
     lean: u32,
     /// How many pieces the input word is cut into, one arriving a step.
     steps: u32,
+    /// Whether the answers come off one row a step instead of off one row each.
+    ///
+    /// **Folded, the chip has to know which step it is on.** Answer `k` is whatever the top wire of
+    /// the last column held at step `steps + hold − outputs + k`, so nothing but the state rows
+    /// tells one step from the next.
+    fold: bool,
     /// How many further steps run after the word has arrived, with the input rows at nought.
     ///
     /// **This is the only thing that asks the memory to hold rather than to work.** During a hold
@@ -1659,6 +1727,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut weigh = 0;
     let mut slack = 0;
     let mut hold = 0;
+    let mut fold = false;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
     let mut lean = 0;
@@ -1689,6 +1758,9 @@ fn read(text: &str) -> Result<Exam, String> {
                     .next()
                     .and_then(|it| it.parse::<u32>().ok())
                     .ok_or_else(|| say("`slack` wants a number"))?;
+            }
+            (Some("fold"), _) => {
+                fold = word.next() != Some("0");
             }
             (Some("hold"), _) => {
                 hold = word
@@ -1897,6 +1969,14 @@ fn read(text: &str) -> Result<Exam, String> {
     if weigh != 0 && outputs < 2 {
         return Err("`weigh` needs more than one answer to weigh".to_string());
     }
+    if fold && state == 0 {
+        return Err(
+        "`fold` needs `state`: without it the chip cannot tell one step from the next".to_string(),
+        );
+    }
+    if fold && steps + hold < outputs {
+        return Err(format!("`fold` wants {outputs} steps to answer in, and there are {}", steps + hold));
+    }
     if hold != 0 && state == 0 {
         return Err("`hold` with no `state` holds nothing: the rows are the only memory".to_string());
     }
@@ -1912,7 +1992,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, hold, state,
+        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, hold, fold, state,
         colony, island, seed, want, ask, name,
     })
 }
@@ -1931,6 +2011,8 @@ fn stirred(seed: &mut u32) -> u32 {
 /// to what the exam and the padding say.
 fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
     let fan = exam.bits / exam.steps;
+    let total = exam.steps + exam.hold;
+    let mut caught = vec![0_u32; exam.outputs as usize];
     let mut last: Vec<u32> = vec![0; ROWS as usize];
     for step in 0..exam.steps + exam.hold {
         let keep = |row: u32| last.get(row as usize).copied().unwrap_or(0);
@@ -1972,9 +2054,23 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
                 .collect();
             column = next;
         }
+        if let Some(held) = (step + exam.outputs)
+            .checked_sub(total)
+            .and_then(|slot| caught.get_mut(slot as usize))
+        {
+            *held = column.first().copied().unwrap_or(0);
+        }
         last = column;
     }
-    // The answer is the top `outputs` wires after the last step, packed as the exam packs it.
+    // The answer is the top `outputs` wires after the last step, packed as the exam packs it — or,
+    // folded, the top wire at the last `outputs` steps, which `caught` collected on the way.
+    if exam.fold {
+        return caught
+            .iter()
+            .enumerate()
+            .filter(|&(_, &it)| it == 1)
+            .fold(0_u32, |held, (at, _)| held | (1 << at));
+    }
     (0..exam.outputs)
         .filter(|&at| last.get((at * exam.apart) as usize).copied().unwrap_or(0) == 1)
         .fold(0_u32, |held, at| held | (1 << at))
@@ -2460,6 +2556,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         7,
         cases as usize,
         ((colony + 1) * exam.outputs) as usize,
+        ((colony + 1) * exam.outputs * cases) as usize,
     ];
     let mut arena = host.resident(&sizes, &held)?;
     for (binding, words) in sizes.iter().enumerate() {
