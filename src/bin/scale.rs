@@ -14,62 +14,88 @@
 //!
 //! `Resident::frame` times a submit and a fence around the work, and on this machine that costs
 //! 37 µs whatever is inside it — `tests/floor.rs` prices it. Measured that way every size looked
-//! like "a hundred and something", and a change that halved the work was invisible — worse,
-//! the first version of the coarse gate *appeared to make things slower* and nearly went in the bin
-//! on that evidence.
+//! like "a hundred and something", and a change that halved the work was invisible.
 //!
 //! `Resident::frames` records twenty frames into one command buffer. The round trip is paid once
-//! and the work twenty times, so what comes back is the work. Six arrangements, measured:
+//! and the work twenty times, so what comes back is the work.
+//!
+//! # Six arrangements, all measured on one afternoon
+//!
+//! **Every column was taken on one machine state against one `simdr`.** Each is a worktree at the
+//! commit that introduced it, built and run round-robin three times, and all eighteen runs reported
+//! `listed` at 768 — the same program throughout. Host clock, µs:
 //!
 //! ```text
-//!         cells     ungated       gated      listed      staged     narrowed          kept
-//!       262 144       66 us       79 us       57 us       44 us        35 us   27 - 29 us
-//!     1 048 576       92 us       79 us       57 us       44 us        35 us   28 - 29 us
-//!     4 194 304      161 us       79 us       59 us       44 us        36 us   28 - 29 us
-//!    16 777 216      323 us      144 us       60 us       46 us        36 us   29 - 32 us
+//!         cells       gated      listed      staged    narrowed        kept         now
+//!       262 144   36.6–36.8   57.9–61.8   43.3–44.3   33.9–34.3   27.4–27.6   27.3–28.8
+//!     1 048 576   37.0–37.4   57.6–63.6   42.9–44.0   34.1–36.6   27.5–29.5   27.7–28.1
+//!     4 194 304   41.4–42.7   58.0–58.7   43.6–44.8   34.4–36.3   27.9–28.2   28.1–28.3
+//!    16 777 216   60.3–61.5   59.4–62.0   45.3–46.8   36.2–36.3   29.5–29.5   29.7–30.9
 //! ```
 //!
-//! *Ungated* is a workgroup a block, every block. *Gated* is the same dispatch with a vote that
-//! lets a cold block exit early — which flattens the middle and leaves the largest size paying for
-//! 3 × 16 384 workgroups that do one load and then nothing. *Listed* is the coarse hierarchy: those
-//! three passes dispatched over a compacted list of the blocks that hold something, so a cold block
-//! is not launched at all.
+//! *Gated* is `47cf09a`: a workgroup a block, every block, with a vote that lets a cold one exit
+//! early. *Listed* is `da7c7b8`, the coarse hierarchy. *Staged* is `a7d9fce`, the same passes in
+//! eleven stages. *Narrowed* is `ea75656`, `DRAW_INDIRECT` in four barriers instead of ten. *Kept*
+//! is `9eb4577`, the command buffer recorded once and submitted again. *Now* is `HEAD`.
 //!
-//! **The last three columns are not about work at all.** By then the frame was sixteen passes with a
-//! barrier between each, and a barrier is a full pipeline flush. Priced by taking five passes out at
-//! a size where none of them had anything to do — 60.2 µs to 41.2 µs, so about 3.8 µs a barrier —
-//! and sixteen of those is very nearly the whole frame. *Staged* is the same sixteen passes in
-//! eleven stages, which is `crate::live::wired` saying which of them do not read what their
-//! neighbours write.
+//! **Two columns this file used to carry are gone, and the reason is the point.** *Ungated* — no
+//! vote at all — read 66, 92, 161 and 323, and *gated* read 79, 79, 79 and 144. Both arrived in
+//! `245a786`, "Recover grit from the conversation log": they were taken on a codebase that is not in
+//! this history, by a method that cannot be inspected. *Ungated* has no commit here to retake it at,
+//! because the vote is in that first commit. *Gated* has one, and at it the numbers are the row
+//! above — building it against the `simdr` of the day before moves nothing, so the engine is not the
+//! difference.
 //!
-//! That 3.8 µs was a **wide** barrier, and the next column is why it is not the number any more:
-//! `tests/floor.rs` prices a narrowed one at 1004 ns and a dispatch at 224 ns, on an apparatus that
-//! has no simulation in it at all.
+//! **On the numbers that are here, the coarse hierarchy did not pay for itself when it went in.**
+//! *Listed* is 21 µs worse than *gated* at the smallest size and a wash at the largest: it adds five
+//! passes to a frame that still put a wide barrier after every pass, and 21.3 µs over five passes is
+//! 4.3 µs each — which is the wide barrier, priced this time by adding rather than removing. The
+//! three columns after it are what made the hierarchy worth keeping.
 //!
-//! *Narrowed* is the same eleven stages with `DRAW_INDIRECT` named only in the four barriers that
-//! precede a dispatch reading its count from a buffer. `Resident` had it in all ten, on the written
-//! grounds that naming it "costs nothing and cannot be forgotten" — the second half was true and the
-//! first was not, by a fifth of the frame.
+//! # What the hierarchy is worth now
+//!
+//! Three arrangements of `HEAD`. The middle dispatches `decay`, `mark` and `gather` over every block
+//! instead of over the coarse list; the right one also drops the five passes that build that list.
+//! Device clock, µs, three runs each, and `tests/live.rs` passes in all three — so they compute the
+//! same simulation and differ only in price:
+//!
+//! ```text
+//!         cells   over the list   list built, not used   neither built nor used
+//!       262 144     24.40–24.49            20.81–20.85              14.38–14.45
+//!     1 048 576     24.95–25.03            25.61–25.64              19.16–19.19
+//!     4 194 304     24.95–25.04            43.63–43.66              37.41–49.02
+//!    16 777 216     25.13–25.18          115.44–115.50            108.81–108.86
+//! ```
+//!
+//! **Building the list costs 6.2–6.7 µs at every size**, which is the middle column against the
+//! right one — a constant, because `Plan::over` bounds the tiles at `per_block` and one workgroup
+//! scans them all.
+//!
+//! **Using it costs 10 µs of 24 at 262 144 cells and saves 84 µs of 109 at 16 777 216.** It turns
+//! somewhere between 1 048 576 and 4 194 304, and no size in between was measured. `decisions/DR-0003`.
+//!
+//! # The stages, the barriers and the recording
+//!
+//! **The last three columns of the first table are not about work at all.** By *listed* the frame
+//! was sixteen passes with a barrier between each. *Staged* is those sixteen in eleven stages, which
+//! is `crate::live::wired` saying which of them do not read what their neighbours write.
+//!
+//! *Narrowed* is `DRAW_INDIRECT` named only in the four barriers that precede a dispatch reading its
+//! count from a buffer. `Resident` had it in all ten, on the written grounds that naming it "costs
+//! nothing and cannot be forgotten" — the second half was true and the first was not, by a fifth of
+//! the frame. `tests/floor.rs` prices a narrowed barrier at 1004 ns and a dispatch at 224 ns, on an
+//! apparatus with no simulation in it at all.
 //!
 //! *Kept* is the command buffer recorded once and submitted again. Nothing that changes between
 //! frames is in a recording — a dispatch names a pipeline and a count, and `Groups::From` reads even
 //! the count out of a buffer at execution — so a frame the same shape as the last needs no second
-//! recording. Worth about 7 µs of **host** time a frame here, and it needed a second command buffer
-//! to be worth anything at all: transfers were recorded into the frame's, so the four brush words
-//! this file writes between batches threw the frame away every time. *Recorded sixteen times,
-//! reused nought* before; two and fourteen after, and the two are the warm-up and the first batch,
-//! which differ in how many frames they hold.
+//! recording. It needed a second command buffer to be worth anything at all: transfers were recorded
+//! into the frame's, so the four brush words this file writes between batches threw the frame away
+//! every time. *Recorded sixteen times, reused nought* before; two and fourteen after.
 //!
-//! **Every column here is a host clock, and the file now prints a device one beside it.** `Resident`
-//! writes two timestamps around the recorded work, and three runs put the frame at 24–26 µs on the
-//! card against 27–31 µs of wall — so the difference is the submission and the fence, and the card
-//! figure is both smaller and flatter.
-//!
-//! **The last column is a range and the other five are not.** Five runs put *kept* at 27–29 µs and
-//! the largest size at 29–32; a single figure taken on the day read 25 to 27, which is below every
-//! one of those five. The other columns were each measured when they went in and have not been taken
-//! again, so they carry whatever the machine was doing then. Comparing across them is comparing
-//! days.
+//! **Every column of the first table is a host clock, and the file prints a device one beside it.**
+//! `Resident` writes two timestamps around the recorded work, and *now* against *kept* says those
+//! two writes cost nothing this apparatus can see.
 //!
 //! **What the table is for** is the flatness rather than any one number: sixty-four times the world
 //! for two microseconds more, with nothing in the frame proportional to the grid.

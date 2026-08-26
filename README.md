@@ -8,14 +8,14 @@ this repository is: a sparse-grid stream compaction engine, built on
 [`simdr`](../simdr), with a sand simulation on top of it to prove the claim.
 
 ```text
-       cells      quads       on card         wall     stepped    of grid
-      262 144     65 536    24 - 25 µs   27 - 29 µs        768        85×
-    1 048 576    262 144    25 - 25 µs   28 - 29 µs        768       341×
-    4 194 304  1 048 576    25 - 26 µs   29 - 30 µs        768      1365×
-   16 777 216  4 194 304    25 - 25 µs   30 - 31 µs        768      5461×
+       cells      quads        on card           wall     stepped    of grid
+      262 144     65 536  24.4 - 24.5 µs  27.3 - 29.2 µs      768        85×
+    1 048 576    262 144  24.9 - 25.1 µs  27.7 - 29.1 µs      768       341×
+    4 194 304  1 048 576  24.9 - 25.5 µs  28.1 - 29.0 µs      768      1365×
+   16 777 216  4 194 304  25.1 - 25.3 µs  29.6 - 30.9 µs      768      5461×
 ```
 
-**Sixty-four times the world for under a microsecond more on the card**, over three runs. `on card`
+**Sixty-four times the world for under a microsecond more on the card**, over nine runs. `on card`
 is the device's own clock — two timestamps around the recorded work; `wall` is what a caller waits,
 which adds a submission and a fence. The last column is the ratio between what
 was stepped and what exists, and it is the number this repository was written to print.

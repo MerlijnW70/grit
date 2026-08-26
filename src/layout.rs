@@ -122,8 +122,9 @@ pub const HOT: u32 = 12;
 /// [`HOT`] made the passes that produce the work list *skip* a cold block. It did not stop them
 /// being **dispatched** for one: `decay`, `mark` and `gather` still ran a workgroup per block, and
 /// at sixteen million cells that is 3 × 16 384 workgroups doing one load and a vote before they
-/// exit. `src/bin/scale.rs` measured the whole of the growth from four million cells to sixteen —
-/// 79 µs to 144 — and there is nothing else in that loop whose size is the world's.
+/// exit. `src/bin/scale.rs` measures that arrangement at 37–49 µs on the device at four million
+/// cells and 108.8–108.9 at sixteen, and there is nothing else in that loop whose size is the
+/// world's.
 ///
 /// So the compaction is applied to itself. These seven bindings are the same hierarchy as
 /// [`BUCKETS`] through [`INDIRECT`], over a different input: not one word a quad, but one word a
