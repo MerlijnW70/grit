@@ -124,11 +124,15 @@ pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 ///
 /// # What comes back is stages, not passes
 ///
-/// A barrier sits between stages and not inside one, and it costs about 3.8 µs on this machine —
-/// which at a size where no pass has any work to do is very nearly the whole frame. So the second
-/// half of this function is a dependency argument: sixteen passes in eleven stages, and the comment
-/// beside them names every seam. [`crate::Resident::staged`] and
+/// A barrier sits between stages and not inside one, and `tests/floor.rs` prices one at 996–1009 ns
+/// against 210–245 ns for a dispatch. At a size where no pass has any work to do, ten of them are
+/// most of the frame. So the second half of this function is a dependency argument: sixteen passes
+/// in eleven stages, and the comment beside them names every seam. [`crate::Resident::staged`] and
 /// [`crate::Resident::staged_frames`] are what take them.
+///
+/// The grouping was worth 60 µs to 44 when it went in, against a barrier that then cost about
+/// 3.8 µs — `Resident` named `DRAW_INDIRECT` in all ten of them at the time, and `DR-0002` is what
+/// that turned out to be worth.
 ///
 /// # And why the picture is an argument rather than something a caller appends
 ///

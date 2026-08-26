@@ -1386,10 +1386,13 @@ impl Resident<'_> {
     /// The same, over passes a caller has said are not all ordered against each other.
     ///
     /// **The measurement that made this worth having.** [`Resident::frames`] puts every pass in a
-    /// stage of its own, which is a barrier between each of them — and a barrier is not free. Five
-    /// passes taken out of `grit`'s seventeen took the frame from 60.2 µs to 41.2 µs at a size where
-    /// none of them had any work to do, which prices a barrier at about 3.8 µs and the whole
-    /// arrangement at very nearly the frame.
+    /// stage of its own, which is a barrier between each of them, and `tests/floor.rs` prices a
+    /// barrier at 996–1009 ns against 210–245 ns for a dispatch. Ten of them are most of a frame at
+    /// a size where no pass has any work to do.
+    ///
+    /// It was 3.8 µs a barrier when this went in, measured by taking five passes out of `grit`'s
+    /// seventeen — 60.2 µs to 41.2 — and that number was a barrier naming `DRAW_INDIRECT`, which all
+    /// ten did then. `decisions/DR-0002` is what that turned out to be worth.
     ///
     /// So the passes that do not read what their neighbours write want saying so, and this is the
     /// batched timing for them. `crate::live::wired` is where that grouping is decided.
