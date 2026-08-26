@@ -168,6 +168,31 @@
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
 //!
+//! # Sixteen rows, which cost half as much again and buy nothing
+//!
+//! `ROWS` is the one number the whole file is derived from, so doubling it is a constant. It
+//! doubles the cells, the genome and the wire buffer, and it costs 345.4 us a generation on the
+//! device against 212.8 for the same forty-eight passes — 1.62 times, for twice the grid.
+//!
+//! Six starts each at 4096 chips, the kit with `maj` and `sum`:
+//!
+//! ```text
+//!                                          of its perfect     inputs entirely right
+//!   times, apart 2                         58.5 of 64         10.6 of 16
+//!   times, apart 4                         58.6               11.1
+//!   times, steps 2 state 2, apart 4        56.5                9.3
+//!   times, steps 2 state 4, apart 4        56.8               10.0
+//!   times, steps 4 state 4, apart 4        55.8                9.3
+//!   count, apart 3                         43.8 of 48         12.0
+//! ```
+//!
+//! At eight rows and the same colony `times` gives 58.8 and `count` 44.3. **Nothing moved.** Eight
+//! starts on the sequential counter at four, eight and twelve state rows give 14.2, 13.7 and 14.0
+//! of 16, so the extra memory is not doing anything either.
+//!
+//! `ROWS` is left at eight. What sixteen rows bought was the measurement that says the multiplier
+//! was never short of rows.
+//!
 //! # A gate that adds, which is the half of an adder that was missing
 //!
 //! `maj` of the wire above, the wire below and the wire straight ahead is the carry out of a full
@@ -251,9 +276,13 @@
 //! ```
 //!
 //! Six starts each. **It does not come out, and neither more depth nor more time is why.** Twice
-//! the columns is worth 0.3 of 64. Counting in time is what solved `count` and here it loses three
-//! of 64: four answers, two input rows and the bottom row are seven of the eight, so the state has
-//! nowhere to be that is not already an answer.
+//! the columns is worth 0.3 of 64, and counting in time — which is what solved `count` — loses
+//! three of 64 here.
+//!
+//! This file first said the reason was that the grid had run out of rows, four answers and two
+//! input rows and the bottom row being seven of the eight. That was a guess and it is wrong: at
+//! sixteen rows, where `steps 2 state 2 apart 4` puts the state nowhere near an answer, the
+//! sequential multiplier is 56.5 of 64 against 58.6 for the same grid asked all at once.
 //!
 //! **Three of the four product bits come out perfect and one never does.** The report reads
 //! `[16, 12, 16, 16]` on start after start, and the short one is bit one, which is
