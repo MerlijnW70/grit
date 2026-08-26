@@ -166,6 +166,16 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
     }
 
     let asked = u64::from(FRAMES.div_ceil(BATCH * 2));
+    // **`listed` is the canary on any timing taken from this file, and it is necessary rather than
+    // sufficient.** A change that alters what the loop computes hands back a timing that belongs to
+    // another program, and this column is how that shows: dropping `DRAW_INDIRECT` from every
+    // barrier once reported a third off the frame with `listed` at 471 instead of 768, because the
+    // settle was dispatching over a stale count.
+    //
+    // It does not catch everything. Setting five passes to `Groups::Fixed(0)` left `listed` at 768
+    // and was still a different program — without those passes the hot-block list is never rebuilt
+    // and three passes fall back to a workgroup a block, which changes how many workgroups run and
+    // not how many quads are listed. `decisions/DR-0001`.
     let listed = listed_total / asked.max(1);
     let share = f64::from(quads) / (listed.max(1) as f64);
     println!(
