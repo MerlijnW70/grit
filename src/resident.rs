@@ -24,7 +24,7 @@ use crate::host::{Error, Host};
 /// than from a caller who would have to read it back first. Reading it back is a submit and a fence
 /// — about a hundred microseconds by `decisions/DR-0008`'s measurement — to learn a number the
 /// device already had.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Groups {
     /// A count the host knows.
     ///
@@ -39,6 +39,44 @@ pub enum Groups {
         /// Which word of it the three begin at.
         at: usize,
     },
+}
+
+/// What the command buffer already holds, so that a frame the same shape as the last is not
+/// recorded again.
+///
+/// # Why a frame can be recorded once and submitted many times
+///
+/// Because **none of what changes between frames is in the recording.** A dispatch names a pipeline
+/// and a workgroup count; a descriptor set names buffers. What a frame actually differs by is what
+/// those buffers *hold*, and a command buffer does not carry that. `Groups::From` is the sharpest
+/// case: the count is read out of a buffer at the `DRAW_INDIRECT` stage, so a recording that says
+/// "dispatch from binding eight" is correct on every frame however the count changes.
+///
+/// So the recording is a function of exactly the three things below, and a caller that hands over
+/// the same three wants the same commands. `grit`'s loop hands over the same three every frame; a
+/// caller that varies a workgroup count between calls — `hyperia`'s card tier does, per token —
+/// gets a miss and pays what it used to.
+///
+/// # What it is worth
+///
+/// About 7 µs a frame at seventeen passes, measured with [`Resident::recording`], against a frame of
+/// 35 µs once the round trip is spread over twenty of them. It is **host** time, which is what makes
+/// it worth more than the number suggests: it is spent on the thread that ought to be waiting for
+/// something else.
+///
+/// # And what invalidates it
+///
+/// [`Resident::once`] records into the same command buffer, so every staged write and every read
+/// throws this away. That is the whole of the invalidation, and it is why this is set to `None`
+/// there rather than reasoned about here.
+#[derive(Debug, PartialEq, Eq)]
+struct Recorded {
+    /// The passes, grouped as the caller grouped them.
+    stages: Vec<Vec<Groups>>,
+    /// Which buffers are copied out at the end, and how much of each.
+    out: Vec<(vk::Buffer, u64)>,
+    /// How many frames were recorded back to back.
+    times: u32,
 }
 
 /// A buffer and the memory under it.
@@ -114,6 +152,8 @@ pub struct Resident<'host> {
     pipelines: Vec<vk::Pipeline>,
     commands: vk::CommandPool,
     command: vk::CommandBuffer,
+    /// The second command buffer, for one-off copies. See `Recorded` for why it is not the first.
+    transfer: vk::CommandBuffer,
     fence: vk::Fence,
     /// The submission on the device, if there is one.
     ///
@@ -154,6 +194,10 @@ pub struct Resident<'host> {
     poked: u64,
     /// How long a fence is waited on before the device is presumed lost.
     patience: Duration,
+    /// What the command buffer holds, if it holds a frame. See [`Recorded`].
+    held: Option<Recorded>,
+    /// How many submissions went out over a recording that was already there.
+    reused: u64,
 }
 
 impl Host {
@@ -300,7 +344,7 @@ impl Host {
 
             let (layout, pool, set) = self.describe(&buffers)?;
             let (pipeline_layout, shaders, pipelines) = self.compile(layout, modules)?;
-            let (commands, command) = self.record_into()?;
+            let (commands, command, transfer) = self.record_into()?;
             let fence = self
                 .device()
                 .create_fence(&vk::FenceCreateInfo::default(), None)?;
@@ -325,11 +369,14 @@ impl Host {
                 pipelines,
                 commands,
                 command,
+                transfer,
                 fence,
                 flight: None,
                 tickets: 0,
                 cached,
                 patience: Resident::PATIENCE,
+                held: None,
+                reused: 0,
             })
         }
     }
@@ -506,22 +553,31 @@ impl Host {
     /// # Safety
     ///
     /// As [`Host::allocate`].
-    unsafe fn record_into(&self) -> Result<(vk::CommandPool, vk::CommandBuffer), Error> {
+    unsafe fn record_into(
+        &self,
+    ) -> Result<(vk::CommandPool, vk::CommandBuffer, vk::CommandBuffer), Error> {
         let create = vk::CommandPoolCreateInfo::default()
             .queue_family_index(self.family())
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         // SAFETY: the family is the one the device was created with.
         let pool = unsafe { self.device().create_command_pool(&create, None) }?;
 
+        // **Two, and the second is what makes a kept recording worth keeping.** A frame is recorded
+        // into the first and left there; a one-off copy — every staged write and every read — is
+        // recorded into the second. They used to be one buffer, so a single parameter word written
+        // between two frames threw the frame away and it was recorded again. Measured on `grit`'s
+        // loop, which writes four brush words between batches: **recorded sixteen times, reused
+        // nought.** See `Recorded`.
         let allocate = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
+            .command_buffer_count(2);
         // SAFETY: the pool was just created by this device.
         let buffers = unsafe { self.device().allocate_command_buffers(&allocate) }?;
         let command = buffers.first().copied().unwrap_or_default();
+        let transfer = buffers.get(1).copied().unwrap_or_default();
 
-        Ok((pool, command))
+        Ok((pool, command, transfer))
     }
 }
 
@@ -684,12 +740,13 @@ impl Resident<'_> {
         }
 
         let region = [vk::BufferCopy::default().size(bytes.max(4))];
+        // Lifted out of the closure: `once` takes `&mut self` now, so that it can forget the frame
+        // it is about to record over, and a closure reading `self` would be a second borrow.
+        let from = self.staging.handle;
         // SAFETY: both buffers are live and the region is inside both.
         unsafe {
-            self.once(|device, command| {
-                device.cmd_copy_buffer(command, self.staging.handle, handle, &region)
-            })
-            .map(|()| false)
+            self.once(|device, command| device.cmd_copy_buffer(command, from, handle, &region))
+                .map(|()| false)
         }
     }
 
@@ -783,10 +840,11 @@ impl Resident<'_> {
         let region = [vk::BufferCopy::default()
             .dst_offset(offset)
             .size(bytes.max(4))];
+        let from = self.staging.handle;
         // SAFETY: both buffers are live and the region is inside both.
         unsafe {
             self.once(|device, command| {
-                device.cmd_copy_buffer(command, self.staging.handle, handle, &region);
+                device.cmd_copy_buffer(command, from, handle, &region);
             })
         }
     }
@@ -930,10 +988,11 @@ impl Resident<'_> {
 
         let region = [vk::BufferCopy::default().size(bytes.max(4))];
         let began = std::time::Instant::now();
+        let into = self.staging.handle;
         // SAFETY: as in `write`.
         unsafe {
             self.once(|device, command| {
-                device.cmd_copy_buffer(command, handle, self.staging.handle, &region);
+                device.cmd_copy_buffer(command, handle, into, &region);
             })
         }?;
         self.copying += began.elapsed();
@@ -1317,6 +1376,20 @@ impl Resident<'_> {
         (self.recording, self.recorded)
     }
 
+    /// How many submissions went out over commands that were already there. See [`Recorded`].
+    ///
+    /// Against [`Resident::recording`]'s second number, this is the hit rate: a caller that hands
+    /// over the same passes and the same grouping every frame records once and reuses for ever,
+    /// and one that varies a workgroup count between calls records every time.
+    ///
+    /// **A caller that expects the first and measures the second has a bug rather than a slow
+    /// frame** — something in its stage list is changing that it did not mean to change, and this
+    /// is the only place that would say so.
+    #[must_use]
+    pub const fn reused(&self) -> u64 {
+        self.reused
+    }
+
     /// The recording, `times` frames over.
     fn run_times(
         &mut self,
@@ -1337,12 +1410,42 @@ impl Resident<'_> {
         let began = std::time::Instant::now();
         let took;
 
+        let commands = [self.command];
+        let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+
+        // What was asked for, in the form the command buffer can be asked whether it already holds.
+        let wanted = Recorded {
+            stages: stages.iter().map(|one| one.to_vec()).collect(),
+            out: out.to_vec(),
+            times,
+        };
+        if self.held.as_ref() == Some(&wanted) {
+            // SAFETY: nothing is in flight — `start` refuses while something is — and the recording
+            // below is made *without* `ONE_TIME_SUBMIT`, so the command buffer is still in the
+            // executable state and may be submitted again as it stands.
+            unsafe {
+                device.reset_fences(&[self.fence])?;
+                device.queue_submit(self.host.queue(), &submit, self.fence)?;
+            }
+            self.reused += 1;
+            return Ok(());
+        }
+
+        // **Forgotten before it is rebuilt, not after.** A recording that fails part way through
+        // leaves the command buffer in a state nobody can describe, and every `?` below is a place
+        // that can happen. What is remembered has to stop being true at the moment it does.
+        self.held = None;
+
         // SAFETY: nothing is in flight — `start` is the only caller and it refuses while something
         // is — so resetting the command buffer here cannot touch a running submission.
         unsafe {
             device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())?;
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // **No `ONE_TIME_SUBMIT`, which is what makes the reuse above legal.** That flag tells
+            // the implementation the recording will be submitted once and is free to be invalid
+            // afterwards; without it the buffer returns to the executable state and may go again.
+            // Nothing here needs `SIMULTANEOUS_USE`: two submissions never overlap, because there is
+            // one fence and `start` refuses a second while the first is outstanding.
+            let begin = vk::CommandBufferBeginInfo::default();
             device.begin_command_buffer(self.command, &begin)?;
 
             device.cmd_bind_descriptor_sets(
@@ -1504,12 +1607,12 @@ impl Resident<'_> {
             device.end_command_buffer(self.command)?;
             took = began.elapsed();
 
-            let commands = [self.command];
-            let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
             device.reset_fences(&[self.fence])?;
             device.queue_submit(self.host.queue(), &submit, self.fence)?;
         }
 
+        // Only now, with the whole recording behind it and nothing left that can fail.
+        self.held = Some(wanted);
         self.recording += took;
         self.recorded += 1;
 
@@ -1528,10 +1631,14 @@ impl Resident<'_> {
     where
         F: FnOnce(&ash::Device, vk::CommandBuffer),
     {
-        // **The one command buffer again.** A staged write records and submits, so it cannot happen
-        // while a frame is in flight. A *direct* write does not come through here at all — it is a
-        // copy into mapped device memory with nothing submitted — which is why a caller with
-        // resizable BAR may upload during a frame and a caller without it may not.
+        // **The one fence.** A staged write records and submits, so it cannot happen while a frame
+        // is in flight. A *direct* write does not come through here at all — it is a copy into
+        // mapped device memory with nothing submitted — which is why a caller with resizable BAR
+        // may upload during a frame and a caller without it may not.
+        //
+        // The command *buffer* is a second one, and that is not a tidiness. Recording here into the
+        // frame's buffer threw away whatever it held, and the frame was then recorded afresh — which
+        // is what a caller writing one parameter word between two frames does. See [`Recorded`].
         self.live()?;
         if self.flight.is_some() {
             return Err(Error::StillInFlight);
@@ -1539,14 +1646,14 @@ impl Resident<'_> {
         let device = self.host.device();
         // SAFETY: the fence is waited on before returning, so nothing is in flight.
         unsafe {
-            device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())?;
+            device.reset_command_buffer(self.transfer, vk::CommandBufferResetFlags::empty())?;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            device.begin_command_buffer(self.command, &begin)?;
-            record(device, self.command);
-            device.end_command_buffer(self.command)?;
+            device.begin_command_buffer(self.transfer, &begin)?;
+            record(device, self.transfer);
+            device.end_command_buffer(self.transfer)?;
 
-            let commands = [self.command];
+            let commands = [self.transfer];
             let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
             device.reset_fences(&[self.fence])?;
             device.queue_submit(self.host.queue(), &submit, self.fence)?;

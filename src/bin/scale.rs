@@ -19,14 +19,14 @@
 //! on that evidence.
 //!
 //! `Resident::frames` records twenty frames into one command buffer. The round trip is paid once
-//! and the work twenty times, so what comes back is the work. Five arrangements, measured:
+//! and the work twenty times, so what comes back is the work. Six arrangements, measured:
 //!
 //! ```text
-//!         cells     ungated       gated      listed      staged     narrowed
-//!       262 144       66 us       79 us       57 us       44 us        35 us
-//!     1 048 576       92 us       79 us       57 us       44 us        35 us
-//!     4 194 304      161 us       79 us       59 us       44 us        36 us
-//!    16 777 216      323 us      144 us       60 us       46 us        36 us
+//!         cells     ungated       gated      listed      staged     narrowed        kept
+//!       262 144       66 us       79 us       57 us       44 us        35 us       25 us
+//!     1 048 576       92 us       79 us       57 us       44 us        35 us       26 us
+//!     4 194 304      161 us       79 us       59 us       44 us        36 us       26 us
+//!    16 777 216      323 us      144 us       60 us       46 us        36 us       27 us
 //! ```
 //!
 //! *Ungated* is a workgroup a block, every block. *Gated* is the same dispatch with a vote that
@@ -47,8 +47,17 @@
 //! grounds that naming it "costs nothing and cannot be forgotten" — the second half was true and the
 //! first was not, by a fifth of the frame.
 //!
+//! *Kept* is the command buffer recorded once and submitted again. Nothing that changes between
+//! frames is in a recording — a dispatch names a pipeline and a count, and `Groups::From` reads even
+//! the count out of a buffer at execution — so a frame the same shape as the last needs no second
+//! recording. Worth about 7 µs of **host** time a frame here, and it needed a second command buffer
+//! to be worth anything at all: transfers were recorded into the frame's, so the four brush words
+//! this file writes between batches threw the frame away every time. *Recorded sixteen times,
+//! reused nought* before; two and fourteen after, and the two are the warm-up and the first batch,
+//! which differ in how many frames they hold.
+//!
 //! **What the table is for** is the flatness rather than any one number: sixty-four times the world
-//! for one microsecond more, with nothing in the frame proportional to the grid.
+//! for two microseconds more, with nothing in the frame proportional to the grid.
 //!
 //! # The pour is the same at every size
 //!

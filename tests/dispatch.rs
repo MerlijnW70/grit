@@ -307,3 +307,54 @@ fn a_workgroup_count_written_by_one_stage_is_read_by_the_next() {
         ran / width.max(1)
     );
 }
+
+/// A frame recorded once is submitted again, and a write in between does not undo that.
+///
+/// # The two halves, and why they are one test
+///
+/// `Resident` used to reset and re-record the command buffer on every call, though the comment
+/// beside the counter said the quiet part out loud: *the structure does not change between calls;
+/// only what the parameters buffer holds does.* At seventeen passes that recording is about 7 µs of
+/// host time a frame, against a frame of 35 — so it is kept now, keyed on the passes, their grouping
+/// and how many frames were asked for.
+///
+/// Keeping it is only worth anything if it survives what a caller actually does between frames,
+/// which is **write a parameter**. A staged write is a recorded copy, and it used to be recorded
+/// into the same command buffer — so `grit`'s own loop, which writes four brush words between
+/// batches, recorded sixteen times and reused nought. Transfers have a command buffer of their own
+/// now.
+///
+/// And keeping it is only *safe* if a second submission of the same commands sees the second frame's
+/// data. It does, because none of what changes is in the recording — but that is an argument, and
+/// this is the check. The write between the two frames puts a number there that the first frame
+/// never saw, and the answer has to be built on it.
+#[test]
+fn a_frame_is_recorded_once_and_a_write_between_two_does_not_undo_it() {
+    let Some(host) = device("a_frame_is_recorded_once_and_a_write_between_two_does_not_undo_it")
+    else {
+        return;
+    };
+    let module = bump(host.width()).expect("a kernel");
+    let mut held = host.resident(&[1], &[&module]).expect("a device buffer");
+    let groups = [Groups::Fixed(1)];
+
+    held.write(0, &[0]).expect("a clear");
+    held.frame(&groups).expect("the first frame");
+
+    // A staged write — this resident is not direct, so it is a recorded copy and a submission.
+    held.write(0, &[100]).expect("a parameter");
+    held.frame(&groups).expect("the second frame");
+
+    assert_eq!(
+        held.read(0, 1).expect("a read"),
+        vec![101],
+        "the second frame did not see the write, so a kept recording is a stale answer"
+    );
+    assert_eq!(
+        held.reused(),
+        1,
+        "the second frame was recorded again — a write between two frames is not supposed to cost \
+         that, and {} recordings say it did",
+        held.recording().1
+    );
+}
