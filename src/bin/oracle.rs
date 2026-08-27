@@ -28,7 +28,7 @@
 //!   band 8          split the rows into bands of eight that cannot read each other
 //!   feeds 1         show the word to the first band only and starve the rest
 //!   keep grid.txt   write the winner's grid out when the run ends
-//!   start grid.txt  fill the colony with that grid instead of drawing one
+//!   start g.txt 64  put 64 copies of that grid into the drawn colony
 //!   gates ... over  the one gate that crosses a band, one offset up — a carry
 //!   fold 1          read the answers off one row, one a step, instead of one row each
 //!   renew 8         after eight batches with no gain, draw the colony again but for the best
@@ -177,6 +177,53 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # Three ways of being thriftier, and what each of them costs
+//!
+//! Four bands, each holding the whole word and answering one bit, is the widest arrangement there
+//! is. `2x2+1` sits at 121.3 of 128 in it. Three economies were measured against that, six starts
+//! each, and all three cost.
+//!
+//! **Sharing the time instead of the copper.** The same exam cut into five steps on one eight-row
+//! grid, the answers folded onto one row or read off separate ones:
+//!
+//! ```text
+//!   folded, hold 3, state 4                     108.6 of 128
+//!   folded, hold 3, state 6                     109.1
+//!   folded, hold 5, state 6                     105.8
+//!   folded, hold 3, state 6, linger             104.6
+//!   unfolded, apart 2, state 3, one overlap     107.5
+//!   unfolded, apart 2, state 1, no overlap      102.6
+//!   unfolded, apart 1, state 3, three overlaps   98.3
+//! ```
+//!
+//! Twelve to twenty-three of 128 worse than the bands, whichever way it is arranged.
+//!
+//! **Sharing the colony.** A solved two-by-two multiplier put into the drawn colony as a minority:
+//!
+//! ```text
+//!   aliens        0      1     64   1024   16 384
+//!   of 128    121.3  121.3  120.8  120.8    115.6
+//! ```
+//!
+//! One alien is swamped and gives the drawn colony's answer to the digit. Sixty-four and a thousand
+//! cost half a point. Filling the colony costs 5.7. **There is no fraction at which handing an
+//! earlier answer to a later exam is worth anything here.**
+//!
+//! **Sharing the word.** The bands as stages of a pipeline rather than four copies, with `over` in
+//! the kit so what a band knows can cross:
+//!
+//! ```text
+//!                                of 128   crossings kept
+//!   every band fed, no over      121.3     0
+//!   every band fed, with over    119.5    32.0
+//!   two bands fed, with over     117.8    36.8
+//!   one band fed, with over      115.8    38.6
+//! ```
+//!
+//! The crossings survive in every one of them and are paid for in every one of them. On an adder,
+//! where a starved band would otherwise answer with a constant, the crossing was worth twelve of
+//! 48; here nothing is starved unless it is made to be, and making it so costs 5.5.
 //!
 //! # Where the accumulator breaks, which is one bit after the multiply
 //!
@@ -1971,8 +2018,13 @@ struct Exam {
     /// **A run is one draw, and this is how a draw is kept.** Evolving a small exam and handing
     /// its answer to a bigger one is the only way of stacking runs there is here.
     keep: Option<String>,
-    /// A grid to fill the colony with instead of drawing it, from an earlier exam's `keep`.
+    /// A grid to put into the drawn colony, from an earlier exam's `keep`, and how many copies.
+    ///
+    /// **A colony of one answer has no spread to select on.** Filling every chip with a kept grid
+    /// is worse than not stacking at all, so what is stacked is a minority.
     start: Option<String>,
+    /// How many copies of `start` go in, or nought for [`KEPT`].
+    aliens: u32,
     /// How many rows a band is, or `ROWS` for one band, which is what it was.
     ///
     /// **A band is a chip of its own.** Its gates cannot read across the boundary, it gets its own
@@ -2121,6 +2173,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut feeds = 0;
     let mut keep = None;
     let mut start = None;
+    let mut aliens = 0;
     let mut renew = 0;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
@@ -2170,6 +2223,7 @@ fn read(text: &str) -> Result<Exam, String> {
             }
             (Some("start"), _) => {
                 start = word.next().map(str::to_owned);
+                aliens = word.next().and_then(|it| it.parse().ok()).unwrap_or(0);
             }
             (Some("band"), _) => {
                 band = word
@@ -2445,8 +2499,8 @@ fn read(text: &str) -> Result<Exam, String> {
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, band, feeds, keep, start, ladder, weigh, slack, allowed, noise, lean,
-        steps, hold, linger,
+        bits, outputs, apart, band, feeds, keep, start, aliens, ladder, weigh, slack, allowed,
+        noise, lean, steps, hold, linger,
         fold,
         renew,
         state,
@@ -3107,10 +3161,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
-            println!("  starting from {path}, {} cells in {KEPT} chips", held.len());
+            let many = if exam.aliens == 0 { KEPT } else { exam.aliens.min(colony) };
+            println!("  starting from {path}, {} cells in {many} chips", held.len());
             let mut fresh = draw(&mut seed);
             let span = CELLS as usize;
-            for slot in (0..colony as usize).step_by((colony / KEPT).max(1) as usize) {
+            for slot in (0..colony as usize).step_by((colony / many).max(1) as usize) {
                 if let Some(now) = fresh.get_mut(slot * span..(slot + 1) * span) {
                     now.copy_from_slice(&held);
                 }
