@@ -171,6 +171,36 @@
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
 //!
+//! # Breeding a clock, and how long a tune it can whistle
+//!
+//! Folded, the answers are one row read at several steps, so an exam whose answer is the same for
+//! every input is an exam about time alone. `0 -> 0101` and `1 -> 0101` asks for a wire that goes
+//! high, low, high, low whatever it is shown, which is an oscillator. It comes out 8 of 8 on every
+//! start, and the state trace reads 4, 5, 4, 5.
+//!
+//! It is not limited to two. `010101`, `001001`, `01010101`, `000100010001` and `011010011010` all
+//! come out perfect on six starts of six, so a repeating tune of twenty-four steps is no harder
+//! than one of four. What is harder is a tune that does not repeat. Eight starts, `state 4`, on the
+//! prefixes of one arbitrary string:
+//!
+//! ```text
+//!   length      8    10    12    14
+//!   perfect   8/8   5/8   4/8   0/8
+//! ```
+//!
+//! **Length is not what bounds it; being incompressible is.** Twenty-four steps of `011010` is
+//! easy and fourteen steps of nothing in particular is out of reach.
+//!
+//! Some of that is the machine and the rest is the search. A chip with `state` rows has 2^state
+//! states, so an arbitrary tune longer than that cannot be played at all: twelve steps at `state 3`
+//! is nought of six and at `state 4` is two. But twenty steps at `state 5` is thirty-two states for
+//! a twenty-step tune, and it is still nought of six — there the machine can and the search does
+//! not.
+//!
+//! Two checks were in the way and both were about rows. `outputs` was capped at seven and answers
+//! had to be a row apart; folded there is one answer row and the cap is that an answer packs into
+//! one word.
+//!
 //! # Folding the answers into time, which costs more than the rows it frees
 //!
 //! Three answers need three rows of the last column. `fold` takes them off one row instead, one a
@@ -1972,8 +2002,10 @@ fn read(text: &str) -> Result<Exam, String> {
                 outputs = word
                     .next()
                     .and_then(|it| it.parse::<u32>().ok())
-                    .filter(|&it| (1..ROWS).contains(&it))
-                    .ok_or_else(|| say("`outputs` wants a number from one to seven"))?;
+                    // Rows are what bounds this unfolded, and the row check below says so;
+                    // folded, the bound is that an answer is packed into one word.
+                    .filter(|&it| (1..32).contains(&it))
+                    .ok_or_else(|| say("`outputs` wants a number from one to thirty-one"))?;
             }
             (Some("inputs"), _) => {
                 let how = word
@@ -2079,7 +2111,9 @@ fn read(text: &str) -> Result<Exam, String> {
             bits / steps
         ));
     }
-    if outputs > 0 && (outputs - 1) * apart >= ROWS - 1 {
+    // Folded, every answer comes off the same row, so how many there are is a question about steps
+    // rather than about rows.
+    if !fold && outputs > 0 && (outputs - 1) * apart >= ROWS - 1 {
         return Err(format!(
             "{outputs} answers {apart} rows apart do not fit above the bottom row"
         ));
