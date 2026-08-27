@@ -180,6 +180,34 @@
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
 //!
+//! # Handing the circuit over, as code that has been checked against the grid
+//!
+//! The report writes the winner out as straight-line bitwise code. It is folded on the way: a
+//! constant on either side of a gate settles it, a gate of a value with itself settles it, a wire
+//! is a rename rather than a line, a three-wire gate that loses a wire to a constant becomes a
+//! two-wire one and folds again, and what no answer reaches is dropped. A full adder comes out in
+//! 26 lines and the four-band multiplier in 129.
+//!
+//! **Every line is then worked through for every input and matched against the grid.** If the two
+//! ever disagree nothing is offered at all, so what is handed over is the circuit and not a
+//! description of one. Only a combinational grid is written: steps, memory, a hold and a fold are a
+//! state machine, and what one of those is in straight-line code is a longer question than this
+//! answers.
+//!
+//! # Cascading, which reaches what one grid cannot
+//!
+//! `a·b + c` at six inputs is 243.5 of 256 and will not come out, because its middle answers are
+//! six-input functions and six is past the reach below. Cut before it is handed over, it is not:
+//!
+//! - A two-by-two multiplier is four four-input answers and comes out 64 of 64 in four bands.
+//! - A ripple-carry adder is a full adder repeated, and a full adder is two three-input answers.
+//!   On one grid it comes out 16 of 16 on six starts of six.
+//!
+//! **So the product and the sum are each exact, and the carry between them is a wire rather than
+//! something to be evolved.** That is a consequence of the two measurements above and not a third
+//! one: an exact multiplier followed by exact full adders computes `a·b + c` exactly, for any width
+//! of `c`, where asking one grid for the whole of it reaches 95%.
+//!
 //! # How far the engine reaches, which is four inputs
 //!
 //! One grid of eight rows and twelve columns, one answer, 16 384 chips with `renew 2`, and a truth
@@ -3341,6 +3369,286 @@ fn pulls(genome: &[u32], exam: &Exam) -> (u32, u32, u32, u32, usize, u32, u32) {
     (trades, gains, losses, flat, weakest, lifts, refused)
 }
 
+/// One line of the written-out circuit, before it is given a name.
+#[derive(Clone, Copy, PartialEq)]
+enum Line {
+    /// A constant, which is what the bottom row and an unused row put there.
+    Held(u32),
+    /// A pin of the input word.
+    Pin(u32),
+    /// The same value as another line, which is what a wire is.
+    Same(usize),
+    Not(usize),
+    And(usize, usize),
+    Or(usize, usize),
+    Xor(usize, usize),
+    /// An exclusive-or read back the other way, which is what a one on one side of one leaves.
+    Nxor(usize, usize),
+    Maj(usize, usize, usize),
+    Mux(usize, usize, usize),
+    Sum(usize, usize, usize),
+}
+
+impl Line {
+    /// Which lines this one reads.
+    fn feeds(self) -> Vec<usize> {
+        match self {
+            Self::Held(_) | Self::Pin(_) => Vec::new(),
+            Self::Same(a) | Self::Not(a) => vec![a],
+            Self::And(a, b) | Self::Or(a, b) | Self::Xor(a, b) | Self::Nxor(a, b) => vec![a, b],
+            Self::Maj(a, b, c) | Self::Mux(a, b, c) | Self::Sum(a, b, c) => vec![a, b, c],
+        }
+    }
+
+    /// How this line is referred to elsewhere: a constant and a rename need no name of their own.
+    fn call(self, cell: usize) -> String {
+        match self {
+            Self::Held(now) => now.to_string(),
+            Self::Pin(at) => format!("x{at}"),
+            Self::Same(a) => format!("w{a}"),
+            _ => format!("w{cell}"),
+        }
+    }
+
+    /// What this line does, or nothing where it does not need saying.
+    fn say(self, cell: usize, named: &[String]) -> Option<String> {
+        let held = |it: usize| named.get(it).cloned().unwrap_or_default();
+        let body = match self {
+            Self::Held(_) | Self::Pin(_) | Self::Same(_) => return None,
+            Self::Not(a) => format!("!{}", held(a)),
+            Self::And(a, b) => format!("{} & {}", held(a), held(b)),
+            Self::Or(a, b) => format!("{} | {}", held(a), held(b)),
+            Self::Xor(a, b) => format!("{} ^ {}", held(a), held(b)),
+            Self::Nxor(a, b) => format!("!({} ^ {})", held(a), held(b)),
+            Self::Maj(a, b, c) => {
+                format!("({0} & {1}) | ({0} & {2}) | ({1} & {2})", held(a), held(b), held(c))
+            }
+            Self::Mux(a, b, c) => format!("if {} {{ {} }} else {{ {} }}", held(b), held(a), held(c)),
+            Self::Sum(a, b, c) => format!("{} ^ {} ^ {}", held(a), held(b), held(c)),
+        };
+        Some(format!("let w{cell} = {body};"))
+    }
+
+    /// What this line is worth for a given input, which is how the check below works.
+    fn worth(self, case: u32, now: &[u32]) -> u32 {
+        let value = |it: usize| now.get(it).copied().unwrap_or(0);
+        match self {
+            Self::Held(it) => it,
+            Self::Pin(at) => (case >> at) & 1,
+            Self::Same(a) => value(a),
+            Self::Not(a) => 1 - value(a),
+            Self::And(a, b) => value(a).min(value(b)),
+            Self::Or(a, b) => value(a).max(value(b)),
+            Self::Xor(a, b) => (value(a) + value(b)) & 1,
+            Self::Nxor(a, b) => 1 - ((value(a) + value(b)) & 1),
+            Self::Maj(a, b, c) => (value(a) + value(b) + value(c)) / 2,
+            Self::Mux(a, b, c) => {
+                if value(b) == 1 {
+                    value(a)
+                } else {
+                    value(c)
+                }
+            }
+            Self::Sum(a, b, c) => (value(a) + value(b) + value(c)) & 1,
+        }
+    }
+}
+
+/// The winner as straight-line bitwise code, folded down and checked against the grid.
+///
+/// # Why this is folded and why it is checked
+///
+/// A grid is a picture; code is a thing another program runs. Written out cell by cell it is a line
+/// for every cell in the cone, and most of those are a constant being carried or a wire being
+/// renamed — folding them away is the difference between a transcript and something worth pasting.
+/// Every line is then worked through for every input and matched against [`runs`], so what is handed
+/// over is the circuit rather than a description of one. If the two disagree, nothing is offered.
+///
+/// **Only a combinational grid is written out.** Steps, memory and a hold are a state machine, and
+/// what one of those is in straight-line code is a longer question than this answers.
+fn written(genome: &[u32], exam: &Exam) -> Option<String> {
+    if exam.steps > 1 || exam.state > 0 || exam.hold > 0 || exam.fold {
+        return None;
+    }
+    let at = |column: u32, row: u32| (column * ROWS + row % ROWS) as usize;
+    let mut lines = vec![Line::Held(0); (COLUMNS * ROWS) as usize];
+    for row in 0..ROWS {
+        let (_, base, size) = banded(&exam.band, row);
+        let inside = row - base;
+        if let Some(slot) = lines.get_mut(at(0, row)) {
+            *slot = if inside < exam.bits {
+                Line::Pin(inside)
+            } else {
+                Line::Held(u32::from(inside == size - 1))
+            };
+        }
+    }
+    // **Folded as it is built.** A constant on either side of a gate settles it, a gate of a value
+    // with itself settles it, and a wire is a rename, so none of those ever becomes a line.
+    for column in 1..COLUMNS {
+        for row in 0..ROWS {
+            let kind = genome.get(((column - 1) * ROWS + row) as usize).copied().unwrap_or(0);
+            let from: Vec<usize> =
+                reads(kind, row, &exam.band).into_iter().map(|it| at(column - 1, it)).collect();
+            let same = |it: usize| from.get(it).copied().unwrap_or(0);
+            let held = |it: usize| lines.get(same(it)).copied().unwrap_or(Line::Held(0));
+            let known = |it: usize| match held(it) {
+                Line::Held(now) => Some(now),
+                _ => None,
+            };
+            // **Folding a three-wire gate leaves a two-wire one, and that one folds too.** These
+            // three are what the arms below hand their leftovers to, so a constant never survives
+            // being carried through a `maj` or a `sum`.
+            let seen = |at: usize| match lines.get(at).copied() {
+                Some(Line::Held(now)) => Some(now),
+                _ => None,
+            };
+            let and2 = |a: usize, b: usize| match (seen(a), seen(b)) {
+                (Some(0), _) | (_, Some(0)) => Line::Held(0),
+                (Some(_), _) => Line::Same(b),
+                (_, Some(_)) => Line::Same(a),
+                _ if a == b => Line::Same(a),
+                _ => Line::And(a, b),
+            };
+            let or2 = |a: usize, b: usize| match (seen(a), seen(b)) {
+                (Some(1), _) | (_, Some(1)) => Line::Held(1),
+                (Some(_), _) => Line::Same(b),
+                (_, Some(_)) => Line::Same(a),
+                _ if a == b => Line::Same(a),
+                _ => Line::Or(a, b),
+            };
+            // A one on one side of an exclusive-or inverts the other, and inverting something
+            // already folded is a matter of reading it back the other way.
+            let flip = |held: Line| match held {
+                Line::Held(now) => Some(Line::Held(1 - now)),
+                Line::Same(at) => Some(Line::Not(at)),
+                Line::Not(at) => Some(Line::Same(at)),
+                Line::Xor(a, b) => Some(Line::Nxor(a, b)),
+                Line::Nxor(a, b) => Some(Line::Xor(a, b)),
+                _ => None,
+            };
+            let xor2 = |a: usize, b: usize| match (seen(a), seen(b)) {
+                (Some(x), Some(y)) => Line::Held(x ^ y),
+                (Some(0), _) => Line::Same(b),
+                (_, Some(0)) => Line::Same(a),
+                (Some(_), _) => Line::Not(b),
+                (_, Some(_)) => Line::Not(a),
+                _ if a == b => Line::Held(0),
+                _ => Line::Xor(a, b),
+            };
+            let settled = match kind {
+                1 => and2(same(0), same(1)),
+                2 => or2(same(0), same(1)),
+                3 => xor2(same(0), same(1)),
+                4 => match (known(0), held(0)) {
+                    (Some(now), _) => Line::Held(1 - now),
+                    (_, Line::Not(back)) => Line::Same(back),
+                    _ => Line::Not(same(0)),
+                },
+                5 => match (known(0), known(1), known(2)) {
+                    (Some(0), _, _) => and2(same(1), same(2)),
+                    (Some(_), _, _) => or2(same(1), same(2)),
+                    (_, Some(0), _) => and2(same(0), same(2)),
+                    (_, Some(_), _) => or2(same(0), same(2)),
+                    (_, _, Some(0)) => and2(same(0), same(1)),
+                    (_, _, Some(_)) => or2(same(0), same(1)),
+                    _ => Line::Maj(same(0), same(1), same(2)),
+                },
+                6 => match known(1) {
+                    Some(1) => Line::Same(same(0)),
+                    Some(_) => Line::Same(same(2)),
+                    None => Line::Mux(same(0), same(1), same(2)),
+                },
+                7 => match (known(0), known(1), known(2)) {
+                    (Some(0), _, _) => xor2(same(1), same(2)),
+                    (_, Some(0), _) => xor2(same(0), same(2)),
+                    (_, _, Some(0)) => xor2(same(0), same(1)),
+                    (Some(_), _, _) => flip(xor2(same(1), same(2)))
+                        .unwrap_or(Line::Sum(same(0), same(1), same(2))),
+                    (_, Some(_), _) => flip(xor2(same(0), same(2)))
+                        .unwrap_or(Line::Sum(same(0), same(1), same(2))),
+                    (_, _, Some(_)) => flip(xor2(same(0), same(1)))
+                        .unwrap_or(Line::Sum(same(0), same(1), same(2))),
+                    _ => Line::Sum(same(0), same(1), same(2)),
+                },
+                _ => Line::Same(same(0)),
+            };
+            // A rename of a constant is that constant, so a chain of them never forms.
+            let settled = match settled {
+                Line::Same(back) => match lines.get(back).copied() {
+                    Some(Line::Held(now)) => Line::Held(now),
+                    Some(Line::Same(further)) => Line::Same(further),
+                    _ => Line::Same(back),
+                },
+                held => held,
+            };
+            if let Some(slot) = lines.get_mut(at(column, row)) {
+                *slot = settled;
+            }
+        }
+    }
+
+    // What the answers still reach, after the folding, is what is worth a name.
+    let ends: Vec<usize> =
+        (0..exam.outputs).map(|it| at(COLUMNS - 1, exam.answer_row(it))).collect();
+    let mut wanted = vec![false; lines.len()];
+    let mut left = ends.clone();
+    while let Some(now) = left.pop() {
+        if wanted.get(now).copied().unwrap_or(true) {
+            continue;
+        }
+        if let Some(slot) = wanted.get_mut(now) {
+            *slot = true;
+        }
+        left.extend(lines.get(now).copied().into_iter().flat_map(Line::feeds));
+    }
+    // A rename is called whatever it renames, and a rename always points backwards, so one pass
+    // in order is enough to give every line the name it is referred to by.
+    let mut named: Vec<String> = Vec::with_capacity(lines.len());
+    for (cell, held) in lines.iter().enumerate() {
+        let now = match *held {
+            Line::Same(back) => named.get(back).cloned().unwrap_or_default(),
+            other => other.call(cell),
+        };
+        named.push(now);
+    }
+
+    let mut out = String::new();
+    for (cell, held) in lines.iter().enumerate() {
+        if !wanted.get(cell).copied().unwrap_or(false) {
+            continue;
+        }
+        if let Some(line) = held.say(cell, &named) {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    for (which, &end) in ends.iter().enumerate() {
+        let held = named.get(end).cloned().unwrap_or_default();
+        out.push_str(&format!("  let y{which} = {held};\n"));
+    }
+
+    // **The check.** Nothing is offered that has not been worked through and matched.
+    let mask = (1 << exam.outputs) - 1;
+    for case in 0..exam.cases() {
+        let mut now = vec![0_u32; lines.len()];
+        for (cell, held) in lines.iter().enumerate() {
+            let settled = held.worth(case, &now);
+            if let Some(slot) = now.get_mut(cell) {
+                *slot = settled;
+            }
+        }
+        let says = ends
+            .iter()
+            .enumerate()
+            .filter(|&(_, &end)| now.get(end).copied().unwrap_or(0) == 1)
+            .fold(0_u32, |bits, (which, _)| bits | (1 << which));
+        if says != runs(genome, case, exam) & mask {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 /// The chip as something to look at: one letter a gate, the inputs down the left.
 ///
 /// **An arrow marks an answer wire.** Output nought is the top row of the last column, output one
@@ -3849,6 +4157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let held: Vec<String> = genome.iter().map(u32::to_string).collect();
         std::fs::write(path, held.join(" "))?;
         println!("  kept in {path}");
+    }
+    if let Some(code) = written(genome, &exam) {
+        println!("  the same circuit as code, worked through and matched against the grid:");
+        print!("{code}");
+        println!();
     }
     let again = scored(genome, &exam);
     let (whole, worst) = exactly(genome, &exam);
