@@ -27,6 +27,7 @@
 //!   linger 1        during a hold, keep the last slice on the wires instead
 //!   band 8          split the rows into bands of eight that cannot read each other
 //!   feeds 1         show the word to the first band only and starve the rest
+//!   apiece 1        select each band on its own answer, not on the chip's total
 //!   keep grid.txt   write the winner's grid out when the run ends
 //!   start g.txt 64  put 64 copies of that grid into the drawn colony
 //!   gates ... over  the one gate that crosses a band, one offset up — a carry
@@ -177,6 +178,44 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # The accumulator solved, by moving the separation into the score
+//!
+//! `2x2+1` sat at 121.3 of 128 and would not move for the colony, for depth, for the kit or for
+//! anything else tried. The report said where: bit nought is 32 of 32 on every start and the six or
+//! seven missing bits are spread over the other three, which is the carry chain of the addition.
+//! Bit one is worst, at 27 to 29, and it is the hard product bit with a carry term on top of it —
+//! `(a0·b1 xor a1·b0) xor (a0·b0 and c)`.
+//!
+//! Three knobs were measured against it and none of them is the answer. Twelve, eighteen and
+//! twenty-four columns give 122.0, 121.5 and 122.6. One, two, four and eight gates turned over by a
+//! mutation give 126.1, 126.3, 126.1 and 126.5. `maj` in the kit is worth 0.7 and `mux` costs 11.5.
+//!
+//! **What was wrong is that `band` separates the copper and not the score.** A chip whose band one
+//! is the best in the colony still loses to a chip that is better on the total, and its band one
+//! goes down with it. Three changes put the separation into the selection as well:
+//!
+//! - `apiece` makes each band copy from the neighbour's band only when *that band* is the better
+//!   one, reading the two numbers out of `SPLIT` where `select` read one out of `SCORE`.
+//! - A chip that took a band has changed, so it goes on the changed list — without that it could
+//!   keep a score describing a grid it no longer had.
+//! - A redraw keeps the best band from whichever chip held it, so what it carries over is a grid
+//!   that nothing in the colony was.
+//!
+//! ```text
+//!                                       of 128    perfect chips
+//!   as it was                            121.3    0 of 6
+//!   apiece                               125.6    0
+//!   apiece, best band kept, renew 8      127.0    2
+//!   apiece, best band kept, renew 2      127.8    5
+//!   the same at 65 536 chips             128.0    12 of 12
+//! ```
+//!
+//! **Every start, every input, every answer bit**, with the host's count and the card's agreeing on
+//! all twelve. It costs 7509 us a generation and redraws itself about sixty times on the way.
+//!
+//! At 16 384 chips it is seven of twelve. And it carries: `2x2+2`, the six-input accumulator that
+//! sat at 227.0 of 256, comes out at 244.0 on the same recipe, still with no perfect chip.
 //!
 //! # Three ways of being thriftier, and what each of them costs
 //!
@@ -1348,6 +1387,7 @@ fn select(
     colony: u32,
     island: u32,
     allowed: &[u32],
+    exam: &Exam,
 ) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -1394,23 +1434,49 @@ fn select(
     let theirs = kernel.load_at(SCORE, neighbour)?;
     let better = above(&mut kernel, theirs, ours)?;
     let take = kernel.module().i_mul(uint, my_turn, better)?;
-    // **Only what lost changes.** Mutating whenever a chip is not *ahead* of its neighbour means two
-    // equals churn for ever and a good genome is destroyed by the next turn it takes; this way a
-    // chip that drew or won keeps what it has, and only one that was beaten copies and is changed.
+    // **What is ahead is left alone.** `above` is a strict `>`, so a chip that beats its neighbour
+    // keeps what it has; a chip that drew is mutated but copies nothing, and one that lost copies
+    // and is mutated. This paragraph used to say a draw was left alone as well, which the line
+    // below has never done.
     //
     // **Except on the first tick**, where every score is nought, nobody is better than anybody, and
     // so nothing would ever be put on the list to be evaluated at all — which is a colony that sits
     // at nought for ever, and is what this did before the line below.
+    // **A band's own verdict, where the exam asked for one.** The cell's band is known while the
+    // kernel is being written, so each band's copy decision reads that band's own two numbers out
+    // of `SPLIT` instead of the chip's one out of `SCORE`.
+    let mut apiece = Vec::new();
+    if exam.apiece {
+        let wide = kernel.module().constant_u32(exam.outputs)?;
+        let ours_split = kernel.module().i_mul(uint, who, wide)?;
+        let theirs_split = kernel.module().i_mul(uint, neighbour, wide)?;
+        for which in 0..exam.outputs {
+            let off = kernel.module().constant_u32(which)?;
+            let here = kernel.module().i_add(uint, ours_split, off)?;
+            let there = kernel.module().i_add(uint, theirs_split, off)?;
+            let mine_now = kernel.load_at(SPLIT, here)?;
+            let theirs_now = kernel.load_at(SPLIT, there)?;
+            let better = above(&mut kernel, theirs_now, mine_now)?;
+            apiece.push(kernel.module().i_mul(uint, my_turn, better)?);
+        }
+    }
+
     let first = is(&mut kernel, tick, one)?;
     let ahead = above(&mut kernel, ours, theirs)?;
     let behind = minus(&mut kernel, one, ahead)?;
     let churn = kernel.module().i_mul(uint, my_turn, behind)?;
-    let either = kernel.module().i_add(uint, churn, first)?;
+    let mut either = kernel.module().i_add(uint, churn, first)?;
+    // **A band that was copied is a chip that changed.** Without this a chip whose total was ahead
+    // could take a band from its neighbour and stay off the changed list, keeping a score that
+    // describes a grid it no longer has.
+    for &taken in &apiece {
+        either = kernel.module().i_add(uint, either, taken)?;
+    }
     let restless = at_most(&mut kernel, either, 1)?;
 
-    // **Three gates at a time, not one.** With one the colony settles at 56 of 64 by generation two
-    // hundred and four times the colony does not move it: a single gate turned over is too small a
-    // step to leave the hollow it is in. `MUTATIONS` is what that number cost.
+    // **One gate at a time**, which is what `MUTATIONS` says and what this paragraph used to
+    // contradict. On `2x2+1` in four bands, six starts each, one, two, four and eight turned over
+    // at once give 126.1, 126.3, 126.1 and 126.5 of 128 — the number does not matter there.
     let mut seed = kernel.load_at(SEED, who)?;
     let mut spots = Vec::with_capacity(MUTATIONS as usize);
     for _ in 0..MUTATIONS {
@@ -1443,6 +1509,8 @@ fn select(
         let there = kernel.module().i_add(uint, theirs_at, off)?;
         let held = kernel.load_at(GENE, here)?;
         let other = kernel.load_at(GENE, there)?;
+        let which = (cell % ROWS) / exam.band.max(1);
+        let take = apiece.get(which as usize).copied().unwrap_or(take);
         let mut settled = pick(&mut kernel, take, other, held)?;
         for &(spot, fresh) in &spots {
             let at_spot = is(&mut kernel, spot, off)?;
@@ -2008,6 +2076,12 @@ struct Exam {
     /// draw from the starting grids and not the four thousand generations it then spends.
     /// Redrawing everything but the best turns the one draw into many without losing the best.
     renew: u32,
+    /// Whether a band is selected on its own answer instead of on the chip's total.
+    ///
+    /// **Bands separate the copper and not the score.** A chip whose band one is the best in the
+    /// colony still loses if its band three is poor, and its band one goes with it. With this, a
+    /// band copies from the neighbour's band only when that band is the better one.
+    apiece: bool,
     /// How many bands are shown the word, or nought for all of them.
     ///
     /// **A band that is fed can work anything out for itself.** Starving the rest is what makes a
@@ -2171,6 +2245,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut linger = false;
     let mut band = ROWS;
     let mut feeds = 0;
+    let mut apiece = false;
     let mut keep = None;
     let mut start = None;
     let mut aliens = 0;
@@ -2211,6 +2286,9 @@ fn read(text: &str) -> Result<Exam, String> {
                     .next()
                     .and_then(|it| it.parse::<u32>().ok())
                     .ok_or_else(|| say("`renew` wants a number of batches"))?;
+            }
+            (Some("apiece"), _) => {
+                apiece = word.next() != Some("0");
             }
             (Some("feeds"), _) => {
                 feeds = word
@@ -2476,6 +2554,11 @@ fn read(text: &str) -> Result<Exam, String> {
     if weigh != 0 && outputs < 2 {
         return Err("`weigh` needs more than one answer to weigh".to_string());
     }
+    if apiece && (band >= ROWS || apart != band) {
+        return Err(
+            "`apiece` wants `band` and `apart` the same, so an answer lives in a band".to_string(),
+        );
+    }
     if fold && state == 0 {
         return Err(
         "`fold` needs `state`: without it the chip cannot tell one step from the next".to_string(),
@@ -2499,8 +2582,8 @@ fn read(text: &str) -> Result<Exam, String> {
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, band, feeds, keep, start, aliens, ladder, weigh, slack, allowed,
-        noise, lean, steps, hold, linger,
+        bits, outputs, apart, band, feeds, apiece, keep, start, aliens, ladder, weigh, slack,
+        allowed, noise, lean, steps, hold, linger,
         fold,
         renew,
         state,
@@ -3066,7 +3149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // carry across the seam between them and nothing else does.
     let mut modules = vec![
         advance(width)?,
-        select(width, colony, exam.island, &exam.allowed)?,
+        select(width, colony, exam.island, &exam.allowed, &exam)?,
         ready(width, cases)?,
     ];
     for step in 0..exam.steps + exam.hold {
@@ -3265,20 +3348,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let at = scores.iter().enumerate().max_by_key(|&(_, it)| *it).map_or(0, |(at, _)| at);
             let mut fresh = draw(&mut seed);
             let span = CELLS as usize;
+            // **With `apiece` the best bands are in different chips.** Each is kept from whichever
+            // chip held it, so what a redraw carries over is a grid nothing in the colony was.
+            let mut best = genome
+                .get(at * span..(at + 1) * span)
+                .map(<[u32]>::to_vec)
+                .unwrap_or_else(|| vec![0; span]);
+            let apiece = arena.read(SPLIT as usize, (colony * exam.outputs) as usize)?;
+            let mut theirs = vec![0_u32; exam.outputs as usize];
+            if exam.apiece {
+                for which in 0..exam.outputs as usize {
+                    let from = (0..colony as usize)
+                        .max_by_key(|&chip| {
+                            apiece.get(chip * exam.outputs as usize + which).copied().unwrap_or(0)
+                        })
+                        .unwrap_or(0);
+                    if let Some(slot) = theirs.get_mut(which) {
+                        *slot = apiece
+                            .get(from * exam.outputs as usize + which)
+                            .copied()
+                            .unwrap_or(0);
+                    }
+                    for cell in 0..span {
+                        if (cell as u32 % ROWS) / exam.band.max(1) != which as u32 {
+                            continue;
+                        }
+                        if let (Some(now), Some(was)) =
+                            (best.get_mut(cell), genome.get(from * span + cell))
+                        {
+                            *now = *was;
+                        }
+                    }
+                }
+            }
             // **One copy of the best does not survive a generation**, because every chip is a
             // mutant of itself or its neighbour and the best is no exception. Spreading `KEPT`
             // copies across the colony is what makes the redraw keep anything at all.
             let mut blank = vec![0_u32; (colony + 1) as usize];
+            let mut apart = vec![0_u32; ((colony + 1) * exam.outputs) as usize];
             let step = (colony / KEPT).max(1) as usize;
             for slot in (0..colony as usize).step_by(step) {
-                if let (Some(was), Some(now)) = (
-                    genome.get(at * span..(at + 1) * span),
-                    fresh.get_mut(slot * span..(slot + 1) * span),
-                ) {
-                    now.copy_from_slice(was);
+                if let Some(now) = fresh.get_mut(slot * span..(slot + 1) * span) {
+                    now.copy_from_slice(&best);
                 }
                 if let (Some(held), Some(now)) = (held.get(at), blank.get_mut(slot)) {
-                    *now = *held;
+                    *now = if exam.apiece { theirs.iter().sum() } else { *held };
+                }
+                for (which, &was) in theirs.iter().enumerate() {
+                    if let Some(now) = apart.get_mut(slot * exam.outputs as usize + which) {
+                        *now = was;
+                    }
                 }
             }
             arena.write(GENE as usize, &fresh)?;
@@ -3286,6 +3405,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // reads the scores the last one left, so a fresh grid carrying the number its
             // predecessor earned would be copied over the one chip that was worth keeping.
             arena.write(SCORE as usize, &blank)?;
+            if exam.apiece {
+                arena.write(SPLIT as usize, &apart)?;
+            }
             arena.write_at(PARAMS as usize, 0, &[0])?;
             waited = 0;
             drawn_again += 1;
