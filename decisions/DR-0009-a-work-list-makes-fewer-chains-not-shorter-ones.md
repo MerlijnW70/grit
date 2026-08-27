@@ -26,5 +26,7 @@ of the work, the card holding fewer chains rather than running shorter ones.
 
 ## The Limit
 
-Both apparatus are demonstrations that are not part of the crate and are not kept, and one card at
-one width is all that was measured.
+Both apparatus were demonstrations that were never part of the crate, and both have since been
+removed: `src/bin/chip.rs` and `src/bin/ticket.rs` are gone, so the figures above cannot be re-run
+as they stand. What is here is the record of what they measured while they existed. One card at one
+width is all that was measured.
