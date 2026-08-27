@@ -180,6 +180,34 @@
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
 //!
+//! # How far the engine reaches, which is four inputs
+//!
+//! One grid of eight rows and twelve columns, one answer, 16 384 chips with `renew 2`, and a truth
+//! table with no structure in it at all. Six starts at each width:
+//!
+//! ```text
+//!   inputs          2      3        4        5        6
+//!   of its perfect  4/4    8/8   16/16   29.8/32  55.8/64
+//!   perfect chips   6/6    6/6     6/6      0/6      0/6
+//! ```
+//!
+//! **Up to four inputs it solves anything, every time. Past four it never solves an arbitrary
+//! function.** But width is not the whole of it: bit one of `a·b+c` with a one-bit `c` is five
+//! inputs too, and alone it gives 31.6 of 32 with four perfect chips in six. At the same width,
+//! structure is the difference between four of six and none.
+//!
+//! That is what the six-input accumulator runs into. Its per-answer line reads `[64, 57, 58, 64]`,
+//! and answers one and two are six-input functions. **Asked alone on a single eight-row grid, bit
+//! one gives 57.5 of 64 and bit two 57.8 — the same as they get inside the four-band chip.** So
+//! `band` and `apiece` have taken the problem apart completely and what is left is the engine's own
+//! ceiling, four times over. Sixteen thousand chips against sixty-five give 57.5 and 58.1: it is
+//! not a search budget.
+//!
+//! Everything else tried on it moves nothing. Twice the colony is 244.7 of 256 against 243.5. One,
+//! two, four and eight gates turned over by a mutation give 243.1, 243.6, 242.8 and 240.8. Two
+//! crossings — which are worth 39 to a starved band — are worth −9 here, 214.5 against 223.2,
+//! because no band is starved.
+//!
 //! # One wire across is worse than none and two are worth having
 //!
 //! `feeds` takes a count for each band now, so a band can be cut off from some of the input pins
