@@ -26,6 +26,7 @@
 //!   hold 4          four more steps after the word, with nothing arriving
 //!   linger 1        during a hold, keep the last slice on the wires instead
 //!   band 8          split the rows into bands of eight that cannot read each other
+//!   gates ... over  the one gate that crosses a band, one offset up — a carry
 //!   fold 1          read the answers off one row, one a step, instead of one row each
 //!   renew 8         after eight batches with no gain, draw the colony again but for the best
 //!   colony 65536    how many chips search at once — the way out of a local optimum
@@ -37,6 +38,7 @@
 //!   count           fill the table: how many ones there are, in binary
 //!   times           fill the table: the low half of the word times the high half
 //!   shift           fill the table: the low half shifted left by the high half
+//!   mac             fill the table: the first third times the second, plus the third
 //!   add             fill the table: the first half plus the second
 //!   10-1 -> 01      the inputs that pattern stands for, and what they answer
 //!   ---- -> --1     a dash on the left is every value; a dash on the right is not asked
@@ -173,6 +175,59 @@
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
 //!
+//! # A multiply-accumulate, which bands help and do not finish
+//!
+//! `mac` fills the table with the first third of the word times the second, plus the third. At
+//! `inputs 6` that is two bits by two bits plus two, sixty-four inputs and a four-bit answer, which
+//! is the arithmetic an accelerator is made of. Six starts, `and or xor not sum` with `renew 8`:
+//!
+//! ```text
+//!                                    of 256    inputs entirely right
+//!   one band, 4096 chips             200.3     20.8 of 64
+//!   four bands of 8, 4096            224.3     38.0
+//!   four bands of 8, 16 384          227.0     39.6
+//! ```
+//!
+//! **Bands are worth twenty-four of 256 and no perfect chip.** Sixty-four inputs of six bits is a
+//! bigger exam than sixteen of four, and separating the answers does not make it a small one.
+//!
+//! # One wire that crosses, which buys finding and costs size
+//!
+//! A band cannot read its neighbour, and a carry is exactly a thing that has to. `over` is the one
+//! gate that crosses: it reads the same offset one band up, and it is a wire rather than a gate of
+//! its own, so it is the least leakage that can be allowed.
+//!
+//! **It does not help the thing it was built for.** With it in the kit the multiply-accumulate is
+//! 221.8 of 256 against 227.0 without, over six starts, and ten crossings survive in the winner.
+//! Every band already holds the whole word, so a band can always work a carry out for itself, and
+//! the wire is a convenience the search pays for in width.
+//!
+//! **On an adder it buys something else.** `add` in bands, twelve starts with `lean wires`:
+//!
+//! ```text
+//!                              perfect chips   smallest one   crossings
+//!   and or xor not sum           1 of 12       124 gates      0
+//!   and or xor not sum over      8 of 12       141 gates      25.5
+//! ```
+//!
+//! Eight times as likely to come out and bigger when it does. The leak buys finding, not size.
+//!
+//! # How small a perfect multiplier gets, which is not very
+//!
+//! Eight starts on the banded multiplier at 65 536 chips, counting only the chips that scored 64 of
+//! 64:
+//!
+//! ```text
+//!                 perfect   smallest
+//!   no pressure   7 of 8    159 gates, 338 wires
+//!   lean wires    5 of 8    147 gates, 303 wires
+//!   lean 1        4 of 8    167 gates, 364 wires
+//! ```
+//!
+//! **Pressing on the size costs perfect chips and buys ten per cent.** And it is not short of time:
+//! sixteen thousand generations instead of four thousand gives the same chip, 182 gates and 366
+//! wires, on the start that was checked.
+//!
 //! # The full multiplier, solved by giving each answer its own copper
 //!
 //! The four answers were built from 96 to 100 per cent the same gates. `band` makes that
@@ -192,8 +247,9 @@
 //!   32 rows, four bands of 8, 65 536           64.0     6
 //! ```
 //!
-//! **Every start, every input, every answer bit.** One of them does it in 30 live gates reading 61
-//! wires, and the host's count and the card's agree. It costs 4150 us a generation.
+//! **Every start, every input, every answer bit.** The host's count and the card's agree, and it
+//! costs 4150 us a generation. The smallest of them carries the answer in 159 gates reading 338
+//! wires of the 352 cells.
 //!
 //! Two things this is not. It is not more room: thirty-two rows in one band is worse than eight
 //! rows in one band. And it is not a better layout: putting the two operands' bits in a different
@@ -424,8 +480,8 @@
 //!
 //! ```text
 //!                 wires read   three-wire gates   inputs entirely right
-//!   lean 1        153.0        24.3               13.6 of 16
-//!   lean wires    144.5        20.8               13.6
+//!   lean 1        160.0        26.0               13.6 of 16
+//!   lean wires    150.1        21.8               13.6
 //! ```
 //!
 //! **Both are down on every one of the six starts and correctness does not move.** The wiring comes
@@ -581,8 +637,8 @@
 //! and, when it is wrong, is wrong by nearly three — a count of four reported as one. A chip scored
 //! within one is never once more than one out, on any input, on any start.
 //!
-//! It is a little cheaper too, and less than the usual claim: with `lean` on, 46.8 gates against
-//! 54.8, for 6.3 inputs entirely right against 13.5.
+//! It is a little cheaper too, and less than the usual claim: with `lean` on, 49.1 gates against
+//! 57.3, for 6.3 inputs entirely right against 13.5.
 //!
 //! # Making it work under faults, which costs more than it buys
 //!
@@ -949,7 +1005,7 @@ const SETTLED: u32 = 64;
 const MIGRATE: u32 = 64;
 
 /// How many kinds of gate there are.
-const KINDS: u32 = 8;
+const KINDS: u32 = 9;
 
 /// How many gates a mutation turns over at once.
 const MUTATIONS: u32 = 1;
@@ -1510,7 +1566,16 @@ fn propagate(
     let at_a = wire(&mut kernel, chip, column - 1, up, case, cases)?;
     let at_b = wire(&mut kernel, chip, column - 1, down, case, cases)?;
     let at_w = wire(&mut kernel, chip, column - 1, row, case, cases)?;
+    // **The one thing that crosses a band.** Everything else wraps inside its own band; this reads
+    // the same offset one band up, which is where a carry has to come from.
+    let over_at = {
+        let back = kernel.module().constant_u32(ROWS - band)?;
+        let raised = kernel.module().i_add(uint, row, back)?;
+        let held = low_bits(&mut kernel, raised, ROWS.trailing_zeros())?;
+        wire(&mut kernel, chip, column - 1, held, case, cases)?
+    };
     let a = kernel.load_at(WIRE, at_a)?;
+    let crossing = if allowed.contains(&8) { Some(kernel.load_at(WIRE, over_at)?) } else { None };
     let b = kernel.load_at(WIRE, at_b)?;
     let straight = kernel.load_at(WIRE, at_w)?;
 
@@ -1563,7 +1628,7 @@ fn propagate(
 
     let mut answer = straight;
     let arms = [(1, Some(both)), (2, Some(either)), (3, Some(odd)), (4, Some(inverted)), (5, most),
-        (6, chosen), (7, carried)];
+        (6, chosen), (7, carried), (8, crossing)];
     for (number, value) in arms.into_iter().filter_map(|(at, held)| {
         held.filter(|_| allowed.contains(&at)).map(|held| (at, held))
     }) {
@@ -2050,8 +2115,9 @@ fn read(text: &str) -> Result<Exam, String> {
                         "maj" => 5,
                         "mux" => 6,
                         "sum" => 7,
+                        "over" => 8,
                         "not" => 4,
-                        _ => return Err(say("a gate is wire, and, or, xor, not, maj, mux or sum")),
+                        _ => return Err(say("a gate is wire, and, or, xor, not, maj, mux, sum or over")),
                     };
                     if !kinds.contains(&kind) {
                         kinds.push(kind);
@@ -2131,12 +2197,14 @@ fn read(text: &str) -> Result<Exam, String> {
                 ask = vec![0; 1 << how];
             }
             (Some(_), None) => return Err(say("`inputs` has to come first")),
-            (Some(filler @ ("parity" | "majority" | "equal" | "count" | "add" | "times" | "shift")), Some(how)) => {
+            (Some(filler @ ("parity" | "majority" | "equal" | "count" | "add" | "times" | "shift"
+                | "mac")), Some(how)) => {
                 let widest = match filler {
                     "count" => u32::BITS - how.leading_zeros(),
                     "add" => how / 2 + 1,
                     "times" => how,
                     "shift" => how / 2 + (1 << (how / 2)) - 1,
+                    "mac" => 2 * (how / 3),
                     _ => 1,
                 };
                 // **Fewer answer bits than the table needs is the low bits of it.** That is what
@@ -2146,6 +2214,9 @@ fn read(text: &str) -> Result<Exam, String> {
                     return Err(say(&format!(
                         "`{filler}` has {widest} answer bits and `outputs {outputs}` asks for more"
                     )));
+                }
+                if filler == "mac" && !how.is_multiple_of(3) {
+                    return Err(say("`mac` wants a number of inputs divisible by three"));
                 }
                 if matches!(filler, "add" | "times" | "shift") && how % 2 != 0 {
                     return Err(say(&format!("`{filler}` wants an even number of inputs")));
@@ -2162,6 +2233,11 @@ fn read(text: &str) -> Result<Exam, String> {
                         "count" => ones,
                         "add" => (case & ((1 << half) - 1)) + (case >> half),
                         "times" => (case & ((1 << half) - 1)) * (case >> half),
+                        "mac" => {
+                            let third = how / 3;
+                            let each = |at: u32| (case >> (at * third)) & ((1 << third) - 1);
+                            each(0) * each(1) + each(2)
+                        }
                         _ => (case & ((1 << half) - 1)) << (case >> half),
                     };
                     if let (Some(a), Some(b)) =
@@ -2343,6 +2419,7 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
                             }
                         }
                         Some(7) => (up + down + straight) & 1,
+                        Some(8) => read(row + ROWS - exam.band),
                         _ => straight,
                     }
                 })
@@ -2503,6 +2580,7 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
                             }
                         }
                         Some(7) => (up + down + straight) & 1,
+                        Some(8) => read(row + ROWS - exam.band),
                         _ => straight,
                     }
                 })
@@ -2552,6 +2630,7 @@ fn reads(kind: u32, row: u32, band: u32) -> Vec<u32> {
     match kind {
         0 | 4 => vec![row],
         5..=7 => vec![up, row, down],
+        8 => vec![row + ROWS - band],
         _ => vec![up, down],
     }
 }
@@ -2601,7 +2680,10 @@ fn live(genome: &[u32], exam: &Exam) -> Vec<bool> {
     let fan = exam.bits / exam.steps;
     let mut wanted = vec![false; (COLUMNS * ROWS) as usize];
     let at = |column: u32, row: u32| (column * ROWS + row % ROWS) as usize;
-    for row in 0..exam.outputs.max(fan + exam.state) {
+    // **Every row, not the first few.** This counted up to `outputs` or the state rows, whichever
+    // was further, and an answer read off a row past that was left out of its own cone: at
+    // `apart 3` it missed the third answer and at `apart 8` it missed three of four.
+    for row in 0..ROWS {
         let reads_it = (row % exam.apart == 0 && row / exam.apart < exam.outputs)
             || (row >= fan && row < fan + exam.state);
         if let Some(slot) = wanted.get_mut(at(COLUMNS - 1, row)).filter(|_| reads_it) {
@@ -2758,6 +2840,7 @@ fn drawn(genome: &[u32], bits: u32, outputs: u32, apart: u32, alive: &[bool]) ->
                 Some(5) => '#',
                 Some(6) => '?',
                 Some(7) => '+',
+                Some(8) => '|',
                 _ => '-',
             });
         }
@@ -3051,7 +3134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let alive = live(genome, &exam);
     println!("\n{}", drawn(genome, exam.bits, exam.outputs, exam.apart, &alive));
     println!(
-        "    - wire  & and  v or  ^ xor  ! not  # maj  ? mux  + sum  · dead  (<- an answer wire)"
+        "    - wire  & and  v or  ^ xor  ! not  # maj  ? mux  + sum  | over  · dead  (<- an answer)"
     );
     if exam.outputs > 1 {
         let apiece = each(genome, &exam);
@@ -3084,6 +3167,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
     let (live_gates, survived, whole) = faults(genome, &exam);
+    let across = alive
+        .iter()
+        .enumerate()
+        .filter(|&(cell, &it)| it && genome.get(cell).copied() == Some(8))
+        .count();
     let wide = alive
         .iter()
         .enumerate()
@@ -3100,6 +3188,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          them three at a time; the rest \
          are scenery."
     );
+    if exam.band < ROWS {
+        println!("  {across} of them cross a band, which is the only thing that does");
+    }
     println!(
         "  Breaking one live gate into a wire: {} of {live_gates} faults change nothing, {} cost the answer.",
         survived,
