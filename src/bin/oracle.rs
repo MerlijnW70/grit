@@ -19,6 +19,7 @@
 //!   slack 1         read the answer as a number and accept it within one
 //!   ladder 1        reveal one output bit at a time, widening when it is mastered
 //!   gates and or sum   the gates it draws from; wire is always in
+//!   gates 1 xor sum    the gates band one draws from, where the others keep theirs
 //!   noise 16        break one gate in sixteen each generation
 //!   lean wires      among equally right chips prefer the cheaper: 1 by gates, wires by wires
 //!   steps 4         cut the word into four, one piece a step — time
@@ -26,7 +27,7 @@
 //!   hold 4          four more steps after the word, with nothing arriving
 //!   linger 1        during a hold, keep the last slice on the wires instead
 //!   band 8,24,24,8  split the rows into bands that cannot read each other, one an answer
-//!   feeds 1         show the word to the first band only and starve the rest
+//!   feeds 6,2,2,6   how many input rows each band sees, starving it of the rest
 //!   apiece 1        select each band on its own answer, not on the chip's total
 //!   keep grid.txt   write the winner's grid out when the run ends
 //!   start g.txt 64  put 64 copies of that grid into the drawn colony
@@ -178,6 +179,54 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # One wire across is worse than none and two are worth having
+//!
+//! `feeds` takes a count for each band now, so a band can be cut off from some of the input pins
+//! rather than all of them, and `span` is a second crossing one row down from `over`. A six-bit
+//! adder in four bands of eight, four starts each, with only band nought shown the word:
+//!
+//! ```text
+//!                                              of 256   crossings kept
+//!   every band fed, no crossing                 213.7     0
+//!   band nought only, no crossing               164.0     0
+//!   band nought only, over                      153.0    44.2
+//!   band nought only, span                      162.7    49.7
+//!   band nought only, over and span             202.7    58.5
+//!   band nought only, mux instead of a crossing 143.0     0
+//! ```
+//!
+//! **164.0 on every start is what a starved band can say with a constant.** One crossing lands
+//! below it — the extra kind in the lottery costs about twenty, which the last row measures with a
+//! gate that crosses nothing, and one wire does not carry enough to pay for it. Two crossings carry
+//! enough: 202.7, within eleven of a chip that was never starved.
+//!
+//! Cutting the accumulator's two short bands off some pins does not help either — 175.0, 166.0,
+//! 164.5 and 164.0 as they are shown six, four, two and no pins — because a crossing in the kit
+//! costs more there than the pins were worth.
+//!
+//! **And a crossing contradicts `apiece`, which is now refused.** Per band selection compares a
+//! band against a band and a redraw composes the best of each out of different chips; both are
+//! meaningless once a band reads its neighbour, and the two together showed up as the host's count
+//! and the card's disagreeing.
+//!
+//! # A kit for each band, which does not beat one kit for all
+//!
+//! `gates 1 xor sum` gives band one a kit of its own — the lottery is per band even though the arms
+//! `propagate` works out are the union. The six-input accumulator's short bands are one and two, so
+//! they are the ones to squeeze. Four starts each, against 243.5 with one kit everywhere:
+//!
+//! ```text
+//!   bands 1 and 2 on xor sum            212.0 of 256
+//!   bands 1 and 2 on and xor sum        235.0
+//!   bands 1 and 2 on and xor not sum    239.7
+//!   bands 1 and 2 on and xor maj sum    243.2
+//!   bands 0 and 3 on and xor sum        214.5
+//! ```
+//!
+//! **Nothing beats the full kit.** `xor sum` is flat at 212.0 on every start, which is what a band
+//! that cannot build a product term is worth. And squeezing the two bands that already come out at
+//! 64 of 64 costs 29, so they are not carrying their answer in spite of those gates but with them.
 //!
 //! # How little copper a perfect accumulator needs, which is not little
 //!
@@ -1200,7 +1249,7 @@ const SETTLED: u32 = 64;
 const MIGRATE: u32 = 64;
 
 /// How many kinds of gate there are.
-const KINDS: u32 = 9;
+const KINDS: u32 = 10;
 
 /// How many gates a mutation turns over at once.
 const MUTATIONS: u32 = 1;
@@ -1532,18 +1581,25 @@ fn select(
         let spot = at_most(&mut kernel, drawn, CELLS - 1)?;
         seed = stir(&mut kernel, seed)?;
         // **Drawn from what the exam allows, not from every gate there is.** The index is picked
-        // and then turned into a kind, so a set of three is three kinds and never a fourth.
-        let wide = u32::try_from(allowed.len().max(1)).unwrap_or(1);
-        let rolled = low_bits(&mut kernel, seed, wide.next_power_of_two().trailing_zeros())?;
-        let which = at_most(&mut kernel, rolled, wide - 1)?;
-        let mut fresh = kernel.module().constant_u32(allowed.first().copied().unwrap_or(0))?;
-        for (index, &kind) in allowed.iter().enumerate().skip(1) {
-            let want = kernel.module().constant_u32(u32::try_from(index).unwrap_or(0))?;
-            let hit = is(&mut kernel, which, want)?;
-            let value = kernel.module().constant_u32(kind)?;
-            fresh = pick(&mut kernel, hit, value, fresh)?;
+        // and then turned into a kind, so a set of three is three kinds and never a fourth — and
+        // one kind a band, where the bands were given kits of their own.
+        let mut theirs = Vec::new();
+        for held in exam.kits.iter().map(Vec::as_slice).chain(std::iter::once(allowed)).take(
+            exam.kits.len().max(1),
+        ) {
+            let wide = u32::try_from(held.len().max(1)).unwrap_or(1);
+            let rolled = low_bits(&mut kernel, seed, wide.next_power_of_two().trailing_zeros())?;
+            let which = at_most(&mut kernel, rolled, wide - 1)?;
+            let mut fresh = kernel.module().constant_u32(held.first().copied().unwrap_or(0))?;
+            for (index, &kind) in held.iter().enumerate().skip(1) {
+                let want = kernel.module().constant_u32(u32::try_from(index).unwrap_or(0))?;
+                let hit = is(&mut kernel, which, want)?;
+                let value = kernel.module().constant_u32(kind)?;
+                fresh = pick(&mut kernel, hit, value, fresh)?;
+            }
+            theirs.push(fresh);
         }
-        spots.push((spot, fresh));
+        spots.push((spot, theirs));
     }
     let again = seed;
 
@@ -1559,8 +1615,9 @@ fn select(
         let which = banded(&exam.band, cell % ROWS).0;
         let take = apiece.get(which).copied().unwrap_or(take);
         let mut settled = pick(&mut kernel, take, other, held)?;
-        for &(spot, fresh) in &spots {
-            let at_spot = is(&mut kernel, spot, off)?;
+        for (spot, theirs) in &spots {
+            let fresh = theirs.get(which).or_else(|| theirs.first()).copied().unwrap_or(settled);
+            let at_spot = is(&mut kernel, *spot, off)?;
             let changing = kernel.module().i_mul(uint, at_spot, restless)?;
             settled = pick(&mut kernel, changing, fresh, settled)?;
         }
@@ -1737,10 +1794,16 @@ fn feed(
     let mut feeding = above(&mut kernel, fan_at, inside)?;
     // **A starved band's input rows are not input rows.** Everything it is going to know has to
     // arrive over the boundary.
-    if exam.feeds > 0 {
-        let many = kernel.module().constant_u32(exam.feeds)?;
-        let fed = above(&mut kernel, many, which_band)?;
-        feeding = kernel.module().i_mul(uint, feeding, fed)?;
+    if !exam.feeds.is_empty() {
+        // The band's own pin count, picked out of the list by which band this row is in.
+        let mut mine_fan = kernel.module().constant_u32(0)?;
+        for (at, &many) in exam.feeds.iter().enumerate() {
+            let index = kernel.module().constant_u32(u32::try_from(at).unwrap_or(0))?;
+            let hit = is(&mut kernel, which_band, index)?;
+            let held = kernel.module().constant_u32(many)?;
+            mine_fan = pick(&mut kernel, hit, held, mine_fan)?;
+        }
+        feeding = above(&mut kernel, mine_fan, inside)?;
     }
     let past = kernel.module().constant_u32(fan + state)?;
     let within = above(&mut kernel, past, inside)?;
@@ -1807,6 +1870,17 @@ fn propagate(
     };
     let a = kernel.load_at(WIRE, at_a)?;
     let crossing = if allowed.contains(&8) { Some(kernel.load_at(WIRE, over_at)?) } else { None };
+    // **A second lane over the same boundary**, one row further down, so what crosses is two wires
+    // rather than one.
+    let wider = if allowed.contains(&9) {
+        let back = kernel.module().constant_u32(ROWS - band.first().copied().unwrap_or(ROWS) + 1)?;
+        let raised = kernel.module().i_add(uint, row, back)?;
+        let held = low_bits(&mut kernel, raised, ROWS.trailing_zeros())?;
+        let at = wire(&mut kernel, chip, column - 1, held, case, cases)?;
+        Some(kernel.load_at(WIRE, at)?)
+    } else {
+        None
+    };
     let b = kernel.load_at(WIRE, at_b)?;
     let straight = kernel.load_at(WIRE, at_w)?;
 
@@ -1859,7 +1933,7 @@ fn propagate(
 
     let mut answer = straight;
     let arms = [(1, Some(both)), (2, Some(either)), (3, Some(odd)), (4, Some(inverted)), (5, most),
-        (6, chosen), (7, carried), (8, crossing)];
+        (6, chosen), (7, carried), (8, crossing), (9, wider)];
     for (number, value) in arms.into_iter().filter_map(|(at, held)| {
         held.filter(|_| allowed.contains(&at)).map(|held| (at, held))
     }) {
@@ -2100,6 +2174,13 @@ struct Exam {
     slack: u32,
     /// Whether the exam is revealed one output bit at a time instead of all at once.
     ladder: bool,
+    /// Which gates each band draws from, where a band was given its own set. Empty means every
+    /// band draws from `allowed`.
+    ///
+    /// **The lottery is per band even though the arms are not.** `propagate` works out every arm
+    /// the exam allows anywhere; what a band's kit decides is which of them a cell can be drawn or
+    /// mutated into.
+    kits: Vec<Vec<u32>>,
     /// Which gates the search draws from. Wire is always in it, because a grid needs somewhere
     /// for a signal to go.
     allowed: Vec<u32>,
@@ -2128,11 +2209,12 @@ struct Exam {
     /// colony still loses if its band three is poor, and its band one goes with it. With this, a
     /// band copies from the neighbour's band only when that band is the better one.
     apiece: bool,
-    /// How many bands are shown the word, or nought for all of them.
+    /// How many input rows each band is shown, or empty for all of them.
     ///
-    /// **A band that is fed can work anything out for itself.** Starving the rest is what makes a
-    /// wire across the boundary necessary rather than convenient.
-    feeds: u32,
+    /// **A band that is fed can work anything out for itself.** Starving one is what makes a wire
+    /// across the boundary necessary rather than convenient, and starving it of some pins rather
+    /// than all of them is the difference between a stage of a pipeline and a dead band.
+    feeds: Vec<u32>,
     /// Where to write the winner's grid, so that a later exam can start from it.
     ///
     /// **A run is one draw, and this is how a draw is kept.** Evolving a small exam and handing
@@ -2305,13 +2387,14 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut fold = false;
     let mut linger = false;
     let mut band: Vec<u32> = vec![ROWS];
-    let mut feeds = 0;
+    let mut feeds: Vec<u32> = Vec::new();
     let mut apiece = false;
     let mut keep = None;
     let mut start = None;
     let mut aliens = 0;
     let mut renew = 0;
     let mut allowed: Option<Vec<u32>> = None;
+    let mut kits: Vec<Vec<u32>> = Vec::new();
     let mut noise = 0_u32;
     let mut lean = 0;
     let mut steps = 1_u32;
@@ -2354,8 +2437,13 @@ fn read(text: &str) -> Result<Exam, String> {
             (Some("feeds"), _) => {
                 feeds = word
                     .next()
-                    .and_then(|it| it.parse::<u32>().ok())
-                    .ok_or_else(|| say("`feeds` wants a number of bands"))?;
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|it| it.parse().ok())
+                    .collect();
+                if feeds.is_empty() {
+                    return Err(say("`feeds` wants an input-row count for each band"));
+                }
             }
             (Some("keep"), _) => {
                 keep = word.next().map(str::to_owned);
@@ -2400,6 +2488,12 @@ fn read(text: &str) -> Result<Exam, String> {
                 };
             }
             (Some("gates"), _) => {
+                // A leading number is a band, and what follows is that band alone's kit.
+                let mut only = None;
+                if let Some(which) = word.clone().next().and_then(|it| it.parse::<u32>().ok()) {
+                    word.next();
+                    only = Some(which as usize);
+                }
                 let mut kinds = vec![0_u32];
                 for name in word.by_ref() {
                     let kind = match name {
@@ -2411,8 +2505,9 @@ fn read(text: &str) -> Result<Exam, String> {
                         "mux" => 6,
                         "sum" => 7,
                         "over" => 8,
+                        "span" => 9,
                         "not" => 4,
-                        _ => return Err(say("a gate is wire, and, or, xor, not, maj, mux, sum or over")),
+                        _ => return Err(say("a gate is wire, and, or, xor, not, maj, mux, sum, over or span")),
                     };
                     if !kinds.contains(&kind) {
                         kinds.push(kind);
@@ -2421,7 +2516,17 @@ fn read(text: &str) -> Result<Exam, String> {
                 if kinds.len() < 2 {
                     return Err(say("`gates` wants at least one gate besides wire"));
                 }
-                allowed = Some(kinds);
+                match only {
+                    Some(which) => {
+                        while kits.len() <= which {
+                            kits.push(Vec::new());
+                        }
+                        if let Some(slot) = kits.get_mut(which) {
+                            slot.clone_from(&kinds);
+                        }
+                    }
+                    None => allowed = Some(kinds),
+                }
             }
             (Some("noise"), _) => {
                 noise = word
@@ -2620,6 +2725,26 @@ fn read(text: &str) -> Result<Exam, String> {
     if weigh != 0 && outputs < 2 {
         return Err("`weigh` needs more than one answer to weigh".to_string());
     }
+    if feeds.iter().any(|it| *it > bits / steps) {
+        return Err(format!(
+            "`feeds` cannot show a band more than the {} input rows there are",
+            bits / steps
+        ));
+    }
+    if !feeds.is_empty() && feeds.len() != band.len() {
+        return Err(format!("{} bands and {} feed counts is not one each", band.len(), feeds.len()));
+    }
+    // **A crossing makes one band depend on another and `apiece` assumes none of them do.** Per
+    // band selection compares a band against a band, and a redraw composes the best of each out of
+    // different chips: either is meaningless once a band reads its neighbour.
+    let crosses = allowed.as_ref().is_some_and(|it: &Vec<u32>| it.iter().any(|k| *k >= 8));
+    if apiece && crosses {
+        return Err("`apiece` and a crossing gate contradict: one wants the bands apart".to_string()
+            + ", the other joins them");
+    }
+    if crosses && band.iter().any(|it| Some(it) != band.first()) {
+        return Err("a crossing goes to the same offset, so the bands have to match".to_string());
+    }
     if apiece && band.len() < 2 {
         return Err("`apiece` wants bands, so that an answer lives in one".to_string());
     }
@@ -2644,9 +2769,29 @@ fn read(text: &str) -> Result<Exam, String> {
         return Err(format!("`slack {slack}` is wider than the {outputs} bits of the answer"));
     }
     let island = island.unwrap_or(colony).min(colony);
-    let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
+    let mut allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
+    // **What a band may be drawn into has to be emitted for it**, so the arms are the union of the
+    // kits and the kits are what the lottery reads.
+    if !kits.is_empty() {
+        while kits.len() < band.len() {
+            kits.push(Vec::new());
+        }
+        // A band nobody named keeps the exam's own kit.
+        for held in &mut kits {
+            if held.is_empty() {
+                held.clone_from(&allowed);
+            }
+        }
+        for held in &kits {
+            for &kind in held {
+                if !allowed.contains(&kind) {
+                    allowed.push(kind);
+                }
+            }
+        }
+    }
     Ok(Exam {
-        bits, outputs, apart, band, feeds, apiece, keep, start, aliens, ladder, weigh, slack,
+        bits, outputs, apart, band, feeds, apiece, keep, start, aliens, kits, ladder, weigh, slack,
         allowed, noise, lean, steps, hold, linger,
         fold,
         renew,
@@ -2678,8 +2823,8 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
             .map(|row| {
                 let (which, base, size) = banded(&exam.band, row);
                 let inside = row - base;
-                let fed = exam.feeds == 0 || (which as u32) < exam.feeds;
-                if inside < fan && fed {
+                let mine_fan = exam.feeds.get(which).copied().unwrap_or(fan);
+                if inside < mine_fan.min(fan) {
                     if step >= exam.steps && !exam.linger {
                         0
                     } else {
@@ -2721,6 +2866,9 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
                         }
                         Some(7) => (up + down + straight) & 1,
                         Some(8) => read(row + ROWS - exam.band.first().copied().unwrap_or(ROWS)),
+                        Some(9) => {
+                            read(row + ROWS - exam.band.first().copied().unwrap_or(ROWS) + 1)
+                        }
                         _ => straight,
                     }
                 })
@@ -2841,8 +2989,8 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
             .map(|row| {
                 let (which, base, size) = banded(&exam.band, row);
                 let inside = row - base;
-                let fed = exam.feeds == 0 || (which as u32) < exam.feeds;
-                if inside < fan && fed {
+                let mine_fan = exam.feeds.get(which).copied().unwrap_or(fan);
+                if inside < mine_fan.min(fan) {
                     if step >= exam.steps && !exam.linger {
                         0
                     } else {
@@ -2884,6 +3032,9 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
                         }
                         Some(7) => (up + down + straight) & 1,
                         Some(8) => read(row + ROWS - exam.band.first().copied().unwrap_or(ROWS)),
+                        Some(9) => {
+                            read(row + ROWS - exam.band.first().copied().unwrap_or(ROWS) + 1)
+                        }
                         _ => straight,
                     }
                 })
@@ -2980,6 +3131,7 @@ fn reads(kind: u32, row: u32, band: &[u32]) -> Vec<u32> {
         0 | 4 => vec![row],
         5..=7 => vec![up, row, down],
         8 => vec![row + ROWS - band.first().copied().unwrap_or(ROWS)],
+        9 => vec![row + ROWS - band.first().copied().unwrap_or(ROWS) + 1],
         _ => vec![up, down],
     }
 }
@@ -3192,6 +3344,7 @@ fn drawn(genome: &[u32], bits: u32, exam: &Exam, alive: &[bool]) -> String {
                 Some(6) => '?',
                 Some(7) => '+',
                 Some(8) => '|',
+                Some(9) => ':',
                 _ => '-',
             });
         }
@@ -3334,11 +3487,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seed = exam.seed;
     // **Drawn from what the exam allows**, or the restriction is only half a restriction: the grids
     // would start full of gates the mutation is never allowed to put back.
+    // **The starting grids are drawn from the same kit the mutation draws from**, per band where
+    // the bands were given their own: restricting one and not the other is not a restriction.
     let draw = |seed: &mut u32| -> Vec<u32> {
         (0..colony * CELLS)
-            .map(|_| {
-                let at = stirred(seed) as usize % exam.allowed.len().max(1);
-                exam.allowed.get(at).copied().unwrap_or(0)
+            .map(|cell| {
+                let which = banded(&exam.band, cell % ROWS).0;
+                let held = exam.kits.get(which).filter(|it| !it.is_empty()).unwrap_or(&exam.allowed);
+                let at = stirred(seed) as usize % held.len().max(1);
+                held.get(at).copied().unwrap_or(0)
             })
             .collect()
     };
@@ -3588,7 +3745,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let across = alive
         .iter()
         .enumerate()
-        .filter(|&(cell, &it)| it && genome.get(cell).copied() == Some(8))
+        .filter(|&(cell, &it)| it && genome.get(cell).copied().is_some_and(|k| k >= 8))
         .count();
     let wide = alive
         .iter()
