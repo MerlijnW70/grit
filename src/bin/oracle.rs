@@ -20,6 +20,12 @@
 //!   ladder 1        reveal one output bit at a time, widening when it is mastered
 //!   gates and or sum   the gates it draws from; wire is always in
 //!   gates 1 xor sum    the gates band one draws from, where the others keep theirs
+//! ```
+//!
+//! And one run that grows nothing, reading five kept grids back and wiring them together:
+//!
+//! ```text
+//!   oracle cascade p0.grid p1.grid p2.grid p3.grid adder.grid
 //!   noise 16        break one gate in sixteen each generation
 //!   lean wires      among equally right chips prefer the cheaper: 1 by gates, wires by wires
 //!   steps 4         cut the word into four, one piece a step — time
@@ -204,9 +210,19 @@
 //!   On one grid it comes out 16 of 16 on six starts of six.
 //!
 //! **So the product and the sum are each exact, and the carry between them is a wire rather than
-//! something to be evolved.** That is a consequence of the two measurements above and not a third
-//! one: an exact multiplier followed by exact full adders computes `a·b + c` exactly, for any width
-//! of `c`, where asking one grid for the whole of it reaches 95%.
+//! something to be evolved.** That is an argument, and an argument is not a measurement, so
+//! `oracle cascade p0 p1 p2 p3 fa` reads five kept grids back off disk, wires them — each product
+//! bit out of its own grid, then one full adder a bit with the carry handed along — and runs all
+//! sixty-four inputs through the wiring.
+//!
+//! ```text
+//!   four grids of 16 of 16, one of 16 of 16, wired by the carry
+//!   64 of 64 inputs exactly right, never more than 0 out
+//! ```
+//!
+//! **Five grids of 88 cells each do exactly what 352 cells asked at once cannot.** The one grid
+//! reaches 243.5 of 256; the five reach all of it, on every input, with nothing evolved that was
+//! not inside the reach below.
 //!
 //! # How far the engine reaches, which is four inputs
 //!
@@ -3711,9 +3727,85 @@ fn spread(scores: &[u32], perfect: u32) -> String {
         .collect()
 }
 
+/// A grid read back off disk, with the exam it was grown against.
+fn recalled(path: &str, bits: u32, outputs: u32) -> Result<(Vec<u32>, Exam), String> {
+    let held: Vec<u32> = std::fs::read_to_string(path)
+        .map_err(|why| format!("{path}: {why}"))?
+        .split_ascii_whitespace()
+        .filter_map(|it| it.parse().ok())
+        .collect();
+    if held.len() != CELLS as usize {
+        return Err(format!("{path} holds {} cells and this grid has {CELLS}", held.len()));
+    }
+    // The table does not matter here — only the shape does, and `runs` reads the shape.
+    let filler = if outputs > 1 { "count" } else { "parity" };
+    let exam = read(&format!("inputs {bits}\noutputs {outputs}\n{filler}"))?;
+    Ok((held, exam))
+}
+
+/// Four grids for the product and one for the sum, wired by the carry and checked on every input.
+///
+/// # Why this is run and not argued
+///
+/// Each piece is exact where it was measured, so the arithmetic says the whole is exact too. That
+/// is an argument, and an argument is not a measurement: the pieces have to be wired the way the
+/// argument says they are, and the only way to know that they were is to run all sixty-four inputs
+/// through the wiring itself.
+///
+/// **The carry is the wire the engine never had to evolve.** A full adder is asked for one bit of
+/// the sum and the carry out of it; the carry out is handed to the next one along, four times, and
+/// what comes back is `a·b + c` or it is not.
+fn cascaded(paths: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let product: Vec<(Vec<u32>, Exam)> = paths
+        .get(..4)
+        .unwrap_or_default()
+        .iter()
+        .map(|path| recalled(path, 4, 1))
+        .collect::<Result<_, _>>()?;
+    let (adder, sums) = recalled(paths.get(4).map_or("", String::as_str), 3, 2)?;
+    println!("  four grids for the product and one for the sum, on every one of 64 inputs:\n");
+
+    let mut right = 0;
+    let mut worst = 0;
+    for case in 0..64_u32 {
+        let (a, b, carry_in) = (case & 3, (case >> 2) & 3, case >> 4);
+        let word = a | (b << 2);
+        // The product, a bit at a time, out of a grid of its own.
+        let bits: Vec<u32> =
+            product.iter().map(|(grid, exam)| runs(grid, word, exam) & 1).collect();
+        // The sum, a bit at a time, with the carry handed along.
+        let mut carry = 0;
+        let mut said = 0;
+        for (at, &now) in bits.iter().enumerate() {
+            let with = (carry_in >> at) & 1;
+            let asked = now | (with << 1) | (carry << 2);
+            let held = runs(&adder, asked, &sums);
+            said |= (held & 1) << at;
+            carry = (held >> 1) & 1;
+        }
+        let wanted = (a * b + carry_in) & 15;
+        if said == wanted {
+            right += 1;
+        }
+        worst = worst.max(said.abs_diff(wanted));
+        if case < 8 || said != wanted {
+            let mark = if said == wanted { "" } else { "   <- wrong" };
+            println!("    {a} x {b} + {carry_in} = {wanted:>2}, the wiring says {said:>2}{mark}");
+        }
+    }
+    println!("\n  {right} of 64 inputs exactly right, never more than {worst} out");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // **The exam is the only input.** Name a file and it is read; name nothing and the one below is
     // used, printed, so there is something to copy and change.
+    // **A run of five grids instead of one exam.** Named this way the engine grows nothing: it
+    // reads back what earlier runs grew and puts them together.
+    let held: Vec<String> = std::env::args().skip(1).collect();
+    if held.first().map(String::as_str) == Some("cascade") {
+        return cascaded(held.get(1..).unwrap_or_default());
+    }
     let named = std::env::args().nth(1);
     let text = match &named {
         Some(path) => std::fs::read_to_string(path)?,
