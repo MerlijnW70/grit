@@ -25,6 +25,7 @@
 //!   state 2         rows wired from the last column back to the first — memory
 //!   hold 4          four more steps after the word, with nothing arriving
 //!   linger 1        during a hold, keep the last slice on the wires instead
+//!   band 8          split the rows into bands of eight that cannot read each other
 //!   fold 1          read the answers off one row, one a step, instead of one row each
 //!   renew 8         after eight batches with no gain, draw the colony again but for the best
 //!   colony 65536    how many chips search at once — the way out of a local optimum
@@ -172,7 +173,32 @@
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
 //!
-//! # The full multiplier, which is out of reach exactly and free within one
+//! # The full multiplier, solved by giving each answer its own copper
+//!
+//! The four answers were built from 96 to 100 per cent the same gates. `band` makes that
+//! impossible: a band is a chip of its own, its gates cannot read across the boundary, and it gets
+//! its own copy of the word and its own bottom row. `apart` puts one answer on each band's top row.
+//! The report reads zero shared gates where it read sixty-one.
+//!
+//! Six starts each, `and or xor not sum` with `renew 8`:
+//!
+//! ```text
+//!                                              of 64    perfect chips
+//!   8 rows, one band, 16 384 chips             59.5     0 of 6
+//!   32 rows, one band, 16 384                  58.6     0
+//!   32 rows, four bands of 8, 4096             62.3     1
+//!   32 rows, four bands of 8, 16 384           63.1     3
+//!   32 rows, four bands of 8, 65 536           64.0     6
+//! ```
+//!
+//! **Every start, every input, every answer bit.** One of them does it in 30 live gates reading 61
+//! wires, and the host's count and the card's agree. It costs 4150 us a generation.
+//!
+//! Two things this is not. It is not more room: thirty-two rows in one band is worse than eight
+//! rows in one band. And it is not a better layout: putting the two operands' bits in a different
+//! order — interleaved, or mirrored — gives 58.0 and 58.3 against 59.5 for the order it had.
+//!
+//! # Within one, which was free before any of this
 //!
 //! Every one of the four product bits comes out at 16 of 16 on its own. All four at once has not
 //! come out once. Six starts each, `and or xor not sum` with `renew 8`:
@@ -892,7 +918,7 @@ use simdr::lanes::{LaneError, U32};
 use simdr::module::Id;
 
 /// How many rows the chip has: the inputs, and a nought and a one to build with.
-const ROWS: u32 = 8;
+const ROWS: u32 = 32;
 /// How many columns, of which the first is the inputs.
 const COLUMNS: u32 = 12;
 /// How many gates a chip holds, which is the length of a genome.
@@ -1106,7 +1132,6 @@ fn pick(kernel: &mut Kernel<U32>, flag: Id, yes: Id, no: Id) -> Result<Id, LaneE
     let b = lanes.splat_id::<U32, 1>(no)?;
     Ok(lanes.select(on, a, b)?.id())
 }
-
 
 
 // ---------- the kernels ----------
@@ -1359,6 +1384,7 @@ fn feed(
 ) -> Result<Vec<u32>, LaneError> {
     let (fan, state) = (exam.bits / exam.steps, exam.state);
     let (first, blank) = (step == 0, step >= exam.steps && !exam.linger);
+
     // Lingering, every step past the word repeats its last slice rather than arriving at nought.
     // **This is the slice and not the step**: which answer a folded exam catches here is a question
     // about the step, and clamping the two together silently caught nothing.
@@ -1368,6 +1394,8 @@ fn feed(
     let one = kernel.module().constant_u32(1)?;
     let held = kernel.load_at(COUNTS, none)?;
     let (chip, row, case) = wire_at(&mut kernel, subgroup, cases, colony, held)?;
+    // Every row question is a question about where a row sits in its band, not the grid.
+    let inside = low_bits(&mut kernel, row, exam.band.trailing_zeros())?;
 
     // This step's slice of the word: bit `step * fan + row` of the input. **After `hold` has
     // started there is no slice left**, and the input rows arrive at nought so that everything the
@@ -1377,7 +1405,7 @@ fn feed(
         none
     } else {
         let along = kernel.module().constant_u32(slice * fan)?;
-        let reach = kernel.module().i_add(uint, row, along)?;
+        let reach = kernel.module().i_add(uint, inside, along)?;
         let shifted = shift_down(&mut kernel, case, reach)?;
         low_bits(&mut kernel, shifted, 1)?
     };
@@ -1410,13 +1438,13 @@ fn feed(
     }
 
     let fan_at = kernel.module().constant_u32(fan)?;
-    let feeding = above(&mut kernel, fan_at, row)?;
+    let feeding = above(&mut kernel, fan_at, inside)?;
     let past = kernel.module().constant_u32(fan + state)?;
-    let within = above(&mut kernel, past, row)?;
+    let within = above(&mut kernel, past, inside)?;
     let not_input = minus(&mut kernel, one, feeding)?;
     let remembering = kernel.module().i_mul(uint, within, not_input)?;
-    let bottom = kernel.module().constant_u32(ROWS - 1)?;
-    let lowest = is(&mut kernel, row, bottom)?;
+    let bottom = kernel.module().constant_u32(exam.band - 1)?;
+    let lowest = is(&mut kernel, inside, bottom)?;
 
     let padding = pick(&mut kernel, lowest, one, none)?;
     let kept = pick(&mut kernel, remembering, carried, padding)?;
@@ -1438,6 +1466,7 @@ fn propagate(
     colony: u32,
     noise: u32,
     allowed: &[u32],
+    band: u32,
 ) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -1446,14 +1475,21 @@ fn propagate(
     let held = kernel.load_at(COUNTS, none)?;
     let (chip, row, case) = wire_at(&mut kernel, subgroup, cases, colony, held)?;
 
+    // **The wrap is inside the band.** The top row of a band reads the bottom row of the same band
+    // and never the row above it, so no signal crosses a boundary in either direction.
+    let wide = band.trailing_zeros();
+    let inside = low_bits(&mut kernel, row, wide)?;
+    let base = minus(&mut kernel, row, inside)?;
     let up = {
-        let back = kernel.module().constant_u32(ROWS - 1)?;
-        let raised = kernel.module().i_add(uint, row, back)?;
-        low_bits(&mut kernel, raised, ROWS.trailing_zeros())?
+        let back = kernel.module().constant_u32(band - 1)?;
+        let raised = kernel.module().i_add(uint, inside, back)?;
+        let held = low_bits(&mut kernel, raised, wide)?;
+        kernel.module().i_add(uint, base, held)?
     };
     let down = {
-        let raised = kernel.module().i_add(uint, row, one)?;
-        low_bits(&mut kernel, raised, ROWS.trailing_zeros())?
+        let raised = kernel.module().i_add(uint, inside, one)?;
+        let held = low_bits(&mut kernel, raised, wide)?;
+        kernel.module().i_add(uint, base, held)?
     };
     let at_a = wire(&mut kernel, chip, column - 1, up, case, cases)?;
     let at_b = wire(&mut kernel, chip, column - 1, down, case, cases)?;
@@ -1774,6 +1810,12 @@ struct Exam {
     /// draw from the starting grids and not the four thousand generations it then spends.
     /// Redrawing everything but the best turns the one draw into many without losing the best.
     renew: u32,
+    /// How many rows a band is, or `ROWS` for one band, which is what it was.
+    ///
+    /// **A band is a chip of its own.** Its gates cannot read across the boundary, it gets its own
+    /// copy of the word and its own bottom row, and an answer read off its top row is built out of
+    /// cells no other answer can reach. It is what `apart` looked like it was and never was.
+    band: u32,
     /// Whether the last slice of the word stays on the input rows during a hold.
     ///
     /// **A hold blanks the inputs, which asks the chip to remember the question as well as answer
@@ -1912,6 +1954,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut hold = 0;
     let mut fold = false;
     let mut linger = false;
+    let mut band = ROWS;
     let mut renew = 0;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
@@ -1949,6 +1992,13 @@ fn read(text: &str) -> Result<Exam, String> {
                     .next()
                     .and_then(|it| it.parse::<u32>().ok())
                     .ok_or_else(|| say("`renew` wants a number of batches"))?;
+            }
+            (Some("band"), _) => {
+                band = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .filter(|it| it.is_power_of_two() && ROWS.is_multiple_of(*it))
+                    .ok_or_else(|| say("`band` wants a power of two that divides the rows"))?;
             }
             (Some("linger"), _) => {
                 linger = word.next() != Some("0");
@@ -2152,6 +2202,15 @@ fn read(text: &str) -> Result<Exam, String> {
     if bits % steps != 0 {
         return Err(format!("`steps {steps}` does not divide `inputs {bits}`"));
     }
+    if bits / steps + state >= band {
+        return Err(format!(
+            "{} input rows and {state} state rows do not fit in a band of {band} with the one on",
+            bits / steps
+        ) + " the bottom");
+    }
+    if outputs * band > ROWS && band < ROWS {
+        return Err(format!("{outputs} bands of {band} do not fit in {ROWS} rows"));
+    }
     if bits / steps + state >= ROWS {
         return Err(format!(
             "{} input rows and {state} state rows leave no room for the one on the bottom",
@@ -2197,7 +2256,8 @@ fn read(text: &str) -> Result<Exam, String> {
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, hold, linger, fold,
+        bits, outputs, apart, band, ladder, weigh, slack, allowed, noise, lean, steps, hold, linger,
+        fold,
         renew,
         state,
         colony, island, seed, want, ask, name,
@@ -2225,15 +2285,16 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
         let keep = |row: u32| last.get(row as usize).copied().unwrap_or(0);
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
-                if row < fan {
+                let inside = row % exam.band;
+                if inside < fan {
                     if step >= exam.steps && !exam.linger {
                         0
                     } else {
-                        (case >> (step.min(exam.steps - 1) * fan + row)) & 1
+                        (case >> (step.min(exam.steps - 1) * fan + inside)) & 1
                     }
-                } else if row < fan + exam.state {
+                } else if inside < fan + exam.state {
                     if step == 0 { 0 } else { keep(row) }
-                } else if row == ROWS - 1 {
+                } else if inside == exam.band - 1 {
                     1
                 } else {
                     0
@@ -2244,7 +2305,14 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
             let read = |row: u32| column.get((row % ROWS) as usize).copied().unwrap_or(0);
             let next: Vec<u32> = (0..ROWS)
                 .map(|row| {
-                    let (up, down, straight) = (read(row + ROWS - 1), read(row + 1), read(row));
+                    // The wrap is inside the band, so a boundary is as good as an edge.
+                    let base = row - row % exam.band;
+                    let round = |at: u32| base + at % exam.band;
+                    let (up, down, straight) = (
+                        read(round(row % exam.band + exam.band - 1)),
+                        read(round(row % exam.band + 1)),
+                        read(row),
+                    );
                     match genome.get(((at - 1) * ROWS + row) as usize).copied() {
                         Some(1) => up.min(down),
                         Some(2) => up.max(down),
@@ -2377,15 +2445,16 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
         let keep = |row: u32| last.get(row as usize).copied().unwrap_or(0);
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
-                if row < fan {
+                let inside = row % exam.band;
+                if inside < fan {
                     if step >= exam.steps && !exam.linger {
                         0
                     } else {
-                        (case >> (step.min(exam.steps - 1) * fan + row)) & 1
+                        (case >> (step.min(exam.steps - 1) * fan + inside)) & 1
                     }
-                } else if row < fan + exam.state {
+                } else if inside < fan + exam.state {
                     if step == 0 { 0 } else { keep(row) }
-                } else if row == ROWS - 1 {
+                } else if inside == exam.band - 1 {
                     1
                 } else {
                     0
@@ -2396,7 +2465,14 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
             let read = |row: u32| column.get((row % ROWS) as usize).copied().unwrap_or(0);
             let next: Vec<u32> = (0..ROWS)
                 .map(|row| {
-                    let (up, down, straight) = (read(row + ROWS - 1), read(row + 1), read(row));
+                    // The wrap is inside the band, so a boundary is as good as an edge.
+                    let base = row - row % exam.band;
+                    let round = |at: u32| base + at % exam.band;
+                    let (up, down, straight) = (
+                        read(round(row % exam.band + exam.band - 1)),
+                        read(round(row % exam.band + 1)),
+                        read(row),
+                    );
                     match genome.get(((at - 1) * ROWS + row) as usize).copied() {
                         Some(1) => up.min(down),
                         Some(2) => up.max(down),
@@ -2446,18 +2522,21 @@ fn unpack(score: u32, budget: u32) -> (u32, u32) {
 ///
 /// **A wire is not a gate**, so it is free, and the two that read three cost three.
 fn price(kind: u32) -> u32 {
-    u32::try_from(reads(kind, 0).len()).unwrap_or(0) * u32::from(kind != 0)
+    u32::try_from(reads(kind, 0, ROWS).len()).unwrap_or(0) * u32::from(kind != 0)
 }
 
 /// Which wires of the column before a gate of this kind reads.
 ///
 /// **Two of the seven read three.** `maj` and `mux` take the wire straight ahead as well as the two
 /// diagonals, so a cone traced back through one of them is a row wider than through the others.
-fn reads(kind: u32, row: u32) -> Vec<u32> {
+fn reads(kind: u32, row: u32, band: u32) -> Vec<u32> {
+    let base = row - row % band;
+    let round = |at: u32| base + at % band;
+    let (up, down) = (round(row % band + band - 1), round(row % band + 1));
     match kind {
         0 | 4 => vec![row],
-        5..=7 => vec![row + ROWS - 1, row, row + 1],
-        _ => vec![row + ROWS - 1, row + 1],
+        5..=7 => vec![up, row, down],
+        _ => vec![up, down],
     }
 }
 
@@ -2483,7 +2562,7 @@ fn cone(genome: &[u32], exam: &Exam, output: u32) -> Vec<bool> {
             if let Some(slot) = used.get_mut(cell) {
                 *slot = kind != 0;
             }
-            let reaches = reads(kind, row);
+            let reaches = reads(kind, row, exam.band);
             for back in reaches {
                 if let Some(slot) = wanted.get_mut(at(column - 1, back)) {
                     *slot = true;
@@ -2524,7 +2603,7 @@ fn live(genome: &[u32], exam: &Exam) -> Vec<bool> {
             if let Some(slot) = used.get_mut(cell) {
                 *slot = kind != 0;
             }
-            let reaches = reads(kind, row);
+            let reaches = reads(kind, row, exam.band);
             for back in reaches {
                 if let Some(slot) = wanted.get_mut(at(column - 1, back)) {
                     *slot = true;
@@ -2740,7 +2819,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for step in 0..exam.steps + exam.hold {
         modules.push(feed(width, cases, colony, step, &exam)?);
         for column in 1..COLUMNS {
-            modules.push(propagate(width, column, cases, colony, exam.noise, &exam.allowed)?);
+            modules.push(propagate(
+                width,
+                column,
+                cases,
+                colony,
+                exam.noise,
+                &exam.allowed,
+                exam.band,
+            )?);
         }
     }
     modules.push(tally(width, cases, colony, &exam)?);
@@ -2993,8 +3080,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(cell, _)| price(genome.get(cell).copied().unwrap_or(0)))
         .sum();
     println!(
-        "\n  {live_gates} of {CELLS} gates carry the answer and read {wires} wires, {wide} of\
-         them three at a time; the rest\
+        "\n  {live_gates} of {CELLS} gates carry the answer and read {wires} wires, {wide} of \
+         them three at a time; the rest \
          are scenery."
     );
     println!(
