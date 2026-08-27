@@ -186,6 +186,41 @@
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
 //!
+//! # What this would put into a model, which is a table
+//!
+//! A weight in a quantised model is a constant, so multiplying by one is not a multiplier: every
+//! bit of the product is a function of the activation alone. At four bits of activation that is
+//! four inputs an answer, which is exactly the reach below. It comes out:
+//!
+//! ```text
+//!   4-bit activation times 3, 5 and 7, each answer bit on its own
+//!   16 of 16 on all six bits of the product, all three weights
+//! ```
+//!
+//! **And it is far too big.** With `lean wires` the six bits of a multiply-by-three come to 173
+//! lines of gates. Bit nought of it is `a0` and took 27 of those.
+//!
+//! So the exporter writes a table instead, where an answer reaches few enough pins to have one. A
+//! function of four inputs is sixteen bits of truth and sixteen bits fit in a constant:
+//!
+//! ```text
+//!   let y0 = (0xAAAA >> (x0 | (x1 << 1) | (x2 << 2) | (x3 << 3))) & 1;
+//! ```
+//!
+//! That line is bit nought of `a·3`, read off the evolved gates and checked against them on every
+//! input. The whole multiply-by-three is six such lines against 173. A full adder is two lines
+//! from 59 gates — `0x96` over three pins, which is their parity, and `0xE8`, which is their
+//! majority. Each product bit of a two-by-two multiplier is one line.
+//!
+//! **And that is the honest end of it.** Below five pins the table is the answer and nothing had to
+//! be evolved to find it; above five pins the table is too wide to write and the search does not
+//! reach, which is what the table below says. There is no width at which the search earns its keep
+//! here. What it produces for a model is a lookup table, and a lookup table is a thing that can be
+//! worked out directly.
+//!
+//! What is not measured here is what any of it does to a model, because there is no model in this
+//! repository and no pipeline to put one in.
+//!
 //! # Handing the circuit over, as code that has been checked against the grid
 //!
 //! The report writes the winner out as straight-line bitwise code. It is folded on the way: a
@@ -3536,6 +3571,74 @@ impl Line {
     }
 }
 
+/// An answer written as the table it is, where it depends on few enough pins to have one.
+///
+/// # Why a table and not the gates
+///
+/// A circuit of four inputs is sixteen bits of truth and nothing more, and sixteen bits fit in a
+/// constant. Where the evolved gates take dozens of lines to work one out, the constant takes one
+/// shift and one and — and it is the same function, because the table is read off the gates.
+///
+/// **This is the honest end of the search.** Below five pins the table is the answer and the search
+/// was not needed to find it; above them the table is too wide to write and the search does not
+/// reach. What the search is for is the middle, and there is not much middle.
+fn tabled(lines: &[Line], end: usize, bits: u32, which: u32) -> Option<String> {
+    // Which pins this answer reaches, walking back over the folded lines.
+    let mut wanted = vec![false; lines.len()];
+    let mut pins: Vec<u32> = Vec::new();
+    let mut left = vec![end];
+    while let Some(now) = left.pop() {
+        if wanted.get(now).copied().unwrap_or(true) {
+            continue;
+        }
+        if let Some(slot) = wanted.get_mut(now) {
+            *slot = true;
+        }
+        match lines.get(now).copied() {
+            Some(Line::Pin(at)) if !pins.contains(&at) => pins.push(at),
+            _ => {}
+        }
+        left.extend(lines.get(now).copied().into_iter().flat_map(Line::feeds));
+    }
+    pins.sort_unstable();
+    if pins.len() > 5 {
+        return None;
+    }
+
+    // The table, read off the lines themselves rather than off anything else.
+    let mut table = 0_u64;
+    for held in 0..1_u32 << pins.len() {
+        let case = pins
+            .iter()
+            .enumerate()
+            .filter(|&(at, _)| (held >> at) & 1 == 1)
+            .fold(0_u32, |bits, (_, &pin)| bits | (1 << pin));
+        let mut now = vec![0_u32; lines.len()];
+        for (cell, line) in lines.iter().enumerate() {
+            let settled = line.worth(case, &now);
+            if let Some(slot) = now.get_mut(cell) {
+                *slot = settled;
+            }
+        }
+        if now.get(end).copied().unwrap_or(0) == 1 {
+            table |= 1 << held;
+        }
+    }
+
+    let index = if pins.len() == 1 {
+        format!("x{}", pins.first().copied().unwrap_or(0))
+    } else {
+        let held: Vec<String> = pins
+            .iter()
+            .enumerate()
+            .map(|(at, pin)| if at == 0 { format!("x{pin}") } else { format!("(x{pin} << {at})") })
+            .collect();
+        held.join(" | ")
+    };
+    let _ = bits;
+    Some(format!("  let y{which} = (0x{table:X} >> ({index})) & 1;\n"))
+}
+
 /// The winner as straight-line bitwise code, folded down and checked against the grid.
 ///
 /// # Why this is folded and why it is checked
@@ -3754,9 +3857,29 @@ fn written(genome: &[u32], exam: &Exam) -> Option<String> {
             out.push_str(&format!("  {line}\n"));
         }
     }
+    // **A table where there is one.** An answer of few enough pins is a constant and a shift, and
+    // the gates that worked it out are then worth nothing to anybody.
+    let mut tables = 0;
     for (which, &end) in ends.iter().enumerate() {
-        let held = named.get(end).cloned().unwrap_or_default();
-        out.push_str(&format!("  let y{which} = {held};\n"));
+        let at = u32::try_from(which).unwrap_or(0);
+        match tabled(&lines, end, exam.bits, at) {
+            Some(line) => {
+                out.push_str(&line);
+                tables += 1;
+            }
+            None => {
+                let held = named.get(end).cloned().unwrap_or_default();
+                out.push_str(&format!("  let y{at} = {held};\n"));
+            }
+        }
+    }
+    if tables == ends.len() {
+        // Nothing above the tables is read by anything, so none of it is worth writing down.
+        out = out.lines().filter(|it| it.contains(" = (0x")).fold(String::new(), |mut held, it| {
+            held.push_str(it);
+            held.push('\n');
+            held
+        });
     }
 
     // **The check.** Nothing is offered that has not been worked through and matched.
