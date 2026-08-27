@@ -24,6 +24,7 @@
 //!   steps 4         cut the word into four, one piece a step — time
 //!   state 2         rows wired from the last column back to the first — memory
 //!   hold 4          four more steps after the word, with nothing arriving
+//!   linger 1        during a hold, keep the last slice on the wires instead
 //!   fold 1          read the answers off one row, one a step, instead of one row each
 //!   renew 8         after eight batches with no gain, draw the colony again but for the best
 //!   colony 65536    how many chips search at once — the way out of a local optimum
@@ -170,6 +171,39 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # The full multiplier, which is out of reach exactly and free within one
+//!
+//! Every one of the four product bits comes out at 16 of 16 on its own. All four at once has not
+//! come out once. Six starts each, `and or xor not sum` with `renew 8`:
+//!
+//! ```text
+//!   16 384 chips, asked at once            59.5 of 64
+//!   65 536 chips                           59.1
+//!   with `weigh dynamic`                   57.8
+//!   with `ladder`                          57.5
+//!   folded into four steps, `linger 1`     56.8
+//!   over 24 columns                        59.8
+//!   over 16 rows                           58.6
+//!   cut into steps with state              55.1 to 56.8
+//! ```
+//!
+//! **Nothing beats asking for it plainly**, and the report says where the missing bits are: the
+//! per-answer line reads `[16, 12, 16, 16]` or `[16, 12, 16, 15]` on start after start. Bit one is
+//! four short and every other bit is whole, and bit one alone is sixteen of sixteen. The four
+//! answers are built from 96 to 100 per cent the same gates.
+//!
+//! **Within one it is free.** `slack 1` reads both answers as numbers and asks for the product to
+//! within one, and that comes out 16 of 16 on all six starts. It is worth being plain about what
+//! that is: those chips are *exactly* right on 0.6 inputs of 16 on average. They are never more
+//! than one out and they are almost never right, which is the tolerance being spent rather than a
+//! multiplier being approximated.
+//!
+//! `linger` is what made the folded row of that table possible: a hold blanks the input rows, which
+//! asks the chip to remember the question as well as answer it, and with `linger` the question
+//! stays put. Folding it also found a fault — the step was clamped to the last slice of the word
+//! before a folded exam worked out which answer to catch, so it caught none. The card and the host
+//! disagreeing is what said so.
 //!
 //! # Breeding a clock, and how long a tune it can whistle
 //!
@@ -1324,7 +1358,11 @@ fn feed(
     exam: &Exam,
 ) -> Result<Vec<u32>, LaneError> {
     let (fan, state) = (exam.bits / exam.steps, exam.state);
-    let (first, blank) = (step == 0, step >= exam.steps);
+    let (first, blank) = (step == 0, step >= exam.steps && !exam.linger);
+    // Lingering, every step past the word repeats its last slice rather than arriving at nought.
+    // **This is the slice and not the step**: which answer a folded exam catches here is a question
+    // about the step, and clamping the two together silently caught nothing.
+    let slice = step.min(exam.steps - 1);
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let none = kernel.module().constant_u32(0)?;
     let one = kernel.module().constant_u32(1)?;
@@ -1338,7 +1376,7 @@ fn feed(
     let arriving = if blank {
         none
     } else {
-        let along = kernel.module().constant_u32(step * fan)?;
+        let along = kernel.module().constant_u32(slice * fan)?;
         let reach = kernel.module().i_add(uint, row, along)?;
         let shifted = shift_down(&mut kernel, case, reach)?;
         low_bits(&mut kernel, shifted, 1)?
@@ -1736,6 +1774,11 @@ struct Exam {
     /// draw from the starting grids and not the four thousand generations it then spends.
     /// Redrawing everything but the best turns the one draw into many without losing the best.
     renew: u32,
+    /// Whether the last slice of the word stays on the input rows during a hold.
+    ///
+    /// **A hold blanks the inputs, which asks the chip to remember the question as well as answer
+    /// it.** With this the question stays put and the extra steps are only extra time.
+    linger: bool,
     /// Whether the answers come off one row a step instead of off one row each.
     ///
     /// **Folded, the chip has to know which step it is on.** Answer `k` is whatever the top wire of
@@ -1868,6 +1911,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut slack = 0;
     let mut hold = 0;
     let mut fold = false;
+    let mut linger = false;
     let mut renew = 0;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
@@ -1905,6 +1949,9 @@ fn read(text: &str) -> Result<Exam, String> {
                     .next()
                     .and_then(|it| it.parse::<u32>().ok())
                     .ok_or_else(|| say("`renew` wants a number of batches"))?;
+            }
+            (Some("linger"), _) => {
+                linger = word.next() != Some("0");
             }
             (Some("fold"), _) => {
                 fold = word.next() != Some("0");
@@ -2150,7 +2197,8 @@ fn read(text: &str) -> Result<Exam, String> {
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, hold, fold, renew,
+        bits, outputs, apart, ladder, weigh, slack, allowed, noise, lean, steps, hold, linger, fold,
+        renew,
         state,
         colony, island, seed, want, ask, name,
     })
@@ -2178,7 +2226,11 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
                 if row < fan {
-                    if step >= exam.steps { 0 } else { (case >> (step * fan + row)) & 1 }
+                    if step >= exam.steps && !exam.linger {
+                        0
+                    } else {
+                        (case >> (step.min(exam.steps - 1) * fan + row)) & 1
+                    }
                 } else if row < fan + exam.state {
                     if step == 0 { 0 } else { keep(row) }
                 } else if row == ROWS - 1 {
@@ -2326,7 +2378,11 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
                 if row < fan {
-                    if step >= exam.steps { 0 } else { (case >> (step * fan + row)) & 1 }
+                    if step >= exam.steps && !exam.linger {
+                        0
+                    } else {
+                        (case >> (step.min(exam.steps - 1) * fan + row)) & 1
+                    }
                 } else if row < fan + exam.state {
                     if step == 0 { 0 } else { keep(row) }
                 } else if row == ROWS - 1 {
@@ -2762,6 +2818,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut best;
     let mut high = 0;
     let mut stuck = 0;
+    // **The ladder and the redraw both wait for a stall and they must not share the wait.** With
+    // one counter the shorter of the two keeps resetting it and the longer never fires.
+    let mut waited = 0;
     let mut drawn_again = 0;
     let mut ran = 0;
     for batch in 0..batches {
@@ -2814,8 +2873,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if best > high {
             high = best;
             stuck = 0;
+            waited = 0;
         } else {
             stuck += 1;
+            waited += 1;
         }
         if (best == asked_at(rung) || stuck >= PATIENCE) && rung < exam.outputs {
             // **Everyone is re-scored when the rung moves.** A chip that did not change is carrying a
@@ -2831,7 +2892,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // **A run is one draw, so draw again.** Everything but the best chip is replaced with fresh
         // grids, which costs one write of the genome and keeps whatever the run has found.
-        if exam.renew > 0 && stuck >= exam.renew && best < perfect {
+        if exam.renew > 0 && waited >= exam.renew && best < perfect {
             let genome = arena.read(GENE as usize, (colony * CELLS) as usize)?;
             let at = scores.iter().enumerate().max_by_key(|&(_, it)| *it).map_or(0, |(at, _)| at);
             let mut fresh = draw(&mut seed);
@@ -2858,7 +2919,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // predecessor earned would be copied over the one chip that was worth keeping.
             arena.write(SCORE as usize, &blank)?;
             arena.write_at(PARAMS as usize, 0, &[0])?;
-            stuck = 0;
+            waited = 0;
             drawn_again += 1;
         }
         // With `lean` on, being right is where the work starts rather than where it stops.
