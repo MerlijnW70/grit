@@ -25,7 +25,7 @@
 //!   state 2         rows wired from the last column back to the first — memory
 //!   hold 4          four more steps after the word, with nothing arriving
 //!   linger 1        during a hold, keep the last slice on the wires instead
-//!   band 8          split the rows into bands of eight that cannot read each other
+//!   band 8,24,24,8  split the rows into bands that cannot read each other, one an answer
 //!   feeds 1         show the word to the first band only and starve the rest
 //!   apiece 1        select each band on its own answer, not on the chip's total
 //!   keep grid.txt   write the winner's grid out when the run ends
@@ -178,6 +178,53 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # How little copper a perfect accumulator needs, which is not little
+//!
+//! `2x2+1` comes out on every start, so the size pressure can be turned up without losing it.
+//! Eight starts at 65 536 chips, counting only the chips that scored 128 of 128:
+//!
+//! ```text
+//!                 perfect   smallest
+//!   no pressure   8 of 8    209 gates, 462 wires
+//!   lean wires    8 of 8    196 gates, 407 wires
+//!   lean 1        8 of 8    195 gates, 433 wires
+//! ```
+//!
+//! Unlike the multiplier, pressing here costs no perfect chips at all. **And what is left is not
+//! slack.** Breaking one live gate of the smallest into a wire costs the answer 134 times of 196,
+//! so two thirds of it is load-bearing one gate at a time.
+//!
+//! Compressing a solved chip rather than finding a lean one is worse: handed back to the colony,
+//! a 488-wire winner comes out at 477 with every chip seeded from it and 449 with a thousand
+//! copies, against 407 for a run that was lean from the start.
+//!
+//! # Two more ways of giving it room, and neither is one
+//!
+//! The six-input accumulator sits at 243.1 of 256 and its report says where: answers nought and
+//! three are 64 of 64 on every start and answers one and two are 56 to 59. So two of the four
+//! bands are doing the work.
+//!
+//! **In time.** Three steps — `a`, then `b`, then `c` — instead of all six bits at once gives 238.8
+//! at four state rows and 240.0 at five, against 243.1 for the word arriving whole.
+//!
+//! **In rows.** `band` now takes a list of sizes rather than one size, so the two bands that are
+//! short can be given the rows the two that are finished do not need. The wrap inside a band is a
+//! comparison rather than a shift, because uneven bands cannot be divided into with a shift, and an
+//! answer is read off its band's top row, which is why `apart` no longer comes into it.
+//!
+//! ```text
+//!   32 rows   8,8,8,8         243.1 of 256
+//!   32 rows   7,9,9,7         242.6
+//!   32 rows   9,7,7,9         243.1
+//!   64 rows   16,16,16,16     240.2
+//!   64 rows   8,24,24,8       238.2
+//! ```
+//!
+//! **Rows do not help wherever they are put.** Two given to the short bands and two given to the
+//! finished ones come out the same, and sixteen given to the short ones is worse than sharing them
+//! out evenly — which is itself worse than not having them. Equal bands reproduce what they gave
+//! before the list existed, start for start.
 //!
 //! # The accumulator solved, by moving the separation into the score
 //!
@@ -1509,8 +1556,8 @@ fn select(
         let there = kernel.module().i_add(uint, theirs_at, off)?;
         let held = kernel.load_at(GENE, here)?;
         let other = kernel.load_at(GENE, there)?;
-        let which = (cell % ROWS) / exam.band.max(1);
-        let take = apiece.get(which as usize).copied().unwrap_or(take);
+        let which = banded(&exam.band, cell % ROWS).0;
+        let take = apiece.get(which).copied().unwrap_or(take);
         let mut settled = pick(&mut kernel, take, other, held)?;
         for &(spot, fresh) in &spots {
             let at_spot = is(&mut kernel, spot, off)?;
@@ -1644,7 +1691,7 @@ fn feed(
     let held = kernel.load_at(COUNTS, none)?;
     let (chip, row, case) = wire_at(&mut kernel, subgroup, cases, colony, held)?;
     // Every row question is a question about where a row sits in its band, not the grid.
-    let inside = low_bits(&mut kernel, row, exam.band.trailing_zeros())?;
+    let (which_band, _, size, inside) = where_in(&mut kernel, row, &exam.band)?;
 
     // This step's slice of the word: bit `step * fan + row` of the input. **After `hold` has
     // started there is no slice left**, and the input rows arrive at nought so that everything the
@@ -1691,16 +1738,15 @@ fn feed(
     // **A starved band's input rows are not input rows.** Everything it is going to know has to
     // arrive over the boundary.
     if exam.feeds > 0 {
-        let which = down_by(&mut kernel, row, exam.band.trailing_zeros())?;
         let many = kernel.module().constant_u32(exam.feeds)?;
-        let fed = above(&mut kernel, many, which)?;
+        let fed = above(&mut kernel, many, which_band)?;
         feeding = kernel.module().i_mul(uint, feeding, fed)?;
     }
     let past = kernel.module().constant_u32(fan + state)?;
     let within = above(&mut kernel, past, inside)?;
     let not_input = minus(&mut kernel, one, feeding)?;
     let remembering = kernel.module().i_mul(uint, within, not_input)?;
-    let bottom = kernel.module().constant_u32(exam.band - 1)?;
+    let bottom = minus(&mut kernel, size, one)?;
     let lowest = is(&mut kernel, inside, bottom)?;
 
     let padding = pick(&mut kernel, lowest, one, none)?;
@@ -1723,7 +1769,7 @@ fn propagate(
     colony: u32,
     noise: u32,
     allowed: &[u32],
-    band: u32,
+    band: &[u32],
 ) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -1734,18 +1780,18 @@ fn propagate(
 
     // **The wrap is inside the band.** The top row of a band reads the bottom row of the same band
     // and never the row above it, so no signal crosses a boundary in either direction.
-    let wide = band.trailing_zeros();
-    let inside = low_bits(&mut kernel, row, wide)?;
-    let base = minus(&mut kernel, row, inside)?;
+    let (_, base, size, inside) = where_in(&mut kernel, row, band)?;
     let up = {
-        let back = kernel.module().constant_u32(band - 1)?;
-        let raised = kernel.module().i_add(uint, inside, back)?;
-        let held = low_bits(&mut kernel, raised, wide)?;
+        let last = minus(&mut kernel, size, one)?;
+        let before = minus(&mut kernel, inside, one)?;
+        let at_top = is(&mut kernel, inside, none)?;
+        let held = pick(&mut kernel, at_top, last, before)?;
         kernel.module().i_add(uint, base, held)?
     };
     let down = {
-        let raised = kernel.module().i_add(uint, inside, one)?;
-        let held = low_bits(&mut kernel, raised, wide)?;
+        let after = kernel.module().i_add(uint, inside, one)?;
+        let over_edge = is(&mut kernel, after, size)?;
+        let held = pick(&mut kernel, over_edge, none, after)?;
         kernel.module().i_add(uint, base, held)?
     };
     let at_a = wire(&mut kernel, chip, column - 1, up, case, cases)?;
@@ -1754,7 +1800,7 @@ fn propagate(
     // **The one thing that crosses a band.** Everything else wraps inside its own band; this reads
     // the same offset one band up, which is where a carry has to come from.
     let over_at = {
-        let back = kernel.module().constant_u32(ROWS - band)?;
+        let back = kernel.module().constant_u32(ROWS - band.first().copied().unwrap_or(ROWS))?;
         let raised = kernel.module().i_add(uint, row, back)?;
         let held = low_bits(&mut kernel, raised, ROWS.trailing_zeros())?;
         wire(&mut kernel, chip, column - 1, held, case, cases)?
@@ -1862,7 +1908,7 @@ fn propagate(
 /// decides, and between two chips that are equally right the one with fewer gates wins. The host
 /// takes it apart again for the report.
 fn tally(subgroup: u32, cases: u32, colony: u32, exam: &Exam) -> Result<Vec<u32>, LaneError> {
-    let Exam { outputs, lean, apart, weigh, slack, fold, .. } = *exam;
+    let Exam { outputs, lean, weigh, slack, fold, .. } = *exam;
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let none = kernel.module().constant_u32(0)?;
@@ -1874,7 +1920,7 @@ fn tally(subgroup: u32, cases: u32, colony: u32, exam: &Exam) -> Result<Vec<u32>
     // output one the wire under it, and so on — the same place a one-bit exam reads, extended.
     let mut apiece = Vec::with_capacity(outputs as usize);
     for output in 0..outputs {
-        let row = kernel.module().constant_u32(if fold { 0 } else { output * apart })?;
+        let row = kernel.module().constant_u32(if fold { 0 } else { exam.answer_row(output) })?;
         let mut got = kernel.module().constant_u32(0)?;
         for case in 0..cases {
             let which = kernel.module().constant_u32(case)?;
@@ -1923,7 +1969,7 @@ fn tally(subgroup: u32, cases: u32, colony: u32, exam: &Exam) -> Result<Vec<u32>
             let want = kernel.load_at(TARGET, which)?;
             let mut says = kernel.module().constant_u32(0)?;
             for output in 0..outputs {
-                let row = kernel.module().constant_u32(output * apart)?;
+                let row = kernel.module().constant_u32(exam.answer_row(output))?;
                 let at = wire(&mut kernel, chip, COLUMNS - 1, row, which, cases)?;
                 let said = kernel.load_at(WIRE, at)?;
                 let place = kernel.module().constant_u32(1 << output)?;
@@ -2099,12 +2145,16 @@ struct Exam {
     start: Option<String>,
     /// How many copies of `start` go in, or nought for [`KEPT`].
     aliens: u32,
-    /// How many rows a band is, or `ROWS` for one band, which is what it was.
+    /// How many rows each band is, or one band of `ROWS`, which is what it was.
+    ///
+    /// **They need not be equal.** On the six-input accumulator answers nought and three come out
+    /// perfect on every start and one and two do not, so the rows are worth more to some bands than
+    /// to others.
     ///
     /// **A band is a chip of its own.** Its gates cannot read across the boundary, it gets its own
     /// copy of the word and its own bottom row, and an answer read off its top row is built out of
     /// cells no other answer can reach. It is what `apart` looked like it was and never was.
-    band: u32,
+    band: Vec<u32>,
     /// Whether the last slice of the word stays on the input rows during a hold.
     ///
     /// **A hold blanks the inputs, which asks the chip to remember the question as well as answer
@@ -2151,6 +2201,17 @@ impl Exam {
             2 => CELLS * price(5),
             _ => CELLS,
         }
+    }
+
+    /// Which row answer `at` is read off.
+    ///
+    /// **With bands it is the band's top row and `apart` does not come into it**, because uneven
+    /// bands do not start at a fixed spacing and a single number cannot say where they start.
+    fn answer_row(&self, at: u32) -> u32 {
+        if self.band.len() > 1 {
+            return self.band.iter().take(at as usize).sum();
+        }
+        at * self.apart
     }
 
     /// How many inputs there are altogether.
@@ -2243,7 +2304,7 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut hold = 0;
     let mut fold = false;
     let mut linger = false;
-    let mut band = ROWS;
+    let mut band: Vec<u32> = vec![ROWS];
     let mut feeds = 0;
     let mut apiece = false;
     let mut keep = None;
@@ -2304,11 +2365,16 @@ fn read(text: &str) -> Result<Exam, String> {
                 aliens = word.next().and_then(|it| it.parse().ok()).unwrap_or(0);
             }
             (Some("band"), _) => {
-                band = word
+                let held: Vec<u32> = word
                     .next()
-                    .and_then(|it| it.parse::<u32>().ok())
-                    .filter(|it| it.is_power_of_two() && ROWS.is_multiple_of(*it))
-                    .ok_or_else(|| say("`band` wants a power of two that divides the rows"))?;
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|it| it.parse().ok())
+                    .collect();
+                if held.iter().sum::<u32>() != ROWS || held.iter().any(|it| *it < 2) {
+                    return Err(say("`band` wants sizes of two or more that add up to the rows"));
+                }
+                band = held;
             }
             (Some("linger"), _) => {
                 linger = word.next() != Some("0");
@@ -2523,14 +2589,14 @@ fn read(text: &str) -> Result<Exam, String> {
     if bits % steps != 0 {
         return Err(format!("`steps {steps}` does not divide `inputs {bits}`"));
     }
-    if bits / steps + state >= band {
+    if band.iter().min().is_some_and(|it| bits / steps + state >= *it) {
         return Err(format!(
-            "{} input rows and {state} state rows do not fit in a band of {band} with the one on",
+            "{} input rows and {state} state rows do not fit in the narrowest band",
             bits / steps
-        ) + " the bottom");
+        ));
     }
-    if outputs * band > ROWS && band < ROWS {
-        return Err(format!("{outputs} bands of {band} do not fit in {ROWS} rows"));
+    if band.len() > 1 && band.len() != outputs as usize {
+        return Err(format!("{} bands and {outputs} answers is not one each", band.len()));
     }
     if bits / steps + state >= ROWS {
         return Err(format!(
@@ -2554,10 +2620,8 @@ fn read(text: &str) -> Result<Exam, String> {
     if weigh != 0 && outputs < 2 {
         return Err("`weigh` needs more than one answer to weigh".to_string());
     }
-    if apiece && (band >= ROWS || apart != band) {
-        return Err(
-            "`apiece` wants `band` and `apart` the same, so an answer lives in a band".to_string(),
-        );
+    if apiece && band.len() < 2 {
+        return Err("`apiece` wants bands, so that an answer lives in one".to_string());
     }
     if fold && state == 0 {
         return Err(
@@ -2612,8 +2676,9 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
         let keep = |row: u32| last.get(row as usize).copied().unwrap_or(0);
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
-                let inside = row % exam.band;
-                let fed = exam.feeds == 0 || row / exam.band < exam.feeds;
+                let (which, base, size) = banded(&exam.band, row);
+                let inside = row - base;
+                let fed = exam.feeds == 0 || (which as u32) < exam.feeds;
                 if inside < fan && fed {
                     if step >= exam.steps && !exam.linger {
                         0
@@ -2622,7 +2687,7 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
                     }
                 } else if inside < fan + exam.state {
                     if step == 0 { 0 } else { keep(row) }
-                } else if inside == exam.band - 1 {
+                } else if inside == size - 1 {
                     1
                 } else {
                     0
@@ -2634,11 +2699,11 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
             let next: Vec<u32> = (0..ROWS)
                 .map(|row| {
                     // The wrap is inside the band, so a boundary is as good as an edge.
-                    let base = row - row % exam.band;
-                    let round = |at: u32| base + at % exam.band;
+                    let (_, base, size) = banded(&exam.band, row);
+                    let round = |at: u32| base + at % size;
                     let (up, down, straight) = (
-                        read(round(row % exam.band + exam.band - 1)),
-                        read(round(row % exam.band + 1)),
+                        read(round(row - base + size - 1)),
+                        read(round(row - base + 1)),
                         read(row),
                     );
                     match genome.get(((at - 1) * ROWS + row) as usize).copied() {
@@ -2655,7 +2720,7 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
                             }
                         }
                         Some(7) => (up + down + straight) & 1,
-                        Some(8) => read(row + ROWS - exam.band),
+                        Some(8) => read(row + ROWS - exam.band.first().copied().unwrap_or(ROWS)),
                         _ => straight,
                     }
                 })
@@ -2680,7 +2745,7 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
             .fold(0_u32, |held, (at, _)| held | (1 << at));
     }
     (0..exam.outputs)
-        .filter(|&at| last.get((at * exam.apart) as usize).copied().unwrap_or(0) == 1)
+        .filter(|&at| last.get(exam.answer_row(at) as usize).copied().unwrap_or(0) == 1)
         .fold(0_u32, |held, at| held | (1 << at))
 }
 /// How many of the marked answer bits this chip gets right, worked out on the host.
@@ -2774,8 +2839,9 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
         let keep = |row: u32| last.get(row as usize).copied().unwrap_or(0);
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
-                let inside = row % exam.band;
-                let fed = exam.feeds == 0 || row / exam.band < exam.feeds;
+                let (which, base, size) = banded(&exam.band, row);
+                let inside = row - base;
+                let fed = exam.feeds == 0 || (which as u32) < exam.feeds;
                 if inside < fan && fed {
                     if step >= exam.steps && !exam.linger {
                         0
@@ -2784,7 +2850,7 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
                     }
                 } else if inside < fan + exam.state {
                     if step == 0 { 0 } else { keep(row) }
-                } else if inside == exam.band - 1 {
+                } else if inside == size - 1 {
                     1
                 } else {
                     0
@@ -2796,11 +2862,11 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
             let next: Vec<u32> = (0..ROWS)
                 .map(|row| {
                     // The wrap is inside the band, so a boundary is as good as an edge.
-                    let base = row - row % exam.band;
-                    let round = |at: u32| base + at % exam.band;
+                    let (_, base, size) = banded(&exam.band, row);
+                    let round = |at: u32| base + at % size;
                     let (up, down, straight) = (
-                        read(round(row % exam.band + exam.band - 1)),
-                        read(round(row % exam.band + 1)),
+                        read(round(row - base + size - 1)),
+                        read(round(row - base + 1)),
                         read(row),
                     );
                     match genome.get(((at - 1) * ROWS + row) as usize).copied() {
@@ -2817,7 +2883,7 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
                             }
                         }
                         Some(7) => (up + down + straight) & 1,
-                        Some(8) => read(row + ROWS - exam.band),
+                        Some(8) => read(row + ROWS - exam.band.first().copied().unwrap_or(ROWS)),
                         _ => straight,
                     }
                 })
@@ -2830,7 +2896,7 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
         // **And what the answer rows say at the same moment**, which is a different question: the
         // state can churn under an answer that has already arrived and stopped moving.
         let saying = (0..exam.outputs)
-            .filter(|&at| column.get((at * exam.apart) as usize).copied().unwrap_or(0) == 1)
+            .filter(|&at| column.get(exam.answer_row(at) as usize).copied().unwrap_or(0) == 1)
             .fold(0_u32, |bits, at| bits | (1 << at));
         seen.push((held, saying));
         last = column;
@@ -2849,25 +2915,71 @@ fn unpack(score: u32, budget: u32) -> (u32, u32) {
     }
 }
 
+/// Where a row sits in its band, worked out on the card.
+///
+/// **Equal bands would be a shift.** Uneven ones are a chain of comparisons instead: each boundary
+/// past the row's own leaves the answer alone, and the last one that is not past it wins.
+fn where_in(
+    kernel: &mut Kernel<U32>,
+    row: Id,
+    bands: &[u32],
+) -> Result<(Id, Id, Id, Id), LaneError> {
+    let uint = kernel.index_type();
+    let first = bands.first().copied().unwrap_or(ROWS);
+    let mut base = kernel.module().constant_u32(0)?;
+    let mut size = kernel.module().constant_u32(first)?;
+    let mut which = kernel.module().constant_u32(0)?;
+    let mut edge = first;
+    for (at, &held) in bands.iter().enumerate().skip(1) {
+        let past = kernel.module().constant_u32(edge - 1)?;
+        let hit = above(kernel, row, past)?;
+        let there = kernel.module().constant_u32(edge)?;
+        let wide = kernel.module().constant_u32(held)?;
+        let index = kernel.module().constant_u32(u32::try_from(at).unwrap_or(0))?;
+        base = pick(kernel, hit, there, base)?;
+        size = pick(kernel, hit, wide, size)?;
+        which = pick(kernel, hit, index, which)?;
+        edge += held;
+    }
+    let inside = minus(kernel, row, base)?;
+    let _ = uint;
+    Ok((which, base, size, inside))
+}
+
+/// Which band a row is in, where that band starts and how many rows it has.
+///
+/// **Equal bands are a shift and unequal ones are not**, so this is worked out with comparisons
+/// rather than by dividing, on the host and in the kernel alike.
+fn banded(bands: &[u32], row: u32) -> (usize, u32, u32) {
+    let mut base = 0;
+    for (which, &size) in bands.iter().enumerate() {
+        if row < base + size {
+            return (which, base, size);
+        }
+        base += size;
+    }
+    (0, 0, bands.first().copied().unwrap_or(ROWS))
+}
+
 /// What a gate of this kind costs, which is how many wires it reads.
 ///
 /// **A wire is not a gate**, so it is free, and the two that read three cost three.
 fn price(kind: u32) -> u32 {
-    u32::try_from(reads(kind, 0, ROWS).len()).unwrap_or(0) * u32::from(kind != 0)
+    u32::try_from(reads(kind, 0, &[ROWS]).len()).unwrap_or(0) * u32::from(kind != 0)
 }
 
 /// Which wires of the column before a gate of this kind reads.
 ///
 /// **Two of the seven read three.** `maj` and `mux` take the wire straight ahead as well as the two
 /// diagonals, so a cone traced back through one of them is a row wider than through the others.
-fn reads(kind: u32, row: u32, band: u32) -> Vec<u32> {
-    let base = row - row % band;
-    let round = |at: u32| base + at % band;
-    let (up, down) = (round(row % band + band - 1), round(row % band + 1));
+fn reads(kind: u32, row: u32, band: &[u32]) -> Vec<u32> {
+    let (_, base, size) = banded(band, row);
+    let round = |at: u32| base + at % size;
+    let (up, down) = (round(row - base + size - 1), round(row - base + 1));
     match kind {
         0 | 4 => vec![row],
         5..=7 => vec![up, row, down],
-        8 => vec![row + ROWS - band],
+        8 => vec![row + ROWS - band.first().copied().unwrap_or(ROWS)],
         _ => vec![up, down],
     }
 }
@@ -2880,7 +2992,7 @@ fn reads(kind: u32, row: u32, band: u32) -> Vec<u32> {
 fn cone(genome: &[u32], exam: &Exam, output: u32) -> Vec<bool> {
     let mut wanted = vec![false; (COLUMNS * ROWS) as usize];
     let at = |column: u32, row: u32| (column * ROWS + row % ROWS) as usize;
-    if let Some(slot) = wanted.get_mut(at(COLUMNS - 1, output * exam.apart)) {
+    if let Some(slot) = wanted.get_mut(at(COLUMNS - 1, exam.answer_row(output))) {
         *slot = true;
     }
     let mut used = vec![false; CELLS as usize];
@@ -2894,7 +3006,7 @@ fn cone(genome: &[u32], exam: &Exam, output: u32) -> Vec<bool> {
             if let Some(slot) = used.get_mut(cell) {
                 *slot = kind != 0;
             }
-            let reaches = reads(kind, row, exam.band);
+            let reaches = reads(kind, row, &exam.band);
             for back in reaches {
                 if let Some(slot) = wanted.get_mut(at(column - 1, back)) {
                     *slot = true;
@@ -2921,8 +3033,10 @@ fn live(genome: &[u32], exam: &Exam) -> Vec<bool> {
     // was further, and an answer read off a row past that was left out of its own cone: at
     // `apart 3` it missed the third answer and at `apart 8` it missed three of four.
     for row in 0..ROWS {
-        let reads_it = (row % exam.apart == 0 && row / exam.apart < exam.outputs)
-            || (row >= fan && row < fan + exam.state);
+        let (which, base, size) = banded(&exam.band, row);
+        let reads_it = (0..exam.outputs).any(|at| exam.answer_row(at) == row)
+            || (row >= base + fan && row < base + fan + exam.state);
+        let _ = (which, size);
         if let Some(slot) = wanted.get_mut(at(COLUMNS - 1, row)).filter(|_| reads_it) {
             *slot = true;
         }
@@ -2938,7 +3052,7 @@ fn live(genome: &[u32], exam: &Exam) -> Vec<bool> {
             if let Some(slot) = used.get_mut(cell) {
                 *slot = kind != 0;
             }
-            let reaches = reads(kind, row, exam.band);
+            let reaches = reads(kind, row, &exam.band);
             for back in reaches {
                 if let Some(slot) = wanted.get_mut(at(column - 1, back)) {
                     *slot = true;
@@ -3051,7 +3165,7 @@ fn pulls(genome: &[u32], exam: &Exam) -> (u32, u32, u32, u32, usize, u32, u32) {
 ///
 /// **An arrow marks an answer wire.** Output nought is the top row of the last column, output one
 /// the row under it, and the exam says how many there are.
-fn drawn(genome: &[u32], bits: u32, outputs: u32, apart: u32, alive: &[bool]) -> String {
+fn drawn(genome: &[u32], bits: u32, exam: &Exam, alive: &[bool]) -> String {
     let mut out = String::new();
     for row in 0..ROWS {
         out.push_str("    ");
@@ -3081,9 +3195,9 @@ fn drawn(genome: &[u32], bits: u32, outputs: u32, apart: u32, alive: &[bool]) ->
                 _ => '-',
             });
         }
-        if row % apart == 0 && row / apart < outputs {
+        if let Some(at) = (0..exam.outputs).find(|&at| exam.answer_row(at) == row) {
             out.push_str(" <- ");
-            out.push(char::from(b'0' + u8::try_from(row / apart).unwrap_or(0)));
+            out.push(char::from(b'0' + u8::try_from(at).unwrap_or(0)));
         }
         out.push('\n');
     }
@@ -3162,7 +3276,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 colony,
                 exam.noise,
                 &exam.allowed,
-                exam.band,
+                &exam.band,
             )?);
         }
     }
@@ -3370,7 +3484,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or(0);
                     }
                     for cell in 0..span {
-                        if (cell as u32 % ROWS) / exam.band.max(1) != which as u32 {
+                        if banded(&exam.band, cell as u32 % ROWS).0 != which {
                             continue;
                         }
                         if let (Some(now), Some(was)) =
@@ -3436,7 +3550,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(winner * CELLS as usize..(winner + 1) * CELLS as usize)
         .unwrap_or(&[]);
     let alive = live(genome, &exam);
-    println!("\n{}", drawn(genome, exam.bits, exam.outputs, exam.apart, &alive));
+    println!("\n{}", drawn(genome, exam.bits, &exam, &alive));
     println!(
         "    - wire  & and  v or  ^ xor  ! not  # maj  ? mux  + sum  | over  · dead  (<- an answer)"
     );
@@ -3492,7 +3606,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          them three at a time; the rest \
          are scenery."
     );
-    if exam.band < ROWS {
+    if exam.band.len() > 1 {
         println!("  {across} of them cross a band, which is the only thing that does");
     }
     println!(
