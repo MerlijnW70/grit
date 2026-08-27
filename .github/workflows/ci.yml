@@ -1,0 +1,243 @@
+# Everything that can be checked without the two GPUs in the author's machine.
+#
+# This repository had no CI at all, and what that cost is not hypothetical. The machine it was
+# written on holds two devices — an RTX 4080 at subgroup 32 and an integrated Radeon at 64 — and
+# `tests/dispatch.rs` says in prose that "the whole suite passes on both". Setting `GRIT_DEVICE=AMD`
+# and running it takes one line, nobody had, and the sentence is no longer true: `tests/coarse.rs`
+# fails there on a **correctness** check, not a timing one, and `tests/floor.rs` fails on a timing
+# one. Neither is found by reading.
+#
+# So: Mesa's lavapipe is a Vulkan implementation that runs on the processor, and it can be pinned to
+# subgroup 4, 8 and 16 — three widths every kernel here has an arm for and no device in that machine
+# can report. `simdr`'s own CI does this and this borrows the mechanism from it wholesale.
+#
+# What does NOT run here, and is stated rather than implied:
+#
+#   * widths 32 and 64, which need the two real devices;
+#   * `tests/floor.rs`, which is nothing but wall-clock comparisons a few hundred nanoseconds apart
+#     and skips itself when `CI` is set — see the note on its `device` helper;
+#   * every figure in `README.md`, none of which means anything on a shared runner.
+#
+# A green run here is not the whole suite. It is the part that travels.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  library:
+    name: the library — no device needed
+    runs-on: ubuntu-latest
+    steps:
+      # **Two checkouts, because this crate cannot be built from its own repository.** `Cargo.toml`
+      # names `simdr = { path = "../simdr" }`, so a clone of this repository alone has no emitter and
+      # no build. That is a fact about the arrangement rather than a fault in it — `simdr` declares no
+      # dependencies and is developed alongside — but it means anybody who clones this needs the
+      # sibling too, and until now nothing said so where it would be noticed.
+      - uses: actions/checkout@v5
+        with:
+          path: grit
+      # **`simdr` is a private repository**, and the token a workflow is given by default can see
+      # only the one it is running in. Without a token of its own the checkout below fails as a 404
+      # on a repository that plainly exists, which is the least useful error there is — so it is
+      # checked for first and said in words.
+      #
+      # `SIBLING` is a personal access token with read access to `MerlijnW70/simdr`, added as a
+      # repository secret. A submodule would do the same job without a secret and would pin a commit
+      # rather than follow `main`; that is a change to how the two repositories are arranged and is
+      # not made here.
+      - name: the sibling this crate is built on
+        env:
+          SIBLING: ${{ secrets.SIBLING }}
+        run: |
+          if [ -z "$SIBLING" ]; then
+            echo "::error::no SIBLING secret. This crate names simdr by path in Cargo.toml and cannot be built without it. Add a token with read access to MerlijnW70/simdr as a repository secret called SIBLING."
+            exit 1
+          fi
+      - uses: actions/checkout@v5
+        with:
+          repository: MerlijnW70/simdr
+          path: simdr
+          token: ${{ secrets.SIBLING }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: formatting
+        working-directory: grit
+        run: cargo fmt --all --check
+
+      # `--no-default-features` drops `minifb` and the two crates under it, which want X11 headers a
+      # runner does not have by default. The windowed binaries are compiled in their own step below,
+      # after those headers are installed, so nothing goes unchecked — it is only checked in two
+      # halves.
+      - name: clippy, without the window
+        working-directory: grit
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo clippy --no-default-features --all-targets
+
+      - name: the headers a window needs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcursor-dev libxrandr-dev \
+            libxi-dev libx11-dev libgl1-mesa-dev
+
+      # `pour` and `spike` are behind `required-features = ["window"]`, so this is the only step that
+      # compiles them at all.
+      - name: clippy, with it
+        working-directory: grit
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo clippy --all-targets
+
+      # **A broken doc link is a build failure and nothing was making it one.** Same reasoning as
+      # `simdr`'s workflow, which found twelve dead links the first time it was asked.
+      - name: documentation
+        working-directory: grit
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+  device:
+    name: lavapipe — widths 4, 8 and 16
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # llvmpipe's subgroup is its vector width over 32, and `minSubgroupSize` equals
+        # `maxSubgroupSize` at each setting, so the width is pinned rather than a default the driver
+        # may vary. These three are the widths this crate has kernel arms for and no device in the
+        # author's machine can report; `tests/hot.rs` already covers them with arithmetic on the
+        # host, and this is the same widths with the device actually running.
+        include:
+          - vector: 128
+            width: 4
+          - vector: 256
+            width: 8
+          - vector: 512
+            width: 16
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: grit
+      # **`simdr` is a private repository**, and the token a workflow is given by default can see
+      # only the one it is running in. Without a token of its own the checkout below fails as a 404
+      # on a repository that plainly exists, which is the least useful error there is — so it is
+      # checked for first and said in words.
+      #
+      # `SIBLING` is a personal access token with read access to `MerlijnW70/simdr`, added as a
+      # repository secret. A submodule would do the same job without a secret and would pin a commit
+      # rather than follow `main`; that is a change to how the two repositories are arranged and is
+      # not made here.
+      - name: the sibling this crate is built on
+        env:
+          SIBLING: ${{ secrets.SIBLING }}
+        run: |
+          if [ -z "$SIBLING" ]; then
+            echo "::error::no SIBLING secret. This crate names simdr by path in Cargo.toml and cannot be built without it. Add a token with read access to MerlijnW70/simdr as a repository secret called SIBLING."
+            exit 1
+          fi
+      - uses: actions/checkout@v5
+        with:
+          repository: MerlijnW70/simdr
+          path: simdr
+          token: ${{ secrets.SIBLING }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+
+      # **Discovered, not assumed.** `simdr`'s first version of this pointed `VK_ICD_FILENAMES` at a
+      # hard-coded path and every job died on `ERROR_INCOMPATIBLE_DRIVER`, which is what
+      # `vkCreateInstance` returns when the loader can see no ICD at all — including when the file it
+      # was told to use is not there.
+      #
+      # Failing here is deliberate. Every test in this crate skips loudly when no device opens, so a
+      # missing driver would leave the whole suite reporting green over nothing.
+      - name: find the software driver
+        run: |
+          echo "ICDs installed:"
+          ls -la /usr/share/vulkan/icd.d/ || true
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -n1)
+          if [ -z "$icd" ]; then
+            echo "::error::no lavapipe ICD found — the tests below would skip and pass over nothing"
+            exit 1
+          fi
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          echo "using $icd"
+
+      - name: what the driver reports
+        env:
+          LP_NATIVE_VECTOR_WIDTH: ${{ matrix.vector }}
+        run: vulkaninfo --summary || true
+
+      # **`--nocapture` is not cosmetic.** `libtest` swallows `eprintln!` from a *passing* test, and
+      # a skip here is a pass — so a run that skipped everything prints exactly the summary of one
+      # that ran it all. Every one of this crate's `device` helpers reports its skip that way.
+      #
+      # The count is asserted rather than printed, for the reason the ICD step is a hard failure:
+      # that step guards one way of ending up with no coverage, and this guards the rest of them —
+      # a driver that stops reporting a feature, a harness that quietly finds nothing to run.
+      # **Nought is the only number that is right here**: every skip in this suite is "no device",
+      # and there is a device.
+      - name: the suite at subgroup ${{ matrix.width }}
+        working-directory: grit
+        env:
+          LP_NATIVE_VECTOR_WIDTH: ${{ matrix.vector }}
+        run: |
+          set -o pipefail
+          cargo test --release --no-default-features --no-fail-fast -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/suite.log"
+          skipped=$(grep -o 'SKIPPED ' "$RUNNER_TEMP/suite.log" | wc -l)
+          echo "$skipped test(s) did not run at subgroup ${{ matrix.width }}"
+          if [ "$skipped" -ne 1 ]; then
+            echo "::error::${{ matrix.width }}-wide run skipped $skipped test(s) and one is expected — tests/floor.rs skips itself because CI is set, and nothing else here has a reason to"
+            exit 1
+          fi
+
+  msrv:
+    name: the version Cargo.toml claims
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: grit
+      # **`simdr` is a private repository**, and the token a workflow is given by default can see
+      # only the one it is running in. Without a token of its own the checkout below fails as a 404
+      # on a repository that plainly exists, which is the least useful error there is — so it is
+      # checked for first and said in words.
+      #
+      # `SIBLING` is a personal access token with read access to `MerlijnW70/simdr`, added as a
+      # repository secret. A submodule would do the same job without a secret and would pin a commit
+      # rather than follow `main`; that is a change to how the two repositories are arranged and is
+      # not made here.
+      - name: the sibling this crate is built on
+        env:
+          SIBLING: ${{ secrets.SIBLING }}
+        run: |
+          if [ -z "$SIBLING" ]; then
+            echo "::error::no SIBLING secret. This crate names simdr by path in Cargo.toml and cannot be built without it. Add a token with read access to MerlijnW70/simdr as a repository secret called SIBLING."
+            exit 1
+          fi
+      - uses: actions/checkout@v5
+        with:
+          repository: MerlijnW70/simdr
+          path: simdr
+          token: ${{ secrets.SIBLING }}
+      # `rust-version = "1.88"` was asserted and never tested against anything. This is what makes
+      # it a fact rather than a number, and it is the same job `simdr` runs for the same reason.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - name: check
+        working-directory: grit
+        run: cargo check --no-default-features --all-targets

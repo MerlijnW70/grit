@@ -38,7 +38,10 @@ fn says(what: &Error, parts: &[&str]) {
 fn every_error_says_the_numbers_it_holds() {
     says(&Error::NoComputeDevice, &[]);
     says(&Error::StillInFlight, &[]);
-    says(&Error::Vulkan(vk::Result::ERROR_DEVICE_LOST), &["DEVICE_LOST"]);
+    says(
+        &Error::Vulkan(vk::Result::ERROR_DEVICE_LOST),
+        &["DEVICE_LOST"],
+    );
     says(
         &Error::NoSuchDevice {
             wanted: "shimmer".to_owned(),
@@ -62,7 +65,13 @@ fn every_error_says_the_numbers_it_holds() {
         },
         &["41", "5000", "64"],
     );
-    says(&Error::WrongPasses { given: 77, held: 91 }, &["77", "91"]);
+    says(
+        &Error::WrongPasses {
+            given: 77,
+            held: 91,
+        },
+        &["77", "91"],
+    );
     says(
         &Error::Wedged {
             after: Duration::from_millis(250),

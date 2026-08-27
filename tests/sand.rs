@@ -19,10 +19,10 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::layout::{LOOKING, PARAMS, PIXELS, STATE};
-use grit::sand::{BINDINGS, WEIGHTS};
 use grit::sand::{
     self, AIR, Grid, RUNNING_RIGHT, SAND, View, WALL, WATER, material_of, running_of,
 };
+use grit::sand::{BINDINGS, WEIGHTS};
 use grit::{Groups, Host};
 
 /// The world under test.

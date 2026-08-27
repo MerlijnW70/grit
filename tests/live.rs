@@ -40,6 +40,13 @@ const FRAMES: u32 = 6000;
 /// How long the pour lasts, in frames.
 const POURING: u32 = 90;
 
+/// How many frames the larger check runs.
+///
+/// Long enough to be well past the pour and into the settling, which is where the disagreement this
+/// size exists to catch appears — and short enough that eight times the grid does not cost eight
+/// times six thousand frames.
+const SETTLING: u32 = 400;
+
 /// And how long the water lasts after it, in frames.
 const WETTING: u32 = 180;
 
@@ -96,12 +103,11 @@ fn brushing(frame: u32) -> [u32; 4] {
 /// **Both arrangements have to be run.** `live::wired` picks between them on `plan.blocks`, and the
 /// grid here is 128 blocks — well under `live::COARSE_FROM` — so leaving the choice to `wired` would
 /// mean the coarse hierarchy was never reached by the strongest check in the repository.
-fn against_the_whole_grid(coarse: bool) {
+fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bool) {
     let Some(host) = device("live") else {
         return;
     };
     let width = host.width();
-    let grid = Grid::of(WIDE, DEEP);
     let quads = grid.quads();
     let plan = match Plan::over(width, quads.div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
@@ -164,7 +170,7 @@ fn against_the_whole_grid(coarse: bool) {
     let mut smallest = u32::MAX;
     let mut busiest = 0_u32;
 
-    for frame in 0..FRAMES {
+    for frame in 0..frames {
         for held in [&mut live, &mut full] {
             held.write_at(PARAMS as usize, BRUSH, &brushing(frame))
                 .expect("brush");
@@ -217,10 +223,10 @@ fn against_the_whole_grid(coarse: bool) {
         busiest = busiest.max(listed);
     }
 
-    let mean = listed_total / u64::from(FRAMES);
+    let mean = listed_total / u64::from(frames);
     let saving = f64::from(quads) / (mean.max(1) as f64);
     println!(
-        "  {FRAMES} frames agreed cell for cell. The list averaged {mean} quads of {quads} \
+        "  {frames} frames agreed cell for cell. The list averaged {mean} quads of {quads} \
          — {saving:.1}× fewer — peaked at {busiest} and fell to {smallest} once the pile settled."
     );
 
@@ -235,16 +241,23 @@ fn against_the_whole_grid(coarse: bool) {
     // **Nought is the right answer, not a failure.** A settled pile has nothing to step, and a wake
     // rule that could not say so would keep the whole pile in the list forever — which is exactly
     // what waking on *content* did, at a third of this saving.
-    assert_eq!(
-        smallest, 0,
-        "the list never emptied, so something stayed awake after the sand stopped"
-    );
+    // **Only where the run is long enough for the pile to stop moving.** A larger grid settles more
+    // slowly, and a check run at a size chosen for something else should not also have to be run
+    // long enough for this one — it would say nothing new and cost the frames to say it.
+    if until_quiet {
+        assert_eq!(
+            smallest, 0,
+            "the list never emptied, so something stayed awake after the sand stopped"
+        );
+    } else {
+        eprintln!("  the list fell to {smallest}; emptying is not what this size is run for");
+    }
 }
 
 /// The arrangement `live::wired` picks at this size: over every block, no coarse list.
 #[test]
 fn the_list_is_shorter_and_never_different() {
-    against_the_whole_grid(false);
+    against_the_whole_grid(false, Grid::of(WIDE, DEEP), FRAMES, true);
 }
 
 /// The other one, which no grid this test can afford to run would reach on its own.
@@ -254,7 +267,31 @@ fn the_list_is_shorter_and_never_different() {
 /// being wrong, and this is the only check that would notice if it were.
 #[test]
 fn the_coarse_list_is_shorter_and_never_different_either() {
-    against_the_whole_grid(true);
+    against_the_whole_grid(true, Grid::of(WIDE, DEEP), FRAMES, true);
+}
+
+/// The same check on a grid eight times the size, where the coarse hierarchy is worth its cost.
+///
+/// # What this covers, and what it was written for and does not
+///
+/// The check above runs the coarse arrangement over 128 blocks. `tests/coarse.rs` runs it over 1024
+/// while timing it, and on an integrated Radeon at subgroup 64 the coarse arrangement there is **not
+/// reproducible**: the same program over the same blocks, twice in one process, stepped 1128 quads
+/// and then 1130, or 1125 and then 1130, where every-block holds at 1130 every time. On an RTX 4080
+/// at subgroup 32 it is quiet in eight runs of eight.
+///
+/// **This test was added to catch that and it does not.** Six runs on the same Radeon, at the same
+/// 1024 blocks and 400 frames, agree cell for cell every time. So whatever wanders in the other file
+/// is not the state this one compares — the coarse arrangement computes the same sand, frame for
+/// frame, at the size and the length where its own quad count will not sit still.
+///
+/// It is kept because the coverage it adds is real on its own terms: before it, the strongest check
+/// in this repository ran the coarse hierarchy only at a size where that hierarchy is not worth
+/// using, and being slower is not the same as being wrong. What it does not do is stated here rather
+/// than left for whoever assumes a test named after a bug catches it.
+#[test]
+fn the_coarse_list_agrees_at_a_size_worth_using_it_at() {
+    against_the_whole_grid(true, Grid::of(WIDE * 4, DEEP * 4), SETTLING, false);
 }
 
 /// Zero every binding, so nothing carries over from an allocation.
@@ -279,7 +316,10 @@ fn a_host_says_how_much_memory_it_has() {
         return;
     };
     let (heap, ceiling) = (host.heap(), host.ceiling());
-    eprintln!("  {} — heap {heap} bytes, ceiling {ceiling} bytes", host.name());
+    eprintln!(
+        "  {} — heap {heap} bytes, ceiling {ceiling} bytes",
+        host.name()
+    );
 
     assert!(heap > 0, "a device with no device-local heap at all");
     assert!(
@@ -288,5 +328,8 @@ fn a_host_says_how_much_memory_it_has() {
     );
     // A device this can run a compute pass on has more than a token's worth of memory. Loose on
     // purpose: the point is that the number is the heap's and not a placeholder.
-    assert!(heap >= 64 * 1024 * 1024, "a heap of {heap} bytes is not a device this runs on");
+    assert!(
+        heap >= 64 * 1024 * 1024,
+        "a heap of {heap} bytes is not a device this runs on"
+    );
 }

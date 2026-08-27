@@ -826,9 +826,8 @@ pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
             let right_free = material_of(there) == AIR;
             let left_free = material_of(here) == AIR;
 
-            let halt = |word: u32| {
-                material_of(word) + held_of(word) * HELD + tired_of(word) * TIRED
-            };
+            let halt =
+                |word: u32| material_of(word) + held_of(word) * HELD + tired_of(word) * TIRED;
             let kept_left = if goes_right && !right_free {
                 halt(here)
             } else {

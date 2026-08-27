@@ -33,10 +33,10 @@
 // A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
+use grit::Groups;
 use grit::Host;
 use grit::compact::{self, Over, Plan, Tier};
 use grit::layout::{HOT, HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, HOT_TOTALS};
-use grit::Groups;
 
 /// Blocks in the check.
 ///
@@ -200,9 +200,7 @@ fn the_hot_list_is_every_hot_block_once_and_in_order() {
             "frame {pass}: something was written past the end of the hot list"
         );
 
-        let indirect = resident
-            .read(HOT_INDIRECT as usize, 3)
-            .expect("indirect");
+        let indirect = resident.read(HOT_INDIRECT as usize, 3).expect("indirect");
         assert_eq!(
             indirect,
             vec![grand, 1, 1],
@@ -219,7 +217,6 @@ fn the_hot_list_is_every_hot_block_once_and_in_order() {
         plan.blocks,
         plan.tiles * 2 + plan.hot_tiles + 1
     );
-
 }
 
 /// [`Plan::cold`] is the number `live::mark` computes for itself, at every width.

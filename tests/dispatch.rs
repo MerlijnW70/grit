@@ -80,6 +80,53 @@ fn a_pass_dispatched_over_no_workgroups_does_not_run() {
     assert_eq!(held.read(0, 1).expect("a read"), vec![MARK]);
 }
 
+/// A count of nought **in a buffer the device reads** stops the pass, and one stops it too.
+///
+/// # Why this is not the test above
+///
+/// `Groups::Fixed(0)` is not recorded at all — `Resident` drops it before the command buffer exists,
+/// and the check above is that it does. `Groups::From` is the opposite case and the one this whole
+/// repository turns on: the pass **is** recorded, because the host does not know what the count says,
+/// and the device reads three words at dispatch time and decides. Those are different mechanisms and
+/// only one of them was checked by what it left behind.
+///
+/// The other was checked by its cost. `tests/floor.rs` fits a line through a sweep of switched-off
+/// passes and asserts that one costs less than a pass left on — which is true on an RTX 4080, 46 ns
+/// against 120, and **false on an integrated Radeon**, 99 against 89 over three runs each. A
+/// mechanism proved by a stopwatch is proved only on the hardware the stopwatch was held on. This
+/// proves it by what is in the buffer afterwards, which every device has to agree about.
+#[test]
+fn a_count_of_nought_in_a_buffer_stops_the_pass_that_reads_it() {
+    let Some(host) = device("a_count_of_nought_in_a_buffer_stops_the_pass_that_reads_it") else {
+        return;
+    };
+    let module = mark(host.width()).expect("a kernel");
+    // Binding 0 is what the kernel writes; binding 1 holds the x, y and z the dispatch reads.
+    let mut held = host
+        .resident(&[4, 3], &[&module])
+        .expect("two device buffers");
+    let over = [Groups::From { binding: 1, at: 0 }];
+
+    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    held.write(1, &[0, 1, 1]).expect("a count of nought");
+    held.frame(&over).expect("a frame");
+    assert_eq!(
+        held.read(0, 1).expect("a read"),
+        vec![0],
+        "the count buffer said nought workgroups and the pass ran anyway"
+    );
+
+    // And the same recorded pass, over the same buffer, with the one word changed. **Nothing else
+    // moves**: the command buffer `Resident` kept is the one that just did nothing.
+    held.write(1, &[1, 1, 1]).expect("a count of one");
+    held.frame(&over).expect("a frame");
+    assert_eq!(
+        held.read(0, 1).expect("a read"),
+        vec![MARK],
+        "the count buffer said one workgroup and the pass did not run"
+    );
+}
+
 #[test]
 fn one_pass_of_several_can_be_run_while_the_others_are_skipped() {
     // The use the clamp made impossible. Three passes over one buffer, each writing a different
@@ -205,7 +252,10 @@ fn a_stage_is_ordered_against_the_next_and_not_against_itself() {
     // running some of them.
     let short: Vec<&[Groups]> = all[..4].chunks(2).collect();
     assert!(
-        matches!(held.staged(&short), Err(Error::WrongPasses { given: 4, held: 6 })),
+        matches!(
+            held.staged(&short),
+            Err(Error::WrongPasses { given: 4, held: 6 })
+        ),
         "four passes were accepted for a frame of six"
     );
 }
@@ -226,7 +276,8 @@ fn a_stage_with_nothing_in_it_orders_nothing() {
     let first = [Groups::Fixed(1)];
     let none = [Groups::Fixed(0), Groups::Fixed(0)];
     let last = [Groups::Fixed(1)];
-    held.staged(&[&first, &none, &last]).expect("a staged frame");
+    held.staged(&[&first, &none, &last])
+        .expect("a staged frame");
     assert_eq!(
         held.read(0, 1).expect("a read"),
         vec![2],
@@ -305,10 +356,16 @@ fn a_workgroup_count_written_by_one_stage_is_read_by_the_next() {
     let second = [Groups::From { binding: 1, at: 0 }];
     held.staged(&[&first, &second]).expect("two stages");
 
-    let ran = held.read(0, 1).expect("the tally").first().copied().unwrap_or(0);
+    let ran = held
+        .read(0, 1)
+        .expect("the tally")
+        .first()
+        .copied()
+        .unwrap_or(0);
     let want = ASKED * width;
     assert_eq!(
-        ran, want,
+        ran,
+        want,
         "{ran} invocations ran and {want} were asked for — the dispatch read {} workgroups, not \
          {ASKED}",
         ran / width.max(1)
@@ -388,7 +445,10 @@ fn a_frame_is_recorded_once_and_a_write_between_two_does_not_undo_it() {
 fn a_pattern_matching_nothing_names_the_devices_that_are_here() {
     let present = match Host::matching(Some("zzz-no-device-is-called-this")) {
         Err(Error::NoSuchDevice { wanted, present }) => {
-            assert_eq!(wanted, "zzz-no-device-is-called-this", "the pattern is echoed back");
+            assert_eq!(
+                wanted, "zzz-no-device-is-called-this",
+                "the pattern is echoed back"
+            );
             present
         }
         Ok(None) => {
@@ -504,9 +564,7 @@ fn many_runs_go_in_together_and_a_refused_call_puts_nothing_in() {
     };
     let width = host.width();
     let module = bump(width).expect("a kernel");
-    let mut held = host
-        .resident(&[4, 4], &[&module])
-        .expect("a device buffer");
+    let mut held = host.resident(&[4, 4], &[&module]).expect("a device buffer");
 
     held.write_many(&[
         Run {

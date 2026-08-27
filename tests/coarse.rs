@@ -126,7 +126,10 @@ fn cost(host: &Host, width: u32, grid: Grid, coarse: bool) -> (u32, u32, Duratio
 /// different block count there and say nothing about the constant.
 fn sized(width: u32, blocks: u32) -> Grid {
     let cells = u64::from(blocks) * u64::from(sweep::cells(width)) * 4;
-    assert!(cells.is_power_of_two(), "{cells} cells is not a power of two");
+    assert!(
+        cells.is_power_of_two(),
+        "{cells} cells is not a power of two"
+    );
     let bits = cells.trailing_zeros();
     let wide = 1_u32 << (bits / 2 + bits % 2);
     let deep = u32::try_from(cells / u64::from(wide)).expect("deep");
@@ -140,6 +143,19 @@ fn sized(width: u32, blocks: u32) -> Grid {
 fn best(host: &Host, width: u32, grid: Grid, coarse: bool) -> (u32, u32, Duration) {
     let first = cost(host, width, grid, coarse);
     let again = cost(host, width, grid, coarse);
+    // **The same arrangement twice has to reach the same place.** This used to keep the faster of
+    // the two and throw the other count away, which meant a run that was not reproducible looked
+    // like one that was — the disagreement only showed later, against the other arrangement, where
+    // it reads as the two programs differing rather than as one of them wandering.
+    assert_eq!(
+        first.1,
+        again.1,
+        "the {} arrangement stepped {} quads and then {} over the same {} blocks: the same program          twice did not reach the same place",
+        if coarse { "coarse" } else { "every-block" },
+        first.1,
+        again.1,
+        first.0,
+    );
     if again.2 < first.2 { again } else { first }
 }
 
@@ -156,7 +172,6 @@ const _: () = assert!(coarse_pays(ABOVE), "ABOVE is not above COARSE_FROM");
 
 #[test]
 fn the_threshold_is_where_the_two_arrangements_cross() {
-
     let Some(host) = device("coarse") else { return };
     let width = host.width();
     eprintln!("{} — subgroup {width}", host.name());

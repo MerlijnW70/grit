@@ -290,7 +290,12 @@ pub fn arranged(
         hot_gather,
         vec![(mark(subgroup, Tier::FINE, listed)?, hot)],
         vec![(
-            crate::compact::scan(subgroup, COUNTS, crate::layout::BASES, crate::layout::TOTALS)?,
+            crate::compact::scan(
+                subgroup,
+                COUNTS,
+                crate::layout::BASES,
+                crate::layout::TOTALS,
+            )?,
             tiles,
         )],
         vec![(
@@ -953,7 +958,8 @@ pub(crate) fn wake<const LANES: u32>(
                 // that would be a hot block no quad ever woke, listed every frame for ever.
                 // `compact::Plan::cold` is the same number, arrived at from the other side.
                 let blocks = grid.quads().div_ceil(per_block);
-                let cold = lanes.splat_bits::<U32, LANES>(blocks.div_ceil(per_block) * per_block)?;
+                let cold =
+                    lanes.splat_bits::<U32, LANES>(blocks.div_ceil(per_block) * per_block)?;
 
                 let which = lanes.shift_right_logical(slot, by)?;
                 let both = lanes.mul(holding, inside)?;

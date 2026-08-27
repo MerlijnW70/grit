@@ -107,9 +107,7 @@ fn a_frame_waited_for_later_is_the_frame_that_was_submitted() {
     };
     let module = walk(host.width()).expect("a kernel");
     let every: Vec<&[u32]> = vec![&module; PASSES];
-    let mut held = host
-        .resident(&[WORDS, 1], &every)
-        .expect("a device buffer");
+    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
     held.write(0, &vec![3; WORDS]).expect("a fill");
 
     let groups = vec![Groups::Fixed(over(host.width())); PASSES];
@@ -144,9 +142,7 @@ fn a_read_back_started_early_is_read_after_the_fence_and_not_before() {
     };
     let module = walk(host.width()).expect("a kernel");
     let every: Vec<&[u32]> = vec![&module; PASSES];
-    let mut held = host
-        .resident(&[WORDS, 1], &every)
-        .expect("a device buffer");
+    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
     let groups = vec![Groups::Fixed(over(host.width())); PASSES];
     let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
 
@@ -174,9 +170,7 @@ fn a_second_submission_while_one_is_in_flight_is_refused() {
     };
     let module = walk(host.width()).expect("a kernel");
     let every: Vec<&[u32]> = vec![&module; PASSES];
-    let mut held = host
-        .resident(&[WORDS, 1], &every)
-        .expect("a device buffer");
+    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
     let groups = vec![Groups::Fixed(over(host.width())); PASSES];
     let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
 
@@ -197,9 +191,9 @@ fn a_second_submission_while_one_is_in_flight_is_refused() {
         matches!(held.wait(ticket), Err(Error::NoSuchTicket { .. })),
         "the same ticket was waited on twice"
     );
-    held.frame(&groups).expect("a frame, once nothing is in flight");
+    held.frame(&groups)
+        .expect("a frame, once nothing is in flight");
 }
-
 
 /// What each of the two bindings is filled with, so a swap between them is visible.
 const FIRST: u32 = 0x0A11_0000;
@@ -283,7 +277,10 @@ fn two_answers_come_back_from_one_submission_in_the_order_they_were_asked_for() 
         (Some(FIRST + 1), Some(SECOND + 1)),
         "the blocking form answered {first:?} and {second:?}, which the submitting form did not"
     );
-    assert!(spent > Duration::ZERO, "a submission that took no time at all");
+    assert!(
+        spent > Duration::ZERO,
+        "a submission that took no time at all"
+    );
 
     // And one answer asked for as two is refused. The frame below copies one buffer out; asking it
     // for two would otherwise hand back an empty second.
@@ -306,7 +303,10 @@ fn two_answers_come_back_from_one_submission_in_the_order_they_were_asked_for() 
     // here because the doc said `NoSuchTicket` where the code says `WrongOutputs`, and running it is
     // what told them apart.
     assert!(
-        matches!(held.wait(ticket), Err(Error::NoSuchTicket { held: None, .. })),
+        matches!(
+            held.wait(ticket),
+            Err(Error::NoSuchTicket { held: None, .. })
+        ),
         "the refusal left the ticket outstanding"
     );
 }

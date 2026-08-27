@@ -56,11 +56,11 @@ use simdr::lanes::{LaneError, U32};
 use simdr::module::Id;
 
 use crate::Groups;
-pub use crate::layout::{BASES, BINDINGS, DENSE, GRAND, INDIRECT, TOTALS};
 use crate::layout::{
     AWAKE, BUCKETS, COUNTS, HOT, HOT_BASES, HOT_BUCKETS, HOT_COUNTS, HOT_DENSE, HOT_GRAND,
     HOT_INDIRECT, HOT_TOTALS, PIXELS,
 };
+pub use crate::layout::{BASES, BINDINGS, DENSE, GRAND, INDIRECT, TOTALS};
 use crate::sand::View;
 use crate::sweep::{self, PER_LANE};
 

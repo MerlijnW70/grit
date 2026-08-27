@@ -128,9 +128,7 @@ fn the_wait_is_time_the_host_gets_back() {
     };
     let module = walk(host.width()).expect("a kernel");
     let every: Vec<&[u32]> = vec![&module; PASSES];
-    let mut held = host
-        .resident(&[WORDS, 1], &every)
-        .expect("a device buffer");
+    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
     held.write(0, &vec![1; WORDS]).expect("a fill");
 
     let groups = vec![Groups::Fixed(over(host.width())); PASSES];

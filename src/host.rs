@@ -158,7 +158,10 @@ impl std::fmt::Display for Error {
                 "a submission did not land in {after:?}; the device is presumed lost"
             ),
             Self::WrongOutputs { asked, wanted } => {
-                write!(out, "the frame copied {asked} buffer(s) and {wanted} were wanted")
+                write!(
+                    out,
+                    "the frame copied {asked} buffer(s) and {wanted} were wanted"
+                )
             }
             Self::NoSuchTicket { ticket, held } => match held {
                 Some(one) => write!(out, "waited on {ticket}, and {one} is outstanding"),

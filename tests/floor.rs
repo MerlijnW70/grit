@@ -42,7 +42,24 @@ fn nothing(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 }
 
 /// Open a device, or say why not and hand back nothing.
+///
+/// # Why this file stops when `CI` is set
+///
+/// Everything below is a measurement, and every one of them is a comparison between two wall-clock
+/// numbers a few hundred nanoseconds apart — a submission against a frame in it, a barrier against a
+/// dispatch, a pass the device switched off against one it left on. A shared runner is contended by
+/// somebody else's job, and those differences do not survive that.
+///
+/// **A check that fails for a reason unrelated to the code is a check that teaches everyone to
+/// ignore red.** `simdr`'s `session.rs` reached the same conclusion about the same kind of number
+/// and its CI states it outright: measurements are among the things that do not travel. So this
+/// skips loudly rather than asserting into noise, and the figures it exists to take are taken on a
+/// machine whose clock means something.
 fn device(label: &str) -> Option<Host> {
+    if std::env::var_os("CI").is_some() {
+        eprintln!("SKIPPED {label}: every check here is a wall-clock comparison and CI is set");
+        return None;
+    }
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
@@ -247,7 +264,12 @@ fn what_a_submission_costs_before_it_holds_anything() {
         let clock = Instant::now();
         let word = held.read(0, 1).expect("one word");
         best = best.min(clock.elapsed());
-        assert_eq!(word.len(), 1, "a read of one word came back with {}", word.len());
+        assert_eq!(
+            word.len(),
+            1,
+            "a read of one word came back with {}",
+            word.len()
+        );
     }
     let asking = best.as_nanos() as f64;
     println!(
@@ -330,11 +352,32 @@ fn what_a_submission_costs_before_it_holds_anything() {
         "a pass costing nothing at all means the sweep measured something other than passes: \
          {off_each:.0} and {on_each:.0} ns"
     );
-    assert!(
-        off_each < on_each,
-        "a pass the device switched off cost {off_each:.0} ns against {on_each:.0} for one it left \
-         on, so what the count buffer holds is not reaching the dispatch"
-    );
+    // **This used to assert that the switched-off pass is the cheaper one, and that is not a fact
+    // about this crate.** It is 46 ns against 120 on an RTX 4080 and 99 against 89 on the integrated
+    // Radeon beside it, three runs each and stable to a nanosecond or two — so the assertion held on
+    // one device and failed on the other, and a machine with only the second would have been told
+    // that `Resident` was broken.
+    //
+    // What the assertion was for is real and is now checked where it can be: that a count of nought
+    // in a buffer stops the pass that reads it is `tests/dispatch.rs`'s
+    // `a_count_of_nought_in_a_buffer_stops_the_pass_that_reads_it`, which asks what is in the buffer
+    // afterwards rather than how long it took. **A mechanism proved by a stopwatch is proved only on
+    // the hardware the stopwatch was held on.**
+    //
+    // What is left here is the measurement, printed with its sign said out loud, because which way
+    // round it comes out is the interesting part and there is no number that is right on both.
+    if off_each < on_each {
+        println!(
+            "  the switched-off pass is the cheaper one here, by {:.0} ns a pass",
+            on_each - off_each
+        );
+    } else {
+        println!(
+            "  **the switched-off pass is the dearer one here**, by {:.0} ns a pass — which an \
+             RTX 4080 does not do and an integrated Radeon does",
+            off_each - on_each
+        );
+    }
     assert!(
         off_each < (split_each - fused_each) / (PASSES - 1) as f64,
         "a pass the device switched off cost {off_each:.0} ns against {:.0} for a barrier, so \

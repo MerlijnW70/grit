@@ -253,7 +253,8 @@ fn the_bound_does_not_get_in_the_way_of_ordinary_work() {
     held.write(0, &vec![1; WORDS]).expect("a fill");
 
     let groups = [Groups::Fixed(over(host.width()))];
-    held.frame(&groups).expect("a frame at the default patience");
+    held.frame(&groups)
+        .expect("a frame at the default patience");
 
     let summed = held.read(1, 1).expect("the answer");
     assert_eq!(

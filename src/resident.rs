@@ -376,7 +376,10 @@ impl Host {
                 // and `resident_direct` want.
                 let held = if bytes <= window {
                     match self.allocate(bytes, usage_of, near) {
-                        Ok(held) => Some(Held { visible: true, ..held }),
+                        Ok(held) => Some(Held {
+                            visible: true,
+                            ..held
+                        }),
                         Err(_) => None,
                     }
                 } else {
@@ -397,15 +400,13 @@ impl Host {
             // 0.3 GB/s to read. Asked for first, and fallen back from rather than failed on,
             // because a device with no cached host-visible type is a device this still works on.
             let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-            let plain = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let (staging, cached) = match self.allocate(
-                largest,
-                usage,
-                plain | vk::MemoryPropertyFlags::HOST_CACHED,
-            ) {
-                Ok(held) => (held, true),
-                Err(_) => (self.allocate(largest, usage, plain)?, false),
-            };
+            let plain =
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let (staging, cached) =
+                match self.allocate(largest, usage, plain | vk::MemoryPropertyFlags::HOST_CACHED) {
+                    Ok(held) => (held, true),
+                    Err(_) => (self.allocate(largest, usage, plain)?, false),
+                };
 
             let (layout, pool, set) = self.describe(&buffers)?;
             let (pipeline_layout, shaders, pipelines) = self.compile(layout, modules)?;
@@ -844,10 +845,12 @@ impl Resident<'_> {
         let bytes = (size_of_val(words) as u64).max(4);
         // SAFETY: the caller's contract.
         unsafe {
-            let mapped =
-                self.host
-                    .device()
-                    .map_memory(memory, offset, bytes, vk::MemoryMapFlags::empty())?;
+            let mapped = self.host.device().map_memory(
+                memory,
+                offset,
+                bytes,
+                vk::MemoryMapFlags::empty(),
+            )?;
             std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
             self.host.device().unmap_memory(memory);
         }
@@ -996,10 +999,12 @@ impl Resident<'_> {
         // SAFETY: host-visible coherent memory, nothing else maps it, and `total` is inside it by
         // the check above. Each run is copied to its own stretch, so the writes do not overlap.
         unsafe {
-            let mapped =
-                self.host
-                    .device()
-                    .map_memory(staging, 0, total.max(4), vk::MemoryMapFlags::empty())?;
+            let mapped = self.host.device().map_memory(
+                staging,
+                0,
+                total.max(4),
+                vk::MemoryMapFlags::empty(),
+            )?;
             let mut along = 0_usize;
             for run in runs {
                 let into = mapped.cast::<u32>().add(along);
@@ -1227,7 +1232,14 @@ impl Resident<'_> {
     /// the words come back empty.
     pub fn wait_reading(&mut self, ticket: Ticket) -> Result<(Duration, Vec<u32>), Error> {
         let (spent, mut every) = self.landed(ticket)?;
-        Ok((spent, if every.is_empty() { Vec::new() } else { every.swap_remove(0) }))
+        Ok((
+            spent,
+            if every.is_empty() {
+                Vec::new()
+            } else {
+                every.swap_remove(0)
+            },
+        ))
     }
 
     /// The same, for a frame that asked for two buffers — see [`Resident::submit_reading_both`].
@@ -1642,10 +1654,11 @@ impl Resident<'_> {
                                 device.cmd_dispatch(self.command, count, 1, 1);
                             }
                             Groups::From { binding, at } => {
-                                let held = self.buffers.get(binding).ok_or(Error::NoSuchBinding {
-                                    index: binding,
-                                    held: self.buffers.len(),
-                                })?;
+                                let held =
+                                    self.buffers.get(binding).ok_or(Error::NoSuchBinding {
+                                        index: binding,
+                                        held: self.buffers.len(),
+                                    })?;
                                 let offset = (at * size_of::<u32>()) as u64;
                                 device.cmd_dispatch_indirect(self.command, held.handle, offset);
                             }
@@ -1688,10 +1701,7 @@ impl Resident<'_> {
                                 vk::PipelineStageFlags::DRAW_INDIRECT,
                             )
                         } else {
-                            (
-                                vk::AccessFlags::empty(),
-                                vk::PipelineStageFlags::empty(),
-                            )
+                            (vk::AccessFlags::empty(), vk::PipelineStageFlags::empty())
                         };
                         let barrier = [vk::MemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::SHADER_WRITE)

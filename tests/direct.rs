@@ -43,7 +43,9 @@ fn a_direct_write_lands_the_same_bytes_a_staged_one_does() {
     let Some(host) = device("a_direct_write_lands_the_same_bytes") else {
         return;
     };
-    let payload: Vec<u32> = (0..4096_u32).map(|one| one.wrapping_mul(2_654_435_761)).collect();
+    let payload: Vec<u32> = (0..4096_u32)
+        .map(|one| one.wrapping_mul(2_654_435_761))
+        .collect();
 
     let Ok(mut straight) = host.resident_direct(&[payload.len()], &[]) else {
         eprintln!("SKIPPED: this device has no host-visible device memory");
@@ -54,7 +56,9 @@ fn a_direct_write_lands_the_same_bytes_a_staged_one_does() {
     assert_eq!(straight.read(0, payload.len()).expect("a read"), payload);
 
     // The same payload the long way round, to the same answer.
-    let mut staged = host.resident(&[payload.len()], &[]).expect("a staged buffer");
+    let mut staged = host
+        .resident(&[payload.len()], &[])
+        .expect("a staged buffer");
     assert!(!staged.direct());
     staged.write(0, &payload).expect("a write");
     assert_eq!(staged.read(0, payload.len()).expect("a read"), payload);
@@ -118,7 +122,11 @@ fn the_staging_buffer_is_cached_where_the_device_has_cached_memory() {
     assert_eq!(held.read(0, 1024).expect("a read"), words);
     eprintln!(
         "  staging on this device is {}",
-        if held.cached() { "cached" } else { "write-combined" }
+        if held.cached() {
+            "cached"
+        } else {
+            "write-combined"
+        }
     );
 }
 
@@ -147,7 +155,10 @@ fn a_window_takes_the_buffers_that_fit_and_leaves_the_rest_device_local() {
     assert_eq!(near.read(1, 2).expect("a read"), vec![9, 9]);
 
     let (_, writes, straight) = near.pushing();
-    assert_eq!(writes, 2, "two writes went in and the counter says {writes}");
+    assert_eq!(
+        writes, 2,
+        "two writes went in and the counter says {writes}"
+    );
     assert!(
         straight <= 1,
         "{straight} of two writes went straight into device memory, so the 4 KiB binding was asked \
