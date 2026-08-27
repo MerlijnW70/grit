@@ -24,6 +24,15 @@ ash = "0.38"
 #   grit = { path = "../grit", default-features = false }
 minifb = { version = "0.28", default-features = false, optional = true }
 
+# **And on anything but Windows it needs one of its own back ends named.** `minifb`'s build script
+# panics outright — "At least one of the x11 or wayland features must be enabled" — because turning
+# its defaults off turns those off with them. On Windows it uses the platform and does not notice;
+# everywhere else `pour` and `spike` did not build at all, and nothing said so until a Linux runner
+# tried. `x11` rather than both: one back end is what a window needs, and `dialogs` is the feature
+# whose absence the default-off was for.
+[target.'cfg(unix)'.dependencies]
+minifb = { version = "0.28", default-features = false, features = ["x11"], optional = true }
+
 [dev-dependencies]
 # The same version the crate already links. `tests/saying.rs` needs it to build the two `Error`
 # variants that wrap a Vulkan type, which nothing else can reach without a device that fails.

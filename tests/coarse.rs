@@ -183,6 +183,16 @@ fn the_threshold_is_where_the_two_arrangements_cross() {
     let mut seen = Vec::new();
     for blocks in [BELOW / 4, BELOW / 2, BELOW, COARSE_FROM, ABOVE] {
         let grid = sized(width, blocks);
+        // **A narrow device cannot plan every size this asks for**, and that is a fact about the
+        // hierarchy rather than about the test. Two levels of scan over four-wide groups reach 1024
+        // blocks; `COARSE_FROM` is 2048. So on a four-wide device the constant that decides whether
+        // the coarse list is worth building names a size at which it cannot be built — see
+        // `decisions/DR-0015`. What this loop can do is measure the sizes that fit and say which
+        // ones did not.
+        if let Err(why) = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
+            eprintln!("  {blocks:>7}  no plan at subgroup {width}: {why}");
+            continue;
+        }
         let (built, listed, with) = best(&host, width, grid, true);
         let (_, stepped, without) = best(&host, width, grid, false);
         assert_eq!(built, blocks, "asked for {blocks} blocks and got {built}");
@@ -204,6 +214,19 @@ fn the_threshold_is_where_the_two_arrangements_cross() {
             .copied()
             .expect("measured")
     };
+
+    // **What follows is the measurement, and it does not travel.** Which of two arrangements is
+    // faster is a property of the device: on `llvmpipe`, which runs on the processor, the list is
+    // the cheaper of the two at 1024 blocks — 473 µs against 552 — where on every card this was
+    // written for it is the dearer one. `COARSE_FROM` is a number about graphics hardware and a
+    // check of it on a shared runner would be a check of the runner.
+    //
+    // The equality above is not a measurement and does run there. That is the half of this file that
+    // found something.
+    if std::env::var_os("CI").is_some() {
+        eprintln!("  the threshold itself is a measurement and CI is set; it is not checked here");
+        return;
+    }
 
     let (_, coarse_below, every_below) = find(BELOW);
     assert!(
