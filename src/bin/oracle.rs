@@ -180,7 +180,8 @@
 //! its own copy of the word and its own bottom row. `apart` puts one answer on each band's top row.
 //! The report reads zero shared gates where it read sixty-one.
 //!
-//! Six starts each, `and or xor not sum` with `renew 8`:
+//! Six starts each, `and or xor not sum` with `renew 8`. **The last three rows want `ROWS` set to
+//! 32**, which is the one constant the grid is derived from and is left at eight:
 //!
 //! ```text
 //!                                              of 64    perfect chips
@@ -256,6 +257,21 @@
 //! is nought of six and at `state 4` is two. But twenty steps at `state 5` is thirty-two states for
 //! a twenty-step tune, and it is still nought of six — there the machine can and the search does
 //! not.
+//!
+//! **Being makeable by a small machine is worth nothing.** A four-bit shift register with feedback
+//! plays a fifteen-step tune that looks like noise and is exactly what four state rows are for. It
+//! comes out at 24.5 of 30 on eight starts and no perfect chip; at `state 5`, none; at 65 536 chips
+//! and `state 6` — sixty-four states for a fifteen-step tune — 27.6 of 30 and none. Fifteen steps
+//! of Thue-Morse is 26 of 30 on every one of eight starts and none. Fifteen arbitrary steps is
+//! 24.4 and none. **Fifteen steps of a five-step tune played three times is thirty of thirty on
+//! eight starts of eight.**
+//!
+//! So it is not the length, not the state, not the colony and not whether some small machine could
+//! play it. It is whether the tune repeats inside the window it is asked for.
+//!
+//! There is nothing to separate here the way `band` separates the answers of a multiplier: folded,
+//! every answer comes off one row, so a tune is the case where the sharing is total by
+//! construction.
 //!
 //! Two checks were in the way and both were about rows. `outputs` was capped at seven and answers
 //! had to be a row apart; folded there is one answer row and the cap is that an answer packs into
@@ -918,7 +934,7 @@ use simdr::lanes::{LaneError, U32};
 use simdr::module::Id;
 
 /// How many rows the chip has: the inputs, and a nought and a one to build with.
-const ROWS: u32 = 32;
+const ROWS: u32 = 8;
 /// How many columns, of which the first is the inputs.
 const COLUMNS: u32 = 12;
 /// How many gates a chip holds, which is the length of a genome.
