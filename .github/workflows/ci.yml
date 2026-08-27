@@ -112,13 +112,23 @@ jobs:
         # may vary. These three are the widths this crate has kernel arms for and no device in the
         # author's machine can report; `tests/hot.rs` already covers them with arithmetic on the
         # host, and this is the same widths with the device actually running.
+        #
+        # `skips` is how many tests legitimately cannot run at that width, and it is asserted rather
+        # than shrugged at — see the step. **The numbers were measured here rather than reasoned
+        # about**: the first run that got this far asserted one everywhere and went red at two of the
+        # three, because `tests/live.rs` runs the coarse arrangement over 4096 blocks and the most a
+        # width can plan is `(subgroup × 8)` squared. Sixteen reaches 16384 and runs it; eight reaches
+        # 4096 and four reaches 1024, and both skip it and say so.
         include:
           - vector: 128
             width: 4
+            skips: 2
           - vector: 256
             width: 8
+            skips: 2
           - vector: 512
             width: 16
+            skips: 1
     steps:
       - uses: actions/checkout@v5
         with:
@@ -172,9 +182,9 @@ jobs:
       #
       # The count is asserted rather than printed, for the reason the ICD step is a hard failure:
       # that step guards one way of ending up with no coverage, and this guards the rest of them —
-      # a driver that stops reporting a feature, a harness that quietly finds nothing to run.
-      # **Nought is the only number that is right here**: every skip in this suite is "no device",
-      # and there is a device.
+      # a driver that stops reporting a feature, a harness that quietly finds nothing to run. Adding
+      # a test that legitimately cannot run at some width means changing a number in the matrix
+      # above, in a diff somebody reads.
       - name: the suite at subgroup ${{ matrix.width }}
         working-directory: grit
         env:
@@ -184,9 +194,9 @@ jobs:
           cargo test --release --no-default-features --no-fail-fast -- --nocapture \
             2>&1 | tee "$RUNNER_TEMP/suite.log"
           skipped=$(grep -o 'SKIPPED ' "$RUNNER_TEMP/suite.log" | wc -l)
-          echo "$skipped test(s) did not run at subgroup ${{ matrix.width }}"
-          if [ "$skipped" -ne 1 ]; then
-            echo "::error::${{ matrix.width }}-wide run skipped $skipped test(s) and one is expected — tests/floor.rs skips itself because CI is set, and nothing else here has a reason to"
+          echo "$skipped test(s) did not run at subgroup ${{ matrix.width }}, and ${{ matrix.skips }} is what this width is written not to run"
+          if [ "$skipped" -ne "${{ matrix.skips }}" ]; then
+            echo "::error::${{ matrix.width }}-wide run did not run $skipped test(s) and the matrix says ${{ matrix.skips }} — read the reasons above, then change the code or the number"
             exit 1
           fi
 
