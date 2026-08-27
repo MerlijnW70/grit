@@ -185,6 +185,16 @@ impl Ticket {
     }
 }
 
+/// The most stages a per-stage profile covers.
+///
+/// A query pool is created once, with the `Resident`, and a stage list arrives on every call —
+/// so the pool is sized for a number rather than for the frame it will be asked about. Sixteen
+/// is what `live::wired` uses at its widest and this is four times that; a frame with more
+/// stages than this still runs and still reports its whole cost, and
+/// [`Resident::stage_times`] answers `None` for it rather than a profile of the first
+/// sixty-four.
+pub const STAGES: usize = 64;
+
 /// Everything a frame needs, allocated once.
 pub struct Resident<'host> {
     host: &'host Host,
@@ -252,6 +262,10 @@ pub struct Resident<'host> {
     queries: Option<vk::QueryPool>,
     /// What the last submission measured on the device, per frame.
     device: Option<Duration>,
+    /// One duration a stage, from the last submission's last frame, where it was profiled.
+    spans: Vec<Duration>,
+    /// How many stages the last recording wrote a stamp for.
+    stamped: usize,
     /// What the command buffer holds, if it holds a frame. See [`Recorded`].
     held: Option<Recorded>,
     /// How many submissions went out over a recording that was already there.
@@ -415,19 +429,29 @@ impl Host {
                 .device()
                 .create_fence(&vk::FenceCreateInfo::default(), None)?;
 
-            // Two timestamps: one before the first pass and one after the last. Asked for only
-            // where the queue counts them, so a device without them costs nothing here and answers
-            // `None` rather than a wrong number.
+            // Two timestamps for the submission — one before the first pass and one after the
+            // last — and then one for each boundary between stages, up to `Resident::STAGES`.
+            //
+            // **The per-stage ones are written on the last repetition only.** A recording of
+            // `times` frames replays the same commands, and a query written twice without a reset
+            // in between is undefined; resetting inside the loop would order a reset against writes
+            // that may still be in flight. Writing them once, on the last frame round, needs
+            // neither — and the last frame is the warm one, which is the one worth profiling.
+            //
+            // Asked for only where the queue counts them, so a device without them costs nothing
+            // here and answers `None` rather than a wrong number.
             let queries = if self.ticking().1 {
                 let create = vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(2);
+                    .query_count(u32::try_from(STAGES + 3).unwrap_or(3));
                 self.device().create_query_pool(&create, None).ok()
             } else {
                 None
             };
 
             Ok(Resident {
+                stamped: 0,
+                spans: Vec::new(),
                 recording: Duration::ZERO,
                 recorded: 0,
                 copying: Duration::ZERO,
@@ -1418,6 +1442,7 @@ impl Resident<'_> {
         self.await_fence()?;
         self.flight = None;
         self.device = self.timed();
+        self.spans = self.split();
         Ok((began.elapsed(), out))
     }
 
@@ -1507,6 +1532,56 @@ impl Resident<'_> {
         self.device
     }
 
+    /// What each stage of the last submission's last frame spent, on the device's own clock.
+    ///
+    /// Empty where the queue counts no timestamps, where nothing has run, or where the frame had
+    /// more stages than [`STAGES`]. **One frame's breakdown, not an average**: the whole
+    /// submission's cost is [`Resident::on_device`], which divides by how many frames were asked
+    /// for, and this is the last of them taken apart.
+    ///
+    /// A stage that ran no passes at all is not recorded and does not appear here — the same
+    /// filtering `run_times` does — so the length is the number of stages that ran and not the
+    /// number that were handed in.
+    #[must_use]
+    pub fn stage_times(&self) -> &[Duration] {
+        &self.spans
+    }
+
+    /// Read the per-stage stamps and turn them into one duration a stage.
+    fn split(&self) -> Vec<Duration> {
+        let Some(pool) = self.queries else {
+            return Vec::new();
+        };
+        let stages = self.stamped;
+        if stages == 0 || stages > STAGES {
+            return Vec::new();
+        }
+        let mut stamps = vec![0_u64; stages + 1];
+        // SAFETY: the fence has been waited on, so every write below has landed. Only the range
+        // this recording wrote is read: the rest of the pool was reset and never written, and a
+        // query that was never written has no result to give.
+        let held = unsafe {
+            self.host.device().get_query_pool_results(
+                pool,
+                2,
+                &mut stamps,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        };
+        if held.is_err() {
+            return Vec::new();
+        }
+        let (tick, _) = self.host.ticking();
+        stamps
+            .windows(2)
+            .map(|two| {
+                let (first, next) = (two.first().copied(), two.get(1).copied());
+                let ticks = next.unwrap_or(0).saturating_sub(first.unwrap_or(0));
+                Duration::from_nanos((ticks as f64 * f64::from(tick)) as u64)
+            })
+            .collect()
+    }
+
     /// Read the two stamps and turn the difference into a duration a frame at a time.
     fn timed(&self) -> Option<Duration> {
         let pool = self.queries?;
@@ -1589,7 +1664,8 @@ impl Resident<'_> {
             // a pool reset done once at record time would leave every later submission writing into
             // slots that already hold an answer.
             if let Some(pool) = self.queries {
-                device.cmd_reset_query_pool(self.command, pool, 0, 2);
+                let held = u32::try_from(STAGES + 3).unwrap_or(3);
+                device.cmd_reset_query_pool(self.command, pool, 0, held);
                 device.cmd_write_timestamp(
                     self.command,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1632,8 +1708,30 @@ impl Resident<'_> {
                 }
             }
 
+            // **The last frame round, and only it.** See the pool's creation for why: a query
+            // written twice without a reset between is undefined, and a reset inside the loop would
+            // have to be ordered against writes that may still be running.
+            let profiling = self
+                .queries
+                .filter(|_| running.len() <= STAGES)
+                .map(|pool| (pool, times.saturating_sub(1)));
+            self.stamped = profiling.map_or(0, |_| running.len());
+
             for repeat in 0..times {
                 for (nth, stage) in running.iter().enumerate() {
+                    if let Some((pool, last)) = profiling
+                        && repeat == last
+                    {
+                        {
+                            let at = u32::try_from(nth + 2).unwrap_or(2);
+                            device.cmd_write_timestamp(
+                                self.command,
+                                vk::PipelineStageFlags::TOP_OF_PIPE,
+                                pool,
+                                at,
+                            );
+                        }
+                    }
                     for &(pass, count) in stage {
                         let &pipeline = self.pipelines.get(pass).ok_or(Error::WrongPasses {
                             given: pass,
@@ -1721,6 +1819,16 @@ impl Resident<'_> {
                         );
                     }
                 }
+            }
+
+            if let Some((pool, _)) = profiling {
+                let at = u32::try_from(running.len() + 2).unwrap_or(2);
+                device.cmd_write_timestamp(
+                    self.command,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    at,
+                );
             }
 
             let mut into = 0_u64;

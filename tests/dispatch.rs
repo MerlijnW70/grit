@@ -80,6 +80,111 @@ fn a_pass_dispatched_over_no_workgroups_does_not_run() {
     assert_eq!(held.read(0, 1).expect("a read"), vec![MARK]);
 }
 
+/// Every stage of a frame, on the device's own clock, without a wait between them.
+///
+/// # What this is for
+///
+/// `Resident::on_device` has always answered what a whole submission spent, and everything finer
+/// than that was a subtraction: run the frame, run it again with a pass taken out, call the
+/// difference that pass. This is the same clock asked more often — a timestamp at each stage
+/// boundary, written into a pool the device fills as it goes and the host reads once, afterwards.
+///
+/// **Nothing here waits.** A host clock around a stage would need a fence between stages, which is
+/// tens of microseconds of not-the-thing-being-measured, and would change what it measured by
+/// measuring it.
+#[test]
+fn a_frame_can_be_taken_apart_stage_by_stage() {
+    let Some(host) = device("a_frame_can_be_taken_apart_stage_by_stage") else {
+        return;
+    };
+    let width = host.width();
+    let one = mark(width).expect("a kernel");
+    let two = bump(width).expect("a kernel");
+    let modules: Vec<&[u32]> = vec![&one, &one, &one, &two];
+    let mut held = host.resident(&[4], &modules).expect("a device buffer");
+    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+
+    // Four passes in three stages, so the profile has to say three and not four.
+    //
+    // **The two that share a stage write the same word to the same place**, which is what makes
+    // sharing one legal: a stage is a promise that nothing in it depends on anything else in it.
+    // Written with two `bump`s here instead — a load, an add and a store over one word — this came
+    // back as `MARK + 2` on an integrated Radeon and `MARK + 3` on an RTX 4080: the same recording,
+    // two answers, and the promise broken by the test rather than by the crate.
+    let first = [Groups::Fixed(1)];
+    let second = [Groups::Fixed(1), Groups::Fixed(1)];
+    let third = [Groups::Fixed(1)];
+    held.staged(&[&first, &second, &third])
+        .expect("three stages");
+
+    let (whole, spans) = (held.on_device(), held.stage_times().to_vec());
+    let Some(whole) = whole else {
+        eprintln!("  this queue counts no timestamps; nothing to take apart");
+        assert!(
+            spans.is_empty(),
+            "no whole time but {} stage times",
+            spans.len()
+        );
+        return;
+    };
+    eprintln!("  the whole submission: {whole:.3?}");
+    for (nth, span) in spans.iter().enumerate() {
+        eprintln!("    stage {nth}: {span:.3?}");
+    }
+
+    assert_eq!(
+        spans.len(),
+        3,
+        "three stages ran and the profile has {}",
+        spans.len()
+    );
+    let parts: Duration = spans.iter().sum();
+    // **A relation, not a measurement.** The whole spans everything the stages do and the barriers
+    // between them, so the parts cannot come to more than it. How long any of it takes is a property
+    // of the device and is not asserted anywhere.
+    assert!(
+        parts <= whole,
+        "the stages come to {parts:.3?} and the whole submission was {whole:.3?}"
+    );
+    assert!(
+        spans.iter().all(|one| *one > Duration::ZERO),
+        "a stage that took no time at all did not run: {spans:.3?}"
+    );
+
+    // And the passes did what they say, so this is a profile of work rather than of nothing.
+    assert_eq!(held.read(0, 1).expect("a read"), vec![MARK + 1]);
+}
+
+/// A frame with more stages than a profile covers still runs, and says it was not profiled.
+#[test]
+fn a_frame_too_long_to_profile_is_not_half_profiled() {
+    let Some(host) = device("a_frame_too_long_to_profile_is_not_half_profiled") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).expect("a kernel");
+    let many = grit::resident::STAGES + 1;
+    let modules: Vec<&[u32]> = vec![&module; many];
+    let mut held = host.resident(&[4], &modules).expect("a device buffer");
+    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+
+    let each = vec![vec![Groups::Fixed(1)]; many];
+    let stages: Vec<&[Groups]> = each.iter().map(Vec::as_slice).collect();
+    held.staged(&stages).expect("a long frame");
+
+    assert_eq!(
+        held.read(0, 1).expect("a read"),
+        vec![many as u32],
+        "the frame did not run all {many} of its passes"
+    );
+    assert!(
+        held.stage_times().is_empty(),
+        "{} stages were profiled and the pool holds {}",
+        held.stage_times().len(),
+        grit::resident::STAGES
+    );
+}
+
 /// A count of nought **in a buffer the device reads** stops the pass, and one stops it too.
 ///
 /// # Why this is not the test above
