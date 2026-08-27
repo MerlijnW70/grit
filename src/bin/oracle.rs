@@ -191,8 +191,20 @@
 //! The report writes the winner out as straight-line bitwise code. It is folded on the way: a
 //! constant on either side of a gate settles it, a gate of a value with itself settles it, a wire
 //! is a rename rather than a line, a three-wire gate that loses a wire to a constant becomes a
-//! two-wire one and folds again, and what no answer reaches is dropped. A full adder comes out in
-//! 26 lines and the four-band multiplier in 129.
+//! two-wire one and folds again, a value against its own inversion settles, a value against a gate
+//! it is already inside of absorbs, an exclusive-or against one of its own halves gives back the
+//! other, two cells that work out the same thing are one line, and what no answer reaches is
+//! dropped.
+//!
+//! ```text
+//!                          gates in the cone   lines of code
+//!   a full adder                   54                25
+//!   the four-band multiplier      171                95
+//! ```
+//!
+//! The identities and the collapsing of duplicates are worth 129 lines down to 95 on the second of
+//! those. What is left is the circuit: about two gates in three of a chip this size cost the answer
+//! when broken one at a time, so most of what is written down is load-bearing.
 //!
 //! **Every line is then worked through for every input and matched against the grid.** If the two
 //! ever disagree nothing is offered at all, so what is handed over is the circuit and not a
@@ -3386,7 +3398,7 @@ fn pulls(genome: &[u32], exam: &Exam) -> (u32, u32, u32, u32, usize, u32, u32) {
 }
 
 /// One line of the written-out circuit, before it is given a name.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Line {
     /// A constant, which is what the bottom row and an unused row put there.
     Held(u32),
@@ -3406,6 +3418,26 @@ enum Line {
 }
 
 impl Line {
+    /// The same line with its operands in a settled order, so that two ways of writing one thing
+    /// are one thing. Only the gates that do not care which wire is which are turned over.
+    fn tidy(self) -> Self {
+        let two = |a: usize, b: usize| (a.min(b), a.max(b));
+        let three = |a: usize, b: usize, c: usize| {
+            let mut held = [a, b, c];
+            held.sort_unstable();
+            held
+        };
+        match self {
+            Self::And(a, b) => { let (a, b) = two(a, b); Self::And(a, b) }
+            Self::Or(a, b) => { let (a, b) = two(a, b); Self::Or(a, b) }
+            Self::Xor(a, b) => { let (a, b) = two(a, b); Self::Xor(a, b) }
+            Self::Nxor(a, b) => { let (a, b) = two(a, b); Self::Nxor(a, b) }
+            Self::Maj(a, b, c) => { let it = three(a, b, c); Self::Maj(it[0], it[1], it[2]) }
+            Self::Sum(a, b, c) => { let it = three(a, b, c); Self::Sum(it[0], it[1], it[2]) }
+            held => held,
+        }
+    }
+
     /// Which lines this one reads.
     fn feeds(self) -> Vec<usize> {
         match self {
@@ -3488,6 +3520,7 @@ fn written(genome: &[u32], exam: &Exam) -> Option<String> {
     }
     let at = |column: u32, row: u32| (column * ROWS + row % ROWS) as usize;
     let mut lines = vec![Line::Held(0); (COLUMNS * ROWS) as usize];
+    let mut already: std::collections::HashMap<Line, usize> = std::collections::HashMap::new();
     for row in 0..ROWS {
         let (_, base, size) = banded(&exam.band, row);
         let inside = row - base;
@@ -3506,7 +3539,16 @@ fn written(genome: &[u32], exam: &Exam) -> Option<String> {
             let kind = genome.get(((column - 1) * ROWS + row) as usize).copied().unwrap_or(0);
             let from: Vec<usize> =
                 reads(kind, row, &exam.band).into_iter().map(|it| at(column - 1, it)).collect();
-            let same = |it: usize| from.get(it).copied().unwrap_or(0);
+            // **A cell that renames another is that other one.** Every operand is followed to what
+            // it actually names, so two cells holding the same value compare equal and the rules
+            // below see one value rather than two spellings of it.
+            let same = |it: usize| {
+                let raw = from.get(it).copied().unwrap_or(0);
+                match lines.get(raw).copied() {
+                    Some(Line::Same(back)) => back,
+                    _ => raw,
+                }
+            };
             let held = |it: usize| lines.get(same(it)).copied().unwrap_or(Line::Held(0));
             let known = |it: usize| match held(it) {
                 Line::Held(now) => Some(now),
@@ -3519,11 +3561,30 @@ fn written(genome: &[u32], exam: &Exam) -> Option<String> {
                 Some(Line::Held(now)) => Some(now),
                 _ => None,
             };
+            // **What the other side already is** decides more than what it holds. A value against
+            // its own inversion settles; a value against a gate it is already inside of absorbs;
+            // an exclusive-or against one of its own halves gives the other half back.
+            let look = |at: usize| lines.get(at).copied().unwrap_or(Line::Held(0));
+            let inverts = |a: usize, b: usize| look(a) == Line::Not(b) || look(b) == Line::Not(a);
+            let inside_or = |a: usize, b: usize| {
+                matches!(look(b), Line::Or(x, y) if x == a || y == a)
+            };
+            let inside_and = |a: usize, b: usize| {
+                matches!(look(b), Line::And(x, y) if x == a || y == a)
+            };
+            let undoes = |a: usize, b: usize| match look(b) {
+                Line::Xor(x, y) if x == a => Some(y),
+                Line::Xor(x, y) if y == a => Some(x),
+                _ => None,
+            };
             let and2 = |a: usize, b: usize| match (seen(a), seen(b)) {
                 (Some(0), _) | (_, Some(0)) => Line::Held(0),
                 (Some(_), _) => Line::Same(b),
                 (_, Some(_)) => Line::Same(a),
                 _ if a == b => Line::Same(a),
+                _ if inverts(a, b) => Line::Held(0),
+                _ if inside_or(a, b) => Line::Same(a),
+                _ if inside_or(b, a) => Line::Same(b),
                 _ => Line::And(a, b),
             };
             let or2 = |a: usize, b: usize| match (seen(a), seen(b)) {
@@ -3531,6 +3592,9 @@ fn written(genome: &[u32], exam: &Exam) -> Option<String> {
                 (Some(_), _) => Line::Same(b),
                 (_, Some(_)) => Line::Same(a),
                 _ if a == b => Line::Same(a),
+                _ if inverts(a, b) => Line::Held(1),
+                _ if inside_and(a, b) => Line::Same(a),
+                _ if inside_and(b, a) => Line::Same(b),
                 _ => Line::Or(a, b),
             };
             // A one on one side of an exclusive-or inverts the other, and inverting something
@@ -3550,7 +3614,11 @@ fn written(genome: &[u32], exam: &Exam) -> Option<String> {
                 (Some(_), _) => Line::Not(b),
                 (_, Some(_)) => Line::Not(a),
                 _ if a == b => Line::Held(0),
-                _ => Line::Xor(a, b),
+                _ if inverts(a, b) => Line::Held(1),
+                _ => match (undoes(a, b), undoes(b, a)) {
+                    (Some(rest), _) | (_, Some(rest)) => Line::Same(rest),
+                    _ => Line::Xor(a, b),
+                },
             };
             let settled = match kind {
                 1 => and2(same(0), same(1)),
@@ -3596,9 +3664,23 @@ fn written(genome: &[u32], exam: &Exam) -> Option<String> {
                     Some(Line::Same(further)) => Line::Same(further),
                     _ => Line::Same(back),
                 },
-                held => held,
+                held => held.tidy(),
             };
-            if let Some(slot) = lines.get_mut(at(column, row)) {
+            // **Two cells that work the same thing out are one line.** The first to say it keeps
+            // the name and every other cell is a rename of it, which is what most of the folding
+            // below the first column turns out to be.
+            let here = at(column, row);
+            let settled = match settled {
+                Line::Held(_) | Line::Pin(_) | Line::Same(_) => settled,
+                held => match already.get(&held) {
+                    Some(&before) => Line::Same(before),
+                    None => {
+                        already.insert(held, here);
+                        held
+                    }
+                },
+            };
+            if let Some(slot) = lines.get_mut(here) {
                 *slot = settled;
             }
         }
@@ -4251,7 +4333,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  kept in {path}");
     }
     if let Some(code) = written(genome, &exam) {
-        println!("  the same circuit as code, worked through and matched against the grid:");
+        let held = code.lines().filter(|it| it.contains(" = ")).count();
+        println!(
+            "  the same circuit as {held} lines of code, folded down from {live_gates} gates and \
+             matched against the grid on every input:"
+        );
         print!("{code}");
         println!();
     }
