@@ -461,27 +461,55 @@
 //! **A two-by-two multiply comes out and a two-by-two multiply plus one bit does not.** Sixteen
 //! times the colony does not move it: 121.6 of 128 at 65 536 chips against 121.3 at 16 384.
 //!
-//! # Starving the bands, which is what makes the crossing necessary
+//! # A race that was in every redraw, and what it moved
 //!
-//! `over` bought nothing on a multiply-accumulate, and the reason offered was that every band holds
-//! the whole word and can work a carry out for itself. `feeds N` shows the word to the first N
-//! bands only. Six starts on `add` in three bands:
+//! `select` forced every chip onto the changed list on the first tick, so that a colony of nought
+//! scores would be evaluated at all. That made the half of the colony which should have been
+//! standing still write its genome while the other half was reading it — and `renew` sets the tick
+//! back, so it happened on every redraw rather than once.
 //!
 //! ```text
-//!                                    of 48   perfect   crossings
-//!   every band fed, no over          47.3    3 of 6    0
-//!   one band fed, no over            34.0    0         0
-//!   one band fed, with over          46.0    0         30.8
+//!   six runs of one exam, same file, same seed
+//!   with renew, before      55  53  55  53  55  55   of 64
+//!   without renew, before   56  56  56  56
+//!   with renew, after       57  57  57  57  57  57
 //! ```
 //!
-//! **34.0 on every one of the six starts, to the point.** A starved band with nothing crossing into
-//! it can only answer with a constant, and the constant that fits best is worth exactly that much.
-//! With one wire allowed across it recovers 12 of 48 and comes within 1.3 of a chip that was never
-//! starved at all.
+//! The first tick now takes its turn like any other. **A run with redraws in it is reproducible
+//! again, and it scores better than either.**
 //!
-//! So the crossing is worth twelve of 48 when it is the only way in and nothing when it is not.
-//! What it does not buy is size: with `lean wires`, starved and crossing is 280.5 wires against
-//! 290.0 fed and crossing, for 45.3 of 48 against 47.6.
+//! **Every figure in this file was measured before that.** What the fix moves is single points, and
+//! the conclusions here rest on gaps of tens, but the spine has been retaken on the fixed build and
+//! the rest has not:
+//!
+//! ```text
+//!                                         before        after
+//!   arbitrary function, 4 inputs      16/16, 6 of 6   16/16, 6 of 6
+//!   arbitrary function, 5 inputs      29.8 of 32      30.5 of 32
+//!   arbitrary function, 6 inputs      55.8 of 64      56.6 of 64
+//!   bit one of a·b+c alone            31.6, 4 of 6    31.8, 5 of 6
+//!   times in four bands               6 of 6          6 of 6
+//!   2x2+1 in four bands, 12 starts    128.0, 12/12    127.6, 9/12
+//!   the cascade, all 64 inputs        64 of 64        64 of 64
+//!   the sequential counter            13.5 of 16      12.3 of 16
+//! ```
+//!
+//! The accumulator is the one that got worse, and it got reproducible: the same seed gives the same
+//! answer three runs of three, where the run that gave twelve of twelve could not be repeated.
+//!
+//! # A section that was here and is not, because it cannot be said any more
+//!
+//! `feeds` used to be one number — how many bands were shown the word — and a table here measured
+//! `add` in three bands under it: 47.3 of 48 with every band fed, 34.0 with one, and 46.0 with one
+//! and a crossing, from which it concluded that a crossing is worth twelve of 48 when it is the
+//! only way in.
+//!
+//! **Neither the spelling nor the conclusion survived.** `feeds` is a count for each band now and
+//! `band` is a list, and three bands of a thirty-two row grid cannot be equal, which a crossing
+//! needs — so that run cannot be set up again to check it. What replaced it is the four-band table
+//! below, which has a control the old one did not: one crossing lands *below* the floor a starved
+//! band reaches with a constant, because the extra kind in the lottery costs more than one wire
+//! carries. Two crossings are what pay.
 //!
 //! # Stacking one run on another, which buys nothing either way
 //!
@@ -1641,7 +1669,13 @@ fn select(
         }
     }
 
-    let first = is(&mut kernel, tick, one)?;
+    // **And the first tick takes its turn like any other.** Forcing every chip onto the list made
+    // the half that should have been standing still write its genome while the other half was
+    // reading it, which is a race — and `renew` sets the tick back, so it happened on every redraw
+    // rather than once. Six runs of one exam gave 53, 55 and 55 of 64 with it and 56 four times
+    // out of four without.
+    let started = is(&mut kernel, tick, one)?;
+    let first = kernel.module().i_mul(uint, my_turn, started)?;
     let ahead = above(&mut kernel, ours, theirs)?;
     let behind = minus(&mut kernel, one, ahead)?;
     let churn = kernel.module().i_mul(uint, my_turn, behind)?;
