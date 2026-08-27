@@ -7,6 +7,12 @@
 # fails there on a **correctness** check, not a timing one, and `tests/floor.rs` fails on a timing
 # one. Neither is found by reading.
 #
+# One thing this cannot do on its own: `Cargo.toml` names `simdr = { path = "../simdr" }`, so a
+# clone of this repository alone has no emitter and no build. Every job below checks the sibling out
+# beside it. That works without a secret because `simdr` is public; while it was not, the first run
+# of this workflow failed on all five jobs at a step that said exactly that, which is what the step
+# was for.
+#
 # So: Mesa's lavapipe is a Vulkan implementation that runs on the processor, and it can be pinned to
 # subgroup 4, 8 and 16 — three widths every kernel here has an arm for and no device in that machine
 # can report. `simdr`'s own CI does this and this borrows the mechanism from it wholesale.
@@ -42,28 +48,18 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: grit
-      # **`simdr` is a private repository**, and the token a workflow is given by default can see
-      # only the one it is running in. Without a token of its own the checkout below fails as a 404
-      # on a repository that plainly exists, which is the least useful error there is — so it is
-      # checked for first and said in words.
+      # **`simdr` is public**, so the token a workflow is given by default is enough to read it and
+      # no secret is involved. It was not, and the first run of this workflow failed on all five jobs
+      # at a step that said so — which is what that step was for. It is gone now: a check that can no
+      # longer fail is a check nobody will read.
       #
-      # `SIBLING` is a personal access token with read access to `MerlijnW70/simdr`, added as a
-      # repository secret. A submodule would do the same job without a secret and would pin a commit
-      # rather than follow `main`; that is a change to how the two repositories are arranged and is
-      # not made here.
-      - name: the sibling this crate is built on
-        env:
-          SIBLING: ${{ secrets.SIBLING }}
-        run: |
-          if [ -z "$SIBLING" ]; then
-            echo "::error::no SIBLING secret. This crate names simdr by path in Cargo.toml and cannot be built without it. Add a token with read access to MerlijnW70/simdr as a repository secret called SIBLING."
-            exit 1
-          fi
+      # This follows `main` rather than pinning a commit. A submodule would pin one, and would make
+      # "which emitter was this built against" a thing the repository records rather than a thing the
+      # clock decides. That is a change to how the two are arranged and is not made here.
       - uses: actions/checkout@v5
         with:
           repository: MerlijnW70/simdr
           path: simdr
-          token: ${{ secrets.SIBLING }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -127,28 +123,18 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: grit
-      # **`simdr` is a private repository**, and the token a workflow is given by default can see
-      # only the one it is running in. Without a token of its own the checkout below fails as a 404
-      # on a repository that plainly exists, which is the least useful error there is — so it is
-      # checked for first and said in words.
+      # **`simdr` is public**, so the token a workflow is given by default is enough to read it and
+      # no secret is involved. It was not, and the first run of this workflow failed on all five jobs
+      # at a step that said so — which is what that step was for. It is gone now: a check that can no
+      # longer fail is a check nobody will read.
       #
-      # `SIBLING` is a personal access token with read access to `MerlijnW70/simdr`, added as a
-      # repository secret. A submodule would do the same job without a secret and would pin a commit
-      # rather than follow `main`; that is a change to how the two repositories are arranged and is
-      # not made here.
-      - name: the sibling this crate is built on
-        env:
-          SIBLING: ${{ secrets.SIBLING }}
-        run: |
-          if [ -z "$SIBLING" ]; then
-            echo "::error::no SIBLING secret. This crate names simdr by path in Cargo.toml and cannot be built without it. Add a token with read access to MerlijnW70/simdr as a repository secret called SIBLING."
-            exit 1
-          fi
+      # This follows `main` rather than pinning a commit. A submodule would pin one, and would make
+      # "which emitter was this built against" a thing the repository records rather than a thing the
+      # clock decides. That is a change to how the two are arranged and is not made here.
       - uses: actions/checkout@v5
         with:
           repository: MerlijnW70/simdr
           path: simdr
-          token: ${{ secrets.SIBLING }}
       - uses: dtolnay/rust-toolchain@stable
 
       - name: install lavapipe
@@ -211,28 +197,18 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: grit
-      # **`simdr` is a private repository**, and the token a workflow is given by default can see
-      # only the one it is running in. Without a token of its own the checkout below fails as a 404
-      # on a repository that plainly exists, which is the least useful error there is — so it is
-      # checked for first and said in words.
+      # **`simdr` is public**, so the token a workflow is given by default is enough to read it and
+      # no secret is involved. It was not, and the first run of this workflow failed on all five jobs
+      # at a step that said so — which is what that step was for. It is gone now: a check that can no
+      # longer fail is a check nobody will read.
       #
-      # `SIBLING` is a personal access token with read access to `MerlijnW70/simdr`, added as a
-      # repository secret. A submodule would do the same job without a secret and would pin a commit
-      # rather than follow `main`; that is a change to how the two repositories are arranged and is
-      # not made here.
-      - name: the sibling this crate is built on
-        env:
-          SIBLING: ${{ secrets.SIBLING }}
-        run: |
-          if [ -z "$SIBLING" ]; then
-            echo "::error::no SIBLING secret. This crate names simdr by path in Cargo.toml and cannot be built without it. Add a token with read access to MerlijnW70/simdr as a repository secret called SIBLING."
-            exit 1
-          fi
+      # This follows `main` rather than pinning a commit. A submodule would pin one, and would make
+      # "which emitter was this built against" a thing the repository records rather than a thing the
+      # clock decides. That is a change to how the two are arranged and is not made here.
       - uses: actions/checkout@v5
         with:
           repository: MerlijnW70/simdr
           path: simdr
-          token: ${{ secrets.SIBLING }}
       # `rust-version = "1.88"` was asserted and never tested against anything. This is what makes
       # it a fact rather than a number, and it is the same job `simdr` runs for the same reason.
       - uses: dtolnay/rust-toolchain@master
