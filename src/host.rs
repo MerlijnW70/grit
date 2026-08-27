@@ -74,6 +74,11 @@ pub enum Error {
         /// Words the buffer has.
         held: usize,
     },
+    /// A buffer larger than its memory was asked for on a device that will not hold one.
+    ///
+    /// `sparseBinding` and `sparseResidencyBuffer` are optional in Vulkan and this device reports
+    /// neither, or one of the two.
+    NoSparse,
     /// A submission was started while one was still in flight.
     ///
     /// One command buffer and one fence, so one at a time. Waiting here instead of saying so would
@@ -136,6 +141,11 @@ impl std::fmt::Display for Error {
         match self {
             Self::NoLoader(why) => write!(out, "no Vulkan loader: {why}"),
             Self::Vulkan(code) => write!(out, "Vulkan said {code:?}"),
+            Self::NoSparse => write!(
+                out,
+                "this device will not hold a buffer larger than the memory behind it: it reports \
+                 no sparseBinding, or no sparseResidencyBuffer"
+            ),
             Self::NoComputeDevice => write!(out, "no physical device offers a compute queue"),
             Self::NoSuchDevice { wanted, present } => {
                 write!(out, "no device matching {wanted:?}; here: {present:?}")
@@ -201,6 +211,8 @@ pub struct Host {
     /// a queue with work on it that will never finish is not a thing one resident can be poisoned
     /// about while its neighbours carry on.
     wedged: AtomicBool,
+    /// Whether this device was created with the two sparse features a vast buffer needs.
+    sparse: bool,
 }
 
 impl Host {
@@ -381,10 +393,27 @@ impl Host {
         let (tick, timing) = unsafe { timestamps(&instance, physical, family) };
 
         let priorities = [1.0_f32];
+        // **Nothing was ever asked for, and one thing is worth asking for.** A buffer with an
+        // address range larger than the memory behind it needs `sparseBinding`, and a *partly*
+        // bound one needs `sparseResidencyBuffer` — both are optional features and a device created
+        // without them refuses the buffer rather than the flag. Asked for only where the device
+        // says it has them, so a part without them still opens.
+        //
+        // Nothing else is asked for. A feature enabled is a promise the driver has to keep, and
+        // this crate uses no other.
+        // SAFETY: `physical` came from this instance.
+        let has = unsafe { instance.get_physical_device_features(physical) };
+        let wanted = vk::PhysicalDeviceFeatures::default()
+            .sparse_binding(has.sparse_binding == 1)
+            .sparse_residency_buffer(has.sparse_binding == 1 && has.sparse_residency_buffer == 1);
+        let sparse = wanted.sparse_binding == 1 && wanted.sparse_residency_buffer == 1;
+
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priorities)];
-        let create = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+        let create = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queues)
+            .enabled_features(&wanted);
 
         // SAFETY: `create` borrows `queues`, which outlives the call.
         let device = match unsafe { instance.create_device(physical, &create, None) } {
@@ -410,6 +439,7 @@ impl Host {
             ceiling,
             tick,
             timing,
+            sparse,
             wedged: AtomicBool::new(false),
         })
     }
@@ -430,6 +460,17 @@ impl Host {
     /// timestamp bits does not support them, whatever the period says.
     pub(crate) const fn ticking(&self) -> (f32, bool) {
         (self.tick, self.timing)
+    }
+
+    /// Whether this device will hold a buffer larger than the memory behind it.
+    ///
+    /// Both `sparseBinding` and `sparseResidencyBuffer` are optional in Vulkan, and a device
+    /// created without them refuses such a buffer rather than the flag that asks for one. Where this
+    /// is false, [`Host::resident_vast`] answers [`Error::NoSparse`] and every other constructor is
+    /// unaffected.
+    #[must_use]
+    pub const fn sparse(&self) -> bool {
+        self.sparse
     }
 
     /// The device, for the layer that allocates over it.

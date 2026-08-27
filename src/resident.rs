@@ -132,6 +132,19 @@ struct Held {
     handle: vk::Buffer,
     memory: vk::DeviceMemory,
     bytes: u64,
+    /// How large a page of this buffer is, where it is one the caller binds by hand.
+    ///
+    /// Nought for an ordinary buffer, whose memory is bound once when it is made. For a vast one it
+    /// is what `vkGetBufferMemoryRequirements` calls the alignment, which for a sparse buffer is the
+    /// block the hardware pages at — 64 KiB on both parts here, and not a number to assume.
+    page: u64,
+    /// What is bound into it: where, what, and how much.
+    ///
+    /// Empty for an ordinary buffer. One entry a call to [`Resident::bind`], because the size of a
+    /// chunk is the caller's business — a voxel world binds a megabyte at a time and a model binds
+    /// an expert — and one allocation a page would run a device out of allocations long before it
+    /// ran out of memory.
+    pages: Vec<(u64, vk::DeviceMemory, u64)>,
     /// Whether the host can write into it without a submission.
     ///
     /// Decided per buffer rather than per `Resident`: a window of device-local host-visible memory
@@ -340,6 +353,41 @@ impl Host {
         self.buffers_in(sizes, modules, false, window)
     }
 
+    /// Allocate `sizes` buffers, one of which is **larger than the memory behind it**.
+    ///
+    /// `sizes[vast]` is an address range in words rather than an allocation: the buffer exists, a
+    /// shader may index anywhere in it, and nothing is behind any of it until [`Resident::bind`]
+    /// puts something there. The RTX 4080 this was written on will hold a terabyte of such a range
+    /// and the integrated Radeon beside it a hundred and twenty-eight; neither has sixteen gigabytes
+    /// of memory.
+    ///
+    /// Every other binding is what [`Host::resident`] would have made it.
+    ///
+    /// # What it is not
+    ///
+    /// **The device does not fetch what a shader touches.** There is no page fault here that reaches
+    /// the host: a read of an unbound range answers with nothing and a write to one is discarded, and
+    /// nothing anywhere is told it happened. What this replaces is the *bookkeeping* — a table of
+    /// slots, a compacted arena, and an index turned into a slot on every access — not the loop that
+    /// decides what to fetch. That loop is still the caller's, and a shader that writes down what it
+    /// could not read is still how it is driven.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSparse`] where the device reports no `sparseBinding` or no
+    /// `sparseResidencyBuffer`; otherwise as [`Host::resident`].
+    pub fn resident_vast<'host>(
+        &'host self,
+        sizes: &[usize],
+        modules: &[&[u32]],
+        vast: usize,
+    ) -> Result<Resident<'host>, Error> {
+        if !self.sparse() {
+            return Err(Error::NoSparse);
+        }
+        self.buffers_in_with(sizes, modules, false, 0, Some(vast))
+    }
+
     /// Allocate `sizes` buffers and build one pipeline per module over them.
     fn buffers_in<'host>(
         &'host self,
@@ -348,8 +396,28 @@ impl Host {
         direct: bool,
         window: u64,
     ) -> Result<Resident<'host>, Error> {
+        self.buffers_in_with(sizes, modules, direct, window, None)
+    }
+
+    /// The same, with one binding possibly vast.
+    fn buffers_in_with<'host>(
+        &'host self,
+        sizes: &[usize],
+        modules: &[&[u32]],
+        direct: bool,
+        window: u64,
+        vast: Option<usize>,
+    ) -> Result<Resident<'host>, Error> {
         let words = |count: usize| (count.max(1) * size_of::<u32>()) as u64;
-        let largest = sizes.iter().copied().map(words).max().unwrap_or(4);
+        // **The vast one is not counted.** Staging is sized by the largest buffer a write has to
+        // pass through, and an address range of a terabyte would ask for a terabyte of it.
+        let largest = sizes
+            .iter()
+            .enumerate()
+            .filter(|&(at, _)| Some(at) != vast)
+            .map(|(_, &count)| words(count))
+            .max()
+            .unwrap_or(4);
 
         // SAFETY: every handle created below is owned by the `Resident` and destroyed in its
         // `Drop`, which cannot run while a frame is in flight because every frame waits on its
@@ -380,8 +448,12 @@ impl Host {
                 | vk::MemoryPropertyFlags::HOST_COHERENT;
 
             let mut buffers = Vec::with_capacity(sizes.len());
-            for &size in sizes {
+            for (at, &size) in sizes.iter().enumerate() {
                 let bytes = words(size);
+                if Some(at) == vast {
+                    buffers.push(self.allocate_vast(bytes, usage_of)?);
+                    continue;
+                }
 
                 // **Small enough to be worth the window, and asked for one at a time.** A buffer
                 // written every frame wants memory the host can poke; a buffer holding an expert
@@ -523,8 +595,38 @@ impl Host {
             handle,
             memory,
             bytes: bytes.max(4),
+            page: 0,
+            pages: Vec::new(),
             // Whatever the caller asked for; `buffers_in` says which it settled on.
             visible: wanted.contains(vk::MemoryPropertyFlags::HOST_VISIBLE),
+        })
+    }
+
+    /// A buffer with an address range and no memory behind it.
+    ///
+    /// # Safety
+    ///
+    /// As [`Host::allocate`].
+    unsafe fn allocate_vast(&self, bytes: u64, usage: vk::BufferUsageFlags) -> Result<Held, Error> {
+        // **Both flags, and they are not the same thing.** `SPARSE_BINDING` says the memory is bound
+        // by hand; `SPARSE_RESIDENCY` says it may be bound in part, which is the whole point — a
+        // buffer that must be fully bound before it is used is an ordinary buffer with extra steps.
+        let create = vk::BufferCreateInfo::default()
+            .size(bytes.max(4))
+            .usage(usage)
+            .flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: the caller's contract.
+        let handle = unsafe { self.device().create_buffer(&create, None) }?;
+        // SAFETY: `handle` was just created by this device.
+        let requirements = unsafe { self.device().get_buffer_memory_requirements(handle) };
+        Ok(Held {
+            handle,
+            memory: vk::DeviceMemory::null(),
+            bytes: bytes.max(4),
+            page: requirements.alignment.max(1),
+            pages: Vec::new(),
+            visible: false,
         })
     }
 
@@ -1074,6 +1176,197 @@ impl Resident<'_> {
     #[must_use]
     pub const fn copying(&self) -> (Duration, u64) {
         (self.copying, self.copies)
+    }
+
+    /// How large a page of binding `index` is, in words, or `None` where it is not a vast one.
+    ///
+    /// Every offset and length handed to [`Resident::bind`] is a whole number of these. It is what
+    /// `vkGetBufferMemoryRequirements` calls the alignment, and it is 16 384 words — 64 KiB — on
+    /// both parts this was written on, which is a measurement and not a promise.
+    #[must_use]
+    pub fn page(&self, index: usize) -> Option<usize> {
+        let held = self.buffers.get(index)?;
+        (held.page > 0).then_some((held.page / 4) as usize)
+    }
+
+    /// How many words of binding `index` have something behind them.
+    #[must_use]
+    pub fn bound(&self, index: usize) -> usize {
+        self.buffers.get(index).map_or(0, |held| {
+            held.pages.iter().map(|&(_, _, bytes)| bytes).sum::<u64>() as usize / 4
+        })
+    }
+
+    /// Put memory behind `words` words of binding `index`, starting `at` words in.
+    ///
+    /// # What this costs
+    ///
+    /// One allocation and one `vkQueueBindSparse`, waited on. **The chunk is the caller's to
+    /// choose**: a device has a few thousand allocations in it and a page is 64 KiB, so binding a
+    /// page at a time would run out of allocations at a few hundred megabytes. A voxel world binds a
+    /// megabyte because that is what its chunks are; a model binds an expert.
+    ///
+    /// Binding over a range that already has something behind it replaces it, and the memory that
+    /// was there is freed — so a caller that binds the same window again does not leak, and one that
+    /// binds overlapping windows of different sizes gets the arithmetic it asked for and no warning.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchBinding`] for an index this does not hold, [`Error::NoSparse`] where that
+    /// binding is not a vast one, [`Error::Overrun`] where the range runs past its end or is not a
+    /// whole number of pages, and [`Error::NoMemory`] where the device has none to give.
+    pub fn bind(&mut self, index: usize, at: usize, words: usize) -> Result<(), Error> {
+        let page = self.buffers.get(index).map_or(0, |held| held.page);
+        if page == 0 {
+            return match self.buffers.get(index) {
+                Some(_) => Err(Error::NoSparse),
+                None => Err(Error::NoSuchBinding {
+                    index,
+                    held: self.buffers.len(),
+                }),
+            };
+        }
+        let (from, bytes) = (
+            (at * size_of::<u32>()) as u64,
+            (words * size_of::<u32>()) as u64,
+        );
+        let end = from.saturating_add(bytes);
+        let held = self.buffers.get(index).ok_or(Error::NoSuchBinding {
+            index,
+            held: self.buffers.len(),
+        })?;
+        if from % page != 0 || bytes % page != 0 || end > held.bytes {
+            return Err(Error::Overrun {
+                index,
+                needed: (end / size_of::<u32>() as u64) as usize,
+                held: (held.bytes / size_of::<u32>() as u64) as usize,
+            });
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        // Whatever was there first, so that binding the same window twice replaces rather than
+        // leaks. Vulkan is happy to have a range rebound; the memory under it is this crate's.
+        self.unbind(index, at, words)?;
+
+        // SAFETY: `handle` belongs to this device and nothing is in flight — every frame waits on
+        // its fence before returning, and `bind` takes `&mut self`.
+        unsafe {
+            let device = self.host.device();
+            let held = self.buffers.get(index).ok_or(Error::NoSuchBinding {
+                index,
+                held: self.buffers.len(),
+            })?;
+            let requirements = device.get_buffer_memory_requirements(held.handle);
+            let kind = self
+                .host
+                .suits(requirements, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .ok_or(Error::NoMemory { bytes })?;
+            let allocate = vk::MemoryAllocateInfo::default()
+                .allocation_size(bytes)
+                .memory_type_index(kind);
+            let memory = device.allocate_memory(&allocate, None)?;
+
+            let binds = [vk::SparseMemoryBind::default()
+                .resource_offset(from)
+                .size(bytes)
+                .memory(memory)
+                .memory_offset(0)];
+            let one = [vk::SparseBufferMemoryBindInfo::default()
+                .buffer(held.handle)
+                .binds(&binds)];
+            let info = [vk::BindSparseInfo::default().buffer_binds(&one)];
+
+            // **Waited on.** A bind is queue work like any other and a dispatch that reads the range
+            // before it lands reads nothing. One fence a bind is the honest cost of that, and it is
+            // paid where a chunk arrives rather than in a frame.
+            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let held = device.queue_bind_sparse(self.host.queue(), &info, fence);
+            if held.is_err() {
+                device.destroy_fence(fence, None);
+                device.free_memory(memory, None);
+                held?;
+            }
+            let waited = device.wait_for_fences(&[fence], true, u64::MAX);
+            device.destroy_fence(fence, None);
+            waited?;
+
+            if let Some(slot) = self.buffers.get_mut(index) {
+                slot.pages.push((from, memory, bytes));
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the memory out from behind `words` words of binding `index`, starting `at` words in.
+    ///
+    /// Only whole bindings made by [`Resident::bind`] are taken back — a range that covers part of
+    /// one leaves it alone, because half an allocation cannot be freed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resident::bind`].
+    pub fn unbind(&mut self, index: usize, at: usize, words: usize) -> Result<(), Error> {
+        let (from, bytes) = (
+            (at * size_of::<u32>()) as u64,
+            (words * size_of::<u32>()) as u64,
+        );
+        let end = from.saturating_add(bytes);
+        let Some(held) = self.buffers.get(index) else {
+            return Err(Error::NoSuchBinding {
+                index,
+                held: self.buffers.len(),
+            });
+        };
+        let going: Vec<(u64, vk::DeviceMemory, u64)> = held
+            .pages
+            .iter()
+            .copied()
+            .filter(|&(off, _, size)| off >= from && off + size <= end)
+            .collect();
+        if going.is_empty() {
+            return Ok(());
+        }
+
+        // SAFETY: as `bind`.
+        unsafe {
+            let device = self.host.device();
+            let handle = held.handle;
+            let binds: Vec<vk::SparseMemoryBind> = going
+                .iter()
+                .map(|&(off, _, size)| {
+                    vk::SparseMemoryBind::default()
+                        .resource_offset(off)
+                        .size(size)
+                        .memory(vk::DeviceMemory::null())
+                        .memory_offset(0)
+                })
+                .collect();
+            let one = [vk::SparseBufferMemoryBindInfo::default()
+                .buffer(handle)
+                .binds(&binds)];
+            let info = [vk::BindSparseInfo::default().buffer_binds(&one)];
+            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let sent = device.queue_bind_sparse(self.host.queue(), &info, fence);
+            if sent.is_err() {
+                device.destroy_fence(fence, None);
+                sent?;
+            }
+            let waited = device.wait_for_fences(&[fence], true, u64::MAX);
+            device.destroy_fence(fence, None);
+            waited?;
+
+            // Only now: freeing memory the queue is still unbinding is undefined.
+            for &(_, memory, _) in &going {
+                device.free_memory(memory, None);
+            }
+            if let Some(slot) = self.buffers.get_mut(index) {
+                slot.pages
+                    .retain(|&(off, _, size)| !(off >= from && off + size <= end));
+            }
+        }
+        Ok(())
     }
 
     /// Read `count` words back from binding `index`.
@@ -1999,6 +2292,11 @@ impl Drop for Resident<'_> {
             for held in self.buffers.iter().chain(std::iter::once(&self.staging)) {
                 device.destroy_buffer(held.handle, None);
                 device.free_memory(held.memory, None);
+                // A vast buffer has no memory of its own and some number of pages behind it. The
+                // buffer is destroyed above, which unbinds them; this is what gives them back.
+                for &(_, memory, _) in &held.pages {
+                    device.free_memory(memory, None);
+                }
             }
         }
     }
