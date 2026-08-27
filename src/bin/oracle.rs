@@ -26,6 +26,9 @@
 //!   hold 4          four more steps after the word, with nothing arriving
 //!   linger 1        during a hold, keep the last slice on the wires instead
 //!   band 8          split the rows into bands of eight that cannot read each other
+//!   feeds 1         show the word to the first band only and starve the rest
+//!   keep grid.txt   write the winner's grid out when the run ends
+//!   start grid.txt  fill the colony with that grid instead of drawing one
 //!   gates ... over  the one gate that crosses a band, one offset up — a carry
 //!   fold 1          read the answers off one row, one a step, instead of one row each
 //!   renew 8         after eight batches with no gain, draw the colony again but for the best
@@ -174,6 +177,65 @@
 //!
 //! The colony is what it costs: 2610 us a generation of host clock at 65 536 against about 80 at
 //! 4096, for sixteen times the chips and forty-eight passes a tick instead of twelve.
+//!
+//! # Where the accumulator breaks, which is one bit after the multiply
+//!
+//! `mac` at three inputs is one bit times one bit plus one, and it grows from there. Six starts
+//! each in four bands of eight, `and or xor not sum` with `renew 8` at 16 384 chips:
+//!
+//! ```text
+//!                                       of its perfect   perfect chips
+//!   1x1+1, 3 inputs, 2 answers          16.0 of 16       6 of 6
+//!   1x1+2, 4 inputs, 3 answers          47.5 of 48       3
+//!   2x2,   4 inputs, 4 answers          63.1 of 64       3
+//!   2x2+1, 5 inputs, 4 answers         121.3 of 128      0
+//!   2x2+2, 6 inputs, 4 answers         227.0 of 256      0
+//! ```
+//!
+//! **A two-by-two multiply comes out and a two-by-two multiply plus one bit does not.** Sixteen
+//! times the colony does not move it: 121.6 of 128 at 65 536 chips against 121.3 at 16 384.
+//!
+//! # Starving the bands, which is what makes the crossing necessary
+//!
+//! `over` bought nothing on a multiply-accumulate, and the reason offered was that every band holds
+//! the whole word and can work a carry out for itself. `feeds N` shows the word to the first N
+//! bands only. Six starts on `add` in three bands:
+//!
+//! ```text
+//!                                    of 48   perfect   crossings
+//!   every band fed, no over          47.3    3 of 6    0
+//!   one band fed, no over            34.0    0         0
+//!   one band fed, with over          46.0    0         30.8
+//! ```
+//!
+//! **34.0 on every one of the six starts, to the point.** A starved band with nothing crossing into
+//! it can only answer with a constant, and the constant that fits best is worth exactly that much.
+//! With one wire allowed across it recovers 12 of 48 and comes within 1.3 of a chip that was never
+//! starved at all.
+//!
+//! So the crossing is worth twelve of 48 when it is the only way in and nothing when it is not.
+//! What it does not buy is size: with `lean wires`, starved and crossing is 280.5 wires against
+//! 290.0 fed and crossing, for 45.3 of 48 against 47.6.
+//!
+//! # Stacking one run on another, which buys nothing either way
+//!
+//! `keep` writes the winner's grid to a file and `start` fills the colony from it, which is the
+//! only way of handing one run's answer to another. Handing a solved two-by-two multiplier to
+//! `2x2+1`, six starts:
+//!
+//! ```text
+//!   drawn at random                  121.3 of 128
+//!   every chip the kept grid         115.6
+//!   KEPT copies of it, spread        120.8
+//! ```
+//!
+//! **Filling the colony with one answer is worse than not stacking at all**, because a colony of
+//! identical chips has no spread left for the selection to work on. Spreading `KEPT` copies through
+//! a drawn colony — the same shape `renew` uses — gets back to where drawing got to, and no
+//! further.
+//!
+//! The same on a rung where the layout does not change at all: two answer bits of `times` handed to
+//! four gives 63.3 of 64 against 63.1 drawn, three perfect chips in six either way.
 //!
 //! # A multiply-accumulate, which bands help and do not finish
 //!
@@ -1510,7 +1572,15 @@ fn feed(
     }
 
     let fan_at = kernel.module().constant_u32(fan)?;
-    let feeding = above(&mut kernel, fan_at, inside)?;
+    let mut feeding = above(&mut kernel, fan_at, inside)?;
+    // **A starved band's input rows are not input rows.** Everything it is going to know has to
+    // arrive over the boundary.
+    if exam.feeds > 0 {
+        let which = down_by(&mut kernel, row, exam.band.trailing_zeros())?;
+        let many = kernel.module().constant_u32(exam.feeds)?;
+        let fed = above(&mut kernel, many, which)?;
+        feeding = kernel.module().i_mul(uint, feeding, fed)?;
+    }
     let past = kernel.module().constant_u32(fan + state)?;
     let within = above(&mut kernel, past, inside)?;
     let not_input = minus(&mut kernel, one, feeding)?;
@@ -1891,6 +1961,18 @@ struct Exam {
     /// draw from the starting grids and not the four thousand generations it then spends.
     /// Redrawing everything but the best turns the one draw into many without losing the best.
     renew: u32,
+    /// How many bands are shown the word, or nought for all of them.
+    ///
+    /// **A band that is fed can work anything out for itself.** Starving the rest is what makes a
+    /// wire across the boundary necessary rather than convenient.
+    feeds: u32,
+    /// Where to write the winner's grid, so that a later exam can start from it.
+    ///
+    /// **A run is one draw, and this is how a draw is kept.** Evolving a small exam and handing
+    /// its answer to a bigger one is the only way of stacking runs there is here.
+    keep: Option<String>,
+    /// A grid to fill the colony with instead of drawing it, from an earlier exam's `keep`.
+    start: Option<String>,
     /// How many rows a band is, or `ROWS` for one band, which is what it was.
     ///
     /// **A band is a chip of its own.** Its gates cannot read across the boundary, it gets its own
@@ -2036,6 +2118,9 @@ fn read(text: &str) -> Result<Exam, String> {
     let mut fold = false;
     let mut linger = false;
     let mut band = ROWS;
+    let mut feeds = 0;
+    let mut keep = None;
+    let mut start = None;
     let mut renew = 0;
     let mut allowed: Option<Vec<u32>> = None;
     let mut noise = 0_u32;
@@ -2073,6 +2158,18 @@ fn read(text: &str) -> Result<Exam, String> {
                     .next()
                     .and_then(|it| it.parse::<u32>().ok())
                     .ok_or_else(|| say("`renew` wants a number of batches"))?;
+            }
+            (Some("feeds"), _) => {
+                feeds = word
+                    .next()
+                    .and_then(|it| it.parse::<u32>().ok())
+                    .ok_or_else(|| say("`feeds` wants a number of bands"))?;
+            }
+            (Some("keep"), _) => {
+                keep = word.next().map(str::to_owned);
+            }
+            (Some("start"), _) => {
+                start = word.next().map(str::to_owned);
             }
             (Some("band"), _) => {
                 band = word
@@ -2348,7 +2445,8 @@ fn read(text: &str) -> Result<Exam, String> {
     let island = island.unwrap_or(colony).min(colony);
     let allowed = allowed.unwrap_or_else(|| (0..KINDS).collect());
     Ok(Exam {
-        bits, outputs, apart, band, ladder, weigh, slack, allowed, noise, lean, steps, hold, linger,
+        bits, outputs, apart, band, feeds, keep, start, ladder, weigh, slack, allowed, noise, lean,
+        steps, hold, linger,
         fold,
         renew,
         state,
@@ -2378,7 +2476,8 @@ fn runs(genome: &[u32], case: u32, exam: &Exam) -> u32 {
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
                 let inside = row % exam.band;
-                if inside < fan {
+                let fed = exam.feeds == 0 || row / exam.band < exam.feeds;
+                if inside < fan && fed {
                     if step >= exam.steps && !exam.linger {
                         0
                     } else {
@@ -2539,7 +2638,8 @@ fn remembers(genome: &[u32], case: u32, exam: &Exam) -> Vec<(u32, u32)> {
         let mut column: Vec<u32> = (0..ROWS)
             .map(|row| {
                 let inside = row % exam.band;
-                if inside < fan {
+                let fed = exam.feeds == 0 || row / exam.band < exam.feeds;
+                if inside < fan && fed {
                     if step >= exam.steps && !exam.linger {
                         0
                     } else {
@@ -2991,7 +3091,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect()
     };
-    let genes = draw(&mut seed);
+    // **Stacked, the colony starts where an earlier exam finished.** The kept grid goes in `KEPT`
+    // times, spread out, and the rest of the colony is drawn as usual — filling every chip with it
+    // leaves a colony with no spread in it at all, and that is measurably worse than not stacking.
+    let genes = match exam.start.as_deref() {
+        Some(path) => {
+            let held: Vec<u32> = std::fs::read_to_string(path)?
+                .split_ascii_whitespace()
+                .filter_map(|it| it.parse().ok())
+                .collect();
+            if held.len() != CELLS as usize {
+                return Err(format!(
+                    "`start {path}` holds {} cells and this grid has {CELLS}",
+                    held.len()
+                )
+                .into());
+            }
+            println!("  starting from {path}, {} cells in {KEPT} chips", held.len());
+            let mut fresh = draw(&mut seed);
+            let span = CELLS as usize;
+            for slot in (0..colony as usize).step_by((colony / KEPT).max(1) as usize) {
+                if let Some(now) = fresh.get_mut(slot * span..(slot + 1) * span) {
+                    now.copy_from_slice(&held);
+                }
+            }
+            fresh
+        }
+        None => draw(&mut seed),
+    };
     arena.write(GENE as usize, &genes)?;
     let seeds: Vec<u32> = (0..=colony).map(|_| stirred(&mut seed)).collect();
     arena.write(SEED as usize, &seeds)?;
@@ -3241,6 +3368,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("    {pattern} -> {says}   exam said {asked}  {mark}");
         }
         println!();
+    }
+    if let Some(path) = exam.keep.as_deref() {
+        let held: Vec<String> = genome.iter().map(u32::to_string).collect();
+        std::fs::write(path, held.join(" "))?;
+        println!("  kept in {path}");
     }
     let again = scored(genome, &exam);
     let (whole, worst) = exactly(genome, &exam);
