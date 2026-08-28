@@ -96,9 +96,23 @@ pub const TALLY: u32 = 11;
 /// middle of the loop.
 ///
 /// So the same trick, one level up. A block is [`crate::sweep::cells`] quads, and this says whether
-/// any of them is awake. It is written by exactly the code that writes [`AWAKE`], with the same
-/// countdown and the same nine-neighbour dilation, so the two cannot fall out of step: **a block
-/// reading nought has no awake quad in it**, and the two passes above skip it without looking.
+/// any of them is awake: **a block reading nought has no awake quad in it**, and the two passes
+/// above skip it without looking.
+///
+/// # And it is the largest counter under it, not a countdown of its own
+///
+/// [`crate::live::wake`] writes the same two to a quad's counter and to its block's flag in one
+/// invocation, so the flag has always been exactly the highest counter in the block — and
+/// [`crate::live::decay`] now *computes* it that way rather than stepping it down beside them.
+///
+/// It used to be its own countdown, read and written back by every lane of the workgroup at one
+/// address, on the argument the section below makes about identical writes. That argument holds for
+/// a store of a constant and not for a read-modify-write, whose value depends on when the read
+/// happened: `tests/wander.rs` measured one dispatch over a list naming each of 1024 blocks once,
+/// four hundred times, and up to six of the 204 800 blocks came back one decrement below the
+/// counters they stand for. A flag below its counters is a block that leaves the coarse list with
+/// quads still awake in it, and is never dispatched for again. `decisions/DR-0018` is the whole of
+/// it.
 ///
 /// Skipping is a real branch rather than a `select`, which `decisions/DR-0003` permits precisely
 /// here: the condition is one word loaded at the workgroup's own index, so every lane of the

@@ -448,19 +448,48 @@ fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, Lane
     // **No gate any more.** Every block this is dispatched over is one the list said had something
     // in it, so the vote that used to stand here would pass every time. The saving moved from
     // skipping the body to not being dispatched at all.
+    let mut highest = kernel.module().constant_u32(0)?;
     for offset in 0..PER_LANE {
         let along = kernel.module().constant_u32(offset)?;
         let quad = kernel.module().i_add(uint, mine, along)?;
         let held = kernel.load_at(AWAKE, quad)?;
         let lower = step(&mut kernel, held)?;
         kernel.store_at(AWAKE, quad, lower)?;
+        highest = {
+            let mut lanes = kernel.lanes()?;
+            let so_far = lanes.splat_id::<U32, 1>(highest)?;
+            let now = lanes.splat_id::<U32, 1>(lower)?;
+            lanes.max(so_far, now)?.id()
+        };
     }
 
-    // And the block's own counter, written by every lane because every lane has the same answer —
-    // the argument `layout::HOT` makes about identical writes, one level up.
-    let held = kernel.load_at(HOT, block)?;
-    let lower = step(&mut kernel, held)?;
-    kernel.store_at(HOT, block, lower)?;
+    // **And the block's flag, which is the highest counter in the block and not a countdown of its
+    // own.** The two are the same number by construction: [`wake`] writes the same two to a quad's
+    // counter and to its block's flag in one invocation, and nothing else raises either, so a flag
+    // has always been exactly the largest counter under it. Saying so is what makes this safe.
+    //
+    // It used to be read here, stepped, and written back — by *every* lane of the workgroup, at one
+    // address, on the argument [`crate::layout::HOT`] makes about identical writes. That argument
+    // holds for a store of a constant and not for a read-modify-write, whose value depends on when
+    // the read happened. `tests/wander.rs` prices what that was worth: one `decay` over a list
+    // naming each of 1024 blocks once, four hundred times, and between nought and six of the
+    // 204 800 blocks came back a second decrement lower than the counters they stand for — a flag
+    // reading nought over quads that were still awake, and therefore a block that leaves the coarse
+    // list and is never dispatched for again. `decisions/DR-0018` has the rest.
+    //
+    // A reduction and a store of the same value from every lane is what [`tally`] already does, and
+    // it reads nothing, so there is nothing for a second read to disagree with.
+    // **`LANES` wide, not one.** A one-wide vector on a sixty-four-lane device maps to clusters of
+    // one, and a clustered reduction over a cluster of one is the value it was given — every lane
+    // would keep its own highest counter and the flag would be whichever lane's store landed last.
+    // Which looks right whenever the highest counter happens to sit in the last lane, and was wrong
+    // in `tests/wander.rs` in 128 runs of 128 the moment it did not.
+    let flag = {
+        let mut lanes = kernel.lanes()?;
+        let mine = lanes.splat_id::<U32, LANES>(highest)?;
+        lanes.reduce_max::<U32, LANES>(mine)?
+    };
+    kernel.store_at(HOT, block, flag)?;
     kernel.finish()
 }
 

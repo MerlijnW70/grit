@@ -67,6 +67,14 @@ Blaming the stage grouping is rejected on the one-pass-a-stage run. Blaming a du
 list is rejected too: the list is ascending and free of duplicates in every run, which
 `tests/hunt.rs` checks — only its length moves.
 
+## What Answered It
+
+`decisions/DR-0018`. The cause is `decay`'s own countdown on the coarse flag — a read-modify-write on
+one word by every lane of the workgroup — and everything in **The Limit** below stands as it was
+written except the first line: the cause is now localised to those three lines, without the tool that
+section says the next step wanted. `tests/wander.rs` is the instrument that did it, and
+`tests/hunt.rs` now reads the same on every line.
+
 ## The Limit
 
 **The cause is NOT LOCALISED to a line.** What is measured is the shape: two counter buffers, both

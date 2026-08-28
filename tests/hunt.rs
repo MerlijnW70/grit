@@ -15,6 +15,12 @@
 //!
 //! It asserts nothing about which arrangement is right. It prints what each grouping did over several
 //! runs, and leaves the reading to whoever is holding `decisions/DR-0013`.
+//!
+//! **It was not a missing barrier**, and `decisions/DR-0018` says what it was: the coarse flag's own
+//! countdown, read and written back by every lane of the workgroup at one address. Every line here
+//! reads the same now — the same work list, the same coarse list, the same counters and the same
+//! world, in every run of every grouping. `tests/wander.rs` is what took it apart, and holds the
+//! check that fails if it comes back.
 
 // A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
