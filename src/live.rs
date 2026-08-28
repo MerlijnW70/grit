@@ -65,14 +65,24 @@ pub type Loop = (Vec<Vec<u32>>, Vec<Vec<crate::Groups>>);
 /// The one word the host never writes after the first frame — the partition's phase is its low bit,
 /// so a host that incremented it would be deciding the phase, and that is the device's business.
 ///
-/// Every invocation of the single workgroup writes the same word, which is the case
-/// `Kernel::store_at` documents as safe.
+/// # One invocation, not a workgroup's worth
+///
+/// This is a read-modify-write on one word, and it used to be executed by every invocation of its
+/// single workgroup on the argument `Kernel::store_at` makes about identical writes. That argument
+/// covers a store of a constant and not a value that depends on when the read happened, which is
+/// exactly what `decisions/DR-0018` had to take out of [`decay`] — where the same shape cost a
+/// second decrement in one block of every hundred thousand.
+///
+/// `tests/counting.rs` measured this one and found no miscount: half a million dispatches on each of
+/// two cards, and sixteen thousand frames of the real loop under both arrangements. It is a workgroup
+/// of **one invocation** now anyway, which is the same pass with nothing left to race, and
+/// `decisions/DR-0020` prices that at nothing this machine can separate from its own drift.
 ///
 /// # Errors
 ///
 /// As [`settle`].
 pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, 1, BINDINGS))?;
     let slot = kernel.module().constant_u32(0)?;
     let one = kernel.module().constant_u32(1)?;
     let element = kernel.element();

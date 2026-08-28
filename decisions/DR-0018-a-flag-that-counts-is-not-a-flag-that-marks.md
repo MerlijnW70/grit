@@ -77,12 +77,20 @@ What it is worth, on the same 1024 blocks: a hundred `decay` dispatches a submis
 submissions a measurement, three measurements a side, timed on the device rather than the host.
 
 ```text
-  AMD Radeon(TM) Graphics, subgroup 64     before  3623-3643 ns    after  2426-2457 ns
-  NVIDIA GeForce RTX 4080, subgroup 32     before    69-92   ns    after    69-91   ns
+  AMD Radeon(TM) Graphics, subgroup 64     before  362.1-366.3 us   after  244.2-245.6 us
+  NVIDIA GeForce RTX 4080, subgroup 32     before    6.93-7.02 us   after    6.83-6.90 us
 ```
 
-**It is cheaper.** Sixty-four lanes loading one word and storing to it serialise; a reduction and one
-store do not. On the 4080 nothing moved.
+**It is cheaper on both.** Sixty-four lanes loading one word and storing to it serialise; a reduction
+and one store do not.
+
+**Corrected.** The first version of this record printed those four figures a hundred times too small
+— 3623-3643 ns against 2426-2457, and 69-92 against 69-91 — because the test divided
+`Resident::on_device` by the hundred frames a submission held, and `Resident::timed` had already
+divided by them. `tests/counting.rs::what_a_tick_costs` is what says so: it asks at 1, 10, 100 and
+1000 frames a submission and the figure does not move with the count. The ratio was never affected,
+and the 4080's answer was: at 69-92 against 69-91 ns the two ranges overlapped and this record said
+nothing moved, where undivided and measured again three runs a side they do not overlap.
 
 And `tests/hunt.rs`, which is the whole of DR-0013, now reads the same on every line: four
 groupings, five runs each, work list 1130 every time, coarse list 230 every time, `AWAKE`, `HOT` and

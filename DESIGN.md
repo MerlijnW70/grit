@@ -83,7 +83,8 @@ dispatch time. And ten barriers at ~1 µs are most of what is left, which is why
 | **What it buys** | Conservation falls out of the arrangement instead of being enforced on top of it — no atomics, no priority pass, no double buffering. |
 | **The corollary** | *Reading* outside a block is a race too. `tests/live.rs` caught it as one presents: frame nought, disagreement at subgroup 8, agreement at 32. |
 | **The fix** | One bit. `sand::HELD` — the cell writes down what it is standing on, refreshed every second frame by the invocation entitled to write it. |
-| **Read** | `src/sand.rs` module doc |
+| **And the one the rule did not cover** | The *bookkeeping* is not the world. `live::decay` read the coarse flag, stepped it and wrote it back from every lane of the workgroup at one address, on the rule about identical writes — which covers a store of a constant and not a read-modify-write. One block in a hundred thousand took a second decrement, dropped out of the coarse list with quads still awake in it, and was never dispatched for again. The flag is computed from the counters now. |
+| **Read** | `src/sand.rs` module doc, `DR-0018`, `DR-0020` |
 
 ---
 
@@ -194,7 +195,7 @@ sinking through water falls out of that.
 
 | | |
 | --- | --- |
-| `decisions/` | nine records: measurement, decision, rejected route, limit — four headings, no prose |
+| `decisions/` | twenty records: measurement, decision, rejected route, limit — four headings, no prose |
 | `src/live.rs` | `wired`, the one place the loop's order and grouping are decided |
 | `src/resident.rs` | stages, the barrier mask, the kept recording |
 | `src/sand.rs` | the Margolus rule and what a cell word holds |

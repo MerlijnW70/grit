@@ -914,9 +914,12 @@ fn what_the_flag_costs() {
     let mut seen = Vec::with_capacity(10);
     for round in 0..11 {
         held.staged_frames(&[&stage], 100).expect("decay");
+        // **Not divided.** `Resident::on_device` is already per frame — `timed` divides the two
+        // stamps by how many frames the submission held — and dividing again is how the first
+        // version of this file reported a number a hundred times too small.
         let each = held
             .on_device()
-            .map_or(0.0, |whole| whole.as_secs_f64() * 1e9 / 100.0);
+            .map_or(0.0, |each| each.as_secs_f64() * 1e9);
         // The first submission carries the pipeline's first use with it.
         if round > 0 {
             seen.push(each);
@@ -925,7 +928,7 @@ fn what_the_flag_costs() {
     let low = seen.iter().copied().fold(f64::MAX, f64::min);
     let high = seen.iter().copied().fold(0.0_f64, f64::max);
     eprintln!(
-        "{} — subgroup {width}, one decay over {} blocks: {low:.0}-{high:.0} ns a dispatch over {} submissions",
+        "{} — subgroup {width}, one decay over {} blocks: {low:.0}-{high:.0} ns a dispatch over {} submissions of a hundred",
         host.name(),
         plan.blocks,
         seen.len(),
