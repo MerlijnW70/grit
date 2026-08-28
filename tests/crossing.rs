@@ -1,19 +1,3 @@
-//! Whether a device can be asked which arrangement it prefers, and what asking costs.
-//!
-//! `tests/coarse.rs` prices the two arrangements and compares the answer with
-//! [`grit::live::COARSE_FROM`], a constant. The constant is right on one of the two cards this
-//! machine holds and wrong on the other, and no rule derived from the subgroup width fixes that: at
-//! the same 131 072 cells the sixty-four-lane part prefers the list and the thirty-two-lane part
-//! prefers every block, so width names which card it is rather than why.
-//!
-//! What is left is to ask the device, which is what [`grit::live::both`] and
-//! [`grit::live::cheaper`] are for. This is where their numbers come from: how few frames it takes
-//! before the winner stops changing, what has to be paid before either arrangement can be timed at
-//! all, and what the whole path costs against the constant over a long pour.
-//!
-//! One test here checks and the rest report. `decisions/DR-0019` is what they report into.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::time::{Duration, Instant};
@@ -23,30 +7,18 @@ use grit::layout::{BRUSH, GRAND, PARAMS, STATE};
 use grit::sand::{AIR, Grid, SAND, WALL};
 use grit::{Groups, Host, sweep};
 
-/// Block counts to ask the question at, either side of both cards' crossings.
 const SIZES: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
 
-/// How many frames a calibration is allowed, in the order they are tried.
 const BUDGETS: [u32; 5] = [1, 5, 20, 60, 300];
 
-/// How many times each budget is asked, to see whether it answers the same way twice.
 const ROUNDS: usize = 5;
 
-/// How many frames of each arrangement the end-to-end comparison spends on deciding.
-///
-/// **Twenty, and `how_few_frames_name_the_winner` is why**: one frame named the wrong arrangement
-/// at two of the seven sizes, and five agreed with three hundred at every size on the Radeon. It is
-/// also one submission at [`BATCH`].
 const CALIBRATION: u32 = 20;
 
-/// Frames a submission, as `tests/coarse.rs` uses — a frame's own submit and fence would otherwise
-/// drown the difference being measured.
 const BATCH: u32 = 20;
 
-/// How many frames the same-world check pours before comparing.
 const AGREEING: u32 = 60;
 
-/// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -61,7 +33,6 @@ fn device(label: &str) -> Option<Host> {
     }
 }
 
-/// A room with walls, and air inside it.
 fn room(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
     for row in 0..grid.deep {
@@ -75,7 +46,6 @@ fn room(grid: Grid) -> Vec<u32> {
     cells
 }
 
-/// A grid with this many blocks at this width, both sides a power of two.
 fn sized(width: u32, blocks: u32) -> Grid {
     let cells = u64::from(blocks) * u64::from(sweep::cells(width)) * 4;
     let bits = cells.trailing_zeros();
@@ -84,7 +54,6 @@ fn sized(width: u32, blocks: u32) -> Grid {
     Grid::of(wide, deep)
 }
 
-/// A buffer as one number, so whole worlds can be compared without holding them all.
 fn folded(words: &[u32]) -> u64 {
     let mut held = 0xcbf2_9ce4_8422_2325_u64;
     for one in words {
@@ -94,7 +63,6 @@ fn folded(words: &[u32]) -> u64 {
     held
 }
 
-/// Put a seeded world and a brush into a resident that has just been made.
 fn seeded(resident: &mut grit::Resident<'_>, grid: Grid, plan: &Plan, sizes: &[usize]) {
     for (binding, held) in sizes.iter().enumerate() {
         resident.write(binding, &vec![0_u32; *held]).expect("wipe");
@@ -110,19 +78,12 @@ fn seeded(resident: &mut grit::Resident<'_>, grid: Grid, plan: &Plan, sizes: &[u
         .expect("brush");
 }
 
-/// Pour `frames` frames, a [`BATCH`] a submission, and read nothing back.
-///
-/// **Nothing, because a read is not part of what is being timed.** Reading the world costs four to
-/// sixteen megabytes over the bus, which on the 4080 is more than the two thousand frames it would
-/// be attributed to — this file had it inside the timed path for one measurement and the numbers
-/// doubled.
 fn pouring(resident: &mut grit::Resident<'_>, groups: &[&[Groups]], frames: u32) {
     for _ in (0..frames).step_by(BATCH as usize) {
         resident.staged_frames(groups, BATCH).expect("frames");
     }
 }
 
-/// Pour `frames` frames and hand back the world and the work list.
 fn poured(
     resident: &mut grit::Resident<'_>,
     grid: Grid,
@@ -142,17 +103,12 @@ fn poured(
     (world, stepped)
 }
 
-/// What one arrangement cost a frame, and what had to be paid before it could be timed.
 struct Priced {
-    /// Device time a frame, over the last submission.
     each: Duration,
-    /// Host time to emit the arrangement's modules.
     built: Duration,
-    /// Host time to make it resident — pipelines, buffers and descriptor set.
     made: Duration,
 }
 
-/// One arrangement alone, in a resident of its own, over one frame budget.
 fn priced(host: &Host, width: u32, grid: Grid, coarse: bool, frames: u32) -> Priced {
     let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).expect("plan");
 
@@ -179,14 +135,6 @@ fn priced(host: &Host, width: u32, grid: Grid, coarse: bool, frames: u32) -> Pri
     }
 }
 
-/// **The check.** An arrangement silenced beside another computes what it computes alone.
-///
-/// [`grit::live::both`] puts both arrangements' passes in one module list and hands back a stage
-/// list for each, the one that is not running given counts of nothing. That is a claim about
-/// [`grit::Resident`] — that a pass told to run no workgroups is not recorded and takes no barrier
-/// with it, and that the pass indices still line up — and if it were wrong the passes would be
-/// dispatched over the wrong counts and nothing in either list would look wrong. So this pours the
-/// same frames four ways and demands one world.
 #[test]
 fn a_silenced_arrangement_computes_the_same_world() {
     let Some(host) = device("crossing") else {
@@ -244,7 +192,6 @@ fn a_silenced_arrangement_computes_the_same_world() {
     }
 }
 
-/// How few frames it takes to get the same answer as three hundred do.
 #[test]
 fn how_few_frames_name_the_winner() {
     let Some(host) = device("crossing") else {
@@ -289,7 +236,6 @@ fn how_few_frames_name_the_winner() {
     }
 }
 
-/// What has to be paid on the host before either arrangement can be timed.
 #[test]
 fn what_asking_the_device_costs_before_it_answers() {
     let Some(host) = device("crossing") else {
@@ -316,15 +262,11 @@ fn what_asking_the_device_costs_before_it_answers() {
     }
 }
 
-/// What a run costs the host from nothing to `frames` frames poured, and which arrangement it ran.
 struct Whole {
-    /// Wall clock for the whole path: emitting modules, making it resident, and the frames.
     wall: Duration,
-    /// Which arrangement the path ran, where it had a choice.
     chose: &'static str,
 }
 
-/// The path the constant names: build the one arrangement it picks, make it resident, pour.
 fn by_constant(host: &Host, width: u32, grid: Grid, frames: u32) -> Whole {
     let clock = Instant::now();
     let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).expect("plan");
@@ -344,7 +286,6 @@ fn by_constant(host: &Host, width: u32, grid: Grid, frames: u32) -> Whole {
     }
 }
 
-/// The path that asks the device, spending the first two submissions of the run on the question.
 fn by_measurement(host: &Host, width: u32, grid: Grid, frames: u32, budget: u32) -> Whole {
     let clock = Instant::now();
     let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).expect("plan");
@@ -361,9 +302,6 @@ fn by_measurement(host: &Host, width: u32, grid: Grid, frames: u32, budget: u32)
         &both.every
     };
     let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
-    // **The calibration's frames are frames of the run.** Both paths pour the same number into the
-    // same world; this one spends its first two submissions finding out which arrangement to spend
-    // the rest on.
     let left = frames.saturating_sub(budget * 2);
     pouring(&mut resident, &groups, left);
     Whole {
@@ -372,7 +310,6 @@ fn by_measurement(host: &Host, width: u32, grid: Grid, frames: u32, budget: u32)
     }
 }
 
-/// What asking the device is worth over a long pour, against reading the constant.
 #[test]
 fn what_calibrating_costs_end_to_end() {
     let Some(host) = device("crossing") else {

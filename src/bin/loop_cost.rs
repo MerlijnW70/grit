@@ -1,27 +1,14 @@
-//! `cargo run --release --bin loop_cost` — what a resident frame costs, without a window in it.
-//!
-//! The spike next door opens a window, and a window is a blit and a compositor and a vsync. This
-//! runs the same three passes over the same buffers with none of that, so the number is the
-//! submission: three dispatches, two barriers, one copy out, one fence.
-//!
-//! It also asks the question the other way round. The same frame **without** the copy out is what a
-//! simulation costs when nothing is looked at — and the difference between the two is the price of
-//! looking, which is the only traffic this design allows.
-
 use std::time::Duration;
 
 use grit::{Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
-/// Invocations per workgroup.
 const WORKGROUP: u32 = 64;
 
-/// The mixer's multipliers.
 const GOLDEN: u32 = 0x9E37_79B1;
 const STIR: u32 = 0x85EB_CA6B;
 
-/// How many frames each measurement averages over.
 const FRAMES: u32 = 240;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,7 +36,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let over = u32::try_from(cells.div_ceil(WORKGROUP as usize)).unwrap_or(u32::MAX);
         let groups = [Groups::Fixed(1), Groups::Fixed(over), Groups::Fixed(over)];
 
-        // A discarded frame first: the first submission of a pipeline pays for its compile.
         let _ = resident.frame_reading(&groups, 2, cells)?;
 
         let mut looking = Duration::ZERO;
@@ -80,7 +66,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Pass one: the frame number, incremented on the device.
 fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, WORKGROUP, 3))?;
     let slot = kernel.module().constant_u32(0)?;
@@ -93,7 +78,6 @@ fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     kernel.finish()
 }
 
-/// Pass two: every cell, from its own coordinate and the frame number.
 fn step(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, WORKGROUP, 3))?;
     let slot = kernel.module().constant_u32(0)?;
@@ -119,7 +103,6 @@ fn step(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     kernel.finish()
 }
 
-/// Pass three: the picture, from the state.
 fn draw(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, WORKGROUP, 3))?;
     let state = kernel.load::<WORKGROUP>(1)?;

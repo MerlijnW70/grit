@@ -1,23 +1,3 @@
-//! Whether the frame counter counts frames.
-//!
-//! `decisions/DR-0018` took a read-modify-write out of `live::decay`: the coarse flag was read,
-//! stepped and written back by **every lane of the workgroup at one address**, on the argument
-//! `layout::HOT` makes about identical writes — which holds for a store of a constant and not for a
-//! value that depends on when the read happened. Measured, the flag took a second decrement in one
-//! block of every hundred thousand.
-//!
-//! [`grit::live::tick`] is the same shape and the only other one left in the crate: it loads
-//! `PARAMS[0]`, adds one, and stores it back, from every invocation of its single workgroup. Its doc
-//! makes the same argument the flag's did.
-//!
-//! What a wrong count would cost is not a wrong number on a screen. The **low bit of that word is
-//! the partition's phase**, so a frame counter that jumps by two leaves the Margolus origin where it
-//! was for two frames running, and nothing crosses a block boundary in between. `tests/live.rs`
-//! cannot see it: both arrangements read the same word and would agree about the same wrong phase.
-//!
-//! So this dispatches the pass alone and counts.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::compact::Plan;
@@ -25,26 +5,18 @@ use grit::layout::PARAMS;
 use grit::sand::Grid;
 use grit::{Groups, Host, sweep};
 
-/// How many blocks the plan is built for. Nothing here dispatches over them; it is the smallest
-/// plan that gives the bindings a size.
 const BLOCKS: u32 = 16;
 
-/// How many ticks go into one submission, with a barrier between each as the frame loop has.
 const RUN: u32 = 10_000;
 
-/// How many submissions each round makes.
 const ROUNDS: usize = 50;
 
-/// How many blocks the poured round runs over.
 const POURED_BLOCKS: u32 = 256;
 
-/// How many frames one poured round walks.
 const POURED: u32 = 2000;
 
-/// How many poured rounds each arrangement gets.
 const POURED_ROUNDS: usize = 4;
 
-/// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -59,7 +31,6 @@ fn device(label: &str) -> Option<Host> {
     }
 }
 
-/// A grid with this many blocks at this width, both sides a power of two.
 fn sized(width: u32, blocks: u32) -> Grid {
     let cells = u64::from(blocks) * u64::from(sweep::cells(width)) * 4;
     let bits = cells.trailing_zeros();
@@ -68,7 +39,6 @@ fn sized(width: u32, blocks: u32) -> Grid {
     Grid::of(wide, deep)
 }
 
-/// **The check.** The frame counter is exactly as high as the number of ticks that ran.
 #[test]
 fn the_frame_counter_counts_frames() {
     let Some(host) = device("counting") else {
@@ -132,15 +102,6 @@ fn the_frame_counter_counts_frames() {
     );
 }
 
-/// **And in the loop it actually runs in.** The counter after a pour is the number of frames poured.
-///
-/// The probe above dispatches [`grit::live::tick`] alone, a barrier between each. In the frame loop
-/// it is one of four passes in a stage — beside `decay`, `wipe` and `wipe_counts`, with no barrier
-/// between them — so three other dispatches are in flight while it reads and writes that word. None
-/// of the three touches `PARAMS`, but contention is the thing this class of defect is sensitive to,
-/// and it costs one test to say so rather than reason about it.
-///
-/// The host writes `u32::MAX`, so the warm frame's tick wraps it to nought and frame `n` leaves `n`.
 #[test]
 fn the_counter_after_a_pour_is_the_frames_poured() {
     use grit::layout::{BRUSH, STATE};
@@ -223,11 +184,6 @@ fn the_counter_after_a_pour_is_the_frames_poured() {
     );
 }
 
-/// What one tick costs on the device, so that changing its shape can be priced.
-///
-/// **`Resident::on_device` is already per frame** — `timed` divides the two stamps by how many
-/// frames the submission held — so nothing here divides again. Asking at four submission sizes is
-/// what says so: a figure that moved with the size would be a total wearing a per-frame label.
 #[test]
 fn what_a_tick_costs() {
     let Some(host) = device("counting") else {
@@ -260,7 +216,6 @@ fn what_a_tick_costs() {
         let mut seen = Vec::new();
         for round in 0..6 {
             held.staged_frames(&[&stage], times).expect("ticks");
-            // The first submission at each size carries the pipeline's first use with it.
             if round > 0 {
                 seen.push(held.on_device().unwrap_or_default().as_nanos());
             }

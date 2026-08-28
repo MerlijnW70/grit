@@ -1,51 +1,3 @@
-//! The sand drives the compaction, and the compaction drives the sand.
-//!
-//! Everything before this was two systems: a settle over the whole grid, and a compaction of a
-//! predicate that had nothing to do with it. This is the loop that makes them one.
-//!
-//! ```text
-//!   decay    the hot list   every wake counter, one closer to nothing
-//!   brush    a small box    what the pointer holds, and the quads it touched, woken
-//!   settle   the work list  one Margolus step over what moved last frame
-//!   hot ×5   tiles          which blocks hold anything, compacted into a list
-//!   mark     the hot list   the flags, scanned into buckets and counts
-//!   scan ×2                 the blocks against each other
-//!   gather   the hot list   the buckets, into one contiguous work list
-//!   prepare  1              how many workgroups the *next* settle runs
-//!   paint    every pixel    the cells the window is over, as colours
-//! ```
-//!
-//! [`wired`] is that table as code, and the one place the order is decided.
-//!
-//! # Waking, and why nine writes race with nothing
-//!
-//! A quad that changed must be looked at again, and so must its neighbours: material crosses a
-//! block boundary when the partition's origin shifts, so what moves in one quad this frame is in a
-//! different quad next frame. Each moving quad therefore writes a **two** for itself and its eight
-//! neighbours, and [`decay`] takes one off every frame — a two-frame window, for the reason that
-//! function gives.
-//!
-//! Nine invocations may write the same flag in the same submission and that is not a race, because
-//! **they all write the number one**. `Kernel::store_at` documents exactly this: identical writes to
-//! one address need no ordering. A flag that counted rather than marked would need an atomic; a flag
-//! that marks needs nothing.
-//!
-//! # Why one index space serves both phases
-//!
-//! The partition alternates between origin `(0,0)` and `(1,1)`, so a quad's four cells are not the
-//! same four on consecutive frames. A flag indexed by quad would therefore name the wrong cells half
-//! the time — except that the dilation already covers it: a phase-one quad `(x, y)` overlaps
-//! phase-zero quads `(x, y)` through `(x+1, y+1)`, and a phase-zero quad overlaps phase-one quads
-//! `(x-1, y-1)` through `(x, y)`. Both are inside the eight neighbours, so one index space and a
-//! dilation of one is enough for either.
-//!
-//! # What proves it
-//!
-//! `tests/live.rs` runs the same pour twice — once over the work list and once over the whole grid —
-//! and demands the two grids be **identical**, cell for cell, every frame. A quad that should have
-//! woken and did not is a grain that stops, and the full-grid run is a different algorithm rather
-//! than a second copy of the same mistake.
-
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 
@@ -53,34 +5,8 @@ use crate::compact::{Over, Tier, owned};
 use crate::layout::{AWAKE, BINDINGS, DENSE, GRAND, HOT, PARAMS, STATE};
 use crate::sand::{self, Grid};
 
-/// What [`wired`] hands back: one module a pass, and the workgroup counts grouped into stages.
-///
-/// The two are separate lists and have to stay in one order — `Resident` counts a pass index through
-/// the flattened stages — which is why [`wired`] builds them as pairs and splits them only on the
-/// way out.
 pub type Loop = (Vec<Vec<u32>>, Vec<Vec<crate::Groups>>);
 
-/// The frame number, one higher, on the device.
-///
-/// The one word the host never writes after the first frame — the partition's phase is its low bit,
-/// so a host that incremented it would be deciding the phase, and that is the device's business.
-///
-/// # One invocation, not a workgroup's worth
-///
-/// This is a read-modify-write on one word, and it used to be executed by every invocation of its
-/// single workgroup on the argument `Kernel::store_at` makes about identical writes. That argument
-/// covers a store of a constant and not a value that depends on when the read happened, which is
-/// exactly what `decisions/DR-0018` had to take out of [`decay`] — where the same shape cost a
-/// second decrement in one block of every hundred thousand.
-///
-/// `tests/counting.rs` measured this one and found no miscount: half a million dispatches on each of
-/// two cards, and sixteen thousand frames of the real loop under both arrangements. It is a workgroup
-/// of **one invocation** now anyway, which is the same pass with nothing left to race, and
-/// `decisions/DR-0020` prices that at nothing this machine can separate from its own drift.
-///
-/// # Errors
-///
-/// As [`settle`].
 pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, 1, BINDINGS))?;
     let slot = kernel.module().constant_u32(0)?;
@@ -93,100 +19,13 @@ pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     kernel.finish()
 }
 
-/// How many blocks it takes before the coarse hierarchy pays for what it costs to build.
-///
-/// # This is a measurement, not a rule
-///
-/// The hierarchy shortens `decay`, `mark` and `gather` from a workgroup a block to a workgroup a
-/// *listed* block, and building it is five passes that cost 6.2–6.7 µs of device clock at every
-/// size. Below this many blocks the three are short enough that the five are not worth running:
-/// at 256 blocks the arrangement costs 7.5 µs of 22, and at 4096 it saves 15 µs of 37.
-///
-/// `tests/coarse.rs` measures both arrangements either side of this number, and
-/// `decisions/DR-0003` carries the figures.
-///
-/// # It is a number about one card
-///
-/// The two devices in the machine this was written on disagree about it, and not by a little: on the
-/// Radeon the coarse list is the cheaper arrangement from 64 blocks up, where on the 4080 it is the
-/// dearer one until 2048. At the same 131 072 cells they give opposite answers, so nothing derived
-/// from the subgroup width or from the block-to-quad ratio explains it — the width names *which
-/// card* and not *why*. [`both`] and [`cheaper`] are what a caller uses instead of this when it does
-/// not know the device it is on; `decisions/DR-0019` carries the tables.
 pub const COARSE_FROM: u32 = 2048;
 
-/// Whether a plan of this many blocks is dispatched over the coarse list.
-///
-/// [`wired`] asks this; [`arranged`] is how a caller says otherwise.
 #[must_use]
 pub const fn coarse_pays(blocks: u32) -> bool {
     blocks >= COARSE_FROM
 }
 
-/// Every pass of the loop, and how many workgroups each runs, in the order they have to run in.
-///
-/// # Why this is a function and not a list in four callers
-///
-/// Because one of the orderings is a correctness property that a flat list does not show. The
-/// coarse hierarchy — the five passes that compact [`HOT`] into a list of the blocks with something
-/// in them — has to sit **after the settle and before the mark**:
-///
-/// * after, because `brush` and `settle` are what write [`HOT`], and a list built before them would
-///   miss every block woken this frame. Those blocks' quads would never reach the work list, and a
-///   grain would stop where the whole-grid run keeps falling — which is the failure `tests/live.rs`
-///   exists to catch;
-/// * before, because `mark` and `gather` are dispatched over that list and want this frame's.
-///
-/// [`decay`] reads the same list one frame later, which is sound for the reason that function
-/// gives: nothing writes [`HOT`] between the list being built and the next frame's decay.
-///
-/// Getting that wrong in one of four wirings and right in the other three is exactly the bug this
-/// repository writes tests against, so there is one wiring.
-///
-/// ```text
-///    0  tick             1            the frame number, and the partition's phase
-///    1  decay            hot list     every wake counter, one closer to nothing
-///    2  wipe             1            both tile totals and the tally, back to nothing
-///    3  wipe_counts      tiles        every block's count, back to nothing
-///    4  brush            a box        what the pointer holds, and the quads it touched
-///    5  settle           work list    one Margolus step over what the last frame woke
-///    6  hot_mark         tiles      ┐
-///    7  hot_scan_counts  hot_tiles  │ the coarse hierarchy: which blocks have
-///    8  hot_scan_totals  1          │ anything in them, compacted into a list
-///    9  hot_gather       tiles      │
-///   10  hot_prepare      1          ┘ and how many workgroups that list is worth
-///   11  mark             hot list     the counters, scanned into buckets and counts
-///   12  scan_counts      tiles        the blocks against each other
-///   13  scan_totals      1
-///   14  gather           hot list     the buckets into one contiguous list
-///   15  prepare          1            how many workgroups the *next* settle runs
-/// ```
-///
-/// # What comes back is stages, not passes
-///
-/// A barrier sits between stages and not inside one, and `tests/floor.rs` prices one at 981–1013 ns
-/// against 224–232 ns for a dispatch. At a size where no pass has any work to do, ten of them are
-/// most of the frame. So the second half of this function is a dependency argument: sixteen passes
-/// in eleven stages, or eleven in seven without the coarse hierarchy, and the comment beside them
-/// names every seam. [`crate::Resident::staged`] and [`crate::Resident::staged_frames`] are what
-/// take them.
-///
-/// The grouping was worth 60 µs to 44 when it went in, against a barrier that then cost about
-/// 3.8 µs — `Resident` named `DRAW_INDIRECT` in all ten of them at the time, and `DR-0002` is what
-/// that turned out to be worth.
-///
-/// # And why the picture is an argument rather than something a caller appends
-///
-/// Because `Resident` counts a pass index straight through the flattened stages, so the modules and
-/// the counts have to be in one order and not two. A caller appending [`sand::paint`] to the end of
-/// the module list and to the *middle* of the stage list — which is where it belongs, beside the
-/// coarse mark — would dispatch the wrong kernel over the wrong count, and nothing in either list
-/// would look wrong. So the two travel as pairs in here and are split apart only on the way out, and
-/// `picture` is how a caller says it wants one. `src/bin/scale.rs` passes `None`.
-///
-/// # Errors
-///
-/// As [`settle`], for whichever pass could not be built.
 pub fn wired(
     subgroup: u32,
     grid: Grid,
@@ -196,21 +35,6 @@ pub fn wired(
     arranged(subgroup, grid, plan, picture, coarse_pays(plan.blocks))
 }
 
-/// [`wired`], with the coarse hierarchy said out loud instead of decided by [`coarse_pays`].
-///
-/// # Why the choice is reachable at all
-///
-/// [`COARSE_FROM`] is a number taken on one card, and the only way to say whether it is the right
-/// one is to build both arrangements and time them. `tests/coarse.rs` does that, and it cannot if
-/// the choice is not reachable.
-///
-/// **The two compute the same simulation.** `false` dispatches `decay`, `mark` and `gather` over
-/// every block rather than over the coarse list, and leaves out the five passes that build that
-/// list. Nothing else moves, and `tests/live.rs` passes either way.
-///
-/// # Errors
-///
-/// As [`settle`], for whichever pass could not be built.
 pub fn arranged(
     subgroup: u32,
     grid: Grid,
@@ -222,9 +46,6 @@ pub fn arranged(
     use crate::layout::{HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_TOTALS};
     use crate::sweep::COUNTS;
 
-    // **Where the list comes from, and how many workgroups read it.** Over the coarse list, the
-    // count is a word the device wrote and Vulkan reads at dispatch time; over every block it is a
-    // number the host already knows. The three passes below take whichever pair this is.
     let (listed, hot) = if coarse {
         (Over::Listed(HOT_DENSE), crate::compact::Plan::hot_listed())
     } else {
@@ -233,20 +54,12 @@ pub fn arranged(
     let tiles = Groups::Fixed(plan.tiles);
     let one = Groups::Fixed(1);
 
-    // **A pass and how many workgroups it runs, together.** They used to be two lists that had to
-    // stay in the same order, and now that the order is *stages* rather than passes the two could
-    // disagree without looking wrong: `Resident` counts a pass index through the flattened stages,
-    // so a picture appended to the end of one list and the middle of the other would silently
-    // dispatch the wrong kernel over the wrong count. Pairing them makes that unsayable.
     let looking = {
         let mut stage = Vec::new();
         if coarse {
             stage.push((mark(subgroup, Tier::COARSE, Over::Every)?, tiles));
         }
         if let Some(view) = picture {
-            // **Beside the coarse mark where there is one, not on the end of the frame.** It reads
-            // the state the settle wrote and writes pixels nothing else touches, so it has no reason
-            // to wait behind the compaction — and it is the largest fixed dispatch in the loop.
             let over = u32::try_from(view.pixels())
                 .unwrap_or(u32::MAX)
                 .div_ceil(subgroup);
@@ -255,8 +68,6 @@ pub fn arranged(
         stage
     };
 
-    // **The five that build the coarse list, or nothing at all.** An empty stage is dropped where
-    // the pairs are flattened rather than recorded, so leaving these out costs no barrier either.
     let hot_scan_counts = if coarse {
         vec![(
             crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
@@ -279,9 +90,6 @@ pub fn arranged(
                 crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
                 tiles,
             ),
-            // **Divided by one**, because this list is dispatched a workgroup an entry rather than a
-            // workgroup a subgroup's worth. Dividing by the wrong one is a pass that silently covers
-            // part of the list.
             (
                 crate::compact::prepare(subgroup, 1, Tier::COARSE)?,
                 Groups::Counting(1),
@@ -341,8 +149,6 @@ pub fn arranged(
     let mut passes = Vec::new();
     let mut groups = Vec::with_capacity(stages.len());
     for stage in stages {
-        // **An empty stage is not a stage.** Recording one would put a barrier between two passes
-        // with nothing in between, and `tests/floor.rs` prices a barrier at about a microsecond.
         if stage.is_empty() {
             continue;
         }
@@ -357,24 +163,12 @@ pub fn arranged(
     Ok((passes, groups))
 }
 
-/// Both arrangements in one module list, and a stage list that runs each of them.
-///
-/// What [`both`] hands back, and what [`cheaper`] times.
 pub struct Both {
-    /// Every pass of both arrangements, the coarse one's first.
     pub passes: Vec<Vec<u32>>,
-    /// The stages that run the coarse arrangement and give the other nothing to do.
     pub listed: Vec<Vec<crate::Groups>>,
-    /// The stages that run the every-block arrangement and give the other nothing to do.
     pub every: Vec<Vec<crate::Groups>>,
 }
 
-/// Every count in a stage list turned off, so [`crate::Resident`] drops those passes whole.
-///
-/// A pass whose count is `Fixed(0)` is not recorded and a stage left with nothing in it is dropped,
-/// so the arrangement that is not running costs neither a dispatch nor a barrier. `Groups::From` is
-/// the one count the recorder cannot skip — its value is on the device — so it is replaced rather
-/// than zeroed, which is the same thing said in a way the recorder can see.
 fn silenced(stages: &[Vec<crate::Groups>]) -> Vec<Vec<crate::Groups>> {
     stages
         .iter()
@@ -382,35 +176,6 @@ fn silenced(stages: &[Vec<crate::Groups>]) -> Vec<Vec<crate::Groups>> {
         .collect()
 }
 
-/// Both arrangements over one set of buffers, so a caller can time them against each other.
-///
-/// # Why this is not [`wired`]
-///
-/// [`COARSE_FROM`] is a measurement of one card, and `tests/coarse.rs` is what found out that it
-/// does not travel: on the Radeon in this machine the coarse list is the cheaper arrangement from
-/// 64 blocks up, where on the 4080 it is the dearer one until 2048. No rule fixes that — at the same
-/// 131 072 cells the two cards give opposite answers, so the subgroup width names *which card* and
-/// not *why*. `decisions/DR-0019` carries the tables.
-///
-/// So the only thing that is not a guess is to ask the device, and this is what makes that
-/// affordable: one resident over both arrangements' passes rather than two residents and two copies
-/// of every buffer. At 4096 blocks on a sixty-four-lane part those buffers are the whole of what a
-/// frame owns.
-///
-/// # What it costs, measured
-///
-/// `tests/crossing.rs` pours 2000 frames both ways. Against [`wired`]'s constant, a calibration of
-/// twenty frames an arrangement was worth −135 to −139 ms of 740 on the Radeon at 1024 blocks and
-/// −58 to −59 of 410 at 512; it cost +2 to +8 ms at 64 and 128 blocks, where it picks the
-/// arrangement that is cheaper on the device and dearer on the wall, and +10 to +17 at 2048. On the
-/// 4080 it chose what the constant chose at every size and cost 0.9 to 7.8 ms of 37 to 120.
-///
-/// **So it is offered rather than taken.** A caller that knows its device keeps [`wired`]; one that
-/// does not can pay for the answer.
-///
-/// # Errors
-///
-/// As [`arranged`], for whichever pass of either arrangement could not be built.
 pub fn both(
     subgroup: u32,
     grid: Grid,
@@ -435,44 +200,13 @@ pub fn both(
     })
 }
 
-/// Which arrangement was cheaper here, and what saying so cost.
-///
-/// What [`cheaper`] hands back. The two durations are whatever clock `on_device` says they came
-/// from: the device's is per frame, the host's is for the whole budget. Either way they are the two
-/// numbers the choice was made on, so a caller can see how close it was.
 pub struct Cheaper {
-    /// Whether the coarse list was the cheaper of the two.
     pub coarse: bool,
-    /// What the coarse arrangement cost.
     pub listed: std::time::Duration,
-    /// What the every-block arrangement cost.
     pub every: std::time::Duration,
-    /// Whether the two came from the device's own clock rather than the host's.
     pub on_device: bool,
 }
 
-/// Pour `budget` frames of each arrangement and say which was cheaper.
-///
-/// The resident must already hold a seeded world — [`seed`] and the writes around it — because both
-/// arrangements are timed on it as it stands, one after the other, and the frames they run are
-/// frames of the simulation rather than extra ones.
-///
-/// **Both are warmed first.** A pipeline's first use is carried by the submission that makes it, and
-/// warming only the one timed first hands the other its own warm-up inside the window being
-/// measured. `tests/crossing.rs` was doing exactly that until it was measured and stopped.
-///
-/// # How few frames are enough
-///
-/// `tests/crossing.rs` asks the same question at 1, 5, 20, 60 and 300 frames, five rounds each. One
-/// frame named the wrong arrangement at 64 and 4096 blocks; five agreed with three hundred at every
-/// size on the Radeon; and near the 4080's own crossing at 2048 blocks, 5, 20 and 60 all split
-/// across rounds, which is what two arrangements within a few percent of each other look like.
-/// Twenty is what that measurement supports and it is one submission at the batch `tests/coarse.rs`
-/// uses.
-///
-/// # Errors
-///
-/// As [`crate::Resident::staged_frames`].
 pub fn cheaper(
     held: &mut crate::Resident<'_>,
     both: &Both,
@@ -492,8 +226,6 @@ pub fn cheaper(
     held.staged_frames(&every, budget)?;
     let (every_wall, every_card) = (clock.elapsed(), held.on_device());
 
-    // **One clock for both sides or neither.** A queue family that counts no timestamps hands back
-    // nothing, and a comparison of one card figure against one host figure is not a comparison.
     let (with, without, on_device) = match (listed_card, every_card) {
         (Some(with), Some(without)) => (with, without, true),
         _ => (listed_wall, every_wall, false),
@@ -506,16 +238,6 @@ pub fn cheaper(
     })
 }
 
-/// Seed every buffer the loop reads before it has written it, for the first frame.
-///
-/// **The first frame has been told nothing**, so "look at everything" has to be said out loud: every
-/// quad awake, every block hot, and both lists the identity. Without the coarse half of this the
-/// first `decay` is dispatched over a list of nothing, no block is ever marked, and the world sits
-/// perfectly still — which looks exactly like a simulation that does not work.
-///
-/// # Errors
-///
-/// As [`crate::Resident::write`].
 pub fn seed(
     held: &mut crate::Resident<'_>,
     grid: Grid,
@@ -535,42 +257,6 @@ pub fn seed(
     held.write(HOT_INDIRECT as usize, &[plan.blocks, 1, 1])
 }
 
-/// Every wake counter, one closer to nothing.
-///
-/// # Two, and why one is not enough
-///
-/// A quad that moves is set to two, and this takes one off every frame. That is a **two-frame**
-/// window rather than one, and the second frame is the one that makes it sound.
-///
-/// The partition's origin alternates, so a quad has two different neighbourhoods on consecutive
-/// frames. A grain that has just landed on the bottom row of its quad has nowhere to go *this*
-/// phase — the cells below it are not in this quad — and somewhere to go the next. Waking only what
-/// moved would drop it from the list in between, and it would hang there forever with nothing
-/// nearby moving to wake it.
-///
-/// Two frames covers both phases with the same contents. If it is still static after that it cannot
-/// move at all until something near it does, and that something will set it to two again.
-///
-/// The step down is `max(v, 1) − 1`, because there is no signed compare on the lane API and a
-/// counter that wrapped past nothing would be awake for four billion frames.
-///
-/// One invocation a quad, its own slot, so nothing races. The dump past the counters is left alone —
-/// nothing reads it, so nothing has to clear it.
-///
-/// # Why the list this runs over is the *previous* frame's
-///
-/// [`Over::Listed`] hands this a list of the blocks with something in them, and it is built after
-/// the settle — which is after this pass has already run. That is not a mistake and not a
-/// compromise: between the moment the list is built and the moment this reads it, the only thing
-/// that runs is the frame counter. **Nothing writes [`HOT`] in between**, so a list one frame old
-/// is the current set exactly.
-///
-/// A block that is not in it holds nought, and `max(0, 1) − 1` is nought, so the pass that was
-/// skipped was the pass that would have changed nothing.
-///
-/// # Errors
-///
-/// As [`sand::settle`].
 pub fn decay(subgroup: u32, over: Over) -> Result<Vec<u32>, LaneError> {
     match subgroup {
         4 => decayed::<4>(subgroup, over),
@@ -585,16 +271,12 @@ pub fn decay(subgroup: u32, over: Over) -> Result<Vec<u32>, LaneError> {
     }
 }
 
-/// The decay, at a width the caller has matched to the device.
 fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
 
-    // **A workgroup a block, not a lane a quad**, and which block comes from the hot-block list
-    // rather than from the workgroup's own number. The block is the same one `mark` sweeps, which
-    // is what keeps the two in step.
     let block = owned(&mut kernel, over)?;
     let lane = kernel.local_index();
     let span = kernel.module().constant_u32(sweep::cells(subgroup))?;
@@ -613,9 +295,6 @@ fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, Lane
         Ok::<_, LaneError>(lanes.add(floored, back)?.id())
     };
 
-    // **No gate any more.** Every block this is dispatched over is one the list said had something
-    // in it, so the vote that used to stand here would pass every time. The saving moved from
-    // skipping the body to not being dispatched at all.
     let mut highest = kernel.module().constant_u32(0)?;
     for offset in 0..PER_LANE {
         let along = kernel.module().constant_u32(offset)?;
@@ -631,27 +310,6 @@ fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, Lane
         };
     }
 
-    // **And the block's flag, which is the highest counter in the block and not a countdown of its
-    // own.** The two are the same number by construction: [`wake`] writes the same two to a quad's
-    // counter and to its block's flag in one invocation, and nothing else raises either, so a flag
-    // has always been exactly the largest counter under it. Saying so is what makes this safe.
-    //
-    // It used to be read here, stepped, and written back — by *every* lane of the workgroup, at one
-    // address, on the argument [`crate::layout::HOT`] makes about identical writes. That argument
-    // holds for a store of a constant and not for a read-modify-write, whose value depends on when
-    // the read happened. `tests/wander.rs` prices what that was worth: one `decay` over a list
-    // naming each of 1024 blocks once, four hundred times, and between nought and six of the
-    // 204 800 blocks came back a second decrement lower than the counters they stand for — a flag
-    // reading nought over quads that were still awake, and therefore a block that leaves the coarse
-    // list and is never dispatched for again. `decisions/DR-0018` has the rest.
-    //
-    // A reduction and a store of the same value from every lane is what [`tally`] already does, and
-    // it reads nothing, so there is nothing for a second read to disagree with.
-    // **`LANES` wide, not one.** A one-wide vector on a sixty-four-lane device maps to clusters of
-    // one, and a clustered reduction over a cluster of one is the value it was given — every lane
-    // would keep its own highest counter and the flag would be whichever lane's store landed last.
-    // Which looks right whenever the highest counter happens to sit in the last lane, and was wrong
-    // in `tests/wander.rs` in 128 runs of 128 the moment it did not.
     let flag = {
         let mut lanes = kernel.lanes()?;
         let mine = lanes.splat_id::<U32, LANES>(highest)?;
@@ -661,20 +319,6 @@ fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, Lane
     kernel.finish()
 }
 
-/// The tile totals, back to nothing.
-///
-/// **The in-place scan leaves its answer where the next frame's input goes.** `scan_totals` reads
-/// `TOTALS` and writes its exclusive prefix back over it, and the frame after that `scan_counts`
-/// writes only the `tiles` entries it has — so the rest still hold last frame's prefix, and the
-/// reduction adds them all again. It compounds: the grand total reached three billion by frame
-/// sixty-one, the workgroup count with it, and the settle ran over a list that was not there.
-///
-/// One workgroup, because there are never more than `per_block` tiles — `Plan::over` refuses a
-/// third level rather than pretend otherwise.
-///
-/// # Errors
-///
-/// As [`settle`].
 pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     use crate::layout::{HOT_TOTALS, TALLY, TALLY_WORDS, TOTALS};
     use crate::sweep::PER_LANE;
@@ -686,9 +330,6 @@ pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mine = kernel.module().i_mul(uint, lane, run)?;
     let nothing = kernel.module().constant_u32(0)?;
 
-    // **Both hierarchies' tile totals**, because both are scanned in place and both would otherwise
-    // carry last frame's prefix into this frame's reduction. The coarse one is the same array with
-    // one entry where the fine one has a tile, and it goes wrong in exactly the same way.
     for step in 0..PER_LANE {
         let along = kernel.module().constant_u32(step)?;
         let at = kernel.module().i_add(uint, mine, along)?;
@@ -696,11 +337,6 @@ pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
         kernel.store_at(HOT_TOTALS, at, nothing)?;
     }
 
-    // **The tally is accumulated with atomics, so it has to start at nothing every frame** — for
-    // exactly the reason the tile totals do, and found the same way: a sum that is never cleared is
-    // a sum of the whole run, and it looks perfectly plausible until you notice it only goes up.
-    // Written by every lane rather than one, because they all write the same nought to the same
-    // slot and a uniform store is cheaper than deciding which lane may do it.
     for word in 0..TALLY_WORDS {
         let at = kernel
             .module()
@@ -710,27 +346,6 @@ pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     kernel.finish()
 }
 
-/// Every block's count, back to nothing.
-///
-/// # The pass the hot-block list made necessary
-///
-/// [`mark`] used to write `counts[block] = 0` before its gate, so a block it skipped said *nothing*
-/// rather than last frame's *something*. That worked because it was dispatched for every block
-/// whether it was hot or not. Dispatched over the hot list instead, a cold block is not visited at
-/// all — and nobody writes its count.
-///
-/// Which matters because `scan_counts` reads **every** block: it is a prefix, and a prefix has to
-/// see the zeros. One stale count inflates every base after it and the grand total with them, and
-/// the settle then runs over a list whose tail is whatever the buckets happened to hold. That is
-/// the same failure `wipe` exists for, arriving by a different road.
-///
-/// One workgroup a tile, [`PER_LANE`](crate::sweep::PER_LANE) stores a lane, over the padded array
-/// — sixty-four workgroups at sixteen million cells, against the forty-nine thousand this whole
-/// change is about.
-///
-/// # Errors
-///
-/// As [`settle`].
 pub fn wipe_counts(subgroup: u32, counts: u32) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
@@ -754,15 +369,6 @@ pub fn wipe_counts(subgroup: u32, counts: u32) -> Result<Vec<u32>, LaneError> {
     kernel.finish()
 }
 
-/// One Margolus step over the quads the work list names, waking what moved.
-///
-/// The same rule as [`sand::settle`] — the four ordered swaps — over a different set of quads and
-/// with the wake writes on the end. Kept apart from that one rather than folded into it, because
-/// `tests/live.rs` runs both and compares, and a shared body would agree with itself.
-///
-/// # Errors
-///
-/// As [`sand::settle`].
 pub fn settle(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
     match subgroup {
         4 => listed::<4>(subgroup, grid),
@@ -777,7 +383,6 @@ pub fn settle(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
     }
 }
 
-/// The listed settle, at a width the caller has matched to the device.
 fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -794,11 +399,6 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
     let second = kernel.module().constant_u32(1)?;
     let dump_base = kernel.load_at(PARAMS, second)?;
 
-    // **The last workgroup reads past the end of the list**, because a workgroup count is a ceiling,
-    // and what it reads there is a stale entry the gather did not overwrite. That quad is *not*
-    // harmless to step: it may be one another invocation is legitimately stepping this frame, and
-    // then the same four cells are written twice with different answers. Both its state writes and
-    // its wake writes are therefore sent to a dump instead.
     let inside = {
         let mut lanes = kernel.lanes()?;
         let here = lanes.splat_id::<U32, LANES>(slot)?;
@@ -809,8 +409,6 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
         lanes.select(listed, one, none)?
     };
 
-    // Which quad, and where its four cells are. A slot past the end names whatever is there, and
-    // `low_bits` keeps it inside the grid however wild it is.
     let quad = kernel.load_at(DENSE, slot)?;
     let (places, column, row) = corners::<LANES>(&mut kernel, grid, quad, frame)?;
 
@@ -828,9 +426,6 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
         let c = lanes.splat_id::<U32, LANES>(held[2])?;
         let d = lanes.splat_id::<U32, LANES>(held[3])?;
 
-        // **The same seven rules as `sand::settle`, in the same order**, because the whole claim of
-        // `tests/live.rs` is that the two runs differ only in *which* quads are stepped. A rule that
-        // lived in one of them and not the other would make the comparison meaningless.
         let a = sand::hold::<LANES>(&mut lanes, a, c)?;
         let b = sand::hold::<LANES>(&mut lanes, b, d)?;
         let [sa, sb, sc, sd] = sand::start::<LANES>(&mut lanes, [a, b, c, d])?;
@@ -842,16 +437,6 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
         let (na, nd) = sand::fall::<LANES>(&mut lanes, na, nd)?;
         let (nb, nc) = sand::fall::<LANES>(&mut lanes, nb, nc)?;
 
-        // **Does it hold anything that can move**, not *did anything move*. Those are different
-        // questions and the second one is wrong: the partition's origin shifts every frame, so a
-        // quad with nowhere to go this frame can have somewhere next frame with the same contents.
-        // Waking on movement lets a falling stream outrun its own wake front, which is what
-        // `tests/live.rs` found at frame 75 — a grain present in the whole-grid run and missing
-        // from the listed one.
-        //
-        // Content is sufficient and provable: a move needs sand, a move happens inside one quad,
-        // and next phase that sand lies inside a quad within one of this one. Four comparisons
-        // summed, because a `Predicate` is not a value this API combines.
         let mut count = lanes.splat_bits::<U32, LANES>(0)?;
         for (before, after) in [(a, na), (b, nb), (c, nc), (d, nd)] {
             let one = lanes.splat_bits::<U32, LANES>(1)?;
@@ -861,8 +446,6 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
             count = lanes.add(count, differs)?;
         }
 
-        // What this quad holds, for the tally. Counted after the step rather than before, so the
-        // numbers describe the world the viewer is about to be shown.
         let mut wet = lanes.splat_bits::<U32, LANES>(0)?;
         let mut dry = lanes.splat_bits::<U32, LANES>(0)?;
         for cell in [na, nb, nc, nd] {
@@ -881,8 +464,6 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
         ([na, nb, nc, nd], [count, wet, dry])
     };
 
-    // Where a slot past the end of the list puts its four cells: past the grid, four to an
-    // invocation, and never read.
     let spare = {
         let mut lanes = kernel.lanes()?;
         let past =
@@ -927,39 +508,13 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
     kernel.finish()
 }
 
-/// What [`tally`] needs, gathered so the call is not eight arguments long.
 struct Tallying<const LANES: u32> {
-    /// Cells changed, water cells and sand cells, per quad.
     counted: [Vector<U32, LANES>; 3],
-    /// The quad's own column and row.
     column: Vector<U32, LANES>,
-    /// The quad's row.
     row: Vector<U32, LANES>,
-    /// One where this slot is a real list entry, nought where it is past the end.
     inside: Vector<U32, LANES>,
 }
 
-/// Add this workgroup's share of the frame's numbers into [`TALLY`].
-///
-/// # The one reduction in a crate about scans
-///
-/// Every other pass here compacts: it wants to know *which* quads, in what order, and a prefix sum
-/// is the only thing that answers that. This wants the opposite — not which, but how many, and one
-/// answer for the whole device. That is [`simdr::lanes::Lanes::reduce_sum`], which folds the strips
-/// inside a lane and then the lanes across the subgroup, and hands the same total back to every one
-/// of them.
-///
-/// # And why the total is then multiplied by nought in all but one lane
-///
-/// Because every lane holds it, and every lane is about to execute the atomic. An add is not
-/// idempotent, so `width` lanes adding the same total would count the workgroup `width` times.
-/// `decisions/DR-0003` refuses the branch that would let only one lane run the instruction, so the
-/// instruction runs everywhere and the *value* is what carries the decision: the total in the first
-/// lane, nought in the rest. Adding nought is free and lands nowhere.
-///
-/// The cost is one subgroup reduction and one atomic a workgroup for each of six numbers, on data
-/// that was already in registers because the settle had just computed it. **The telemetry is not a
-/// pass.**
 fn tally<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     what: Tallying<LANES>,
@@ -983,19 +538,16 @@ fn tally<const LANES: u32>(
         let keep =
             |lanes: &mut Lanes<'_>, value: Vector<U32, LANES>| lanes.select(listed, value, none);
 
-        // A slot past the end of the list stepped a spare quad, and its numbers are not the world's.
         let moved = keep(&mut lanes, moved)?;
         let wet = keep(&mut lanes, wet)?;
         let dry = keep(&mut lanes, dry)?;
 
-        // Coarse, because the sum has to fit in a word — see `layout::COARSE`.
         let by = lanes.splat_bits::<U32, LANES>(COARSE)?;
         let across = lanes.shift_right_logical(column, by)?;
         let down = lanes.shift_right_logical(row, by)?;
         let across = lanes.mul(across, moved)?;
         let down = lanes.mul(down, moved)?;
 
-        // And whether the quad moved at all, which is what the two sums are averaged over.
         let stirred = lanes.greater_than(moved, none)?;
         let stirred = lanes.select(stirred, one, none)?;
 
@@ -1018,23 +570,17 @@ fn tally<const LANES: u32>(
         let at = kernel
             .module()
             .constant_u32(u32::try_from(word).unwrap_or(0))?;
-        // The slot's old value is what makes this instruction an allocator elsewhere. Here it
-        // is a counter and nobody wants the answer.
         let _ = kernel.atomic_add_at(TALLY, at, mine.id())?;
     }
     Ok(())
 }
 
-/// Where a quad's four cells are, and which quad it was.
 type Corners<const LANES: u32> = (
     [Vector<U32, LANES>; 4],
     Vector<U32, LANES>,
     Vector<U32, LANES>,
 );
 
-/// The four cell addresses of a quad, at this frame's partition origin.
-///
-/// Also hands back the quad's own column and row, which the wake writes need.
 fn corners<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     grid: Grid,
@@ -1067,22 +613,13 @@ fn corners<const LANES: u32>(
     Ok((places, along, down))
 }
 
-/// Which quad is doing the waking, and on what device.
 pub(crate) struct Waking<const LANES: u32> {
-    /// The subgroup's width, which is also the workgroup's.
     pub subgroup: u32,
-    /// How big the world is.
     pub grid: Grid,
-    /// The quad's column and row.
     pub column: Vector<U32, LANES>,
     pub row: Vector<U32, LANES>,
 }
 
-/// Mark this quad and its eight neighbours, if `holding` is anything and this slot was in the list.
-///
-/// Nine unconditional writes of the number one. Where the quad holds nothing, or the slot was past
-/// the end of the list, every one of them goes to this invocation's dump slot instead — and they all
-/// go to the *same* one, so it is a cache line touched once rather than nine words moved.
 pub(crate) fn wake<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     where_at: Waking<LANES>,
@@ -1107,7 +644,6 @@ pub(crate) fn wake<const LANES: u32>(
                 let none = lanes.splat_bits::<U32, LANES>(0)?;
                 let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
 
-                // The neighbour, wrapped into the quad grid the way the cells wrap into theirs.
                 let along = lanes.splat_bits::<U32, LANES>(across)?;
                 let below = lanes.splat_bits::<U32, LANES>(down)?;
                 let back = lanes.mul(one, minus)?;
@@ -1123,11 +659,9 @@ pub(crate) fn wake<const LANES: u32>(
                 let stride = lanes.shift_left(y, by)?;
                 let flag = lanes.add(stride, x)?;
 
-                // Where this invocation's discarded writes go.
                 let base = lanes.splat_id::<U32, LANES>(dump_base)?;
                 let mine = lanes.splat_id::<U32, LANES>(group)?;
                 let seat = lanes.splat_id::<U32, LANES>(lane)?;
-                // The workgroup's own width, not the quad grid's — this is an invocation index.
                 let width = lanes.splat_bits::<U32, LANES>(subgroup)?;
                 let spread = lanes.mul(mine, width)?;
                 let elsewhere = lanes.add(base, spread)?;
@@ -1137,23 +671,14 @@ pub(crate) fn wake<const LANES: u32>(
                 let waking = lanes.greater_than(both, none)?;
                 lanes.select(waking, flag, elsewhere)?
             };
-            // Two, not one — see `clear`. One frame is a window that closes on the phase where the
-            // move it was waiting for becomes available.
             let mark = kernel.module().constant_u32(2)?;
             kernel.store_at(AWAKE, slot.id(), mark)?;
 
-            // **And the block that quad is in**, with the same number and by the same rule, so the
-            // coarse flag can never be colder than the fine one it stands for. A quad index divided
-            // by a block's worth of quads, which is a shift because both are powers of two.
             let coarse = {
                 let mut lanes = kernel.lanes()?;
                 let none = lanes.splat_bits::<U32, LANES>(0)?;
                 let per_block = crate::sweep::cells(subgroup);
                 let by = lanes.splat_bits::<U32, LANES>(per_block.trailing_zeros())?;
-                // **Past the padding, not past the last block.** The coarse sweep reads whole
-                // tiles, so `HOT` is rounded up to `tiles × per_block` — and a dump slot inside
-                // that would be a hot block no quad ever woke, listed every frame for ever.
-                // `compact::Plan::cold` is the same number, arrived at from the other side.
                 let blocks = grid.quads().div_ceil(per_block);
                 let cold =
                     lanes.splat_bits::<U32, LANES>(blocks.div_ceil(per_block) * per_block)?;
@@ -1169,23 +694,6 @@ pub(crate) fn wake<const LANES: u32>(
     Ok(())
 }
 
-/// The wake flags, scanned into buckets and counts — the compaction's first tier.
-///
-/// [`crate::sweep`] without the simulation in front of it: the predicate is already in the tier's
-/// flags, so this reads it, scans it in three tiers, and writes the indices that survive.
-/// Everything after it — the two scans, the gather, the count — is `crate::compact` unchanged.
-///
-/// # One kernel, both hierarchies
-///
-/// Over [`Tier::FINE`] the flags are one word a quad and this writes the quad indices the settle
-/// will step. Over [`Tier::COARSE`] they are one word a *block* and it writes the block indices
-/// this pass will itself be dispatched over next frame. Nothing in the body knows which — a
-/// countdown above nought is a live entry either way, and the index it writes is the index it read
-/// at.
-///
-/// # Errors
-///
-/// As [`settle`].
 pub fn mark(subgroup: u32, tier: Tier, over: Over) -> Result<Vec<u32>, LaneError> {
     match subgroup {
         4 => marked::<4>(subgroup, tier, over),
@@ -1200,7 +708,6 @@ pub fn mark(subgroup: u32, tier: Tier, over: Over) -> Result<Vec<u32>, LaneError
     }
 }
 
-/// The mark, at a width the caller has matched to the device.
 fn marked<const LANES: u32>(subgroup: u32, tier: Tier, over: Over) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
@@ -1221,13 +728,6 @@ fn marked<const LANES: u32>(subgroup: u32, tier: Tier, over: Over) -> Result<Vec
     let dump_start = kernel.module().i_add(uint, region, past)?;
     let dump_mine = kernel.module().i_add(uint, dump_start, lane)?;
 
-    // Blocked, not striped: the two scan tiers add up to a prefix only when (lane, then step) is
-    // index order. `tests/compact.rs` found that out the hard way.
-    //
-    // **The gate is gone and so is the zeroing that stood in front of it.** Every block this is
-    // dispatched over is one the hot list named, so the vote would pass every time — and the zero
-    // that used to be written here for a skipped block is now [`wipe_counts`]'s job, because a
-    // block this never visits is a block this cannot write anything for.
     swept::<LANES>(
         &mut kernel,
         Sweeping {
@@ -1241,21 +741,14 @@ fn marked<const LANES: u32>(subgroup: u32, tier: Tier, over: Over) -> Result<Vec
     kernel.finish()
 }
 
-/// Where one workgroup's sweep reads and writes, gathered so the call is not five arguments long.
 struct Sweeping {
-    /// The first quad this lane owns.
     mine: simdr::module::Id,
-    /// Where this block's bucket begins.
     region: simdr::module::Id,
-    /// Where this lane's discarded bucket writes go.
     dump_mine: simdr::module::Id,
-    /// Which block this is.
     block: simdr::module::Id,
-    /// Which hierarchy's flags are being read and whose buckets are being written.
     tier: Tier,
 }
 
-/// The sweep itself, over the blocks the caller was dispatched for.
 fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Result<(), LaneError> {
     use crate::sweep::PER_LANE;
 
@@ -1282,8 +775,6 @@ fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Resu
         let mut lanes = kernel.lanes()?;
         let mut running = lanes.splat_bits::<U32, LANES>(0)?;
         for &flag in &flags {
-            // **One or nothing, not the countdown itself.** A scan of the counters would give
-            // offsets two apart and a bucket full of holes.
             let held = lanes.splat_id::<U32, LANES>(flag)?;
             let none = lanes.splat_bits::<U32, LANES>(0)?;
             let one = lanes.splat_bits::<U32, LANES>(1)?;
@@ -1312,7 +803,6 @@ fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Resu
             let here = lanes.splat_id::<U32, LANES>(region)?;
             let elsewhere = lanes.splat_id::<U32, LANES>(dump_mine)?;
             let none = lanes.splat_bits::<U32, LANES>(0)?;
-            // The counter is a countdown, so anything above nothing is awake.
             let awake = lanes.splat_id::<U32, LANES>(*flag)?;
 
             let within = lanes.add(before, earlier)?;

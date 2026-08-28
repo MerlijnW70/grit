@@ -1,21 +1,3 @@
-//! Falling sand, held to the host and to physics.
-//!
-//! # Three things a wrong sand simulation still looks like
-//!
-//! It looks like sand. Grains move down, piles form, and the picture is entirely convincing while
-//! the rule is wrong — so the checks here are the ones a convincing picture cannot satisfy:
-//!
-//! * **Conservation.** Not one grain appears or disappears, over a hundred steps. A Margolus
-//!   partition gives that by construction, so a count that drifts means the partition is not what
-//!   the kernel thinks it is — two invocations writing the same cell, which is the one failure this
-//!   whole arrangement exists to make impossible.
-//! * **The host, step for step.** Every cell, every frame, bit for bit. The rule is four ordered
-//!   swaps and a reference that applied them in another order would agree about a heap and disagree
-//!   about a grain.
-//! * **That it actually falls.** A rule that did nothing would conserve perfectly and match a
-//!   reference that also did nothing.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::layout::{LOOKING, PARAMS, PIXELS, STATE};
@@ -25,14 +7,11 @@ use grit::sand::{
 use grit::sand::{BINDINGS, WEIGHTS};
 use grit::{Groups, Host};
 
-/// The world under test.
 const WIDE: u32 = 512;
 const DEEP: u32 = 256;
 
-/// How many steps the check runs.
 const STEPS: u32 = 100;
 
-/// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -47,7 +26,6 @@ fn device(label: &str) -> Option<Host> {
     }
 }
 
-/// A grid worth stepping: a floor, a wall down one side, and a slab of sand up top.
 fn poured(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
     for row in 0..grid.deep {
@@ -69,12 +47,10 @@ fn poured(grid: Grid) -> Vec<u32> {
     cells
 }
 
-/// How many grains there are.
 fn grains(cells: &[u32]) -> usize {
     cells.iter().filter(|&&cell| cell == SAND).count()
 }
 
-/// How far down the lowest grain has reached.
 fn lowest(grid: Grid, cells: &[u32]) -> u32 {
     (0..grid.deep)
         .rev()
@@ -102,7 +78,6 @@ fn the_sand_falls_where_the_host_says_and_no_grain_is_lost() {
     let tick = grit::sand::settle(width, grid).expect("settle");
     let bump = frame_counter(width).expect("counter");
 
-    // The frame counter first, so the phase the settle reads is this step's rather than the last.
     let modules: Vec<&[u32]> = vec![&bump, &tick];
     let cells = grid.cells();
     let mut sizes = [1_usize; BINDINGS as usize];
@@ -165,7 +140,6 @@ fn the_sand_falls_where_the_host_says_and_no_grain_is_lost() {
     );
 }
 
-/// What each material comes out as, in the order `paint` asks its three questions.
 fn colour(material: u32) -> u32 {
     match material {
         WATER => 0x0024_6FA8,
@@ -175,7 +149,6 @@ fn colour(material: u32) -> u32 {
     }
 }
 
-/// A floor, two sides, and a column of `material` standing above the middle of it.
 fn column(grid: Grid, material: u32) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
     let left = grid.wide / 2 - COLUMN / 2;
@@ -195,7 +168,6 @@ fn column(grid: Grid, material: u32) -> Vec<u32> {
     cells
 }
 
-/// How many columns hold at least one cell of `material`.
 fn reach(grid: Grid, cells: &[u32], material: u32) -> u32 {
     (0..grid.wide)
         .filter(|&at| {
@@ -210,8 +182,6 @@ fn reach(grid: Grid, cells: &[u32], material: u32) -> u32 {
         .unwrap_or(0)
 }
 
-/// Step a world on the device for `steps` frames, checking the host every one, and hand back the
-/// last two states so the caller can ask whether anything is still moving.
 fn run(host: &Host, grid: Grid, start: &[u32], steps: u32, label: &str) -> (Vec<u32>, Vec<u32>) {
     let width = host.width();
     let tick = sand::settle(width, grid).expect("settle");
@@ -257,18 +227,14 @@ fn run(host: &Host, grid: Grid, start: &[u32], steps: u32, label: &str) -> (Vec<
     (before, ran)
 }
 
-/// How wide the column of material starts, and how tall.
 const COLUMN: u32 = 8;
 const TALL: u32 = 16;
 
-/// The basin both materials are dropped into.
 const BASIN: u32 = 64;
 const HIGH: u32 = 32;
 
-/// How long each is given to find its shape.
 const SETTLING: u32 = 400;
 
-/// How deep the water lies in each column.
 fn depths(grid: Grid, cells: &[u32], material: u32) -> Vec<u32> {
     (0..grid.wide)
         .map(|at| {
@@ -322,7 +288,6 @@ fn water_goes_flat_where_sand_heaps_up() {
     );
     println!("  water lies {shallowest} to {deepest} deep, and {moving} cells are still moving");
 
-    // Conserved, both of them. A rule that leaked would spread beautifully and mean nothing.
     assert_eq!(
         heaped.iter().filter(|&&w| material_of(w) == SAND).count() as u32,
         poured,
@@ -334,9 +299,6 @@ fn water_goes_flat_where_sand_heaps_up() {
         "water was created or lost"
     );
 
-    // **The claim of the pass.** Sand has an angle of repose and stops at a heap a little wider than
-    // the column it came from; water has none and reaches the walls. Same rule, same block, same
-    // four falls — what differs is one number and one extra read.
     assert!(
         water_wide > sand_wide * 2,
         "water reached {water_wide} columns and sand {sand_wide} — the fluid is behaving like a solid"
@@ -350,19 +312,8 @@ fn water_goes_flat_where_sand_heaps_up() {
         "the water lies {shallowest} deep in one place and {deepest} in another, which is not level"
     );
 
-    // **And that it stops, which it used not to.** A hundred and twenty-eight cells do not divide
-    // into sixty-two columns, so four of them have no level place to be — and they used to pace back
-    // and forth for ever, because a rule reading one 2×2 block cannot tell them from water that
-    // ought to flow. What it can read is its own past, and `sand::TIRED` is three bits of it: at
-    // `sand::PATIENCE` a cell stops asking for a direction. This bound was `moving * 16 < poured`
-    // and is now nought.
     assert_eq!(moving, 0, "{moving} of {poured} cells are still running");
 
-    // The same claim without the loophole. No direction is a snapshot: a cell may be about to be
-    // given one on the very next frame, and counting words would not see it. So step the settled
-    // grid again on the host — **in both phases**, because the partition's origin alternates and a
-    // cell with nowhere to go this frame may have somewhere the next — and demand it come back
-    // unchanged. Nothing that cannot move is the whole of what "the work list reaches nought" means.
     for phase in 0..2 {
         let again = sand::settle_reference(grid, phase, &settled);
         let differs = again
@@ -396,8 +347,6 @@ fn the_window_shows_the_cells_it_is_pointed_at() {
     sizes[PIXELS as usize] = pixels;
     let mut resident = host.resident(&sizes, &modules).expect("allocated");
 
-    // Something with no symmetry, so a window at the wrong corner cannot look right by accident —
-    // and running water among it, because a runner has to come out the same blue a still cell does.
     let world: Vec<u32> = (0..cells)
         .map(|at| match (at * 7 + at / 13) % 6 {
             0 | 3 => SAND,
@@ -414,8 +363,6 @@ fn the_window_shows_the_cells_it_is_pointed_at() {
         u32::try_from(pixels).unwrap_or(u32::MAX).div_ceil(width),
     )];
 
-    // The last two wrap: a window is allowed to hang off the right edge and off the bottom, because
-    // the grid is a torus and every other address in this crate already relies on it.
     for corner in [(0, 0), (17, 9), (grid.wide - 3, 6), (30, grid.deep - 5)] {
         resident
             .write_at(PARAMS as usize, LOOKING, &[corner.0, corner.1])
@@ -443,16 +390,12 @@ fn the_window_shows_the_cells_it_is_pointed_at() {
         grid.wide, grid.deep, view.wide, view.deep
     );
 
-    // **The window is smaller than the world, which is the whole point of the pass.** A viewport
-    // that painted everything would pass every check above and still cost the readback it exists
-    // to avoid.
     assert!(
         pixels < cells,
         "the window holds the whole grid, so nothing was saved by looking through it"
     );
 }
 
-/// One word, incremented on the device — the same trick `src/bin/spike.rs` uses.
 fn frame_counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
     use simdr::kernel::{Kernel, Shape};
     use simdr::lanes::U32;
@@ -468,18 +411,6 @@ fn frame_counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
     kernel.finish()
 }
 
-/// [`WEIGHTS`] is in weight order, which is the whole of why `fall` is one comparison.
-///
-/// # What was wrong with it before
-///
-/// Nothing read it. It was a `pub const` two doc comments pointed at to explain why the rule works
-/// — "a material's properties have to *be* its number" — and the property it asserts was checked by
-/// no line of code anywhere. Renumbering `WATER` above `SAND` would have left every doc in
-/// `src/sand.rs` describing an ordering the constants no longer had, and the simulation would have
-/// gone on running with water sinking through sand.
-///
-/// So the array is load-bearing now: it holds every material this crate has, and it holds them
-/// heaviest last.
 #[test]
 fn the_materials_are_in_the_order_the_rule_needs() {
     assert_eq!(

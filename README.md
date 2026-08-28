@@ -1,153 +1,141 @@
 # grit
 
-**Sixteen million cells of falling sand and water, stepped in 22 µs on the card.**
+Sparse-grid stream compaction on Vulkan compute. Built on `simdr` (SPIR-V emitter, path dependency).
 
-A frame touches about seven hundred of the world's four million quads, and the host never learns how
-many — the device writes the count into a buffer and Vulkan reads it at dispatch time. That is what
-this repository is: a sparse-grid stream compaction engine, built on
-[`simdr`](../simdr), with a sand simulation on top of it to prove the claim.
+## Commands
 
-```text
-       cells      quads        on card           wall     stepped    of grid
-      262 144     65 536  14.3 - 14.4 µs  16.9 - 17.9 µs      768        85×
-    1 048 576    262 144  19.1 - 19.4 µs  21.9 - 23.1 µs      768       341×
-    4 194 304  1 048 576  22.3 - 22.4 µs  25.4 - 27.4 µs      768      1365×
-   16 777 216  4 194 304  22.4 - 22.6 µs  26.9 - 29.4 µs      768      5461×
+```sh
+cargo build --release
+cargo test                       # whole suite, default device
+cargo test --test <name>         # one file
+cargo clippy --all-targets
+cargo fmt
+
+GRIT_DEVICE=AMD cargo test       # select device by name substring
+
+cargo run --release --bin scale      # frame cost against world size
+cargo run --release --bin loop_cost  # per-stage device time
+cargo run --release --bin pour       # windowed, needs default feature `window`
+cargo run --release --bin spike      # windowed, needs default feature `window`
 ```
 
-**Four times the world, and the frame does not grow**: 22.3–22.4 µs at 4 194 304 cells against
-22.4–22.6 at 16 777 216, over eighteen runs. Below four million it gets *smaller* rather than flat,
-because the machinery that keeps it flat costs more than it saves there and `live::wired` leaves it
-out.
+Features: `window` (default) pulls in `minifb`; `default-features = false` drops it.
 
-`on card` is the device's own clock — two timestamps around the recorded work; `wall` is what a
-caller waits, which adds a submission and a fence. The last column is the ratio between what was
-stepped and what exists, and it is the number this repository was written to print.
-
----
-
-## Run it
-
-```text
-cargo run --release --bin pour       # the demo: 4096×4096, seen through a window
-cargo run --release --bin scale      # the table above, measured on your card
-cargo run --release --bin loop_cost  # what looking costs, which is why there is a window
-cargo test  --release                # every number below, checked
-```
-
-In `pour`: **left button** pours sand, **right** pours water, **WASD** flies, **F** follows the
-motion, **Escape** leaves. Watch the count beside the frame time — pour, and it climbs into the
-hundreds; stop, and it falls to nought while the grid it is not looking at stays four million quads.
-
----
-
-## Use it
-
-Eleven stages, one submission, and the only thing crossing the bus per frame is six words.
-
-```rust,no_run
-use grit::compact::Plan;
-use grit::layout::{PARAMS, STATE};
-use grit::sand::{AIR, Grid};
-use grit::{Groups, Host, sweep};
-
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let Some(host) = Host::open()? else { return Ok(()) };
-let width = host.width();
-let grid = Grid::of(4096, 4096);
-let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width)))?;
-
-// Sixteen passes, grouped into the eleven stages the dependencies allow. Below
-// `live::COARSE_FROM` blocks it is eleven in seven — `wired` leaves the coarse list out.
-// `None` asks for no picture; `Some(view)` puts `paint` in the fourth stage.
-let (passes, stages) = grit::live::wired(width, grid, &plan, None)?;
-let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
-
-// Allocate once. Everything after this is a submission.
-let mut resident = host.resident(&plan.sizes(), &modules)?;
-resident.write(STATE as usize, &vec![AIR; grid.cells()])?;
-resident.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
-grit::live::seed(&mut resident, grid, &plan)?;
-
-loop {
-    resident.staged(&groups)?;
-}
-# }
-```
-
-`src/lib.rs` pulls this file in under `cfg(doctest)`, so `cargo test` compiles the block above and a
-snippet that stops working stops the build.
-
-**Want the Vulkan without the sand?** [`host`] and [`resident`] name no buffer of the simulation's —
-`hyperia`, a sibling repository that runs its own kernels on this host layer, vendored those two
-files and nothing else. See `decisions/DR-0005`.
-
-**Want it without a windowing library?** `pour` and `spike` open a window and the library opens none,
-so `minifb` is behind a feature that is on by default:
-
-```toml
-grit = { path = "../grit", default-features = false }
-```
-
-That drops `minifb`, `raw-window-handle` and `winapi` — eight lines of `cargo tree` to five — and
-builds `scale` and `loop_cost` but not the two that need a window.
-
----
-
-## Where things are
+## Modules
 
 | | |
 | --- | --- |
-| `src/resident.rs` | buffers that outlive a frame, stages, one submission, the kept recording |
-| `src/host.rs` | a device, opened once, and what it will say about itself |
-| `src/compact.rs` | the scan tiers, the gather, and the count the host never sees |
-| `src/sweep.rs` | the fused pass: step a cell and count it in the same register |
-| `src/live.rs` | the loop — `wired` is the one place its order is decided |
-| `src/sand.rs` | the Margolus rule, four ordered swaps, and what a cell word holds |
-| `src/layout.rs` | which buffer is which |
-| `decisions/` | nine records, four headings each: measurement, decision, rejected route, limit |
+| `host` | device open, memory, queue. `Host::open`, `Host::matching`, `Host::width`, `Host::heap`, `Host::sparse` |
+| `resident` | buffers, descriptor set, recording, submission. `Resident`, `Groups`, `Run`, `Ticket` |
+| `layout` | binding indices |
+| `sweep` | one Margolus step over every quad, and the block sweep |
+| `sand` | cell word, the fall rules, `Grid` |
+| `compact` | `Plan`, `Tier`, `Over`, `scan`, `gather`, `prepare`, `dense_reference` |
+| `live` | the frame loop: `wired`, `arranged`, `both`, `cheaper`, `seed`, and one function a pass |
+| `gate` | `if_any`, a workgroup-uniform branch |
+| `netlist` | `Netlist`, `Gate`, `Chip`, `Exam`, `drawn`, `turned`, `answered` |
 
-Start at `src/live.rs`'s `wired` if you want the loop, `src/resident.rs` if you want the Vulkan, and
-`decisions/DR-0002` if you want to know which of this repository's claims have been checked.
+## Bindings
 
----
+`layout::BINDINGS` = 20. Every kernel declares all of them, in one descriptor set.
 
-## What the tests are for
+| | | | |
+| --- | --- | --- | --- |
+| 0 `PARAMS` | 5 `TOTALS` | 10 `PIXELS` | 15 `HOT_BASES` |
+| 1 `STATE` | 6 `DENSE` | 11 `TALLY` | 16 `HOT_TOTALS` |
+| 2 `BUCKETS` | 7 `GRAND` | 12 `HOT` | 17 `HOT_DENSE` |
+| 3 `COUNTS` | 8 `INDIRECT` | 13 `HOT_BUCKETS` | 18 `HOT_GRAND` |
+| 4 `BASES` | 9 `AWAKE` | 14 `HOT_COUNTS` | 19 `HOT_INDIRECT` |
 
-Each is aimed at a failure that a convincing picture survives.
+`PARAMS`: 0 frame, 1 dump base, 2..6 brush (`layout::BRUSH`, 4 words), 6..8 window
+(`layout::LOOKING`). `TALLY` is `layout::TALLY_WORDS` = 6.
 
-| file | the claim |
+## Resident
+
+```
+host.resident(&sizes, &modules)      // sizes: [usize; BINDINGS], modules: &[&[u32]]
+host.resident_direct(..)             // host-visible buffers, no staging
+host.resident_near(..)               // device-local preferred
+host.resident_vast(..)               // sparse binding; needs Host::sparse
+```
+
+| | |
 | --- | --- |
-| `live.rs` | **the same pour, through the list and over the whole grid, agrees cell for cell** |
-| `sand.rs` | conservation, the host step for step, and that water reaches all 62 columns |
-| `compact.rs` | the work list is every awake quad, once, in block order |
-| `hot.rs` | and the hot-block list is every hot block, once, across several tiles |
-| `sweep.rs` | the first tier's offsets are the ones the host computes |
-| `tally.rs` | the reduction says what a count done by hand says |
-| `dispatch.rs` | a stage's workgroup count is read by the next, and a frame is recorded once |
-| `floor.rs` | a submission costs more than a frame in it, and a barrier more than a dispatch |
-| `coarse.rs` | the coarse hierarchy is worth its cost above `COARSE_FROM` blocks and not below |
-| `saying.rs` | every refusal carries the numbers it holds |
-| `direct.rs`, `overlap.rs`, `waiting.rs`, `wedged.rs` | the host layer: direct writes, tickets, the fence bound |
+| write | `write`, `write_at`, `write_many`, `read` |
+| sparse | `bind`, `unbind`, `page`, `bound` |
+| run | `frame`, `frames`, `staged`, `staged_frames` |
+| run and read | `frame_reading`, `staged_reading`, `staged_reading_both` |
+| async | `submit`, `submit_reading`, `submit_reading_both`, `wait`, `wait_reading`, `wait_reading_both` |
+| numbers | `on_device`, `stage_times`, `recording`, `reused`, `pushing`, `copying` |
+| shape | `bindings`, `passes`, `cached`, `direct`, `patience`, `set_patience` |
 
-`live.rs` is the one that matters. A host reference for a wake set would derive it from the same rule
-the kernel does and be wrong in the same place — so the comparison is against **a different
-algorithm**: the same pour, stepped over every quad whether it needs it or not, for six thousand
-frames.
+`Groups::Fixed(n)` dispatches n workgroups; `Groups::From { binding, at }` reads the count off the
+device; `Groups::Counting(n)` is `Fixed(n)` and declares that the stage wrote a count, which puts
+`DRAW_INDIRECT` in the barrier behind it. `Fixed(0)` is not recorded, and a stage left empty is
+dropped.
 
-> *The list is allowed to be shorter. It is not allowed to be different.*
+`staged` takes `&[&[Groups]]`: one slice a stage, a barrier between stages and none inside one.
 
-Every kernel is built for subgroup **4, 8, 16, 32 and 64** — one arm each, and `LaneError::NoMapping`
-for anything else. `GRIT_DEVICE` picks a device by substring. Every figure on this page is from an
-RTX 4080 at subgroup 32.
+## Plan
 
----
+`compact::Plan::over(subgroup, blocks)` — refuses past `per_block²`, where
+`per_block = sweep::cells(subgroup) = subgroup * 8`.
 
-## Read further
+| | |
+| --- | --- |
+| fields | `subgroup`, `per_block`, `blocks`, `tiles`, `hot_tiles`, `quads`, `grid` |
+| sizes | `sizes()`, `showing(view)`, `padded()`, `cold()`, `dump()`, `hot_dump()` |
+| counts | `groups()`, `listed()`, `hot_listed()` |
 
-**[`DESIGN.md`](DESIGN.md)** — why the partition has no race, how the compaction adds up in three
-tiers, why there is a second hierarchy over the first, and what is still true and unflattering.
+## Live
 
-**[`decisions/`](decisions/)** — what was decided, what it measured, what was rejected at what price,
-and what the numbers do not prove.
+`live::wired(subgroup, grid, plan, picture)` picks an arrangement by `live::coarse_pays(blocks)`,
+which is `blocks >= live::COARSE_FROM`. `live::arranged(.., coarse)` says which one out loud.
+
+`live::both(..)` builds both into one module list with a stage list each, the one not running given
+`Fixed(0)`. `live::cheaper(resident, both, budget)` times both on the device and returns
+`Cheaper { coarse, listed, every, on_device }`.
+
+Passes: `tick`, `decay`, `wipe`, `wipe_counts`, `settle`, `mark`, and `sand::brush`, `sand::paint`,
+`compact::scan`, `compact::gather`, `compact::prepare`.
+
+## Sand
+
+Cell word: material in the low bits, then `RUNNING_LEFT`/`RUNNING_RIGHT`, `HELD`, and a tired
+counter to `PATIENCE`. Materials `AIR` 0, `WATER` 1, `SAND` 2, `WALL` 3.
+
+Readers: `material_of`, `running_of`, `held_of`, `tired_of`, `hold_of`. Lane forms: `material`,
+`running`, `hold`, `held`, `tired`, `fall`, `course`, `start`.
+
+`Grid::of(wide, deep)` — rounds each side up to a power of two. `cells()`, `quads()`, `across()`, `down()`.
+
+## Netlist
+
+Sources are `inputs + gates`: source `n < inputs` is input `n`, source `inputs + n` is gate `n`.
+A gate may name only a source below its own.
+
+A gate is one word: `KIND_BITS` = 8 kind, `SOURCE_BITS` = 12 each reference. `SOURCES` = 4096,
+`KINDS` = 256. A kind is the four-bit truth table of the gate: `0b1000` and, `0b1110` or, `0b0110`
+xor, `0b1010` left wire.
+
+| | |
+| --- | --- |
+| shape | `Netlist::over(inputs, outputs, gates, kinds)` → `TooWide` |
+| shape | `sources()`, `below(at)`, `words()`, `sizes()` |
+| rule | `checked(at, gate)` → `Fault`, `faults(packed)` |
+| draw | `drawn(netlist, at, roll)`, `turned(netlist, at, gate, roll)` — legal for any roll |
+| run | `Chip::of(shape, gates, outputs)` → `NotAChip`; `sourced`, `answers`, `table` |
+| score | `Exam::of(shape, answers)` → `NotAnExam`; `asked`, `marks`, `scored` |
+| gate | `Gate::pack`, `Gate::unpack`, `answered(gate, left, right)` |
+
+## Tests
+
+| | |
+| --- | --- |
+| `live` | list arrangement against whole grid, cell for cell |
+| `sand`, `sweep`, `compact`, `hot`, `tally` | the rules and the hierarchy |
+| `coarse`, `crossing` | the two arrangements priced, and the device asked which it prefers |
+| `floor` | submission, dispatch and barrier cost |
+| `dispatch`, `direct`, `overlap`, `waiting`, `wedged`, `vast`, `saying` | `Resident` behaviour |
+| `hunt`, `wander`, `counting` | wake bookkeeping, and the flag against its counters |
+| `netlist` | the packing, the rule, the draw, the chip and the exam — no device needed |

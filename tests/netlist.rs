@@ -1,17 +1,3 @@
-//! What the netlist's one rule is worth, checked without a card.
-//!
-//! `src/netlist.rs` makes a single claim and hangs three properties off it: a gate may only name a
-//! source below its own, and therefore a cycle cannot be written down, the array is already in
-//! evaluation order, and a mutation has exactly one bound to respect.
-//!
-//! **A claim of that shape is worth nothing unasserted**, so each of the three is a test here rather
-//! than a sentence there. None of them needs a device: the structure is arithmetic, and the passes
-//! that will read it are not written yet.
-//!
-//! What is deliberately *not* here is any number about what it costs. Nothing in `src/netlist.rs`
-//! has been dispatched.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::netlist::{
@@ -19,7 +5,6 @@ use grit::netlist::{
     TooWide, answered, drawn, turned,
 };
 
-/// The three fields are the whole word, with nothing spare and nothing overlapping.
 #[test]
 fn the_packing_is_exactly_a_word() {
     assert_eq!(
@@ -31,11 +16,6 @@ fn the_packing_is_exactly_a_word() {
     assert_eq!(KINDS, 1 << KIND_BITS);
 }
 
-/// Every gate whose fields are inside their fields survives the round trip.
-///
-/// Walked at the edges rather than everywhere: the two references and the kind are each checked at
-/// nought, at one, and at the top of their field, against every combination of the other two's
-/// edges. A field that was one bit short or one place over would fail at the top and nowhere else.
 #[test]
 fn a_gate_in_range_packs_and_unpacks_to_itself() {
     let edges = |limit: u32| [0, 1, limit / 2, limit - 2, limit - 1];
@@ -53,7 +33,6 @@ fn a_gate_in_range_packs_and_unpacks_to_itself() {
     }
 }
 
-/// The three fields do not bleed into each other: each one alone moves only its own bits.
 #[test]
 fn each_field_owns_its_own_bits() {
     let none = Gate {
@@ -85,7 +64,6 @@ fn each_field_owns_its_own_bits() {
     );
 }
 
-/// A netlist of a shape the packing cannot hold is refused, and says which way.
 #[test]
 fn a_shape_past_the_packing_is_refused() {
     assert!(Netlist::over(5, 1, 96, 8).is_ok(), "a five-input chip fits");
@@ -118,20 +96,16 @@ fn a_shape_past_the_packing_is_refused() {
         })
     );
 
-    // The largest netlist the packing does reach, so that the refusal above is one past a size that
-    // works rather than one past nothing.
     assert!(
         Netlist::over(0, 1, SOURCES, KINDS).is_ok(),
         "the packing has to reach its own limit"
     );
 }
 
-/// **The rule.** A reference at or above the gate's own source is refused, on either side.
 #[test]
 fn a_gate_may_only_name_a_source_below_its_own() {
     let held = Netlist::over(5, 1, 96, 8).expect("netlist");
 
-    // Gate nought sees the five inputs and nothing else.
     assert_eq!(held.below(0), 5);
     assert!(
         held.checked(
@@ -161,7 +135,6 @@ fn a_gate_may_only_name_a_source_below_its_own() {
         "gate nought naming gate nought is a gate reading itself"
     );
 
-    // Gate seven sees the five inputs and gates nought through six.
     assert_eq!(held.below(7), 12);
     assert!(
         held.checked(
@@ -221,11 +194,6 @@ fn a_gate_may_only_name_a_source_below_its_own() {
     );
 }
 
-/// Every gate of a small netlist, exhaustively, agrees with the rule written out by hand.
-///
-/// Three inputs and four gates is 7 sources and 4 places, so `4 × 4 × 7 × 7` gates is 784 —
-/// small enough to walk all of them and say that `checked` and the sentence in the module doc are
-/// the same function.
 #[test]
 fn the_rule_and_the_check_are_the_same_function() {
     let held = Netlist::over(3, 1, 4, 4).expect("netlist");
@@ -252,25 +220,16 @@ fn the_rule_and_the_check_are_the_same_function() {
             }
         }
     }
-    // Both arms have to have been taken, or the loop above proves nothing.
     assert!(
         allowed > 0 && refused > 0,
         "{allowed} allowed, {refused} refused"
     );
 }
 
-/// **A cycle cannot be written down.** Following references from any legal gate reaches an input.
-///
-/// This is the property the ordering is for, and it is checked the only way that means anything:
-/// walk every reference from every gate of a legal netlist and demand the walk ends. A netlist that
-/// admitted a cycle would not end, so the walk is bounded by the number of sources and the bound
-/// failing *is* the failure.
 #[test]
 fn following_references_always_reaches_an_input() {
     let held = Netlist::over(5, 1, 96, 8).expect("netlist");
 
-    // A netlist where every gate reads the two sources directly below it, which is the densest
-    // legal wiring there is: every reference is as high as the rule allows.
     let packed: Vec<u32> = (0..held.gates)
         .map(|at| {
             let below = held.below(at);
@@ -311,7 +270,6 @@ fn following_references_always_reaches_an_input() {
     }
 }
 
-/// A netlist read back with faults in it names every one of them, and where.
 #[test]
 fn every_fault_is_found_and_placed() {
     let held = Netlist::over(4, 1, 8, 4).expect("netlist");
@@ -331,7 +289,6 @@ fn every_fault_is_found_and_placed() {
         "the plain netlist is legal"
     );
 
-    // Gate two reads gate two, gate five holds a kind the kit does not have.
     packed[2] = Gate {
         kind: 0,
         left: 6,
@@ -362,7 +319,6 @@ fn every_fault_is_found_and_placed() {
     );
 }
 
-/// The sizes a device would be asked for come off the three numbers and nothing else.
 #[test]
 fn the_sizes_are_the_shape_and_nothing_else() {
     let held = Netlist::over(5, 3, 96, 8).expect("netlist");
@@ -379,7 +335,6 @@ fn the_sizes_are_the_shape_and_nothing_else() {
     assert_eq!(four.sizes(), [96, 1, 16]);
 }
 
-/// A fault and a refusal both say what they are, because they end up in a message someone reads.
 #[test]
 fn what_they_say_when_they_are_printed() {
     let ahead = Fault::Ahead {
@@ -405,12 +360,6 @@ fn what_they_say_when_they_are_printed() {
     );
 }
 
-/// **The safety.** A drawn gate is legal for every roll, at every place, whatever the roll is.
-///
-/// The construction reduces each field into what that field may hold, so legality does not depend
-/// on the roll at all — which is a claim about arithmetic and is checked as one. The rolls walked
-/// are every value up to the construction's own period, the top of the word, and a stride across
-/// the whole of `u32` so that no region of it is unvisited.
 #[test]
 fn a_drawn_gate_is_legal_for_every_roll() {
     let held = Netlist::over(3, 1, 4, 4).expect("netlist");
@@ -435,7 +384,6 @@ fn a_drawn_gate_is_legal_for_every_roll() {
     assert!(seen > 100_000, "only {seen} rolls were walked");
 }
 
-/// And at the width the exam is for, over the same three regions of the roll space.
 #[test]
 fn a_drawn_gate_is_legal_at_five_inputs() {
     let held = Netlist::over(5, 1, 96, 8).expect("netlist");
@@ -453,10 +401,6 @@ fn a_drawn_gate_is_legal_at_five_inputs() {
     }
 }
 
-/// A turned gate is legal, and it turns exactly one field.
-///
-/// Both halves matter. Legal is the safety; one field is what makes "one gate turned" the
-/// experiment it says it is rather than a fresh draw wearing its name.
 #[test]
 fn turning_a_gate_moves_one_field_and_keeps_it_legal() {
     let held = Netlist::over(5, 1, 96, 8).expect("netlist");
@@ -487,7 +431,6 @@ fn turning_a_gate_moves_one_field_and_keeps_it_legal() {
             }
         }
     }
-    // All three fields have to be reachable, or the mutation cannot search the whole space.
     assert!(
         moved[0] > 0 && moved[1] > 0 && moved[2] > 0,
         "kind moved {}, left {}, right {}",
@@ -497,7 +440,6 @@ fn turning_a_gate_moves_one_field_and_keeps_it_legal() {
     );
 }
 
-/// A gate that was already illegal is not repaired by turning it, and says so.
 #[test]
 fn turning_does_not_repair_what_was_already_wrong() {
     let held = Netlist::over(5, 1, 96, 8).expect("netlist");
@@ -507,7 +449,6 @@ fn turning_does_not_repair_what_was_already_wrong() {
         right: 0,
     };
     assert!(held.checked(3, bad).is_err(), "the gate has to start wrong");
-    // Roll 2 turns the right reference, so the left one is left where it was.
     let now = turned(&held, 3, bad, 2);
     assert_eq!(now.left, 90, "turning the right must not touch the left");
     assert!(
@@ -516,7 +457,6 @@ fn turning_does_not_repair_what_was_already_wrong() {
     );
 }
 
-/// A table that is not the shape's table is refused, and says which way.
 #[test]
 fn a_table_that_is_not_the_shape_is_refused() {
     let five = Netlist::over(5, 1, 96, 8).expect("netlist");
@@ -545,7 +485,6 @@ fn a_table_that_is_not_the_shape_is_refused() {
 
     assert!(Exam::of(five, vec![1; 32]).is_ok());
 
-    // Three outputs give three bits, and the fourth is still refused.
     let three = Netlist::over(5, 3, 96, 8).expect("netlist");
     assert!(Exam::of(three, vec![0b111; 32]).is_ok());
     assert_eq!(
@@ -558,11 +497,9 @@ fn a_table_that_is_not_the_shape_is_refused() {
     );
 }
 
-/// **The five-input exam.** Thirty-two rows, and what a perfect score is worth.
 #[test]
 fn the_exam_of_five_inputs_is_thirty_two_rows() {
     let shape = Netlist::over(5, 1, 96, 8).expect("netlist");
-    // The parity of five inputs, written out the way an exam is: one row an input word.
     let answers: Vec<u32> = (0..32_u32).map(|word| word.count_ones() & 1).collect();
     let exam = Exam::of(shape, answers).expect("exam");
 
@@ -577,7 +514,6 @@ fn the_exam_of_five_inputs_is_thirty_two_rows() {
     assert_eq!(exam.asked(3), 0, "two ones is even");
     assert_eq!(exam.asked(31), 1, "five ones is odd");
 
-    // Three answer bits over the same width is three times the marks.
     let wide = Netlist::over(5, 3, 96, 8).expect("netlist");
     let counted: Vec<u32> = (0..32_u32).map(u32::count_ones).collect();
     let count = Exam::of(wide, counted).expect("exam");
@@ -585,7 +521,6 @@ fn the_exam_of_five_inputs_is_thirty_two_rows() {
     assert_eq!(count.asked(31), 5, "five ones is a hundred and one");
 }
 
-/// A score is the bits that agree, over the bits the exam asked about and no others.
 #[test]
 fn a_score_counts_the_bits_that_agree() {
     let shape = Netlist::over(3, 2, 8, 4).expect("netlist");
@@ -606,12 +541,10 @@ fn a_score_counts_the_bits_that_agree() {
         "the complement gets nothing right"
     );
 
-    // A run that is right about one bit of one row and wrong about the rest.
     let mut nearly = inverted.clone();
     nearly[0] = answers[0] ^ 0b10;
     assert_eq!(exam.scored(&nearly), 1);
 
-    // Bits past the two the exam asks about are not counted either way.
     let noisy: Vec<u32> = answers.iter().map(|held| held | 0xffff_fffc).collect();
     assert_eq!(
         exam.scored(&noisy),
@@ -619,12 +552,10 @@ fn a_score_counts_the_bits_that_agree() {
         "a bit nobody asked about must not cost a mark"
     );
 
-    // A buffer that came back short scores nothing for the rows it does not reach.
     assert_eq!(exam.scored(&answers[..4]), 8);
     assert_eq!(exam.scored(&[]), 0);
 }
 
-/// What the exam's refusals say when they are printed.
 #[test]
 fn what_a_refused_table_says() {
     assert_eq!(
@@ -646,11 +577,6 @@ fn what_a_refused_table_says() {
     );
 }
 
-/// Every one of the sixteen kinds, on every one of its four inputs, against the table by hand.
-///
-/// **Sixty-four cases and all of them walked**, because "the kind is the truth table" is either
-/// exactly true or it is a bug that shows up on one function of two — and a spot check of an AND and
-/// an XOR is what would miss it.
 #[test]
 fn a_kind_is_its_own_truth_table() {
     for kind in 0..16_u32 {
@@ -675,7 +601,6 @@ fn a_kind_is_its_own_truth_table() {
     }
 }
 
-/// The functions that have names, named, so that the numbering is pinned to something readable.
 #[test]
 fn the_gates_that_have_names_answer_what_they_are_called() {
     let of = |kind: u32| {
@@ -701,8 +626,6 @@ fn the_gates_that_have_names_answer_what_they_are_called() {
     assert_eq!(of(0b1100), [0, 0, 1, 1], "a wire carrying the right input");
     assert_eq!(of(0b0101), [1, 0, 1, 0], "not the left input");
 
-    // The kit that a `kinds` of eight actually is, put through the check that enforces it: an xor
-    // is in it and an and is not, which is what the module doc warns a caller about.
     let eight = Netlist::over(3, 1, 4, 8).expect("netlist");
     let sat = |kind: u32| {
         eight.checked(
@@ -722,7 +645,6 @@ fn the_gates_that_have_names_answer_what_they_are_called() {
     );
 }
 
-/// A pair of arrays that is not a chip is refused, and says which way.
 #[test]
 fn a_pair_of_arrays_that_is_not_a_chip_is_refused() {
     let shape = Netlist::over(3, 1, 4, 16).expect("netlist");
@@ -783,7 +705,6 @@ fn a_pair_of_arrays_that_is_not_a_chip_is_refused() {
     );
 }
 
-/// The inputs arrive as the word's bits, lowest first.
 #[test]
 fn the_inputs_are_the_words_bits() {
     let shape = Netlist::over(5, 1, 1, 16).expect("netlist");
@@ -807,12 +728,6 @@ fn the_inputs_are_the_words_bits() {
     assert_eq!(chip.sourced(31)[..5], [1, 1, 1, 1, 1]);
 }
 
-/// **The five-input exam, sat and passed.** Four exclusive-ors chained is the parity of five.
-///
-/// This is the whole of the file end to end: a shape, gates that are legal in it, a circuit worked
-/// out over every one of the thirty-two input words, and a score against the table the exam holds.
-/// Parity is the function `oracle`'s `NOTEBOOK.md` calls the one with no gradient in it, and by hand
-/// it is four gates.
 #[test]
 fn a_hand_built_chip_passes_the_five_input_parity_exam() {
     let shape = Netlist::over(5, 1, 4, 16).expect("netlist");
@@ -824,15 +739,9 @@ fn a_hand_built_chip_passes_the_five_input_parity_exam() {
         }
         .pack()
     };
-    // Sources 0..5 are the inputs; gate n's answer is source 5 + n.
     let chip = Chip::of(
         shape,
-        vec![
-            xor(0, 1),
-            xor(5, 2), // gate 0 with input two
-            xor(6, 3), // gate 1 with input three
-            xor(7, 4), // gate 2 with input four
-        ],
+        vec![xor(0, 1), xor(5, 2), xor(6, 3), xor(7, 4)],
         vec![3],
     )
     .expect("chip");
@@ -845,11 +754,9 @@ fn a_hand_built_chip_passes_the_five_input_parity_exam() {
     assert_eq!(exam.scored(&chip.table()), 32, "and it is worth full marks");
 }
 
-/// A chip that is wrong scores what it is worth, and the score is not all-or-nothing.
 #[test]
 fn a_chip_that_is_wrong_scores_what_it_is_worth() {
     let shape = Netlist::over(5, 1, 4, 16).expect("netlist");
-    // The parity of the first four inputs only, which is right wherever input four is nought.
     let xor = |left: u32, right: u32| {
         Gate {
             kind: 0b0110,
@@ -874,11 +781,9 @@ fn a_chip_that_is_wrong_scores_what_it_is_worth() {
     );
 }
 
-/// Three answer bits off one circuit, which is what a `count` exam asks for.
 #[test]
 fn a_chip_can_carry_more_than_one_answer() {
     let shape = Netlist::over(2, 2, 3, 16).expect("netlist");
-    // The sum of two bits: gate 0 is the low bit, gate 1 the carry, gate 2 spare.
     let chip = Chip::of(
         shape,
         vec![
@@ -905,7 +810,6 @@ fn a_chip_can_carry_more_than_one_answer() {
     )
     .expect("chip");
 
-    // word 0b00 -> 0, 0b01 -> 1, 0b10 -> 1, 0b11 -> 2
     assert_eq!(chip.table(), vec![0, 1, 1, 2]);
 
     let exam = Exam::of(shape, vec![0, 1, 1, 2]).expect("exam");
@@ -913,7 +817,6 @@ fn a_chip_can_carry_more_than_one_answer() {
     assert_eq!(exam.scored(&chip.table()), 8);
 }
 
-/// What a refused chip says when it is printed.
 #[test]
 fn what_a_refused_chip_says() {
     assert_eq!(
@@ -943,11 +846,6 @@ fn what_a_refused_chip_says() {
     );
 }
 
-/// Every gate a mutation can produce is one the evaluator can run.
-///
-/// The two halves of the file meet here: `drawn` says what a mutation may make, `Chip::of` says what
-/// can be run, and if those two spaces were not the same one the engine would spend its time on
-/// circuits that are refused. Every place, over a walk of the roll space, built into a whole chip.
 #[test]
 fn everything_a_mutation_draws_is_something_a_chip_can_run() {
     let shape = Netlist::over(5, 1, 32, 16).expect("netlist");
@@ -964,7 +862,6 @@ fn everything_a_mutation_draws_is_something_a_chip_can_run() {
             .collect();
         let chip = Chip::of(shape, gates, vec![shape.gates - 1])
             .unwrap_or_else(|why| panic!("roll {roll} drew a chip that will not run: {why}"));
-        // And it runs: every row of the table is one answer bit and nothing else.
         for row in chip.table() {
             assert!(row <= 1, "row {row} is not one answer bit");
         }

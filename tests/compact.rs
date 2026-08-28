@@ -1,32 +1,11 @@
-//! The whole compaction, four passes in one submission, held to the host.
-//!
-//! # What this checks that `tests/sweep.rs` cannot
-//!
-//! That file holds one block to its own bucket. This holds every block against every *other* one —
-//! which is where a compaction actually goes wrong. The tiers are added in three places and a base
-//! that is off by one block is a work list that looks entirely reasonable: the right length, full of
-//! plausible indices, with one block's worth written over another's.
-//!
-//! So the checks are:
-//!
-//! * the grand total, which `scan_totals` reduces and nothing else may write;
-//! * the list itself, word for word, against a host that concatenates the buckets in block order —
-//!   **order included**, because a check that sorted first would pass a scan whose tiers were added
-//!   in the wrong arrangement;
-//! * and that every awake cell appears exactly once and no sleeping one appears at all, which holds
-//!   whatever the arithmetic turned out to be.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::Host;
 use grit::compact::{self, Over, Plan, Tier};
 use grit::sweep;
 
-/// Blocks in the check. Enough that there is more than one tile at every width here.
 const BLOCKS: u32 = 1024;
 
-/// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -109,7 +88,6 @@ fn the_work_list_is_every_awake_cell_once_and_in_block_order() {
         )
         .expect("dense");
 
-    // Six passes, one submission, one fence — and the last one's size came from the device.
     let spent = resident.frame(&plan.groups()).expect("dispatched");
 
     let ran_state = resident
@@ -131,8 +109,6 @@ fn the_work_list_is_every_awake_cell_once_and_in_block_order() {
         .read(compact::DENSE as usize, plan.quads)
         .expect("dense");
 
-    // What the host says, from the counts and buckets the device produced — so this is a check of
-    // the *scan*, with the sweep's own answer taken as given. `tests/sweep.rs` checks that half.
     let (want_dense, want_grand) = compact::dense_reference(&plan, &ran_counts, &ran_buckets);
 
     assert_eq!(
@@ -159,7 +135,6 @@ fn the_work_list_is_every_awake_cell_once_and_in_block_order() {
         );
     }
 
-    // The properties, which hold whatever the arithmetic is.
     let awake: Vec<u32> = (0..plan.quads)
         .filter(|&at| ran_state.get(at).copied().is_some_and(sweep::is_awake))
         .map(|at| u32::try_from(at).unwrap_or(u32::MAX))
@@ -186,13 +161,11 @@ fn the_work_list_is_every_awake_cell_once_and_in_block_order() {
         "the list and the awake cells are different sets"
     );
 
-    // And nothing was written past the end of it.
     assert!(
         dense[grand as usize..].iter().all(|&slot| slot == u32::MAX),
         "something was written past the end of the work list"
     );
 
-    // And the pass that ran over the list rather than the grid reached exactly those cells.
     let indirect = resident
         .read(compact::INDIRECT as usize, 3)
         .expect("indirect");

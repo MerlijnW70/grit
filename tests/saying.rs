@@ -1,18 +1,3 @@
-//! Every refusal this crate can hand back, rendered.
-//!
-//! # Why a test that only formats things
-//!
-//! Because a coverage run said no test had ever formatted one. `Error` and `compact::TooBig` are
-//! reached on failure paths — a device that will not open, a plan too large, a binding written past
-//! its end — and none of those happen in a suite that passes. So every `Display` arm in the crate
-//! was code that had never run, which `decisions/DR-0002` is about.
-//!
-//! **The check is that each message carries the numbers its variant holds**, not that it is worded
-//! any particular way. An arm that formats the wrong field, or drops one, is the bug this catches;
-//! rewording is not. `Error::NoLoader` is the one variant absent here, because `ash::LoadingError`
-//! cannot be built without a loader that failed.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::time::Duration;
@@ -21,7 +6,6 @@ use ash::vk;
 use grit::Error;
 use grit::compact::Plan;
 
-/// Every number and name `what` holds has to appear in what it says.
 #[track_caller]
 fn says(what: &Error, parts: &[&str]) {
     let said = what.to_string();
@@ -93,8 +77,6 @@ fn every_error_says_the_numbers_it_holds() {
         &["4242", "4141"],
     );
 
-    // **The one arm that is not a substitution.** A ticket with nothing outstanding says so in
-    // words, and an arm that reached for `{held:?}` instead would put `None` in front of a caller.
     let nothing = Error::NoSuchTicket {
         ticket: 4242,
         held: None,
@@ -107,7 +89,6 @@ fn every_error_says_the_numbers_it_holds() {
     );
 }
 
-/// A Vulkan code turns into the variant that holds it, and says the same thing.
 #[test]
 fn a_vulkan_code_becomes_the_error_that_carries_it() {
     let from = Error::from(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
@@ -118,10 +99,6 @@ fn a_vulkan_code_becomes_the_error_that_carries_it() {
     says(&from, &["OUT_OF_DEVICE_MEMORY"]);
 }
 
-/// A plan past what two levels of scan reach is refused **by name**.
-///
-/// `src/bin/scale.rs` prints this at a caller, and until now nothing had ever seen it: the sizes
-/// that file runs are all inside the limit.
 #[test]
 fn a_plan_too_large_says_how_large_and_what_the_limit_is() {
     let width = 32_u32;

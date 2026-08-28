@@ -1,29 +1,3 @@
-//! The one number that comes back by reduction, held to a count done by hand.
-//!
-//! # Why a telemetry number is worth a test at all
-//!
-//! Because it is the easiest thing in the crate to get quietly wrong and never notice. A frame
-//! counter that is off by one still counts up. A grain count that is short by the last workgroup
-//! still rises when you pour and falls when you stop, and it will look right on a title bar for as
-//! long as nobody adds it up themselves.
-//!
-//! The failures it is actually exposed to are specific, and each of them survives a glance:
-//!
-//! * **The reduction counted once a lane instead of once a workgroup.** An atomic add is not
-//!   idempotent, and every lane of a subgroup holds the same total after `reduce_sum` — so the
-//!   obvious code multiplies every number by the subgroup width. On a thirty-two-wide part that is
-//!   a plausible-looking number thirty-two times too big.
-//! * **The accumulator was never cleared.** Then it is the sum over the whole run, which also goes
-//!   up when you pour. The same mistake cost this crate a work list once already; `live::wipe` says
-//!   so at length.
-//! * **The slots past the end of the list were counted.** They step a spare quad off the end of the
-//!   grid, and their contents are not the world's.
-//!
-//! So the check is a count done the slow way: read the work list the settle is about to use, run the
-//! frame, and add up the cells of exactly those quads on the host. Not a bound, not a trend — the
-//! same number.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::compact::Plan;
@@ -32,14 +6,11 @@ use grit::sand::{AIR, Grid, SAND, WALL, WATER, material_of};
 use grit::sweep;
 use grit::{Groups, Host};
 
-/// The world under test.
 const WIDE: u32 = 512;
 const DEEP: u32 = 256;
 
-/// How many frames are checked.
 const FRAMES: u32 = 120;
 
-/// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -54,7 +25,6 @@ fn device(label: &str) -> Option<Host> {
     }
 }
 
-/// A box with a floor and two sides.
 fn room(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
     for row in 0..grid.deep {
@@ -69,8 +39,6 @@ fn room(grid: Grid) -> Vec<u32> {
     cells
 }
 
-/// The four cells of `quad` at this frame's partition origin — the same arithmetic `live::corners`
-/// does on the device, written out.
 fn corners(grid: Grid, quad: u32, phase: u32) -> [usize; 4] {
     let column = ((quad % grid.across()) * 2 + phase) & (grid.wide - 1);
     let row = ((quad / grid.across()) * 2 + phase) & (grid.deep - 1);
@@ -125,8 +93,6 @@ fn the_reduction_says_what_a_count_by_hand_says() {
     let mut ever_moved = 0_u64;
 
     for frame in 0..FRAMES {
-        // **Before the frame**, because `gather` rewrites the list during it: what the settle is
-        // about to read is what is there now, not what is there afterwards.
         let listed = live
             .read(GRAND as usize, 1)
             .expect("grand")
@@ -138,7 +104,6 @@ fn the_reduction_says_what_a_count_by_hand_says() {
             .read(DENSE as usize, listed as usize)
             .expect("dense list");
 
-        // Sand for a while, then water, so both are in the world and both are counted.
         let material = match frame {
             0..40 => SAND,
             40..80 => WATER,
@@ -151,7 +116,6 @@ fn the_reduction_says_what_a_count_by_hand_says() {
         let state = live.read(STATE as usize, cells).expect("state");
         let tally = live.read(TALLY as usize, TALLY_WORDS).expect("tally");
 
-        // The same count, by hand, over exactly the quads the list named.
         let phase = frame & 1;
         let (mut wet, mut dry) = (0_u32, 0_u32);
         for &quad in &list {
@@ -175,8 +139,6 @@ fn the_reduction_says_what_a_count_by_hand_says() {
             tally[2]
         );
 
-        // What moved cannot exceed what was looked at, and the quads that moved cannot exceed the
-        // quads that were listed. Both would fail if a lane's share were counted more than once.
         assert!(
             tally[0] <= listed * 4,
             "frame {frame}: {} cells moved out of {listed} quads, which is more than they hold",
@@ -188,7 +150,6 @@ fn the_reduction_says_what_a_count_by_hand_says() {
             tally[5]
         );
 
-        // The centre of the motion, which is a weighted sum and so has a bound of its own.
         let far = (grid.across() >> COARSE) * tally[0];
         assert!(
             tally[3] <= far && tally[4] <= (grid.down() >> COARSE) * tally[0],
@@ -207,8 +168,6 @@ fn the_reduction_says_what_a_count_by_hand_says() {
          {ever_moved} cell-moves altogether."
     );
 
-    // **A tally that was always nought would satisfy every equality above.** The host would agree
-    // with it, because the host would be counting the same empty list.
     assert!(
         busiest > 0,
         "nothing ever moved, so the agreement is between two zeroes"

@@ -1,18 +1,3 @@
-//! When the coarse arrangement first parts, and in which word.
-//!
-//! `tests/hunt.rs` says the arrangement does not reach the same place twice at 1024 blocks on a
-//! sixty-four-lane part, that the world is identical every time, and that what wanders is `AWAKE`,
-//! `HOT` and the lists derived from them. It says nothing about **when** — it reads once at the end
-//! of three hundred frames, because reading between frames changes the answer.
-//!
-//! Reading once at the end of a run of *`n`* frames does not. So this runs the same arrangement
-//! several times at each of a rising number of frames and asks which `n` is the first where the runs
-//! disagree, and then which words disagree at that `n`. Nothing here reads between frames either;
-//! the shortening is the instrument.
-//!
-//! It asserts nothing. `decisions/DR-0013` is what it reports into.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::compact::Plan;
@@ -20,44 +5,28 @@ use grit::layout::{AWAKE, BRUSH, GRAND, HOT, HOT_DENSE, HOT_GRAND, PARAMS, STATE
 use grit::sand::{AIR, Grid, SAND, WALL};
 use grit::{Groups, Host, sweep};
 
-/// When the brush stops. Past every frame count this walks, so the brush is always pouring.
 const POURING: u32 = 200;
 
-/// How many blocks. The size at which `tests/coarse.rs` disagrees.
 const BLOCKS: u32 = 1024;
 
-/// How many times each frame count is run.
 const RUNS: usize = 8;
 
-/// The lowest frame count the scan walks from.
 const FROM: u32 = 1;
 
-/// The highest frame count the scan walks to.
 const LIMIT: u32 = 150;
 
-/// How many frames the flag-against-counters classification walks.
 const EARLY: u32 = 6;
 
-/// How many frames the batch-size comparison walks, and how many runs it makes at each size.
 const BATCH_FRAMES: u32 = 150;
 
-/// What the isolated decay probe starts every counter and every flag at.
-///
-/// **Not two.** One decrement leaves one below it, a second leaves two below, and a read that saw
-/// the nought the buffer held a moment before leaves nought — and at two the last two are the same
-/// number. Anything above three tells them apart.
 const START: u32 = 5;
 
-/// How many rounds the isolated decay probe makes, half of each list.
 const ROUNDS: usize = 400;
 
-/// How many runs the batch-size comparison makes at each size.
 const BATCH_RUNS: usize = 400;
 
-/// How many runs it makes at each of those.
 const EARLY_RUNS: usize = 128;
 
-/// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -72,7 +41,6 @@ fn device(label: &str) -> Option<Host> {
     }
 }
 
-/// A room with walls, and air inside it.
 fn room(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
     for row in 0..grid.deep {
@@ -86,7 +54,6 @@ fn room(grid: Grid) -> Vec<u32> {
     cells
 }
 
-/// A grid with this many blocks at this width, both sides a power of two.
 fn sized(width: u32, blocks: u32) -> Grid {
     let cells = u64::from(blocks) * u64::from(sweep::cells(width)) * 4;
     let (mut wide, mut deep) = (1_u32, 1_u32);
@@ -100,37 +67,23 @@ fn sized(width: u32, blocks: u32) -> Grid {
     Grid::of(wide, deep)
 }
 
-/// What one run leaves behind, read once and only at the end.
 struct Shot {
-    /// How long the fine work list is.
     grand: u32,
-    /// How long the coarse block list is.
     hot_grand: u32,
-    /// One word a quad.
     awake: Vec<u32>,
-    /// One word a block, padded, and the dump past it.
     hot: Vec<u32>,
-    /// The coarse block list, as long as `hot_grand` says.
     dense: Vec<u32>,
-    /// The world, folded.
     world: u64,
 }
 
-/// How one run is arranged: which grouping, how many frames a submission, how many frames, and
-/// whether the coarse hierarchy is built at all.
 #[derive(Clone, Copy)]
 struct Running {
-    /// One pass a stage, rather than the stages [`grit::live::arranged`] chose.
     apart: bool,
-    /// How many frames go into one submission.
     batch: u32,
-    /// How many frames the run walks.
     frames: u32,
-    /// Whether the coarse list is built and the three passes dispatched over it.
     coarse: bool,
 }
 
-/// One whole run, and what it left behind.
 fn ran(host: &Host, width: u32, grid: Grid, plan: &Plan, how: Running) -> Shot {
     let Running {
         apart,
@@ -198,7 +151,6 @@ fn ran(host: &Host, width: u32, grid: Grid, plan: &Plan, how: Running) -> Shot {
     }
 }
 
-/// A buffer as one number, so that whole buffers can be compared without holding them all.
 fn folded(words: &[u32]) -> u64 {
     let mut held = 0xcbf2_9ce4_8422_2325_u64;
     for one in words {
@@ -208,7 +160,6 @@ fn folded(words: &[u32]) -> u64 {
     held
 }
 
-/// Where two buffers differ: how many words, and the first few as `(index, left, right)`.
 fn parted(left: &[u32], right: &[u32]) -> (usize, Vec<(usize, u32, u32)>) {
     let mut count = 0;
     let mut first = Vec::new();
@@ -223,11 +174,6 @@ fn parted(left: &[u32], right: &[u32]) -> (usize, Vec<(usize, u32, u32)>) {
     (count, first)
 }
 
-/// Which blocks a run disagrees about, at each of a rising number of frames.
-///
-/// A run is read once at the end, so the frame count is the only clock this has. Every block whose
-/// wake counters differ between runs is named, and beside it what the coarse level said about that
-/// same block: its flag, whether the list held it, and the three counter values across its quads.
 #[test]
 fn which_block_goes_out_of_step() {
     let Some(host) = device("wander") else { return };
@@ -278,11 +224,6 @@ fn which_block_goes_out_of_step() {
                 blocks.push(block);
             }
         }
-        // **The flag against the counters it stands for.** `live::wake` writes the same two to a
-        // quad's counter and to its block's flag in the same invocation, and `decay` takes one off
-        // both in the same invocation too — so a flag is at least the highest counter in its block,
-        // always. A block where it is lower is one of the two decrements landing without the other,
-        // and it needs no second run to see.
         for (nth, one) in shots.iter().enumerate() {
             let cold: Vec<usize> = (0..plan.blocks as usize)
                 .filter(|block| {
@@ -299,9 +240,6 @@ fn which_block_goes_out_of_step() {
             }
         }
 
-        // **The list against the flags it was compacted from.** `hot_grand` should be exactly how
-        // many blocks hold a flag above nought, and the list should be exactly those blocks, once
-        // each. This is the one check that does not need a second run to compare against.
         for (nth, one) in shots.iter().enumerate() {
             let expected: Vec<u32> = (0..plan.blocks)
                 .filter(|&block| one.hot[block as usize] > 0)
@@ -348,17 +286,6 @@ fn which_block_goes_out_of_step() {
     }
 }
 
-/// What a block's wake counters and its flag say about each other, over the first few frames.
-///
-/// A block nothing has touched since [`grit::live::seed`] is in a state this can be written down:
-/// the seed puts two in every quad's counter and two in the block's flag, and `decay` takes one off
-/// both **in the same invocation**, so after one frame it is one and one, after two it is nought and
-/// nought, and the block leaves the list. The flag can be *higher* than a quad's counter — anything
-/// waking any quad in the block raises it — and it can never be lower.
-///
-/// So this classifies every block by what its five hundred and twelve counters hold and what its
-/// flag holds, and counts the classes. A class where the flag is below every counter in the block is
-/// a decrement one of the two took and the other did not.
 #[test]
 fn what_a_flag_and_its_counters_say_about_each_other() {
     let Some(host) = device("wander") else { return };
@@ -436,7 +363,6 @@ fn what_a_flag_and_its_counters_say_about_each_other() {
     }
 }
 
-/// The shortest run that does not reach the same place twice.
 #[test]
 #[ignore = "the range scan above subsumes it; kept for the first-parting frame count alone"]
 fn how_few_frames_it_takes_to_part() {
@@ -517,21 +443,6 @@ fn how_few_frames_it_takes_to_part() {
     eprintln!("  no disagreement in {LIMIT} frames");
 }
 
-/// What one `decay` dispatch does when the list names the same block twice.
-///
-/// # Why this is worth asking in isolation
-///
-/// The counters and the flag are read-modify-written in the same invocation, so nothing that
-/// dispatches the pass **once** a block can part them. Twice a block can: the two workgroups race,
-/// and the two halves of the pass do not race the same way. A quad's counter is read and written by
-/// one lane in each workgroup, so both nearly always read the old value and one decrement is lost.
-/// The block's flag is read and written by *every* lane of both — a hundred and twenty-eight
-/// read-modify-writes on one word — so one of them nearly always reads what another has already
-/// written, and the decrement is not lost.
-///
-/// Which is exactly the state `which_block_goes_out_of_step` finds: counters one above the flag,
-/// never below. This runs the pass alone, over a list that names every block twice, and counts how
-/// the two come out. It asserts nothing.
 #[test]
 fn a_block_named_twice_in_one_list() {
     use grit::compact::Over;
@@ -552,8 +463,6 @@ fn a_block_named_twice_in_one_list() {
     let decay = grit::live::decay(width, Over::Listed(HOT_DENSE)).expect("decay");
     let modules: Vec<&[u32]> = vec![&decay];
 
-    // Half the blocks, each named twice, so the dispatch is as wide as the seeded one -- and the
-    // same dispatch over a list that names each block once, as the control.
     let doubled = plan.blocks / 2;
     let twice: Vec<u32> = (0..doubled).flat_map(|block| [block, block]).collect();
     let once: Vec<u32> = (0..plan.blocks).collect();
@@ -579,9 +488,6 @@ fn a_block_named_twice_in_one_list() {
         }
         held.write(PARAMS as usize, &[0, plan.dump()])
             .expect("params");
-        // **Five, not two.** One decrement leaves four; a second leaves three; a read that saw the
-        // nought this buffer held a moment ago leaves nought. Two is the value the loop uses and it
-        // cannot tell those apart -- both the second decrement and the stale read leave nought.
         held.write(AWAKE as usize, &vec![START; plan.quads])
             .expect("awake");
         held.write(HOT as usize, &vec![START; plan.padded() as usize])
@@ -641,14 +547,6 @@ fn a_block_named_twice_in_one_list() {
     }
 }
 
-/// Whether the frame boundary is where the flag and its counters part.
-///
-/// [`grit::Resident::staged_frames`] puts a barrier between the last stage of one frame and the
-/// first of the next — but only **inside** one call. The call's last stage has nothing after it, so
-/// a run of `n` frames taken a frame a submission has `n` boundaries with no barrier on them and one
-/// with a barrier inside every batch; taken all in one submission it has one boundary and `n − 1`
-/// barriers. If that boundary is where `decay` reaches over the previous frame's `settle`, the count
-/// of blocks whose flag is below their counters moves with the batch size. It asserts nothing.
 #[test]
 fn what_the_batch_size_does_to_it() {
     let Some(host) = device("batch") else { return };
@@ -701,13 +599,6 @@ fn what_the_batch_size_does_to_it() {
     }
 }
 
-/// The same invariant under the arrangement that has no coarse list at all.
-///
-/// `decay`, `mark` and `gather` dispatched over every block rather than over a list is the other
-/// half of [`grit::live::arranged`], and `tests/live.rs` runs it. It cannot go out of step the way
-/// the coarse one does — a block is visited whether its flag says anything or not — so if the flag
-/// still falls below the counters it stands for here, the list is not where the two part. It asserts
-/// nothing.
 #[test]
 fn the_flag_against_its_counters_without_a_list() {
     let Some(host) = device("listless") else {
@@ -781,11 +672,6 @@ fn the_flag_against_its_counters_without_a_list() {
                     "as arranged    "
                 },
             );
-            // **The one line in this file that is a check and not a reading.** Before
-            // `decisions/DR-0018` this was 42 of 128 runs as arranged without a list, 33 with one
-            // pass a stage and 22 with a list — so a flag that steps down beside its counters again,
-            // rather than being computed from them, fails here, and does not have to be caught by
-            // two runs disagreeing about something further downstream.
             assert_eq!(
                 runs_hit, 0,
                 "a flag below the counters it stands for, in {runs_hit} of {EARLY_RUNS} runs: {seen:?}"
@@ -794,17 +680,6 @@ fn the_flag_against_its_counters_without_a_list() {
     }
 }
 
-/// How far across a workgroup a reduction in `decay` actually reaches.
-///
-/// The pass is built as [`grit::Shape`]`::new(subgroup, subgroup, ..)` — one workgroup of exactly a
-/// subgroup's invocations — and everything in it that folds across lanes assumes those two numbers
-/// are the same partition. If a workgroup is more than one subgroup on this part, a reduction sees
-/// only its own share and the flag it writes is whichever share stored last.
-///
-/// So this gives every block counters that rise across its lanes: quad `q` holds `q mod per_block`,
-/// so the highest counter in the block belongs to the **last** lane. One `decay` steps them all and
-/// writes the block's flag. A flag of `per_block − 2` is a reduction that reached the last lane;
-/// anything lower names the lane it stopped at. It asserts nothing.
 #[test]
 fn how_far_a_reduction_in_decay_reaches() {
     use grit::compact::Over;
@@ -865,12 +740,6 @@ fn how_far_a_reduction_in_decay_reaches() {
     eprintln!("  flags written, and how many blocks got each: {seen:?}");
 }
 
-/// What the flag's reduction costs, against the read-modify-write it replaced.
-///
-/// One `decay` and nothing else, dispatched over a list naming every block once, timed on the
-/// device rather than on the host — the same clock [`grit::Resident::on_device`] hands the frame
-/// loop. Ten submissions of a hundred repetitions each, and the whole spread is printed rather than
-/// an average, because a number without its spread is a claim about one run. It asserts nothing.
 #[test]
 fn what_the_flag_costs() {
     use grit::compact::Over;
@@ -914,13 +783,9 @@ fn what_the_flag_costs() {
     let mut seen = Vec::with_capacity(10);
     for round in 0..11 {
         held.staged_frames(&[&stage], 100).expect("decay");
-        // **Not divided.** `Resident::on_device` is already per frame — `timed` divides the two
-        // stamps by how many frames the submission held — and dividing again is how the first
-        // version of this file reported a number a hundred times too small.
         let each = held
             .on_device()
             .map_or(0.0, |each| each.as_secs_f64() * 1e9);
-        // The first submission carries the pipeline's first use with it.
         if round > 0 {
             seen.push(each);
         }

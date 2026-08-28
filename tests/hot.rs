@@ -1,36 +1,3 @@
-//! The coarse hierarchy on its own: which blocks have anything in them, compacted.
-//!
-//! # What `tests/live.rs` cannot reach, and why it matters
-//!
-//! That test runs the whole loop and demands it agree with a whole-grid run cell for cell, which is
-//! the strongest check in the repository — but it runs one world, and on a thirty-two-lane part that
-//! world has **one tile**. The coarse scan's second and third tiers are then a base of nought added
-//! to a base of nought, and a bug in either would go straight past it. The same world on an
-//! eight-lane part has sixteen tiles, so the gap is a property of the device rather than of the
-//! test, which is the worst kind: it passes here and fails on somebody else's card.
-//!
-//! So this holds the coarse tier to the same checks `tests/compact.rs` holds the fine one to, at a
-//! shape with more than one tile **at every width this crate builds for** — and one that is not a
-//! whole number of tiles, so the padding is exercised too.
-//!
-//! * the grand total is the number of hot blocks, on the nose;
-//! * the list is those blocks, **in ascending order**, because the order is the scan — a check that
-//!   sorted first would pass a hierarchy whose tiers were added in some other arrangement;
-//! * nothing past the end of the list was written;
-//! * no block in the padding is listed, because the padding is not a block;
-//! * and the workgroup count the device wrote is the length of the list, not a ceiling of it —
-//!   `prepare` divides by one here and a rounded count would dispatch over entries that are not
-//!   there.
-//!
-//! # Two frames, not one
-//!
-//! Because the coarse scan writes its exclusive prefix back over its own input, exactly as the fine
-//! one does. A frame that does not clear [`HOT_TOTALS`] first adds last frame's prefix to this
-//! frame's counts, and the grand total climbs for ever — a failure that a single frame cannot see
-//! and that cost this crate a work list once already. `live::wipe` is the first pass here for that
-//! reason, and the second frame is what would catch it going missing.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::Groups;
@@ -38,14 +5,8 @@ use grit::Host;
 use grit::compact::{self, Over, Plan, Tier};
 use grit::layout::{HOT, HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, HOT_TOTALS};
 
-/// Blocks in the check.
-///
-/// **Not a multiple of any width's `per_block`**, so the array is padded and the padding has to stay
-/// out of the list. A thousand and twenty-four would divide evenly at every width here and prove
-/// less.
 const BLOCKS: u32 = 1000;
 
-/// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -60,12 +21,6 @@ fn device(label: &str) -> Option<Host> {
     }
 }
 
-/// Which blocks are hot, in a pattern that crosses tile boundaries rather than respecting them.
-///
-/// A run, a gap, a lone block, a stretch of nothing wide enough to be a whole tile at any width, and
-/// a tail — so there is at least one tile that is entirely cold, one that is entirely hot, and
-/// several that are neither. A pattern aligned to tiles would agree with a hierarchy that had
-/// mistaken a tile for a block.
 fn hot_blocks() -> Vec<u32> {
     (0..BLOCKS)
         .filter(|&block| match block {
@@ -130,8 +85,6 @@ fn the_hot_list_is_every_hot_block_once_and_in_order() {
             .expect("cleared");
     }
 
-    // The countdown a block carries, not a flag — anything above nothing is hot, and two is what
-    // `live::wake` writes. The padding past `BLOCKS` stays at nought.
     let want = hot_blocks();
     let mut flags = vec![0_u32; sizes[HOT as usize]];
     for &block in &want {
@@ -139,7 +92,6 @@ fn the_hot_list_is_every_hot_block_once_and_in_order() {
     }
     resident.write(HOT as usize, &flags).expect("hot");
 
-    // Something recognisable in the list, so a slot nobody wrote is not mistaken for a block.
     let untouched = u32::MAX;
     resident
         .write(
@@ -155,7 +107,6 @@ fn the_hot_list_is_every_hot_block_once_and_in_order() {
         want.len() as f64 * 100.0 / f64::from(plan.blocks)
     );
 
-    // Twice, because the scan writes over its own input and the second frame is where that shows.
     for pass in 1..=2 {
         resident.frame(&groups).expect("dispatched");
 
@@ -219,19 +170,6 @@ fn the_hot_list_is_every_hot_block_once_and_in_order() {
     );
 }
 
-/// [`Plan::cold`] is the number `live::mark` computes for itself, at every width.
-///
-/// # Why this is worth a test of its own
-///
-/// The kernel does not call it. `live.rs` works the dump slot out in lanes — `blocks.div_ceil(
-/// per_block) * per_block` — and a comment there says `compact::Plan::cold` is "the same number,
-/// arrived at from the other side". That was an assertion in prose and nothing checked it: `cold`
-/// is `tiles × per_block`, so the two agree only while `tiles` is `blocks` rounded up to a whole
-/// number of them. A `tiles` derived from quads instead would leave the host and the device naming
-/// different slots, and the symptom would be one hot block listed every frame for ever.
-///
-/// **This is arithmetic on the host**, so it covers the widths this machine has no device to run —
-/// four, eight, sixteen and sixty-four lanes are checked here and nowhere else.
 #[test]
 fn the_dump_slot_is_the_same_number_the_kernel_works_out() {
     for width in [4_u32, 8, 16, 32, 64] {

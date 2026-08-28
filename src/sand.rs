@@ -1,65 +1,3 @@
-//! Falling sand, on a partition where the race cannot happen.
-//!
-//! # The problem every GPU sand simulation has
-//!
-//! Two cells want to move into the same empty one. On a CPU the loop order decides; on a GPU
-//! nothing does, and the usual answers are atomics, a priority pass, or double buffering with a
-//! tie-break — all of which cost more than the physics.
-//!
-//! This one has no race to resolve, because **no invocation writes outside its own 2×2 block**. The
-//! grid is partitioned into blocks, each block is read and rewritten by one invocation, and the
-//! partition's origin alternates between frames so material can cross a boundary on the next step.
-//! That is the Margolus neighbourhood, and it is the reason a block cellular automaton is what a
-//! parallel machine wants: conservation and locality fall out of the arrangement rather than being
-//! enforced on top of it.
-//!
-//! ```text
-//!   frame even          frame odd
-//!   ┌──┬──┬──┬──┐       ─┬──┬──┬──┬─
-//!   │ab│ab│ab│ab│        │ab│ab│ab│
-//!   │cd│cd│cd│cd│        │cd│cd│cd│
-//!   ├──┼──┼──┼──┤       ─┼──┼──┼──┼─
-//! ```
-//!
-//! # The rule, as one memory and six conditional swaps
-//!
-//! `a b` on top, `c d` below. Applied in order, and the order matters — a later rule sees what an
-//! earlier one did:
-//!
-//! 0. [`hold`]   the top row writes down what it is standing on, which only this block can see
-//! 1. [`start`]  still water that remembers standing on water, with air along its row, takes it
-//! 2. [`course`] whatever is running goes one cell that way, or stops against what is in the way
-//! 3. [`fall`]   heavier above lighter swaps, straight down, each column
-//! 4. the same again for the other column
-//! 5. [`fall`]   the slump: still blocked below, into the free diagonal
-//! 6. and its mirror
-//!
-//! Three and four give a straight fall; five and six give a pile that slumps instead of standing in
-//! columns; nought through two are what a fluid needs and a solid does not. Every one is a
-//! comparison and a `select`, because `decisions/DR-0003` refuses the branch a sand simulation is
-//! otherwise written with.
-//!
-//! The order is not a preference. Put [`start`] after the falls and the diagonal slump has already
-//! taken every configuration it looks for, so the rule becomes dead code that compiles. Put
-//! [`hold`] after [`start`] and the memory it reads is always a frame older than it needs to be.
-//!
-//! # Everything a cell needs is in its own word
-//!
-//! There is no lookup table in the lane API, so a material's properties have to *be* its number:
-//! see [`WEIGHTS`] for why that makes [`fall`] one comparison rather than one per pair of materials,
-//! [`RUNNING_LEFT`] for how a fluid's direction fits in the same word without disturbing it, and
-//! [`HELD`] for the one bit that is there because the alternative was a race.
-//!
-//! # No conditional writes, and nothing read from outside
-//!
-//! Every cell this pass reads, it writes; every cell it writes, it read. The four stores are
-//! unconditional and land where the four loads came from, so there is nothing to skip and nothing to
-//! skip it with — and, more to the point, **nothing another invocation could be rewriting while this
-//! one looks at it**. That is not decoration: [`HELD`] exists because the obvious way to answer
-//! [`start`]'s question was to read one row further down, and one row further down belongs to
-//! somebody else.
-//! block, because [`start`] has a question that cannot be answered inside four cells.
-
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 use simdr::module::Id;
@@ -67,153 +5,29 @@ use simdr::module::Id;
 pub use crate::layout::{BINDINGS, BRUSH, BRUSH_WORDS, LOOKING, PIXELS};
 use crate::layout::{PARAMS, STATE};
 
-/// Nothing at all: what everything falls into.
 pub const AIR: u32 = 0;
-/// What falls and spreads out flat.
 pub const WATER: u32 = 1;
-/// What falls and heaps up.
 pub const SAND: u32 = 2;
-/// What does not move and nothing moves into.
 pub const WALL: u32 = 3;
 
-/// **The numbers are the weights, and that is the whole of the material table.**
-///
-/// There is no lookup in the lane API — no table, no gather, only arithmetic and selects — so a
-/// material's properties have to *be* its number. Ordering them by weight makes [`fall`] one
-/// comparison instead of one equality per pair of materials: heavier above lighter swaps, whatever
-/// the two are. Sand sinks through water for free, and adding a material after this one costs the
-/// rule nothing as long as it is given the right place in the order.
-///
-/// [`WALL`] is heaviest so nothing can be above it and heavier, and the rule excludes it explicitly
-/// so it never sinks itself.
 pub const WEIGHTS: [u32; 4] = [AIR, WATER, SAND, WALL];
 
-/// Water that is on its way to the left, and to the right.
-///
-/// # Why a fluid needs to remember something and sand does not
-///
-/// [`fall`] gives an angle of repose: a heap slumps into free diagonals and stops at forty-five
-/// degrees. Water has no angle, and **no rule that reads only a 2×2 block can give it one**, because
-/// going flat means moving material sideways at the same height, and a sideways rule that fires
-/// whenever there is room fires just as happily in reverse. A lone drop would step left, then right,
-/// for ever; the work list would never empty and the demo's one real claim would go with it.
-///
-/// The way out is the way actual fluid models take it: a cell that starts moving **keeps** moving.
-/// Water under pressure — water with water directly above it and air beside it — takes a direction
-/// and runs that way one cell a frame until something stops it. Running is not symmetric, so it does
-/// not undo itself, and it ends: a runner stops when it is blocked and starts only where something
-/// is about to fall.
-///
-/// # The word holds both
-///
-/// A second buffer would be a second binding and a second pass over the grid, so the direction lives
-/// in the same word as the material, two bits up:
-///
-/// ```text
-///   word    = material + 4 × direction
-///   material = word mod 4        ...  which is `low_bits(word, 2)`
-///   direction = word ÷ 4         ...  which is a shift
-/// ```
-///
-/// So every comparison in [`fall`] is on the *material*, and a running grain of water weighs exactly
-/// what a still one does — which is what stops the two sinking through each other.
 pub const RUNNING_LEFT: u32 = WATER + 4;
-/// Water on its way to the right. See [`RUNNING_LEFT`].
 pub const RUNNING_RIGHT: u32 = WATER + 8;
 
-/// How many bits of a cell's word are its material.
 const MATERIAL_BITS: u32 = 2;
-/// How many bits are the material and the direction together.
 const CARRIED_BITS: u32 = 4;
-/// The bit a cell sets to remember it was standing on water.
-///
-/// # Why a cell has to remember, when it could just look
-///
-/// [`start`] needs to know whether the cell below is water. For the top row of a block that is `c`
-/// or `d` and the question is free. For the bottom row the answer is one row further down, in
-/// another invocation's block — **and reading it is a race**, because that block is being rewritten
-/// at the same moment. Caught in exactly that form: `tests/live.rs` disagreed at frame nought on an
-/// eight-wide part and agreed on a thirty-two-wide one.
-///
-/// So the answer is written down instead, by the one invocation entitled to write it. A cell is the
-/// top row of a block on one phase and the bottom row on the other, so every cell has this bit
-/// refreshed from the truth every second frame and reads its own copy on the frames in between. One
-/// frame stale, never wrong about whose cell it is.
-///
-/// # Why the top row alone was not enough
-///
-/// Because a bank at forty-five degrees keeps `column − row` constant along its whole length, and a
-/// Margolus block only covers a pair whose column and row parities agree. Measured: water poured
-/// into a basin levelled out to two deep across sixty columns and left a perfect ten-wide pyramid in
-/// the middle that never moved again, on either flank, for four thousand frames.
 pub const HELD: u32 = 1 << CARRIED_BITS;
 
-/// How many bits count the times a cell has taken a direction and got nowhere.
 const TIRED_BITS: u32 = 3;
 
-/// One step of that counter: the bit above [`HELD`].
-///
-/// # Why a fluid needs to be able to give up
-///
-/// [`start`] fires on the one thing a 2×2 block can see — water directly underneath — and that
-/// stands in for "there is somewhere lower to go" almost everywhere. Where it fails is the
-/// remainder: a hundred and twenty-eight cells do not divide into sixty-two columns, and the four
-/// left over sit on a level surface with air beside them, which is indistinguishable from water that
-/// *should* flow. So they take a direction, run until something stops them, and are handed the same
-/// direction again next frame. For ever.
-///
-/// **That is not a cosmetic fault.** The claim this repository exists to make is that the work list
-/// reaches nought when nothing is happening, and a few dozen quads kept awake by cells pacing about
-/// is that claim being false in the only case anyone would check.
-///
-/// No rule reading one block can tell those four cells from the rest — whether there is somewhere
-/// lower is a property of the whole surface. What a rule *can* see is its own history, and this is
-/// that history in three bits: how many times this cell has been given a direction without ever
-/// descending. At [`PATIENCE`] it stops asking, the word stops changing, and the quad goes to sleep.
-///
-/// # What clears it
-///
-/// [`fall`] does, and nothing else has to: *what lands is bare*. A cell that moves down has got
-/// somewhere, which is the whole of what the counter was measuring the absence of — so the rule that
-/// strips a landing cell's direction and memory strips this with them, and it was already written
-/// that way before there was anything here to strip.
 pub const TIRED: u32 = HELD << 1;
 
-/// How many times a cell may take a direction before it stops asking.
-///
-/// The counter saturates rather than wraps, and it does so by never being incremented past this:
-/// [`start`] refuses a cell that has reached it, so the add below it can only ever see a value one
-/// short. A counter that wrapped would make a cell fresh again and the pacing would resume.
-///
-/// # What the number was chosen from
-///
-/// Too small and a cell gives up while the surface under it is still moving, which is not a fluid
-/// that has come to rest but one that has been stopped mid-level. Measured on the basin in
-/// `tests/sand.rs` — a hundred and twenty-eight cells poured into sixty-two columns:
-///
-/// ```text
-///   bits  patience   water lies      still running
-///      1         1   1 to 7 deep                 0     not level, and the test says so
-///      2         3   2 to 3 deep                 0
-///      3         7   2 to 3 deep                 0
-/// ```
-///
-/// So **two bits is the measured minimum and three is what is here**, because what the third buys is
-/// headroom that nothing measures: a cell restarts when something stops it, and how often that
-/// happens over a basin sixty-two columns wide says little about one four thousand wide. The bit is
-/// there to be had — two of material, two of direction, one of memory and three of this is **eight
-/// of the word's thirty-two** — and being stopped mid-level is the failure that a picture does not
-/// show and this test does.
 pub const PATIENCE: u32 = (1 << TIRED_BITS) - 1;
 
-/// What [`running`] gives back for [`RUNNING_LEFT`]. Nought is water going nowhere.
 const LEFTWARD: u32 = 1;
-/// What [`running`] gives back for [`RUNNING_RIGHT`].
 const RIGHTWARD: u32 = 2;
 
-/// The material a word holds, with any direction taken off it.
-///
-/// The mask is [`low_bits`], which is how a crate with no bitwise and spells one.
 pub fn material<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     word: Vector<U32, LANES>,
@@ -221,7 +35,6 @@ pub fn material<const LANES: u32>(
     low_bits::<LANES>(lanes, word, MATERIAL_BITS)
 }
 
-/// Which way a word is running: nought for still, one for leftward, two for rightward.
 pub fn running<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     word: Vector<U32, LANES>,
@@ -231,12 +44,6 @@ pub fn running<const LANES: u32>(
     low_bits::<LANES>(lanes, above, MATERIAL_BITS)
 }
 
-/// Refresh a cell's [`HELD`] bit from what is actually under it.
-///
-/// Called for the top row of a block, where `under` is the cell below inside the same block. The old
-/// bit is dropped by keeping only the material and the direction, which is a mask and therefore a
-/// [`low_bits`]; the new one is a multiplication of two zero-or-ones, because a `Predicate` is not a
-/// value this API combines.
 pub fn hold<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     cell: Vector<U32, LANES>,
@@ -259,20 +66,12 @@ pub fn hold<const LANES: u32>(
     let set = lanes.mul(both, bit)?;
     let kept = lanes.add(carried, set)?;
 
-    // **And the fatigue rides through.** This rebuilds the word from its low bits up, so anything
-    // above the memory has to be put back by hand or a cell would arrive fresh every second frame —
-    // which is exactly how often this is called, and would have made [`TIRED`] count nothing.
     let step = lanes.splat_bits::<U32, LANES>(TIRED)?;
     let worn = tired::<LANES>(lanes, cell)?;
     let worn = lanes.mul(worn, step)?;
     lanes.add(kept, worn)
 }
 
-/// Whether a cell remembers standing on water.
-///
-/// **One bit, and it has to say so.** This used to be the whole of the word above the direction,
-/// which was the same thing right up until [`TIRED`] went in above it — and then every cell that had
-/// ever tried to run would have read as standing on water whatever it was standing on.
 pub fn held<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     cell: Vector<U32, LANES>,
@@ -282,7 +81,6 @@ pub fn held<const LANES: u32>(
     low_bits::<LANES>(lanes, above, 1)
 }
 
-/// How many times this cell has taken a direction without ever getting lower. See [`TIRED`].
 pub fn tired<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     cell: Vector<U32, LANES>,
@@ -292,31 +90,26 @@ pub fn tired<const LANES: u32>(
     low_bits::<LANES>(lanes, above, TIRED_BITS)
 }
 
-/// The same things on the host, so the reference and the kernel cannot drift apart.
 #[must_use]
 pub const fn material_of(word: u32) -> u32 {
     word % (1 << MATERIAL_BITS)
 }
 
-/// The host's [`running`].
 #[must_use]
 pub const fn running_of(word: u32) -> u32 {
     (word >> MATERIAL_BITS) % (1 << MATERIAL_BITS)
 }
 
-/// The host's [`held`]. One bit, for the reason that function gives.
 #[must_use]
 pub const fn held_of(word: u32) -> u32 {
     (word >> CARRIED_BITS) % 2
 }
 
-/// The host's [`tired`].
 #[must_use]
 pub const fn tired_of(word: u32) -> u32 {
     (word >> (CARRIED_BITS + 1)) % (1 << TIRED_BITS)
 }
 
-/// The host's [`hold`].
 #[must_use]
 pub const fn hold_of(word: u32, under: u32) -> u32 {
     let carried = word % HELD;
@@ -328,29 +121,13 @@ pub const fn hold_of(word: u32, under: u32) -> u32 {
     }
 }
 
-/// How big the world is, in cells.
-///
-/// **Both sides powers of two**, so every wrap is a shift and a difference — there is no division
-/// and none is wanted. A grid that was not would need one at every address, four times a quad.
-///
-/// Carried rather than compiled in: the kernels are built from Rust at run time, so the size is an
-/// argument like the subgroup width is. Sixteen million cells and a hundred and thirty thousand are
-/// the same code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grid {
-    /// Cells across.
     pub wide: u32,
-    /// Cells down.
     pub deep: u32,
 }
 
 impl Grid {
-    /// A grid of `wide` by `deep`, both of which must be powers of two.
-    ///
-    /// # Panics
-    ///
-    /// Never — a size that is not a power of two is rounded up to one, because every address in
-    /// this crate is a shift and a grid that broke that would be wrong rather than slow.
     #[must_use]
     pub const fn of(wide: u32, deep: u32) -> Self {
         Self {
@@ -359,39 +136,27 @@ impl Grid {
         }
     }
 
-    /// How many cells there are.
     #[must_use]
     pub const fn cells(self) -> usize {
         self.wide as usize * self.deep as usize
     }
 
-    /// Quads across: half the grid.
     #[must_use]
     pub const fn across(self) -> u32 {
         self.wide / 2
     }
 
-    /// Quads down.
     #[must_use]
     pub const fn down(self) -> u32 {
         self.deep / 2
     }
 
-    /// How many 2×2 quads the grid holds.
     #[must_use]
     pub const fn quads(self) -> u32 {
         self.across() * self.down()
     }
 }
 
-/// One Margolus step: every block read, its four cells rewritten.
-///
-/// The partition's origin comes from the frame number in [`PARAMS`], so the host never writes it —
-/// the device increments the frame itself and the phase is its low bit.
-///
-/// # Errors
-///
-/// [`LaneError::NoMapping`] for a width with no arm, otherwise as the module builder.
 pub fn settle(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
     match subgroup {
         4 => settled::<4>(subgroup, grid),
@@ -406,7 +171,6 @@ pub fn settle(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
     }
 }
 
-/// The step, at a width the caller has matched to the device.
 fn settled<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, crate::compact::BINDINGS))?;
     let uint = kernel.index_type();
@@ -420,14 +184,11 @@ fn settled<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, Lane
     let head = kernel.module().constant_u32(0)?;
     let frame = kernel.load_at(PARAMS, head)?;
 
-    // Where this block's four cells are. Every division here is a shift and every remainder a
-    // difference, because the grid's sides are powers of two — chosen for that reason.
     let (top_left, top_right, bottom_left, bottom_right) = {
         let mut lanes = kernel.lanes()?;
         let which = lanes.splat_id::<U32, LANES>(block)?;
         let now = lanes.splat_id::<U32, LANES>(frame)?;
 
-        // The phase: the frame's low bit, and the origin the partition sits at this step.
         let phase = low_bits::<LANES>(&mut lanes, now, 1)?;
 
         let by_across = lanes.splat_bits::<U32, LANES>(grid.across().trailing_zeros())?;
@@ -462,34 +223,22 @@ fn settled<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, Lane
 
     let settled = {
         let mut lanes = kernel.lanes()?;
-        // Four adopted one by one rather than through a collection, so the four names below are
-        // four bindings and not four indexings that might not be there.
         let a = lanes.splat_id::<U32, LANES>(held[0])?;
         let b = lanes.splat_id::<U32, LANES>(held[1])?;
         let c = lanes.splat_id::<U32, LANES>(held[2])?;
         let d = lanes.splat_id::<U32, LANES>(held[3])?;
 
-        // **Before the falls, and that is not a preference.** The diagonal slump on the fourth line
-        // below takes material from `a` into an empty `d`, so by the time it has run there is no
-        // block left in which water has air below and beside it — which is the exact shape `start`
-        // looks for. Put after, the rule is dead code that compiles, and water is sand.
-        // First the memory, refreshed from what this block can actually see.
         let a = hold::<LANES>(&mut lanes, a, c)?;
         let b = hold::<LANES>(&mut lanes, b, d)?;
 
         let [a, b, c, d] = start::<LANES>(&mut lanes, [a, b, c, d])?;
 
-        // Then whatever is running goes one along its row, and whatever is blocked stops.
         let (a, b) = course::<LANES>(&mut lanes, a, b)?;
         let (c, d) = course::<LANES>(&mut lanes, c, d)?;
 
-        // Straight down, each column.
         let (a, c) = fall::<LANES>(&mut lanes, a, c)?;
         let (b, d) = fall::<LANES>(&mut lanes, b, d)?;
 
-        // And the slump: material still on top, blocked underneath, into the free diagonal. Three
-        // before four, so a block with one free corner and two grains fills it once. Water is
-        // refused it — see `down` for what that refusal buys.
         let (a, d) = fall::<LANES>(&mut lanes, a, d)?;
         let (b, c) = fall::<LANES>(&mut lanes, b, c)?;
 
@@ -503,15 +252,6 @@ fn settled<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, Lane
     kernel.finish()
 }
 
-/// Swap `upper` and `lower` when the first is heavier than the second, and is not a wall.
-///
-/// The whole rule in one shape, used four times: two straight falls and two slumps. What differs
-/// between them is which pair is handed over, which is why there is one of these rather than four.
-///
-/// **One comparison, not one per pair of materials.** Because [`WEIGHTS`] puts the materials in
-/// order, "heavier above lighter" covers sand into air, water into air *and* sand sinking through
-/// water without naming any of them. The second condition is the only special case there is: a wall
-/// is the heaviest thing here, so without it a wall would sink through everything else.
 pub fn fall<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     upper: Vector<U32, LANES>,
@@ -521,13 +261,9 @@ pub fn fall<const LANES: u32>(
     let one = lanes.splat_bits::<U32, LANES>(1)?;
     let none = lanes.splat_bits::<U32, LANES>(0)?;
 
-    // On the material, never on the word: a running grain of water must weigh what a still one
-    // does, or the two would sink through each other for ever.
     let above = material::<LANES>(lanes, upper)?;
     let below = material::<LANES>(lanes, lower)?;
 
-    // Two conditions, multiplied rather than and-ed: a `Predicate` is not a value the lane API
-    // combines, and a product of two zero-or-ones is the conjunction.
     let heavier = lanes.greater_than(above, below)?;
     let movable = lanes.greater_than(wall, above)?;
     let falling = lanes.select(heavier, one, none)?;
@@ -535,24 +271,11 @@ pub fn fall<const LANES: u32>(
     let both = lanes.mul(falling, loose)?;
     let moving = lanes.greater_than(both, none)?;
 
-    // **What lands is bare.** The direction and the memory both go: water that drops off a ledge
-    // arrives with nothing left over, and what it is standing on now is a fresh question the next
-    // block to own it will ask.
     let upper_next = lanes.select(moving, lower, upper)?;
     let lower_next = lanes.select(moving, above, lower)?;
     Ok((upper_next, lower_next))
 }
 
-/// Carry a runner one cell along its row, or stop it if there is no room.
-///
-/// The two halves are mutually exclusive by construction — a leftward runner in the right seat can
-/// only move if the left seat is air, and air is not running anywhere — so both are read off the
-/// same two inputs and applied as one swap.
-///
-/// A runner in the *far* seat of its direction cannot be judged here: the cell it wants is outside
-/// the block, and this rule writes only inside one. It is judged next frame, when the partition has
-/// shifted and it is in the near seat instead. That is the same argument the whole crate rests on,
-/// applied one rule further down.
 pub fn course<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     left: Vector<U32, LANES>,
@@ -590,16 +313,12 @@ pub fn course<const LANES: u32>(
     let either = lanes.add(goes_right, goes_left)?;
     let swapping = lanes.greater_than(either, none)?;
 
-    // Blocked is stopped, and stopping drops the direction and keeps the memory: a runner that has
-    // been brought up short is standing on whatever it was standing on a moment ago.
     let bit = lanes.splat_bits::<U32, LANES>(HELD)?;
     let step = lanes.splat_bits::<U32, LANES>(TIRED)?;
     let halt = |lanes: &mut Lanes<'_>, cell: Vector<U32, LANES>, kind: Vector<U32, LANES>| {
         let memory = held::<LANES>(lanes, cell)?;
         let up = lanes.mul(memory, bit)?;
         let stilled = lanes.add(kind, up)?;
-        // The fatigue too, and this is the one place it matters most: being brought up short is
-        // what the counter is counting, so a halt that dropped it would count nothing at all.
         let worn = tired::<LANES>(lanes, cell)?;
         let worn = lanes.mul(worn, step)?;
         lanes.add(stilled, worn)
@@ -618,21 +337,6 @@ pub fn course<const LANES: u32>(
     Ok((left_next, right_next))
 }
 
-/// Give still water that is standing on water a direction to run in.
-///
-/// # What pressure is, once you have to say it exactly
-///
-/// "Water that should flow sideways" is water with somewhere lower to go, and no rule reading one
-/// 2x2 block can know whether there is somewhere lower - that is a property of the whole surface. So
-/// the rule uses the one local thing that stands in for it: **water directly underneath**.
-///
-/// * Water standing on water is at least two deep, so it is holding something up. It flows.
-/// * Water standing on rock is a puddle one cell deep, or a lone drop. It stays, and that is what
-///   lets [`crate::live::decay`] take the work list back towards nothing.
-///
-/// Where the answer comes from is [`HELD`]: refreshed in the block that owns the cell, read on the
-/// frames in between. All four cells are asked, because a bank at forty-five degrees hides one whole
-/// parity from any rule that needs the pair to be inside the same block.
 pub fn start<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     block: [Vector<U32, LANES>; 4],
@@ -654,8 +358,6 @@ pub fn start<const LANES: u32>(
         let same = lanes.equal(kind, want)?;
         lanes.select(same, one, none)
     };
-    // Still water, and still means not already running - a cell keeps the direction it has rather
-    // than being told a new one every frame.
     let idle = |lanes: &mut Lanes<'_>, cell: Vector<U32, LANES>| {
         let wet = is(lanes, cell, water)?;
         let way = running::<LANES>(lanes, cell)?;
@@ -692,10 +394,6 @@ pub fn start<const LANES: u32>(
     let c_free = is(lanes, c, air)?;
     let d_free = is(lanes, d, air)?;
 
-    // **And a fourth condition: that this cell has not already tried and got nowhere.** See
-    // [`TIRED`] for what that is for. It is a condition on the cell's own past rather than on its
-    // neighbourhood, which is the only kind of thing left for a rule that has read every cell it is
-    // allowed to read and still cannot tell a runner from a remainder.
     let willing = |lanes: &mut Lanes<'_>, cell: Vector<U32, LANES>| {
         let worn = tired::<LANES>(lanes, cell)?;
         let done = lanes.splat_bits::<U32, LANES>(PATIENCE)?;
@@ -721,17 +419,11 @@ pub fn start<const LANES: u32>(
                 when: Vector<U32, LANES>,
                 way: Vector<U32, LANES>| {
         let fires = lanes.greater_than(when, none)?;
-        // The direction replaces whatever the word carried, and the memory bit rides along, because
-        // a cell that starts running is still standing on the same thing it was.
         let bit = held::<LANES>(lanes, cell)?;
         let up = lanes.splat_bits::<U32, LANES>(HELD)?;
         let kept = lanes.mul(bit, up)?;
         let running = lanes.add(way, kept)?;
 
-        // **One higher, and it cannot wrap.** A cell only reaches here with fewer than [`PATIENCE`]
-        // behind it, because that is the fourth condition above — so this add tops out at the
-        // largest value the counter holds and stays there. A counter that wrapped would hand the
-        // cell its patience back and the pacing would start again.
         let step = lanes.splat_bits::<U32, LANES>(TIRED)?;
         let worn = tired::<LANES>(lanes, cell)?;
         let worn = lanes.add(worn, one)?;
@@ -747,11 +439,6 @@ pub fn start<const LANES: u32>(
     ])
 }
 
-/// A cell's index from its column and row, both wrapped into the grid.
-///
-/// The grid is a torus, which is what makes every edge case disappear: a block whose origin sits on
-/// the last column reads the first, and nothing has to be clamped or skipped. A wall along the
-/// bottom row is what stops sand actually falling through — geometry, not a special case.
 pub fn at<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     grid: Grid,
@@ -766,9 +453,6 @@ pub fn at<const LANES: u32>(
     lanes.add(along, column)
 }
 
-/// The low `bits` of a value — a mask, spelled by an engine whose lane API has no bitwise and.
-///
-/// Down and back up, and the difference: `v − ((v >> bits) << bits)`.
 pub fn low_bits<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     value: Vector<U32, LANES>,
@@ -783,10 +467,6 @@ pub fn low_bits<const LANES: u32>(
     lanes.add(value, away)
 }
 
-/// The same step on the host, block by block.
-///
-/// **Written from the rule rather than from the kernel**, and in the same order, because the order
-/// is what is being checked: rule three sees what rule one did.
 #[must_use]
 pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
     let mut out = cells.to_vec();
@@ -809,8 +489,6 @@ pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
             *slot = out.get(place).copied().unwrap_or(WALL);
         }
 
-        // Written from the rule rather than from the kernel — the two agree because they were
-        // derived from the same four lines above, not because one was transcribed from the other.
         let put = |cells: &mut [u32; 4], at: usize, value: u32| {
             if let Some(slot) = cells.get_mut(at) {
                 *slot = value;
@@ -818,7 +496,6 @@ pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
         };
         let read = |cells: &[u32; 4], at: usize| cells.get(at).copied().unwrap_or(WALL);
 
-        // `course`: a runner moves one along its row, or stops against what is in the way.
         let along = |cells: &mut [u32; 4], left: usize, right: usize| {
             let (here, there) = (read(cells, left), read(cells, right));
             let goes_right = running_of(here) == RIGHTWARD;
@@ -846,18 +523,14 @@ pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
                 put(cells, right, kept_right);
             }
         };
-        // `hold`: the top row remembers what it is standing on, which only this block can see.
         let (top, under) = (read(&cells, 0), read(&cells, 2));
         put(&mut cells, 0, hold_of(top, under));
         let (top, under) = (read(&cells, 1), read(&cells, 3));
         put(&mut cells, 1, hold_of(top, under));
 
-        // `start`: still water that remembers standing on water, with air along its row.
         let (a, b) = (read(&cells, 0), read(&cells, 1));
         let (c, d) = (read(&cells, 2), read(&cells, 3));
         let idle = |word: u32| material_of(word) == WATER && running_of(word) == 0;
-        // `held_of` is one or nought and `tired_of` is below `PATIENCE` here, so the words written
-        // below are the whole of what the rule produces rather than a common case of it.
         let ready = |word: u32| idle(word) && held_of(word) != 0 && tired_of(word) < PATIENCE;
         let started = |word: u32, way: u32| way + HELD + (tired_of(word) + 1) * TIRED;
         if ready(a) && material_of(b) == AIR {
@@ -876,8 +549,6 @@ pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
         along(&mut cells, 0, 1);
         along(&mut cells, 2, 3);
 
-        // `fall` and `down`: heavier above lighter swaps, whatever lands is still, and the diagonal
-        // refuses anything as light as water.
         let moved = |cells: &mut [u32; 4], upper: usize, lower: usize| {
             let (up, low) = (read(cells, upper), read(cells, lower));
             let (above, below) = (material_of(up), material_of(low));
@@ -901,20 +572,8 @@ pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
     out
 }
 
-/// How wide a brush dispatch is, in cells each way.
-///
-/// **A box around the pointer, not a pass over the grid.** The brush used to visit every cell and
-/// ask whether it was near — one load, one compare and one store apiece, which at sixteen million
-/// cells is as much work as the simulation. The pointer is somewhere; only the cells around it can
-/// be painted; so only those are dispatched. A thousand and twenty-four invocations, whatever the
-/// world is.
 pub const BOX: u32 = 32;
 
-/// Pour whatever the brush names into every empty cell of a box around it.
-///
-/// # Errors
-///
-/// As [`settle`].
 pub fn brush(subgroup: u32, grid: Grid, waking: bool) -> Result<Vec<u32>, LaneError> {
     match subgroup {
         4 => brushed::<4>(subgroup, grid, waking),
@@ -929,7 +588,6 @@ pub fn brush(subgroup: u32, grid: Grid, waking: bool) -> Result<Vec<u32>, LaneEr
     }
 }
 
-/// The brush, at a width the caller has matched to the device.
 fn brushed<const LANES: u32>(
     subgroup: u32,
     grid: Grid,
@@ -955,7 +613,6 @@ fn brushed<const LANES: u32>(
     let how_wide = word(&mut kernel, 2)?;
     let what_of = word(&mut kernel, 3)?;
 
-    // Which cell of the box this invocation owns, and where that is in the world.
     let (cell, column, row) = {
         let mut lanes = kernel.lanes()?;
         let within = lanes.splat_id::<U32, LANES>(seat)?;
@@ -996,8 +653,6 @@ fn brushed<const LANES: u32>(
         let one = lanes.splat_bits::<U32, LANES>(1)?;
         let none = lanes.splat_bits::<U32, LANES>(0)?;
 
-        // The distance, squared on both sides so there is no square root, and squared from a
-        // difference so there is no sign either: `(x − bx)²` is the same whichever way it wrapped.
         let away_x = lanes.mul(bx, minus)?;
         let away_y = lanes.mul(by_row, minus)?;
         let dx = lanes.add(column, away_x)?;
@@ -1006,7 +661,6 @@ fn brushed<const LANES: u32>(
         let down_sq = lanes.mul(dy, dy)?;
         let far = lanes.add(across_sq, down_sq)?;
 
-        // Three conditions, multiplied: inside the brush, empty here, and something to pour.
         let inside = lanes.greater_than(reach, far)?;
         let empty = lanes.equal(there, air)?;
         let pouring = lanes.greater_than(material, none)?;
@@ -1022,8 +676,6 @@ fn brushed<const LANES: u32>(
 
     kernel.store_at(STATE, cell.id(), painted.id())?;
 
-    // **A painted cell has to be looked at**, and by the quads either side of it, because the
-    // partition shifts next frame. Without this, poured sand lands and is never in a work list.
     if waking {
         let changed = {
             let mut lanes = kernel.lanes()?;
@@ -1059,25 +711,13 @@ fn brushed<const LANES: u32>(
     kernel.finish()
 }
 
-/// How much of the world the window shows.
-///
-/// **A window rather than the whole thing.** Painting sixteen million cells and copying them back is
-/// sixty-seven megabytes a frame — around thirty-eight milliseconds on this machine, against a
-/// hundred and sixty *micro*seconds for the simulation that produced them. At that size the picture,
-/// not the physics, is what stops the world being watchable, and a viewport is the only honest fix:
-/// the cost of looking becomes the size of the window instead of the size of the world.
-///
-/// Both sides powers of two, for the reason [`Grid`]'s are — every address is a shift.
 #[derive(Debug, Clone, Copy)]
 pub struct View {
-    /// Cells across the window shows.
     pub wide: u32,
-    /// Cells down.
     pub deep: u32,
 }
 
 impl View {
-    /// A window of `wide` by `deep`, each rounded up to a power of two.
     #[must_use]
     pub const fn of(wide: u32, deep: u32) -> Self {
         Self {
@@ -1086,22 +726,12 @@ impl View {
         }
     }
 
-    /// How many pixels it holds.
     #[must_use]
     pub const fn pixels(self) -> usize {
         self.wide as usize * self.deep as usize
     }
 }
 
-/// Turn the visible part of the grid into a picture: one word a pixel, as `0RGB`.
-///
-/// One invocation a *pixel*, not a cell. Where the window sits comes from [`LOOKING`] — the host's
-/// two words, like the brush's four — so panning costs a write of eight bytes and no recompilation,
-/// and the grid being a torus means the corner can be anywhere without an edge case.
-///
-/// # Errors
-///
-/// As [`settle`].
 pub fn paint(subgroup: u32, grid: Grid, view: View) -> Result<Vec<u32>, LaneError> {
     match subgroup {
         4 => painted::<4>(subgroup, grid, view),
@@ -1116,7 +746,6 @@ pub fn paint(subgroup: u32, grid: Grid, view: View) -> Result<Vec<u32>, LaneErro
     }
 }
 
-/// The picture, at a width the caller has matched to the device.
 fn painted<const LANES: u32>(subgroup: u32, grid: Grid, view: View) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -1132,8 +761,6 @@ fn painted<const LANES: u32>(subgroup: u32, grid: Grid, view: View) -> Result<Ve
     let from_x = kernel.load_at(PARAMS, first)?;
     let from_y = kernel.load_at(PARAMS, second)?;
 
-    // Pixel to cell: split the pixel index across the *window*, then offset by the corner and wrap
-    // into the grid. `at` does the wrapping, so a window hanging off the right edge shows the left.
     let cell = {
         let mut lanes = kernel.lanes()?;
         let seat = lanes.splat_id::<U32, LANES>(pixel)?;
@@ -1152,7 +779,6 @@ fn painted<const LANES: u32>(subgroup: u32, grid: Grid, view: View) -> Result<Ve
     let colour = {
         let mut lanes = kernel.lanes()?;
         let word = lanes.splat_id::<U32, LANES>(held)?;
-        // On the material, so running water is the same blue as still water is.
         let there = material::<LANES>(&mut lanes, word)?;
 
         let water = lanes.splat_bits::<U32, LANES>(WATER)?;
@@ -1163,8 +789,6 @@ fn painted<const LANES: u32>(subgroup: u32, grid: Grid, view: View) -> Result<Ve
         let grain = lanes.splat_bits::<U32, LANES>(0x00D9_B36A)?;
         let stone = lanes.splat_bits::<U32, LANES>(0x0044_4A52)?;
 
-        // A chain of selects rather than a table: four materials is three questions, and the lane
-        // API has no gather to make it anything else.
         let is_water = lanes.equal(there, water)?;
         let is_sand = lanes.equal(there, sand)?;
         let is_wall = lanes.equal(there, wall)?;
@@ -1177,7 +801,6 @@ fn painted<const LANES: u32>(subgroup: u32, grid: Grid, view: View) -> Result<Ve
     kernel.finish()
 }
 
-/// Which word of [`PARAMS`] the window's corner lives in, as a number a constant can be made from.
 fn looking(part: usize) -> u32 {
     u32::try_from(LOOKING + part).unwrap_or(u32::MAX)
 }

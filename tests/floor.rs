@@ -1,18 +1,3 @@
-//! What Vulkan charges before any arithmetic happens.
-//!
-//! Every timing in this repository is a host clock around a submit and a fence, divided by however
-//! many frames were in the submission. That is the right number for a caller — it is what a caller
-//! waits — but it is a *sum* of two very different things, and nothing here has ever taken them
-//! apart:
-//!
-//! * what a submission costs once, however much is in it;
-//! * what one more frame inside it costs.
-//!
-//! So this varies the only thing that separates them, which is how many frames go into one
-//! submission, and reads the two off the line. The intercept is the round trip; the slope is a
-//! frame. Everything is a kernel that writes one word, so what is left is Vulkan.
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::time::{Duration, Instant};
@@ -21,19 +6,12 @@ use grit::{Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
-/// How many passes the probe holds.
 const PASSES: usize = 8;
 
-/// How many frames go into one submission, across the sweep.
 const TIMES: [u32; 6] = [1, 2, 5, 10, 20, 40];
 
-/// How many times each point is measured, of which the best is kept.
-///
-/// Contention only ever adds, so the smallest reading is the one least contaminated. The same
-/// argument `tests/waiting.rs` makes at more length.
 const TRIES: usize = 9;
 
-/// A kernel that writes one word. As close to nothing as a dispatch can be and still be one.
 fn nothing(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 1))?;
     let head = kernel.module().constant_u32(0)?;
@@ -41,20 +19,6 @@ fn nothing(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     kernel.finish()
 }
 
-/// Open a device, or say why not and hand back nothing.
-///
-/// # Why this file stops when `CI` is set
-///
-/// Everything below is a measurement, and every one of them is a comparison between two wall-clock
-/// numbers a few hundred nanoseconds apart — a submission against a frame in it, a barrier against a
-/// dispatch, a pass the device switched off against one it left on. A shared runner is contended by
-/// somebody else's job, and those differences do not survive that.
-///
-/// **A check that fails for a reason unrelated to the code is a check that teaches everyone to
-/// ignore red.** `simdr`'s `session.rs` reached the same conclusion about the same kind of number
-/// and its CI states it outright: measurements are among the things that do not travel. So this
-/// skips loudly rather than asserting into noise, and the figures it exists to take are taken on a
-/// machine whose clock means something.
 fn device(label: &str) -> Option<Host> {
     if std::env::var_os("CI").is_some() {
         eprintln!("SKIPPED {label}: every check here is a wall-clock comparison and CI is set");
@@ -73,7 +37,6 @@ fn device(label: &str) -> Option<Host> {
     }
 }
 
-/// The best of [`TRIES`] whole submissions of `times` frames, in nanoseconds.
 fn whole(held: &mut grit::Resident<'_>, stages: &[&[Groups]], times: u32) -> f64 {
     let mut best = Duration::MAX;
     for _ in 0..TRIES {
@@ -84,7 +47,6 @@ fn whole(held: &mut grit::Resident<'_>, stages: &[&[Groups]], times: u32) -> f64
     best.as_nanos() as f64
 }
 
-/// A least-squares line through the points, as (intercept, slope) in nanoseconds.
 fn line(points: &[(f64, f64)]) -> (f64, f64) {
     let n = points.len() as f64;
     let mean_x = points.iter().map(|&(x, _)| x).sum::<f64>() / n;
@@ -98,14 +60,8 @@ fn line(points: &[(f64, f64)]) -> (f64, f64) {
     (mean_y - slope * mean_x, slope)
 }
 
-/// How many indirect passes the switch sweep covers.
 const SWITCHED: [usize; 6] = [1, 2, 4, 8, 16, 32];
 
-/// The best of [`TRIES`] frames of `n` indirect passes in one stage, in device nanoseconds.
-///
-/// Every pass reads its own workgroup count out of binding 1, three words apart, exactly as
-/// [`grit::compact::Plan::listed`] does. `live` is what the host puts there — but the recording
-/// cannot tell, which is the point: the command buffer is the same either way.
 fn switched(host: &Host, width: u32, n: usize, live: bool) -> f64 {
     let module = nothing(width).expect("a kernel");
     let modules: Vec<&[u32]> = vec![&module; n];
@@ -138,11 +94,6 @@ fn switched(host: &Host, width: u32, n: usize, live: bool) -> f64 {
     best
 }
 
-/// The best of [`TRIES`] frames of `n` passes in `n` stages, in device nanoseconds.
-///
-/// One pass a stage, so what the slope holds is a barrier and a dispatch together. `writes` is
-/// whether the pass is marked `Groups::Counting` — which is what makes `Resident` name
-/// `DRAW_INDIRECT` in the barrier *after* it, and is the only difference between the two sweeps.
 fn spread(host: &Host, width: u32, n: usize, writes: bool) -> f64 {
     let module = nothing(width).expect("a kernel");
     let modules: Vec<&[u32]> = vec![&module; n];
@@ -189,8 +140,6 @@ fn what_a_submission_costs_before_it_holds_anything() {
     let mut held = host.resident(&[1], &every).expect("a device buffer");
     held.write(0, &[0]).expect("a word");
 
-    // Three shapes over the same eight passes: none of them running, all of them in one stage, and
-    // all of them in a stage each. The differences are a dispatch and a barrier.
     let idle = [Groups::Fixed(0); PASSES];
     let busy = [Groups::Fixed(1); PASSES];
     let together: [&[Groups]; 1] = [&busy];
@@ -207,7 +156,6 @@ fn what_a_submission_costs_before_it_holds_anything() {
     let mut fused = Vec::new();
     let mut split = Vec::new();
     for times in TIMES {
-        // Warm each shape, so the first point does not pay for a pipeline the driver has not seen.
         held.staged_frames(&none, times).expect("a warm");
         held.staged_frames(&together, times).expect("a warm");
         held.staged_frames(&apart, times).expect("a warm");
@@ -254,11 +202,6 @@ fn what_a_submission_costs_before_it_holds_anything() {
             / 1000.0
     );
 
-    // **And what it costs to ask the device for one number**, which is the thing this whole crate
-    // is arranged to avoid: `compact::prepare` exists so that a workgroup count never comes back to
-    // the host. A read is a recorded copy, a submission, a fence and a map — the submission above
-    // plus whatever four bytes cost — and the argument for `prepare` has always been priced at "a
-    // round trip, about a hundred microseconds". That number is a round trip *that moves data*.
     let mut best = Duration::MAX;
     for _ in 0..TRIES {
         let clock = Instant::now();
@@ -279,10 +222,6 @@ fn what_a_submission_costs_before_it_holds_anything() {
         empty_once / 1000.0
     );
 
-    // **The check that the device clock measures the device.** A submission holding nothing takes
-    // 35-42 us of host time and does no work at all, so its timestamps have to say so; the same
-    // submission with eight dispatches and seven barriers in it has to say more. If the two came
-    // back alike, the query would be measuring the round trip -- which the host clock already did.
     held.staged_frames(&none, 20).expect("a warm");
     let idle_card = held.on_device();
     held.staged_frames(&apart, 20).expect("a warm");
@@ -296,9 +235,6 @@ fn what_a_submission_costs_before_it_holds_anything() {
         );
     }
 
-    // **The claims, and they are shapes rather than numbers.** A number from this machine on this
-    // day is not a thing to assert on; that a submission costs more than a frame inside it, and
-    // that a barrier costs more than a dispatch, are.
     assert!(
         empty_once > 10_000.0,
         "a submission cost {empty_once} ns before holding anything, which is too little to be a \
@@ -319,17 +255,6 @@ fn what_a_submission_costs_before_it_holds_anything() {
         "eight dispatches cost {fused_each} ns and none cost {empty_each} ns, so a dispatch is free"
     );
 
-    // **What a pass costs when the device decided it should not run**, which is the one price this
-    // file had never taken. `Groups::Fixed(0)` is not recorded at all — `Resident` drops it and
-    // `tests/dispatch.rs` checks that it does. A `Groups::From` whose count the device wrote *is*
-    // recorded, because the host does not know what the count says: the command buffer holds a
-    // dispatch that turns out to launch nothing.
-    //
-    // It is the price of a branch not taken. The count buffer can be written by a kernel, so a
-    // frame that records every path it could take and lets the device choose pays this once per
-    // path per frame. Against a barrier's thousand nanoseconds that would be a few paths at most.
-    //
-    // **In one stage, not eight**, so what the slope holds is dispatches and not barriers.
     println!("\n  {:>7}  {:>12}  {:>12}", "passes", "off (ns)", "on (ns)");
     let mut off = Vec::new();
     let mut on = Vec::new();
@@ -352,20 +277,6 @@ fn what_a_submission_costs_before_it_holds_anything() {
         "a pass costing nothing at all means the sweep measured something other than passes: \
          {off_each:.0} and {on_each:.0} ns"
     );
-    // **This used to assert that the switched-off pass is the cheaper one, and that is not a fact
-    // about this crate.** It is 46 ns against 120 on an RTX 4080 and 99 against 89 on the integrated
-    // Radeon beside it, three runs each and stable to a nanosecond or two — so the assertion held on
-    // one device and failed on the other, and a machine with only the second would have been told
-    // that `Resident` was broken.
-    //
-    // What the assertion was for is real and is now checked where it can be: that a count of nought
-    // in a buffer stops the pass that reads it is `tests/dispatch.rs`'s
-    // `a_count_of_nought_in_a_buffer_stops_the_pass_that_reads_it`, which asks what is in the buffer
-    // afterwards rather than how long it took. **A mechanism proved by a stopwatch is proved only on
-    // the hardware the stopwatch was held on.**
-    //
-    // What is left here is the measurement, printed with its sign said out loud, because which way
-    // round it comes out is the interesting part and there is no number that is right on both.
     if off_each < on_each {
         println!(
             "  the switched-off pass is the cheaper one here, by {:.0} ns a pass",
@@ -385,15 +296,6 @@ fn what_a_submission_costs_before_it_holds_anything() {
         (split_each - fused_each) / (PASSES - 1) as f64
     );
 
-    // **And what it costs to let the device write that count**, which is not the dispatch but the
-    // barrier behind it. `Resident` names `DRAW_INDIRECT` in the barrier after a stage holding a
-    // `Groups::Counting`, because a count the device wrote has to be made visible to the commands
-    // that read it. Both sweeps below run one workgroup a pass, one pass a stage; the only
-    // difference is whether the pass says it wrote a count.
-    //
-    // It is the number that decides whether a frame can switch its own passes off. Doing so means
-    // every gated count is written by a kernel, which puts one of these behind every stage that
-    // writes one — so the saving of 73 ns a dispatch is set against whatever this is.
     let mut wide = Vec::new();
     let mut narrow = Vec::new();
     for count in [1_usize, 2, 4, 8, 16] {

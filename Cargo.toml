@@ -45,7 +45,6 @@ default = ["window"]
 window = ["dep:minifb"]
 
 [lints.rust]
-missing_docs = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]

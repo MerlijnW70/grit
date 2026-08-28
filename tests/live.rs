@@ -1,21 +1,3 @@
-//! The wired loop against the whole grid, frame for frame.
-//!
-//! # The one check that matters, and why it is not a reference
-//!
-//! Everything else in this crate compares a device against a host that computes the same thing a
-//! different way. That cannot work here: a host reference for the wake set would derive it from the
-//! same rule the kernel does, agree perfectly, and be wrong in the same place.
-//!
-//! So the comparison is against **a different algorithm**. The same pour is run twice: once through
-//! the work list, and once by stepping every quad in the grid whether it needs it or not. The second
-//! is obviously correct and obviously slow, and it knows nothing about waking. If the two grids
-//! agree cell for cell on every frame, the wake set missed nothing — because anything it missed is a
-//! grain that stopped in one run and kept falling in the other.
-//!
-//! That is the whole argument for compaction stated as a test: *the list is allowed to be shorter,
-//! and not allowed to be different.*
-
-// A test may panic — that is how it reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::compact::Plan;
@@ -24,33 +6,17 @@ use grit::sand::{self, AIR, Grid, SAND, WALL, WATER};
 use grit::sweep;
 use grit::{Groups, Host, Resident};
 
-/// The world under test.
 const WIDE: u32 = 512;
 const DEEP: u32 = 256;
 
-/// How many frames the two runs are compared over.
-///
-/// **Enough that the list reaches nought**, which is what the last assertion here demands and what a
-/// scene with water in it takes a while to do: a runner moves one cell a frame, and levelling a pool
-/// five hundred columns wide is thousands of them. Measured on this scene — the list fell to nine at
-/// four thousand frames and to nought between four thousand and four and a half. Six is that with
-/// margin, and costs the test about four seconds.
 const FRAMES: u32 = 6000;
 
-/// How long the pour lasts, in frames.
 const POURING: u32 = 90;
 
-/// How many frames the larger check runs.
-///
-/// Long enough to be well past the pour and into the settling, which is where the disagreement this
-/// size exists to catch appears — and short enough that eight times the grid does not cost eight
-/// times six thousand frames.
 const SETTLING: u32 = 400;
 
-/// And how long the water lasts after it, in frames.
 const WETTING: u32 = 180;
 
-/// Open a device, or say why not and hand back nothing.
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -65,7 +31,6 @@ fn device(label: &str) -> Option<Host> {
     }
 }
 
-/// A box with a floor, two sides, and a shelf to pile against.
 fn room(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
     for row in 0..grid.deep {
@@ -80,15 +45,6 @@ fn room(grid: Grid) -> Vec<u32> {
     cells
 }
 
-/// The brush the two runs share, so the only difference between them is the dispatch.
-///
-/// **Sand first and then water**, because they fail differently and this test used to see only one
-/// of them. Sand is what proves the list can reach nothing: a heap stops, and a wake rule keyed to
-/// movement stops with it. Water is what proves the list is never *wrong*: a runner crosses the
-/// world sideways through cells that are not changing, which is exactly the case a movement-keyed
-/// rule would lose — and, since `sand::TIRED` went in, the case where a cell's own history decides
-/// whether it moves. A rule that reads history is a rule with state, and state is the thing a
-/// listed run and a whole-grid run can disagree about.
 fn brushing(frame: u32) -> [u32; 4] {
     let material = match frame {
         0..POURING => SAND,
@@ -98,11 +54,6 @@ fn brushing(frame: u32) -> [u32; 4] {
     [190, 30, 36, material]
 }
 
-/// One arrangement of the loop against the whole grid, cell for cell.
-///
-/// **Both arrangements have to be run.** `live::wired` picks between them on `plan.blocks`, and the
-/// grid here is 128 blocks — well under `live::COARSE_FROM` — so leaving the choice to `wired` would
-/// mean the coarse hierarchy was never reached by the strongest check in the repository.
 fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bool) {
     let Some(host) = device("live") else {
         return;
@@ -125,13 +76,11 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
         plan.blocks
     );
 
-    // The wired loop, in the order `live::wired` insists on — with the coarse hierarchy or without.
     let (wired, wired_stages) =
         grit::live::arranged(width, grid, &plan, None, coarse).expect("wired");
     let wired_groups: Vec<&[Groups]> = wired_stages.iter().map(Vec::as_slice).collect();
     let over_box = sand::BOX * sand::BOX / width;
 
-    // The whole grid, which knows nothing about waking.
     let whole = [
         grit::live::tick(width).expect("tick"),
         sand::brush(width, grid, false).expect("brush"),
@@ -153,17 +102,10 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
     for held in [&mut live, &mut full] {
         clear_all(held, &sizes);
         held.write(STATE as usize, &start).expect("state");
-        // **The dump base, and leaving it at nought is a buffer overwritten by its own discards.**
-        // Every conditional write in this crate lands here when the condition is false; at nought
-        // that is slot zero of whatever it was avoiding. The frame counter starts one below nought
-        // so the first increment makes it nought.
         held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
             .expect("params");
     }
 
-    // **Seeded, because the first frame has been told nothing.** Every quad awake, every block hot,
-    // and both lists the identity — which is what "look at everything" means when nothing has said
-    // otherwise yet.
     grit::live::seed(&mut live, grid, &plan).expect("seeded");
 
     let mut listed_total = 0_u64;
@@ -184,7 +126,6 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
         if let Some(at) = there.iter().zip(&here).position(|(a, b)| a != b) {
             let (row, column) = (at as u32 / grid.wide, at as u32 % grid.wide);
 
-            // What the wake set actually said about the quad this cell is in, either phase.
             let phase = frame & 1;
             let quad_x = (column.wrapping_sub(phase)) / 2;
             let quad_y = (row.wrapping_sub(phase)) / 2;
@@ -238,12 +179,6 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
         busiest > 0,
         "the list was never anything but empty, so the pour woke nothing"
     );
-    // **Nought is the right answer, not a failure.** A settled pile has nothing to step, and a wake
-    // rule that could not say so would keep the whole pile in the list forever — which is exactly
-    // what waking on *content* did, at a third of this saving.
-    // **Only where the run is long enough for the pile to stop moving.** A larger grid settles more
-    // slowly, and a check run at a size chosen for something else should not also have to be run
-    // long enough for this one — it would say nothing new and cost the frames to say it.
     if until_quiet {
         assert_eq!(
             smallest, 0,
@@ -254,47 +189,21 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
     }
 }
 
-/// The arrangement `live::wired` picks at this size: over every block, no coarse list.
 #[test]
 fn the_list_is_shorter_and_never_different() {
     against_the_whole_grid(false, Grid::of(WIDE, DEEP), FRAMES, true);
 }
 
-/// The other one, which no grid this test can afford to run would reach on its own.
-///
-/// **The coarse hierarchy is 128 blocks of work here and is not worth its cost at this size** — that
-/// is what `tests/coarse.rs` measures. It is run anyway, because being slower is not the same as
-/// being wrong, and this is the only check that would notice if it were.
 #[test]
 fn the_coarse_list_is_shorter_and_never_different_either() {
     against_the_whole_grid(true, Grid::of(WIDE, DEEP), FRAMES, true);
 }
 
-/// The same check on a grid eight times the size, where the coarse hierarchy is worth its cost.
-///
-/// # What this covers, and what it was written for and does not
-///
-/// The check above runs the coarse arrangement over 128 blocks. `tests/coarse.rs` runs it over 1024
-/// while timing it, and on an integrated Radeon at subgroup 64 the coarse arrangement there is **not
-/// reproducible**: the same program over the same blocks, twice in one process, stepped 1128 quads
-/// and then 1130, or 1125 and then 1130, where every-block holds at 1130 every time. On an RTX 4080
-/// at subgroup 32 it is quiet in eight runs of eight.
-///
-/// **This test was added to catch that and it does not.** Six runs on the same Radeon, at the same
-/// 1024 blocks and 400 frames, agree cell for cell every time. So whatever wanders in the other file
-/// is not the state this one compares — the coarse arrangement computes the same sand, frame for
-/// frame, at the size and the length where its own quad count will not sit still.
-///
-/// It is kept because the coverage it adds is real on its own terms: before it, the strongest check
-/// in this repository ran the coarse hierarchy only at a size where that hierarchy is not worth
-/// using, and being slower is not the same as being wrong. What it does not do is stated here rather
-/// than left for whoever assumes a test named after a bug catches it.
 #[test]
 fn the_coarse_list_agrees_at_a_size_worth_using_it_at() {
     against_the_whole_grid(true, Grid::of(WIDE * 4, DEEP * 4), SETTLING, false);
 }
 
-/// Zero every binding, so nothing carries over from an allocation.
 fn clear_all(held: &mut Resident<'_>, sizes: &[usize; BINDINGS as usize]) {
     for (binding, &words) in sizes.iter().enumerate() {
         if binding == PIXELS as usize {
@@ -304,12 +213,6 @@ fn clear_all(held: &mut Resident<'_>, sizes: &[usize; BINDINGS as usize]) {
     }
 }
 
-/// What the device says it has, against what it says it will allocate at once.
-///
-/// `Host::heap` and `Host::ceiling` answer different questions and a caller sizing a cache wants
-/// the first. They are far apart on a real card — about four gigabytes against sixteen — and a
-/// caller that reached for the ceiling because there was no heap to ask would size its cache to a
-/// quarter of the card without knowing it.
 #[test]
 fn a_host_says_how_much_memory_it_has() {
     let Some(host) = device("a_host_says_how_much_memory_it_has") else {
@@ -326,8 +229,6 @@ fn a_host_says_how_much_memory_it_has() {
         heap >= ceiling,
         "the largest allocation {ceiling} is bigger than the heap {heap} it comes out of"
     );
-    // A device this can run a compute pass on has more than a token's worth of memory. Loose on
-    // purpose: the point is that the number is the heap's and not a placeholder.
     assert!(
         heap >= 64 * 1024 * 1024,
         "a heap of {heap} bytes is not a device this runs on"
