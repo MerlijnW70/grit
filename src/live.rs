@@ -94,6 +94,15 @@ pub fn tick(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 ///
 /// `tests/coarse.rs` measures both arrangements either side of this number, and
 /// `decisions/DR-0003` carries the figures.
+///
+/// # It is a number about one card
+///
+/// The two devices in the machine this was written on disagree about it, and not by a little: on the
+/// Radeon the coarse list is the cheaper arrangement from 64 blocks up, where on the 4080 it is the
+/// dearer one until 2048. At the same 131 072 cells they give opposite answers, so nothing derived
+/// from the subgroup width or from the block-to-quad ratio explains it — the width names *which
+/// card* and not *why*. [`both`] and [`cheaper`] are what a caller uses instead of this when it does
+/// not know the device it is on; `decisions/DR-0019` carries the tables.
 pub const COARSE_FROM: u32 = 2048;
 
 /// Whether a plan of this many blocks is dispatched over the coarse list.
@@ -336,6 +345,155 @@ pub fn arranged(
     }
 
     Ok((passes, groups))
+}
+
+/// Both arrangements in one module list, and a stage list that runs each of them.
+///
+/// What [`both`] hands back, and what [`cheaper`] times.
+pub struct Both {
+    /// Every pass of both arrangements, the coarse one's first.
+    pub passes: Vec<Vec<u32>>,
+    /// The stages that run the coarse arrangement and give the other nothing to do.
+    pub listed: Vec<Vec<crate::Groups>>,
+    /// The stages that run the every-block arrangement and give the other nothing to do.
+    pub every: Vec<Vec<crate::Groups>>,
+}
+
+/// Every count in a stage list turned off, so [`crate::Resident`] drops those passes whole.
+///
+/// A pass whose count is `Fixed(0)` is not recorded and a stage left with nothing in it is dropped,
+/// so the arrangement that is not running costs neither a dispatch nor a barrier. `Groups::From` is
+/// the one count the recorder cannot skip — its value is on the device — so it is replaced rather
+/// than zeroed, which is the same thing said in a way the recorder can see.
+fn silenced(stages: &[Vec<crate::Groups>]) -> Vec<Vec<crate::Groups>> {
+    stages
+        .iter()
+        .map(|stage| stage.iter().map(|_| crate::Groups::Fixed(0)).collect())
+        .collect()
+}
+
+/// Both arrangements over one set of buffers, so a caller can time them against each other.
+///
+/// # Why this is not [`wired`]
+///
+/// [`COARSE_FROM`] is a measurement of one card, and `tests/coarse.rs` is what found out that it
+/// does not travel: on the Radeon in this machine the coarse list is the cheaper arrangement from
+/// 64 blocks up, where on the 4080 it is the dearer one until 2048. No rule fixes that — at the same
+/// 131 072 cells the two cards give opposite answers, so the subgroup width names *which card* and
+/// not *why*. `decisions/DR-0019` carries the tables.
+///
+/// So the only thing that is not a guess is to ask the device, and this is what makes that
+/// affordable: one resident over both arrangements' passes rather than two residents and two copies
+/// of every buffer. At 4096 blocks on a sixty-four-lane part those buffers are the whole of what a
+/// frame owns.
+///
+/// # What it costs, measured
+///
+/// `tests/crossing.rs` pours 2000 frames both ways. Against [`wired`]'s constant, a calibration of
+/// twenty frames an arrangement was worth −135 to −139 ms of 740 on the Radeon at 1024 blocks and
+/// −58 to −59 of 410 at 512; it cost +2 to +8 ms at 64 and 128 blocks, where it picks the
+/// arrangement that is cheaper on the device and dearer on the wall, and +10 to +17 at 2048. On the
+/// 4080 it chose what the constant chose at every size and cost 0.9 to 7.8 ms of 37 to 120.
+///
+/// **So it is offered rather than taken.** A caller that knows its device keeps [`wired`]; one that
+/// does not can pay for the answer.
+///
+/// # Errors
+///
+/// As [`arranged`], for whichever pass of either arrangement could not be built.
+pub fn both(
+    subgroup: u32,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+    picture: Option<sand::View>,
+) -> Result<Both, LaneError> {
+    let (with_passes, with_stages) = arranged(subgroup, grid, plan, picture, true)?;
+    let (without_passes, without_stages) = arranged(subgroup, grid, plan, picture, false)?;
+
+    let mut passes = with_passes;
+    passes.extend(without_passes);
+
+    let mut listed = with_stages.clone();
+    listed.extend(silenced(&without_stages));
+    let mut every = silenced(&with_stages);
+    every.extend(without_stages);
+
+    Ok(Both {
+        passes,
+        listed,
+        every,
+    })
+}
+
+/// Which arrangement was cheaper here, and what saying so cost.
+///
+/// What [`cheaper`] hands back. The two durations are whatever clock `on_device` says they came
+/// from: the device's is per frame, the host's is for the whole budget. Either way they are the two
+/// numbers the choice was made on, so a caller can see how close it was.
+pub struct Cheaper {
+    /// Whether the coarse list was the cheaper of the two.
+    pub coarse: bool,
+    /// What the coarse arrangement cost.
+    pub listed: std::time::Duration,
+    /// What the every-block arrangement cost.
+    pub every: std::time::Duration,
+    /// Whether the two came from the device's own clock rather than the host's.
+    pub on_device: bool,
+}
+
+/// Pour `budget` frames of each arrangement and say which was cheaper.
+///
+/// The resident must already hold a seeded world — [`seed`] and the writes around it — because both
+/// arrangements are timed on it as it stands, one after the other, and the frames they run are
+/// frames of the simulation rather than extra ones.
+///
+/// **Both are warmed first.** A pipeline's first use is carried by the submission that makes it, and
+/// warming only the one timed first hands the other its own warm-up inside the window being
+/// measured. `tests/crossing.rs` was doing exactly that until it was measured and stopped.
+///
+/// # How few frames are enough
+///
+/// `tests/crossing.rs` asks the same question at 1, 5, 20, 60 and 300 frames, five rounds each. One
+/// frame named the wrong arrangement at 64 and 4096 blocks; five agreed with three hundred at every
+/// size on the Radeon; and near the 4080's own crossing at 2048 blocks, 5, 20 and 60 all split
+/// across rounds, which is what two arrangements within a few percent of each other look like.
+/// Twenty is what that measurement supports and it is one submission at the batch `tests/coarse.rs`
+/// uses.
+///
+/// # Errors
+///
+/// As [`crate::Resident::staged_frames`].
+pub fn cheaper(
+    held: &mut crate::Resident<'_>,
+    both: &Both,
+    budget: u32,
+) -> Result<Cheaper, crate::Error> {
+    let listed: Vec<&[crate::Groups]> = both.listed.iter().map(Vec::as_slice).collect();
+    let every: Vec<&[crate::Groups]> = both.every.iter().map(Vec::as_slice).collect();
+
+    held.staged(&listed)?;
+    held.staged(&every)?;
+
+    let clock = std::time::Instant::now();
+    held.staged_frames(&listed, budget)?;
+    let (listed_wall, listed_card) = (clock.elapsed(), held.on_device());
+
+    let clock = std::time::Instant::now();
+    held.staged_frames(&every, budget)?;
+    let (every_wall, every_card) = (clock.elapsed(), held.on_device());
+
+    // **One clock for both sides or neither.** A queue family that counts no timestamps hands back
+    // nothing, and a comparison of one card figure against one host figure is not a comparison.
+    let (with, without, on_device) = match (listed_card, every_card) {
+        (Some(with), Some(without)) => (with, without, true),
+        _ => (listed_wall, every_wall, false),
+    };
+    Ok(Cheaper {
+        coarse: with < without,
+        listed: with,
+        every: without,
+        on_device,
+    })
 }
 
 /// Seed every buffer the loop reads before it has written it, for the first frame.
