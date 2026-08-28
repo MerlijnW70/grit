@@ -25,6 +25,10 @@ pub enum Error {
         needed: usize,
         held: usize,
     },
+    Staged {
+        needed: usize,
+        staging: usize,
+    },
     NoSparse,
     StillInFlight,
     NoSuchTicket {
@@ -67,6 +71,10 @@ impl std::fmt::Display for Error {
                 needed,
                 held,
             } => write!(out, "binding {index} wants {needed} words and holds {held}"),
+            Self::Staged { needed, staging } => write!(
+                out,
+                "a staged write of {needed} words through a staging buffer of {staging}"
+            ),
             Self::WrongPasses { given, held } => {
                 write!(out, "{given} workgroup counts for {held} passes")
             }

@@ -513,6 +513,12 @@ impl Resident<'_> {
         if held.visible {
             return unsafe { self.poke(held.memory, 0, words) }.map(|()| true);
         }
+        if bytes > self.staging.bytes {
+            return Err(Error::Staged {
+                needed: words.len(),
+                staging: (self.staging.bytes as usize) / size_of::<u32>(),
+            });
+        }
         let (handle, staging) = (held.handle, self.staging.memory);
 
         unsafe {
@@ -578,6 +584,12 @@ impl Resident<'_> {
         if held.visible {
             return unsafe { self.poke(held.memory, offset, words) };
         }
+        if bytes > self.staging.bytes {
+            return Err(Error::Staged {
+                needed: words.len(),
+                staging: (self.staging.bytes as usize) / size_of::<u32>(),
+            });
+        }
         let (handle, staging) = (held.handle, self.staging.memory);
 
         unsafe {
@@ -623,10 +635,9 @@ impl Resident<'_> {
             total += bytes;
         }
         if total > self.staging.bytes {
-            return Err(Error::Overrun {
-                index: 0,
+            return Err(Error::Staged {
                 needed: (total as usize) / size_of::<u32>(),
-                held: (self.staging.bytes as usize) / size_of::<u32>(),
+                staging: (self.staging.bytes as usize) / size_of::<u32>(),
             });
         }
 
