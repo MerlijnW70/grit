@@ -34,6 +34,7 @@ pub mod gate;
 pub mod host;
 pub mod layout;
 pub mod live;
+pub mod netlist;
 pub mod resident;
 pub mod sand;
 pub mod sweep;
