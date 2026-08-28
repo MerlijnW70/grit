@@ -15,8 +15,8 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::netlist::{
-    Exam, Fault, Gate, KIND_BITS, KINDS, Netlist, NotAnExam, SOURCE_BITS, SOURCES, TooWide, drawn,
-    turned,
+    Chip, Exam, Fault, Gate, KIND_BITS, KINDS, Netlist, NotAChip, NotAnExam, SOURCE_BITS, SOURCES,
+    TooWide, answered, drawn, turned,
 };
 
 /// The three fields are the whole word, with nothing spare and nothing overlapping.
@@ -644,4 +644,329 @@ fn what_a_refused_table_says() {
         .to_string(),
         "row 9 holds 0x2, which sets a bit past the 1 asked for"
     );
+}
+
+/// Every one of the sixteen kinds, on every one of its four inputs, against the table by hand.
+///
+/// **Sixty-four cases and all of them walked**, because "the kind is the truth table" is either
+/// exactly true or it is a bug that shows up on one function of two — and a spot check of an AND and
+/// an XOR is what would miss it.
+#[test]
+fn a_kind_is_its_own_truth_table() {
+    for kind in 0..16_u32 {
+        for right in 0..2_u32 {
+            for left in 0..2_u32 {
+                let by_hand = (kind >> (left | (right << 1))) & 1;
+                assert_eq!(
+                    answered(
+                        Gate {
+                            kind,
+                            left: 0,
+                            right: 0
+                        },
+                        left,
+                        right
+                    ),
+                    by_hand,
+                    "kind {kind:#06b} on left {left}, right {right}"
+                );
+            }
+        }
+    }
+}
+
+/// The functions that have names, named, so that the numbering is pinned to something readable.
+#[test]
+fn the_gates_that_have_names_answer_what_they_are_called() {
+    let of = |kind: u32| {
+        let gate = Gate {
+            kind,
+            left: 0,
+            right: 0,
+        };
+        [
+            answered(gate, 0, 0),
+            answered(gate, 1, 0),
+            answered(gate, 0, 1),
+            answered(gate, 1, 1),
+        ]
+    };
+    assert_eq!(of(0b0000), [0, 0, 0, 0], "the constant nought");
+    assert_eq!(of(0b1111), [1, 1, 1, 1], "the constant one");
+    assert_eq!(of(0b1000), [0, 0, 0, 1], "and");
+    assert_eq!(of(0b1110), [0, 1, 1, 1], "or");
+    assert_eq!(of(0b0110), [0, 1, 1, 0], "xor");
+    assert_eq!(of(0b1001), [1, 0, 0, 1], "equal");
+    assert_eq!(of(0b1010), [0, 1, 0, 1], "a wire carrying the left input");
+    assert_eq!(of(0b1100), [0, 0, 1, 1], "a wire carrying the right input");
+    assert_eq!(of(0b0101), [1, 0, 1, 0], "not the left input");
+
+    // The kit that a `kinds` of eight actually is, put through the check that enforces it: an xor
+    // is in it and an and is not, which is what the module doc warns a caller about.
+    let eight = Netlist::over(3, 1, 4, 8).expect("netlist");
+    let sat = |kind: u32| {
+        eight.checked(
+            1,
+            Gate {
+                kind,
+                left: 0,
+                right: 1,
+            },
+        )
+    };
+    assert!(sat(0b0110).is_ok(), "an xor is in a kit of eight");
+    assert_eq!(
+        sat(0b1000),
+        Err(Fault::NoSuchKind { kind: 8, kinds: 8 }),
+        "and an and is not"
+    );
+}
+
+/// A pair of arrays that is not a chip is refused, and says which way.
+#[test]
+fn a_pair_of_arrays_that_is_not_a_chip_is_refused() {
+    let shape = Netlist::over(3, 1, 4, 16).expect("netlist");
+    let plain: Vec<u32> = std::iter::repeat_n(
+        Gate {
+            kind: 0b0110,
+            left: 0,
+            right: 1,
+        }
+        .pack(),
+        4,
+    )
+    .collect();
+    assert!(Chip::of(shape, plain.clone(), vec![3]).is_ok());
+
+    assert_eq!(
+        Chip::of(shape, vec![0; 3], vec![3]),
+        Err(NotAChip::Gates {
+            given: 3,
+            wanted: 4
+        })
+    );
+    assert_eq!(
+        Chip::of(shape, plain.clone(), vec![3, 2]),
+        Err(NotAChip::Outputs {
+            given: 2,
+            wanted: 1
+        })
+    );
+    assert_eq!(
+        Chip::of(shape, plain.clone(), vec![4]),
+        Err(NotAChip::NoSuchGate {
+            output: 0,
+            names: 4,
+            gates: 4
+        }),
+        "an answer off a gate that is not there"
+    );
+
+    let mut ahead = plain;
+    ahead[1] = Gate {
+        kind: 0,
+        left: 0,
+        right: 4,
+    }
+    .pack();
+    assert_eq!(
+        Chip::of(shape, ahead, vec![3]),
+        Err(NotAChip::Gate {
+            at: 1,
+            fault: Fault::Ahead {
+                side: 1,
+                names: 4,
+                below: 4
+            }
+        }),
+        "a chip is refused for the same reason a gate is"
+    );
+}
+
+/// The inputs arrive as the word's bits, lowest first.
+#[test]
+fn the_inputs_are_the_words_bits() {
+    let shape = Netlist::over(5, 1, 1, 16).expect("netlist");
+    let chip = Chip::of(
+        shape,
+        vec![
+            Gate {
+                kind: 0b1010,
+                left: 0,
+                right: 0,
+            }
+            .pack(),
+        ],
+        vec![0],
+    )
+    .expect("chip");
+
+    assert_eq!(chip.sourced(0)[..5], [0, 0, 0, 0, 0]);
+    assert_eq!(chip.sourced(1)[..5], [1, 0, 0, 0, 0]);
+    assert_eq!(chip.sourced(0b10101)[..5], [1, 0, 1, 0, 1]);
+    assert_eq!(chip.sourced(31)[..5], [1, 1, 1, 1, 1]);
+}
+
+/// **The five-input exam, sat and passed.** Four exclusive-ors chained is the parity of five.
+///
+/// This is the whole of the file end to end: a shape, gates that are legal in it, a circuit worked
+/// out over every one of the thirty-two input words, and a score against the table the exam holds.
+/// Parity is the function `oracle`'s `NOTEBOOK.md` calls the one with no gradient in it, and by hand
+/// it is four gates.
+#[test]
+fn a_hand_built_chip_passes_the_five_input_parity_exam() {
+    let shape = Netlist::over(5, 1, 4, 16).expect("netlist");
+    let xor = |left: u32, right: u32| {
+        Gate {
+            kind: 0b0110,
+            left,
+            right,
+        }
+        .pack()
+    };
+    // Sources 0..5 are the inputs; gate n's answer is source 5 + n.
+    let chip = Chip::of(
+        shape,
+        vec![
+            xor(0, 1),
+            xor(5, 2), // gate 0 with input two
+            xor(6, 3), // gate 1 with input three
+            xor(7, 4), // gate 2 with input four
+        ],
+        vec![3],
+    )
+    .expect("chip");
+
+    let answers: Vec<u32> = (0..32_u32).map(|word| word.count_ones() & 1).collect();
+    let exam = Exam::of(shape, answers.clone()).expect("exam");
+
+    assert_eq!(chip.table(), answers, "the circuit is the parity of five");
+    assert_eq!(exam.marks(), 32);
+    assert_eq!(exam.scored(&chip.table()), 32, "and it is worth full marks");
+}
+
+/// A chip that is wrong scores what it is worth, and the score is not all-or-nothing.
+#[test]
+fn a_chip_that_is_wrong_scores_what_it_is_worth() {
+    let shape = Netlist::over(5, 1, 4, 16).expect("netlist");
+    // The parity of the first four inputs only, which is right wherever input four is nought.
+    let xor = |left: u32, right: u32| {
+        Gate {
+            kind: 0b0110,
+            left,
+            right,
+        }
+        .pack()
+    };
+    let chip = Chip::of(
+        shape,
+        vec![xor(0, 1), xor(5, 2), xor(6, 3), xor(7, 7)],
+        vec![2],
+    )
+    .expect("chip");
+
+    let answers: Vec<u32> = (0..32_u32).map(|word| word.count_ones() & 1).collect();
+    let exam = Exam::of(shape, answers).expect("exam");
+    assert_eq!(
+        exam.scored(&chip.table()),
+        16,
+        "right on the sixteen words where the fifth input is nought and wrong on the rest"
+    );
+}
+
+/// Three answer bits off one circuit, which is what a `count` exam asks for.
+#[test]
+fn a_chip_can_carry_more_than_one_answer() {
+    let shape = Netlist::over(2, 2, 3, 16).expect("netlist");
+    // The sum of two bits: gate 0 is the low bit, gate 1 the carry, gate 2 spare.
+    let chip = Chip::of(
+        shape,
+        vec![
+            Gate {
+                kind: 0b0110,
+                left: 0,
+                right: 1,
+            }
+            .pack(),
+            Gate {
+                kind: 0b1000,
+                left: 0,
+                right: 1,
+            }
+            .pack(),
+            Gate {
+                kind: 0b0000,
+                left: 0,
+                right: 0,
+            }
+            .pack(),
+        ],
+        vec![0, 1],
+    )
+    .expect("chip");
+
+    // word 0b00 -> 0, 0b01 -> 1, 0b10 -> 1, 0b11 -> 2
+    assert_eq!(chip.table(), vec![0, 1, 1, 2]);
+
+    let exam = Exam::of(shape, vec![0, 1, 1, 2]).expect("exam");
+    assert_eq!(exam.marks(), 8, "four rows of two answers");
+    assert_eq!(exam.scored(&chip.table()), 8);
+}
+
+/// What a refused chip says when it is printed.
+#[test]
+fn what_a_refused_chip_says() {
+    assert_eq!(
+        NotAChip::Gates {
+            given: 3,
+            wanted: 4
+        }
+        .to_string(),
+        "3 gates for a circuit of 4"
+    );
+    assert_eq!(
+        NotAChip::NoSuchGate {
+            output: 0,
+            names: 4,
+            gates: 4
+        }
+        .to_string(),
+        "answer 0 is taken off gate 4, and there are 4"
+    );
+    assert_eq!(
+        NotAChip::Gate {
+            at: 1,
+            fault: Fault::NoSuchKind { kind: 9, kinds: 4 }
+        }
+        .to_string(),
+        "gate 1: kind 9 in a kit of 4"
+    );
+}
+
+/// Every gate a mutation can produce is one the evaluator can run.
+///
+/// The two halves of the file meet here: `drawn` says what a mutation may make, `Chip::of` says what
+/// can be run, and if those two spaces were not the same one the engine would spend its time on
+/// circuits that are refused. Every place, over a walk of the roll space, built into a whole chip.
+#[test]
+fn everything_a_mutation_draws_is_something_a_chip_can_run() {
+    let shape = Netlist::over(5, 1, 32, 16).expect("netlist");
+    for roll in (0..512_u32).chain((u32::MAX - 64)..=u32::MAX) {
+        let gates: Vec<u32> = (0..shape.gates)
+            .map(|at| {
+                drawn(
+                    &shape,
+                    at,
+                    roll.wrapping_add(at.wrapping_mul(2_654_435_761)),
+                )
+                .pack()
+            })
+            .collect();
+        let chip = Chip::of(shape, gates, vec![shape.gates - 1])
+            .unwrap_or_else(|why| panic!("roll {roll} drew a chip that will not run: {why}"));
+        // And it runs: every row of the table is one answer bit and nothing else.
+        for row in chip.table() {
+            assert!(row <= 1, "row {row} is not one answer bit");
+        }
+    }
 }

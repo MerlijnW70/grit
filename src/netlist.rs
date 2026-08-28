@@ -46,11 +46,23 @@
 //! the circuit cannot grow into. What is here is the largest reference field that leaves a byte for
 //! the kind.
 //!
+//! # And a kind is its own truth table
+//!
+//! There is no kit in this file: a gate's kind **is** the four-bit truth table of the gate, so all
+//! sixteen functions of two bits are named by the numbers 0 to 15 and there is nothing to add a kind
+//! to later. [`answered`] is the whole of it.
+//!
+//! That makes [`Netlist::kinds`] a *range* rather than a list, and it is worth saying what that
+//! costs before somebody finds out: a kit of eight is not "and, or, xor and five more", it is the
+//! eight functions whose truth table is below eight — which does **not** include an AND, whose table
+//! is `0b1000`. Sixteen is every function. A caller that wants a chosen handful draws from its own
+//! list and maps it, and this file does not pretend to help.
+//!
 //! # What is not here yet
 //!
-//! **No passes, and therefore no numbers.** This file is the structure and its rule, checked on the
-//! host. Nothing in it has been dispatched, so nothing in it claims a cost. What a gate pass and a
-//! mutation pass are worth belongs to the record that measures them.
+//! **No passes, and therefore no numbers.** This file is the structure, its rule, and the same
+//! circuit worked out on the host — which is what a device pass will be checked against. Nothing in
+//! it has been dispatched, so nothing in it claims a cost.
 
 use std::fmt;
 
@@ -77,7 +89,7 @@ pub const KINDS: u32 = 1 << KIND_BITS;
 /// and source `inputs + n` is gate `n`'s answer. See the module doc for why they are one space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gate {
-    /// Which operation, as an index into whatever kit the caller drew from.
+    /// What it does, as the four-bit truth table of the gate itself — see [`answered`].
     pub kind: u32,
     /// The source its first input reads.
     pub left: u32,
@@ -533,5 +545,197 @@ impl Exam {
                 (!(held ^ wanted) & !past).count_ones()
             })
             .sum()
+    }
+}
+
+/// What a gate answers for two input bits.
+///
+/// # A kind is its own truth table
+///
+/// There is no kit here, no table of names, and nothing to keep in step with a shader. **The kind
+/// *is* the four-bit truth table of the gate**: bit `left | right << 1` of it is what the gate
+/// answers for those two inputs. So `0b1000` is an AND, `0b1110` an OR, `0b0110` an XOR, `0b1010`
+/// a wire that passes its left input on, and `0b0000` and `0b1111` are the two constants.
+///
+/// That is not a shorthand for a kit — it is *every* function of two bits, all sixteen of them,
+/// with no name anywhere and nothing to add a kind to later. A kit is then a range rather than a
+/// list: [`Netlist::kinds`] of sixteen draws from all of them, and a smaller number draws from the
+/// low ones, which is a choice a caller makes and this file does not.
+///
+/// Only the low bit of each input is read, so a source holding anything else answers as though it
+/// held that bit. Nothing in this file produces such a source; [`Chip::table`] carries ones and
+/// noughts.
+#[must_use]
+pub const fn answered(gate: Gate, left: u32, right: u32) -> u32 {
+    (gate.kind >> ((left & 1) | ((right & 1) << 1))) & 1
+}
+
+/// Why a pair of arrays is not a chip of the shape it was handed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAChip {
+    /// The gate array is not one word a gate.
+    Gates {
+        /// How many were given.
+        given: usize,
+        /// How many the shape has.
+        wanted: usize,
+    },
+    /// A gate is not legal where it sits.
+    Gate {
+        /// Which gate.
+        at: u32,
+        /// What is wrong with it.
+        fault: Fault,
+    },
+    /// The answer array is not one entry an output.
+    Outputs {
+        /// How many were given.
+        given: usize,
+        /// How many the shape has.
+        wanted: usize,
+    },
+    /// An answer is taken off a gate that is not there.
+    NoSuchGate {
+        /// Which answer.
+        output: u32,
+        /// The gate it named.
+        names: u32,
+        /// How many gates there are.
+        gates: u32,
+    },
+}
+
+impl fmt::Display for NotAChip {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gates { given, wanted } => {
+                write!(out, "{given} gates for a circuit of {wanted}")
+            }
+            Self::Gate { at, fault } => write!(out, "gate {at}: {fault}"),
+            Self::Outputs { given, wanted } => {
+                write!(out, "{given} answers for a circuit with {wanted}")
+            }
+            Self::NoSuchGate {
+                output,
+                names,
+                gates,
+            } => write!(
+                out,
+                "answer {output} is taken off gate {names}, and there are {gates}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NotAChip {}
+
+/// A netlist and the gates that fill it, checked once so that running it cannot fail.
+///
+/// **Everything that can be wrong about a circuit is wrong at the boundary**, which is
+/// [`Chip::of`]: the arrays are the right length, every gate is legal where it sits, and every
+/// answer is taken off a gate that exists. Past that there is nothing left to check and
+/// [`Chip::table`] returns a table rather than a result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chip {
+    /// The shape it fills.
+    shape: Netlist,
+    /// One packed word a gate.
+    gates: Vec<u32>,
+    /// Which gate each answer is taken off.
+    outputs: Vec<u32>,
+}
+
+impl Chip {
+    /// A chip of this shape, or the first thing wrong with it.
+    ///
+    /// # Errors
+    ///
+    /// [`NotAChip::Gates`] and [`NotAChip::Outputs`] for an array of the wrong length,
+    /// [`NotAChip::Gate`] for the first gate that is not legal where it sits, and
+    /// [`NotAChip::NoSuchGate`] for the first answer taken off a gate that is not there.
+    pub fn of(shape: Netlist, gates: Vec<u32>, outputs: Vec<u32>) -> Result<Self, NotAChip> {
+        if gates.len() != shape.gates as usize {
+            return Err(NotAChip::Gates {
+                given: gates.len(),
+                wanted: shape.gates as usize,
+            });
+        }
+        if outputs.len() != shape.outputs as usize {
+            return Err(NotAChip::Outputs {
+                given: outputs.len(),
+                wanted: shape.outputs as usize,
+            });
+        }
+        if let Some((at, fault)) = shape.faults(&gates).first() {
+            return Err(NotAChip::Gate {
+                at: *at,
+                fault: *fault,
+            });
+        }
+        for (output, names) in outputs.iter().enumerate() {
+            if *names >= shape.gates {
+                return Err(NotAChip::NoSuchGate {
+                    output: u32::try_from(output).unwrap_or(u32::MAX),
+                    names: *names,
+                    gates: shape.gates,
+                });
+            }
+        }
+        Ok(Self {
+            shape,
+            gates,
+            outputs,
+        })
+    }
+
+    /// The shape it fills.
+    #[must_use]
+    pub const fn shape(&self) -> Netlist {
+        self.shape
+    }
+
+    /// What every source holds for one input word: the inputs, then a gate at a time in order.
+    ///
+    /// **One pass and no scheduling**, which is what the ordering is for: gate `n` reads sources
+    /// below `inputs + n`, and those are already filled in when it is reached. Input `n` is bit `n`
+    /// of the word, so the leftmost input is the low bit.
+    #[must_use]
+    pub fn sourced(&self, word: u32) -> Vec<u32> {
+        let mut held = Vec::with_capacity(self.shape.sources() as usize);
+        for input in 0..self.shape.inputs {
+            held.push((word >> input) & 1);
+        }
+        for packed in &self.gates {
+            let gate = Gate::unpack(*packed);
+            let left = held.get(gate.left as usize).copied().unwrap_or(0);
+            let right = held.get(gate.right as usize).copied().unwrap_or(0);
+            held.push(answered(gate, left, right));
+        }
+        held
+    }
+
+    /// The answer bits for one input word, in the same form an [`Exam`] row holds them.
+    #[must_use]
+    pub fn answers(&self, word: u32) -> u32 {
+        let sourced = self.sourced(word);
+        self.outputs
+            .iter()
+            .enumerate()
+            .map(|(bit, gate)| {
+                let at = self.shape.inputs as usize + *gate as usize;
+                let held = sourced.get(at).copied().unwrap_or(0);
+                held << bit
+            })
+            .fold(0, |word, bit| word | bit)
+    }
+
+    /// The whole truth table this chip computes, one word a row.
+    ///
+    /// What [`Exam::scored`] takes, so that a chip and the exam it is sat against meet in one place.
+    #[must_use]
+    pub fn table(&self) -> Vec<u32> {
+        (0..self.shape.words())
+            .map(|word| self.answers(word))
+            .collect()
     }
 }
