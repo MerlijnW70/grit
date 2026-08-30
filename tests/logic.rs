@@ -1,8 +1,10 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::netlist::{
-    Exam, Gate, KIND_BITS, KINDS, Netlist, SOURCE_BITS, SOURCES, answered, drawn, turned,
+    Chip, Exam, Gate, KIND_BITS, KINDS, Netlist, NotAChip, NotAnExam, SOURCE_BITS, SOURCES,
+    answered, drawn, turned,
 };
+use grit::sand::View;
 use grit::sand::{
     AIR, Grid, HELD, PATIENCE, RUNNING_LEFT, RUNNING_RIGHT, SAND, TIRED, WALL, WATER, WEIGHTS,
     held_of, hold_of, material_of, running_of, settle_reference, tired_of,
@@ -539,4 +541,312 @@ fn the_two_phases_of_a_settle_are_offset_from_one_another() {
     );
     assert_eq!(odd.iter().map(|one| u64::from(*one)).sum::<u64>(), 224);
     assert_ne!(even, odd, "the phase does not reach the neighbourhood");
+}
+
+#[test]
+fn a_gate_answers_by_the_low_bit_of_each_input_and_ignores_the_rest() {
+    for (kind, wanted) in [
+        (0b1010_u32, [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1]),
+        (0b0110, [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0]),
+        (0b1100, [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]),
+    ] {
+        let gate = Gate {
+            kind,
+            left: 0,
+            right: 1,
+        };
+        let mut got = Vec::new();
+        for left in 0..4_u32 {
+            for right in 0..4_u32 {
+                got.push(answered(gate, left, right));
+            }
+        }
+        assert_eq!(got, wanted, "kind {kind:04b}");
+    }
+}
+
+#[test]
+fn held_water_beside_air_starts_running_and_carries_its_tiredness_with_it() {
+    let grid = Grid::of(8, 8);
+    let mut cells = vec![AIR; grid.cells()];
+    for row in 0..4_usize {
+        cells[row * 8] = WATER | HELD;
+    }
+
+    let even = settle_reference(grid, 0, &cells);
+    let odd = settle_reference(grid, 1, &cells);
+
+    assert_eq!(
+        &even[..16],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1, 57, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(
+        &odd[..16],
+        [0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(even.iter().map(|one| u64::from(*one)).sum::<u64>(), 116);
+    assert_eq!(odd.iter().map(|one| u64::from(*one)).sum::<u64>(), 108);
+}
+
+#[test]
+fn a_netlist_takes_a_kit_of_every_size_up_to_the_limit_and_refuses_the_one_past_it() {
+    assert!(Netlist::over(4, 1, 4, KINDS).is_ok(), "the kit limit fits");
+    assert!(
+        Netlist::over(4, 1, 4, KINDS + 1).is_err(),
+        "a kit past the limit was accepted"
+    );
+}
+
+#[test]
+fn a_netlist_with_more_outputs_than_gates_has_nothing_to_read_them_from() {
+    assert!(Netlist::over(4, 4, 4, 4).is_ok(), "one output a gate fits");
+    assert!(
+        Netlist::over(4, 5, 4, 4).is_err(),
+        "more outputs than gates was accepted"
+    );
+}
+
+#[test]
+fn a_gate_of_the_last_kind_in_the_kit_is_legal_and_the_one_after_it_is_not() {
+    let one = Netlist::over(4, 1, 4, 4).expect("a netlist");
+    let last = Gate {
+        kind: one.kinds - 1,
+        left: 0,
+        right: 1,
+    };
+    let past = Gate {
+        kind: one.kinds,
+        left: 0,
+        right: 1,
+    };
+
+    assert!(one.checked(1, last).is_ok(), "the last kind was refused");
+    assert!(one.checked(1, past).is_err(), "a kind past the kit passed");
+}
+
+#[test]
+fn an_exam_refuses_a_table_of_the_wrong_height() {
+    let shape = Netlist::over(3, 1, 4, 4).expect("a netlist");
+    let wanted = shape.words() as usize;
+
+    assert!(Exam::of(shape, vec![0; wanted]).is_ok());
+    assert_eq!(
+        Exam::of(shape, vec![0; wanted - 1]),
+        Err(NotAnExam::Rows {
+            given: wanted - 1,
+            wanted
+        })
+    );
+    assert_eq!(
+        Exam::of(shape, vec![0; wanted + 1]),
+        Err(NotAnExam::Rows {
+            given: wanted + 1,
+            wanted
+        })
+    );
+}
+
+#[test]
+fn an_exam_refuses_an_answer_with_a_bit_above_the_outputs_it_has() {
+    let shape = Netlist::over(3, 2, 4, 4).expect("a netlist");
+    let wanted = shape.words() as usize;
+
+    let mut answers = vec![0_u32; wanted];
+    answers[1] = 0b11;
+    assert!(
+        Exam::of(shape, answers).is_ok(),
+        "two outputs hold two bits"
+    );
+
+    let mut stray = vec![0_u32; wanted];
+    stray[1] = 0b100;
+    assert_eq!(
+        Exam::of(shape, stray),
+        Err(NotAnExam::Stray {
+            row: 1,
+            holds: 0b100,
+            outputs: 2
+        })
+    );
+}
+
+#[test]
+fn an_exam_is_worth_one_mark_a_word_a_output() {
+    for (inputs, outputs) in [(1_u32, 1_u32), (3, 2), (5, 4)] {
+        let shape = Netlist::over(inputs, outputs, outputs, 4).expect("a netlist");
+        let exam = Exam::of(shape, vec![0; shape.words() as usize]).expect("an exam");
+        assert_eq!(
+            exam.marks(),
+            shape.words() * outputs,
+            "at {inputs} input(s) and {outputs} output(s)"
+        );
+    }
+}
+
+#[test]
+fn a_chip_refuses_a_bag_of_gates_that_is_not_its_own_size() {
+    let shape = Netlist::over(4, 1, 4, 4).expect("a netlist");
+    let good = Gate {
+        kind: 0,
+        left: 0,
+        right: 1,
+    }
+    .pack();
+    let gates = vec![good; shape.gates as usize];
+
+    assert!(Chip::of(shape, gates.clone(), vec![0]).is_ok());
+    assert_eq!(
+        Chip::of(shape, vec![good; 3], vec![0]),
+        Err(NotAChip::Gates {
+            given: 3,
+            wanted: 4
+        })
+    );
+    assert_eq!(
+        Chip::of(shape, vec![good; 5], vec![0]),
+        Err(NotAChip::Gates {
+            given: 5,
+            wanted: 4
+        })
+    );
+}
+
+#[test]
+fn turning_reads_the_roll_two_bits_at_a_time_and_the_rest_after() {
+    let one = netlist();
+    let start = drawn(&one, 5, 99);
+
+    assert_eq!(
+        turned(&one, 5, start, 7).pack(),
+        turned(&one, 5, start, 7).pack(),
+        "turning is not a function of its roll"
+    );
+
+    let reached: std::collections::BTreeSet<u32> = (0..256_u32)
+        .map(|roll| turned(&one, 5, start, roll).pack())
+        .collect();
+    assert!(
+        reached.len() > 3,
+        "the roll reaches only {} gate(s) from one start",
+        reached.len()
+    );
+}
+
+fn wire_through() -> Gate {
+    Gate {
+        kind: 0b1010,
+        left: 0,
+        right: 0,
+    }
+}
+
+#[test]
+fn a_chip_reads_each_input_from_its_own_bit_of_the_word() {
+    let shape = Netlist::over(2, 1, 1, KINDS).expect("a netlist");
+    let chip = Chip::of(shape, vec![wire_through().pack()], vec![0]).expect("a chip");
+
+    assert_eq!(chip.sourced(0b00)[..2], [0, 0]);
+    assert_eq!(chip.sourced(0b01)[..2], [1, 0], "bit 0 is input 0");
+    assert_eq!(chip.sourced(0b10)[..2], [0, 1], "bit 1 is input 1");
+    assert_eq!(chip.sourced(0b11)[..2], [1, 1]);
+}
+
+#[test]
+fn a_chip_answers_from_the_gate_an_output_names_and_puts_it_at_that_outputs_bit() {
+    let shape = Netlist::over(2, 2, 2, KINDS).expect("a netlist");
+    let first = wire_through();
+    let second = Gate {
+        kind: 0b1100,
+        left: 1,
+        right: 1,
+    };
+    let chip = Chip::of(shape, vec![first.pack(), second.pack()], vec![0, 1]).expect("a chip");
+
+    for word in 0..4_u32 {
+        let sourced = chip.sourced(word);
+        let wanted = sourced[2] | (sourced[3] << 1);
+        assert_eq!(
+            chip.answers(word),
+            wanted,
+            "word {word:02b}: sources {sourced:?}"
+        );
+    }
+
+    let swapped = Chip::of(shape, vec![first.pack(), second.pack()], vec![1, 0]).expect("a chip");
+    let differs = (0..4_u32).any(|word| swapped.answers(word) != chip.answers(word));
+    assert!(
+        differs,
+        "naming the gates the other way round changed nothing"
+    );
+}
+
+#[test]
+fn a_chip_refuses_a_bag_of_outputs_that_is_not_its_own_size() {
+    let shape = Netlist::over(4, 2, 4, KINDS).expect("a netlist");
+    let gates = vec![wire_through().pack(); 4];
+
+    assert!(Chip::of(shape, gates.clone(), vec![0, 1]).is_ok());
+    assert_eq!(
+        Chip::of(shape, gates.clone(), vec![0]),
+        Err(NotAChip::Outputs {
+            given: 1,
+            wanted: 2
+        })
+    );
+    assert_eq!(
+        Chip::of(shape, gates, vec![0, 1, 2]),
+        Err(NotAChip::Outputs {
+            given: 3,
+            wanted: 2
+        })
+    );
+}
+
+#[test]
+fn a_chip_refuses_an_output_naming_a_gate_it_does_not_have() {
+    let shape = Netlist::over(4, 1, 4, KINDS).expect("a netlist");
+    let gates = vec![wire_through().pack(); 4];
+
+    assert!(
+        Chip::of(shape, gates.clone(), vec![shape.gates - 1]).is_ok(),
+        "the last gate is nameable"
+    );
+    assert_eq!(
+        Chip::of(shape, gates, vec![shape.gates]),
+        Err(NotAChip::NoSuchGate {
+            output: 0,
+            names: shape.gates,
+            gates: shape.gates
+        })
+    );
+}
+
+#[test]
+fn an_exam_of_thirty_two_outputs_has_no_bits_left_over_to_stray_into() {
+    let wide = Netlist::over(1, 32, 32, 4).expect("a netlist");
+    let answers = vec![u32::MAX; wide.words() as usize];
+
+    assert!(
+        Exam::of(wide, answers).is_ok(),
+        "with thirty-two outputs every bit is an output and none is stray"
+    );
+}
+
+#[test]
+fn a_view_is_as_many_pixels_as_it_is_wide_and_deep() {
+    for (wide, deep) in [(8_u32, 8_u32), (16, 8), (64, 32)] {
+        let one = View::of(wide, deep);
+        assert_eq!(one.pixels(), one.wide as usize * one.deep as usize);
+    }
+    assert_eq!(View::of(8, 8).pixels(), 64);
+    assert_eq!(View::of(16, 8).pixels(), 128);
+    assert!(View::of(16, 8).pixels() > View::of(8, 8).pixels());
+}
+
+#[test]
+fn a_view_rounds_each_side_up_to_a_power_of_two() {
+    let one = View::of(9, 17);
+    assert_eq!(one.wide, 16);
+    assert_eq!(one.deep, 32);
+    assert_eq!(one.pixels(), 512);
 }
