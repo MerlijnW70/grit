@@ -4,11 +4,13 @@ use grit::netlist::{
     Chip, Exam, Gate, KIND_BITS, KINDS, Netlist, NotAChip, NotAnExam, SOURCE_BITS, SOURCES,
     answered, drawn, turned,
 };
-use grit::sand::View;
 use grit::sand::{
     AIR, Grid, HELD, PATIENCE, RUNNING_LEFT, RUNNING_RIGHT, SAND, TIRED, WALL, WATER, WEIGHTS,
     held_of, hold_of, material_of, running_of, settle_reference, tired_of,
 };
+use grit::sand::{View, brush, paint, settle};
+use simdr::decode;
+use simdr::module::op;
 
 fn netlist() -> Netlist {
     Netlist::over(4, 2, 8, 4).expect("a netlist")
@@ -849,4 +851,173 @@ fn a_view_rounds_each_side_up_to_a_power_of_two() {
     assert_eq!(one.wide, 16);
     assert_eq!(one.deep, 32);
     assert_eq!(one.pixels(), 512);
+}
+
+fn constants(words: &[u32]) -> Vec<u32> {
+    let mut held: Vec<u32> = decode::body(words)
+        .filter(|one| one.opcode() == op::CONSTANT)
+        .filter_map(|one| one.operands().get(2).copied())
+        .collect();
+    held.sort_unstable();
+    held.dedup();
+    held
+}
+
+#[test]
+fn turning_picks_a_field_from_the_low_two_bits_and_its_value_from_the_rest() {
+    let one = Netlist::over(4, 2, 8, KINDS).expect("a netlist");
+    let start = drawn(&one, 5, 99);
+    assert_eq!((start.kind, start.left, start.right), (99, 0, 0));
+
+    let wanted = [
+        (0, 0, 0),
+        (99, 0, 0),
+        (99, 0, 0),
+        (99, 0, 0),
+        (1, 0, 0),
+        (99, 1, 0),
+        (99, 0, 1),
+        (99, 0, 1),
+    ];
+    for (roll, want) in wanted.iter().enumerate() {
+        let after = turned(&one, 5, start, roll as u32);
+        assert_eq!((after.kind, after.left, after.right), *want, "roll {roll}");
+    }
+}
+
+#[test]
+fn held_water_runs_toward_the_air_beside_it_and_the_two_directions_differ() {
+    let grid = Grid::of(8, 8);
+
+    let mut rightward = vec![AIR; grid.cells()];
+    rightward[0] = WATER | HELD;
+    rightward[8] = SAND;
+    assert_eq!(
+        &settle_reference(grid, 0, &rightward)[..12],
+        [0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0]
+    );
+
+    let mut leftward = vec![AIR; grid.cells()];
+    leftward[1] = WATER | HELD;
+    assert_eq!(
+        &settle_reference(grid, 0, &leftward)[..12],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+    );
+}
+
+#[test]
+fn a_waking_brush_emits_the_comparison_a_calm_one_has_no_use_for() {
+    let grid = Grid::of(8, 8);
+    let waking = brush(32, grid, true).expect("a waking brush");
+    let calm = brush(32, grid, false).expect("a calm brush");
+
+    assert_eq!(
+        constants(&waking),
+        [0, 1, 2, 3, 4, 5, 8, 16, 32, 256, 4_294_967_295]
+    );
+    assert_eq!(constants(&calm), [0, 1, 2, 3, 4, 5, 16, 32, 4_294_967_295]);
+    assert_ne!(waking, calm, "waking changed nothing about the module");
+}
+
+#[test]
+fn a_chip_reads_the_gate_above_its_inputs_and_not_the_input_below_them() {
+    let shape = Netlist::over(2, 1, 2, KINDS).expect("a netlist");
+    let wire = Gate {
+        kind: 0b1010,
+        left: 0,
+        right: 0,
+    }
+    .pack();
+    let inverter = Gate {
+        kind: 0b0001,
+        left: 1,
+        right: 1,
+    }
+    .pack();
+    let chip = Chip::of(shape, vec![wire, inverter], vec![1]).expect("a chip");
+
+    assert_eq!(chip.sourced(0b10), [0, 1, 0, 0]);
+    assert_eq!(
+        (0..4_u32)
+            .map(|word| chip.answers(word))
+            .collect::<Vec<_>>(),
+        [1, 1, 0, 0]
+    );
+}
+
+#[test]
+fn running_water_stopped_by_a_wall_is_put_back_as_the_fields_it_had() {
+    let grid = Grid::of(8, 8);
+    let mut blocked = vec![AIR; grid.cells()];
+    blocked[0] = WATER | RUNNING_RIGHT;
+    blocked[1] = WALL;
+
+    assert_eq!(
+        &settle_reference(grid, 0, &blocked)[..8],
+        [0, 3, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn water_already_running_is_not_started_again() {
+    let grid = Grid::of(8, 8);
+    let mut running = vec![AIR; grid.cells()];
+    running[0] = WATER | RUNNING_RIGHT | HELD;
+
+    assert_eq!(
+        &settle_reference(grid, 0, &running)[..12],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+    );
+}
+
+#[test]
+fn the_second_cell_of_a_quad_starts_only_when_the_first_is_air() {
+    let grid = Grid::of(8, 8);
+    let mut blocked = vec![AIR; grid.cells()];
+    blocked[1] = WATER | HELD;
+    blocked[0] = SAND;
+
+    assert_eq!(
+        &settle_reference(grid, 0, &blocked)[..12],
+        [0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0]
+    );
+}
+
+#[test]
+fn a_cell_worn_to_its_patience_does_not_start_running() {
+    let grid = Grid::of(8, 8);
+    let mut worn = vec![AIR; grid.cells()];
+    worn[0] = WATER | HELD | (PATIENCE * TIRED);
+
+    assert_eq!(
+        &settle_reference(grid, 0, &worn)[..12],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+    );
+}
+
+#[test]
+fn the_settle_and_paint_passes_bake_the_constants_their_arithmetic_produces() {
+    let grid = Grid::of(8, 8);
+
+    assert_eq!(
+        constants(&settle(32, grid).expect("a settle module")),
+        [0, 1, 2, 3, 4, 5, 7, 9, 16, 32, 4_294_967_295]
+    );
+    assert_eq!(
+        constants(&paint(32, grid, View::of(8, 8)).expect("a paint module")),
+        [
+            0,
+            1,
+            2,
+            3,
+            6,
+            7,
+            32,
+            1_119_778,
+            2_387_880,
+            4_475_474,
+            14_267_242,
+            4_294_967_295
+        ]
+    );
 }
