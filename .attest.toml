@@ -1,0 +1,52 @@
+# What this repository will let an agent write about itself.
+#
+# `strict`, and it already was: `9548ac1` stripped the prose before this file existed, and the
+# checker found nothing to refuse on first contact. The setting records that as a rule rather than
+# as a state something can drift out of.
+#
+# What survives a strict file: `// SAFETY:` and the whole argument under it, lint directives, and
+# fenced blocks in doc comments, which `cargo test` compiles and runs. Reasoning goes in the commit
+# message, which is where this repository already puts it.
+
+comments = "strict"
+tolerance = 0.005
+exempt = ["target/**", ".git/**"]
+
+# Not held to every number: the README is a cheat-sheet of binding indices and module names, and a
+# binding index is a fact about the layout rather than a measurement of it.
+strict_numbers = []
+
+# The measurements this repository is willing to take. Both need the card to themselves.
+[[benchmarks]]
+name = "scale"
+command = "cargo run --release --bin scale"
+scope = ["src"]
+timeout = 1800
+
+[[benchmarks]]
+name = "loop_cost"
+command = "cargo run --release --bin loop_cost"
+scope = ["src/live.rs", "src/resident.rs"]
+timeout = 1800
+
+[[benchmarks]]
+name = "suite"
+command = "cargo test --quiet"
+scope = ["src", "tests"]
+timeout = 1800
+
+# There is no floor here yet, and that is the largest gap in this repository.
+#
+# Ninety-five tests pass and nothing shows they hold anything. Twenty of the twenty-two test files
+# open a device and `src` carries no unit tests at all, so every mutant would be priced at a suite
+# that takes minutes, one worker, because the card is one.
+#
+# `proved` stays empty until a path has earned a run with no survivors. The way in is the files with
+# no Vulkan surface -- `sand`, `compact`, `netlist`, `sweep`, `live` -- which are most of the code
+# and need no device to check.
+[mutation]
+command = "noha prober --diff"
+pattern = 'killed\s+(?P<killed>[0-9]+)/(?P<total>[0-9]+) viable\s+survivors\s+(?P<survivors>[0-9]+)'
+required = 1.0
+timeout = 3600
+proved = []
