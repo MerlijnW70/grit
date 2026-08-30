@@ -1021,3 +1021,63 @@ fn the_settle_and_paint_passes_bake_the_constants_their_arithmetic_produces() {
         ]
     );
 }
+
+fn pinned_quad(set: &dyn Fn(&mut Vec<u32>)) -> Vec<u32> {
+    let grid = Grid::of(8, 8);
+    let mut cells = vec![AIR; grid.cells()];
+    cells[8] = WALL;
+    cells[9] = WALL;
+    set(&mut cells);
+    settle_reference(grid, 0, &cells)
+}
+
+#[test]
+fn the_starting_rules_are_read_where_the_fall_cannot_overwrite_them() {
+    assert_eq!(
+        &pinned_quad(&|cells| cells[0] = WATER | HELD)[..4],
+        [1, 0, 0, 0]
+    );
+    assert_eq!(
+        &pinned_quad(&|cells| cells[1] = WATER | HELD)[..4],
+        [0, 1, 0, 0]
+    );
+    assert_eq!(&pinned_quad(&|cells| cells[0] = WATER)[..4], [1, 0, 0, 0]);
+}
+
+#[test]
+fn a_cell_with_something_beside_it_does_not_start_and_is_put_back() {
+    assert_eq!(
+        &pinned_quad(&|cells| {
+            cells[0] = WATER | HELD;
+            cells[1] = WALL;
+        })[..4],
+        [1, 3, 0, 0]
+    );
+    assert_eq!(
+        &pinned_quad(&|cells| {
+            cells[0] = WATER | RUNNING_RIGHT;
+            cells[1] = WALL;
+        })[..4],
+        [1, 3, 0, 0]
+    );
+}
+
+#[test]
+fn water_that_is_already_running_moves_rather_than_starting_again() {
+    assert_eq!(
+        &pinned_quad(&|cells| cells[0] = WATER | RUNNING_RIGHT | HELD)[..4],
+        [0, 9, 0, 0]
+    );
+}
+
+#[test]
+fn a_cell_at_its_patience_keeps_its_wear_and_one_below_it_keeps_less() {
+    assert_eq!(
+        &pinned_quad(&|cells| cells[0] = WATER | HELD | (PATIENCE * TIRED))[..4],
+        [225, 0, 0, 0]
+    );
+    assert_eq!(
+        &pinned_quad(&|cells| cells[0] = WATER | HELD | ((PATIENCE - 1) * TIRED))[..4],
+        [193, 0, 0, 0]
+    );
+}
