@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::layout::{LOOKING, PARAMS, PIXELS, STATE};
 use grit::sand::{
@@ -16,11 +16,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -68,15 +68,10 @@ fn the_sand_falls_where_the_host_says_and_no_grain_is_lost() {
     };
     let width = host.width();
     let grid = Grid::of(WIDE, DEEP);
-    println!(
-        "{} — subgroup {width}, {}×{} cells",
-        host.name(),
-        grid.wide,
-        grid.deep
-    );
+    println!("{} {width} {} {}", host.name(), grid.wide, grid.deep);
 
-    let tick = grit::sand::settle(width, grid).expect("settle");
-    let bump = frame_counter(width).expect("counter");
+    let tick = grit::sand::settle(width, grid).unwrap();
+    let bump = frame_counter(width).unwrap();
 
     let modules: Vec<&[u32]> = vec![&bump, &tick];
     let cells = grid.cells();
@@ -84,12 +79,12 @@ fn the_sand_falls_where_the_host_says_and_no_grain_is_lost() {
     sizes[0] = 8;
     sizes[1] = cells;
 
-    let mut resident = host.resident(&sizes, &modules).expect("allocated");
+    let mut resident = host.resident(&sizes, &modules).unwrap();
 
     let start = poured(grid);
     let before = grains(&start);
-    resident.write(0, &[u32::MAX]).expect("params");
-    resident.write(1, &start).expect("state");
+    resident.write(0, &[u32::MAX]).unwrap();
+    resident.write(1, &start).unwrap();
 
     let groups = [
         Groups::Fixed(1),
@@ -100,44 +95,27 @@ fn the_sand_falls_where_the_host_says_and_no_grain_is_lost() {
     let mut moved = 0_u32;
 
     for step in 0..STEPS {
-        resident.frame(&groups).expect("dispatched");
+        resident.frame(&groups).unwrap();
         want = sand::settle_reference(grid, step, &want);
 
-        let ran = resident.read(1, cells).expect("state");
+        let ran = resident.read(1, cells).unwrap();
         if let Some(at) = ran
             .iter()
             .zip(&want)
             .position(|(there, here)| there != here)
         {
             let (row, column) = (at as u32 / WIDE, at as u32 % WIDE);
-            panic!(
-                "step {step}: cell ({column}, {row}) holds {} and the host says {}",
-                ran[at], want[at]
-            );
+            panic!("{step} {column} {row} {} {}", ran[at], want[at]);
         }
 
-        assert_eq!(
-            grains(&ran),
-            before,
-            "step {step}: {} grains, and {before} were poured — a cell was written twice",
-            grains(&ran)
-        );
+        assert_eq!(grains(&ran), before);
         moved = lowest(grid, &ran);
     }
 
     let settled = lowest(grid, &want);
-    println!(
-        "  {before} grains, {STEPS} steps, the lowest reached row {moved} of {}",
-        grid.deep
-    );
-    assert!(
-        settled > 96,
-        "the sand never left the slab it was poured in, so the rule does nothing"
-    );
-    assert!(
-        settled + 1 < DEEP,
-        "sand reached the floor row, which is wall and cannot hold it"
-    );
+    println!("{before} {STEPS} {moved} {}", grid.deep);
+    assert!(settled > 96);
+    assert!(settled + 1 < DEEP);
 }
 
 fn colour(material: u32) -> u32 {
@@ -182,21 +160,19 @@ fn reach(grid: Grid, cells: &[u32], material: u32) -> u32 {
         .unwrap_or(0)
 }
 
-fn run(host: &Host, grid: Grid, start: &[u32], steps: u32, label: &str) -> (Vec<u32>, Vec<u32>) {
+fn run(host: &Host, grid: Grid, start: &[u32], steps: u32, label: u32) -> (Vec<u32>, Vec<u32>) {
     let width = host.width();
-    let tick = sand::settle(width, grid).expect("settle");
-    let bump = frame_counter(width).expect("counter");
+    let tick = sand::settle(width, grid).unwrap();
+    let bump = frame_counter(width).unwrap();
     let modules: Vec<&[u32]> = vec![&bump, &tick];
 
     let cells = grid.cells();
     let mut sizes = [1_usize; BINDINGS as usize];
     sizes[PARAMS as usize] = 8;
     sizes[STATE as usize] = cells;
-    let mut resident = host.resident(&sizes, &modules).expect("allocated");
-    resident
-        .write(PARAMS as usize, &[u32::MAX; 8])
-        .expect("params");
-    resident.write(STATE as usize, start).expect("state");
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+    resident.write(PARAMS as usize, &[u32::MAX; 8]).unwrap();
+    resident.write(STATE as usize, start).unwrap();
 
     let groups = [
         Groups::Fixed(1),
@@ -208,9 +184,9 @@ fn run(host: &Host, grid: Grid, start: &[u32], steps: u32, label: &str) -> (Vec<
     let mut ran = start.to_vec();
     for step in 0..steps {
         before = ran;
-        resident.frame(&groups).expect("dispatched");
+        resident.frame(&groups).unwrap();
         want = sand::settle_reference(grid, step, &want);
-        ran = resident.read(STATE as usize, cells).expect("state");
+        ran = resident.read(STATE as usize, cells).unwrap();
 
         if let Some(at) = ran
             .iter()
@@ -218,10 +194,7 @@ fn run(host: &Host, grid: Grid, start: &[u32], steps: u32, label: &str) -> (Vec<
             .position(|(here, there)| here != there)
         {
             let (row, at_column) = (at as u32 / grid.wide, at as u32 % grid.wide);
-            panic!(
-                "{label} step {step}: cell ({at_column}, {row}) holds {} and the host says {}",
-                ran[at], want[at]
-            );
+            panic!("{label} {step} {at_column} {row} {} {}", ran[at], want[at]);
         }
     }
     (before, ran)
@@ -258,7 +231,7 @@ fn water_goes_flat_where_sand_heaps_up() {
     };
     let grid = Grid::of(BASIN, HIGH);
     println!(
-        "{} — subgroup {}, {}×{} cells",
+        "{} {} {} {}",
         host.name(),
         host.width(),
         grid.wide,
@@ -267,8 +240,8 @@ fn water_goes_flat_where_sand_heaps_up() {
 
     let poured = COLUMN * TALL;
     let floor = grid.wide - 2;
-    let (_, heaped) = run(&host, grid, &column(grid, SAND), SETTLING, "sand");
-    let (_, settled) = run(&host, grid, &column(grid, WATER), SETTLING, "water");
+    let (_, heaped) = run(&host, grid, &column(grid, SAND), SETTLING, SAND);
+    let (_, settled) = run(&host, grid, &column(grid, WATER), SETTLING, WATER);
 
     let sand_wide = reach(grid, &heaped, SAND);
     let water_wide = reach(grid, &settled, WATER);
@@ -283,36 +256,23 @@ fn water_goes_flat_where_sand_heaps_up() {
         .filter(|&&word| running_of(word) != 0)
         .count();
 
-    println!(
-        "  {poured} cells from a {COLUMN}-wide column: sand reached {sand_wide} columns, water {water_wide} of {floor}"
-    );
-    println!("  water lies {shallowest} to {deepest} deep, and {moving} cells are still moving");
+    println!("{poured} {COLUMN} {sand_wide} {water_wide} {floor}");
+    println!("{shallowest} {deepest} {moving}");
 
     assert_eq!(
         heaped.iter().filter(|&&w| material_of(w) == SAND).count() as u32,
-        poured,
-        "sand was created or lost"
+        poured
     );
     assert_eq!(
         settled.iter().filter(|&&w| material_of(w) == WATER).count() as u32,
-        poured,
-        "water was created or lost"
+        poured
     );
 
-    assert!(
-        water_wide > sand_wide * 2,
-        "water reached {water_wide} columns and sand {sand_wide} — the fluid is behaving like a solid"
-    );
-    assert_eq!(
-        water_wide, floor,
-        "water stopped short of the walls, so it did not find its level"
-    );
-    assert!(
-        deepest - shallowest <= 1,
-        "the water lies {shallowest} deep in one place and {deepest} in another, which is not level"
-    );
+    assert!(water_wide > sand_wide * 2);
+    assert_eq!(water_wide, floor);
+    assert!(deepest - shallowest <= 1);
 
-    assert_eq!(moving, 0, "{moving} of {poured} cells are still running");
+    assert_eq!(moving, 0);
 
     for phase in 0..2 {
         let again = sand::settle_reference(grid, phase, &settled);
@@ -320,11 +280,7 @@ fn water_goes_flat_where_sand_heaps_up() {
             .iter()
             .zip(&settled)
             .position(|(there, here)| there != here);
-        assert!(
-            differs.is_none(),
-            "a further step in phase {phase} moved cell {:?}, so the water has not come to rest",
-            differs.unwrap_or(0)
-        );
+        assert!(differs.is_none());
     }
 }
 
@@ -336,7 +292,7 @@ fn the_window_shows_the_cells_it_is_pointed_at() {
     let width = host.width();
     let grid = Grid::of(64, 32);
     let view = View::of(16, 8);
-    let module = sand::paint(width, grid, view).expect("paint");
+    let module = sand::paint(width, grid, view).unwrap();
     let modules: Vec<&[u32]> = vec![&module];
 
     let cells = grid.cells();
@@ -345,7 +301,7 @@ fn the_window_shows_the_cells_it_is_pointed_at() {
     sizes[PARAMS as usize] = 8;
     sizes[STATE as usize] = cells;
     sizes[PIXELS as usize] = pixels;
-    let mut resident = host.resident(&sizes, &modules).expect("allocated");
+    let mut resident = host.resident(&sizes, &modules).unwrap();
 
     let world: Vec<u32> = (0..cells)
         .map(|at| match (at * 7 + at / 13) % 6 {
@@ -356,8 +312,8 @@ fn the_window_shows_the_cells_it_is_pointed_at() {
             _ => AIR,
         })
         .collect();
-    resident.write(PARAMS as usize, &[0; 8]).expect("params");
-    resident.write(STATE as usize, &world).expect("state");
+    resident.write(PARAMS as usize, &[0; 8]).unwrap();
+    resident.write(STATE as usize, &world).unwrap();
 
     let groups = [Groups::Fixed(
         u32::try_from(pixels).unwrap_or(u32::MAX).div_ceil(width),
@@ -366,10 +322,10 @@ fn the_window_shows_the_cells_it_is_pointed_at() {
     for corner in [(0, 0), (17, 9), (grid.wide - 3, 6), (30, grid.deep - 5)] {
         resident
             .write_at(PARAMS as usize, LOOKING, &[corner.0, corner.1])
-            .expect("looking");
+            .unwrap();
         let (_, picture) = resident
             .frame_reading(&groups, PIXELS as usize, pixels)
-            .expect("painted");
+            .unwrap();
 
         for down in 0..view.deep {
             for across in 0..view.wide {
@@ -377,23 +333,17 @@ fn the_window_shows_the_cells_it_is_pointed_at() {
                 let row = (corner.1 + down) % grid.deep;
                 let want = colour(material_of(world[(row * grid.wide + at) as usize]));
                 let seat = (down * view.wide + across) as usize;
-                assert_eq!(
-                    picture[seat], want,
-                    "at corner {corner:?}, pixel ({across}, {down}) should be cell ({at}, {row})"
-                );
+                assert_eq!(picture[seat], want);
             }
         }
     }
 
     println!(
-        "  four corners of a {}×{} world through a {}×{} window, {pixels} pixels each",
+        "{} {} {} {} {pixels}",
         grid.wide, grid.deep, view.wide, view.deep
     );
 
-    assert!(
-        pixels < cells,
-        "the window holds the whole grid, so nothing was saved by looking through it"
-    );
+    assert!(pixels < cells);
 }
 
 fn frame_counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
@@ -413,22 +363,9 @@ fn frame_counter(subgroup: u32) -> Result<Vec<u32>, simdr::lanes::LaneError> {
 
 #[test]
 fn the_materials_are_in_the_order_the_rule_needs() {
-    assert_eq!(
-        WEIGHTS,
-        [AIR, WATER, SAND, WALL],
-        "a material was added or moved without the order being restated"
-    );
+    assert_eq!(WEIGHTS, [AIR, WATER, SAND, WALL]);
     for pair in WEIGHTS.windows(2) {
-        assert!(
-            pair[0] < pair[1],
-            "{} is not lighter than {}, so `fall`'s one comparison is not the rule it says it is",
-            pair[0],
-            pair[1]
-        );
+        assert!(pair[0] < pair[1]);
     }
-    assert_eq!(
-        *WEIGHTS.last().expect("four materials"),
-        WALL,
-        "WALL is not heaviest, so something can sit above it and sink it"
-    );
+    assert_eq!(*WEIGHTS.last().unwrap(), WALL);
 }

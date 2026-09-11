@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::compact::Plan;
 use grit::layout::{AWAKE, BINDINGS, BRUSH, DENSE, GRAND, PARAMS, PIXELS, STATE};
@@ -21,11 +21,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -63,28 +63,27 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
     let plan = match Plan::over(width, quads.div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(too_big) => {
-            eprintln!("SKIPPED live at width {width}: {too_big}");
+            eprintln!("SKIPPED {width} {too_big}");
             return;
         }
     };
     let cells = grid.cells();
     println!(
-        "{} — subgroup {width}, {}×{} cells in {quads} quads, {} blocks, coarse {coarse}",
+        "{} {width} {} {} {quads} {} {coarse}",
         host.name(),
         grid.wide,
         grid.deep,
         plan.blocks
     );
 
-    let (wired, wired_stages) =
-        grit::live::arranged(width, grid, &plan, None, coarse).expect("wired");
+    let (wired, wired_stages) = grit::live::arranged(width, grid, &plan, None, coarse).unwrap();
     let wired_groups: Vec<&[Groups]> = wired_stages.iter().map(Vec::as_slice).collect();
     let over_box = sand::BOX * sand::BOX / width;
 
     let whole = [
-        grit::live::tick(width).expect("tick"),
-        sand::brush(width, grid, false).expect("brush"),
-        sand::settle(width, grid).expect("settle"),
+        grit::live::tick(width).unwrap(),
+        sand::brush(width, grid, false).unwrap(),
+        sand::settle(width, grid).unwrap(),
     ];
     let whole_groups = [
         Groups::Fixed(1),
@@ -94,19 +93,19 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
 
     let sizes = plan.sizes();
     let modules: Vec<&[u32]> = wired.iter().map(Vec::as_slice).collect();
-    let mut live = host.resident(&sizes, &modules).expect("wired");
+    let mut live = host.resident(&sizes, &modules).unwrap();
     let modules: Vec<&[u32]> = whole.iter().map(Vec::as_slice).collect();
-    let mut full = host.resident(&sizes, &modules).expect("whole");
+    let mut full = host.resident(&sizes, &modules).unwrap();
 
     let start = room(grid);
     for held in [&mut live, &mut full] {
         clear_all(held, &sizes);
-        held.write(STATE as usize, &start).expect("state");
+        held.write(STATE as usize, &start).unwrap();
         held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
-            .expect("params");
+            .unwrap();
     }
 
-    grit::live::seed(&mut live, grid, &plan).expect("seeded");
+    grit::live::seed(&mut live, grid, &plan).unwrap();
 
     let mut listed_total = 0_u64;
     let mut smallest = u32::MAX;
@@ -115,13 +114,13 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
     for frame in 0..frames {
         for held in [&mut live, &mut full] {
             held.write_at(PARAMS as usize, BRUSH, &brushing(frame))
-                .expect("brush");
+                .unwrap();
         }
-        live.staged(&wired_groups).expect("wired");
-        full.frame(&whole_groups).expect("whole");
+        live.staged(&wired_groups).unwrap();
+        full.frame(&whole_groups).unwrap();
 
-        let there = live.read(STATE as usize, cells).expect("wired state");
-        let here = full.read(STATE as usize, cells).expect("whole state");
+        let there = live.read(STATE as usize, cells).unwrap();
+        let here = full.read(STATE as usize, cells).unwrap();
 
         if let Some(at) = there.iter().zip(&here).position(|(a, b)| a != b) {
             let (row, column) = (at as u32 / grid.wide, at as u32 % grid.wide);
@@ -130,10 +129,10 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
             let quad_x = (column.wrapping_sub(phase)) / 2;
             let quad_y = (row.wrapping_sub(phase)) / 2;
             let quad = quad_y * grid.across() + quad_x;
-            let flags = live.read(AWAKE as usize, quads as usize).expect("awake");
+            let flags = live.read(AWAKE as usize, quads as usize).unwrap();
             let listed_now = live
                 .read(GRAND as usize, 1)
-                .expect("grand")
+                .unwrap()
                 .first()
                 .copied()
                 .unwrap_or(0);
@@ -141,21 +140,16 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
                 .read(DENSE as usize, (listed_now as usize).min(quads as usize))
                 .unwrap_or_default();
             eprintln!(
-                "  quad {quad} at ({quad_x}, {quad_y}), phase {phase}: flag now {}, in the list {}, \
-                 list holds {listed_now}",
+                "{quad} {quad_x} {quad_y} {phase} {} {} {listed_now}",
                 flags.get(quad as usize).copied().unwrap_or(9),
                 list.contains(&quad)
             );
-            panic!(
-                "frame {frame}: cell ({column}, {row}) is {} through the list and {} over the whole \
-                 grid — a quad that should have woken did not",
-                there[at], here[at]
-            );
+            panic!("{frame} {column} {row} {} {}", there[at], here[at]);
         }
 
         let listed = live
             .read(GRAND as usize, 1)
-            .expect("grand")
+            .unwrap()
             .first()
             .copied()
             .unwrap_or(0);
@@ -166,26 +160,14 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
 
     let mean = listed_total / u64::from(frames);
     let saving = f64::from(quads) / (mean.max(1) as f64);
-    println!(
-        "  {frames} frames agreed cell for cell. The list averaged {mean} quads of {quads} \
-         — {saving:.1}× fewer — peaked at {busiest} and fell to {smallest} once the pile settled."
-    );
+    println!("{frames} {mean} {quads} {saving:.1} {busiest} {smallest}");
 
-    assert!(
-        mean < u64::from(quads),
-        "the list averaged every quad there is, so nothing was ever asleep"
-    );
-    assert!(
-        busiest > 0,
-        "the list was never anything but empty, so the pour woke nothing"
-    );
+    assert!(mean < u64::from(quads));
+    assert!(busiest > 0);
     if until_quiet {
-        assert_eq!(
-            smallest, 0,
-            "the list never emptied, so something stayed awake after the sand stopped"
-        );
+        assert_eq!(smallest, 0);
     } else {
-        eprintln!("  the list fell to {smallest}; emptying is not what this size is run for");
+        eprintln!("{smallest}");
     }
 }
 
@@ -209,7 +191,7 @@ fn clear_all(held: &mut Resident<'_>, sizes: &[usize; BINDINGS as usize]) {
         if binding == PIXELS as usize {
             continue;
         }
-        held.write(binding, &vec![0_u32; words]).expect("cleared");
+        held.write(binding, &vec![0_u32; words]).unwrap();
     }
 }
 
@@ -219,18 +201,9 @@ fn a_host_says_how_much_memory_it_has() {
         return;
     };
     let (heap, ceiling) = (host.heap(), host.ceiling());
-    eprintln!(
-        "  {} — heap {heap} bytes, ceiling {ceiling} bytes",
-        host.name()
-    );
+    eprintln!("{} {heap} {ceiling}", host.name());
 
-    assert!(heap > 0, "a device with no device-local heap at all");
-    assert!(
-        heap >= ceiling,
-        "the largest allocation {ceiling} is bigger than the heap {heap} it comes out of"
-    );
-    assert!(
-        heap >= 64 * 1024 * 1024,
-        "a heap of {heap} bytes is not a device this runs on"
-    );
+    assert!(heap > 0);
+    assert!(heap >= ceiling);
+    assert!(heap >= 64 * 1024 * 1024);
 }

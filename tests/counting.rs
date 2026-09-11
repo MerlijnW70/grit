@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::compact::Plan;
 use grit::layout::PARAMS;
@@ -21,11 +21,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -35,7 +35,7 @@ fn sized(width: u32, blocks: u32) -> Grid {
     let cells = u64::from(blocks) * u64::from(sweep::cells(width)) * 4;
     let bits = cells.trailing_zeros();
     let wide = 1_u32 << (bits / 2 + bits % 2);
-    let deep = u32::try_from(cells / u64::from(wide)).expect("deep");
+    let deep = u32::try_from(cells / u64::from(wide)).unwrap();
     Grid::of(wide, deep)
 }
 
@@ -49,37 +49,34 @@ fn the_frame_counter_counts_frames() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED counting at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let sizes = plan.sizes();
-    let tick = grit::live::tick(width).expect("tick");
+    let tick = grit::live::tick(width).unwrap();
     let modules: Vec<&[u32]> = vec![&tick];
     let stage: Vec<Groups> = vec![Groups::Fixed(1)];
 
-    eprintln!(
-        "{} — subgroup {width}, {RUN} ticks a submission, {ROUNDS} submissions",
-        host.name()
-    );
+    eprintln!("{} {width} {RUN} {ROUNDS}", host.name());
 
-    let mut held = host.resident(&sizes, &modules).expect("resident");
+    let mut held = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
-        held.write(binding, &vec![0_u32; *words]).expect("wipe");
+        held.write(binding, &vec![0_u32; *words]).unwrap();
     }
 
     let mut seen = Vec::with_capacity(ROUNDS);
     for round in 0..ROUNDS {
-        held.write(PARAMS as usize, &[0_u32; 8]).expect("params");
-        held.staged_frames(&[&stage], RUN).expect("ticks");
+        held.write(PARAMS as usize, &[0_u32; 8]).unwrap();
+        held.staged_frames(&[&stage], RUN).unwrap();
         let now = held
             .read(PARAMS as usize, 1)
-            .expect("params")
+            .unwrap()
             .first()
             .copied()
             .unwrap_or(0);
         if now != RUN {
-            eprintln!("  round {round}: {RUN} ticks left the counter at {now}");
+            eprintln!("{round} {RUN} {now}");
         }
         seen.push(now);
     }
@@ -90,16 +87,8 @@ fn the_frame_counter_counts_frames() {
         .filter(|(_, now)| **now != RUN)
         .map(|(round, now)| (round, *now))
         .collect();
-    eprintln!(
-        "  {} of {ROUNDS} rounds counted {RUN}; the rest {wrong:?}",
-        ROUNDS - wrong.len()
-    );
-    assert!(
-        wrong.is_empty(),
-        "{RUN} dispatches of live::tick, and the frame counter reached {wrong:?} instead — every \
-         invocation of the workgroup reads that word, adds one and writes it back, which is the \
-         shape decisions/DR-0018 took out of live::decay"
-    );
+    eprintln!("{} {ROUNDS} {RUN} {wrong:?}", ROUNDS - wrong.len());
+    assert!(wrong.is_empty());
 }
 
 #[test]
@@ -115,29 +104,28 @@ fn the_counter_after_a_pour_is_the_frames_poured() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED counting at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let sizes = plan.sizes();
 
     eprintln!(
-        "{} — subgroup {width}, {} blocks, {POURED} frames a round, {POURED_ROUNDS} rounds each way",
+        "{} {width} {} {POURED} {POURED_ROUNDS}",
         host.name(),
         plan.blocks
     );
 
     let mut wrong = Vec::new();
     for coarse in [true, false] {
-        let (passes, stages) =
-            grit::live::arranged(width, grid, &plan, None, coarse).expect("arranged");
+        let (passes, stages) = grit::live::arranged(width, grid, &plan, None, coarse).unwrap();
         let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
         for round in 0..POURED_ROUNDS {
-            let mut held = host.resident(&sizes, &modules).expect("resident");
+            let mut held = host.resident(&sizes, &modules).unwrap();
             for (binding, words) in sizes.iter().enumerate() {
-                held.write(binding, &vec![0_u32; *words]).expect("wipe");
+                held.write(binding, &vec![0_u32; *words]).unwrap();
             }
             let mut cells = vec![AIR; grid.cells()];
             for row in 0..grid.deep {
@@ -148,40 +136,32 @@ fn the_counter_after_a_pour_is_the_frames_poured() {
                     }
                 }
             }
-            held.write(STATE as usize, &cells).expect("room");
+            held.write(STATE as usize, &cells).unwrap();
             held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
-                .expect("params");
-            grit::live::seed(&mut held, grid, &plan).expect("seed");
-            held.staged(&groups).expect("warm");
+                .unwrap();
+            grit::live::seed(&mut held, grid, &plan).unwrap();
+            held.staged(&groups).unwrap();
             let (x, y) = (grid.wide / 2, grid.deep / 8);
             held.write_at(PARAMS as usize, BRUSH, &[x, y, 49, SAND])
-                .expect("brush");
-            held.staged_frames(&groups, POURED).expect("frames");
+                .unwrap();
+            held.staged_frames(&groups, POURED).unwrap();
             held.write_at(PARAMS as usize, BRUSH, &[x, y, 49, AIR])
-                .expect("brush");
+                .unwrap();
 
             let now = held
                 .read(PARAMS as usize, 1)
-                .expect("params")
+                .unwrap()
                 .first()
                 .copied()
                 .unwrap_or(0);
             if now != POURED {
-                eprintln!(
-                    "  {} list, round {round}: {POURED} frames left the counter at {now}",
-                    if coarse { "with a" } else { "without" }
-                );
+                eprintln!("{} {round} {POURED} {now}", coarse);
                 wrong.push((coarse, round, now));
             }
         }
     }
-    eprintln!("  {} rounds counted wrong", wrong.len());
-    assert!(
-        wrong.is_empty(),
-        "the frame counter did not count the frames: {wrong:?} — every invocation of tick's \
-         workgroup reads that word, adds one and writes it back, and its low bit is the partition's \
-         phase"
-    );
+    eprintln!("{}", wrong.len());
+    assert!(wrong.is_empty());
 }
 
 #[test]
@@ -194,37 +174,34 @@ fn what_a_tick_costs() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED counting at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let sizes = plan.sizes();
-    let tick = grit::live::tick(width).expect("tick");
+    let tick = grit::live::tick(width).unwrap();
     let modules: Vec<&[u32]> = vec![&tick];
     let stage: Vec<Groups> = vec![Groups::Fixed(1)];
 
-    let mut held = host.resident(&sizes, &modules).expect("resident");
+    let mut held = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
-        held.write(binding, &vec![0_u32; *words]).expect("wipe");
+        held.write(binding, &vec![0_u32; *words]).unwrap();
     }
 
-    eprintln!(
-        "{} — subgroup {width}, one tick and the barrier behind it",
-        host.name()
-    );
+    eprintln!("{} {width}", host.name());
     for times in [1_u32, 10, 100, 1000] {
         let mut seen = Vec::new();
         for round in 0..6 {
-            held.staged_frames(&[&stage], times).expect("ticks");
+            held.staged_frames(&[&stage], times).unwrap();
             if round > 0 {
                 seen.push(held.on_device().unwrap_or_default().as_nanos());
             }
         }
         eprintln!(
-            "  {times:>5} a submission: {}-{} ns a tick over {} submissions",
+            "{times:>5} {} {} {}",
             seen.iter().copied().min().unwrap_or(0),
             seen.iter().copied().max().unwrap_or(0),
-            seen.len(),
+            seen.len()
         );
     }
 }

@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic)]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::time::Duration;
 
@@ -9,12 +9,9 @@ use grit::compact::Plan;
 #[track_caller]
 fn says(what: &Error, parts: &[&str]) {
     let said = what.to_string();
-    assert!(!said.is_empty(), "{what:?} rendered as nothing at all");
+    assert!(!said.is_empty());
     for part in parts {
-        assert!(
-            said.contains(part),
-            "{what:?} holds {part} and says {said:?}, so the field is not in the message"
-        );
+        assert!(said.contains(part));
     }
 }
 
@@ -83,10 +80,7 @@ fn every_error_says_the_numbers_it_holds() {
     };
     says(&nothing, &["4242"]);
     let said = nothing.to_string();
-    assert!(
-        !said.contains("None"),
-        "a ticket with nothing outstanding says {said:?}"
-    );
+    assert!(!said.contains("None"));
 }
 
 #[test]
@@ -94,7 +88,7 @@ fn a_vulkan_code_becomes_the_error_that_carries_it() {
     let from = Error::from(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
     match from {
         Error::Vulkan(code) => assert_eq!(code, vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
-        other => panic!("a Vulkan code became {other:?}"),
+        other => panic!("{other:?}"),
     }
     says(&from, &["OUT_OF_DEVICE_MEMORY"]);
 }
@@ -105,15 +99,9 @@ fn a_plan_too_large_says_how_large_and_what_the_limit_is() {
     let per_block = grit::sweep::cells(width);
     let over = per_block * per_block + 1;
     let Err(too_big) = Plan::over(width, over) else {
-        panic!("{over} blocks at subgroup {width} was not refused");
+        panic!("{over} {width}");
     };
     let said = too_big.to_string();
-    assert!(
-        said.contains(&over.to_string()),
-        "the refusal does not say how many blocks were asked for: {said:?}"
-    );
-    assert!(
-        said.contains(&(per_block * per_block).to_string()),
-        "the refusal does not say what two levels reach: {said:?}"
-    );
+    assert!(said.contains(&over.to_string()));
+    assert!(said.contains(&(per_block * per_block).to_string()));
 }

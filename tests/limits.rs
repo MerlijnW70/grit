@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use ash::vk;
 
@@ -9,11 +9,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -51,40 +51,27 @@ fn the_widest_plan_asks_for_more_workgroups_than_a_device_promises() {
     let width = host.width();
     let pattern = std::env::var("GRIT_DEVICE").ok();
     let Some((name, limits)) = limits_of(pattern.as_deref()) else {
-        eprintln!("SKIPPED limits: no physical device to read");
+        eprintln!("SKIPPED");
         return;
     };
 
     let per_block = sweep::cells(width);
     let widest = per_block * per_block;
-    let plan = Plan::over(width, widest).expect("the widest plan two levels reach");
+    let plan = Plan::over(width, widest).unwrap();
 
     let promised = limits.max_compute_work_group_count[0];
     let asked = plan.blocks;
 
-    eprintln!("{name} — subgroup {width}, per_block {per_block}");
-    eprintln!("  max_compute_work_group_count[0]  {promised}");
-    eprintln!(
-        "  max_storage_buffer_range         {} bytes",
-        limits.max_storage_buffer_range
-    );
-    eprintln!("  Plan::over refuses past           {widest} blocks");
-    eprintln!("  a decay over every block asks for {asked} workgroups");
-    eprintln!(
-        "  Host::ceiling                     {} bytes",
-        host.ceiling()
-    );
+    eprintln!("{name} {width} {per_block}");
+    eprintln!("{promised}");
+    eprintln!("{}", limits.max_storage_buffer_range);
+    eprintln!("{widest}");
+    eprintln!("{asked}");
+    eprintln!("{}", host.ceiling());
 
     let sizes = plan.sizes();
     let widest_binding = sizes.iter().copied().max().unwrap_or(0);
-    eprintln!(
-        "  the widest binding that plan wants {} words, {} bytes",
-        widest_binding,
-        widest_binding * 4
-    );
+    eprintln!("{} {}", widest_binding, widest_binding * 4);
 
-    assert!(
-        promised > 0 && limits.max_storage_buffer_range > 0,
-        "a device that promises nothing"
-    );
+    assert!(promised > 0 && limits.max_storage_buffer_range > 0);
 }

@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::netlist::{
     Chip, Exam, Fault, Gate, KIND_BITS, KINDS, Netlist, NotAChip, NotAnExam, SOURCE_BITS, SOURCES,
@@ -7,11 +7,7 @@ use grit::netlist::{
 
 #[test]
 fn the_packing_is_exactly_a_word() {
-    assert_eq!(
-        KIND_BITS + SOURCE_BITS * 2,
-        32,
-        "a kind and two references have to be a word between them"
-    );
+    assert_eq!(KIND_BITS + SOURCE_BITS * 2, 32);
     assert_eq!(SOURCES, 1 << SOURCE_BITS);
     assert_eq!(KINDS, 1 << KIND_BITS);
 }
@@ -23,11 +19,7 @@ fn a_gate_in_range_packs_and_unpacks_to_itself() {
         for left in edges(SOURCES) {
             for right in edges(SOURCES) {
                 let gate = Gate { kind, left, right };
-                assert_eq!(
-                    Gate::unpack(gate.pack()),
-                    gate,
-                    "kind {kind}, left {left}, right {right} did not survive the word"
-                );
+                assert_eq!(Gate::unpack(gate.pack()), gate);
             }
         }
     }
@@ -54,19 +46,15 @@ fn each_field_owns_its_own_bits() {
         right: SOURCES - 1,
         ..none
     };
-    assert_eq!(kind.pack() & left.pack(), 0, "kind and left share a bit");
-    assert_eq!(kind.pack() & right.pack(), 0, "kind and right share a bit");
-    assert_eq!(left.pack() & right.pack(), 0, "left and right share a bit");
-    assert_eq!(
-        kind.pack() | left.pack() | right.pack(),
-        u32::MAX,
-        "the three fields do not cover the word"
-    );
+    assert_eq!(kind.pack() & left.pack(), 0);
+    assert_eq!(kind.pack() & right.pack(), 0);
+    assert_eq!(left.pack() & right.pack(), 0);
+    assert_eq!(kind.pack() | left.pack() | right.pack(), u32::MAX);
 }
 
 #[test]
 fn a_shape_past_the_packing_is_refused() {
-    assert!(Netlist::over(5, 1, 96, 8).is_ok(), "a five-input chip fits");
+    assert!(Netlist::over(5, 1, 96, 8).is_ok());
 
     let sources = Netlist::over(8, 1, SOURCES, 8);
     assert_eq!(
@@ -74,8 +62,7 @@ fn a_shape_past_the_packing_is_refused() {
         Err(TooWide::Sources {
             sources: SOURCES + 8,
             limit: SOURCES
-        }),
-        "more sources than a reference names has to be refused"
+        })
     );
 
     let kinds = Netlist::over(4, 1, 16, KINDS + 1);
@@ -96,15 +83,12 @@ fn a_shape_past_the_packing_is_refused() {
         })
     );
 
-    assert!(
-        Netlist::over(0, 1, SOURCES, KINDS).is_ok(),
-        "the packing has to reach its own limit"
-    );
+    assert!(Netlist::over(0, 1, SOURCES, KINDS).is_ok());
 }
 
 #[test]
 fn a_gate_may_only_name_a_source_below_its_own() {
-    let held = Netlist::over(5, 1, 96, 8).expect("netlist");
+    let held = Netlist::over(5, 1, 96, 8).unwrap();
 
     assert_eq!(held.below(0), 5);
     assert!(
@@ -131,8 +115,7 @@ fn a_gate_may_only_name_a_source_below_its_own() {
             side: 0,
             names: 5,
             below: 5
-        }),
-        "gate nought naming gate nought is a gate reading itself"
+        })
     );
 
     assert_eq!(held.below(7), 12);
@@ -145,8 +128,7 @@ fn a_gate_may_only_name_a_source_below_its_own() {
                 right: 0
             }
         )
-        .is_ok(),
-        "the gate one below is the highest it may read"
+        .is_ok()
     );
     assert_eq!(
         held.checked(
@@ -161,8 +143,7 @@ fn a_gate_may_only_name_a_source_below_its_own() {
             side: 1,
             names: 12,
             below: 12
-        }),
-        "reading its own answer is the first thing forbidden"
+        })
     );
     assert_eq!(
         held.checked(
@@ -177,8 +158,7 @@ fn a_gate_may_only_name_a_source_below_its_own() {
             side: 1,
             names: 95,
             below: 12
-        }),
-        "and a reference far ahead is the same fault"
+        })
     );
 
     assert_eq!(
@@ -196,7 +176,7 @@ fn a_gate_may_only_name_a_source_below_its_own() {
 
 #[test]
 fn the_rule_and_the_check_are_the_same_function() {
-    let held = Netlist::over(3, 1, 4, 4).expect("netlist");
+    let held = Netlist::over(3, 1, 4, 4).unwrap();
     let mut refused = 0;
     let mut allowed = 0;
     for at in 0..held.gates {
@@ -206,11 +186,7 @@ fn the_rule_and_the_check_are_the_same_function() {
                     let gate = Gate { kind, left, right };
                     let by_hand =
                         left < held.inputs + at && right < held.inputs + at && kind < held.kinds;
-                    assert_eq!(
-                        held.checked(at, gate).is_ok(),
-                        by_hand,
-                        "at {at}, kind {kind}, left {left}, right {right}"
-                    );
+                    assert_eq!(held.checked(at, gate).is_ok(), by_hand);
                     if by_hand {
                         allowed += 1;
                     } else {
@@ -220,15 +196,12 @@ fn the_rule_and_the_check_are_the_same_function() {
             }
         }
     }
-    assert!(
-        allowed > 0 && refused > 0,
-        "{allowed} allowed, {refused} refused"
-    );
+    assert!(allowed > 0 && refused > 0);
 }
 
 #[test]
 fn following_references_always_reaches_an_input() {
-    let held = Netlist::over(5, 1, 96, 8).expect("netlist");
+    let held = Netlist::over(5, 1, 96, 8).unwrap();
 
     let packed: Vec<u32> = (0..held.gates)
         .map(|at| {
@@ -241,38 +214,25 @@ fn following_references_always_reaches_an_input() {
             .pack()
         })
         .collect();
-    assert!(
-        held.faults(&packed).is_empty(),
-        "the densest legal wiring has to be legal"
-    );
+    assert!(held.faults(&packed).is_empty());
 
     for start in 0..held.gates {
         let mut at = held.below(start);
         let mut steps = 0;
         while at >= held.inputs {
             let gate = Gate::unpack(packed[(at - held.inputs) as usize]);
-            assert!(
-                gate.left < at,
-                "a walk that does not go down is a walk that can return"
-            );
+            assert!(gate.left < at);
             at = gate.left;
             steps += 1;
-            assert!(
-                steps <= held.sources(),
-                "the walk from gate {start} has taken {steps} steps over {} sources",
-                held.sources()
-            );
+            assert!(steps <= held.sources());
         }
-        assert!(
-            at < held.inputs,
-            "the walk ended somewhere that is not an input"
-        );
+        assert!(at < held.inputs);
     }
 }
 
 #[test]
 fn every_fault_is_found_and_placed() {
-    let held = Netlist::over(4, 1, 8, 4).expect("netlist");
+    let held = Netlist::over(4, 1, 8, 4).unwrap();
     let mut packed: Vec<u32> = (0..held.gates)
         .map(|_| {
             Gate {
@@ -284,10 +244,7 @@ fn every_fault_is_found_and_placed() {
         })
         .collect();
 
-    assert!(
-        held.faults(&packed).is_empty(),
-        "the plain netlist is legal"
-    );
+    assert!(held.faults(&packed).is_empty());
 
     packed[2] = Gate {
         kind: 0,
@@ -321,16 +278,12 @@ fn every_fault_is_found_and_placed() {
 
 #[test]
 fn the_sizes_are_the_shape_and_nothing_else() {
-    let held = Netlist::over(5, 3, 96, 8).expect("netlist");
-    assert_eq!(
-        held.words(),
-        32,
-        "five inputs is a table of thirty-two rows"
-    );
+    let held = Netlist::over(5, 3, 96, 8).unwrap();
+    assert_eq!(held.words(), 32);
     assert_eq!(held.sources(), 101);
     assert_eq!(held.sizes(), [96, 3, 32]);
 
-    let four = Netlist::over(4, 1, 96, 8).expect("netlist");
+    let four = Netlist::over(4, 1, 96, 8).unwrap();
     assert_eq!(four.words(), 16);
     assert_eq!(four.sizes(), [96, 1, 16]);
 }
@@ -342,27 +295,21 @@ fn what_they_say_when_they_are_printed() {
         names: 12,
         below: 12,
     };
-    assert_eq!(
-        ahead.to_string(),
-        "the right reference names source 12, which is not below 12"
-    );
-    assert_eq!(
-        Fault::NoSuchKind { kind: 9, kinds: 4 }.to_string(),
-        "kind 9 in a kit of 4"
-    );
+    assert_eq!(ahead.to_string(), "1 12 12");
+    assert_eq!(Fault::NoSuchKind { kind: 9, kinds: 4 }.to_string(), "9 4");
     assert_eq!(
         TooWide::Outputs {
             outputs: 9,
             gates: 8
         }
         .to_string(),
-        "9 outputs over 8 gates"
+        "9 8"
     );
 }
 
 #[test]
 fn a_drawn_gate_is_legal_for_every_roll() {
-    let held = Netlist::over(3, 1, 4, 4).expect("netlist");
+    let held = Netlist::over(3, 1, 4, 4).unwrap();
     let mut seen = 0_u64;
     for at in 0..held.gates {
         let period = u64::from(held.kinds) * u64::from(held.below(at)) * u64::from(held.below(at));
@@ -372,54 +319,42 @@ fn a_drawn_gate_is_legal_for_every_roll() {
             .chain((0..4096).map(|step: u32| step.wrapping_mul(1_048_573)));
         for roll in walked {
             let gate = drawn(&held, at, roll);
-            assert!(
-                held.checked(at, gate).is_ok(),
-                "roll {roll} at {at} drew {gate:?}, which is not legal there"
-            );
+            assert!(held.checked(at, gate).is_ok());
             assert!(gate.left < held.below(at) && gate.right < held.below(at));
             assert!(gate.kind < held.kinds);
             seen += 1;
         }
     }
-    assert!(seen > 100_000, "only {seen} rolls were walked");
+    assert!(seen > 100_000);
 }
 
 #[test]
 fn a_drawn_gate_is_legal_at_five_inputs() {
-    let held = Netlist::over(5, 1, 96, 8).expect("netlist");
+    let held = Netlist::over(5, 1, 96, 8).unwrap();
     for at in 0..held.gates {
         let walked = (0..20_000_u32)
             .chain((u32::MAX - 20_000)..=u32::MAX)
             .chain((0..20_000).map(|step: u32| step.wrapping_mul(214_749)));
         for roll in walked {
             let gate = drawn(&held, at, roll);
-            assert!(
-                held.checked(at, gate).is_ok(),
-                "roll {roll} at {at} drew {gate:?}"
-            );
+            assert!(held.checked(at, gate).is_ok());
         }
     }
 }
 
 #[test]
 fn turning_a_gate_moves_one_field_and_keeps_it_legal() {
-    let held = Netlist::over(5, 1, 96, 8).expect("netlist");
+    let held = Netlist::over(5, 1, 96, 8).unwrap();
     let mut moved = [0_u32; 3];
     for at in 0..held.gates {
         let was = drawn(&held, at, at.wrapping_mul(2_654_435_761));
         for roll in (0..8192_u32).chain((u32::MAX - 4096)..=u32::MAX) {
             let now = turned(&held, at, was, roll);
-            assert!(
-                held.checked(at, now).is_ok(),
-                "roll {roll} at {at} turned {was:?} into {now:?}"
-            );
+            assert!(held.checked(at, now).is_ok());
             let differs = u32::from(now.kind != was.kind)
                 + u32::from(now.left != was.left)
                 + u32::from(now.right != was.right);
-            assert!(
-                differs <= 1,
-                "{was:?} became {now:?}, which is {differs} fields"
-            );
+            assert!(differs <= 1);
             if now.kind != was.kind {
                 moved[0] += 1;
             }
@@ -431,35 +366,26 @@ fn turning_a_gate_moves_one_field_and_keeps_it_legal() {
             }
         }
     }
-    assert!(
-        moved[0] > 0 && moved[1] > 0 && moved[2] > 0,
-        "kind moved {}, left {}, right {}",
-        moved[0],
-        moved[1],
-        moved[2]
-    );
+    assert!(moved[0] > 0 && moved[1] > 0 && moved[2] > 0);
 }
 
 #[test]
 fn turning_does_not_repair_what_was_already_wrong() {
-    let held = Netlist::over(5, 1, 96, 8).expect("netlist");
+    let held = Netlist::over(5, 1, 96, 8).unwrap();
     let bad = Gate {
         kind: 0,
         left: 90,
         right: 0,
     };
-    assert!(held.checked(3, bad).is_err(), "the gate has to start wrong");
+    assert!(held.checked(3, bad).is_err());
     let now = turned(&held, 3, bad, 2);
-    assert_eq!(now.left, 90, "turning the right must not touch the left");
-    assert!(
-        held.checked(3, now).is_err(),
-        "a mutation is not a check and must not look like one"
-    );
+    assert_eq!(now.left, 90);
+    assert!(held.checked(3, now).is_err());
 }
 
 #[test]
 fn a_table_that_is_not_the_shape_is_refused() {
-    let five = Netlist::over(5, 1, 96, 8).expect("netlist");
+    let five = Netlist::over(5, 1, 96, 8).unwrap();
     assert_eq!(five.words(), 32);
 
     assert_eq!(
@@ -467,8 +393,7 @@ fn a_table_that_is_not_the_shape_is_refused() {
         Err(NotAnExam::Rows {
             given: 16,
             wanted: 32
-        }),
-        "a sixteen-row table is a four-input exam"
+        })
     );
 
     let mut stray = vec![0_u32; 32];
@@ -479,13 +404,12 @@ fn a_table_that_is_not_the_shape_is_refused() {
             row: 9,
             holds: 0b10,
             outputs: 1
-        }),
-        "one output means bit nought and no other"
+        })
     );
 
     assert!(Exam::of(five, vec![1; 32]).is_ok());
 
-    let three = Netlist::over(5, 3, 96, 8).expect("netlist");
+    let three = Netlist::over(5, 3, 96, 8).unwrap();
     assert!(Exam::of(three, vec![0b111; 32]).is_ok());
     assert_eq!(
         Exam::of(three, vec![0b1000; 32]),
@@ -499,58 +423,42 @@ fn a_table_that_is_not_the_shape_is_refused() {
 
 #[test]
 fn the_exam_of_five_inputs_is_thirty_two_rows() {
-    let shape = Netlist::over(5, 1, 96, 8).expect("netlist");
+    let shape = Netlist::over(5, 1, 96, 8).unwrap();
     let answers: Vec<u32> = (0..32_u32).map(|word| word.count_ones() & 1).collect();
-    let exam = Exam::of(shape, answers).expect("exam");
+    let exam = Exam::of(shape, answers).unwrap();
 
-    assert_eq!(
-        exam.marks(),
-        32,
-        "one answer bit for each of thirty-two rows"
-    );
+    assert_eq!(exam.marks(), 32);
     assert_eq!(exam.shape().words(), 32);
-    assert_eq!(exam.asked(0), 0, "no ones is even");
+    assert_eq!(exam.asked(0), 0);
     assert_eq!(exam.asked(1), 1);
-    assert_eq!(exam.asked(3), 0, "two ones is even");
-    assert_eq!(exam.asked(31), 1, "five ones is odd");
+    assert_eq!(exam.asked(3), 0);
+    assert_eq!(exam.asked(31), 1);
 
-    let wide = Netlist::over(5, 3, 96, 8).expect("netlist");
+    let wide = Netlist::over(5, 3, 96, 8).unwrap();
     let counted: Vec<u32> = (0..32_u32).map(u32::count_ones).collect();
-    let count = Exam::of(wide, counted).expect("exam");
+    let count = Exam::of(wide, counted).unwrap();
     assert_eq!(count.marks(), 96);
-    assert_eq!(count.asked(31), 5, "five ones is a hundred and one");
+    assert_eq!(count.asked(31), 5);
 }
 
 #[test]
 fn a_score_counts_the_bits_that_agree() {
-    let shape = Netlist::over(3, 2, 8, 4).expect("netlist");
+    let shape = Netlist::over(3, 2, 8, 4).unwrap();
     let answers: Vec<u32> = (0..8_u32).map(|word| word & 0b11).collect();
-    let exam = Exam::of(shape, answers.clone()).expect("exam");
-    assert_eq!(exam.marks(), 16, "eight rows of two answers");
+    let exam = Exam::of(shape, answers.clone()).unwrap();
+    assert_eq!(exam.marks(), 16);
 
-    assert_eq!(
-        exam.scored(&answers),
-        16,
-        "the answers themselves are perfect"
-    );
+    assert_eq!(exam.scored(&answers), 16);
 
     let inverted: Vec<u32> = answers.iter().map(|held| !*held).collect();
-    assert_eq!(
-        exam.scored(&inverted),
-        0,
-        "the complement gets nothing right"
-    );
+    assert_eq!(exam.scored(&inverted), 0);
 
     let mut nearly = inverted.clone();
     nearly[0] = answers[0] ^ 0b10;
     assert_eq!(exam.scored(&nearly), 1);
 
     let noisy: Vec<u32> = answers.iter().map(|held| held | 0xffff_fffc).collect();
-    assert_eq!(
-        exam.scored(&noisy),
-        16,
-        "a bit nobody asked about must not cost a mark"
-    );
+    assert_eq!(exam.scored(&noisy), 16);
 
     assert_eq!(exam.scored(&answers[..4]), 8);
     assert_eq!(exam.scored(&[]), 0);
@@ -564,7 +472,7 @@ fn what_a_refused_table_says() {
             wanted: 32
         }
         .to_string(),
-        "16 rows for a table of 32"
+        "16 32"
     );
     assert_eq!(
         NotAnExam::Stray {
@@ -573,7 +481,7 @@ fn what_a_refused_table_says() {
             outputs: 1
         }
         .to_string(),
-        "row 9 holds 0x2, which sets a bit past the 1 asked for"
+        "9 0x2 1"
     );
 }
 
@@ -593,8 +501,7 @@ fn a_kind_is_its_own_truth_table() {
                         left,
                         right
                     ),
-                    by_hand,
-                    "kind {kind:#06b} on left {left}, right {right}"
+                    by_hand
                 );
             }
         }
@@ -616,17 +523,17 @@ fn the_gates_that_have_names_answer_what_they_are_called() {
             answered(gate, 1, 1),
         ]
     };
-    assert_eq!(of(0b0000), [0, 0, 0, 0], "the constant nought");
-    assert_eq!(of(0b1111), [1, 1, 1, 1], "the constant one");
-    assert_eq!(of(0b1000), [0, 0, 0, 1], "and");
-    assert_eq!(of(0b1110), [0, 1, 1, 1], "or");
-    assert_eq!(of(0b0110), [0, 1, 1, 0], "xor");
-    assert_eq!(of(0b1001), [1, 0, 0, 1], "equal");
-    assert_eq!(of(0b1010), [0, 1, 0, 1], "a wire carrying the left input");
-    assert_eq!(of(0b1100), [0, 0, 1, 1], "a wire carrying the right input");
-    assert_eq!(of(0b0101), [1, 0, 1, 0], "not the left input");
+    assert_eq!(of(0b0000), [0, 0, 0, 0]);
+    assert_eq!(of(0b1111), [1, 1, 1, 1]);
+    assert_eq!(of(0b1000), [0, 0, 0, 1]);
+    assert_eq!(of(0b1110), [0, 1, 1, 1]);
+    assert_eq!(of(0b0110), [0, 1, 1, 0]);
+    assert_eq!(of(0b1001), [1, 0, 0, 1]);
+    assert_eq!(of(0b1010), [0, 1, 0, 1]);
+    assert_eq!(of(0b1100), [0, 0, 1, 1]);
+    assert_eq!(of(0b0101), [1, 0, 1, 0]);
 
-    let eight = Netlist::over(3, 1, 4, 8).expect("netlist");
+    let eight = Netlist::over(3, 1, 4, 8).unwrap();
     let sat = |kind: u32| {
         eight.checked(
             1,
@@ -637,17 +544,13 @@ fn the_gates_that_have_names_answer_what_they_are_called() {
             },
         )
     };
-    assert!(sat(0b0110).is_ok(), "an xor is in a kit of eight");
-    assert_eq!(
-        sat(0b1000),
-        Err(Fault::NoSuchKind { kind: 8, kinds: 8 }),
-        "and an and is not"
-    );
+    assert!(sat(0b0110).is_ok());
+    assert_eq!(sat(0b1000), Err(Fault::NoSuchKind { kind: 8, kinds: 8 }));
 }
 
 #[test]
 fn a_pair_of_arrays_that_is_not_a_chip_is_refused() {
-    let shape = Netlist::over(3, 1, 4, 16).expect("netlist");
+    let shape = Netlist::over(3, 1, 4, 16).unwrap();
     let plain: Vec<u32> = std::iter::repeat_n(
         Gate {
             kind: 0b0110,
@@ -680,8 +583,7 @@ fn a_pair_of_arrays_that_is_not_a_chip_is_refused() {
             output: 0,
             names: 4,
             gates: 4
-        }),
-        "an answer off a gate that is not there"
+        })
     );
 
     let mut ahead = plain;
@@ -700,14 +602,13 @@ fn a_pair_of_arrays_that_is_not_a_chip_is_refused() {
                 names: 4,
                 below: 4
             }
-        }),
-        "a chip is refused for the same reason a gate is"
+        })
     );
 }
 
 #[test]
 fn the_inputs_are_the_words_bits() {
-    let shape = Netlist::over(5, 1, 1, 16).expect("netlist");
+    let shape = Netlist::over(5, 1, 1, 16).unwrap();
     let chip = Chip::of(
         shape,
         vec![
@@ -720,7 +621,7 @@ fn the_inputs_are_the_words_bits() {
         ],
         vec![0],
     )
-    .expect("chip");
+    .unwrap();
 
     assert_eq!(chip.sourced(0)[..5], [0, 0, 0, 0, 0]);
     assert_eq!(chip.sourced(1)[..5], [1, 0, 0, 0, 0]);
@@ -730,7 +631,7 @@ fn the_inputs_are_the_words_bits() {
 
 #[test]
 fn a_hand_built_chip_passes_the_five_input_parity_exam() {
-    let shape = Netlist::over(5, 1, 4, 16).expect("netlist");
+    let shape = Netlist::over(5, 1, 4, 16).unwrap();
     let xor = |left: u32, right: u32| {
         Gate {
             kind: 0b0110,
@@ -744,19 +645,19 @@ fn a_hand_built_chip_passes_the_five_input_parity_exam() {
         vec![xor(0, 1), xor(5, 2), xor(6, 3), xor(7, 4)],
         vec![3],
     )
-    .expect("chip");
+    .unwrap();
 
     let answers: Vec<u32> = (0..32_u32).map(|word| word.count_ones() & 1).collect();
-    let exam = Exam::of(shape, answers.clone()).expect("exam");
+    let exam = Exam::of(shape, answers.clone()).unwrap();
 
-    assert_eq!(chip.table(), answers, "the circuit is the parity of five");
+    assert_eq!(chip.table(), answers);
     assert_eq!(exam.marks(), 32);
-    assert_eq!(exam.scored(&chip.table()), 32, "and it is worth full marks");
+    assert_eq!(exam.scored(&chip.table()), 32);
 }
 
 #[test]
 fn a_chip_that_is_wrong_scores_what_it_is_worth() {
-    let shape = Netlist::over(5, 1, 4, 16).expect("netlist");
+    let shape = Netlist::over(5, 1, 4, 16).unwrap();
     let xor = |left: u32, right: u32| {
         Gate {
             kind: 0b0110,
@@ -770,20 +671,16 @@ fn a_chip_that_is_wrong_scores_what_it_is_worth() {
         vec![xor(0, 1), xor(5, 2), xor(6, 3), xor(7, 7)],
         vec![2],
     )
-    .expect("chip");
+    .unwrap();
 
     let answers: Vec<u32> = (0..32_u32).map(|word| word.count_ones() & 1).collect();
-    let exam = Exam::of(shape, answers).expect("exam");
-    assert_eq!(
-        exam.scored(&chip.table()),
-        16,
-        "right on the sixteen words where the fifth input is nought and wrong on the rest"
-    );
+    let exam = Exam::of(shape, answers).unwrap();
+    assert_eq!(exam.scored(&chip.table()), 16);
 }
 
 #[test]
 fn a_chip_can_carry_more_than_one_answer() {
-    let shape = Netlist::over(2, 2, 3, 16).expect("netlist");
+    let shape = Netlist::over(2, 2, 3, 16).unwrap();
     let chip = Chip::of(
         shape,
         vec![
@@ -808,12 +705,12 @@ fn a_chip_can_carry_more_than_one_answer() {
         ],
         vec![0, 1],
     )
-    .expect("chip");
+    .unwrap();
 
     assert_eq!(chip.table(), vec![0, 1, 1, 2]);
 
-    let exam = Exam::of(shape, vec![0, 1, 1, 2]).expect("exam");
-    assert_eq!(exam.marks(), 8, "four rows of two answers");
+    let exam = Exam::of(shape, vec![0, 1, 1, 2]).unwrap();
+    assert_eq!(exam.marks(), 8);
     assert_eq!(exam.scored(&chip.table()), 8);
 }
 
@@ -825,7 +722,7 @@ fn what_a_refused_chip_says() {
             wanted: 4
         }
         .to_string(),
-        "3 gates for a circuit of 4"
+        "3 4"
     );
     assert_eq!(
         NotAChip::NoSuchGate {
@@ -834,7 +731,7 @@ fn what_a_refused_chip_says() {
             gates: 4
         }
         .to_string(),
-        "answer 0 is taken off gate 4, and there are 4"
+        "0 4 4"
     );
     assert_eq!(
         NotAChip::Gate {
@@ -842,13 +739,13 @@ fn what_a_refused_chip_says() {
             fault: Fault::NoSuchKind { kind: 9, kinds: 4 }
         }
         .to_string(),
-        "gate 1: kind 9 in a kit of 4"
+        "1 9 4"
     );
 }
 
 #[test]
 fn everything_a_mutation_draws_is_something_a_chip_can_run() {
-    let shape = Netlist::over(5, 1, 32, 16).expect("netlist");
+    let shape = Netlist::over(5, 1, 32, 16).unwrap();
     for roll in (0..512_u32).chain((u32::MAX - 64)..=u32::MAX) {
         let gates: Vec<u32> = (0..shape.gates)
             .map(|at| {
@@ -861,9 +758,9 @@ fn everything_a_mutation_draws_is_something_a_chip_can_run() {
             })
             .collect();
         let chip = Chip::of(shape, gates, vec![shape.gates - 1])
-            .unwrap_or_else(|why| panic!("roll {roll} drew a chip that will not run: {why}"));
+            .unwrap_or_else(|why| panic!("{roll} {why}"));
         for row in chip.table() {
-            assert!(row <= 1, "row {row} is not one answer bit");
+            assert!(row <= 1);
         }
     }
 }

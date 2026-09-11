@@ -16,20 +16,15 @@ const STIR: u32 = 0x85EB_CA6B;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(host) = Host::open()? else {
-        println!("no Vulkan device");
         return Ok(());
     };
     let width = host.width();
-    println!("{} — subgroup {width}", host.name());
+    println!("{} {width}", host.name());
 
     let built = Instant::now();
     let passes = [tick(width)?, step(width)?, draw(width)?];
     let words: usize = passes.iter().map(Vec::len).sum();
-    println!(
-        "{words} words of SPIR-V across {} passes in {:?}",
-        passes.len(),
-        built.elapsed()
-    );
+    println!("{words} {} {:?}", passes.len(), built.elapsed());
 
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let mut resident = host.resident(&[1, CELLS, CELLS], &modules)?;
@@ -41,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let groups = [Groups::Fixed(1), Groups::Fixed(over), Groups::Fixed(over)];
 
     let mut window = Window::new(
-        "grit — three passes, nothing uploaded",
+        "grit",
         WIDE,
         DEEP,
         WindowOptions {
@@ -55,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let warm = Instant::now();
     let _ = resident.frame_reading(&groups, 2, CELLS)?;
-    println!("first frame, driver compile included: {:?}", warm.elapsed());
+    println!("{:?}", warm.elapsed());
 
     let mut frames = 0_u32;
     let mut on_device = Duration::ZERO;
@@ -71,10 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if clock.elapsed().as_secs_f64() >= 0.5 {
             let seconds = clock.elapsed().as_secs_f64();
             window.set_title(&format!(
-                "grit — {:.0} fps · {:.2} ms in the submission · {CELLS} cells · {}",
+                "{:.0} {:.2} {CELLS} {}",
                 f64::from(frames) / seconds,
                 on_device.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
-                host.name(),
+                host.name()
             ));
             clock = Instant::now();
             frames = 0;
@@ -82,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("flew for {:?} without uploading a word", wall.elapsed());
+    println!("{:?}", wall.elapsed());
     Ok(())
 }
 

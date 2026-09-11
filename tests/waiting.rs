@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::time::{Duration, Instant};
 
@@ -44,11 +44,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -63,17 +63,17 @@ fn the_wait_is_time_the_host_gets_back() {
     let Some(host) = device("the_wait_is_time_the_host_gets_back") else {
         return;
     };
-    let module = walk(host.width()).expect("a kernel");
+    let module = walk(host.width()).unwrap();
     let every: Vec<&[u32]> = vec![&module; PASSES];
-    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
-    held.write(0, &vec![1; WORDS]).expect("a fill");
+    let mut held = host.resident(&[WORDS, 1], &every).unwrap();
+    held.write(0, &vec![1; WORDS]).unwrap();
 
     let groups = vec![Groups::Fixed(over(host.width())); PASSES];
     let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
 
     let elsewhere = || std::thread::sleep(std::time::Duration::from_millis(4));
 
-    held.frame(&groups).expect("a frame");
+    held.frame(&groups).unwrap();
     elsewhere();
 
     let mut showed = false;
@@ -81,7 +81,7 @@ fn the_wait_is_time_the_host_gets_back() {
 
     for _ in 0..TRIES {
         let clock = Instant::now();
-        held.frame(&groups).expect("a frame");
+        held.frame(&groups).unwrap();
         let device_alone = clock.elapsed();
 
         let clock = Instant::now();
@@ -89,9 +89,9 @@ fn the_wait_is_time_the_host_gets_back() {
         let host_alone = clock.elapsed();
 
         let clock = Instant::now();
-        let ticket = held.submit(&stages).expect("a submission");
+        let ticket = held.submit(&stages).unwrap();
         elsewhere();
-        held.wait(ticket).expect("a landing");
+        held.wait(ticket).unwrap();
         let overlapped = clock.elapsed();
 
         let sum = device_alone + host_alone;
@@ -107,15 +107,7 @@ fn the_wait_is_time_the_host_gets_back() {
     let (recorded, frames) = held.recording();
     let per_frame = recorded / u32::try_from(frames.max(1)).unwrap_or(u32::MAX);
     let (device_alone, host_alone, overlapped) = best.unwrap_or_default();
-    eprintln!(
-        "  best of {TRIES}: device {device_alone:?} (of which {per_frame:?} is the host recording \
-         it), host {host_alone:?}, overlapped {overlapped:?}"
-    );
+    eprintln!("{TRIES} {device_alone:?} {per_frame:?} {host_alone:?} {overlapped:?}");
 
-    assert!(
-        showed,
-        "in {TRIES} tries the wait was never given back: the best was device {device_alone:?} and \
-         host {host_alone:?} overlapping to {overlapped:?}, which is nearer their sum than the \
-         longer of them"
-    );
+    assert!(showed);
 }

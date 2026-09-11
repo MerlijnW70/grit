@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::Host;
 use grit::sweep::{self, PER_LANE};
@@ -9,11 +9,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -33,16 +33,12 @@ fn the_work_list_is_the_work_list_the_host_computes() {
     let width = host.width();
     let cells = sweep::cells(width) as usize * BLOCKS as usize;
     let region = sweep::stride(width) as usize * BLOCKS as usize;
-    println!(
-        "{} — subgroup {width}, {} cells a block, {PER_LANE} a lane",
-        host.name(),
-        sweep::cells(width)
-    );
+    println!("{} {width} {} {PER_LANE}", host.name(), sweep::cells(width));
 
     let spirv = match sweep::sweep(width) {
         Ok(spirv) => spirv,
         Err(refused) => {
-            eprintln!("SKIPPED sweep at width {width}: {refused}");
+            eprintln!("SKIPPED {width} {refused}");
             return;
         }
     };
@@ -53,31 +49,21 @@ fn the_work_list_is_the_work_list_the_host_computes() {
 
     let mut resident = host
         .resident(&[1, cells, region, BLOCKS as usize], &[&spirv])
-        .expect("allocated");
-    resident
-        .write(sweep::PARAMS as usize, &[frame])
-        .expect("params");
-    resident
-        .write(sweep::STATE as usize, &state)
-        .expect("state");
-    resident
-        .write(sweep::BUCKETS as usize, &buckets)
-        .expect("buckets");
+        .unwrap();
+    resident.write(sweep::PARAMS as usize, &[frame]).unwrap();
+    resident.write(sweep::STATE as usize, &state).unwrap();
+    resident.write(sweep::BUCKETS as usize, &buckets).unwrap();
     resident
         .write(sweep::COUNTS as usize, &vec![0; BLOCKS as usize])
-        .expect("counts");
+        .unwrap();
 
-    resident
-        .frame(&[grit::Groups::Fixed(BLOCKS)])
-        .expect("dispatched");
+    resident.frame(&[grit::Groups::Fixed(BLOCKS)]).unwrap();
 
-    let ran_state = resident.read(sweep::STATE as usize, cells).expect("state");
-    let ran_buckets = resident
-        .read(sweep::BUCKETS as usize, region)
-        .expect("buckets");
+    let ran_state = resident.read(sweep::STATE as usize, cells).unwrap();
+    let ran_buckets = resident.read(sweep::BUCKETS as usize, region).unwrap();
     let ran_counts = resident
         .read(sweep::COUNTS as usize, BLOCKS as usize)
-        .expect("counts");
+        .unwrap();
 
     let (want_state, want_buckets, want_counts) =
         sweep::sweep_reference(width, BLOCKS, frame, &state, &buckets);
@@ -87,13 +73,10 @@ fn the_work_list_is_the_work_list_the_host_computes() {
         .zip(&want_state)
         .position(|(there, here)| there != here)
     {
-        panic!(
-            "cell {at} stepped to {:#010x} and the host says {:#010x}",
-            ran_state[at], want_state[at]
-        );
+        panic!("{at} {:#010x} {:#010x}", ran_state[at], want_state[at]);
     }
 
-    assert_eq!(ran_counts, want_counts, "the block totals disagree");
+    assert_eq!(ran_counts, want_counts);
 
     let wide = sweep::stride(width) as usize;
     for block in 0..BLOCKS as usize {
@@ -101,7 +84,7 @@ fn the_work_list_is_the_work_list_the_host_computes() {
         let from = block * wide;
         let there = &ran_buckets[from..from + live];
         let here = &want_buckets[from..from + live];
-        assert_eq!(there, here, "block {block}'s bucket disagrees");
+        assert_eq!(there, here);
     }
 
     let per_block = sweep::cells(width) as usize;
@@ -116,36 +99,20 @@ fn the_work_list_is_the_work_list_the_host_computes() {
             .map(|at| u32::try_from(at).unwrap_or(u32::MAX))
             .collect();
 
-        assert_eq!(
-            listed.len(),
-            expected.len(),
-            "block {block} listed {} cells and {} are awake",
-            listed.len(),
-            expected.len()
-        );
+        assert_eq!(listed.len(), expected.len());
 
         let mut sorted = listed.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            listed.len(),
-            "block {block} listed a cell twice, which is an offset collision"
-        );
+        assert_eq!(sorted.len(), listed.len());
 
         let mut wanted = expected.clone();
         wanted.sort_unstable();
-        assert_eq!(
-            sorted, wanted,
-            "block {block} listed a different set of cells than the ones that are awake"
-        );
+        assert_eq!(sorted, wanted);
     }
 
     let total: u32 = ran_counts.iter().sum();
     let density = f64::from(total) * 100.0 / cells as f64;
-    println!("  {total} of {cells} cells awake — {density:.1}%");
-    assert!(
-        total > 0 && (total as usize) < cells,
-        "every cell is awake or none is, so the predicate says nothing"
-    );
+    println!("{total} {cells} {density:.1}");
+    assert!(total > 0 && (total as usize) < cells);
 }

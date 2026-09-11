@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::compact::Plan;
 use grit::layout::{AWAKE, BRUSH, GRAND, HOT, HOT_DENSE, HOT_GRAND, PARAMS, STATE};
@@ -31,11 +31,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -91,7 +91,7 @@ fn ran(host: &Host, width: u32, grid: Grid, plan: &Plan, how: Running) -> Shot {
         frames,
         coarse,
     } = how;
-    let (passes, wired) = grit::live::arranged(width, grid, plan, None, coarse).expect("arranged");
+    let (passes, wired) = grit::live::arranged(width, grid, plan, None, coarse).unwrap();
     let stages: Vec<Vec<Groups>> = if apart {
         wired.into_iter().flatten().map(|one| vec![one]).collect()
     } else {
@@ -101,46 +101,43 @@ fn ran(host: &Host, width: u32, grid: Grid, plan: &Plan, how: Running) -> Shot {
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
 
-    let mut held = host.resident(&sizes, &modules).expect("resident");
+    let mut held = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
-        held.write(binding, &vec![0_u32; *words]).expect("wipe");
+        held.write(binding, &vec![0_u32; *words]).unwrap();
     }
-    held.write(STATE as usize, &room(grid)).expect("room");
+    held.write(STATE as usize, &room(grid)).unwrap();
     held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
-        .expect("params");
-    grit::live::seed(&mut held, grid, plan).expect("seed");
-    held.staged(&groups).expect("warm");
+        .unwrap();
+    grit::live::seed(&mut held, grid, plan).unwrap();
+    held.staged(&groups).unwrap();
 
     for frame in (0..frames).step_by(batch as usize) {
         let material = if frame < POURING { SAND } else { AIR };
         let (x, y) = (grid.wide / 2, grid.deep / 8);
         held.write_at(PARAMS as usize, BRUSH, &[x, y, 49, material])
-            .expect("brush");
+            .unwrap();
         let left = frames - frame;
-        held.staged_frames(&groups, batch.min(left))
-            .expect("frames");
+        held.staged_frames(&groups, batch.min(left)).unwrap();
     }
 
     let grand = held
         .read(GRAND as usize, 1)
-        .expect("grand")
+        .unwrap()
         .first()
         .copied()
         .unwrap_or(0);
     let hot_grand = held
         .read(HOT_GRAND as usize, 1)
-        .expect("hot grand")
+        .unwrap()
         .first()
         .copied()
         .unwrap_or(0);
     let dense = held
         .read(HOT_DENSE as usize, (hot_grand as usize).max(1))
-        .expect("hot dense");
-    let hot = held
-        .read(HOT as usize, plan.padded() as usize + 1)
-        .expect("hot");
-    let awake = held.read(AWAKE as usize, plan.quads).expect("awake");
-    let world = folded(&held.read(STATE as usize, grid.cells()).expect("state"));
+        .unwrap();
+    let hot = held.read(HOT as usize, plan.padded() as usize + 1).unwrap();
+    let awake = held.read(AWAKE as usize, plan.quads).unwrap();
+    let world = folded(&held.read(STATE as usize, grid.cells()).unwrap());
     Shot {
         grand,
         hot_grand,
@@ -182,13 +179,13 @@ fn which_block_goes_out_of_step() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED wander at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let per = plan.per_block as usize;
     eprintln!(
-        "{} — subgroup {width}, {}x{} cells in {} blocks, {RUNS} runs a frame count",
+        "{} {width} {} {} {} {RUNS}",
         host.name(),
         grid.wide,
         grid.deep,
@@ -233,9 +230,9 @@ fn which_block_goes_out_of_step() {
                 .collect();
             if !cold.is_empty() {
                 eprintln!(
-                    "  {frames:>3} frames run {nth}: flag below its counters in {} blocks {:?}",
+                    "{frames:>3} {nth} {} {:?}",
                     cold.len(),
-                    &cold[..cold.len().min(6)],
+                    &cold[..cold.len().min(6)]
                 );
             }
         }
@@ -251,10 +248,10 @@ fn which_block_goes_out_of_step() {
             distinct.dedup();
             if sorted != expected {
                 eprintln!(
-                    "  {frames:>3} frames run {nth}: the list is not the flags — {} listed, {} distinct, {} flagged",
+                    "{frames:>3} {nth} {} {} {}",
                     listed.len(),
                     distinct.len(),
-                    expected.len(),
+                    expected.len()
                 );
             }
         }
@@ -262,11 +259,11 @@ fn which_block_goes_out_of_step() {
             continue;
         }
         eprintln!(
-            "  {frames:>3} frames  world {}  {} blocks out of step  fine {:?}  coarse {:?}",
-            if world_same { "same" } else { "**differ**" },
+            "{frames:>3} {} {} {:?} {:?}",
+            world_same,
             blocks.len(),
             shots.iter().map(|one| one.grand).collect::<Vec<_>>(),
-            shots.iter().map(|one| one.hot_grand).collect::<Vec<_>>(),
+            shots.iter().map(|one| one.hot_grand).collect::<Vec<_>>()
         );
         for block in blocks.iter().take(4) {
             for (nth, one) in shots.iter().enumerate() {
@@ -278,8 +275,8 @@ fn which_block_goes_out_of_step() {
                 );
                 let listed = one.dense[..one.hot_grand as usize].contains(&(*block as u32));
                 eprintln!(
-                    "    block {block} run {nth}: HOT {} listed {listed}  AWAKE 2x{twos} 1x{ones} 0x{noughts}",
-                    one.hot[*block],
+                    "{block} {nth} {} {listed} {twos} {ones} {noughts}",
+                    one.hot[*block]
                 );
             }
         }
@@ -294,16 +291,12 @@ fn what_a_flag_and_its_counters_say_about_each_other() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED wander at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let per = plan.per_block as usize;
-    eprintln!(
-        "{} — subgroup {width}, {} blocks, {EARLY_RUNS} runs a frame count",
-        host.name(),
-        plan.blocks
-    );
+    eprintln!("{} {width} {} {EARLY_RUNS}", host.name(), plan.blocks);
 
     for frames in 1..=EARLY {
         let mut classes: std::collections::BTreeMap<(u32, u32, u32), usize> =
@@ -332,11 +325,7 @@ fn what_a_flag_and_its_counters_say_about_each_other() {
                     .filter(|&block| shot.hot[block as usize] > 0)
                     .count();
                 if distinct.len() != listed.len() || sorted.len() != flagged {
-                    eprintln!(
-                        "    {frames} frames: {} listed, {} distinct, {flagged} flagged",
-                        listed.len(),
-                        distinct.len(),
-                    );
+                    eprintln!("{frames} {} {} {flagged}", listed.len(), distinct.len());
                 }
             }
             for block in 0..plan.blocks as usize {
@@ -347,24 +336,19 @@ fn what_a_flag_and_its_counters_say_about_each_other() {
                 *classes.entry((low, high, flag)).or_default() += 1;
                 if flag < high {
                     below += 1;
-                    eprintln!(
-                        "    {frames} frames: block {block} counters {low}..={high}, flag {flag}"
-                    );
+                    eprintln!("{frames} {block} {low} {high} {flag}");
                 }
             }
         }
-        eprintln!(
-            "  {frames:>3} frames  flag below its counters in {below} of {} blocks seen",
-            plan.blocks as usize * EARLY_RUNS
-        );
+        eprintln!("{frames:>3} {below} {}", plan.blocks as usize * EARLY_RUNS);
         for ((low, high, flag), count) in &classes {
-            eprintln!("    counters {low}..={high}, flag {flag}: {count} blocks");
+            eprintln!("{low} {high} {flag} {count}");
         }
     }
 }
 
 #[test]
-#[ignore = "the range scan above subsumes it; kept for the first-parting frame count alone"]
+#[ignore]
 fn how_few_frames_it_takes_to_part() {
     let Some(host) = device("wander") else { return };
     let width = host.width();
@@ -372,12 +356,12 @@ fn how_few_frames_it_takes_to_part() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED wander at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     eprintln!(
-        "{} — subgroup {width}, {}x{} cells in {} blocks, {RUNS} runs a frame count",
+        "{} {width} {} {} {} {RUNS}",
         host.name(),
         grid.wide,
         grid.deep,
@@ -410,10 +394,8 @@ fn how_few_frames_it_takes_to_part() {
         let steady = awake_same && hot_same && world_same;
         if !steady || frames <= 3 || frames % 20 == 0 {
             eprintln!(
-                "  {frames:>3} frames  AWAKE {}  HOT {}  world {}  fine {grands:?}  coarse {hot_grands:?}",
-                if awake_same { "same" } else { "**differ**" },
-                if hot_same { "same" } else { "**differ**" },
-                if world_same { "same" } else { "**differ**" },
+                "{frames:>3} {} {} {} {grands:?} {hot_grands:?}",
+                awake_same, hot_same, world_same
             );
         }
         if !steady {
@@ -423,16 +405,14 @@ fn how_few_frames_it_takes_to_part() {
                 if awake_count == 0 && hot_count == 0 {
                     continue;
                 }
-                eprintln!(
-                    "    run 0 against run {nth}: AWAKE {awake_count} words {awake_first:?}, HOT {hot_count} words {hot_first:?}"
-                );
+                eprintln!("{nth} {awake_count} {awake_first:?} {hot_count} {hot_first:?}");
                 for (at, _, _) in &awake_first {
                     let block = at / plan.per_block as usize;
                     let in_first =
                         first.dense[..first.hot_grand as usize].contains(&(block as u32));
                     let in_other = one.dense[..one.hot_grand as usize].contains(&(block as u32));
                     eprintln!(
-                        "      quad {at} is block {block}: listed in run 0 {in_first}, in run {nth} {in_other}, HOT {} against {}",
+                        "{at} {block} {in_first} {nth} {in_other} {} {}",
                         first.hot[block], one.hot[block]
                     );
                 }
@@ -440,7 +420,7 @@ fn how_few_frames_it_takes_to_part() {
             return;
         }
     }
-    eprintln!("  no disagreement in {LIMIT} frames");
+    eprintln!("{LIMIT}");
 }
 
 #[test]
@@ -454,60 +434,57 @@ fn a_block_named_twice_in_one_list() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED twice at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let per = plan.per_block as usize;
     let sizes = plan.sizes();
-    let decay = grit::live::decay(width, Over::Listed(HOT_DENSE)).expect("decay");
+    let decay = grit::live::decay(width, Over::Listed(HOT_DENSE)).unwrap();
     let modules: Vec<&[u32]> = vec![&decay];
 
     let doubled = plan.blocks / 2;
     let twice: Vec<u32> = (0..doubled).flat_map(|block| [block, block]).collect();
     let once: Vec<u32> = (0..plan.blocks).collect();
 
-    let mut totals: std::collections::BTreeMap<&str, (usize, usize, usize)> =
+    let mut totals: std::collections::BTreeMap<bool, (usize, usize, usize)> =
         std::collections::BTreeMap::new();
     eprintln!(
-        "{} — subgroup {width}, one decay over {} entries naming {doubled} blocks twice, and over {} naming {} once",
+        "{} {width} {} {doubled} {} {}",
         host.name(),
         twice.len(),
         once.len(),
-        plan.blocks,
+        plan.blocks
     );
 
     for (round, list) in
         (0..ROUNDS).map(|round| (round, if round % 2 == 0 { &twice } else { &once }))
     {
-        let named = if round % 2 == 0 { "twice" } else { "once " };
+        let named = round % 2 == 0;
         let covered = if round % 2 == 0 { doubled } else { plan.blocks };
-        let mut held = host.resident(&sizes, &modules).expect("resident");
+        let mut held = host.resident(&sizes, &modules).unwrap();
         for (binding, words) in sizes.iter().enumerate() {
-            held.write(binding, &vec![0_u32; *words]).expect("wipe");
+            held.write(binding, &vec![0_u32; *words]).unwrap();
         }
-        held.write(PARAMS as usize, &[0, plan.dump()])
-            .expect("params");
+        held.write(PARAMS as usize, &[0, plan.dump()]).unwrap();
         held.write(AWAKE as usize, &vec![START; plan.quads])
-            .expect("awake");
+            .unwrap();
         held.write(HOT as usize, &vec![START; plan.padded() as usize])
-            .expect("hot");
-        held.write(HOT_DENSE as usize, list).expect("list");
+            .unwrap();
+        held.write(HOT_DENSE as usize, list).unwrap();
         held.write(HOT_GRAND as usize, &[list.len() as u32])
-            .expect("grand");
+            .unwrap();
         held.write(HOT_INDIRECT as usize, &[list.len() as u32, 1, 1])
-            .expect("indirect");
+            .unwrap();
 
         let stage: Vec<Groups> = vec![Groups::From {
             binding: HOT_INDIRECT as usize,
             at: 0,
         }];
-        held.staged(&[&stage]).expect("decay");
+        held.staged(&[&stage]).unwrap();
 
-        let hot = held
-            .read(HOT as usize, plan.padded() as usize)
-            .expect("hot");
-        let awake = held.read(AWAKE as usize, plan.quads).expect("awake");
+        let hot = held.read(HOT as usize, plan.padded() as usize).unwrap();
+        let awake = held.read(AWAKE as usize, plan.quads).unwrap();
 
         let mut both_once = 0;
         let mut flag_twice = 0;
@@ -532,17 +509,17 @@ fn a_block_named_twice_in_one_list() {
         totals.entry(named).or_insert((0_usize, 0_usize, 0_usize)).2 += other;
         if ROUNDS <= 16 {
             eprintln!(
-                "  round {round}, named {named}: counters {} flag {} in {both_once} blocks, flag one lower in {flag_twice}, anything else {other} {elsewhere:?}",
+                "{round} {named} {} {} {both_once} {flag_twice} {other} {elsewhere:?}",
                 START - 1,
-                START - 1,
+                START - 1
             );
         }
     }
     for (named, (both_once, flag_twice, other)) in &totals {
         eprintln!(
-            "  named {named} over {ROUNDS} rounds: counters {} flag {} in {both_once} blocks, flag one lower in {flag_twice}, anything else {other}",
+            "{named} {ROUNDS} {} {} {both_once} {flag_twice} {other}",
             START - 1,
-            START - 1,
+            START - 1
         );
     }
 }
@@ -555,13 +532,13 @@ fn what_the_batch_size_does_to_it() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED batch at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let per = plan.per_block as usize;
     eprintln!(
-        "{} — subgroup {width}, {} blocks, {BATCH_FRAMES} frames, {BATCH_RUNS} runs a batch size",
+        "{} {width} {} {BATCH_FRAMES} {BATCH_RUNS}",
         host.name(),
         plan.blocks
     );
@@ -593,9 +570,7 @@ fn what_the_batch_size_does_to_it() {
             }
             blocks_hit += cold;
         }
-        eprintln!(
-            "  {batch:>3} frames a submission: {runs_hit} of {BATCH_RUNS} runs hold a block whose flag is below its counters, {blocks_hit} blocks in all"
-        );
+        eprintln!("{batch:>3} {runs_hit} {BATCH_RUNS} {blocks_hit}");
     }
 }
 
@@ -609,16 +584,12 @@ fn the_flag_against_its_counters_without_a_list() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED listless at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let per = plan.per_block as usize;
-    eprintln!(
-        "{} — subgroup {width}, {} blocks, {EARLY_RUNS} runs a frame count",
-        host.name(),
-        plan.blocks
-    );
+    eprintln!("{} {width} {} {EARLY_RUNS}", host.name(), plan.blocks);
 
     for (coarse, apart) in [(false, false), (false, true), (true, false), (true, true)] {
         for frames in 2..=2 {
@@ -652,9 +623,9 @@ fn the_flag_against_its_counters_without_a_list() {
                             let twos = mine.iter().filter(|&&v| v == 2).count();
                             let ones = mine.iter().filter(|&&v| v == 1).count();
                             eprintln!(
-                                "      block {block}: flag {}, counters up to {}, 2x{twos} 1x{ones}",
+                                "{block} {} {} {twos} {ones}",
                                 shot.hot[*block],
-                                mine.iter().copied().max().unwrap_or(0),
+                                mine.iter().copied().max().unwrap_or(0)
                             );
                         }
                     }
@@ -663,19 +634,8 @@ fn the_flag_against_its_counters_without_a_list() {
                     *seen.entry(block).or_default() += 1;
                 }
             }
-            eprintln!(
-                "  {} list, {}, {frames:>2} frames: {runs_hit} of {EARLY_RUNS} runs hold one, blocks {seen:?}",
-                if coarse { "with a" } else { "without" },
-                if apart {
-                    "one pass a stage"
-                } else {
-                    "as arranged    "
-                },
-            );
-            assert_eq!(
-                runs_hit, 0,
-                "a flag below the counters it stands for, in {runs_hit} of {EARLY_RUNS} runs: {seen:?}"
-            );
+            eprintln!("{coarse} {apart} {frames:>2} {runs_hit} {EARLY_RUNS} {seen:?}");
+            assert_eq!(runs_hit, 0);
         }
     }
 }
@@ -691,53 +651,50 @@ fn how_far_a_reduction_in_decay_reaches() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED reach at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let per = plan.per_block as u32;
     let sizes = plan.sizes();
-    let decay = grit::live::decay(width, Over::Listed(HOT_DENSE)).expect("decay");
+    let decay = grit::live::decay(width, Over::Listed(HOT_DENSE)).unwrap();
     let modules: Vec<&[u32]> = vec![&decay];
     let list: Vec<u32> = (0..plan.blocks).collect();
     let counters: Vec<u32> = (0..plan.quads as u32).map(|quad| quad % per).collect();
 
     eprintln!(
-        "{} — subgroup {width}, {per} quads a block over {width} lanes, 8 a lane; the highest counter is {} and lands in lane {}",
+        "{} {width} {per} {width} {} {}",
         host.name(),
         per - 1,
-        width - 1,
+        width - 1
     );
 
     let mut seen: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     for _ in 0..8 {
-        let mut held = host.resident(&sizes, &modules).expect("resident");
+        let mut held = host.resident(&sizes, &modules).unwrap();
         for (binding, words) in sizes.iter().enumerate() {
-            held.write(binding, &vec![0_u32; *words]).expect("wipe");
+            held.write(binding, &vec![0_u32; *words]).unwrap();
         }
-        held.write(PARAMS as usize, &[0, plan.dump()])
-            .expect("params");
-        held.write(AWAKE as usize, &counters).expect("awake");
+        held.write(PARAMS as usize, &[0, plan.dump()]).unwrap();
+        held.write(AWAKE as usize, &counters).unwrap();
         held.write(HOT as usize, &vec![0_u32; plan.padded() as usize])
-            .expect("hot");
-        held.write(HOT_DENSE as usize, &list).expect("list");
+            .unwrap();
+        held.write(HOT_DENSE as usize, &list).unwrap();
         held.write(HOT_GRAND as usize, &[list.len() as u32])
-            .expect("grand");
+            .unwrap();
         held.write(HOT_INDIRECT as usize, &[list.len() as u32, 1, 1])
-            .expect("indirect");
+            .unwrap();
         let stage: Vec<Groups> = vec![Groups::From {
             binding: HOT_INDIRECT as usize,
             at: 0,
         }];
-        held.staged(&[&stage]).expect("decay");
-        let hot = held
-            .read(HOT as usize, plan.padded() as usize)
-            .expect("hot");
+        held.staged(&[&stage]).unwrap();
+        let hot = held.read(HOT as usize, plan.padded() as usize).unwrap();
         for flag in hot.iter().take(plan.blocks as usize) {
             *seen.entry(*flag).or_default() += 1;
         }
     }
-    eprintln!("  flags written, and how many blocks got each: {seen:?}");
+    eprintln!("{seen:?}");
 }
 
 #[test]
@@ -751,30 +708,29 @@ fn what_the_flag_costs() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED cost at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let sizes = plan.sizes();
-    let decay = grit::live::decay(width, Over::Listed(HOT_DENSE)).expect("decay");
+    let decay = grit::live::decay(width, Over::Listed(HOT_DENSE)).unwrap();
     let modules: Vec<&[u32]> = vec![&decay];
     let list: Vec<u32> = (0..plan.blocks).collect();
 
-    let mut held = host.resident(&sizes, &modules).expect("resident");
+    let mut held = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
-        held.write(binding, &vec![0_u32; *words]).expect("wipe");
+        held.write(binding, &vec![0_u32; *words]).unwrap();
     }
-    held.write(PARAMS as usize, &[0, plan.dump()])
-        .expect("params");
+    held.write(PARAMS as usize, &[0, plan.dump()]).unwrap();
     held.write(AWAKE as usize, &vec![2_u32; plan.quads])
-        .expect("awake");
+        .unwrap();
     held.write(HOT as usize, &vec![2_u32; plan.padded() as usize])
-        .expect("hot");
-    held.write(HOT_DENSE as usize, &list).expect("list");
+        .unwrap();
+    held.write(HOT_DENSE as usize, &list).unwrap();
     held.write(HOT_GRAND as usize, &[list.len() as u32])
-        .expect("grand");
+        .unwrap();
     held.write(HOT_INDIRECT as usize, &[list.len() as u32, 1, 1])
-        .expect("indirect");
+        .unwrap();
     let stage: Vec<Groups> = vec![Groups::From {
         binding: HOT_INDIRECT as usize,
         at: 0,
@@ -782,7 +738,7 @@ fn what_the_flag_costs() {
 
     let mut seen = Vec::with_capacity(10);
     for round in 0..11 {
-        held.staged_frames(&[&stage], 100).expect("decay");
+        held.staged_frames(&[&stage], 100).unwrap();
         let each = held
             .on_device()
             .map_or(0.0, |each| each.as_secs_f64() * 1e9);
@@ -793,9 +749,9 @@ fn what_the_flag_costs() {
     let low = seen.iter().copied().fold(f64::MAX, f64::min);
     let high = seen.iter().copied().fold(0.0_f64, f64::max);
     eprintln!(
-        "{} — subgroup {width}, one decay over {} blocks: {low:.0}-{high:.0} ns a dispatch over {} submissions of a hundred",
+        "{} {width} {} {low:.0} {high:.0} {}",
         host.name(),
         plan.blocks,
-        seen.len(),
+        seen.len()
     );
 }

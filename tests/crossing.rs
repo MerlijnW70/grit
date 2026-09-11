@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::time::{Duration, Instant};
 
@@ -23,11 +23,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -50,7 +50,7 @@ fn sized(width: u32, blocks: u32) -> Grid {
     let cells = u64::from(blocks) * u64::from(sweep::cells(width)) * 4;
     let bits = cells.trailing_zeros();
     let wide = 1_u32 << (bits / 2 + bits % 2);
-    let deep = u32::try_from(cells / u64::from(wide)).expect("deep");
+    let deep = u32::try_from(cells / u64::from(wide)).unwrap();
     Grid::of(wide, deep)
 }
 
@@ -65,22 +65,22 @@ fn folded(words: &[u32]) -> u64 {
 
 fn seeded(resident: &mut grit::Resident<'_>, grid: Grid, plan: &Plan, sizes: &[usize]) {
     for (binding, held) in sizes.iter().enumerate() {
-        resident.write(binding, &vec![0_u32; *held]).expect("wipe");
+        resident.write(binding, &vec![0_u32; *held]).unwrap();
     }
-    resident.write(STATE as usize, &room(grid)).expect("room");
+    resident.write(STATE as usize, &room(grid)).unwrap();
     resident
         .write(PARAMS as usize, &[u32::MAX, plan.dump()])
-        .expect("params");
-    grit::live::seed(resident, grid, plan).expect("seed");
+        .unwrap();
+    grit::live::seed(resident, grid, plan).unwrap();
     let (x, y) = (grid.wide / 2, grid.deep / 8);
     resident
         .write_at(PARAMS as usize, BRUSH, &[x, y, 49, SAND])
-        .expect("brush");
+        .unwrap();
 }
 
 fn pouring(resident: &mut grit::Resident<'_>, groups: &[&[Groups]], frames: u32) {
     for _ in (0..frames).step_by(BATCH as usize) {
-        resident.staged_frames(groups, BATCH).expect("frames");
+        resident.staged_frames(groups, BATCH).unwrap();
     }
 }
 
@@ -91,12 +91,12 @@ fn poured(
     frames: u32,
 ) -> (u64, u32) {
     for _ in (0..frames).step_by(BATCH as usize) {
-        resident.staged_frames(groups, BATCH).expect("frames");
+        resident.staged_frames(groups, BATCH).unwrap();
     }
-    let world = folded(&resident.read(STATE as usize, grid.cells()).expect("state"));
+    let world = folded(&resident.read(STATE as usize, grid.cells()).unwrap());
     let stepped = resident
         .read(GRAND as usize, 1)
-        .expect("grand")
+        .unwrap()
         .first()
         .copied()
         .unwrap_or(0);
@@ -110,11 +110,10 @@ struct Priced {
 }
 
 fn priced(host: &Host, width: u32, grid: Grid, coarse: bool, frames: u32) -> Priced {
-    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).expect("plan");
+    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
 
     let clock = Instant::now();
-    let (passes, stages) =
-        grit::live::arranged(width, grid, &plan, None, coarse).expect("arranged");
+    let (passes, stages) = grit::live::arranged(width, grid, &plan, None, coarse).unwrap();
     let built = clock.elapsed();
 
     let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
@@ -122,12 +121,12 @@ fn priced(host: &Host, width: u32, grid: Grid, coarse: bool, frames: u32) -> Pri
     let sizes = plan.sizes();
 
     let clock = Instant::now();
-    let mut resident = host.resident(&sizes, &modules).expect("resident");
+    let mut resident = host.resident(&sizes, &modules).unwrap();
     let made = clock.elapsed();
 
     seeded(&mut resident, grid, &plan, &sizes);
-    resident.staged(&groups).expect("warm");
-    resident.staged_frames(&groups, frames).expect("frames");
+    resident.staged(&groups).unwrap();
+    resident.staged_frames(&groups, frames).unwrap();
     Priced {
         each: resident.on_device().unwrap_or_default(),
         built,
@@ -145,50 +144,41 @@ fn a_silenced_arrangement_computes_the_same_world() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED crossing at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     let sizes = plan.sizes();
 
-    let both = grit::live::both(width, grid, &plan, None).expect("both");
+    let both = grit::live::both(width, grid, &plan, None).unwrap();
     let together: Vec<&[u32]> = both.passes.iter().map(Vec::as_slice).collect();
     let listed: Vec<&[Groups]> = both.listed.iter().map(Vec::as_slice).collect();
     let every: Vec<&[Groups]> = both.every.iter().map(Vec::as_slice).collect();
 
     let mut seen = Vec::new();
-    for (what, groups) in [("silenced list", &listed), ("silenced every", &every)] {
-        let mut resident = host.resident(&sizes, &together).expect("resident");
+    for (what, groups) in [(0_u8, &listed), (1, &every)] {
+        let mut resident = host.resident(&sizes, &together).unwrap();
         seeded(&mut resident, grid, &plan, &sizes);
-        resident.staged(groups).expect("warm");
+        resident.staged(groups).unwrap();
         seen.push((what, poured(&mut resident, grid, groups, AGREEING)));
     }
-    for (what, coarse) in [("list alone", true), ("every alone", false)] {
-        let (passes, stages) =
-            grit::live::arranged(width, grid, &plan, None, coarse).expect("arranged");
+    for (what, coarse) in [(2_u8, true), (3, false)] {
+        let (passes, stages) = grit::live::arranged(width, grid, &plan, None, coarse).unwrap();
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
         let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
-        let mut resident = host.resident(&sizes, &modules).expect("resident");
+        let mut resident = host.resident(&sizes, &modules).unwrap();
         seeded(&mut resident, grid, &plan, &sizes);
-        resident.staged(&groups).expect("warm");
+        resident.staged(&groups).unwrap();
         seen.push((what, poured(&mut resident, grid, &groups, AGREEING)));
     }
 
-    eprintln!(
-        "{} — subgroup {width}, {} blocks, {AGREEING} frames",
-        host.name(),
-        plan.blocks
-    );
+    eprintln!("{} {width} {} {AGREEING}", host.name(), plan.blocks);
     for (what, (world, stepped)) in &seen {
-        eprintln!("  {what:<16} world {world:#018x}  work list {stepped}");
+        eprintln!("{what} {world:#018x} {stepped}");
     }
     let first = seen[0].1;
-    for (what, held) in &seen {
-        assert_eq!(
-            *held, first,
-            "{what} reached a different place from {}: the silencing is not the same program",
-            seen[0].0
-        );
+    for (_, held) in &seen {
+        assert_eq!(*held, first);
     }
 }
 
@@ -198,16 +188,12 @@ fn how_few_frames_name_the_winner() {
         return;
     };
     let width = host.width();
-    eprintln!("{} — subgroup {width}", host.name());
-    eprintln!(
-        "  {:>7}  {:>7}  {:>7}  which arrangement each round called cheaper",
-        "blocks", "frames", "rounds"
-    );
+    eprintln!("{} {width}", host.name());
 
     for blocks in SIZES {
         let grid = sized(width, blocks);
         if let Err(why) = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
-            eprintln!("  {blocks:>7}  no plan at subgroup {width}: {why}");
+            eprintln!("{blocks:>7} {width} {why}");
             continue;
         }
         for frames in BUDGETS {
@@ -216,21 +202,15 @@ fn how_few_frames_name_the_winner() {
             for _ in 0..ROUNDS {
                 let with = priced(&host, width, grid, true, frames);
                 let without = priced(&host, width, grid, false, frames);
-                called.push(if with.each < without.each {
-                    "list"
-                } else {
-                    "every"
-                });
+                called.push(with.each < without.each);
                 let (a, b) = (with.each.as_secs_f64(), without.each.as_secs_f64());
                 gaps.push((a - b) / a.max(b) * 100.0);
             }
             let agreed = called.windows(2).all(|two| two[0] == two[1]);
             eprintln!(
-                "  {blocks:>7}  {frames:>7}  {ROUNDS:>7}  {}  {}  gap {:.0}..{:.0}%",
-                called.join(" "),
-                if agreed { "agreed" } else { "**split**" },
+                "{blocks:>7} {frames:>7} {ROUNDS:>7} {called:?} {agreed} {:.0} {:.0}",
                 gaps.iter().copied().fold(f64::MAX, f64::min),
-                gaps.iter().copied().fold(f64::MIN, f64::max),
+                gaps.iter().copied().fold(f64::MIN, f64::max)
             );
         }
     }
@@ -242,11 +222,7 @@ fn what_asking_the_device_costs_before_it_answers() {
         return;
     };
     let width = host.width();
-    eprintln!("{} — subgroup {width}", host.name());
-    eprintln!(
-        "  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}",
-        "blocks", "built list", "made list", "built every", "made every"
-    );
+    eprintln!("{} {width}", host.name());
 
     for blocks in SIZES {
         let grid = sized(width, blocks);
@@ -256,7 +232,7 @@ fn what_asking_the_device_costs_before_it_answers() {
         let with = priced(&host, width, grid, true, 1);
         let without = priced(&host, width, grid, false, 1);
         eprintln!(
-            "  {blocks:>7}  {:>10.3?}  {:>10.3?}  {:>10.3?}  {:>10.3?}",
+            "{blocks:>7} {:>10.3?} {:>10.3?} {:>10.3?} {:>10.3?}",
             with.built, with.made, without.built, without.made
         );
     }
@@ -264,38 +240,37 @@ fn what_asking_the_device_costs_before_it_answers() {
 
 struct Whole {
     wall: Duration,
-    chose: &'static str,
+    chose: bool,
 }
 
 fn by_constant(host: &Host, width: u32, grid: Grid, frames: u32) -> Whole {
     let clock = Instant::now();
-    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).expect("plan");
+    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
     let coarse = grit::live::coarse_pays(plan.blocks);
-    let (passes, stages) =
-        grit::live::arranged(width, grid, &plan, None, coarse).expect("arranged");
+    let (passes, stages) = grit::live::arranged(width, grid, &plan, None, coarse).unwrap();
     let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
-    let mut resident = host.resident(&sizes, &modules).expect("resident");
+    let mut resident = host.resident(&sizes, &modules).unwrap();
     seeded(&mut resident, grid, &plan, &sizes);
-    resident.staged(&groups).expect("warm");
+    resident.staged(&groups).unwrap();
     pouring(&mut resident, &groups, frames);
     Whole {
         wall: clock.elapsed(),
-        chose: if coarse { "list" } else { "every" },
+        chose: coarse,
     }
 }
 
 fn by_measurement(host: &Host, width: u32, grid: Grid, frames: u32, budget: u32) -> Whole {
     let clock = Instant::now();
-    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).expect("plan");
-    let both = grit::live::both(width, grid, &plan, None).expect("both");
+    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
+    let both = grit::live::both(width, grid, &plan, None).unwrap();
     let modules: Vec<&[u32]> = both.passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
-    let mut resident = host.resident(&sizes, &modules).expect("resident");
+    let mut resident = host.resident(&sizes, &modules).unwrap();
     seeded(&mut resident, grid, &plan, &sizes);
 
-    let asked = grit::live::cheaper(&mut resident, &both, budget).expect("cheaper");
+    let asked = grit::live::cheaper(&mut resident, &both, budget).unwrap();
     let stages = if asked.coarse {
         &both.listed
     } else {
@@ -306,7 +281,7 @@ fn by_measurement(host: &Host, width: u32, grid: Grid, frames: u32, budget: u32)
     pouring(&mut resident, &groups, left);
     Whole {
         wall: clock.elapsed(),
-        chose: if asked.coarse { "list" } else { "every" },
+        chose: asked.coarse,
     }
 }
 
@@ -316,14 +291,7 @@ fn what_calibrating_costs_end_to_end() {
         return;
     };
     let width = host.width();
-    eprintln!(
-        "{} — subgroup {width}, a calibration of {CALIBRATION} frames an arrangement",
-        host.name()
-    );
-    eprintln!(
-        "  {:>7}  {:>7}  {:>12}  {:>7}  {:>12}  {:>7}",
-        "blocks", "frames", "by constant", "chose", "by measure", "chose"
-    );
+    eprintln!("{} {width} {CALIBRATION}", host.name());
 
     for blocks in SIZES {
         let grid = sized(width, blocks);
@@ -334,7 +302,7 @@ fn what_calibrating_costs_end_to_end() {
             let one = by_constant(&host, width, grid, frames);
             let two = by_measurement(&host, width, grid, frames, CALIBRATION);
             eprintln!(
-                "  {blocks:>7}  {frames:>7}  {:>12.3?}  {:>7}  {:>12.3?}  {:>7}",
+                "{blocks:>7} {frames:>7} {:>12.3?} {:>7} {:>12.3?} {:>7}",
                 one.wall, one.chose, two.wall, two.chose
             );
         }

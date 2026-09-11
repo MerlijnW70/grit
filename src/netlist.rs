@@ -42,13 +42,9 @@ pub enum Fault {
 impl fmt::Display for Fault {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ahead { side, names, below } => write!(
-                out,
-                "the {} reference names source {names}, which is not below {below}",
-                if *side == 0 { "left" } else { "right" }
-            ),
+            Self::Ahead { side, names, below } => write!(out, "{side} {names} {below}"),
             Self::NoSuchKind { kind, kinds } => {
-                write!(out, "kind {kind} in a kit of {kinds}")
+                write!(out, "{kind} {kinds}")
             }
         }
     }
@@ -66,17 +62,10 @@ pub enum TooWide {
 impl fmt::Display for TooWide {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sources { sources, limit } => write!(
-                out,
-                "{sources} sources needs a wider reference than {SOURCE_BITS} bits; \
-                 {limit} is what it reaches"
-            ),
-            Self::Kinds { kinds, limit } => write!(
-                out,
-                "{kinds} kinds needs a wider field than {KIND_BITS} bits; {limit} is what it holds"
-            ),
+            Self::Sources { sources, limit } => write!(out, "{sources} {SOURCE_BITS} {limit}"),
+            Self::Kinds { kinds, limit } => write!(out, "{kinds} {KIND_BITS} {limit}"),
             Self::Outputs { outputs, gates } => {
-                write!(out, "{outputs} outputs over {gates} gates")
+                write!(out, "{outputs} {gates}")
             }
         }
     }
@@ -228,16 +217,13 @@ impl fmt::Display for NotAnExam {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rows { given, wanted } => {
-                write!(out, "{given} rows for a table of {wanted}")
+                write!(out, "{given} {wanted}")
             }
             Self::Stray {
                 row,
                 holds,
                 outputs,
-            } => write!(
-                out,
-                "row {row} holds {holds:#x}, which sets a bit past the {outputs} asked for"
-            ),
+            } => write!(out, "{row} {holds:#x} {outputs}"),
         }
     }
 }
@@ -320,20 +306,17 @@ impl fmt::Display for NotAChip {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Gates { given, wanted } => {
-                write!(out, "{given} gates for a circuit of {wanted}")
+                write!(out, "{given} {wanted}")
             }
-            Self::Gate { at, fault } => write!(out, "gate {at}: {fault}"),
+            Self::Gate { at, fault } => write!(out, "{at} {fault}"),
             Self::Outputs { given, wanted } => {
-                write!(out, "{given} answers for a circuit with {wanted}")
+                write!(out, "{given} {wanted}")
             }
             Self::NoSuchGate {
                 output,
                 names,
                 gates,
-            } => write!(
-                out,
-                "answer {output} is taken off gate {names}, and there are {gates}"
-            ),
+            } => write!(out, "{output} {names} {gates}"),
         }
     }
 }

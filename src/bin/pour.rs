@@ -18,7 +18,6 @@ const REACH: u32 = 7;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(host) = Host::open()? else {
-        println!("no Vulkan device");
         return Ok(());
     };
     let width = host.width();
@@ -27,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quads = grid.quads();
     let plan = Plan::over(width, quads.div_ceil(sweep::cells(width)))?;
     println!(
-        "{} — subgroup {width}, {}×{} cells in {quads} quads, seen {}×{}",
+        "{} {width} {} {} {quads} {} {}",
         host.name(),
         grid.wide,
         grid.deep,
@@ -42,17 +41,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.showing(view);
     let held: usize = sizes.iter().sum();
-    println!(
-        "{words} words of SPIR-V across {} passes, {} MB of buffers",
-        passes.len(),
-        held * 4 / (1 << 20)
-    );
+    println!("{words} {} {}", passes.len(), held * 4 / (1 << 20));
     let mut resident = host.resident(&sizes, &modules)?;
 
     for (binding, words) in sizes.iter().enumerate() {
         resident.write(binding, &vec![0_u32; *words])?;
     }
-    print!("building the room... ");
     let laying = Instant::now();
     resident.write(STATE as usize, &room(grid))?;
     println!("{:?}", laying.elapsed());
@@ -62,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     grit::live::seed(&mut resident, grid, &plan)?;
 
     let mut window = minifb::Window::new(
-        "grit — left button pours sand, right pours water, WASD flies, F follows",
+        "grit",
         view.wide as usize,
         view.deep as usize,
         minifb::WindowOptions {
@@ -77,7 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut looking = (grid.wide / 2, grid.deep / 2);
     resident.write_at(PARAMS as usize, LOOKING, &[looking.0, looking.1])?;
 
-    print!("waking the driver... ");
     let warm = Instant::now();
     drop(resident.staged_reading(&groups, PIXELS as usize, view.pixels())?);
     println!("{:?}", warm.elapsed());
@@ -146,15 +139,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let seconds = clock.elapsed().as_secs_f64();
             window.set_title(&format!(
-                "grit — {:.0} fps · {:.2} ms · {listed} of {quads} quads · {moved} cells moving · \
-                 {dry} sand {wet} water · ({}, {}) of {}×{}{}",
+                "{:.0} {:.2} {listed} {quads} {moved} {dry} {wet} {} {} {} {} {following}",
                 f64::from(frames) / seconds,
                 cost.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
                 looking.0,
                 looking.1,
                 grid.wide,
-                grid.deep,
-                if following { " · following" } else { "" },
+                grid.deep
             ));
             clock = Instant::now();
             frames = 0;
@@ -162,7 +153,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("poured.");
     Ok(())
 }
 

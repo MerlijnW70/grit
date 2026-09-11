@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::time::Duration;
 
@@ -31,11 +31,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -46,19 +46,15 @@ fn a_pass_dispatched_over_no_workgroups_does_not_run() {
     let Some(host) = device("a_pass_dispatched_over_no_workgroups_does_not_run") else {
         return;
     };
-    let module = mark(host.width()).expect("a kernel");
-    let mut held = host.resident(&[4], &[&module]).expect("a device buffer");
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    let module = mark(host.width()).unwrap();
+    let mut held = host.resident(&[4], &[&module]).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
 
-    held.frame(&[Groups::Fixed(0)]).expect("a frame");
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![0],
-        "a pass told to run over nothing ran anyway"
-    );
+    held.frame(&[Groups::Fixed(0)]).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![0]);
 
-    held.frame(&[Groups::Fixed(1)]).expect("a frame");
-    assert_eq!(held.read(0, 1).expect("a read"), vec![MARK]);
+    held.frame(&[Groups::Fixed(1)]).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![MARK]);
 }
 
 #[test]
@@ -67,50 +63,33 @@ fn a_frame_can_be_taken_apart_stage_by_stage() {
         return;
     };
     let width = host.width();
-    let one = mark(width).expect("a kernel");
-    let two = bump(width).expect("a kernel");
+    let one = mark(width).unwrap();
+    let two = bump(width).unwrap();
     let modules: Vec<&[u32]> = vec![&one, &one, &one, &two];
-    let mut held = host.resident(&[4], &modules).expect("a device buffer");
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    let mut held = host.resident(&[4], &modules).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
 
     let first = [Groups::Fixed(1)];
     let second = [Groups::Fixed(1), Groups::Fixed(1)];
     let third = [Groups::Fixed(1)];
-    held.staged(&[&first, &second, &third])
-        .expect("three stages");
+    held.staged(&[&first, &second, &third]).unwrap();
 
     let (whole, spans) = (held.on_device(), held.stage_times().to_vec());
     let Some(whole) = whole else {
-        eprintln!("  this queue counts no timestamps; nothing to take apart");
-        assert!(
-            spans.is_empty(),
-            "no whole time but {} stage times",
-            spans.len()
-        );
+        assert!(spans.is_empty());
         return;
     };
-    eprintln!("  the whole submission: {whole:.3?}");
+    eprintln!("{whole:.3?}");
     for (nth, span) in spans.iter().enumerate() {
-        eprintln!("    stage {nth}: {span:.3?}");
+        eprintln!("{nth} {span:.3?}");
     }
 
-    assert_eq!(
-        spans.len(),
-        3,
-        "three stages ran and the profile has {}",
-        spans.len()
-    );
+    assert_eq!(spans.len(), 3);
     let parts: Duration = spans.iter().sum();
-    assert!(
-        parts <= whole,
-        "the stages come to {parts:.3?} and the whole submission was {whole:.3?}"
-    );
-    assert!(
-        spans.iter().all(|one| *one > Duration::ZERO),
-        "a stage that took no time at all did not run: {spans:.3?}"
-    );
+    assert!(parts <= whole);
+    assert!(spans.iter().all(|one| *one > Duration::ZERO));
 
-    assert_eq!(held.read(0, 1).expect("a read"), vec![MARK + 1]);
+    assert_eq!(held.read(0, 1).unwrap(), vec![MARK + 1]);
 }
 
 #[test]
@@ -119,27 +98,18 @@ fn a_frame_too_long_to_profile_is_not_half_profiled() {
         return;
     };
     let width = host.width();
-    let module = bump(width).expect("a kernel");
+    let module = bump(width).unwrap();
     let many = grit::resident::STAGES + 1;
     let modules: Vec<&[u32]> = vec![&module; many];
-    let mut held = host.resident(&[4], &modules).expect("a device buffer");
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    let mut held = host.resident(&[4], &modules).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
 
     let each = vec![vec![Groups::Fixed(1)]; many];
     let stages: Vec<&[Groups]> = each.iter().map(Vec::as_slice).collect();
-    held.staged(&stages).expect("a long frame");
+    held.staged(&stages).unwrap();
 
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![many as u32],
-        "the frame did not run all {many} of its passes"
-    );
-    assert!(
-        held.stage_times().is_empty(),
-        "{} stages were profiled and the pool holds {}",
-        held.stage_times().len(),
-        grit::resident::STAGES
-    );
+    assert_eq!(held.read(0, 1).unwrap(), vec![many as u32]);
+    assert!(held.stage_times().is_empty());
 }
 
 #[test]
@@ -147,28 +117,18 @@ fn a_count_of_nought_in_a_buffer_stops_the_pass_that_reads_it() {
     let Some(host) = device("a_count_of_nought_in_a_buffer_stops_the_pass_that_reads_it") else {
         return;
     };
-    let module = mark(host.width()).expect("a kernel");
-    let mut held = host
-        .resident(&[4, 3], &[&module])
-        .expect("two device buffers");
+    let module = mark(host.width()).unwrap();
+    let mut held = host.resident(&[4, 3], &[&module]).unwrap();
     let over = [Groups::From { binding: 1, at: 0 }];
 
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
-    held.write(1, &[0, 1, 1]).expect("a count of nought");
-    held.frame(&over).expect("a frame");
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![0],
-        "the count buffer said nought workgroups and the pass ran anyway"
-    );
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+    held.write(1, &[0, 1, 1]).unwrap();
+    held.frame(&over).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![0]);
 
-    held.write(1, &[1, 1, 1]).expect("a count of one");
-    held.frame(&over).expect("a frame");
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![MARK],
-        "the count buffer said one workgroup and the pass did not run"
-    );
+    held.write(1, &[1, 1, 1]).unwrap();
+    held.frame(&over).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![MARK]);
 }
 
 #[test]
@@ -176,24 +136,18 @@ fn one_pass_of_several_can_be_run_while_the_others_are_skipped() {
     let Some(host) = device("one_pass_of_several_can_be_run_while_the_others_are_skipped") else {
         return;
     };
-    let module = mark(host.width()).expect("a kernel");
-    let mut held = host
-        .resident(&[4], &[&module, &module, &module])
-        .expect("a device buffer");
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    let module = mark(host.width()).unwrap();
+    let mut held = host.resident(&[4], &[&module, &module, &module]).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
 
     held.frame(&[Groups::Fixed(0), Groups::Fixed(1), Groups::Fixed(0)])
-        .expect("a frame");
-    assert_eq!(held.read(0, 1).expect("a read"), vec![MARK]);
+        .unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![MARK]);
 
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    held.write(0, &[0, 0, 0, 0]).unwrap();
     held.frame(&[Groups::Fixed(0), Groups::Fixed(0), Groups::Fixed(0)])
-        .expect("a frame");
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![0],
-        "no pass ran, so nothing was written"
-    );
+        .unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![0]);
 }
 
 #[test]
@@ -202,16 +156,13 @@ fn the_allocation_ceiling_is_a_buffer_this_device_will_actually_hand_out() {
         return;
     };
     let ceiling = host.ceiling();
-    assert!(ceiling > 0, "a device that can allocate nothing");
-    assert!(
-        ceiling <= u64::from(u32::MAX),
-        "a binding cannot address more than a u32 of bytes, and this says {ceiling}"
-    );
+    assert!(ceiling > 0);
+    assert!(ceiling <= u64::from(u32::MAX));
 
-    let words = usize::try_from(ceiling / 4).expect("a count");
+    let words = usize::try_from(ceiling / 4).unwrap();
     match host.resident(&[words], &[]) {
         Ok(held) => drop(held),
-        Err(why) => panic!("the device refused its own ceiling of {ceiling}: {why}"),
+        Err(why) => panic!("{ceiling} {why}"),
     }
 }
 
@@ -220,16 +171,16 @@ fn a_skipped_pass_does_not_take_the_ordering_with_it() {
     let Some(host) = device("a_skipped_pass_does_not_take_the_ordering_with_it") else {
         return;
     };
-    let module = bump(host.width()).expect("a kernel");
+    let module = bump(host.width()).unwrap();
     let mut held = host
         .resident(&[4], &[&module, &module, &module, &module, &module])
-        .expect("a device buffer");
+        .unwrap();
 
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
-    held.frame(&[Groups::Fixed(1); 5]).expect("a frame");
-    assert_eq!(held.read(0, 1).expect("a read"), vec![5]);
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+    held.frame(&[Groups::Fixed(1); 5]).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![5]);
 
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    held.write(0, &[0, 0, 0, 0]).unwrap();
     held.frame(&[
         Groups::Fixed(1),
         Groups::Fixed(0),
@@ -237,12 +188,8 @@ fn a_skipped_pass_does_not_take_the_ordering_with_it() {
         Groups::Fixed(0),
         Groups::Fixed(1),
     ])
-    .expect("a frame");
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![2],
-        "the second pass did not see what the first wrote"
-    );
+    .unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![2]);
 }
 
 #[test]
@@ -250,37 +197,26 @@ fn a_stage_is_ordered_against_the_next_and_not_against_itself() {
     let Some(host) = device("a_stage_is_ordered_against_the_next_and_not_against_itself") else {
         return;
     };
-    let module = bump(host.width()).expect("a kernel");
+    let module = bump(host.width()).unwrap();
     let every: Vec<&[u32]> = vec![&module; 6];
-    let mut held = host.resident(&[4], &every).expect("a device buffer");
+    let mut held = host.resident(&[4], &every).unwrap();
 
     let all = [Groups::Fixed(1); 6];
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
-    held.frame(&all).expect("a frame");
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![6],
-        "six ordered bumps are six"
-    );
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+    held.frame(&all).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![6]);
 
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    held.write(0, &[0, 0, 0, 0]).unwrap();
     let stages: Vec<&[Groups]> = all.chunks(2).collect();
-    held.staged(&stages).expect("a staged frame");
-    let paired = held.read(0, 1).expect("a read");
-    assert!(
-        paired[0] >= 3 && paired[0] <= 6,
-        "three ordered stages of two unordered bumps came back as {}",
-        paired[0]
-    );
+    held.staged(&stages).unwrap();
+    let paired = held.read(0, 1).unwrap();
+    assert!(paired[0] >= 3 && paired[0] <= 6);
 
     let short: Vec<&[Groups]> = all[..4].chunks(2).collect();
-    assert!(
-        matches!(
-            held.staged(&short),
-            Err(Error::WrongPasses { given: 4, held: 6 })
-        ),
-        "four passes were accepted for a frame of six"
-    );
+    assert!(matches!(
+        held.staged(&short),
+        Err(Error::WrongPasses { given: 4, held: 6 })
+    ));
 }
 
 #[test]
@@ -288,21 +224,16 @@ fn a_stage_with_nothing_in_it_orders_nothing() {
     let Some(host) = device("a_stage_with_nothing_in_it_orders_nothing") else {
         return;
     };
-    let module = bump(host.width()).expect("a kernel");
+    let module = bump(host.width()).unwrap();
     let every: Vec<&[u32]> = vec![&module; 4];
-    let mut held = host.resident(&[4], &every).expect("a device buffer");
+    let mut held = host.resident(&[4], &every).unwrap();
 
-    held.write(0, &[0, 0, 0, 0]).expect("a clear");
+    held.write(0, &[0, 0, 0, 0]).unwrap();
     let first = [Groups::Fixed(1)];
     let none = [Groups::Fixed(0), Groups::Fixed(0)];
     let last = [Groups::Fixed(1)];
-    held.staged(&[&first, &none, &last])
-        .expect("a staged frame");
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![2],
-        "the two stages that ran did not see each other"
-    );
+    held.staged(&[&first, &none, &last]).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![2]);
 }
 
 const ASKED: u32 = 37;
@@ -333,32 +264,21 @@ fn a_workgroup_count_written_by_one_stage_is_read_by_the_next() {
         return;
     };
     let width = host.width();
-    let writes = counting(width).expect("a kernel");
-    let adds = counted(width).expect("a kernel");
+    let writes = counting(width).unwrap();
+    let adds = counted(width).unwrap();
     let modules: Vec<&[u32]> = vec![&writes, &adds];
-    let mut held = host.resident(&[1, 3], &modules).expect("a device buffer");
+    let mut held = host.resident(&[1, 3], &modules).unwrap();
 
-    held.write(0, &[0]).expect("a tally");
-    held.write(1, &[1, 1, 1]).expect("a seeded count");
+    held.write(0, &[0]).unwrap();
+    held.write(1, &[1, 1, 1]).unwrap();
 
     let first = [Groups::Counting(1)];
     let second = [Groups::From { binding: 1, at: 0 }];
-    held.staged(&[&first, &second]).expect("two stages");
+    held.staged(&[&first, &second]).unwrap();
 
-    let ran = held
-        .read(0, 1)
-        .expect("the tally")
-        .first()
-        .copied()
-        .unwrap_or(0);
+    let ran = held.read(0, 1).unwrap().first().copied().unwrap_or(0);
     let want = ASKED * width;
-    assert_eq!(
-        ran,
-        want,
-        "{ran} invocations ran and {want} were asked for — the dispatch read {} workgroups, not \
-         {ASKED}",
-        ran / width.max(1)
-    );
+    assert_eq!(ran, want);
 }
 
 #[test]
@@ -367,70 +287,45 @@ fn a_frame_is_recorded_once_and_a_write_between_two_does_not_undo_it() {
     else {
         return;
     };
-    let module = bump(host.width()).expect("a kernel");
-    let mut held = host.resident(&[1], &[&module]).expect("a device buffer");
+    let module = bump(host.width()).unwrap();
+    let mut held = host.resident(&[1], &[&module]).unwrap();
     let groups = [Groups::Fixed(1)];
 
-    held.write(0, &[0]).expect("a clear");
-    held.frame(&groups).expect("the first frame");
+    held.write(0, &[0]).unwrap();
+    held.frame(&groups).unwrap();
 
-    held.write(0, &[100]).expect("a parameter");
-    held.frame(&groups).expect("the second frame");
+    held.write(0, &[100]).unwrap();
+    held.frame(&groups).unwrap();
 
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![101],
-        "the second frame did not see the write, so a kept recording is a stale answer"
-    );
-    assert_eq!(
-        held.reused(),
-        1,
-        "the second frame was recorded again — a write between two frames is not supposed to cost \
-         that, and {} recordings say it did",
-        held.recording().1
-    );
+    assert_eq!(held.read(0, 1).unwrap(), vec![101]);
+    assert_eq!(held.reused(), 1);
 }
 
 #[test]
 fn a_pattern_matching_nothing_names_the_devices_that_are_here() {
     let present = match Host::matching(Some("zzz-no-device-is-called-this")) {
         Err(Error::NoSuchDevice { wanted, present }) => {
-            assert_eq!(
-                wanted, "zzz-no-device-is-called-this",
-                "the pattern is echoed back"
-            );
+            assert_eq!(wanted, "zzz-no-device-is-called-this");
             present
         }
         Ok(None) => {
-            eprintln!("SKIPPED a_pattern_matching_nothing: no Vulkan loader");
+            eprintln!("SKIPPED");
             return;
         }
-        Ok(Some(taken)) => panic!("a pattern matching nothing opened {:?}", taken.name()),
-        Err(other) => panic!("a pattern matching nothing gave {other:?}"),
+        Ok(Some(taken)) => panic!("{:?}", taken.name()),
+        Err(other) => panic!("{other:?}"),
     };
 
-    eprintln!("  devices here: {present:?}");
-    assert!(
-        !present.is_empty(),
-        "the refusal named no devices, so the machine has none and `Ok(None)` was the answer"
-    );
+    eprintln!("{present:?}");
+    assert!(!present.is_empty());
 
     let first = present.first().cloned().unwrap_or_default();
-    let taken = Host::matching(Some(&first)).expect("the device it just named");
+    let taken = Host::matching(Some(&first)).unwrap();
     let Some(taken) = taken else {
-        panic!("a device named in the refusal could not then be opened");
+        panic!();
     };
-    assert!(
-        taken.name().to_lowercase().contains(&first.to_lowercase()),
-        "asked for {first:?} and got {:?}",
-        taken.name()
-    );
-    assert!(
-        [4, 8, 16, 32, 64].contains(&taken.width()),
-        "{} reports subgroup {}, which no kernel here has an arm for",
-        taken.name(),
-        taken.width()
-    );
+    assert!(taken.name().to_lowercase().contains(&first.to_lowercase()));
+    assert!([4, 8, 16, 32, 64].contains(&taken.width()));
 }
 
 #[test]
@@ -439,37 +334,24 @@ fn a_resident_says_what_it_holds_and_what_its_transfers_cost() {
         return;
     };
     let width = host.width();
-    let module = bump(width).expect("a kernel");
-    let mut held = host
-        .resident(&[4, 8], &[&module, &module])
-        .expect("a device buffer");
+    let module = bump(width).unwrap();
+    let mut held = host.resident(&[4, 8], &[&module, &module]).unwrap();
 
-    assert_eq!(held.bindings(), 2, "two sizes were asked for");
-    assert_eq!(held.passes(), 2, "two modules were asked for");
-    assert_eq!(
-        held.pushing(),
-        (Duration::ZERO, 0, 0),
-        "nothing has been written and the counter says otherwise"
-    );
-    assert_eq!(
-        held.copying(),
-        (Duration::ZERO, 0),
-        "nothing has been read and the counter says otherwise"
-    );
+    assert_eq!(held.bindings(), 2);
+    assert_eq!(held.passes(), 2);
+    assert_eq!(held.pushing(), (Duration::ZERO, 0, 0));
+    assert_eq!(held.copying(), (Duration::ZERO, 0));
 
-    held.write(0, &[7]).expect("a write");
+    held.write(0, &[7]).unwrap();
     let (spent, writes, straight) = held.pushing();
-    assert_eq!(writes, 1, "one write went in and the counter says {writes}");
-    assert!(spent > Duration::ZERO, "a write that took no time at all");
-    assert!(
-        straight <= writes,
-        "{straight} writes went straight into device memory out of {writes} that went in at all"
-    );
+    assert_eq!(writes, 1);
+    assert!(spent > Duration::ZERO);
+    assert!(straight <= writes);
 
-    assert_eq!(held.read(0, 1).expect("a read"), vec![7]);
+    assert_eq!(held.read(0, 1).unwrap(), vec![7]);
     let (spent, reads) = held.copying();
-    assert_eq!(reads, 1, "one read came back and the counter says {reads}");
-    assert!(spent > Duration::ZERO, "a read that took no time at all");
+    assert_eq!(reads, 1);
+    assert!(spent > Duration::ZERO);
 }
 
 #[test]
@@ -478,17 +360,13 @@ fn a_frame_asked_for_five_times_runs_five_times() {
         return;
     };
     let width = host.width();
-    let module = bump(width).expect("a kernel");
-    let mut held = host.resident(&[4], &[&module]).expect("a device buffer");
-    held.write(0, &[0]).expect("a write");
+    let module = bump(width).unwrap();
+    let mut held = host.resident(&[4], &[&module]).unwrap();
+    held.write(0, &[0]).unwrap();
 
-    let each = held.frames(&[Groups::Fixed(1)], 5).expect("five frames");
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![5],
-        "five frames of a kernel that adds one did not add five"
-    );
-    assert!(each > Duration::ZERO, "five frames took no time at all");
+    let each = held.frames(&[Groups::Fixed(1)], 5).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![5]);
+    assert!(each > Duration::ZERO);
 }
 
 #[test]
@@ -497,8 +375,8 @@ fn many_runs_go_in_together_and_a_refused_call_puts_nothing_in() {
         return;
     };
     let width = host.width();
-    let module = bump(width).expect("a kernel");
-    let mut held = host.resident(&[4, 4], &[&module]).expect("a device buffer");
+    let module = bump(width).unwrap();
+    let mut held = host.resident(&[4, 4], &[&module]).unwrap();
 
     held.write_many(&[
         Run {
@@ -512,13 +390,9 @@ fn many_runs_go_in_together_and_a_refused_call_puts_nothing_in() {
             words: &[22],
         },
     ])
-    .expect("two runs");
-    assert_eq!(held.read(0, 1).expect("a read"), vec![11]);
-    assert_eq!(
-        held.read(1, 2).expect("a read"),
-        vec![0, 22],
-        "the second run went in at the wrong offset"
-    );
+    .unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![11]);
+    assert_eq!(held.read(1, 2).unwrap(), vec![0, 22]);
 
     let refused = held.write_many(&[
         Run {
@@ -534,13 +408,9 @@ fn many_runs_go_in_together_and_a_refused_call_puts_nothing_in() {
     ]);
     match refused {
         Err(Error::Overrun { index, .. }) => {
-            assert_eq!(index, 1, "the wrong binding was named as overrun");
+            assert_eq!(index, 1);
         }
-        other => panic!("a run past the end of a binding was not refused: {other:?}"),
+        other => panic!("{other:?}"),
     }
-    assert_eq!(
-        held.read(0, 1).expect("a read"),
-        vec![11],
-        "the good run in a refused call landed anyway, so the check is not before the copy"
-    );
+    assert_eq!(held.read(0, 1).unwrap(), vec![11]);
 }

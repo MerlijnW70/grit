@@ -1,19 +1,5 @@
-# Line endings are the repository's, not each clone's config.
-#
-# Nothing here is being repaired. Every blob and every working copy is already LF —
-# `git cat-file -p HEAD:src/lib.rs | tr -cd '\r' | wc -c` is nought, and `git add --renormalize .`
-# changed no file. What this does is stop that depending on whoever cloned: `core.autocrlf` is a
-# per-machine setting, and a clone without it would commit CRLF into a repository that has none.
-#
-# `text=auto` stores LF and hands out the platform's own on checkout, so a Windows editor still sees
-# CRLF and the object database stops caring who typed.
-#
-# The "LF will be replaced by CRLF" line git prints on commit is `core.autocrlf` announcing what it
-# will do at the *next checkout*. It is not a warning about the content, and this file does not
-# silence it.
 * text=auto
 
-# Rust, TOML and Markdown are text whatever the heuristic thinks.
 *.rs   text
 *.toml text
 *.md   text

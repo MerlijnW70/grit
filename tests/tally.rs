@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::compact::Plan;
 use grit::layout::{BRUSH, COARSE, DENSE, GRAND, PARAMS, STATE, TALLY, TALLY_WORDS};
@@ -15,11 +15,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -63,31 +63,31 @@ fn the_reduction_says_what_a_count_by_hand_says() {
     let plan = match Plan::over(width, quads.div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(too_big) => {
-            eprintln!("SKIPPED tally at width {width}: {too_big}");
+            eprintln!("SKIPPED {width} {too_big}");
             return;
         }
     };
     let cells = grid.cells();
     println!(
-        "{} — subgroup {width}, {}×{} cells in {quads} quads",
+        "{} {width} {} {} {quads}",
         host.name(),
         grid.wide,
         grid.deep
     );
 
-    let (passes, stages) = grit::live::wired(width, grid, &plan, None).expect("wired");
+    let (passes, stages) = grit::live::wired(width, grid, &plan, None).unwrap();
     let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
 
     let sizes = plan.sizes();
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let mut live = host.resident(&sizes, &modules).expect("resident");
+    let mut live = host.resident(&sizes, &modules).unwrap();
     for (binding, &words) in sizes.iter().enumerate() {
-        live.write(binding, &vec![0_u32; words]).expect("cleared");
+        live.write(binding, &vec![0_u32; words]).unwrap();
     }
-    live.write(STATE as usize, &room(grid)).expect("state");
+    live.write(STATE as usize, &room(grid)).unwrap();
     live.write(PARAMS as usize, &[u32::MAX, plan.dump()])
-        .expect("params");
-    grit::live::seed(&mut live, grid, &plan).expect("seeded");
+        .unwrap();
+    grit::live::seed(&mut live, grid, &plan).unwrap();
 
     let mut busiest = 0_u32;
     let mut ever_moved = 0_u64;
@@ -95,14 +95,12 @@ fn the_reduction_says_what_a_count_by_hand_says() {
     for frame in 0..FRAMES {
         let listed = live
             .read(GRAND as usize, 1)
-            .expect("grand")
+            .unwrap()
             .first()
             .copied()
             .unwrap_or(0)
             .min(quads);
-        let list = live
-            .read(DENSE as usize, listed as usize)
-            .expect("dense list");
+        let list = live.read(DENSE as usize, listed as usize).unwrap();
 
         let material = match frame {
             0..40 => SAND,
@@ -110,11 +108,11 @@ fn the_reduction_says_what_a_count_by_hand_says() {
             _ => AIR,
         };
         live.write_at(PARAMS as usize, BRUSH, &[190, 30, 36, material])
-            .expect("brush");
-        live.staged(&groups).expect("dispatched");
+            .unwrap();
+        live.staged(&groups).unwrap();
 
-        let state = live.read(STATE as usize, cells).expect("state");
-        let tally = live.read(TALLY as usize, TALLY_WORDS).expect("tally");
+        let state = live.read(STATE as usize, cells).unwrap();
+        let tally = live.read(TALLY as usize, TALLY_WORDS).unwrap();
 
         let phase = frame & 1;
         let (mut wet, mut dry) = (0_u32, 0_u32);
@@ -128,48 +126,20 @@ fn the_reduction_says_what_a_count_by_hand_says() {
             }
         }
 
-        assert_eq!(
-            tally[1], wet,
-            "frame {frame}: the device counted {} water cells over {listed} quads and the host {wet}",
-            tally[1]
-        );
-        assert_eq!(
-            tally[2], dry,
-            "frame {frame}: the device counted {} sand cells over {listed} quads and the host {dry}",
-            tally[2]
-        );
+        assert_eq!(tally[1], wet);
+        assert_eq!(tally[2], dry);
 
-        assert!(
-            tally[0] <= listed * 4,
-            "frame {frame}: {} cells moved out of {listed} quads, which is more than they hold",
-            tally[0]
-        );
-        assert!(
-            tally[5] <= listed,
-            "frame {frame}: {} quads moved out of {listed} listed",
-            tally[5]
-        );
+        assert!(tally[0] <= listed * 4);
+        assert!(tally[5] <= listed);
 
         let far = (grid.across() >> COARSE) * tally[0];
-        assert!(
-            tally[3] <= far && tally[4] <= (grid.down() >> COARSE) * tally[0],
-            "frame {frame}: the centre sums are {} and {}, past what {} moving cells can reach",
-            tally[3],
-            tally[4],
-            tally[0]
-        );
+        assert!(tally[3] <= far && tally[4] <= (grid.down() >> COARSE) * tally[0]);
 
         busiest = busiest.max(tally[0]);
         ever_moved += u64::from(tally[0]);
     }
 
-    println!(
-        "  {FRAMES} frames counted twice and agreed. The busiest frame moved {busiest} cells; \
-         {ever_moved} cell-moves altogether."
-    );
+    println!("{FRAMES} {busiest} {ever_moved}");
 
-    assert!(
-        busiest > 0,
-        "nothing ever moved, so the agreement is between two zeroes"
-    );
+    assert!(busiest > 0);
 }

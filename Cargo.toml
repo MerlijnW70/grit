@@ -8,40 +8,18 @@ publish = false
 description = "A sparse-grid stream compaction engine, built on simdr."
 
 [dependencies]
-# The emitter, by path. It declares no dependencies of its own and this does not change that.
 simdr = { path = "../simdr" }
-# Vulkan. `runner` next door uses the same version, and this crate exists because `runner` is a
-# measurement harness rather than a real-time host — see `src/host.rs`.
 ash = "0.38"
-# A window and a framebuffer, for the one thing that has to leave the device.
-#
-# **Optional, and on by default.** Two of the four binaries open a window -- `pour` and `spike` --
-# and the library opens none: `grep -rl minifb src/` names those two files and no other. So a caller
-# that wants the engine can take it without a windowing library and the two crates under it
-# (`raw-window-handle`, `winapi`), and the documented `cargo run --bin pour` keeps working because
-# the feature is default.
-#
-#   grit = { path = "../grit", default-features = false }
 minifb = { version = "0.28", default-features = false, optional = true }
 
-# **And on anything but Windows it needs one of its own back ends named.** `minifb`'s build script
-# panics outright — "At least one of the x11 or wayland features must be enabled" — because turning
-# its defaults off turns those off with them. On Windows it uses the platform and does not notice;
-# everywhere else `pour` and `spike` did not build at all, and nothing said so until a Linux runner
-# tried. `x11` rather than both: one back end is what a window needs, and `dialogs` is the feature
-# whose absence the default-off was for.
 [target.'cfg(unix)'.dependencies]
 minifb = { version = "0.28", default-features = false, features = ["x11"], optional = true }
 
 [dev-dependencies]
-# The same version the crate already links. `tests/saying.rs` needs it to build the two `Error`
-# variants that wrap a Vulkan type, which nothing else can reach without a device that fails.
 ash = "0.38"
 
 [features]
 default = ["window"]
-# What `pour` and `spike` need. `required-features` on both binaries is what stops them being built
-# without it, rather than a link error somewhere further in.
 window = ["dep:minifb"]
 
 [lints.rust]

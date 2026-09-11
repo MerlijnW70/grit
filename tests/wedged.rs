@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::time::Duration;
 
@@ -44,11 +44,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -62,7 +62,7 @@ fn wedge(held: &mut Resident<'_>, groups: &[Groups]) -> Option<Duration> {
     for _ in 0..TRIES {
         match held.frame(groups) {
             Err(Error::Wedged { after }) => return Some(after),
-            Err(other) => panic!("expected the device to be presumed lost, got {other:?}"),
+            Err(other) => panic!("{other:?}"),
             Ok(_) => {}
         }
     }
@@ -75,22 +75,18 @@ fn a_fence_that_does_not_come_back_in_time_presumes_the_device_lost() {
     else {
         return;
     };
-    let module = walk(host.width()).expect("a kernel");
+    let module = walk(host.width()).unwrap();
     let every: Vec<&[u32]> = vec![&module];
-    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
-    held.write(0, &vec![1; WORDS]).expect("a fill");
+    let mut held = host.resident(&[WORDS, 1], &every).unwrap();
+    held.write(0, &vec![1; WORDS]).unwrap();
 
-    assert_eq!(
-        held.patience(),
-        Duration::from_secs(10),
-        "the default patience is ten seconds"
-    );
+    assert_eq!(held.patience(), Duration::from_secs(10));
 
     held.set_patience(IMPATIENT);
     let groups = [Groups::Fixed(over(host.width()))];
 
-    let after = wedge(&mut held, &groups).expect("the timeout branch to be reachable at all");
-    assert_eq!(after, IMPATIENT, "the bound that was crossed");
+    let after = wedge(&mut held, &groups).unwrap();
+    assert_eq!(after, IMPATIENT);
 }
 
 #[test]
@@ -98,38 +94,23 @@ fn a_wedged_device_refuses_everything_afterwards() {
     let Some(host) = device("a_wedged_device_refuses_everything_afterwards") else {
         return;
     };
-    let module = walk(host.width()).expect("a kernel");
+    let module = walk(host.width()).unwrap();
     let every: Vec<&[u32]> = vec![&module];
-    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
-    held.write(0, &vec![1; WORDS]).expect("a fill");
+    let mut held = host.resident(&[WORDS, 1], &every).unwrap();
+    held.write(0, &vec![1; WORDS]).unwrap();
 
     held.set_patience(IMPATIENT);
     let groups = [Groups::Fixed(over(host.width()))];
-    assert!(
-        wedge(&mut held, &groups).is_some(),
-        "the frame is what poisons it"
-    );
+    assert!(wedge(&mut held, &groups).is_some());
 
-    assert!(
-        matches!(held.frame(&groups), Err(Error::Wedged { .. })),
-        "a second frame"
-    );
-    assert!(
-        matches!(held.write(0, &[7]), Err(Error::Wedged { .. })),
-        "a write"
-    );
-    assert!(
-        matches!(held.write_at(0, 1, &[7]), Err(Error::Wedged { .. })),
-        "a write at an offset"
-    );
-    assert!(
-        matches!(held.read(1, 1), Err(Error::Wedged { .. })),
-        "a read, which stages and waits"
-    );
-    assert!(
-        matches!(held.submit(&[&groups]), Err(Error::Wedged { .. })),
-        "a submission that would be waited for later"
-    );
+    assert!(matches!(held.frame(&groups), Err(Error::Wedged { .. })));
+    assert!(matches!(held.write(0, &[7]), Err(Error::Wedged { .. })));
+    assert!(matches!(
+        held.write_at(0, 1, &[7]),
+        Err(Error::Wedged { .. })
+    ));
+    assert!(matches!(held.read(1, 1), Err(Error::Wedged { .. })));
+    assert!(matches!(held.submit(&[&groups]), Err(Error::Wedged { .. })));
 }
 
 #[test]
@@ -137,14 +118,14 @@ fn a_wedged_device_is_dropped_rather_than_waited_for() {
     let Some(host) = device("a_wedged_device_is_dropped_rather_than_waited_for") else {
         return;
     };
-    let module = walk(host.width()).expect("a kernel");
+    let module = walk(host.width()).unwrap();
     let every: Vec<&[u32]> = vec![&module];
-    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
-    held.write(0, &vec![1; WORDS]).expect("a fill");
+    let mut held = host.resident(&[WORDS, 1], &every).unwrap();
+    held.write(0, &vec![1; WORDS]).unwrap();
 
     held.set_patience(IMPATIENT);
     let groups = [Groups::Fixed(over(host.width()))];
-    assert!(wedge(&mut held, &groups).is_some(), "poisoned");
+    assert!(wedge(&mut held, &groups).is_some());
 
     drop(held);
     drop(host);
@@ -155,19 +136,14 @@ fn the_bound_does_not_get_in_the_way_of_ordinary_work() {
     let Some(host) = device("the_bound_does_not_get_in_the_way_of_ordinary_work") else {
         return;
     };
-    let module = walk(host.width()).expect("a kernel");
+    let module = walk(host.width()).unwrap();
     let every: Vec<&[u32]> = vec![&module];
-    let mut held = host.resident(&[WORDS, 1], &every).expect("a device buffer");
-    held.write(0, &vec![1; WORDS]).expect("a fill");
+    let mut held = host.resident(&[WORDS, 1], &every).unwrap();
+    held.write(0, &vec![1; WORDS]).unwrap();
 
     let groups = [Groups::Fixed(over(host.width()))];
-    held.frame(&groups)
-        .expect("a frame at the default patience");
+    held.frame(&groups).unwrap();
 
-    let summed = held.read(1, 1).expect("the answer");
-    assert_eq!(
-        summed.first().copied(),
-        Some(u32::try_from(WORDS).expect("a count that fits a word")),
-        "every word was one and every one of them was added"
-    );
+    let summed = held.read(1, 1).unwrap();
+    assert_eq!(summed.first().copied(), Some(u32::try_from(WORDS).unwrap()));
 }

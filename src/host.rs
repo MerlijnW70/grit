@@ -51,47 +51,34 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoLoader(why) => write!(out, "no Vulkan loader: {why}"),
-            Self::Vulkan(code) => write!(out, "Vulkan said {code:?}"),
-            Self::NoSparse => write!(
-                out,
-                "this device will not hold a buffer larger than the memory behind it: it reports \
-                 no sparseBinding, or no sparseResidencyBuffer"
-            ),
-            Self::NoComputeDevice => write!(out, "no physical device offers a compute queue"),
+            Self::NoLoader(why) => write!(out, "{why}"),
+            Self::Vulkan(code) => write!(out, "{code:?}"),
+            Self::NoSparse => write!(out, "{self:?}"),
+            Self::NoComputeDevice => write!(out, "{self:?}"),
             Self::NoSuchDevice { wanted, present } => {
-                write!(out, "no device matching {wanted:?}; here: {present:?}")
+                write!(out, "{wanted:?} {present:?}")
             }
-            Self::NoMemory { bytes } => write!(out, "no memory type holds {bytes} bytes"),
+            Self::NoMemory { bytes } => write!(out, "{bytes}"),
             Self::NoSuchBinding { index, held } => {
-                write!(out, "binding {index} of {held}")
+                write!(out, "{index} {held}")
             }
             Self::Overrun {
                 index,
                 needed,
                 held,
-            } => write!(out, "binding {index} wants {needed} words and holds {held}"),
-            Self::Staged { needed, staging } => write!(
-                out,
-                "a staged write of {needed} words through a staging buffer of {staging}"
-            ),
+            } => write!(out, "{index} {needed} {held}"),
+            Self::Staged { needed, staging } => write!(out, "{needed} {staging}"),
             Self::WrongPasses { given, held } => {
-                write!(out, "{given} workgroup counts for {held} passes")
+                write!(out, "{given} {held}")
             }
-            Self::StillInFlight => write!(out, "a submission is still in flight"),
-            Self::Wedged { after } => write!(
-                out,
-                "a submission did not land in {after:?}; the device is presumed lost"
-            ),
+            Self::StillInFlight => write!(out, "{self:?}"),
+            Self::Wedged { after } => write!(out, "{after:?}"),
             Self::WrongOutputs { asked, wanted } => {
-                write!(
-                    out,
-                    "the frame copied {asked} buffer(s) and {wanted} were wanted"
-                )
+                write!(out, "{asked} {wanted}")
             }
             Self::NoSuchTicket { ticket, held } => match held {
-                Some(one) => write!(out, "waited on {ticket}, and {one} is outstanding"),
-                None => write!(out, "waited on {ticket}, and nothing is outstanding"),
+                Some(one) => write!(out, "{ticket} {one}"),
+                None => write!(out, "{ticket}"),
             },
         }
     }
@@ -119,6 +106,7 @@ pub struct Host {
     timing: bool,
     wedged: AtomicBool,
     sparse: bool,
+    int64: bool,
 }
 
 impl Host {
@@ -236,8 +224,10 @@ impl Host {
         let has = unsafe { instance.get_physical_device_features(physical) };
         let wanted = vk::PhysicalDeviceFeatures::default()
             .sparse_binding(has.sparse_binding == 1)
-            .sparse_residency_buffer(has.sparse_binding == 1 && has.sparse_residency_buffer == 1);
+            .sparse_residency_buffer(has.sparse_binding == 1 && has.sparse_residency_buffer == 1)
+            .shader_int64(has.shader_int64 == 1);
         let sparse = wanted.sparse_binding == 1 && wanted.sparse_residency_buffer == 1;
+        let int64 = wanted.shader_int64 == 1;
 
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
@@ -268,6 +258,7 @@ impl Host {
             tick,
             timing,
             sparse,
+            int64,
             wedged: AtomicBool::new(false),
         })
     }
@@ -287,6 +278,11 @@ impl Host {
     #[must_use]
     pub const fn sparse(&self) -> bool {
         self.sparse
+    }
+
+    #[must_use]
+    pub const fn int64(&self) -> bool {
+        self.int64
     }
 
     pub(crate) const fn device(&self) -> &ash::Device {

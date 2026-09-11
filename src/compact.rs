@@ -69,10 +69,7 @@ pub enum TooBig {
 impl std::fmt::Display for TooBig {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Blocks { blocks, limit } => write!(
-                out,
-                "{blocks} blocks needs a third level of scan; two reach {limit}"
-            ),
+            Self::Blocks { blocks, limit } => write!(out, "{blocks} {limit}"),
         }
     }
 }

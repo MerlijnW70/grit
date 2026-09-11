@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::compact::Plan;
 use grit::layout::{AWAKE, BRUSH, GRAND, HOT, HOT_DENSE, HOT_GRAND, PARAMS, STATE};
@@ -17,11 +17,11 @@ fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
         Ok(None) => {
-            eprintln!("SKIPPED {label}: no Vulkan device");
+            eprintln!("SKIPPED {label}");
             None
         }
         Err(why) => {
-            eprintln!("SKIPPED {label}: {why}");
+            eprintln!("SKIPPED {label} {why}");
             None
         }
     }
@@ -61,7 +61,7 @@ fn ran(
     apart: bool,
     batch: u32,
 ) -> (u32, u64, u64, usize, usize, bool, u64) {
-    let (passes, wired) = grit::live::arranged(width, grid, plan, None, true).expect("arranged");
+    let (passes, wired) = grit::live::arranged(width, grid, plan, None, true).unwrap();
     let stages: Vec<Vec<Groups>> = if apart {
         wired.into_iter().flatten().map(|one| vec![one]).collect()
     } else {
@@ -71,39 +71,37 @@ fn ran(
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
 
-    let mut held = host.resident(&sizes, &modules).expect("resident");
+    let mut held = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
-        held.write(binding, &vec![0_u32; *words]).expect("wipe");
+        held.write(binding, &vec![0_u32; *words]).unwrap();
     }
-    held.write(STATE as usize, &room(grid)).expect("room");
+    held.write(STATE as usize, &room(grid)).unwrap();
     held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
-        .expect("params");
-    grit::live::seed(&mut held, grid, plan).expect("seed");
-    held.staged(&groups).expect("warm");
+        .unwrap();
+    grit::live::seed(&mut held, grid, plan).unwrap();
+    held.staged(&groups).unwrap();
 
     for frame in (0..FRAMES).step_by(batch as usize) {
         let material = if frame < POURING { SAND } else { AIR };
         let (x, y) = (grid.wide / 2, grid.deep / 8);
         held.write_at(PARAMS as usize, BRUSH, &[x, y, 49, material])
-            .expect("brush");
-        held.staged_frames(&groups, batch).expect("frames");
+            .unwrap();
+        held.staged_frames(&groups, batch).unwrap();
     }
     let grand = held
         .read(GRAND as usize, 1)
-        .expect("grand")
+        .unwrap()
         .first()
         .copied()
         .unwrap_or(0);
-    let world = folded(&held.read(STATE as usize, grid.cells()).expect("state"));
+    let world = folded(&held.read(STATE as usize, grid.cells()).unwrap());
     let long = held
         .read(HOT_GRAND as usize, 1)
-        .expect("hot grand")
+        .unwrap()
         .first()
         .copied()
         .unwrap_or(0) as usize;
-    let list = held
-        .read(HOT_DENSE as usize, long.max(1))
-        .expect("hot dense");
+    let list = held.read(HOT_DENSE as usize, long.max(1)).unwrap();
     let mut sorted = list.clone();
     sorted.sort_unstable();
     let distinct = {
@@ -112,18 +110,14 @@ fn ran(
         held.len()
     };
     let ordered = list == sorted;
-    let hot = folded(
-        &held
-            .read(HOT as usize, plan.padded() as usize)
-            .expect("hot"),
-    );
+    let hot = folded(&held.read(HOT as usize, plan.padded() as usize).unwrap());
     let woke = folded(
         &held
             .read(
                 AWAKE as usize,
                 plan.blocks as usize * plan.per_block as usize,
             )
-            .expect("awake"),
+            .unwrap(),
     );
     (grand, world, woke, long, distinct, ordered, hot)
 }
@@ -145,24 +139,19 @@ fn whether_a_barrier_is_what_is_missing() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED hunt at width {width}: {why}");
+            eprintln!("SKIPPED {width} {why}");
             return;
         }
     };
     eprintln!(
-        "{} — subgroup {width}, {}×{} cells in {} blocks, {FRAMES} frames",
+        "{} {width} {} {} {} {FRAMES}",
         host.name(),
         grid.wide,
         grid.deep,
         plan.blocks
     );
 
-    for (apart, batch, what) in [
-        (false, 1, "grouped, a frame a submission"),
-        (true, 1, "one pass a stage, a frame a submission"),
-        (false, 20, "grouped, twenty frames a submission"),
-        (true, 20, "one pass a stage, twenty a submission"),
-    ] {
+    for (apart, batch) in [(false, 1), (true, 1), (false, 20), (true, 20)] {
         let mut seen = Vec::with_capacity(RUNS);
         for _ in 0..RUNS {
             seen.push(ran(&host, width, grid, &plan, apart, batch));
@@ -173,20 +162,12 @@ fn whether_a_barrier_is_what_is_missing() {
         let hots = seen.windows(2).all(|two| two[0].6 == two[1].6);
         let coarse: Vec<String> = seen
             .iter()
-            .map(|one| format!("{}{}", one.3, if one.3 == one.4 { "" } else { "!" }))
+            .map(|one| format!("{} {}", one.3, one.3 == one.4))
             .collect();
         let all_ordered = seen.iter().all(|one| one.5);
         eprintln!(
-            "  {what:<40} lists {lists:?}  world {}  AWAKE {}  HOT {}  coarse list {}  {}",
-            if worlds { "same" } else { "**differ**" },
-            if wokes { "same" } else { "**differ**" },
-            if hots { "same" } else { "**differ**" },
-            coarse.join("/"),
-            if all_ordered {
-                "ascending"
-            } else {
-                "**not ascending**"
-            },
+            "{apart} {batch} {lists:?} {worlds} {wokes} {hots} {} {all_ordered}",
+            coarse.join("/")
         );
     }
 }

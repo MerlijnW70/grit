@@ -13,16 +13,10 @@ const FRAMES: u32 = 240;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(host) = Host::open()? else {
-        println!("no Vulkan device");
         return Ok(());
     };
     let width = host.width();
-    println!("{} — subgroup {width}\n", host.name());
-
-    println!(
-        "  {:>12}  {:>12}  {:>12}  {:>10}  {:>10}",
-        "cells", "frame", "no readback", "looking", "fps"
-    );
+    println!("{} {width}", host.name());
 
     for power in [18_u32, 20, 22, 24] {
         let cells = 1_usize << power;
@@ -52,17 +46,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let looking = looking / FRAMES;
         let blind = blind / FRAMES;
         println!(
-            "  {cells:>12}  {looking:>12.3?}  {blind:>12.3?}  {:>10.3?}  {:>10.0}",
+            "{cells:>12} {looking:>12.3?} {blind:>12.3?} {:>10.3?} {:>10.0}",
             looking.saturating_sub(blind),
             1.0 / looking.as_secs_f64()
         );
     }
 
-    println!(
-        "\n  `frame` is three dispatches, two barriers and one fence. `no readback` is the same\n  \
-         thing with nothing copied out — what the simulation costs when nobody is watching.\n  \
-         `looking` is the difference, and it is the only traffic this design allows."
-    );
     Ok(())
 }
 

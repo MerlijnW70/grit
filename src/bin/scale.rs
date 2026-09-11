@@ -13,29 +13,20 @@ const POURING: u32 = 200;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(host) = Host::open()? else {
-        println!("no Vulkan device");
         return Ok(());
     };
     let width = host.width();
-    println!("{} — subgroup {width}\n", host.name());
-    println!(
-        "  {:>10}  {:>9}  {:>7}  {:>10}  {:>10}  {:>8}  {:>8}  {:>7}",
-        "cells", "quads", "blocks", "wall", "on card", "listed", "memory", "of grid"
-    );
+    println!("{} {width}", host.name());
 
     for power in [9_u32, 10, 11, 12] {
         let grid = Grid::of(1 << power, 1 << power);
         match once(&host, width, grid) {
             Ok(Some(())) => {}
             Ok(None) => {}
-            Err(why) => println!("  {:>10}  refused: {why}", grid.cells()),
+            Err(why) => println!("{:>10} {why}", grid.cells()),
         }
     }
 
-    println!(
-        "\n  `listed` is how many quads the settle stepped, averaged over the run. `of grid` is that\n  \
-         against every quad there is — what a pass over the whole world would have cost."
-    );
     Ok(())
 }
 
@@ -44,7 +35,7 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
     let plan = match Plan::over(width, quads.div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(too_big) => {
-            println!("  {:>10}  {quads:>9}  refused: {too_big}", grid.cells());
+            println!("{:>10} {quads:>9} {too_big}", grid.cells());
             return Ok(None);
         }
     };
@@ -89,12 +80,12 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
     let listed = listed_total / asked.max(1);
     let share = f64::from(quads) / (listed.max(1) as f64);
     println!(
-        "  {:>10}  {quads:>9}  {:>7}  {:>10.3?}  {:>10.3?}  {listed:>8}  {:>5} MB  {share:>6.0}×",
+        "{:>10} {quads:>9} {:>7} {:>10.3?} {:>10.3?} {listed:>8} {:>5} {share:>6.0}",
         grid.cells(),
         plan.blocks,
         spent / FRAMES.div_ceil(BATCH),
         card.unwrap_or_default(),
-        words * 4 / (1 << 20),
+        words * 4 / (1 << 20)
     );
     Ok(Some(()))
 }
