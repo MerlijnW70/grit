@@ -44,6 +44,60 @@ fn scattered(grid: Grid, seed: u32) -> Vec<u32> {
     cells
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    Turn,
+    Lift,
+}
+
+const KEYS: [u32; 4] = [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
+
+fn mixed<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    key: u32,
+    first: Vector<U32, LANES>,
+    second: Vector<U32, LANES>,
+    third: Vector<U32, LANES>,
+) -> Result<Vector<U32, LANES>, LaneError> {
+    let by = lanes.splat_bits::<U32, LANES>(key)?;
+    let five = lanes.splat_bits::<U32, LANES>(5)?;
+    let three = lanes.splat_bits::<U32, LANES>(3)?;
+
+    let held = lanes.mul(first, by)?;
+    let up = lanes.shift_left(second, five)?;
+    let held = lanes.xor(held, up)?;
+    let down = lanes.shift_right_logical(third, three)?;
+    lanes.add(held, down)
+}
+
+fn lifted<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    held: [Vector<U32, LANES>; 4],
+    back: bool,
+) -> Result<[Vector<U32, LANES>; 4], LaneError> {
+    let [mut a, mut b, mut c, mut d] = held;
+    if back {
+        let step = mixed::<LANES>(lanes, KEYS[3], a, b, c)?;
+        d = lanes.sub(d, step)?;
+        let step = mixed::<LANES>(lanes, KEYS[2], d, a, b)?;
+        c = lanes.sub(c, step)?;
+        let step = mixed::<LANES>(lanes, KEYS[1], c, d, a)?;
+        b = lanes.sub(b, step)?;
+        let step = mixed::<LANES>(lanes, KEYS[0], b, c, d)?;
+        a = lanes.sub(a, step)?;
+    } else {
+        let step = mixed::<LANES>(lanes, KEYS[0], b, c, d)?;
+        a = lanes.add(a, step)?;
+        let step = mixed::<LANES>(lanes, KEYS[1], c, d, a)?;
+        b = lanes.add(b, step)?;
+        let step = mixed::<LANES>(lanes, KEYS[2], d, a, b)?;
+        c = lanes.add(c, step)?;
+        let step = mixed::<LANES>(lanes, KEYS[3], a, b, c)?;
+        d = lanes.add(d, step)?;
+    }
+    Ok([a, b, c, d])
+}
+
 struct Corners<const LANES: u32> {
     places: [Vector<U32, LANES>; 4],
     along: Vector<U32, LANES>,
@@ -90,7 +144,22 @@ fn spun<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     held: [Vector<U32, LANES>; 4],
     back: bool,
+    rule: Rule,
 ) -> Result<([Vector<U32, LANES>; 4], Vector<U32, LANES>), LaneError> {
+    if rule == Rule::Lift {
+        let next = lifted::<LANES>(lanes, held, back)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let mut stirring = none;
+        for (before, after) in held.into_iter().zip(next) {
+            let same = lanes.equal(before, after)?;
+            let differs = lanes.select(same, none, one)?;
+            stirring = lanes.add(stirring, differs)?;
+        }
+        let moving = lanes.greater_than(stirring, none)?;
+        let stirring = lanes.select(moving, one, none)?;
+        return Ok((next, stirring));
+    }
     let [a, b, c, d] = held;
     let one = lanes.splat_bits::<U32, LANES>(1)?;
     let none = lanes.splat_bits::<U32, LANES>(0)?;
@@ -142,13 +211,13 @@ fn spun<const LANES: u32>(
     Ok((kept, stirring))
 }
 
-fn every(subgroup: u32, grid: Grid, back: bool) -> Result<Vec<u32>, LaneError> {
+fn every(subgroup: u32, grid: Grid, back: bool, rule: Rule) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => all_of::<4>(subgroup, grid, back),
-        8 => all_of::<8>(subgroup, grid, back),
-        16 => all_of::<16>(subgroup, grid, back),
-        32 => all_of::<32>(subgroup, grid, back),
-        64 => all_of::<64>(subgroup, grid, back),
+        4 => all_of::<4>(subgroup, grid, back, rule),
+        8 => all_of::<8>(subgroup, grid, back, rule),
+        16 => all_of::<16>(subgroup, grid, back, rule),
+        32 => all_of::<32>(subgroup, grid, back, rule),
+        64 => all_of::<64>(subgroup, grid, back, rule),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -156,7 +225,12 @@ fn every(subgroup: u32, grid: Grid, back: bool) -> Result<Vec<u32>, LaneError> {
     }
 }
 
-fn all_of<const LANES: u32>(subgroup: u32, grid: Grid, back: bool) -> Result<Vec<u32>, LaneError> {
+fn all_of<const LANES: u32>(
+    subgroup: u32,
+    grid: Grid,
+    back: bool,
+    rule: Rule,
+) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let group = kernel.workgroup_index();
@@ -184,7 +258,7 @@ fn all_of<const LANES: u32>(subgroup: u32, grid: Grid, back: bool) -> Result<Vec
             lanes.splat_id::<U32, LANES>(held[2])?,
             lanes.splat_id::<U32, LANES>(held[3])?,
         ];
-        spun::<LANES>(&mut lanes, held, back)?.0
+        spun::<LANES>(&mut lanes, held, back, rule)?.0
     };
     for (place, value) in places.iter().zip(&next) {
         kernel.store_at(STATE, place.id(), value.id())?;
@@ -192,13 +266,13 @@ fn all_of<const LANES: u32>(subgroup: u32, grid: Grid, back: bool) -> Result<Vec
     kernel.finish()
 }
 
-fn listed(subgroup: u32, grid: Grid, back: bool) -> Result<Vec<u32>, LaneError> {
+fn listed(subgroup: u32, grid: Grid, back: bool, rule: Rule) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => some_of::<4>(subgroup, grid, back),
-        8 => some_of::<8>(subgroup, grid, back),
-        16 => some_of::<16>(subgroup, grid, back),
-        32 => some_of::<32>(subgroup, grid, back),
-        64 => some_of::<64>(subgroup, grid, back),
+        4 => some_of::<4>(subgroup, grid, back, rule),
+        8 => some_of::<8>(subgroup, grid, back, rule),
+        16 => some_of::<16>(subgroup, grid, back, rule),
+        32 => some_of::<32>(subgroup, grid, back, rule),
+        64 => some_of::<64>(subgroup, grid, back, rule),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -206,7 +280,12 @@ fn listed(subgroup: u32, grid: Grid, back: bool) -> Result<Vec<u32>, LaneError> 
     }
 }
 
-fn some_of<const LANES: u32>(subgroup: u32, grid: Grid, back: bool) -> Result<Vec<u32>, LaneError> {
+fn some_of<const LANES: u32>(
+    subgroup: u32,
+    grid: Grid,
+    back: bool,
+    rule: Rule,
+) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let group = kernel.workgroup_index();
@@ -249,7 +328,7 @@ fn some_of<const LANES: u32>(subgroup: u32, grid: Grid, back: bool) -> Result<Ve
             lanes.splat_id::<U32, LANES>(held[2])?,
             lanes.splat_id::<U32, LANES>(held[3])?,
         ];
-        spun::<LANES>(&mut lanes, held, back)?
+        spun::<LANES>(&mut lanes, held, back, rule)?
     };
 
     let spare = {
@@ -326,7 +405,7 @@ fn some_of<const LANES: u32>(subgroup: u32, grid: Grid, back: bool) -> Result<Ve
     kernel.finish()
 }
 
-fn stepped(host: &Host, grid: Grid, cells: &[u32], sparse: bool) -> (Vec<u32>, u32) {
+fn stepped(host: &Host, grid: Grid, cells: &[u32], sparse: bool, rule: Rule) -> (Vec<u32>, u32) {
     let width = host.width();
     let quads = grid.quads();
     let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
@@ -337,9 +416,9 @@ fn stepped(host: &Host, grid: Grid, cells: &[u32], sparse: bool) -> (Vec<u32>, u
     let over = Groups::Fixed(quads.div_ceil(width));
 
     let turning = if sparse {
-        listed(width, grid, false).unwrap()
+        listed(width, grid, false, rule).unwrap()
     } else {
-        every(width, grid, false).unwrap()
+        every(width, grid, false, rule).unwrap()
     };
     let passes = if sparse {
         vec![
@@ -408,8 +487,8 @@ fn the_quads_left_out_had_nothing_to_do() {
     let grid = Grid::of(WIDE, DEEP);
     let cells = scattered(grid, 0x0510_0BED);
 
-    let (dense, _) = stepped(&host, grid, &cells, false);
-    let (sparse, awake) = stepped(&host, grid, &cells, true);
+    let (dense, _) = stepped(&host, grid, &cells, false, Rule::Turn);
+    let (sparse, awake) = stepped(&host, grid, &cells, true, Rule::Turn);
 
     let apart = dense
         .iter()
@@ -423,7 +502,7 @@ fn the_quads_left_out_had_nothing_to_do() {
     assert!(awake < grid.quads());
 }
 
-fn both_ways(host: &Host, grid: Grid, cells: &[u32]) -> (Vec<u32>, Vec<u32>, u32) {
+fn both_ways(host: &Host, grid: Grid, cells: &[u32], rule: Rule) -> (Vec<u32>, Vec<u32>, u32) {
     let width = host.width();
     let quads = grid.quads();
     let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
@@ -437,8 +516,8 @@ fn both_ways(host: &Host, grid: Grid, cells: &[u32]) -> (Vec<u32>, Vec<u32>, u32
         live::decay(width, Over::Every).unwrap(),
         live::wipe(width).unwrap(),
         live::wipe_counts(width, COUNTS).unwrap(),
-        listed(width, grid, false).unwrap(),
-        listed(width, grid, true).unwrap(),
+        listed(width, grid, false, rule).unwrap(),
+        listed(width, grid, true, rule).unwrap(),
         live::mark(width, Tier::FINE, Over::Every).unwrap(),
         compact::scan(width, COUNTS, BASES, TOTALS).unwrap(),
         compact::scan(width, TOTALS, TOTALS, GRAND).unwrap(),
@@ -505,7 +584,7 @@ fn a_sparse_run_undoes_itself_over_the_list_it_kept() {
     let grid = Grid::of(WIDE, DEEP);
     let cells = scattered(grid, 0x0510_0BED);
 
-    let (stirred, home, awake) = both_ways(&host, grid, &cells);
+    let (stirred, home, awake) = both_ways(&host, grid, &cells, Rule::Turn);
     let apart = home
         .iter()
         .zip(&cells)
@@ -514,5 +593,51 @@ fn a_sparse_run_undoes_itself_over_the_list_it_kept() {
     eprintln!("{} {} {awake} {apart}", grid.quads(), STEPS);
 
     assert_ne!(stirred, cells);
+    assert_eq!(apart, 0);
+}
+
+#[test]
+fn a_rule_that_computes_still_undoes_itself_over_the_list() {
+    let Some(host) = device("a_rule_that_computes_still_undoes_itself") else {
+        return;
+    };
+    let grid = Grid::of(WIDE, DEEP);
+    let cells = scattered(grid, 0x0510_0BED);
+
+    let (stirred, home, awake) = both_ways(&host, grid, &cells, Rule::Lift);
+    let apart = home
+        .iter()
+        .zip(&cells)
+        .filter(|(one, other)| one != other)
+        .count();
+    let touched = stirred.iter().filter(|word| **word != 0).count();
+    let began = cells.iter().filter(|word| **word != 0).count();
+    eprintln!("{} {STEPS} {awake} {began} {touched} {apart}", grid.quads());
+
+    assert_ne!(stirred, cells);
+    assert!(touched > began * 4);
+    assert!(awake < grid.quads());
+    assert_eq!(apart, 0);
+}
+
+#[test]
+fn the_computing_rule_skips_nothing_the_dense_run_did() {
+    let Some(host) = device("the_computing_rule_skips_nothing_the_dense_run_did") else {
+        return;
+    };
+    let grid = Grid::of(WIDE, DEEP);
+    let cells = scattered(grid, 0x0BED_0510);
+
+    let (dense, _) = stepped(&host, grid, &cells, false, Rule::Lift);
+    let (sparse, awake) = stepped(&host, grid, &cells, true, Rule::Lift);
+
+    let apart = dense
+        .iter()
+        .zip(&sparse)
+        .filter(|(one, other)| one != other)
+        .count();
+    eprintln!("{} {STEPS} {awake} {apart}", grid.quads());
+
+    assert_ne!(dense, cells);
     assert_eq!(apart, 0);
 }
