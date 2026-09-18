@@ -369,9 +369,15 @@ fn a_resident_says_what_it_holds_and_what_its_transfers_cost() {
 
     held.write(0, &[7]).unwrap();
     let (spent, writes, straight) = held.pushing();
-    assert_eq!(writes, 1);
+    assert_eq!((writes, straight), (1, 0));
     assert!(spent > Duration::ZERO);
-    assert!(straight <= writes);
+
+    assert!(matches!(
+        held.write(0, &[1, 2, 3, 4, 5]),
+        Err(Error::Overrun { .. })
+    ));
+    let (_, writes, straight) = held.pushing();
+    assert_eq!((writes, straight), (2, 0));
 
     assert_eq!(held.read(0, 1).unwrap(), vec![7]);
     let (spent, reads) = held.copying();
@@ -438,4 +444,64 @@ fn many_runs_go_in_together_and_a_refused_call_puts_nothing_in() {
         other => panic!("{other:?}"),
     }
     assert_eq!(held.read(0, 1).unwrap(), vec![11]);
+}
+
+#[test]
+fn a_buffer_small_enough_to_live_near_the_host_is_written_straight_into() {
+    let Some(host) = device("a_buffer_small_enough_to_live_near_the_host") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).unwrap();
+    let mut held = host
+        .resident_near(&[4, 8], &[&module, &module], 64)
+        .unwrap();
+
+    held.write(0, &[1, 2, 3, 4]).unwrap();
+    let (_, writes, straight) = held.pushing();
+    eprintln!("{writes} {straight}");
+    assert_eq!((writes, straight), (1, 1));
+    assert_eq!(held.read(0, 4).unwrap(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn an_indirect_count_is_read_from_the_word_it_points_at() {
+    let Some(host) = device("an_indirect_count_is_read_from_the_word_it_points_at") else {
+        return;
+    };
+    let module = bump(host.width()).unwrap();
+    let mut held = host.resident(&[4, 6], &[&module]).unwrap();
+
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+    held.write(1, &[0, 1, 1, 1, 1, 1]).unwrap();
+
+    held.frame(&[Groups::From { binding: 1, at: 0 }]).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![0]);
+
+    held.frame(&[Groups::From { binding: 1, at: 3 }]).unwrap();
+    assert_eq!(held.read(0, 1).unwrap(), vec![1]);
+}
+
+#[test]
+fn a_stage_with_nothing_left_in_it_is_not_a_stage_that_is_timed() {
+    let Some(host) = device("a_stage_with_nothing_left_in_it_is_not_timed") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).unwrap();
+    let modules: Vec<&[u32]> = vec![&module, &module, &module];
+    let mut held = host.resident(&[4], &modules).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+
+    let first = [Groups::Fixed(1)];
+    let middle = [Groups::Fixed(0)];
+    let last = [Groups::Fixed(1)];
+    held.staged(&[&first, &middle, &last]).unwrap();
+
+    assert_eq!(held.read(0, 1).unwrap(), vec![2]);
+    if held.on_device().is_none() {
+        assert!(held.stage_times().is_empty());
+        return;
+    }
+    assert_eq!(held.stage_times().len(), 2);
 }
