@@ -505,3 +505,79 @@ fn a_stage_with_nothing_left_in_it_is_not_a_stage_that_is_timed() {
     }
     assert_eq!(held.stage_times().len(), 2);
 }
+
+#[test]
+fn a_buffer_exactly_the_size_of_the_window_still_lives_near_the_host() {
+    let Some(host) = device("a_buffer_exactly_the_size_of_the_window_lives_near") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).unwrap();
+    let window = (4 * size_of::<u32>()) as u64;
+    let mut held = host
+        .resident_near(&[4, 4], &[&module, &module], window)
+        .unwrap();
+
+    held.write(0, &[1, 2, 3, 4]).unwrap();
+    let (_, writes, straight) = held.pushing();
+    eprintln!("{writes} {straight}");
+    assert_eq!((writes, straight), (1, 1));
+    assert_eq!(held.read(0, 4).unwrap(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn a_write_into_a_near_buffer_does_not_wait_for_the_frame_in_flight() {
+    let Some(host) = device("a_write_into_a_near_buffer_does_not_wait") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).unwrap();
+    let window = 64_u64;
+    let mut held = host.resident_near(&[4, 4], &[&module], window).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+    held.write(1, &[0, 0, 0, 0]).unwrap();
+    let (_, _, straight) = held.pushing();
+    if straight == 0 {
+        eprintln!("SKIPPED {}", host.name());
+        return;
+    }
+
+    let groups = [Groups::Fixed(1)];
+    let stages: Vec<&[Groups]> = vec![&groups];
+    let ticket = held.submit(&stages).unwrap();
+    held.write_at(1, 2, &[MARK]).unwrap();
+    held.wait(ticket).unwrap();
+
+    assert_eq!(held.read(1, 4).unwrap(), vec![0, 0, MARK, 0]);
+    assert_eq!(held.read(0, 1).unwrap(), vec![1]);
+}
+
+#[test]
+fn runs_that_fill_the_staging_buffer_to_the_word_are_taken() {
+    let Some(host) = device("runs_that_fill_the_staging_buffer_to_the_word") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).unwrap();
+    let mut held = host.resident(&[4, 4], &[&module]).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+    held.write(1, &[0, 0, 0, 0]).unwrap();
+
+    let first = [MARK, MARK];
+    let second = [7, 9];
+    let runs = [
+        Run {
+            index: 0,
+            at: 0,
+            words: &first,
+        },
+        Run {
+            index: 1,
+            at: 2,
+            words: &second,
+        },
+    ];
+    held.write_many(&runs).unwrap();
+    assert_eq!(held.read(0, 4).unwrap(), vec![MARK, MARK, 0, 0]);
+    assert_eq!(held.read(1, 4).unwrap(), vec![0, 0, 7, 9]);
+}

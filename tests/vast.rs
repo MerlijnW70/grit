@@ -122,6 +122,11 @@ fn a_bind_that_does_not_fit_says_so() {
     ));
     assert!(matches!(
         held.bind(1, VAST, page),
+        Err(Error::Overrun { index: 1, needed, held: has })
+            if needed == VAST + page && has == VAST
+    ));
+    assert!(matches!(
+        held.bind(1, VAST, page),
         Err(Error::Overrun { .. })
     ));
     assert!(matches!(held.bind(0, 0, page), Err(Error::NoSparse)));
