@@ -410,7 +410,8 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
     };
 
     let quad = kernel.load_at(DENSE, slot)?;
-    let (places, column, row) = corners::<LANES>(&mut kernel, grid, quad, frame)?;
+    let corners = corners::<LANES>(&mut kernel, grid, quad, frame)?;
+    let (places, column, row) = (corners.places, corners.along, corners.down);
 
     let held = [
         kernel.load_at(STATE, places[0].id())?,
@@ -575,13 +576,13 @@ fn tally<const LANES: u32>(
     Ok(())
 }
 
-type Corners<const LANES: u32> = (
-    [Vector<U32, LANES>; 4],
-    Vector<U32, LANES>,
-    Vector<U32, LANES>,
-);
+pub struct Corners<const LANES: u32> {
+    pub places: [Vector<U32, LANES>; 4],
+    pub along: Vector<U32, LANES>,
+    pub down: Vector<U32, LANES>,
+}
 
-fn corners<const LANES: u32>(
+pub fn corners<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     grid: Grid,
     quad: simdr::module::Id,
@@ -610,17 +611,21 @@ fn corners<const LANES: u32>(
         sand::at::<LANES>(&mut lanes, grid, column, under)?,
         sand::at::<LANES>(&mut lanes, grid, right, under)?,
     ];
-    Ok((places, along, down))
+    Ok(Corners {
+        places,
+        along,
+        down,
+    })
 }
 
-pub(crate) struct Waking<const LANES: u32> {
+pub struct Waking<const LANES: u32> {
     pub subgroup: u32,
     pub grid: Grid,
     pub column: Vector<U32, LANES>,
     pub row: Vector<U32, LANES>,
 }
 
-pub(crate) fn wake<const LANES: u32>(
+pub fn wake<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     where_at: Waking<LANES>,
     holding: Vector<U32, LANES>,
