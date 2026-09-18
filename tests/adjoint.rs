@@ -1,7 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+use std::time::Duration;
+
 use grit::compact::{Over, Plan, Tier};
-use grit::layout::{AWAKE, BASES, BINDINGS, COUNTS, DENSE, GRAND, HOT, PARAMS, STATE, TOTALS};
+use grit::layout::{
+    AWAKE, BASES, BINDINGS, COUNTS, DENSE, GRAND, HOT, HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND,
+    HOT_TOTALS, PARAMS, STATE, TOTALS,
+};
 use grit::sand::{self, Grid};
 use grit::{Groups, Host, compact, live, sweep};
 use simdr::kernel::{Kernel, Shape};
@@ -581,39 +586,87 @@ struct Ran {
     carried: Vec<u32>,
     home: Vec<u32>,
     awake: u32,
+    ahead: Duration,
+    back: Duration,
 }
 
-fn over_the_list(host: &Host, grid: Grid, start: &[u32], slope: &[u32], weight: &[u32]) -> Ran {
-    let width = host.width();
-    let quads = grid.quads();
-    let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
+const ROUNDS: u32 = 5;
 
+type Wiring = (Vec<Vec<u32>>, Vec<Vec<Groups>>, Vec<Vec<Groups>>);
+
+fn wiring(width: u32, grid: Grid, plan: &Plan) -> Wiring {
     let one = Groups::Fixed(1);
-    let blocks = Groups::Fixed(plan.blocks);
     let tiles = Groups::Fixed(plan.tiles);
+    let hot_tiles = Groups::Fixed(plan.hot_tiles);
+    let hot = Plan::hot_listed();
     let none = Groups::Fixed(0);
 
-    let passes = [
-        live::decay(width, Over::Every).unwrap(),
+    let passes = vec![
+        live::decay(width, Over::Listed(HOT_DENSE)).unwrap(),
         live::wipe(width).unwrap(),
         live::wipe_counts(width, COUNTS).unwrap(),
         over_list(width, grid, Pass::Tangent).unwrap(),
         over_list(width, grid, Pass::Adjoint).unwrap(),
-        live::mark(width, Tier::FINE, Over::Every).unwrap(),
+        live::mark(width, Tier::COARSE, Over::Every).unwrap(),
+        compact::scan(width, HOT_COUNTS, HOT_BASES, HOT_TOTALS).unwrap(),
+        compact::scan(width, HOT_TOTALS, HOT_TOTALS, HOT_GRAND).unwrap(),
+        compact::gather(width, Tier::COARSE, Over::Every, plan.hot_dump()).unwrap(),
+        compact::prepare(width, 1, Tier::COARSE).unwrap(),
+        live::mark(width, Tier::FINE, Over::Listed(HOT_DENSE)).unwrap(),
         compact::scan(width, COUNTS, BASES, TOTALS).unwrap(),
         compact::scan(width, TOTALS, TOTALS, GRAND).unwrap(),
-        compact::gather(width, Tier::FINE, Over::Every, plan.dump()).unwrap(),
+        compact::gather(width, Tier::FINE, Over::Listed(HOT_DENSE), plan.dump()).unwrap(),
         compact::prepare(width, width, Tier::FINE).unwrap(),
     ];
+
+    let shaped = |rule: [Groups; 2]| {
+        vec![
+            vec![hot, one, tiles],
+            vec![rule[0], rule[1]],
+            vec![tiles],
+            vec![hot_tiles],
+            vec![one],
+            vec![tiles, Groups::Counting(1)],
+            vec![hot],
+            vec![tiles],
+            vec![one],
+            vec![hot, Groups::Counting(1)],
+        ]
+    };
+    (
+        passes,
+        shaped([Plan::listed(), none]),
+        shaped([none, Plan::listed()]),
+    )
+}
+
+fn ran_over(host: &Host, grid: Grid, held: [&[u32]; 3], sparse: bool, rounds: u32) -> Ran {
+    let width = host.width();
+    let quads = grid.quads();
+    let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
+    let [start, slope, weight] = held;
+
+    let over = Groups::Fixed(quads.div_ceil(width));
+    let none = Groups::Fixed(0);
+    let whole_ahead = [over, none];
+    let whole_back = [none, over];
+
+    let (sparse_passes, sparse_ahead, sparse_back) = wiring(width, grid, &plan);
+    let whole_passes = vec![
+        built(width, grid, Pass::Tangent).unwrap(),
+        built(width, grid, Pass::Adjoint).unwrap(),
+    ];
+    let passes = if sparse { sparse_passes } else { whole_passes };
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
-    let held = plan.sizes();
+    let plan_sizes = plan.sizes();
     let mut sizes = [1_usize; HOLDING as usize];
-    for (slot, words) in sizes.iter_mut().zip(held) {
+    for (slot, words) in sizes.iter_mut().zip(plan_sizes) {
         *slot = words;
     }
-    sizes[TANGENT as usize] = held[STATE as usize];
-    sizes[CARRIED as usize] = held[STATE as usize];
+    sizes[TANGENT as usize] = plan_sizes[STATE as usize];
+    sizes[CARRIED as usize] = plan_sizes[STATE as usize];
+
     let mut resident = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
         resident.write(binding, &vec![0_u32; *words]).unwrap();
@@ -626,47 +679,64 @@ fn over_the_list(host: &Host, grid: Grid, start: &[u32], slope: &[u32], weight: 
         .unwrap();
     live::seed(&mut resident, grid, &plan).unwrap();
 
-    let ahead: [Vec<Groups>; 6] = [
-        vec![blocks, one, tiles],
-        vec![Plan::listed(), none],
-        vec![blocks],
-        vec![tiles],
-        vec![one],
-        vec![blocks, Groups::Counting(1)],
-    ];
-    let back: [Vec<Groups>; 6] = [
-        vec![blocks, one, tiles],
-        vec![none, Plan::listed()],
-        vec![blocks],
-        vec![tiles],
-        vec![one],
-        vec![blocks, Groups::Counting(1)],
-    ];
-    let forward: Vec<&[Groups]> = ahead.iter().map(Vec::as_slice).collect();
-    let backward: Vec<&[Groups]> = back.iter().map(Vec::as_slice).collect();
+    let forward: Vec<&[Groups]> = if sparse {
+        sparse_ahead.iter().map(Vec::as_slice).collect()
+    } else {
+        vec![&whole_ahead]
+    };
+    let backward: Vec<&[Groups]> = if sparse {
+        sparse_back.iter().map(Vec::as_slice).collect()
+    } else {
+        vec![&whole_back]
+    };
 
-    for frame in 0..STEPS {
-        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
-        resident.staged(&forward).unwrap();
-    }
-    let pushed = resident.read(TANGENT as usize, grid.cells()).unwrap();
-    let awake = resident
-        .read(GRAND as usize, 1)
-        .unwrap()
-        .first()
-        .copied()
-        .unwrap_or(0);
+    let mut fastest_ahead = Duration::MAX;
+    let mut fastest_back = Duration::MAX;
+    let mut awake = quads;
+    let mut pushed = Vec::new();
+    for _ in 0..rounds {
+        let mut spent = Duration::ZERO;
+        for frame in 0..STEPS {
+            resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+            spent += resident.staged(&forward).unwrap();
+        }
+        fastest_ahead = fastest_ahead.min(spent / STEPS);
+        pushed = resident.read(TANGENT as usize, grid.cells()).unwrap();
+        if sparse {
+            awake = awake.min(
+                resident
+                    .read(GRAND as usize, 1)
+                    .unwrap()
+                    .first()
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }
 
-    for frame in (0..STEPS).rev() {
-        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
-        resident.staged(&backward).unwrap();
+        let mut spent = Duration::ZERO;
+        for frame in (0..STEPS).rev() {
+            resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+            spent += resident.staged(&backward).unwrap();
+        }
+        fastest_back = fastest_back.min(spent / STEPS);
     }
+
     Ran {
         pushed,
         carried: resident.read(CARRIED as usize, grid.cells()).unwrap(),
         home: resident.read(STATE as usize, grid.cells()).unwrap(),
         awake,
+        ahead: fastest_ahead,
+        back: fastest_back,
     }
+}
+
+fn over_the_list(host: &Host, grid: Grid, start: &[u32], slope: &[u32], weight: &[u32]) -> Ran {
+    ran_over(host, grid, [start, slope, weight], true, 1)
+}
+
+fn over_them_all(host: &Host, grid: Grid, start: &[u32], slope: &[u32], weight: &[u32]) -> Ran {
+    ran_over(host, grid, [start, slope, weight], false, 1)
 }
 
 #[test]
@@ -692,52 +762,6 @@ fn the_weights_walk_back_over_the_list_the_engine_kept() {
     assert!(ran.awake < grid.quads());
     assert_eq!(ran.home, start);
     assert_eq!(ahead_side, back_side);
-}
-
-fn over_them_all(host: &Host, grid: Grid, start: &[u32], slope: &[u32], weight: &[u32]) -> Ran {
-    let width = host.width();
-    let quads = grid.quads();
-
-    let passes = [
-        built(width, grid, Pass::Tangent).unwrap(),
-        built(width, grid, Pass::Adjoint).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-
-    let mut sizes = [1_usize; HOLDING as usize];
-    sizes[STATE as usize] = grid.cells();
-    sizes[TANGENT as usize] = grid.cells();
-    sizes[CARRIED as usize] = grid.cells();
-    sizes[PARAMS as usize] = 8;
-    let mut resident = host.resident(&sizes, &modules).unwrap();
-
-    resident.write(STATE as usize, start).unwrap();
-    resident.write(TANGENT as usize, slope).unwrap();
-    resident.write(CARRIED as usize, weight).unwrap();
-
-    let over = Groups::Fixed(quads.div_ceil(width));
-    let none = Groups::Fixed(0);
-    let ahead_only = [over, none];
-    let back_only = [none, over];
-    let forward: Vec<&[Groups]> = vec![&ahead_only];
-    let backward: Vec<&[Groups]> = vec![&back_only];
-
-    for frame in 0..STEPS {
-        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
-        resident.staged(&forward).unwrap();
-    }
-    let pushed = resident.read(TANGENT as usize, grid.cells()).unwrap();
-
-    for frame in (0..STEPS).rev() {
-        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
-        resident.staged(&backward).unwrap();
-    }
-    Ran {
-        pushed,
-        carried: resident.read(CARRIED as usize, grid.cells()).unwrap(),
-        home: resident.read(STATE as usize, grid.cells()).unwrap(),
-        awake: quads,
-    }
 }
 
 #[test]
@@ -776,4 +800,34 @@ fn the_list_carries_the_weights_the_whole_grid_would_have() {
     assert_eq!(weights, 0);
     assert_eq!(listed.home, start);
     assert_eq!(whole.home, start);
+}
+
+#[test]
+fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
+    let Some(host) = device("the_list_starts_paying_when_the_grid_outgrows") else {
+        return;
+    };
+    let mut won = false;
+    for side in [512_u32, 1024, 2048, 4096] {
+        let grid = Grid::of(side, side);
+        let cells = patched(grid, 0x1234_5678, 12);
+        let held = [cells.as_slice(), cells.as_slice(), cells.as_slice()];
+
+        let whole = ran_over(&host, grid, held, false, ROUNDS);
+        let listed = ran_over(&host, grid, held, true, ROUNDS);
+        eprintln!(
+            "{} {} {:.3?} {:.3?} {:.3?} {:.3?}",
+            grid.quads(),
+            listed.awake,
+            whole.ahead,
+            whole.back,
+            listed.ahead,
+            listed.back
+        );
+        assert!(listed.awake < grid.quads() || side == 512);
+        if listed.ahead < whole.ahead && listed.back < whole.back {
+            won = true;
+        }
+    }
+    assert!(won);
 }
