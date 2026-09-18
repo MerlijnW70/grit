@@ -1,6 +1,7 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use grit::{Groups, Host};
+use grit::host::Error;
+use grit::{Groups, Host, Resident};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -9,7 +10,56 @@ const WORKGROUP: u32 = 64;
 const GOLDEN: u32 = 0x9E37_79B1;
 const STIR: u32 = 0x85EB_CA6B;
 
-const FRAMES: u32 = 240;
+const FRAMES: u32 = 48;
+
+const ROUNDS: u32 = 5;
+
+const VIEW: usize = 1 << 19;
+
+fn blind(held: &mut Resident<'_>, groups: &[Groups]) -> Result<Duration, Error> {
+    let mut spent = Duration::ZERO;
+    for _ in 0..FRAMES {
+        spent += held.frame(groups)?;
+    }
+    Ok(spent / FRAMES)
+}
+
+fn ahead(held: &mut Resident<'_>, stages: &[&[Groups]]) -> Result<Duration, Error> {
+    let began = Instant::now();
+    let mut flying = held.submit(stages)?;
+    for _ in 0..FRAMES {
+        let next = held.submit(stages)?;
+        held.wait(flying)?;
+        flying = next;
+    }
+    held.wait(flying)?;
+    Ok(began.elapsed() / (FRAMES + 1))
+}
+
+fn reading(held: &mut Resident<'_>, groups: &[Groups], count: usize) -> Result<Duration, Error> {
+    let mut spent = Duration::ZERO;
+    for _ in 0..FRAMES {
+        let (took, _) = held.frame_reading(groups, 2, count)?;
+        spent += took;
+    }
+    Ok(spent / FRAMES)
+}
+
+fn reading_ahead(
+    held: &mut Resident<'_>,
+    stages: &[&[Groups]],
+    count: usize,
+) -> Result<Duration, Error> {
+    let began = Instant::now();
+    let mut waiting = held.submit_reading(stages, 2, count)?;
+    for _ in 0..FRAMES {
+        let next = held.submit_reading(stages, 2, count)?;
+        let _ = held.wait_reading(waiting)?;
+        waiting = next;
+    }
+    let _ = held.wait_reading(waiting)?;
+    Ok(began.elapsed() / (FRAMES + 1))
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(host) = Host::open()? else {
@@ -29,26 +79,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let over = u32::try_from(cells.div_ceil(WORKGROUP as usize)).unwrap_or(u32::MAX);
         let groups = [Groups::Fixed(1), Groups::Fixed(over), Groups::Fixed(over)];
+        let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
+        let view = VIEW.min(cells);
 
         let _ = resident.frame_reading(&groups, 2, cells)?;
 
-        let mut looking = Duration::ZERO;
-        for _ in 0..FRAMES {
-            let (spent, _) = resident.frame_reading(&groups, 2, cells)?;
-            looking += spent;
+        let mut best = [Duration::MAX; 5];
+        let mut carded = Duration::MAX;
+        for _ in 0..ROUNDS {
+            let first = blind(&mut resident, &groups)?;
+            carded = carded.min(resident.on_device().unwrap_or(Duration::MAX));
+            let round = [
+                first,
+                ahead(&mut resident, &stages)?,
+                reading(&mut resident, &groups, view)?,
+                reading_ahead(&mut resident, &stages, view)?,
+                reading(&mut resident, &groups, cells)?,
+            ];
+            for (slot, spent) in best.iter_mut().zip(round) {
+                *slot = (*slot).min(spent);
+            }
         }
 
-        let mut blind = Duration::ZERO;
-        for _ in 0..FRAMES {
-            blind += resident.frame(&groups)?;
-        }
-
-        let looking = looking / FRAMES;
-        let blind = blind / FRAMES;
+        let [blind, ahead, shown, shown_ahead, whole] = best;
         println!(
-            "{cells:>12} {looking:>12.3?} {blind:>12.3?} {:>10.3?} {:>10.0}",
-            looking.saturating_sub(blind),
-            1.0 / looking.as_secs_f64()
+            "{cells:>12} {blind:>12.3?} {ahead:>12.3?} {carded:>12.3?} {shown:>12.3?} {shown_ahead:>12.3?} {whole:>12.3?} {:>8.0} {:>8.0}",
+            1.0 / shown.as_secs_f64(),
+            1.0 / shown_ahead.as_secs_f64()
         );
     }
 
