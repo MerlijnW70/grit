@@ -25,6 +25,7 @@ struct Held {
     page: u64,
     pages: Vec<(u64, vk::DeviceMemory, u64)>,
     visible: bool,
+    kind: vk::MemoryPropertyFlags,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,8 +217,7 @@ impl Host {
             let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
             let plain =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let mut staged = Vec::with_capacity(SLOTS + 1);
-            let mut cached = true;
+            let mut staged = Vec::new();
             for _ in 0..=SLOTS {
                 let held = match self.allocate(
                     largest,
@@ -225,13 +225,13 @@ impl Host {
                     plain | vk::MemoryPropertyFlags::HOST_CACHED,
                 ) {
                     Ok(held) => held,
-                    Err(_) => {
-                        cached = false;
-                        self.allocate(largest, usage, plain)?
-                    }
+                    Err(_) => self.allocate(largest, usage, plain)?,
                 };
                 staged.push(held);
             }
+            let cached = staged
+                .iter()
+                .all(|held| held.kind.contains(vk::MemoryPropertyFlags::HOST_CACHED));
             let staging = staged.pop().ok_or(Error::NoMemory { bytes: largest })?;
 
             let (layout, pool, set) = self.describe(&buffers)?;
@@ -329,6 +329,7 @@ impl Host {
             page: 0,
             pages: Vec::new(),
             visible: wanted.contains(vk::MemoryPropertyFlags::HOST_VISIBLE),
+            kind: wanted,
         })
     }
 
@@ -347,6 +348,7 @@ impl Host {
             page: requirements.alignment.max(1),
             pages: Vec::new(),
             visible: false,
+            kind: vk::MemoryPropertyFlags::empty(),
         })
     }
 

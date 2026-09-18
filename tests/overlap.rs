@@ -163,6 +163,26 @@ fn a_frame_submitted_while_another_flies_comes_back_on_its_own_ticket() {
     assert_eq!(seen, counted);
 }
 
+#[test]
+fn a_transfer_while_a_frame_flies_is_refused() {
+    let Some(host) = device("a_transfer_while_a_frame_flies_is_refused") else {
+        return;
+    };
+    let module = walk(host.width()).unwrap();
+    let every: Vec<&[u32]> = vec![&module; PASSES];
+    let mut held = host.resident(&[WORDS, 1], &every).unwrap();
+    let groups = vec![Groups::Fixed(over(host.width())); PASSES];
+    let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
+
+    let ticket = held.submit(&stages).unwrap();
+    assert!(matches!(held.read(1, 1), Err(Error::StillInFlight)));
+    assert!(matches!(held.write(1, &[0]), Err(Error::StillInFlight)));
+
+    held.wait(ticket).unwrap();
+    held.write(1, &[0]).unwrap();
+    assert_eq!(held.read(1, 1).unwrap(), vec![0]);
+}
+
 const FIRST: u32 = 0x0A11_0000;
 const SECOND: u32 = 0x0B22_0000;
 
