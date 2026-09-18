@@ -93,6 +93,31 @@ fn a_frame_can_be_taken_apart_stage_by_stage() {
 }
 
 #[test]
+fn a_frame_at_the_last_stage_that_profiles_is_timed_all_the_way_down() {
+    let Some(host) = device("a_frame_at_the_last_stage_that_profiles_is_timed_all_the_way_down")
+    else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).unwrap();
+    let many = grit::resident::STAGES;
+    let modules: Vec<&[u32]> = vec![&module; many];
+    let mut held = host.resident(&[4], &modules).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+
+    let each = vec![vec![Groups::Fixed(1)]; many];
+    let stages: Vec<&[Groups]> = each.iter().map(Vec::as_slice).collect();
+    held.staged(&stages).unwrap();
+
+    assert_eq!(held.read(0, 1).unwrap(), vec![many as u32]);
+    if held.on_device().is_none() {
+        assert!(held.stage_times().is_empty());
+        return;
+    }
+    assert_eq!(held.stage_times().len(), many);
+}
+
+#[test]
 fn a_frame_too_long_to_profile_is_not_half_profiled() {
     let Some(host) = device("a_frame_too_long_to_profile_is_not_half_profiled") else {
         return;
