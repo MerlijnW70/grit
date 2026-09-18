@@ -155,3 +155,34 @@ fn binding_the_same_window_twice_does_not_leak() {
     let back = held.read(0, OUT).unwrap();
     assert_eq!(back.first().copied(), Some(1));
 }
+
+#[test]
+fn unbinding_one_window_leaves_its_neighbour_where_it_was() {
+    let Some(host) = device("unbinding_one_window_leaves_its_neighbour_where_it_was") else {
+        return;
+    };
+    if !host.sparse() {
+        eprintln!("SKIPPED {}", host.name());
+        return;
+    }
+    let width = host.width();
+    let looking = peeking(width, WHERE_AT).unwrap();
+    let module = reaching(width, WHERE_AT).unwrap();
+    let mut held = host
+        .resident_vast(&[OUT, VAST], &[&looking, &module], 1)
+        .unwrap();
+
+    let page = held.page(1).unwrap();
+    held.bind(1, WHERE_AT, page).unwrap();
+    held.bind(1, WHERE_AT + page, page).unwrap();
+    assert_eq!(held.bound(1), page * 2);
+
+    held.unbind(1, WHERE_AT, page).unwrap();
+    assert_eq!(held.bound(1), page);
+
+    held.bind(1, WHERE_AT, page).unwrap();
+    assert_eq!(held.bound(1), page * 2);
+
+    held.unbind(1, WHERE_AT, page * 2).unwrap();
+    assert_eq!(held.bound(1), 0);
+}

@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::layout::BINDINGS;
-use grit::{Error, Host};
+use grit::{Error, Host, Run};
 
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
@@ -59,7 +59,28 @@ fn a_write_to_the_sparse_binding_is_bounded_by_the_staging_buffer() {
         }
         Err(why) => eprintln!("{why}"),
     }
-    assert!(matches!(out, Err(Error::Staged { .. })));
+    assert!(matches!(
+        out,
+        Err(Error::Staged { needed, staging }) if needed == over && staging == ORDINARY
+    ));
+
+    let out = held.write_at(1, 0, &vec![9_u32; over]);
+    assert!(matches!(
+        out,
+        Err(Error::Staged { needed, staging }) if needed == over && staging == ORDINARY
+    ));
+
+    let words = vec![9_u32; over];
+    let runs = [Run {
+        index: 1,
+        at: 0,
+        words: &words,
+    }];
+    let out = held.write_many(&runs);
+    assert!(matches!(
+        out,
+        Err(Error::Staged { needed, staging }) if needed == over && staging == ORDINARY
+    ));
 
     let after = held.read(0, ORDINARY).unwrap();
     let intact = after.iter().all(|word| *word == 7);
@@ -67,3 +88,77 @@ fn a_write_to_the_sparse_binding_is_bounded_by_the_staging_buffer() {
 
     assert!(intact);
 }
+
+#[test]
+fn a_write_that_ends_on_the_last_word_fits_and_one_past_it_does_not() {
+    let Some(host) = device("a_write_that_ends_on_the_last_word_fits") else {
+        return;
+    };
+    let tick = grit::live::tick(host.width()).unwrap();
+    let modules: Vec<&[u32]> = vec![&tick];
+    let mut sizes = [1_usize; BINDINGS as usize];
+    sizes[0] = 4;
+    let mut held = host.resident(&sizes, &modules).unwrap();
+
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+    held.write_at(0, 2, &[FIRST, SECOND]).unwrap();
+    assert_eq!(held.read(0, 4).unwrap(), vec![0, 0, FIRST, SECOND]);
+
+    assert!(matches!(
+        held.write_at(0, 3, &[FIRST, SECOND]),
+        Err(Error::Overrun {
+            index: 0,
+            needed: 5,
+            held: 4
+        })
+    ));
+    assert!(matches!(
+        held.read(0, 5),
+        Err(Error::Overrun {
+            index: 0,
+            needed: 5,
+            held: 4
+        })
+    ));
+    assert_eq!(held.read(0, 4).unwrap(), vec![0, 0, FIRST, SECOND]);
+}
+
+#[test]
+fn a_run_that_reaches_past_the_end_is_refused_by_where_it_starts() {
+    let Some(host) = device("a_run_that_reaches_past_the_end_is_refused") else {
+        return;
+    };
+    let tick = grit::live::tick(host.width()).unwrap();
+    let modules: Vec<&[u32]> = vec![&tick];
+    let mut sizes = [1_usize; BINDINGS as usize];
+    sizes[0] = 4;
+    let mut held = host.resident(&sizes, &modules).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+
+    let words = [FIRST, SECOND];
+    let over = [Run {
+        index: 0,
+        at: 3,
+        words: &words,
+    }];
+    assert!(matches!(
+        held.write_many(&over),
+        Err(Error::Overrun {
+            index: 0,
+            needed: 5,
+            held: 4
+        })
+    ));
+    assert_eq!(held.read(0, 4).unwrap(), vec![0, 0, 0, 0]);
+
+    let fitting = [Run {
+        index: 0,
+        at: 2,
+        words: &words,
+    }];
+    held.write_many(&fitting).unwrap();
+    assert_eq!(held.read(0, 4).unwrap(), vec![0, 0, FIRST, SECOND]);
+}
+
+const FIRST: u32 = 0x00C0_FFEE;
+const SECOND: u32 = 0x00BA_DA55;

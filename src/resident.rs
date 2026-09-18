@@ -869,8 +869,7 @@ impl Resident<'_> {
                 device.free_memory(memory, None);
             }
             if let Some(slot) = self.buffers.get_mut(index) {
-                slot.pages
-                    .retain(|&(off, _, size)| !(off >= from && off + size <= end));
+                slot.pages.retain(|held| !going.contains(held));
             }
         }
         Ok(())
