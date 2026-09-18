@@ -162,3 +162,65 @@ fn a_run_that_reaches_past_the_end_is_refused_by_where_it_starts() {
 
 const FIRST: u32 = 0x00C0_FFEE;
 const SECOND: u32 = 0x00BA_DA55;
+
+#[test]
+fn a_write_too_wide_for_its_binding_says_how_wide_the_binding_is() {
+    let Some(host) = device("a_write_too_wide_for_its_binding_says_how_wide") else {
+        return;
+    };
+    let tick = grit::live::tick(host.width()).unwrap();
+    let modules: Vec<&[u32]> = vec![&tick];
+    let mut sizes = [1_usize; BINDINGS as usize];
+    sizes[0] = 4;
+    let mut held = host.resident(&sizes, &modules).unwrap();
+
+    assert!(matches!(
+        held.write(0, &[1, 2, 3, 4, 5]),
+        Err(Error::Overrun {
+            index: 0,
+            needed: 5,
+            held: 4
+        })
+    ));
+    held.write(0, &[1, 2, 3, 4]).unwrap();
+    assert_eq!(held.read(0, 4).unwrap(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn a_write_at_filling_the_staging_buffer_to_the_word_is_taken() {
+    let Some(host) = device("a_write_at_filling_the_staging_buffer_to_the_word") else {
+        return;
+    };
+    if !host.sparse() {
+        eprintln!("SKIPPED {}", host.name());
+        return;
+    }
+
+    const ORDINARY: usize = 1024;
+    const VAST: usize = 256 * 1024 * 1024;
+
+    let mut sizes = [1_usize; BINDINGS as usize];
+    sizes[0] = ORDINARY;
+    sizes[1] = VAST;
+
+    let tick = grit::live::tick(host.width()).unwrap();
+    let modules: Vec<&[u32]> = vec![&tick];
+    let mut held = match host.resident_vast(&sizes, &modules, 1) {
+        Ok(held) => held,
+        Err(why) => {
+            eprintln!("SKIPPED {why}");
+            return;
+        }
+    };
+
+    let page = held.page(1).unwrap();
+    held.bind(1, 0, page).unwrap();
+    held.write_at(1, 0, &vec![3_u32; ORDINARY]).unwrap();
+    assert!(matches!(
+        held.write_at(1, 0, &vec![3_u32; ORDINARY + 1]),
+        Err(Error::Staged {
+            needed: _,
+            staging: ORDINARY
+        })
+    ));
+}

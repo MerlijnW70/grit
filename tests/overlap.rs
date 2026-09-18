@@ -243,3 +243,29 @@ fn two_answers_come_back_from_one_submission_in_the_order_they_were_asked_for() 
         Err(Error::NoSuchTicket { held: None, .. })
     ));
 }
+
+#[test]
+fn a_frame_that_asked_for_nothing_back_hands_back_nothing() {
+    let Some(host) = device("a_frame_that_asked_for_nothing_back_hands_back_nothing") else {
+        return;
+    };
+    let module = walk(host.width()).unwrap();
+    let every: Vec<&[u32]> = vec![&module; PASSES];
+    let mut held = host.resident(&[WORDS, 1], &every).unwrap();
+    let groups = vec![Groups::Fixed(over(host.width())); PASSES];
+    let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
+
+    let ticket = held.submit(&stages).unwrap();
+    let (spent, words) = held.wait_reading(ticket).unwrap();
+    assert!(words.is_empty());
+    assert!(spent > Duration::ZERO);
+
+    assert!(matches!(
+        held.submit_reading(&stages, 1, WORDS),
+        Err(Error::Overrun {
+            index: 1,
+            needed: WORDS,
+            held: 1
+        })
+    ));
+}

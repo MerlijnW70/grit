@@ -191,3 +191,32 @@ fn unbinding_one_window_leaves_its_neighbour_where_it_was() {
     held.unbind(1, WHERE_AT, page * 2).unwrap();
     assert_eq!(held.bound(1), 0);
 }
+
+#[test]
+fn a_window_ending_on_the_last_word_fits_and_a_window_of_nothing_binds_nothing() {
+    let Some(host) = device("a_window_ending_on_the_last_word_fits") else {
+        return;
+    };
+    if !host.sparse() {
+        eprintln!("SKIPPED {}", host.name());
+        return;
+    }
+    let width = host.width();
+    let looking = peeking(width, WHERE_AT).unwrap();
+    let module = reaching(width, WHERE_AT).unwrap();
+    let mut held = host
+        .resident_vast(&[OUT, VAST], &[&looking, &module], 1)
+        .unwrap();
+
+    let page = held.page(1).unwrap();
+    assert_eq!(held.bound(1), 0);
+
+    held.bind(1, 0, 0).unwrap();
+    assert_eq!(held.bound(1), 0);
+
+    let last = (VAST / page) * page - page;
+    held.bind(1, last, page).unwrap();
+    assert_eq!(held.bound(1), page);
+    held.unbind(1, last, page).unwrap();
+    assert_eq!(held.bound(1), 0);
+}

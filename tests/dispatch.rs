@@ -581,3 +581,22 @@ fn runs_that_fill_the_staging_buffer_to_the_word_are_taken() {
     assert_eq!(held.read(0, 4).unwrap(), vec![MARK, MARK, 0, 0]);
     assert_eq!(held.read(1, 4).unwrap(), vec![0, 0, 7, 9]);
 }
+
+#[test]
+fn the_time_a_repeated_frame_reports_is_the_time_of_one_of_them() {
+    let Some(host) = device("the_time_a_repeated_frame_reports_is_the_time_of_one") else {
+        return;
+    };
+    let width = host.width();
+    let module = bump(width).unwrap();
+    let mut held = host.resident(&[4], &[&module]).unwrap();
+    held.write(0, &[0, 0, 0, 0]).unwrap();
+
+    let groups = [Groups::Fixed(1)];
+    let once = held.frames(&groups, 1).unwrap();
+    let many = held.frames(&groups, 16).unwrap();
+    eprintln!("{once:?} {many:?}");
+
+    assert_eq!(held.read(0, 1).unwrap(), vec![17]);
+    assert!(many < once * 8);
+}
