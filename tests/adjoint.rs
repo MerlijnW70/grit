@@ -1,8 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::layout::{BINDINGS, PARAMS, STATE};
+use grit::compact::{Over, Plan, Tier};
+use grit::layout::{AWAKE, BASES, BINDINGS, COUNTS, DENSE, GRAND, HOT, PARAMS, STATE, TOTALS};
 use grit::sand::{self, Grid};
-use grit::{Groups, Host};
+use grit::{Groups, Host, compact, live, sweep};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 use simdr::module::Id;
@@ -12,8 +13,9 @@ const DEEP: u32 = 256;
 
 const STEPS: u32 = 64;
 
-const TANGENT: u32 = 2;
-const CARRIED: u32 = 3;
+const TANGENT: u32 = BINDINGS;
+const CARRIED: u32 = BINDINGS + 1;
+const HOLDING: u32 = BINDINGS + 2;
 
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
@@ -43,6 +45,21 @@ fn spread(grid: Grid, seed: u32, fill: u32) -> Vec<u32> {
             }
         })
         .collect()
+}
+
+fn patched(grid: Grid, seed: u32, span: u32) -> Vec<u32> {
+    let mut state = seed;
+    let mut cells = vec![0_u32; grid.cells()];
+    let middle = (grid.wide / 2, grid.deep / 2);
+    for row in middle.1..middle.1 + span {
+        for column in middle.0..middle.0 + span {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            cells[(row * grid.wide + column) as usize] = state >> 8;
+        }
+    }
+    cells
 }
 
 fn dot(one: &[u32], other: &[u32]) -> u32 {
@@ -224,7 +241,7 @@ fn building<const LANES: u32>(
     grid: Grid,
     pass: Pass,
 ) -> Result<Vec<u32>, LaneError> {
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, HOLDING))?;
     let uint = kernel.index_type();
     let group = kernel.workgroup_index();
     let lane = kernel.local_index();
@@ -323,7 +340,7 @@ fn the_slope_pushed_forward_and_the_weight_carried_back_agree() {
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
-    let mut sizes = [1_usize; BINDINGS as usize];
+    let mut sizes = [1_usize; HOLDING as usize];
     sizes[STATE as usize] = grid.cells();
     sizes[TANGENT as usize] = grid.cells();
     sizes[CARRIED as usize] = grid.cells();
@@ -367,4 +384,396 @@ fn the_slope_pushed_forward_and_the_weight_carried_back_agree() {
 
     assert_eq!(home, start);
     assert_eq!(ahead_side, back_side);
+}
+
+fn over_list(subgroup: u32, grid: Grid, pass: Pass) -> Result<Vec<u32>, LaneError> {
+    match subgroup {
+        4 => over_listing::<4>(subgroup, grid, pass),
+        8 => over_listing::<8>(subgroup, grid, pass),
+        16 => over_listing::<16>(subgroup, grid, pass),
+        32 => over_listing::<32>(subgroup, grid, pass),
+        64 => over_listing::<64>(subgroup, grid, pass),
+        other => Err(LaneError::NoMapping {
+            lanes: other,
+            width: subgroup,
+        }),
+    }
+}
+
+fn over_listing<const LANES: u32>(
+    subgroup: u32,
+    grid: Grid,
+    pass: Pass,
+) -> Result<Vec<u32>, LaneError> {
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, HOLDING))?;
+    let uint = kernel.index_type();
+    let group = kernel.workgroup_index();
+    let lane = kernel.local_index();
+    let width = kernel.module().constant_u32(subgroup)?;
+    let base = kernel.module().i_mul(uint, group, width)?;
+    let slot = kernel.module().i_add(uint, base, lane)?;
+
+    let head = kernel.module().constant_u32(0)?;
+    let second = kernel.module().constant_u32(1)?;
+    let frame = kernel.load_at(PARAMS, head)?;
+    let grand = kernel.load_at(GRAND, head)?;
+    let dump_base = kernel.load_at(PARAMS, second)?;
+
+    let inside = {
+        let mut lanes = kernel.lanes()?;
+        let here = lanes.splat_id::<U32, LANES>(slot)?;
+        let total = lanes.splat_id::<U32, LANES>(grand)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let listed = lanes.greater_than(total, here)?;
+        lanes.select(listed, one, none)?
+    };
+
+    let quad = kernel.load_at(DENSE, slot)?;
+    let places = corners::<LANES>(&mut kernel, grid, quad, frame)?;
+    let holding = if pass == Pass::Tangent {
+        TANGENT
+    } else {
+        CARRIED
+    };
+
+    let state = [
+        kernel.load_at(STATE, places[0].id())?,
+        kernel.load_at(STATE, places[1].id())?,
+        kernel.load_at(STATE, places[2].id())?,
+        kernel.load_at(STATE, places[3].id())?,
+    ];
+    let carried = [
+        kernel.load_at(holding, places[0].id())?,
+        kernel.load_at(holding, places[1].id())?,
+        kernel.load_at(holding, places[2].id())?,
+        kernel.load_at(holding, places[3].id())?,
+    ];
+
+    let (state_next, carried_next, stirring) = {
+        let mut lanes = kernel.lanes()?;
+        let held = [
+            lanes.splat_id::<U32, LANES>(state[0])?,
+            lanes.splat_id::<U32, LANES>(state[1])?,
+            lanes.splat_id::<U32, LANES>(state[2])?,
+            lanes.splat_id::<U32, LANES>(state[3])?,
+        ];
+        let along = [
+            lanes.splat_id::<U32, LANES>(carried[0])?,
+            lanes.splat_id::<U32, LANES>(carried[1])?,
+            lanes.splat_id::<U32, LANES>(carried[2])?,
+            lanes.splat_id::<U32, LANES>(carried[3])?,
+        ];
+        let (state_next, carried_next) = if pass == Pass::Tangent {
+            let moved = alongside::<LANES>(&mut lanes, held, along)?;
+            (ahead::<LANES>(&mut lanes, held)?, moved)
+        } else {
+            backward::<LANES>(&mut lanes, held, along)?
+        };
+
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let mut count = none;
+        for (before, after) in held
+            .into_iter()
+            .chain(along)
+            .zip(state_next.into_iter().chain(carried_next))
+        {
+            let same = lanes.equal(before, after)?;
+            let differs = lanes.select(same, none, one)?;
+            count = lanes.add(count, differs)?;
+        }
+        let moving = lanes.greater_than(count, none)?;
+        let stirring = lanes.select(moving, one, none)?;
+        (state_next, carried_next, stirring)
+    };
+
+    let spare = {
+        let mut lanes = kernel.lanes()?;
+        let past =
+            lanes.splat_bits::<U32, LANES>(u32::try_from(grid.cells()).unwrap_or(u32::MAX))?;
+        let mine = lanes.splat_id::<U32, LANES>(slot)?;
+        let two = lanes.splat_bits::<U32, LANES>(2)?;
+        let along = lanes.shift_left(mine, two)?;
+        lanes.add(past, along)?
+    };
+    for (corner, place) in places.iter().enumerate() {
+        let where_at = {
+            let mut lanes = kernel.lanes()?;
+            let none = lanes.splat_bits::<U32, LANES>(0)?;
+            let step = lanes.splat_bits::<U32, LANES>(u32::try_from(corner).unwrap_or(0))?;
+            let elsewhere = lanes.add(spare, step)?;
+            let held = lanes.greater_than(inside, none)?;
+            lanes.select(held, *place, elsewhere)?
+        };
+        if let (Some(state_value), Some(carried_value)) =
+            (state_next.get(corner), carried_next.get(corner))
+        {
+            kernel.store_at(STATE, where_at.id(), state_value.id())?;
+            kernel.store_at(holding, where_at.id(), carried_value.id())?;
+        }
+    }
+
+    let (along, down) = {
+        let mut lanes = kernel.lanes()?;
+        let which = lanes.splat_id::<U32, LANES>(quad)?;
+        let by = lanes.splat_bits::<U32, LANES>(grid.across().trailing_zeros())?;
+        let down = lanes.shift_right_logical(which, by)?;
+        let along = sand::low_bits::<LANES>(&mut lanes, which, grid.across().trailing_zeros())?;
+        (along, down)
+    };
+
+    for below in 0..3_u32 {
+        for across in 0..3_u32 {
+            let slot_at = {
+                let mut lanes = kernel.lanes()?;
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                let back = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
+                let step_x = lanes.splat_bits::<U32, LANES>(across)?;
+                let step_y = lanes.splat_bits::<U32, LANES>(below)?;
+                let near_x = lanes.add(along, step_x)?;
+                let near_x = lanes.add(near_x, back)?;
+                let near_y = lanes.add(down, step_y)?;
+                let near_y = lanes.add(near_y, back)?;
+                let x =
+                    sand::low_bits::<LANES>(&mut lanes, near_x, grid.across().trailing_zeros())?;
+                let y = sand::low_bits::<LANES>(&mut lanes, near_y, grid.down().trailing_zeros())?;
+                let by = lanes.splat_bits::<U32, LANES>(grid.across().trailing_zeros())?;
+                let stride = lanes.shift_left(y, by)?;
+                let flag = lanes.add(stride, x)?;
+
+                let base = lanes.splat_id::<U32, LANES>(dump_base)?;
+                let mine = lanes.splat_id::<U32, LANES>(group)?;
+                let seat = lanes.splat_id::<U32, LANES>(lane)?;
+                let wide = lanes.splat_bits::<U32, LANES>(subgroup)?;
+                let spread = lanes.mul(mine, wide)?;
+                let elsewhere = lanes.add(base, spread)?;
+                let elsewhere = lanes.add(elsewhere, seat)?;
+
+                let both = lanes.mul(stirring, inside)?;
+                let waking = lanes.greater_than(both, none)?;
+                lanes.select(waking, flag, elsewhere)?
+            };
+            let mark = kernel.module().constant_u32(2)?;
+            kernel.store_at(AWAKE, slot_at.id(), mark)?;
+
+            let coarse = {
+                let mut lanes = kernel.lanes()?;
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                let per_block = sweep::cells(subgroup);
+                let by = lanes.splat_bits::<U32, LANES>(per_block.trailing_zeros())?;
+                let blocks = grid.quads().div_ceil(per_block);
+                let cold =
+                    lanes.splat_bits::<U32, LANES>(blocks.div_ceil(per_block) * per_block)?;
+                let which = lanes.shift_right_logical(slot_at, by)?;
+                let both = lanes.mul(stirring, inside)?;
+                let waking = lanes.greater_than(both, none)?;
+                lanes.select(waking, which, cold)?
+            };
+            kernel.store_at(HOT, coarse.id(), mark)?;
+        }
+    }
+    kernel.finish()
+}
+
+struct Ran {
+    pushed: Vec<u32>,
+    carried: Vec<u32>,
+    home: Vec<u32>,
+    awake: u32,
+}
+
+fn over_the_list(host: &Host, grid: Grid, start: &[u32], slope: &[u32], weight: &[u32]) -> Ran {
+    let width = host.width();
+    let quads = grid.quads();
+    let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
+
+    let one = Groups::Fixed(1);
+    let blocks = Groups::Fixed(plan.blocks);
+    let tiles = Groups::Fixed(plan.tiles);
+    let none = Groups::Fixed(0);
+
+    let passes = [
+        live::decay(width, Over::Every).unwrap(),
+        live::wipe(width).unwrap(),
+        live::wipe_counts(width, COUNTS).unwrap(),
+        over_list(width, grid, Pass::Tangent).unwrap(),
+        over_list(width, grid, Pass::Adjoint).unwrap(),
+        live::mark(width, Tier::FINE, Over::Every).unwrap(),
+        compact::scan(width, COUNTS, BASES, TOTALS).unwrap(),
+        compact::scan(width, TOTALS, TOTALS, GRAND).unwrap(),
+        compact::gather(width, Tier::FINE, Over::Every, plan.dump()).unwrap(),
+        compact::prepare(width, width, Tier::FINE).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+
+    let held = plan.sizes();
+    let mut sizes = [1_usize; HOLDING as usize];
+    for (slot, words) in sizes.iter_mut().zip(held) {
+        *slot = words;
+    }
+    sizes[TANGENT as usize] = held[STATE as usize];
+    sizes[CARRIED as usize] = held[STATE as usize];
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+    for (binding, words) in sizes.iter().enumerate() {
+        resident.write(binding, &vec![0_u32; *words]).unwrap();
+    }
+    resident.write(STATE as usize, start).unwrap();
+    resident.write(TANGENT as usize, slope).unwrap();
+    resident.write(CARRIED as usize, weight).unwrap();
+    resident
+        .write(PARAMS as usize, &[u32::MAX, plan.dump()])
+        .unwrap();
+    live::seed(&mut resident, grid, &plan).unwrap();
+
+    let ahead: [Vec<Groups>; 6] = [
+        vec![blocks, one, tiles],
+        vec![Plan::listed(), none],
+        vec![blocks],
+        vec![tiles],
+        vec![one],
+        vec![blocks, Groups::Counting(1)],
+    ];
+    let back: [Vec<Groups>; 6] = [
+        vec![blocks, one, tiles],
+        vec![none, Plan::listed()],
+        vec![blocks],
+        vec![tiles],
+        vec![one],
+        vec![blocks, Groups::Counting(1)],
+    ];
+    let forward: Vec<&[Groups]> = ahead.iter().map(Vec::as_slice).collect();
+    let backward: Vec<&[Groups]> = back.iter().map(Vec::as_slice).collect();
+
+    for frame in 0..STEPS {
+        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+        resident.staged(&forward).unwrap();
+    }
+    let pushed = resident.read(TANGENT as usize, grid.cells()).unwrap();
+    let awake = resident
+        .read(GRAND as usize, 1)
+        .unwrap()
+        .first()
+        .copied()
+        .unwrap_or(0);
+
+    for frame in (0..STEPS).rev() {
+        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+        resident.staged(&backward).unwrap();
+    }
+    Ran {
+        pushed,
+        carried: resident.read(CARRIED as usize, grid.cells()).unwrap(),
+        home: resident.read(STATE as usize, grid.cells()).unwrap(),
+        awake,
+    }
+}
+
+#[test]
+fn the_weights_walk_back_over_the_list_the_engine_kept() {
+    let Some(host) = device("the_weights_walk_back_over_the_list_the_engine_kept") else {
+        return;
+    };
+    let grid = Grid::of(WIDE, DEEP);
+    let start = patched(grid, 0x1234_5678, 12);
+    let slope = patched(grid, 0x9ABC_DEF1, 12);
+    let weight = patched(grid, 0x0FED_CBA9, 12);
+
+    let ran = over_the_list(&host, grid, &start, &slope, &weight);
+    let ahead_side = dot(&ran.pushed, &weight);
+    let back_side = dot(&slope, &ran.carried);
+    eprintln!(
+        "{} {STEPS} {} {ahead_side} {back_side}",
+        grid.quads(),
+        ran.awake
+    );
+
+    assert_ne!(ran.pushed, slope);
+    assert!(ran.awake < grid.quads());
+    assert_eq!(ran.home, start);
+    assert_eq!(ahead_side, back_side);
+}
+
+fn over_them_all(host: &Host, grid: Grid, start: &[u32], slope: &[u32], weight: &[u32]) -> Ran {
+    let width = host.width();
+    let quads = grid.quads();
+
+    let passes = [
+        built(width, grid, Pass::Tangent).unwrap(),
+        built(width, grid, Pass::Adjoint).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+
+    let mut sizes = [1_usize; HOLDING as usize];
+    sizes[STATE as usize] = grid.cells();
+    sizes[TANGENT as usize] = grid.cells();
+    sizes[CARRIED as usize] = grid.cells();
+    sizes[PARAMS as usize] = 8;
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+
+    resident.write(STATE as usize, start).unwrap();
+    resident.write(TANGENT as usize, slope).unwrap();
+    resident.write(CARRIED as usize, weight).unwrap();
+
+    let over = Groups::Fixed(quads.div_ceil(width));
+    let none = Groups::Fixed(0);
+    let ahead_only = [over, none];
+    let back_only = [none, over];
+    let forward: Vec<&[Groups]> = vec![&ahead_only];
+    let backward: Vec<&[Groups]> = vec![&back_only];
+
+    for frame in 0..STEPS {
+        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+        resident.staged(&forward).unwrap();
+    }
+    let pushed = resident.read(TANGENT as usize, grid.cells()).unwrap();
+
+    for frame in (0..STEPS).rev() {
+        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+        resident.staged(&backward).unwrap();
+    }
+    Ran {
+        pushed,
+        carried: resident.read(CARRIED as usize, grid.cells()).unwrap(),
+        home: resident.read(STATE as usize, grid.cells()).unwrap(),
+        awake: quads,
+    }
+}
+
+#[test]
+fn the_list_carries_the_weights_the_whole_grid_would_have() {
+    let Some(host) = device("the_list_carries_the_weights_the_whole_grid_would_have") else {
+        return;
+    };
+    let grid = Grid::of(WIDE, DEEP);
+    let start = patched(grid, 0x1234_5678, 12);
+    let slope = patched(grid, 0x9ABC_DEF1, 12);
+    let weight = patched(grid, 0x0FED_CBA9, 12);
+
+    let listed = over_the_list(&host, grid, &start, &slope, &weight);
+    let whole = over_them_all(&host, grid, &start, &slope, &weight);
+
+    let slopes = listed
+        .pushed
+        .iter()
+        .zip(&whole.pushed)
+        .filter(|(one, other)| one != other)
+        .count();
+    let weights = listed
+        .carried
+        .iter()
+        .zip(&whole.carried)
+        .filter(|(one, other)| one != other)
+        .count();
+    eprintln!(
+        "{} {STEPS} {} {slopes} {weights}",
+        grid.quads(),
+        listed.awake
+    );
+
+    assert_ne!(whole.pushed, slope);
+    assert_eq!(slopes, 0);
+    assert_eq!(weights, 0);
+    assert_eq!(listed.home, start);
+    assert_eq!(whole.home, start);
 }
