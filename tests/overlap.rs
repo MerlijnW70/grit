@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use grit::resident::SLOTS;
 use grit::{Error, Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
@@ -105,8 +106,8 @@ fn a_read_back_started_early_is_read_after_the_fence_and_not_before() {
 }
 
 #[test]
-fn a_second_submission_while_one_is_in_flight_is_refused() {
-    let Some(host) = device("a_second_submission_while_one_is_in_flight_is_refused") else {
+fn a_submission_past_the_slots_in_flight_is_refused() {
+    let Some(host) = device("a_submission_past_the_slots_in_flight_is_refused") else {
         return;
     };
     let module = walk(host.width()).unwrap();
@@ -115,13 +116,51 @@ fn a_second_submission_while_one_is_in_flight_is_refused() {
     let groups = vec![Groups::Fixed(over(host.width())); PASSES];
     let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
 
-    let ticket = held.submit(&stages).unwrap();
+    let first = held.submit(&stages).unwrap();
+    assert_eq!(held.in_flight(), 1);
+    let second = held.submit(&stages).unwrap();
+    assert_eq!(held.in_flight(), SLOTS);
     assert!(matches!(held.submit(&stages), Err(Error::StillInFlight)));
     assert!(matches!(held.frame(&groups), Err(Error::StillInFlight)));
 
-    held.wait(ticket).unwrap();
-    assert!(matches!(held.wait(ticket), Err(Error::NoSuchTicket { .. })));
+    held.wait(first).unwrap();
+    assert_eq!(held.in_flight(), SLOTS - 1);
+    assert!(matches!(held.wait(first), Err(Error::NoSuchTicket { .. })));
+    held.wait(second).unwrap();
+    assert_eq!(held.in_flight(), 0);
     held.frame(&groups).unwrap();
+}
+
+#[test]
+fn a_frame_submitted_while_another_flies_comes_back_on_its_own_ticket() {
+    let Some(host) = device("a_frame_submitted_while_another_flies_comes_back_on_its_own_ticket")
+    else {
+        return;
+    };
+    let module = walk(host.width()).unwrap();
+    let every: Vec<&[u32]> = vec![&module; PASSES];
+    let mut held = host.resident(&[WORDS, 1], &every).unwrap();
+    let groups = vec![Groups::Fixed(over(host.width())); PASSES];
+    let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
+
+    held.write(0, &vec![1; WORDS]).unwrap();
+    held.write(1, &[0]).unwrap();
+
+    let mut waiting = held.submit_reading(&stages, 1, 1).unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let next = held.submit_reading(&stages, 1, 1).unwrap();
+        let (_, words) = held.wait_reading(waiting).unwrap();
+        seen.push(words.first().copied().unwrap_or(0));
+        waiting = next;
+    }
+    let (_, words) = held.wait_reading(waiting).unwrap();
+    seen.push(words.first().copied().unwrap_or(0));
+
+    let counted: Vec<u32> = (1..=seen.len() as u32)
+        .map(|frame| frame * (WORDS * PASSES) as u32)
+        .collect();
+    assert_eq!(seen, counted);
 }
 
 const FIRST: u32 = 0x0A11_0000;

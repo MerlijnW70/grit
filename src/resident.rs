@@ -54,6 +54,26 @@ impl Ticket {
 
 pub const STAGES: usize = 64;
 
+pub const SLOTS: usize = 2;
+
+struct Slot {
+    command: vk::CommandBuffer,
+    fence: vk::Fence,
+    staging: Held,
+    queries: Option<vk::QueryPool>,
+    held: Option<Recorded>,
+    flight: Option<Flight>,
+    stamped: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Facing {
+    command: vk::CommandBuffer,
+    fence: vk::Fence,
+    queries: Option<vk::QueryPool>,
+    staging: vk::Buffer,
+}
+
 pub struct Resident<'host> {
     host: &'host Host,
     direct: bool,
@@ -66,10 +86,9 @@ pub struct Resident<'host> {
     shaders: Vec<vk::ShaderModule>,
     pipelines: Vec<vk::Pipeline>,
     commands: vk::CommandPool,
-    command: vk::CommandBuffer,
     transfer: vk::CommandBuffer,
     fence: vk::Fence,
-    flight: Option<Flight>,
+    slots: Vec<Slot>,
     tickets: u64,
     cached: bool,
     recording: Duration,
@@ -80,11 +99,8 @@ pub struct Resident<'host> {
     pushes: u64,
     poked: u64,
     patience: Duration,
-    queries: Option<vk::QueryPool>,
     device: Option<Duration>,
     spans: Vec<Duration>,
-    stamped: usize,
-    held: Option<Recorded>,
     reused: u64,
 }
 
@@ -200,30 +216,57 @@ impl Host {
             let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
             let plain =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let (staging, cached) =
-                match self.allocate(largest, usage, plain | vk::MemoryPropertyFlags::HOST_CACHED) {
-                    Ok(held) => (held, true),
-                    Err(_) => (self.allocate(largest, usage, plain)?, false),
+            let mut staged = Vec::with_capacity(SLOTS + 1);
+            let mut cached = true;
+            for _ in 0..=SLOTS {
+                let held = match self.allocate(
+                    largest,
+                    usage,
+                    plain | vk::MemoryPropertyFlags::HOST_CACHED,
+                ) {
+                    Ok(held) => held,
+                    Err(_) => {
+                        cached = false;
+                        self.allocate(largest, usage, plain)?
+                    }
                 };
+                staged.push(held);
+            }
+            let staging = staged.pop().ok_or(Error::NoMemory { bytes: largest })?;
 
             let (layout, pool, set) = self.describe(&buffers)?;
             let (pipeline_layout, shaders, pipelines) = self.compile(layout, modules)?;
-            let (commands, command, transfer) = self.record_into()?;
+            let (commands, mut spare, transfer) = self.record_into()?;
             let fence = self
                 .device()
                 .create_fence(&vk::FenceCreateInfo::default(), None)?;
 
-            let queries = if self.ticking().1 {
-                let create = vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(u32::try_from(STAGES + 3).unwrap_or(3));
-                self.device().create_query_pool(&create, None).ok()
-            } else {
-                None
-            };
+            let mut slots = Vec::with_capacity(SLOTS);
+            for staging in staged {
+                let command = spare.pop().unwrap_or_default();
+                let fence = self
+                    .device()
+                    .create_fence(&vk::FenceCreateInfo::default(), None)?;
+                let queries = if self.ticking().1 {
+                    let create = vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(u32::try_from(STAGES + 3).unwrap_or(3));
+                    self.device().create_query_pool(&create, None).ok()
+                } else {
+                    None
+                };
+                slots.push(Slot {
+                    command,
+                    fence,
+                    staging,
+                    queries,
+                    held: None,
+                    flight: None,
+                    stamped: 0,
+                });
+            }
 
             Ok(Resident {
-                stamped: 0,
                 spans: Vec::new(),
                 recording: Duration::ZERO,
                 recorded: 0,
@@ -243,16 +286,13 @@ impl Host {
                 shaders,
                 pipelines,
                 commands,
-                command,
                 transfer,
                 fence,
-                flight: None,
+                slots,
                 tickets: 0,
                 cached,
                 patience: Resident::PATIENCE,
-                held: None,
                 reused: 0,
-                queries,
                 device: None,
             })
         }
@@ -418,7 +458,7 @@ impl Host {
 
     unsafe fn record_into(
         &self,
-    ) -> Result<(vk::CommandPool, vk::CommandBuffer, vk::CommandBuffer), Error> {
+    ) -> Result<(vk::CommandPool, Vec<vk::CommandBuffer>, vk::CommandBuffer), Error> {
         let create = vk::CommandPoolCreateInfo::default()
             .queue_family_index(self.family())
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -427,12 +467,11 @@ impl Host {
         let allocate = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(2);
-        let buffers = unsafe { self.device().allocate_command_buffers(&allocate) }?;
-        let command = buffers.first().copied().unwrap_or_default();
-        let transfer = buffers.get(1).copied().unwrap_or_default();
+            .command_buffer_count(u32::try_from(SLOTS + 1).unwrap_or(2));
+        let mut buffers = unsafe { self.device().allocate_command_buffers(&allocate) }?;
+        let transfer = buffers.pop().unwrap_or_default();
 
-        Ok((pool, command, transfer))
+        Ok((pool, buffers, transfer))
     }
 }
 
@@ -456,13 +495,9 @@ impl Resident<'_> {
         Ok(())
     }
 
-    fn await_fence(&self) -> Result<(), Error> {
+    fn await_fence(&self, fence: vk::Fence) -> Result<(), Error> {
         let patience = u64::try_from(self.patience.as_nanos()).unwrap_or(u64::MAX);
-        let waited = unsafe {
-            self.host
-                .device()
-                .wait_for_fences(&[self.fence], true, patience)
-        };
+        let waited = unsafe { self.host.device().wait_for_fences(&[fence], true, patience) };
         match waited {
             Ok(()) => Ok(()),
             Err(vk::Result::TIMEOUT) => {
@@ -862,7 +897,8 @@ impl Resident<'_> {
         }?;
         self.copying += began.elapsed();
         self.copies += 1;
-        unsafe { self.mapped(count) }
+        let memory = self.staging.memory;
+        unsafe { self.mapped_at(memory, 0, count) }
     }
 
     pub fn frame(&mut self, groups: &[Groups]) -> Result<Duration, Error> {
@@ -911,7 +947,7 @@ impl Resident<'_> {
     }
 
     pub fn wait(&mut self, ticket: Ticket) -> Result<Duration, Error> {
-        self.land(ticket).map(|(spent, _)| spent)
+        self.land(ticket).map(|(spent, _, _)| spent)
     }
 
     pub fn wait_reading(&mut self, ticket: Ticket) -> Result<(Duration, Vec<u32>), Error> {
@@ -942,11 +978,17 @@ impl Resident<'_> {
     }
 
     fn landed(&mut self, ticket: Ticket) -> Result<(Duration, Vec<Vec<u32>>), Error> {
-        let (spent, counts) = self.land(ticket)?;
+        let (spent, counts, slot) = self.land(ticket)?;
+        let Some(memory) = self.slots.get(slot).map(|slot| slot.staging.memory) else {
+            return Err(Error::NoSuchTicket {
+                ticket: ticket.get(),
+                held: None,
+            });
+        };
         let mut every = Vec::with_capacity(counts.len());
         let mut at = 0_usize;
         for count in counts {
-            every.push(unsafe { self.mapped_at(at, count) }?);
+            every.push(unsafe { self.mapped_at(memory, at, count) }?);
             at += count.max(1);
         }
         Ok((spent, every))
@@ -998,9 +1040,9 @@ impl Resident<'_> {
         times: u32,
     ) -> Result<Ticket, Error> {
         self.live()?;
-        if self.flight.is_some() {
+        let Some((at, facing)) = self.free() else {
             return Err(Error::StillInFlight);
-        }
+        };
         let mut copy = Vec::with_capacity(out.len());
         let mut wanted = 0_u64;
         for &(index, count) in out {
@@ -1018,39 +1060,89 @@ impl Resident<'_> {
         }
 
         let began = Instant::now();
-        self.run_times(stages, &copy, times)?;
+        self.run_times(at, facing, stages, &copy, times)?;
         self.tickets = self.tickets.wrapping_add(1);
-        self.flight = Some(Flight {
+        let flight = Flight {
             ticket: self.tickets,
             out: out.iter().map(|&(_, count)| count).collect(),
             began,
-        });
+        };
+        if let Some(slot) = self.slots.get_mut(at) {
+            slot.flight = Some(flight);
+        }
         Ok(Ticket(self.tickets))
     }
 
-    fn land(&mut self, ticket: Ticket) -> Result<(Duration, Vec<usize>), Error> {
+    fn free(&self) -> Option<(usize, Facing)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.flight.is_none())
+            .map(|(at, slot)| {
+                (
+                    at,
+                    Facing {
+                        command: slot.command,
+                        fence: slot.fence,
+                        queries: slot.queries,
+                        staging: slot.staging.handle,
+                    },
+                )
+            })
+    }
+
+    fn flying(&self, ticket: Ticket) -> Option<usize> {
+        self.slots.iter().position(|slot| {
+            slot.flight
+                .as_ref()
+                .is_some_and(|held| held.ticket == ticket.get())
+        })
+    }
+
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.flight.is_some())
+            .count()
+    }
+
+    fn land(&mut self, ticket: Ticket) -> Result<(Duration, Vec<usize>, usize), Error> {
         self.live()?;
-        let (began, out) = {
-            let Some(held) = self.flight.as_ref() else {
+        let Some(at) = self.flying(ticket) else {
+            let held = self
+                .slots
+                .iter()
+                .find_map(|slot| slot.flight.as_ref())
+                .map(|held| held.ticket);
+            return Err(Error::NoSuchTicket {
+                ticket: ticket.get(),
+                held,
+            });
+        };
+        let (began, out, fence) = {
+            let Some(slot) = self.slots.get(at) else {
                 return Err(Error::NoSuchTicket {
                     ticket: ticket.get(),
                     held: None,
                 });
             };
-            if held.ticket != ticket.get() {
+            let Some(held) = slot.flight.as_ref() else {
                 return Err(Error::NoSuchTicket {
                     ticket: ticket.get(),
-                    held: Some(held.ticket),
+                    held: None,
                 });
-            }
-            (held.began, held.out.clone())
+            };
+            (held.began, held.out.clone(), slot.fence)
         };
 
-        self.await_fence()?;
-        self.flight = None;
-        self.device = self.timed();
-        self.spans = self.split();
-        Ok((began.elapsed(), out))
+        self.await_fence(fence)?;
+        if let Some(slot) = self.slots.get_mut(at) {
+            slot.flight = None;
+        }
+        self.device = self.timed(at);
+        self.spans = self.split(at);
+        Ok((began.elapsed(), out, at))
     }
 
     pub fn frames(&mut self, groups: &[Groups], times: u32) -> Result<Duration, Error> {
@@ -1083,11 +1175,14 @@ impl Resident<'_> {
         &self.spans
     }
 
-    fn split(&self) -> Vec<Duration> {
-        let Some(pool) = self.queries else {
+    fn split(&self, at: usize) -> Vec<Duration> {
+        let Some(slot) = self.slots.get(at) else {
             return Vec::new();
         };
-        let stages = self.stamped;
+        let Some(pool) = slot.queries else {
+            return Vec::new();
+        };
+        let stages = slot.stamped;
         if stages == 0 || stages > STAGES {
             return Vec::new();
         }
@@ -1114,9 +1209,10 @@ impl Resident<'_> {
             .collect()
     }
 
-    fn timed(&self) -> Option<Duration> {
-        let pool = self.queries?;
-        let times = self.held.as_ref().map_or(1, |held| held.times).max(1);
+    fn timed(&self, at: usize) -> Option<Duration> {
+        let slot = self.slots.get(at)?;
+        let pool = slot.queries?;
+        let times = slot.held.as_ref().map_or(1, |held| held.times).max(1);
         let mut stamps = [0_u64; 2];
         unsafe {
             self.host
@@ -1133,6 +1229,8 @@ impl Resident<'_> {
 
     fn run_times(
         &mut self,
+        at: usize,
+        facing: Facing,
         stages: &[&[Groups]],
         out: &[(vk::Buffer, u64)],
         times: u32,
@@ -1150,7 +1248,7 @@ impl Resident<'_> {
         let began = std::time::Instant::now();
         let took;
 
-        let commands = [self.command];
+        let commands = [facing.command];
         let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
 
         let wanted = Recorded {
@@ -1158,27 +1256,29 @@ impl Resident<'_> {
             out: out.to_vec(),
             times,
         };
-        if self.held.as_ref() == Some(&wanted) {
+        if self.slots.get(at).and_then(|slot| slot.held.as_ref()) == Some(&wanted) {
             unsafe {
-                device.reset_fences(&[self.fence])?;
-                device.queue_submit(self.host.queue(), &submit, self.fence)?;
+                device.reset_fences(&[facing.fence])?;
+                device.queue_submit(self.host.queue(), &submit, facing.fence)?;
             }
             self.reused += 1;
             return Ok(());
         }
 
-        self.held = None;
+        if let Some(slot) = self.slots.get_mut(at) {
+            slot.held = None;
+        }
 
         unsafe {
-            device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())?;
+            device.reset_command_buffer(facing.command, vk::CommandBufferResetFlags::empty())?;
             let begin = vk::CommandBufferBeginInfo::default();
-            device.begin_command_buffer(self.command, &begin)?;
+            device.begin_command_buffer(facing.command, &begin)?;
 
-            if let Some(pool) = self.queries {
+            if let Some(pool) = facing.queries {
                 let held = u32::try_from(STAGES + 3).unwrap_or(3);
-                device.cmd_reset_query_pool(self.command, pool, 0, held);
+                device.cmd_reset_query_pool(facing.command, pool, 0, held);
                 device.cmd_write_timestamp(
-                    self.command,
+                    facing.command,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
                     pool,
                     0,
@@ -1186,7 +1286,7 @@ impl Resident<'_> {
             }
 
             device.cmd_bind_descriptor_sets(
-                self.command,
+                facing.command,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
                 0,
@@ -1209,11 +1309,13 @@ impl Resident<'_> {
                 }
             }
 
-            let profiling = self
+            let profiling = facing
                 .queries
                 .filter(|_| running.len() <= STAGES)
                 .map(|pool| (pool, times.saturating_sub(1)));
-            self.stamped = profiling.map_or(0, |_| running.len());
+            if let Some(slot) = self.slots.get_mut(at) {
+                slot.stamped = profiling.map_or(0, |_| running.len());
+            }
 
             for repeat in 0..times {
                 for (nth, stage) in running.iter().enumerate() {
@@ -1223,7 +1325,7 @@ impl Resident<'_> {
                         {
                             let at = u32::try_from(nth + 2).unwrap_or(2);
                             device.cmd_write_timestamp(
-                                self.command,
+                                facing.command,
                                 vk::PipelineStageFlags::TOP_OF_PIPE,
                                 pool,
                                 at,
@@ -1236,13 +1338,13 @@ impl Resident<'_> {
                             held: self.pipelines.len(),
                         })?;
                         device.cmd_bind_pipeline(
-                            self.command,
+                            facing.command,
                             vk::PipelineBindPoint::COMPUTE,
                             pipeline,
                         );
                         match count {
                             Groups::Fixed(count) | Groups::Counting(count) => {
-                                device.cmd_dispatch(self.command, count, 1, 1);
+                                device.cmd_dispatch(facing.command, count, 1, 1);
                             }
                             Groups::From { binding, at } => {
                                 let held =
@@ -1251,7 +1353,7 @@ impl Resident<'_> {
                                         held: self.buffers.len(),
                                     })?;
                                 let offset = (at * size_of::<u32>()) as u64;
-                                device.cmd_dispatch_indirect(self.command, held.handle, offset);
+                                device.cmd_dispatch_indirect(facing.command, held.handle, offset);
                             }
                         }
                     }
@@ -1283,7 +1385,7 @@ impl Resident<'_> {
                                     | reach,
                             )];
                         device.cmd_pipeline_barrier(
-                            self.command,
+                            facing.command,
                             vk::PipelineStageFlags::COMPUTE_SHADER,
                             vk::PipelineStageFlags::COMPUTE_SHADER | stage,
                             vk::DependencyFlags::empty(),
@@ -1298,7 +1400,7 @@ impl Resident<'_> {
             if let Some((pool, _)) = profiling {
                 let at = u32::try_from(running.len() + 2).unwrap_or(2);
                 device.cmd_write_timestamp(
-                    self.command,
+                    facing.command,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     pool,
                     at,
@@ -1311,7 +1413,7 @@ impl Resident<'_> {
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
                 device.cmd_pipeline_barrier(
-                    self.command,
+                    facing.command,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
@@ -1323,14 +1425,14 @@ impl Resident<'_> {
                 let region = [vk::BufferCopy::default()
                     .dst_offset(into)
                     .size(bytes.max(4))];
-                device.cmd_copy_buffer(self.command, handle, self.staging.handle, &region);
+                device.cmd_copy_buffer(facing.command, handle, facing.staging, &region);
                 into += bytes.max(4);
 
                 let barrier = [vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::HOST_READ)];
                 device.cmd_pipeline_barrier(
-                    self.command,
+                    facing.command,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::HOST,
                     vk::DependencyFlags::empty(),
@@ -1340,23 +1442,25 @@ impl Resident<'_> {
                 );
             }
 
-            if let Some(pool) = self.queries {
+            if let Some(pool) = facing.queries {
                 device.cmd_write_timestamp(
-                    self.command,
+                    facing.command,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     pool,
                     1,
                 );
             }
 
-            device.end_command_buffer(self.command)?;
+            device.end_command_buffer(facing.command)?;
             took = began.elapsed();
 
-            device.reset_fences(&[self.fence])?;
-            device.queue_submit(self.host.queue(), &submit, self.fence)?;
+            device.reset_fences(&[facing.fence])?;
+            device.queue_submit(self.host.queue(), &submit, facing.fence)?;
         }
 
-        self.held = Some(wanted);
+        if let Some(slot) = self.slots.get_mut(at) {
+            slot.held = Some(wanted);
+        }
         self.recording += took;
         self.recorded += 1;
 
@@ -1368,7 +1472,7 @@ impl Resident<'_> {
         F: FnOnce(&ash::Device, vk::CommandBuffer),
     {
         self.live()?;
-        if self.flight.is_some() {
+        if self.slots.iter().any(|slot| slot.flight.is_some()) {
             return Err(Error::StillInFlight);
         }
         let device = self.host.device();
@@ -1385,26 +1489,25 @@ impl Resident<'_> {
             device.reset_fences(&[self.fence])?;
             device.queue_submit(self.host.queue(), &submit, self.fence)?;
         }
-        self.await_fence()
+        self.await_fence(self.fence)
     }
 
-    unsafe fn mapped(&self, count: usize) -> Result<Vec<u32>, Error> {
-        unsafe { self.mapped_at(0, count) }
-    }
-
-    unsafe fn mapped_at(&self, at: usize, count: usize) -> Result<Vec<u32>, Error> {
+    unsafe fn mapped_at(
+        &self,
+        memory: vk::DeviceMemory,
+        at: usize,
+        count: usize,
+    ) -> Result<Vec<u32>, Error> {
         let from = (at * size_of::<u32>()) as u64;
         let bytes = ((count * size_of::<u32>()) as u64).max(4);
         unsafe {
-            let mapped = self.host.device().map_memory(
-                self.staging.memory,
-                from,
-                bytes,
-                vk::MemoryMapFlags::empty(),
-            )?;
+            let mapped =
+                self.host
+                    .device()
+                    .map_memory(memory, from, bytes, vk::MemoryMapFlags::empty())?;
             let mut out = vec![0_u32; count];
             std::ptr::copy_nonoverlapping(mapped.cast::<u32>(), out.as_mut_ptr(), count);
-            self.host.device().unmap_memory(self.staging.memory);
+            self.host.device().unmap_memory(memory);
             Ok(out)
         }
     }
@@ -1419,10 +1522,13 @@ impl Drop for Resident<'_> {
         unsafe {
             let _ = device.device_wait_idle();
             device.destroy_fence(self.fence, None);
-            device.destroy_command_pool(self.commands, None);
-            if let Some(pool) = self.queries {
-                device.destroy_query_pool(pool, None);
+            for slot in &self.slots {
+                device.destroy_fence(slot.fence, None);
+                if let Some(pool) = slot.queries {
+                    device.destroy_query_pool(pool, None);
+                }
             }
+            device.destroy_command_pool(self.commands, None);
             for &pipeline in &self.pipelines {
                 device.destroy_pipeline(pipeline, None);
             }
@@ -1432,7 +1538,13 @@ impl Drop for Resident<'_> {
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.pool, None);
             device.destroy_descriptor_set_layout(self.layout, None);
-            for held in self.buffers.iter().chain(std::iter::once(&self.staging)) {
+            let staged = self.slots.iter().map(|slot| &slot.staging);
+            for held in self
+                .buffers
+                .iter()
+                .chain(std::iter::once(&self.staging))
+                .chain(staged)
+            {
                 device.destroy_buffer(held.handle, None);
                 device.free_memory(held.memory, None);
                 for &(_, memory, _) in &held.pages {
