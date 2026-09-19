@@ -276,4 +276,67 @@ fn the_cheaper_arrangement_is_the_one_the_clock_named() {
         picked.coarse, picked.listed, picked.every, picked.on_device
     );
     assert_eq!(picked.coarse, picked.listed < picked.every);
+    assert_eq!(picked.on_device, held.on_device().is_some());
+}
+
+#[test]
+fn the_brush_wakes_the_ground_it_paints() {
+    let Some(host) = device("the_brush_wakes_the_ground_it_paints") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(256, 256);
+    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
+    let (passes, stages) = grit::live::arranged(width, grid, &plan, None, false).unwrap();
+    let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+
+    let sizes = plan.sizes();
+    let mut held = host.resident(&sizes, &modules).unwrap();
+    for (binding, words) in sizes.iter().enumerate() {
+        held.write(binding, &vec![0_u32; *words]).unwrap();
+    }
+    held.write(STATE as usize, &room(grid)).unwrap();
+    held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
+        .unwrap();
+    grit::live::seed(&mut held, grid, &plan).unwrap();
+
+    let quiet = [0_u32, 0, 0, AIR];
+    held.write_at(PARAMS as usize, BRUSH, &quiet).unwrap();
+    held.staged_frames(&groups, 64).unwrap();
+    let asleep = held
+        .read(GRAND as usize, 1)
+        .unwrap()
+        .first()
+        .copied()
+        .unwrap_or(0);
+    eprintln!("{asleep}");
+    assert_eq!(asleep, 0);
+
+    let (x, y) = (grid.wide / 2, grid.deep / 4);
+    held.write_at(PARAMS as usize, BRUSH, &[x, y, 49, SAND])
+        .unwrap();
+    held.staged(&groups).unwrap();
+    held.write_at(PARAMS as usize, BRUSH, &quiet).unwrap();
+    held.staged(&groups).unwrap();
+
+    let woken = held
+        .read(GRAND as usize, 1)
+        .unwrap()
+        .first()
+        .copied()
+        .unwrap_or(0);
+    eprintln!("{woken}");
+    assert!(woken > 0);
+
+    let before = held.read(STATE as usize, grid.cells()).unwrap();
+    held.staged_frames(&groups, 32).unwrap();
+    let after = held.read(STATE as usize, grid.cells()).unwrap();
+    let moved = before
+        .iter()
+        .zip(&after)
+        .filter(|(one, other)| one != other)
+        .count();
+    eprintln!("{moved}");
+    assert!(moved > 0);
 }
