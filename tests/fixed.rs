@@ -584,6 +584,101 @@ fn descended(board: &mut Board<'_>, grid: Grid, pace: u32, rounds: u32) -> (f64,
     (first, last, strength, reached)
 }
 
+fn leaning(slope: &[u32], guess: &[u32], truth: &[u32]) -> f64 {
+    let mut along = 0.0_f64;
+    let mut held = 0.0_f64;
+    let mut home = 0.0_f64;
+    for ((one, near), far) in slope.iter().zip(guess).zip(truth) {
+        let step = f64::from(*one as i32);
+        let away = f64::from(near.wrapping_sub(*far) as i32);
+        along += step * away;
+        held += step * step;
+        home += away * away;
+    }
+    if held == 0.0 || home == 0.0 {
+        return 0.0;
+    }
+    along / (held.sqrt() * home.sqrt())
+}
+
+fn blended(truth: &[u32], guess: &[u32], part: f64) -> Vec<u32> {
+    truth
+        .iter()
+        .zip(guess)
+        .map(|(far, near)| {
+            let away = f64::from(near.wrapping_sub(*far) as i32);
+            let moved = f64::from(*far as i32) + away * part;
+            moved as i32 as u32
+        })
+        .collect()
+}
+
+#[test]
+fn whether_the_slope_points_home() {
+    let Some(host) = device("whether_the_slope_points_home") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let sizes = [8, grid.cells(), grid.cells()];
+
+    for kind in [Kind::Turn, Kind::Bound] {
+        let passes = [
+            built(width, grid, Pass::Ahead, kind).unwrap(),
+            built(width, grid, Pass::Back, kind).unwrap(),
+        ];
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let named = if kind == Kind::Turn { "turn" } else { "bound" };
+        let resident = host.resident(&sizes, &modules).unwrap();
+        let mut board = Board {
+            resident,
+            over: Groups::Fixed(grid.quads().div_ceil(width)),
+            grid,
+            depth: 32,
+        };
+
+        let truth = spread(grid, 0x1234_5678);
+        let target = board.run(&truth);
+        let drift = spread(grid, 0x0BAD_C0DE);
+        let guess: Vec<u32> = truth
+            .iter()
+            .zip(&drift)
+            .map(|(one, other)| one.wrapping_add(other >> 2))
+            .collect();
+
+        let ended = board.run(&guess);
+        let weight: Vec<u32> = ended
+            .iter()
+            .zip(&target)
+            .map(|(one, other)| one.wrapping_sub(*other))
+            .collect();
+        let (slope, _) = board.carry(&guess, &weight);
+        let points = leaning(&slope, &guess, &truth);
+
+        let mut walk = Vec::new();
+        for part in [0.0_f64, 0.25, 0.5, 0.75, 1.0] {
+            let held = blended(&truth, &guess, part);
+            walk.push(apart(&board.run(&held), &target));
+        }
+        eprintln!(
+            "{named:>6} points home {points:+.4}   loss along the way {:?}",
+            walk.iter()
+                .map(|one| one.round() as i64)
+                .collect::<Vec<_>>()
+        );
+
+        let near = walk[1];
+        let far = walk[4];
+        let level = (far - near) / far.max(1.0);
+        assert!(points > 0.5, "{named} {points}");
+        if kind == Kind::Turn {
+            assert!(level > 0.5, "{named} {level}");
+        } else {
+            assert!(level < 0.1, "{named} {level}");
+        }
+    }
+}
+
 #[test]
 fn whether_the_bounded_rule_is_stalled_or_only_slow() {
     let Some(host) = device("whether_the_bounded_rule_is_stalled_or_only_slow") else {
