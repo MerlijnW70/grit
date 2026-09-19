@@ -360,3 +360,181 @@ fn the_window_where_the_angle_can_be_asked_for() {
     assert!(least > 0.0, "{least}");
     assert!(most > least * 100.0, "{least} {most}");
 }
+
+#[test]
+fn a_rule_can_be_rough_in_its_state_and_smooth_in_its_number() {
+    let Some(host) = device("a_rule_can_be_rough_in_its_state_and_smooth_in_its_number") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let truth = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 16,
+        angle: (truth, 0),
+        loud: 1,
+        planted: false,
+    };
+    let start = spread(grid, 0x1234_5678);
+
+    let aways = [-256_i64, -64, -16, -4, -1, 0, 1, 4, 16, 64, 256];
+    eprintln!(
+        "{:>7} {:>10} {}",
+        "steps",
+        "state",
+        aways
+            .iter()
+            .map(|one| format!("{one:>9}"))
+            .collect::<String>()
+    );
+
+    let mut told = Vec::new();
+    for depth in [16_u32, 64, 256] {
+        board.depth = depth;
+        board.tune(truth, 0);
+        let target = board.run(&start);
+        let reached = target
+            .iter()
+            .map(|one| f64::from(*one as i32).abs())
+            .sum::<f64>()
+            / target.len() as f64;
+
+        let mut walk = Vec::new();
+        let mut shown = String::new();
+        for away in aways {
+            board.tune((i64::from(truth) + away) as u32, 0);
+            let loss = apart(&board.run(&start), &target);
+            shown.push_str(&format!("{loss:>9.2}"));
+            walk.push(loss);
+        }
+        eprintln!("{depth:>7} {reached:>10.1} {shown}");
+        told.push((depth, reached, walk));
+    }
+    board.tune(truth, 0);
+
+    for (depth, _, walk) in &told {
+        let dents = (1..walk.len() - 1)
+            .filter(|at| walk[*at] > 0.0 && walk[*at] < walk[at - 1] && walk[*at] < walk[at + 1])
+            .count();
+        assert_eq!(dents, 0, "{depth}");
+    }
+    let bounded = told.iter().map(|(_, one, _)| *one).collect::<Vec<_>>();
+    let widest = bounded.iter().fold(0.0_f64, |a, b| a.max(*b));
+    let least = bounded.iter().fold(f64::MAX, |a, b| a.min(*b));
+    assert!(widest < least * 2.0, "{least} {widest}");
+}
+
+#[test]
+fn the_living_rule_does_not_obey_superposition_and_the_smooth_one_does() {
+    let Some(host) = device("the_living_rule_does_not_obey_superposition_and_the_smooth_one_does")
+    else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+
+    let one = spread(grid, 0x1234_5678);
+    let other = spread(grid, 0x0BAD_C0DE);
+    let both: Vec<u32> = one
+        .iter()
+        .zip(&other)
+        .map(|(a, b)| a.wrapping_add(*b))
+        .collect();
+    let nothing = vec![0_u32; grid.cells()];
+
+    eprintln!(
+        "{:>8} {:>16} {:>16} {:>9}",
+        "rule", "size of the run", "what is left", "share"
+    );
+    let mut told = Vec::new();
+    for (named, kind, knob) in [
+        ("smooth", Kind::Smooth, TURNING / 64),
+        ("living", Kind::Living, 256),
+    ] {
+        let passes = [
+            built(width, grid, Pass::Ahead, kind).unwrap(),
+            built(width, grid, Pass::Back, kind).unwrap(),
+        ];
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let resident = host.resident(&sizes, &modules).unwrap();
+        let mut board = Board {
+            resident,
+            over: Groups::Fixed(grid.quads().div_ceil(width)),
+            grid,
+            depth: 16,
+            angle: (knob, SWING / 64),
+            loud: 1,
+            planted: false,
+        };
+        board.tune(knob, SWING / 64);
+
+        for depth in [4_u32, 16, 64] {
+            board.depth = depth;
+            let ran_both = board.run(&both);
+            let ran_one = board.run(&one);
+            let ran_other = board.run(&other);
+            let ran_none = board.run(&nothing);
+
+            let mut left = 0.0_f64;
+            let mut size = 0.0_f64;
+            for (((all, a), b), none) in
+                ran_both.iter().zip(&ran_one).zip(&ran_other).zip(&ran_none)
+            {
+                let held = (*all as i32)
+                    .wrapping_sub(*a as i32)
+                    .wrapping_sub(*b as i32)
+                    .wrapping_add(*none as i32);
+                left += f64::from(held).abs();
+                size += f64::from(*all as i32).abs();
+            }
+            let share = left / size.max(1.0);
+            eprintln!(
+                "{named:>8} {depth:>7} {:>16.1} {:>16.1} {share:>8.4}",
+                size / ran_both.len() as f64,
+                left / ran_both.len() as f64
+            );
+            told.push((named, depth, share));
+        }
+    }
+
+    let held = |want: &str, wanted: u32| {
+        told.iter()
+            .find(|(named, depth, _)| *named == want && *depth == wanted)
+            .map_or(0.0, |(_, _, share)| *share)
+    };
+    for depth in [4_u32, 16, 64] {
+        let smooth = held("smooth", depth);
+        let living = held("living", depth);
+        eprintln!(
+            "{depth:>3} steps: living leaves {:.1} times what smooth does",
+            living / smooth.max(f64::MIN_POSITIVE)
+        );
+        assert!(living > smooth * 10.0, "{depth} {smooth} {living}");
+    }
+}

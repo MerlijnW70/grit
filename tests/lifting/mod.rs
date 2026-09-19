@@ -72,6 +72,21 @@ pub enum Kind {
     Turn,
     Bound,
     Smooth,
+    Living,
+}
+
+pub const KNOB: u32 = 12;
+
+fn leaning_on<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    knob: Vector<U32, LANES>,
+    on: Vector<U32, LANES>,
+) -> Result<Pair<LANES>, LaneError> {
+    let by = lanes.splat_bits::<U32, LANES>(KNOB)?;
+    let held = lanes.mul(knob, on)?;
+    let turning = lanes.shift_right_arithmetic(held, by)?;
+    let swing = lanes.add(turning, turning)?;
+    Ok((turning, swing))
 }
 
 pub type Pair<const LANES: u32> = (Vector<U32, LANES>, Vector<U32, LANES>);
@@ -229,6 +244,14 @@ pub fn onward<const LANES: u32>(
     if kind == Kind::Turn {
         return Ok([d, c, b, a]);
     }
+    if kind == Kind::Living {
+        let (knob, _) = angle;
+        let turned = leaning_on::<LANES>(lanes, knob, c)?;
+        let (first, second) = spun::<LANES>(lanes, (a, b), turned, false)?;
+        let turned = leaning_on::<LANES>(lanes, knob, first)?;
+        let (third, fourth) = spun::<LANES>(lanes, (c, d), turned, false)?;
+        return Ok([fourth, third, second, first]);
+    }
     if kind == Kind::Bound || kind == Kind::Smooth {
         let steady = kind == Kind::Smooth;
         let gate = if steady {
@@ -276,6 +299,21 @@ pub fn backward<const LANES: u32>(
     if kind == Kind::Turn {
         let none = lanes.splat_bits::<U32, LANES>(0)?;
         return Ok(([d, c, b, a], [gd, gc, gb, ga], (none, none)));
+    }
+    if kind == Kind::Living {
+        let (knob, _) = angle;
+        let (first, second, third, fourth) = (d, c, b, a);
+        let (gfirst, gsecond, gthird, gfourth) = (gd, gc, gb, ga);
+        let later = leaning_on::<LANES>(lanes, knob, first)?;
+        let (third, fourth) = spun::<LANES>(lanes, (third, fourth), later, true)?;
+        let early = leaning_on::<LANES>(lanes, knob, third)?;
+        let (first, second) = spun::<LANES>(lanes, (first, second), early, true)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        return Ok((
+            [first, second, third, fourth],
+            [gfirst, gsecond, gthird, gfourth],
+            (none, none),
+        ));
     }
     if kind == Kind::Bound || kind == Kind::Smooth {
         let steady = kind == Kind::Smooth;
