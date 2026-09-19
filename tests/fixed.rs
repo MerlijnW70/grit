@@ -31,6 +31,8 @@ const STEP: u32 = 1 << 9;
 
 const GRAIN: u32 = 2;
 
+const FLOOR: f64 = 1.0;
+
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -51,6 +53,7 @@ enum Kind {
     Sum,
     Turn,
     Bound,
+    Smooth,
 }
 
 type Pair<const LANES: u32> = (Vector<U32, LANES>, Vector<U32, LANES>);
@@ -174,11 +177,20 @@ fn onward<const LANES: u32>(
     if kind == Kind::Turn {
         return Ok([d, c, b, a]);
     }
-    if kind == Kind::Bound {
-        let gate = gated::<LANES>(lanes, c, d)?;
+    if kind == Kind::Bound || kind == Kind::Smooth {
+        let steady = kind == Kind::Smooth;
+        let gate = if steady {
+            lanes.splat_bits::<U32, LANES>(1)?
+        } else {
+            gated::<LANES>(lanes, c, d)?
+        };
         let turned = pinned::<LANES>(lanes, gate, angle)?;
         let (first, second) = spun::<LANES>(lanes, (a, b), turned, false)?;
-        let gate = gated::<LANES>(lanes, first, second)?;
+        let gate = if steady {
+            lanes.splat_bits::<U32, LANES>(1)?
+        } else {
+            gated::<LANES>(lanes, first, second)?
+        };
         let turned = pinned::<LANES>(lanes, gate, angle)?;
         let (third, fourth) = spun::<LANES>(lanes, (c, d), turned, false)?;
         return Ok([fourth, third, second, first]);
@@ -208,13 +220,22 @@ fn backward<const LANES: u32>(
     if kind == Kind::Turn {
         return Ok(([d, c, b, a], [gd, gc, gb, ga]));
     }
-    if kind == Kind::Bound {
+    if kind == Kind::Bound || kind == Kind::Smooth {
+        let steady = kind == Kind::Smooth;
         let (first, second, third, fourth) = (d, c, b, a);
         let (gfirst, gsecond, gthird, gfourth) = (gd, gc, gb, ga);
-        let gate = gated::<LANES>(lanes, first, second)?;
+        let gate = if steady {
+            lanes.splat_bits::<U32, LANES>(1)?
+        } else {
+            gated::<LANES>(lanes, first, second)?
+        };
         let later = pinned::<LANES>(lanes, gate, angle)?;
         let (third, fourth) = spun::<LANES>(lanes, (third, fourth), later, true)?;
-        let gate = gated::<LANES>(lanes, third, fourth)?;
+        let gate = if steady {
+            lanes.splat_bits::<U32, LANES>(1)?
+        } else {
+            gated::<LANES>(lanes, third, fourth)?
+        };
         let early = pinned::<LANES>(lanes, gate, angle)?;
         let (first, second) = spun::<LANES>(lanes, (first, second), early, true)?;
         let (gthird, gfourth) = slid::<LANES>(lanes, (gthird, gfourth), later)?;
@@ -805,6 +826,87 @@ fn whether_the_descent_works_where_the_loss_can_still_see() {
 }
 
 #[test]
+fn the_window_where_the_angle_can_be_asked_for() {
+    let Some(host) = device("the_window_where_the_angle_can_be_asked_for") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let base = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 1,
+        angle: (base, swing),
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    let stranger = spread(grid, 0x0BAD_C0DE);
+    let aways = [-64_i64, -16, -4, -1, 0, 1, 4, 16, 64];
+
+    eprintln!(
+        "{:>7} {:>10} {}",
+        "steps",
+        "saturated",
+        aways
+            .iter()
+            .map(|one| format!("{one:>9}"))
+            .collect::<String>()
+    );
+
+    let mut told = Vec::new();
+    for depth in [1_u32, 4, 16, 64, 256, 1024] {
+        board.depth = depth;
+        board.angle = (base, swing);
+        let target = board.run(&start);
+        let level = apart(&board.run(&stranger), &target);
+
+        let mut walk = Vec::new();
+        let mut shown = String::new();
+        for away in aways {
+            board.angle = ((i64::from(base) + away) as u32, swing);
+            let loss = apart(&board.run(&start), &target);
+            shown.push_str(&format!("{loss:>9.2}"));
+            walk.push(loss);
+        }
+        eprintln!("{depth:>7} {level:>10.0} {shown}");
+
+        let finest = aways
+            .iter()
+            .zip(&walk)
+            .filter(|(away, loss)| **away > 0 && **loss > FLOOR)
+            .map(|(away, _)| *away)
+            .min()
+            .unwrap_or(i64::MAX);
+        told.push((depth, level, finest));
+    }
+    board.angle = (base, swing);
+
+    for (depth, level, finest) in &told {
+        if *finest == i64::MAX {
+            eprintln!("{depth:>5} steps: nothing this side of 64 shows at all");
+        } else {
+            eprintln!("{depth:>5} steps, saturated {level:.0}: tells {finest} apart from 0");
+        }
+    }
+
+    let coarse = told.first().map_or(0, |(_, _, finest)| *finest);
+    let fine = told.last().map_or(0, |(_, _, finest)| *finest);
+    assert!(coarse > fine, "{coarse} {fine}");
+    assert_eq!(fine, 1);
+}
+
+#[test]
 fn how_far_back_the_loss_can_still_see() {
     let Some(host) = device("how_far_back_the_loss_can_still_see") else {
         return;
@@ -1095,6 +1197,7 @@ fn how_deep_the_descent_still_finds_its_way() {
             Kind::Sum => "sum",
             Kind::Turn => "turn",
             Kind::Bound => "bound",
+            Kind::Smooth => "smooth",
         };
         let mut deepest = 0_u32;
         for depth in [8_u32, 32, 128, 512] {
