@@ -14,6 +14,8 @@ const FRAMES: u32 = 48;
 
 const ROUNDS: u32 = 5;
 
+const WARMTH: Duration = Duration::from_millis(400);
+
 const VIEW: usize = 1 << 19;
 
 fn blind(held: &mut Resident<'_>, groups: &[Groups]) -> Result<Duration, Error> {
@@ -83,6 +85,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let view = VIEW.min(cells);
 
         let _ = resident.frame_reading(&groups, 2, cells)?;
+        let warming = Instant::now();
+        while warming.elapsed() < WARMTH {
+            resident.frames(&groups, FRAMES)?;
+        }
 
         let mut best = [Duration::MAX; 5];
         let mut carded = Duration::MAX;

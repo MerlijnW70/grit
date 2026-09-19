@@ -11,6 +11,10 @@ const BATCH: u32 = 20;
 
 const POURING: u32 = 200;
 
+const ROUNDS: u32 = 5;
+
+const WARMTH: Duration = Duration::from_millis(400);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(host) = Host::open()? else {
         return Ok(());
@@ -50,31 +54,54 @@ fn once(host: &Host, width: u32, grid: Grid) -> Result<Option<()>, Box<dyn std::
     for (binding, held) in sizes.iter().enumerate() {
         resident.write(binding, &vec![0_u32; *held])?;
     }
-    resident.write(STATE as usize, &room(grid))?;
-    resident.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
-    grit::live::seed(&mut resident, grid, &plan)?;
-
-    resident.staged(&groups)?;
-
-    let mut spent = Duration::ZERO;
-    let mut listed_total = 0_u64;
-    for frame in (0..FRAMES).step_by(BATCH as usize) {
-        let material = if frame < POURING { SAND } else { AIR };
-        let (x, y) = (grid.wide / 2, grid.deep / 8);
-        resident.write_at(PARAMS as usize, BRUSH, &[x, y, 49, material])?;
-        spent += resident.staged_frames(&groups, BATCH)?;
-
-        if frame % (BATCH * 2) == 0 {
-            let listed = resident
-                .read(GRAND as usize, 1)?
-                .first()
-                .copied()
-                .unwrap_or(0);
-            listed_total += u64::from(listed);
-        }
+    let warming = std::time::Instant::now();
+    while warming.elapsed() < WARMTH {
+        resident.staged_frames(&groups, BATCH)?;
     }
 
-    let card = resident.on_device();
+    let mut spent = Duration::MAX;
+    let mut card = None;
+    let mut listed_total = 0_u64;
+    for round in 0..ROUNDS {
+        resident.write(STATE as usize, &room(grid))?;
+        resident.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
+        grit::live::seed(&mut resident, grid, &plan)?;
+        resident.staged(&groups)?;
+
+        let mut walled = Duration::ZERO;
+        let mut counted = 0_u64;
+        for frame in (0..FRAMES).step_by(BATCH as usize) {
+            let material = if frame < POURING { SAND } else { AIR };
+            let (x, y) = (grid.wide / 2, grid.deep / 8);
+            resident.write_at(PARAMS as usize, BRUSH, &[x, y, 49, material])?;
+            walled += resident.staged_frames(&groups, BATCH)?;
+
+            if frame % (BATCH * 2) == 0 {
+                let listed = resident
+                    .read(GRAND as usize, 1)?
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
+                counted += u64::from(listed);
+            }
+        }
+
+        let held = resident.on_device();
+        let better = match (held, card) {
+            (Some(now), Some(best)) => now < best,
+            (Some(_), None) => true,
+            _ => walled < spent,
+        };
+        if better || round == 0 {
+            card = held.or(card);
+            listed_total = counted;
+        }
+        if let (Some(now), Some(best)) = (held, card) {
+            card = Some(now.min(best));
+        }
+        spent = spent.min(walled);
+    }
+    let card = card;
 
     let asked = u64::from(FRAMES.div_ceil(BATCH * 2));
     let listed = listed_total / asked.max(1);

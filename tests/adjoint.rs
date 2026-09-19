@@ -581,6 +581,13 @@ fn ran_over(host: &Host, grid: Grid, held: [&[u32]; 3], sparse: bool, rounds: u3
         vec![&whole_back]
     };
 
+    if rounds > 1 {
+        let warming = std::time::Instant::now();
+        while warming.elapsed() < Duration::from_millis(400) {
+            resident.staged(&forward).unwrap();
+        }
+    }
+
     let mut fastest_ahead = Duration::MAX;
     let mut fastest_back = Duration::MAX;
     let mut awake = quads;
@@ -771,6 +778,11 @@ fn what_a_listed_frame_spends_and_where() {
     live::seed(&mut resident, grid, &plan).unwrap();
 
     let forward: Vec<&[Groups]> = ahead.iter().map(Vec::as_slice).collect();
+    let warming = std::time::Instant::now();
+    while warming.elapsed() < Duration::from_millis(400) {
+        resident.staged(&forward).unwrap();
+    }
+
     let mut best = vec![Duration::MAX; NAMED.len()];
     let mut whole = Duration::MAX;
     for _ in 0..ROUNDS {
