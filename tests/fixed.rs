@@ -640,6 +640,117 @@ fn blended(truth: &[u32], guess: &[u32], part: f64) -> Vec<u32> {
         .collect()
 }
 
+fn making(grid: Grid) -> (Vec<u32>, Vec<u32>) {
+    let truth = spread(grid, 0x1234_5678);
+    let drift = spread(grid, 0x0BAD_C0DE);
+    let guess = truth
+        .iter()
+        .zip(&drift)
+        .map(|(one, other)| one.wrapping_add(other >> 2))
+        .collect();
+    (truth, guess)
+}
+
+fn stepping(board: &mut Board<'_>, target: &[u32], guess: &mut [u32], rounds: u32) {
+    for _ in 0..rounds {
+        let ended = board.run(guess);
+        let weight: Vec<u32> = ended
+            .iter()
+            .zip(target)
+            .map(|(one, other)| one.wrapping_sub(*other))
+            .collect();
+        let (slope, _) = board.carry(guess, &weight);
+        for (cell, step) in guess.iter_mut().zip(&slope) {
+            let moved = i64::from(*cell) - i64::from((*step as i32) >> PACE);
+            *cell = moved.clamp(0, i64::from(CEILING) - 1) as u32;
+        }
+    }
+}
+
+fn climbed(board: &mut Board<'_>, grid: Grid, rungs: &[u32], rounds: u32) -> (f64, f64) {
+    let (truth, mut guess) = making(grid);
+    let strayed = apart(&guess, &truth);
+    for depth in rungs {
+        board.depth = *depth;
+        let target = board.run(&truth);
+        stepping(board, &target, &mut guess, rounds);
+    }
+    (strayed, apart(&guess, &truth))
+}
+
+#[test]
+fn only_the_last_depth_counts_and_the_shallowest_wins() {
+    let Some(host) = device("only_the_last_depth_counts_and_the_shallowest_wins") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Bound).unwrap(),
+        built(width, grid, Pass::Back, Kind::Bound).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells()];
+    let rounds = 30_u32;
+
+    let ways: [(&str, Vec<u32>); 7] = [
+        ("one", vec![1, 1, 1, 1]),
+        ("four", vec![4, 4, 4, 4]),
+        ("sixteen", vec![16, 16, 16, 16]),
+        ("sixty four", vec![64, 64, 64, 64]),
+        ("deep", vec![128, 128, 128, 128]),
+        ("climbing", vec![16, 32, 64, 128]),
+        ("falling", vec![128, 64, 32, 16]),
+    ];
+
+    eprintln!(
+        "{:>9} {:>16} {:>14} {:>14} {:>9}",
+        "way", "steps", "strayed", "left", "closed"
+    );
+    let mut told = Vec::new();
+    for (named, rungs) in &ways {
+        let resident = host.resident(&sizes, &modules).unwrap();
+        let mut board = Board {
+            resident,
+            over: Groups::Fixed(grid.quads().div_ceil(width)),
+            grid,
+            depth: 16,
+            angle: (TURNING / 64, SWING / 64),
+        };
+        let (strayed, left) = climbed(&mut board, grid, rungs, rounds);
+        let closed = if left > 0.0 { strayed / left } else { f64::MAX };
+        let shown = rungs
+            .iter()
+            .map(|one| one.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("{named:>9} {shown:>16} {strayed:>14.1} {left:>14.1} {closed:>8.1}x");
+        told.push((*named, closed));
+    }
+
+    let named = |want: &str| {
+        told.iter()
+            .find(|(held, _)| *held == want)
+            .map_or(0.0, |(_, closed)| *closed)
+    };
+    let flat = [
+        named("one"),
+        named("four"),
+        named("sixteen"),
+        named("sixty four"),
+        named("deep"),
+    ];
+    eprintln!(
+        "one step closes {:.1}x and a hundred and twenty eight {:.1}x",
+        flat[0], flat[4]
+    );
+    for pair in flat.windows(2) {
+        assert!(pair[0] > pair[1], "{pair:?}");
+    }
+    assert!((named("falling") - named("sixteen")).abs() < 0.1);
+    assert!(named("climbing") < named("sixteen"));
+}
+
 #[test]
 fn whether_the_descent_works_where_the_loss_can_still_see() {
     let Some(host) = device("whether_the_descent_works_where_the_loss_can_still_see") else {
