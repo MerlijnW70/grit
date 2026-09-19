@@ -212,8 +212,23 @@ fn the_two_arrangements_a_choice_is_made_between_are_not_the_same_one() {
     let grid = sized(width, COARSE_FROM);
     let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
 
-    let (with_passes, _) = live::arranged(width, grid, &plan, None, true).unwrap();
-    let (without_passes, _) = live::arranged(width, grid, &plan, None, false).unwrap();
+    let (with_passes, with_stages) = live::arranged(width, grid, &plan, None, true).unwrap();
+    let (without_passes, without_stages) = live::arranged(width, grid, &plan, None, false).unwrap();
+
+    for stages in [&with_stages, &without_stages] {
+        assert!(stages.iter().all(|stage| !stage.is_empty()));
+        let counted: usize = stages.iter().map(Vec::len).sum();
+        assert_eq!(
+            counted,
+            if stages == &with_stages {
+                with_passes.len()
+            } else {
+                without_passes.len()
+            }
+        );
+    }
+    eprintln!("{} {}", with_stages.len(), without_stages.len());
+    assert!(with_stages.len() > without_stages.len());
     let both = live::both(width, grid, &plan, None).unwrap();
 
     eprintln!(
