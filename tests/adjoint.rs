@@ -357,6 +357,147 @@ fn the_slope_pushed_forward_and_the_weight_carried_back_agree() {
     assert_eq!(ahead_side, back_side);
 }
 
+#[test]
+fn the_slope_and_the_weight_agree_however_deep_the_walk() {
+    let Some(host) = device("the_slope_and_the_weight_agree_however_deep_the_walk") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let quads = grid.quads();
+
+    let passes = [
+        built(width, grid, Pass::Tangent).unwrap(),
+        built(width, grid, Pass::Adjoint).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+
+    let mut sizes = [1_usize; HOLDING as usize];
+    sizes[STATE as usize] = grid.cells();
+    sizes[TANGENT as usize] = grid.cells();
+    sizes[CARRIED as usize] = grid.cells();
+    sizes[PARAMS as usize] = 8;
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+
+    let start = spread(grid, 0x1234_5678, 7);
+    let slope = spread(grid, 0x9ABC_DEF1, 3);
+    let weight = spread(grid, 0x0FED_CBA9, 5);
+
+    let over = Groups::Fixed(quads.div_ceil(width));
+    let none = Groups::Fixed(0);
+    let ahead_only = [over, none];
+    let back_only = [none, over];
+    let forward: Vec<&[Groups]> = vec![&ahead_only];
+    let backward: Vec<&[Groups]> = vec![&back_only];
+
+    let held = (grid.cells() * size_of::<u32>() * 3) as f64 / (1 << 20) as f64;
+    eprintln!(
+        "{} cells, {held:.1} MiB held whatever the depth",
+        grid.cells()
+    );
+    eprintln!(
+        "{:>7} {:>14} {:>14} {:>12} {:>14}",
+        "steps", "pushed", "carried", "walk", "a tape would be"
+    );
+
+    for depth in [8_u32, 64, 256, 1024, 4096, 16384] {
+        resident.write(STATE as usize, &start).unwrap();
+        resident.write(TANGENT as usize, &slope).unwrap();
+        resident.write(CARRIED as usize, &weight).unwrap();
+
+        let began = std::time::Instant::now();
+        for frame in 0..depth {
+            resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+            resident.staged(&forward).unwrap();
+        }
+        let pushed = resident.read(TANGENT as usize, grid.cells()).unwrap();
+        for frame in (0..depth).rev() {
+            resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+            resident.staged(&backward).unwrap();
+        }
+        let walk = began.elapsed();
+        let carried = resident.read(CARRIED as usize, grid.cells()).unwrap();
+        let home = resident.read(STATE as usize, grid.cells()).unwrap();
+
+        let ahead_side = dot(&pushed, &weight);
+        let back_side = dot(&slope, &carried);
+        let tape = f64::from(depth) * (grid.cells() * size_of::<u32>()) as f64 / (1 << 30) as f64;
+        eprintln!(
+            "{depth:>7} {ahead_side:>14} {back_side:>14} {:>12.3?} {tape:>11.2} GiB",
+            walk
+        );
+
+        assert_eq!(home, start);
+        assert_eq!(ahead_side, back_side);
+    }
+}
+
+#[test]
+fn a_tape_that_would_not_fit_on_the_card_is_never_written() {
+    let Some(host) = device("a_tape_that_would_not_fit_on_the_card_is_never_written") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(2048, 2048);
+    let quads = grid.quads();
+    let depth = 4096_u32;
+
+    let passes = [
+        built(width, grid, Pass::Tangent).unwrap(),
+        built(width, grid, Pass::Adjoint).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+
+    let mut sizes = [1_usize; HOLDING as usize];
+    sizes[STATE as usize] = grid.cells();
+    sizes[TANGENT as usize] = grid.cells();
+    sizes[CARRIED as usize] = grid.cells();
+    sizes[PARAMS as usize] = 8;
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+
+    let start = spread(grid, 0x1234_5678, 7);
+    let slope = spread(grid, 0x9ABC_DEF1, 3);
+    let weight = spread(grid, 0x0FED_CBA9, 5);
+    resident.write(STATE as usize, &start).unwrap();
+    resident.write(TANGENT as usize, &slope).unwrap();
+    resident.write(CARRIED as usize, &weight).unwrap();
+
+    let over = Groups::Fixed(quads.div_ceil(width));
+    let none = Groups::Fixed(0);
+    let ahead_only = [over, none];
+    let back_only = [none, over];
+    let forward: Vec<&[Groups]> = vec![&ahead_only];
+    let backward: Vec<&[Groups]> = vec![&back_only];
+
+    let began = std::time::Instant::now();
+    for frame in 0..depth {
+        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+        resident.staged(&forward).unwrap();
+    }
+    let pushed = resident.read(TANGENT as usize, grid.cells()).unwrap();
+    for frame in (0..depth).rev() {
+        resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+        resident.staged(&backward).unwrap();
+    }
+    let walk = began.elapsed();
+    let carried = resident.read(CARRIED as usize, grid.cells()).unwrap();
+    let home = resident.read(STATE as usize, grid.cells()).unwrap();
+
+    let held = (grid.cells() * size_of::<u32>() * 3) as f64 / (1 << 20) as f64;
+    let tape = f64::from(depth) * (grid.cells() * size_of::<u32>()) as f64 / (1 << 30) as f64;
+    eprintln!(
+        "{} cells, {depth} steps, {held:.0} MiB held, a tape would be {tape:.0} GiB, walk {walk:.3?}",
+        grid.cells()
+    );
+
+    let ahead_side = dot(&pushed, &weight);
+    let back_side = dot(&slope, &carried);
+    eprintln!("{ahead_side} {back_side}");
+
+    assert_eq!(home, start);
+    assert_eq!(ahead_side, back_side);
+}
+
 fn over_list(subgroup: u32, grid: Grid, pass: Pass) -> Result<Vec<u32>, LaneError> {
     match subgroup {
         4 => over_listing::<4>(subgroup, grid, pass),
