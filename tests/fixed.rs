@@ -1183,6 +1183,103 @@ fn what_depth_buys_is_signal_and_signal_buys_room_for_noise() {
     assert!(deep >= shallow, "{shallow} {deep}");
 }
 
+fn narrowed(board: &mut Board<'_>, start: &[u32], target: &[u32], from: u32) -> (u32, u32) {
+    let mut runs = 0_u32;
+    let mut loss = |board: &mut Board<'_>, at: u32, runs: &mut u32| {
+        board.angle = (at, board.angle.1);
+        *runs += 1;
+        squared(&board.run(start), target)
+    };
+
+    let mut low = 1_i64;
+    let mut high = i64::from(from) * 2;
+    while high - low > 2 {
+        let third = (high - low) / 3;
+        let left = low + third;
+        let right = high - third;
+        let here = loss(board, left as u32, &mut runs);
+        let there = loss(board, right as u32, &mut runs);
+        if here < there {
+            high = right;
+        } else {
+            low = left;
+        }
+    }
+    let mut best = low;
+    let mut held = loss(board, low as u32, &mut runs);
+    for at in (low + 1)..=high {
+        let now = loss(board, at as u32, &mut runs);
+        if now < held {
+            held = now;
+            best = at;
+        }
+    }
+    (best as u32, runs)
+}
+
+#[test]
+fn what_the_same_answer_costs_without_any_gradient_at_all() {
+    let Some(host) = device("what_the_same_answer_costs_without_any_gradient_at_all") else {
+        return;
+    };
+    let width = host.width();
+    let truth = TURNING / 64;
+    let swing = SWING / 64;
+
+    eprintln!(
+        "{:>10} {:>7} {:>26} {:>26}",
+        "cells", "steps", "walking the slope", "no slope at all"
+    );
+
+    let mut told = Vec::new();
+    for (side, depth) in [(64_u32, 256_u32), (512, 1024)] {
+        let grid = Grid::of(side, side);
+        let passes = [
+            built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+            built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+        ];
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+        let resident = host.resident(&sizes, &modules).unwrap();
+        let mut board = Board {
+            resident,
+            over: Groups::Fixed(grid.quads().div_ceil(width)),
+            grid,
+            depth,
+            angle: (truth, swing),
+            loud: 1,
+        };
+
+        let start = spread(grid, 0x1234_5678);
+        board.angle = (truth, swing);
+        let target = board.run(&start);
+
+        let began = std::time::Instant::now();
+        let found = hunted(&mut board, &start, &target, truth + 16);
+        let slope_took = began.elapsed();
+
+        let began = std::time::Instant::now();
+        let (blind, runs) = narrowed(&mut board, &start, &target, truth + 16);
+        let blind_took = began.elapsed();
+
+        eprintln!(
+            "{:>10} {depth:>7}   {found:>5} in 30 passes {slope_took:>8.2?}   {blind:>5} in {runs:>2} passes {blind_took:>8.2?}",
+            grid.cells()
+        );
+        told.push((grid.cells(), found, blind, runs));
+    }
+
+    for (cells, found, blind, runs) in &told {
+        eprintln!(
+            "{cells} cells: the slope found {found}, {runs} plain runs found {blind}, the answer is {truth}"
+        );
+    }
+    for (_, found, blind, _) in &told {
+        assert_eq!(*found, truth);
+        assert_eq!(*blind, truth);
+    }
+}
+
 #[test]
 fn the_angle_is_found_where_the_tape_would_not_fit() {
     let Some(host) = device("the_angle_is_found_where_the_tape_would_not_fit") else {
