@@ -1312,6 +1312,155 @@ fn strayed_where(one: &[u32], other: &[u32], live: &[bool]) -> f64 {
     held / seen.max(1) as f64
 }
 
+fn asked_for(
+    board: &mut Board<'_>,
+    start: &[u32],
+    target: &[u32],
+    guess: &[u32],
+) -> (Vec<i32>, f64, f64) {
+    board.sow(guess);
+    let ended = board.run(start);
+    let loss = squared(&ended, target);
+    let weight: Vec<u32> = ended
+        .iter()
+        .zip(target)
+        .map(|(one, other)| one.wrapping_sub(*other))
+        .collect();
+    board.sow(guess);
+    board.carry(start, &weight);
+    let told = board.told_each();
+    let back = f64::from(1_u32 << SPARE) * f64::from(board.loud);
+    let strength = told
+        .iter()
+        .map(|one| (f64::from(*one) / back).abs())
+        .sum::<f64>()
+        / told.len() as f64;
+    (told, loss, strength)
+}
+
+#[test]
+fn whether_the_plateau_is_the_step_or_the_place() {
+    let Some(host) = device("whether_the_plateau_is_the_step_or_the_place") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let base = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 256,
+        angle: (base, swing),
+        loud: 1,
+        planted: false,
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    let scatter = spread(grid, 0x00C0_FFEE);
+    let truth: Vec<u32> = scatter.iter().map(|one| base + (one % 33) - 16).collect();
+    board.tune(base, swing);
+    board.sow(&truth);
+    let target = board.run(&start);
+
+    let rounds = 24_u32;
+    eprintln!(
+        "{:>12} {:>12} {:>12} {:>12} {:>12}",
+        "way", "loss first", "loss last", "slope first", "slope last"
+    );
+
+    let mut told_ways = Vec::new();
+    for way in ["one each", "halving", "by size", "searched"] {
+        let mut guess = vec![base; grid.cells()];
+        let mut first = 0.0;
+        let mut strong_first = 0.0;
+        for round in 0..rounds {
+            let (told, loss, strength) = asked_for(&mut board, &start, &target, &guess);
+            if round == 0 {
+                first = loss;
+                strong_first = strength;
+            }
+
+            let widest = told.iter().map(|one| one.abs()).max().unwrap_or(1).max(1);
+            if way == "searched" {
+                let mut best = guess.clone();
+                let mut held = loss;
+                for step in [8_i64, 4, 2, 1] {
+                    let tried: Vec<u32> = guess
+                        .iter()
+                        .zip(&told)
+                        .map(|(one, slope)| {
+                            let moved = i64::from(*one) - i64::from(slope.signum()) * step;
+                            moved.clamp(1, 4096) as u32
+                        })
+                        .collect();
+                    board.sow(&tried);
+                    let now = squared(&board.run(&start), &target);
+                    if now < held {
+                        held = now;
+                        best = tried;
+                    }
+                }
+                guess = best;
+                continue;
+            }
+            for (held, slope) in guess.iter_mut().zip(&told) {
+                let moved = match way {
+                    "one each" => i64::from(*held) - i64::from(slope.signum()),
+                    "halving" => {
+                        let step = 8_i64 >> (round / 6).min(3);
+                        i64::from(*held) - i64::from(slope.signum()) * step
+                    }
+                    _ => {
+                        let share = f64::from(*slope) / f64::from(widest);
+                        i64::from(*held) - (share * 4.0).round() as i64
+                    }
+                };
+                *held = moved.clamp(1, 4096) as u32;
+            }
+        }
+        let (_, last, strong_last) = asked_for(&mut board, &start, &target, &guess);
+        eprintln!(
+            "{way:>12} {first:>12.3e} {last:>12.3e} {strong_first:>12.2} {strong_last:>12.2}"
+        );
+        told_ways.push((way, first, last, strong_first, strong_last));
+    }
+
+    for (way, first, last, _, _) in &told_ways {
+        eprintln!("{way}: {:.2}x down", first / last.max(1.0));
+    }
+    let best = told_ways
+        .iter()
+        .map(|(_, first, last, _, _)| first / last.max(1.0))
+        .fold(0.0_f64, f64::max);
+    let standing = told_ways
+        .iter()
+        .find(|(way, _, _, _, _)| *way == "one each")
+        .map_or((0.0, 0.0), |(_, _, _, began, ended)| (*began, *ended));
+    eprintln!(
+        "the simplest step leaves the slope at {:.0}% of what it started",
+        standing.1 * 100.0 / standing.0.max(1.0)
+    );
+    assert!(best > 1.5, "{best}");
+    assert!(standing.1 > standing.0 / 3.0, "{standing:?}");
+}
+
 #[test]
 fn one_cells_share_of_the_slope_is_what_nudging_that_cell_measures() {
     let Some(host) = device("one_cells_share_of_the_slope_is_what_nudging_that_cell_measures")
