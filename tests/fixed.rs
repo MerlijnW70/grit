@@ -641,6 +641,73 @@ fn blended(truth: &[u32], guess: &[u32], part: f64) -> Vec<u32> {
 }
 
 #[test]
+fn how_far_back_the_loss_can_still_see() {
+    let Some(host) = device("how_far_back_the_loss_can_still_see") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Bound).unwrap(),
+        built(width, grid, Pass::Back, Kind::Bound).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 1,
+        angle: (TURNING, SWING),
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    let stranger = spread(grid, 0x0BAD_C0DE);
+
+    let depths = [1_u32, 4, 16, 64, 256, 1024];
+    eprintln!(
+        "{:>9} {:>10} {}",
+        "turning",
+        "saturated",
+        depths
+            .iter()
+            .map(|one| format!("{one:>9}"))
+            .collect::<String>()
+    );
+
+    let mut reaches = Vec::new();
+    for share in [64_u32, 8, 1] {
+        let base = TURNING / share;
+        let mut told = String::new();
+        let mut reach = 0_u32;
+        let mut level = 0.0_f64;
+        for depth in depths {
+            board.depth = depth;
+            board.angle = (base, SWING / share);
+            let target = board.run(&start);
+            level = apart(&board.run(&stranger), &target);
+            board.angle = (base + 8, SWING / share);
+            let loss = apart(&board.run(&start), &target);
+            told.push_str(&format!("{loss:>9.0}"));
+            if loss < level / 2.0 {
+                reach = depth;
+            }
+        }
+        eprintln!("{base:>9} {level:>10.0} {told}");
+        reaches.push((base, reach));
+    }
+
+    for (base, reach) in &reaches {
+        eprintln!("at turning {base} the loss still sees a nudge {reach} steps back");
+    }
+    let weakest = reaches.first().copied().unwrap_or_default();
+    let strongest = reaches.last().copied().unwrap_or_default();
+    assert!(weakest.1 > strongest.1, "{weakest:?} {strongest:?}");
+    assert!(weakest.1 >= 1024);
+}
+
+#[test]
 fn whether_the_loss_can_see_the_angle_it_was_made_with() {
     let Some(host) = device("whether_the_loss_can_see_the_angle_it_was_made_with") else {
         return;
