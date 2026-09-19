@@ -688,44 +688,6 @@ pub fn blended(truth: &[u32], guess: &[u32], part: f64) -> Vec<u32> {
         .collect()
 }
 
-pub fn making(grid: Grid) -> (Vec<u32>, Vec<u32>) {
-    let truth = spread(grid, 0x1234_5678);
-    let drift = spread(grid, 0x0BAD_C0DE);
-    let guess = truth
-        .iter()
-        .zip(&drift)
-        .map(|(one, other)| one.wrapping_add(other >> 2))
-        .collect();
-    (truth, guess)
-}
-
-pub fn stepping(board: &mut Board<'_>, target: &[u32], guess: &mut [u32], rounds: u32) {
-    for _ in 0..rounds {
-        let ended = board.run(guess);
-        let weight: Vec<u32> = ended
-            .iter()
-            .zip(target)
-            .map(|(one, other)| one.wrapping_sub(*other))
-            .collect();
-        let (slope, _) = board.carry(guess, &weight);
-        for (cell, step) in guess.iter_mut().zip(&slope) {
-            let moved = i64::from(*cell) - i64::from((*step as i32) >> PACE);
-            *cell = moved.clamp(0, i64::from(CEILING) - 1) as u32;
-        }
-    }
-}
-
-pub fn climbed(board: &mut Board<'_>, grid: Grid, rungs: &[u32], rounds: u32) -> (f64, f64) {
-    let (truth, mut guess) = making(grid);
-    let strayed = apart(&guess, &truth);
-    for depth in rungs {
-        board.depth = *depth;
-        let target = board.run(&truth);
-        stepping(board, &target, &mut guess, rounds);
-    }
-    (strayed, apart(&guess, &truth))
-}
-
 pub fn squared(one: &[u32], other: &[u32]) -> f64 {
     one.iter()
         .zip(other)
@@ -748,19 +710,6 @@ pub fn asking(board: &mut Board<'_>, start: &[u32], target: &[u32], angle: u32) 
         .collect();
     board.carry(start, &weight);
     board.told().0
-}
-
-pub fn muddied(target: &[u32], grid: Grid, seed: u32, loud: u32) -> Vec<u32> {
-    let noise = spread(grid, seed);
-    target
-        .iter()
-        .zip(&noise)
-        .map(|(one, other)| {
-            let span = 2 * loud + 1;
-            let off = (other % span) as i32 - loud as i32;
-            (*one as i32).wrapping_add(off) as u32
-        })
-        .collect()
 }
 
 pub fn hunted(board: &mut Board<'_>, start: &[u32], target: &[u32], from: u32) -> u32 {
@@ -844,32 +793,6 @@ pub fn strayed_where(one: &[u32], other: &[u32], live: &[bool]) -> f64 {
         }
     }
     held / seen.max(1) as f64
-}
-
-pub fn asked_for(
-    board: &mut Board<'_>,
-    start: &[u32],
-    target: &[u32],
-    guess: &[u32],
-) -> (Vec<i32>, f64, f64) {
-    board.sow(guess);
-    let ended = board.run(start);
-    let loss = squared(&ended, target);
-    let weight: Vec<u32> = ended
-        .iter()
-        .zip(target)
-        .map(|(one, other)| one.wrapping_sub(*other))
-        .collect();
-    board.sow(guess);
-    board.carry(start, &weight);
-    let told = board.told_each();
-    let back = f64::from(1_u32 << SPARE) * f64::from(board.loud);
-    let strength = told
-        .iter()
-        .map(|one| (f64::from(*one) / back).abs())
-        .sum::<f64>()
-        / told.len() as f64;
-    (told, loss, strength)
 }
 
 pub fn worst(one: &[u32], other: &[u32]) -> f64 {
