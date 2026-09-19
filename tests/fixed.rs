@@ -58,13 +58,14 @@ type Pair<const LANES: u32> = (Vector<U32, LANES>, Vector<U32, LANES>);
 fn pinned<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     gate: Vector<U32, LANES>,
+    angle: Pair<LANES>,
 ) -> Result<Pair<LANES>, LaneError> {
     let one = lanes.splat_bits::<U32, LANES>(1)?;
+    let none = lanes.splat_bits::<U32, LANES>(0)?;
     let on = lanes.equal(gate, one)?;
-    let turning = lanes.splat_bits::<U32, LANES>(TURNING)?;
-    let swing = lanes.splat_bits::<U32, LANES>(SWING)?;
-    let back_turning = lanes.splat_bits::<U32, LANES>(TURNING.wrapping_neg())?;
-    let back_swing = lanes.splat_bits::<U32, LANES>(SWING.wrapping_neg())?;
+    let (turning, swing) = angle;
+    let back_turning = lanes.sub(none, turning)?;
+    let back_swing = lanes.sub(none, swing)?;
     Ok((
         lanes.select(on, turning, back_turning)?,
         lanes.select(on, swing, back_swing)?,
@@ -167,6 +168,7 @@ fn onward<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     kind: Kind,
     held: [Vector<U32, LANES>; 4],
+    angle: Pair<LANES>,
 ) -> Result<[Vector<U32, LANES>; 4], LaneError> {
     let [mut a, mut b, mut c, mut d] = held;
     if kind == Kind::Turn {
@@ -174,11 +176,11 @@ fn onward<const LANES: u32>(
     }
     if kind == Kind::Bound {
         let gate = gated::<LANES>(lanes, c, d)?;
-        let angle = pinned::<LANES>(lanes, gate)?;
-        let (first, second) = spun::<LANES>(lanes, (a, b), angle, false)?;
+        let turned = pinned::<LANES>(lanes, gate, angle)?;
+        let (first, second) = spun::<LANES>(lanes, (a, b), turned, false)?;
         let gate = gated::<LANES>(lanes, first, second)?;
-        let angle = pinned::<LANES>(lanes, gate)?;
-        let (third, fourth) = spun::<LANES>(lanes, (c, d), angle, false)?;
+        let turned = pinned::<LANES>(lanes, gate, angle)?;
+        let (third, fourth) = spun::<LANES>(lanes, (c, d), turned, false)?;
         return Ok([fourth, third, second, first]);
     }
     let step = mixed::<LANES>(lanes, kind, b, c, d)?;
@@ -199,6 +201,7 @@ fn backward<const LANES: u32>(
     kind: Kind,
     held: [Vector<U32, LANES>; 4],
     weight: [Vector<U32, LANES>; 4],
+    angle: Pair<LANES>,
 ) -> Result<Both<LANES>, LaneError> {
     let [mut a, mut b, mut c, mut d] = held;
     let [mut ga, mut gb, mut gc, mut gd] = weight;
@@ -209,10 +212,10 @@ fn backward<const LANES: u32>(
         let (first, second, third, fourth) = (d, c, b, a);
         let (gfirst, gsecond, gthird, gfourth) = (gd, gc, gb, ga);
         let gate = gated::<LANES>(lanes, first, second)?;
-        let later = pinned::<LANES>(lanes, gate)?;
+        let later = pinned::<LANES>(lanes, gate, angle)?;
         let (third, fourth) = spun::<LANES>(lanes, (third, fourth), later, true)?;
         let gate = gated::<LANES>(lanes, third, fourth)?;
-        let early = pinned::<LANES>(lanes, gate)?;
+        let early = pinned::<LANES>(lanes, gate, angle)?;
         let (first, second) = spun::<LANES>(lanes, (first, second), early, true)?;
         let (gthird, gfourth) = slid::<LANES>(lanes, (gthird, gfourth), later)?;
         let (gfirst, gsecond) = slid::<LANES>(lanes, (gfirst, gsecond), early)?;
@@ -305,6 +308,10 @@ fn building<const LANES: u32>(
 
     let head = kernel.module().constant_u32(0)?;
     let frame = kernel.load_at(PARAMS, head)?;
+    let at_turning = kernel.module().constant_u32(4)?;
+    let at_swing = kernel.module().constant_u32(5)?;
+    let turning = kernel.load_at(PARAMS, at_turning)?;
+    let swing = kernel.load_at(PARAMS, at_swing)?;
     let places = corners::<LANES>(&mut kernel, grid, quad, frame)?.places;
 
     let state = [
@@ -332,7 +339,13 @@ fn building<const LANES: u32>(
             lanes.splat_id::<U32, LANES>(state[3])?,
         ];
         match carried {
-            None => (onward::<LANES>(&mut lanes, kind, held)?, None),
+            None => {
+                let angle = (
+                    lanes.splat_id::<U32, LANES>(turning)?,
+                    lanes.splat_id::<U32, LANES>(swing)?,
+                );
+                (onward::<LANES>(&mut lanes, kind, held, angle)?, None)
+            }
             Some(weight) => {
                 let weight = [
                     lanes.splat_id::<U32, LANES>(weight[0])?,
@@ -340,7 +353,12 @@ fn building<const LANES: u32>(
                     lanes.splat_id::<U32, LANES>(weight[2])?,
                     lanes.splat_id::<U32, LANES>(weight[3])?,
                 ];
-                let (state_back, weight_back) = backward::<LANES>(&mut lanes, kind, held, weight)?;
+                let angle = (
+                    lanes.splat_id::<U32, LANES>(turning)?,
+                    lanes.splat_id::<U32, LANES>(swing)?,
+                );
+                let (state_back, weight_back) =
+                    backward::<LANES>(&mut lanes, kind, held, weight, angle)?;
                 (state_back, Some(weight_back))
             }
         }
@@ -362,11 +380,15 @@ struct Board<'host> {
     over: Groups,
     grid: Grid,
     depth: u32,
+    angle: (u32, u32),
 }
 
 impl Board<'_> {
     fn run(&mut self, cells: &[u32]) -> Vec<u32> {
         self.resident.write(STATE as usize, cells).unwrap();
+        self.resident
+            .write_at(PARAMS as usize, 4, &[self.angle.0, self.angle.1])
+            .unwrap();
         let ahead = [self.over, Groups::Fixed(0)];
         let stages: Vec<&[Groups]> = vec![&ahead];
         for frame in 0..self.depth {
@@ -389,6 +411,9 @@ impl Board<'_> {
     fn carry(&mut self, cells: &[u32], weight: &[u32]) -> (Vec<u32>, Vec<u32>) {
         let ended = self.run(cells);
         self.resident.write(STATE as usize, &ended).unwrap();
+        self.resident
+            .write_at(PARAMS as usize, 4, &[self.angle.0, self.angle.1])
+            .unwrap();
         self.resident.write(SLOPE as usize, weight).unwrap();
 
         let back = [Groups::Fixed(0), self.over];
@@ -445,6 +470,7 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
         over: Groups::Fixed(grid.quads().div_ceil(width)),
         grid,
         depth: STEPS,
+        angle: (TURNING, SWING),
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -502,6 +528,7 @@ fn the_bounded_rules_slope_is_the_slope_a_nudge_measures() {
         over: Groups::Fixed(grid.quads().div_ceil(width)),
         grid,
         depth: STEPS,
+        angle: (TURNING, SWING),
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -614,6 +641,57 @@ fn blended(truth: &[u32], guess: &[u32], part: f64) -> Vec<u32> {
 }
 
 #[test]
+fn whether_the_loss_can_see_the_angle_it_was_made_with() {
+    let Some(host) = device("whether_the_loss_can_see_the_angle_it_was_made_with") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Bound).unwrap(),
+        built(width, grid, Pass::Back, Kind::Bound).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 32,
+        angle: (TURNING, SWING),
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    let target = board.run(&start);
+
+    eprintln!("{:>9} {:>9} {:>14}", "turning", "away", "loss");
+    let mut seen: Vec<(i64, f64)> = Vec::new();
+    for away in [
+        -4096_i64, -2048, -1024, -256, -64, -8, 0, 8, 64, 256, 1024, 2048, 4096,
+    ] {
+        let turning = (i64::from(TURNING) + away) as u32;
+        board.angle = (turning, SWING);
+        let loss = apart(&board.run(&start), &target);
+        eprintln!("{turning:>9} {away:>9} {loss:>14.1}");
+        seen.push((away, loss));
+    }
+    board.angle = (TURNING, SWING);
+
+    let bottom = seen
+        .iter()
+        .min_by(|one, other| one.1.total_cmp(&other.1))
+        .copied()
+        .unwrap();
+    let edge = seen.last().copied().unwrap();
+    eprintln!(
+        "lowest at {} away, {:.1}; furthest {:.1}",
+        bottom.0, bottom.1, edge.1
+    );
+    assert_eq!(bottom.0, 0);
+}
+
+#[test]
 fn whether_the_slope_points_home() {
     let Some(host) = device("whether_the_slope_points_home") else {
         return;
@@ -635,6 +713,7 @@ fn whether_the_slope_points_home() {
             over: Groups::Fixed(grid.quads().div_ceil(width)),
             grid,
             depth: 32,
+            angle: (TURNING, SWING),
         };
 
         let truth = spread(grid, 0x1234_5678);
@@ -705,6 +784,7 @@ fn whether_the_bounded_rule_is_stalled_or_only_slow() {
             over: Groups::Fixed(grid.quads().div_ceil(width)),
             grid,
             depth: 32,
+            angle: (TURNING, SWING),
         };
         let (first, last, _, _) = descended(&mut board, grid, PACE, rounds);
         let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -742,6 +822,7 @@ fn the_step_the_bounded_rule_wants_is_a_smaller_one() {
                 over: Groups::Fixed(grid.quads().div_ceil(width)),
                 grid,
                 depth,
+                angle: (TURNING, SWING),
             };
             let (first, last, _, _) = descended(&mut board, grid, pace, ROUNDS);
             let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -792,6 +873,7 @@ fn how_deep_the_descent_still_finds_its_way() {
                 over: Groups::Fixed(grid.quads().div_ceil(width)),
                 grid,
                 depth,
+                angle: (TURNING, SWING),
             };
             let (first, last, strength, reached) = descended(&mut board, grid, PACE, ROUNDS);
             let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -842,6 +924,7 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
         over: Groups::Fixed(grid.quads().div_ceil(width)),
         grid,
         depth: STEPS,
+        angle: (TURNING, SWING),
     };
 
     let truth = spread(grid, 0x1234_5678);
@@ -978,8 +1061,17 @@ fn over_listing<const LANES: u32>(
             lanes.splat_id::<U32, LANES>(carried[3])?,
         ];
         let (state_next, weight_next) = match pass {
-            Pass::Ahead => (onward::<LANES>(&mut lanes, Kind::Product, block)?, along),
-            Pass::Back => backward::<LANES>(&mut lanes, Kind::Product, block, along)?,
+            Pass::Ahead => {
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                (
+                    onward::<LANES>(&mut lanes, Kind::Product, block, (none, none))?,
+                    along,
+                )
+            }
+            Pass::Back => {
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                backward::<LANES>(&mut lanes, Kind::Product, block, along, (none, none))?
+            }
         };
 
         let one = lanes.splat_bits::<U32, LANES>(1)?;
