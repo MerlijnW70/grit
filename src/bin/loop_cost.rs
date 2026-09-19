@@ -109,9 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let [blind, ahead, shown, shown_ahead, whole] = best;
         println!(
-            "{cells:>12} {blind:>12.3?} {ahead:>12.3?} {carded:>12.3?} {shown:>12.3?} {shown_ahead:>12.3?} {whole:>12.3?} {:>8.0} {:>8.0}",
+            "{cells:>12} {blind:>12.3?} {ahead:>12.3?} {carded:>12.3?} {shown:>12.3?} {shown_ahead:>12.3?} {whole:>12.3?} {:>8.0} {:>8.0} {:>7.1}",
             1.0 / shown.as_secs_f64(),
-            1.0 / shown_ahead.as_secs_f64()
+            1.0 / shown_ahead.as_secs_f64(),
+            (cells * size_of::<u32>()) as f64 / whole.as_secs_f64() / 1e9
         );
     }
 
