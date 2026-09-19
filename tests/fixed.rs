@@ -641,6 +641,59 @@ fn blended(truth: &[u32], guess: &[u32], part: f64) -> Vec<u32> {
 }
 
 #[test]
+fn whether_the_descent_works_where_the_loss_can_still_see() {
+    let Some(host) = device("whether_the_descent_works_where_the_loss_can_still_see") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Bound).unwrap(),
+        built(width, grid, Pass::Back, Kind::Bound).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells()];
+
+    eprintln!(
+        "{:>9} {:>7} {:>14} {:>14} {:>9}",
+        "turning", "steps", "error first", "error last", "shrank"
+    );
+    let mut told = Vec::new();
+    for share in [1_u32, 8, 64] {
+        for depth in [32_u32, 256] {
+            let resident = host.resident(&sizes, &modules).unwrap();
+            let mut board = Board {
+                resident,
+                over: Groups::Fixed(grid.quads().div_ceil(width)),
+                grid,
+                depth,
+                angle: (TURNING / share, SWING / share),
+            };
+            let (first, last, _, _) = descended(&mut board, grid, PACE, ROUNDS);
+            let shrank = if last > 0.0 { first / last } else { f64::MAX };
+            eprintln!(
+                "{:>9} {depth:>7} {first:>14.1} {last:>14.1} {shrank:>8.1}x",
+                TURNING / share
+            );
+            told.push((TURNING / share, depth, shrank));
+        }
+    }
+
+    let weak = told
+        .iter()
+        .filter(|(turning, _, _)| *turning < 200)
+        .map(|(_, _, shrank)| *shrank)
+        .fold(0.0_f64, f64::max);
+    let strong = told
+        .iter()
+        .filter(|(turning, _, _)| *turning > 8000)
+        .map(|(_, _, shrank)| *shrank)
+        .fold(0.0_f64, f64::max);
+    eprintln!("weakest mixing reaches {weak:.1}x, strongest {strong:.1}x");
+    assert!(weak > strong, "{weak} {strong}");
+}
+
+#[test]
 fn how_far_back_the_loss_can_still_see() {
     let Some(host) = device("how_far_back_the_loss_can_still_see") else {
         return;
