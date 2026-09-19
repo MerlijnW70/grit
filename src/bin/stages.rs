@@ -37,37 +37,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let widest = WIDEST;
     for power in [9_u32, 12] {
         let grid = Grid::of(1 << power, 1 << power);
-        let (coarse, tiles, spans) = once(&host, width, grid)?;
-        let names = named(coarse, tiles);
-        let arrangement = if coarse { "two tiers" } else { "one tier" };
-        println!();
-        println!("{} cells, {arrangement}", grid.cells());
-        if spans.len() != names.len() {
-            println!("  {} stages timed, {} named", spans.len(), names.len());
-            continue;
+        for coarse in [false, true] {
+            let (tiles, spans) = once(&host, width, grid, coarse)?;
+            let names = named(coarse, tiles);
+            let arrangement = if coarse { "two tiers" } else { "one tier" };
+            let chosen = if coarse == grit::live::coarse_pays(blocks(width, grid)?) {
+                " (the one the clock names)"
+            } else {
+                ""
+            };
+            println!();
+            println!("{} cells, {arrangement}{chosen}", grid.cells());
+            if spans.len() != names.len() {
+                println!("  {} stages timed, {} named", spans.len(), names.len());
+                continue;
+            }
+            for (name, span) in names.iter().zip(&spans) {
+                println!("  {name:widest$} {span:>12.3?}");
+            }
+            println!(
+                "  {:widest$} {:>12.3?}",
+                "whole frame",
+                spans.iter().sum::<Duration>()
+            );
         }
-        for (name, span) in names.iter().zip(&spans) {
-            println!("  {name:widest$} {span:>12.3?}");
-        }
-        println!(
-            "  {:widest$} {:>12.3?}",
-            "whole frame",
-            spans.iter().sum::<Duration>()
-        );
     }
 
     Ok(())
+}
+
+fn blocks(width: u32, grid: Grid) -> Result<u32, Box<dyn std::error::Error>> {
+    let quads = grid.quads();
+    Ok(Plan::over(width, quads.div_ceil(sweep::cells(width)))?.blocks)
 }
 
 fn once(
     host: &Host,
     width: u32,
     grid: Grid,
-) -> Result<(bool, u32, Vec<Duration>), Box<dyn std::error::Error>> {
+    coarse: bool,
+) -> Result<(u32, Vec<Duration>), Box<dyn std::error::Error>> {
     let quads = grid.quads();
     let plan = Plan::over(width, quads.div_ceil(sweep::cells(width)))?;
 
-    let (passes, stages) = grit::live::wired(width, grid, &plan, None)?;
+    let (passes, stages) = grit::live::arranged(width, grid, &plan, None, coarse)?;
     let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
@@ -108,7 +121,7 @@ fn once(
         }
     }
 
-    Ok((grit::live::coarse_pays(plan.blocks), plan.tiles, best))
+    Ok((plan.tiles, best))
 }
 
 fn room(grid: Grid) -> Vec<u32> {
