@@ -16,7 +16,8 @@ const STEPS: u32 = 8;
 const SLOPE: u32 = 2;
 const TOLD_TURNING: u32 = 3;
 const TOLD_SWING: u32 = 4;
-const BINDINGS: u32 = 5;
+const FIELD: u32 = 5;
+const BINDINGS: u32 = 6;
 
 const POINT: u32 = 16;
 
@@ -376,11 +377,10 @@ fn building<const LANES: u32>(
 
     let head = kernel.module().constant_u32(0)?;
     let frame = kernel.load_at(PARAMS, head)?;
-    let at_turning = kernel.module().constant_u32(4)?;
     let at_swing = kernel.module().constant_u32(5)?;
-    let turning = kernel.load_at(PARAMS, at_turning)?;
     let swing = kernel.load_at(PARAMS, at_swing)?;
     let places = corners::<LANES>(&mut kernel, grid, quad, frame)?.places;
+    let turning = kernel.load_at(FIELD, places[0].id())?;
 
     let state = [
         kernel.load_at(STATE, places[0].id())?,
@@ -460,10 +460,28 @@ struct Board<'host> {
     depth: u32,
     angle: (u32, u32),
     loud: u32,
+    planted: bool,
 }
 
 impl Board<'_> {
+    fn tune(&mut self, turning: u32, swing: u32) {
+        self.angle = (turning, swing);
+        let field = vec![turning; self.grid.cells()];
+        self.resident.write(FIELD as usize, &field).unwrap();
+        self.planted = true;
+    }
+
+    fn sow(&mut self, field: &[u32]) {
+        self.resident.write(FIELD as usize, field).unwrap();
+        self.planted = true;
+    }
+
     fn run(&mut self, cells: &[u32]) -> Vec<u32> {
+        if !self.planted {
+            let field = vec![self.angle.0; self.grid.cells()];
+            self.resident.write(FIELD as usize, &field).unwrap();
+            self.planted = true;
+        }
         self.resident.write(STATE as usize, cells).unwrap();
         self.resident
             .write_at(PARAMS as usize, 4, &[self.angle.0, self.angle.1])
@@ -491,6 +509,15 @@ impl Board<'_> {
         let blank = vec![0_u32; self.grid.cells()];
         self.resident.write(TOLD_TURNING as usize, &blank).unwrap();
         self.resident.write(TOLD_SWING as usize, &blank).unwrap();
+    }
+
+    fn told_each(&mut self) -> Vec<i32> {
+        self.resident
+            .read(TOLD_TURNING as usize, self.grid.cells())
+            .unwrap()
+            .iter()
+            .map(|one| *one as i32)
+            .collect()
     }
 
     fn told(&mut self) -> (f64, f64) {
@@ -578,7 +605,14 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -587,6 +621,7 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
         depth: STEPS,
         angle: (TURNING, SWING),
         loud: 1,
+        planted: false,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -637,7 +672,14 @@ fn the_bounded_rules_slope_is_the_slope_a_nudge_measures() {
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -646,6 +688,7 @@ fn the_bounded_rules_slope_is_the_slope_a_nudge_measures() {
         depth: STEPS,
         angle: (TURNING, SWING),
         loud: 1,
+        planted: false,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -807,7 +850,14 @@ fn only_the_last_depth_counts_and_the_shallowest_wins() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let rounds = 30_u32;
 
     let ways: [(&str, Vec<u32>); 7] = [
@@ -834,6 +884,7 @@ fn only_the_last_depth_counts_and_the_shallowest_wins() {
             depth: 16,
             angle: (TURNING / 64, SWING / 64),
             loud: 1,
+            planted: false,
         };
         let (strayed, left) = climbed(&mut board, grid, rungs, rounds);
         let closed = if left > 0.0 { strayed / left } else { f64::MAX };
@@ -881,7 +932,14 @@ fn whether_the_descent_works_where_the_loss_can_still_see() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
 
     eprintln!(
         "{:>9} {:>7} {:>14} {:>14} {:>9}",
@@ -898,6 +956,7 @@ fn whether_the_descent_works_where_the_loss_can_still_see() {
                 depth,
                 angle: (TURNING / share, SWING / share),
                 loud: 1,
+                planted: false,
             };
             let (first, last, _, _) = descended(&mut board, grid, PACE, ROUNDS);
             let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -936,7 +995,7 @@ fn squared(one: &[u32], other: &[u32]) -> f64 {
 
 fn asking(board: &mut Board<'_>, start: &[u32], target: &[u32], angle: u32) -> f64 {
     let swing = board.angle.1;
-    board.angle = (angle, swing);
+    board.tune(angle, swing);
     let ended = board.run(start);
     let weight: Vec<u32> = ended
         .iter()
@@ -959,7 +1018,14 @@ fn whether_the_weight_stays_the_size_it_started() {
         built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
 
     let truth = TURNING / 64;
@@ -971,6 +1037,7 @@ fn whether_the_weight_stays_the_size_it_started() {
         depth: 1,
         angle: (truth, swing),
         loud: 1,
+        planted: false,
     };
     let start = spread(grid, 0x1234_5678);
     let biggest = |held: &[u32]| {
@@ -985,9 +1052,9 @@ fn whether_the_weight_stays_the_size_it_started() {
     );
     for depth in [16_u32, 64, 256, 1024] {
         board.depth = depth;
-        board.angle = (truth, swing);
+        board.tune(truth, swing);
         let target = board.run(&start);
-        board.angle = (truth + 16, swing);
+        board.tune(truth + 16, swing);
         let ended = board.run(&start);
         let weight: Vec<u32> = ended
             .iter()
@@ -1002,7 +1069,7 @@ fn whether_the_weight_stays_the_size_it_started() {
             came / went.max(1.0)
         );
     }
-    board.angle = (truth, swing);
+    board.tune(truth, swing);
 }
 
 #[test]
@@ -1017,7 +1084,14 @@ fn how_rough_the_loss_is_close_up_at_each_depth() {
         built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
 
     let truth = TURNING / 64;
@@ -1029,6 +1103,7 @@ fn how_rough_the_loss_is_close_up_at_each_depth() {
         depth: 1,
         angle: (truth, swing),
         loud: 1,
+        planted: false,
     };
     let start = spread(grid, 0x1234_5678);
 
@@ -1036,12 +1111,12 @@ fn how_rough_the_loss_is_close_up_at_each_depth() {
     let mut told = Vec::new();
     for depth in [16_u32, 64, 256, 1024] {
         board.depth = depth;
-        board.angle = (truth, swing);
+        board.tune(truth, swing);
         let target = board.run(&start);
 
         let mut walk = Vec::new();
         for here in truth..=(truth + 48) {
-            board.angle = (here, swing);
+            board.tune(here, swing);
             walk.push(squared(&board.run(&start), &target));
         }
 
@@ -1056,7 +1131,7 @@ fn how_rough_the_loss_is_close_up_at_each_depth() {
         eprintln!("{depth:>7} {dents:>10} {worst:>14}");
         told.push((depth, dents));
     }
-    board.angle = (truth, swing);
+    board.tune(truth, swing);
 
     for (depth, dents) in &told {
         eprintln!("{depth:>5} steps: {dents} places to get stuck between 0 and 48 out");
@@ -1125,7 +1200,14 @@ fn what_depth_buys_is_signal_and_signal_buys_room_for_noise() {
         built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
 
     let truth = TURNING / 64;
@@ -1137,6 +1219,7 @@ fn what_depth_buys_is_signal_and_signal_buys_room_for_noise() {
         depth: 1,
         angle: (truth, swing),
         loud: 1,
+        planted: false,
     };
     let start = spread(grid, 0x1234_5678);
     let louds = [0_u32, 16, 64, 256, 1024, 4096];
@@ -1153,7 +1236,7 @@ fn what_depth_buys_is_signal_and_signal_buys_room_for_noise() {
     let mut told = Vec::new();
     for depth in [1_u32, 16, 256, 1024] {
         board.depth = depth;
-        board.angle = (truth, swing);
+        board.tune(truth, swing);
         let clean = board.run(&start);
 
         let mut shown = String::new();
@@ -1173,7 +1256,7 @@ fn what_depth_buys_is_signal_and_signal_buys_room_for_noise() {
         eprintln!("{depth:>7} {shown}");
         told.push((depth, stood));
     }
-    board.angle = (truth, swing);
+    board.tune(truth, swing);
 
     for (depth, stood) in &told {
         eprintln!("{depth:>5} steps: still lands on the answer through noise of {stood}");
@@ -1185,8 +1268,8 @@ fn what_depth_buys_is_signal_and_signal_buys_room_for_noise() {
 
 fn narrowed(board: &mut Board<'_>, start: &[u32], target: &[u32], from: u32) -> (u32, u32) {
     let mut runs = 0_u32;
-    let mut loss = |board: &mut Board<'_>, at: u32, runs: &mut u32| {
-        board.angle = (at, board.angle.1);
+    let loss = |board: &mut Board<'_>, at: u32, runs: &mut u32| {
+        board.tune(at, board.angle.1);
         *runs += 1;
         squared(&board.run(start), target)
     };
@@ -1217,6 +1300,172 @@ fn narrowed(board: &mut Board<'_>, start: &[u32], target: &[u32], from: u32) -> 
     (best as u32, runs)
 }
 
+fn strayed_where(one: &[u32], other: &[u32], live: &[bool]) -> f64 {
+    let mut held = 0.0_f64;
+    let mut seen = 0_usize;
+    for ((a, b), on) in one.iter().zip(other).zip(live) {
+        if *on {
+            held += f64::from((*a as i32) - (*b as i32)).abs();
+            seen += 1;
+        }
+    }
+    held / seen.max(1) as f64
+}
+
+#[test]
+fn many_numbers_at_once_are_what_the_walk_back_is_for() {
+    let Some(host) = device("many_numbers_at_once_are_what_the_walk_back_is_for") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let base = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 256,
+        angle: (base, swing),
+        loud: 1,
+        planted: false,
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    let scatter = spread(grid, 0x00C0_FFEE);
+
+    let probe: Vec<u32> = scatter.iter().map(|one| base + (one % 33) - 16).collect();
+    board.tune(base, swing);
+    board.sow(&probe);
+    let seen = board.run(&start);
+    let weight: Vec<u32> = seen.iter().map(|one| one.wrapping_sub(base)).collect();
+    board.sow(&probe);
+    board.carry(&start, &weight);
+    let live: Vec<bool> = board.told_each().iter().map(|one| *one != 0).collect();
+    let counted = live.iter().filter(|one| **one).count();
+
+    let truth: Vec<u32> = live
+        .iter()
+        .zip(&scatter)
+        .map(|(on, one)| if *on { base + (one % 33) - 16 } else { base })
+        .collect();
+    board.sow(&truth);
+    let target = board.run(&start);
+
+    eprintln!("{:>7} {:>10} {:>12}", "steps", "have one", "point right");
+    for depth in [16_u32, 64, 256, 1024] {
+        board.depth = depth;
+        board.sow(&truth);
+        let aim = board.run(&start);
+        let guess = vec![base; grid.cells()];
+        board.sow(&guess);
+        let ended = board.run(&start);
+        let weight: Vec<u32> = ended
+            .iter()
+            .zip(&aim)
+            .map(|(one, other)| one.wrapping_sub(*other))
+            .collect();
+        board.sow(&guess);
+        board.carry(&start, &weight);
+        let told = board.told_each();
+        let mut agreed = 0_usize;
+        let mut spoke = 0_usize;
+        for (((slope, held), want), on) in told.iter().zip(&guess).zip(&truth).zip(&live) {
+            if !*on || *slope == 0 {
+                continue;
+            }
+            spoke += 1;
+            let off = (*held as i32) - (*want as i32);
+            if off != 0 && slope.signum() == off.signum() {
+                agreed += 1;
+            }
+        }
+        eprintln!(
+            "{depth:>7} {spoke:>10} {:>11.1}%",
+            agreed as f64 * 100.0 / spoke.max(1) as f64
+        );
+    }
+    board.depth = 1024;
+    board.sow(&truth);
+    let target = board.run(&start);
+
+    let mut guess = vec![base; grid.cells()];
+    let first = strayed_where(&guess, &truth, &live);
+
+    let schedule = [1_u32; 32];
+    let began = std::time::Instant::now();
+    let mut walk: Vec<(f64, f64)> = Vec::new();
+    for step in schedule {
+        board.sow(&guess);
+        let ended = board.run(&start);
+        let weight: Vec<u32> = ended
+            .iter()
+            .zip(&target)
+            .map(|(one, other)| one.wrapping_sub(*other))
+            .collect();
+        board.sow(&guess);
+        board.carry(&start, &weight);
+        let told = board.told_each();
+        for (held, slope) in guess.iter_mut().zip(&told) {
+            let moved = i64::from(*held) - i64::from(slope.signum()) * i64::from(step);
+            *held = moved.clamp(1, 4096) as u32;
+        }
+        board.sow(&guess);
+        walk.push((
+            strayed_where(&guess, &truth, &live),
+            squared(&board.run(&start), &target),
+        ));
+    }
+    let took = began.elapsed();
+    let last = strayed_where(&guess, &truth, &live);
+
+    eprintln!("{counted} numbers, {} steps", board.depth);
+    eprintln!(
+        "out by {first:.2} at the start and {last:.2} after {} rounds, {took:.2?}",
+        schedule.len()
+    );
+    let away = walk
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| at % 4 == 3)
+        .map(|(_, (one, _))| format!("{one:.2}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let loss = walk
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| at % 4 == 3)
+        .map(|(_, (_, one))| format!("{one:.3e}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("away from the truth: {away}");
+    eprintln!("the loss itself:     {loss}");
+    eprintln!(
+        "{} passes for all of them; one run apiece would be {}",
+        schedule.len() * 3,
+        schedule.len() * counted
+    );
+    let began_loss = walk.first().map_or(0.0, |(_, one)| *one);
+    let ended_loss = walk.last().map_or(0.0, |(_, one)| *one);
+    eprintln!("the loss went {began_loss:.3e} to {ended_loss:.3e}");
+    assert!(ended_loss < began_loss, "{began_loss} {ended_loss}");
+}
+
 #[test]
 fn what_the_same_answer_costs_without_any_gradient_at_all() {
     let Some(host) = device("what_the_same_answer_costs_without_any_gradient_at_all") else {
@@ -1239,7 +1488,14 @@ fn what_the_same_answer_costs_without_any_gradient_at_all() {
             built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
         ];
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-        let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+        let sizes = [
+            8,
+            grid.cells(),
+            grid.cells(),
+            grid.cells(),
+            grid.cells(),
+            grid.cells(),
+        ];
         let resident = host.resident(&sizes, &modules).unwrap();
         let mut board = Board {
             resident,
@@ -1248,10 +1504,11 @@ fn what_the_same_answer_costs_without_any_gradient_at_all() {
             depth,
             angle: (truth, swing),
             loud: 1,
+            planted: false,
         };
 
         let start = spread(grid, 0x1234_5678);
-        board.angle = (truth, swing);
+        board.tune(truth, swing);
         let target = board.run(&start);
 
         let began = std::time::Instant::now();
@@ -1303,7 +1560,14 @@ fn the_angle_is_found_where_the_tape_would_not_fit() {
             built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
         ];
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-        let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+        let sizes = [
+            8,
+            grid.cells(),
+            grid.cells(),
+            grid.cells(),
+            grid.cells(),
+            grid.cells(),
+        ];
         let resident = host.resident(&sizes, &modules).unwrap();
         let mut board = Board {
             resident,
@@ -1312,10 +1576,11 @@ fn the_angle_is_found_where_the_tape_would_not_fit() {
             depth,
             angle: (truth, swing),
             loud: 1,
+            planted: false,
         };
 
         let start = spread(grid, 0x1234_5678);
-        board.angle = (truth, swing);
+        board.tune(truth, swing);
         let target = board.run(&start);
 
         let began = std::time::Instant::now();
@@ -1336,9 +1601,9 @@ fn the_angle_is_found_where_the_tape_would_not_fit() {
             let here = truth + away;
             let slope = asking(&mut board, &start, &target, here);
             let step = away / 4;
-            board.angle = (here + step, swing);
+            board.tune(here + step, swing);
             let above = squared(&board.run(&start), &target);
-            board.angle = (here - step, swing);
+            board.tune(here - step, swing);
             let below = squared(&board.run(&start), &target);
             let nudged = (above - below) / f64::from(2 * step);
             let apart = (slope - nudged).abs() / slope.abs().max(nudged.abs()).max(1.0);
@@ -1373,7 +1638,14 @@ fn the_smallest_difference_the_slope_can_point_at() {
         built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
 
     let truth = TURNING / 64;
@@ -1385,6 +1657,7 @@ fn the_smallest_difference_the_slope_can_point_at() {
         depth: 1,
         angle: (truth, swing),
         loud: 1,
+        planted: false,
     };
 
     let grids = [spread(grid, 0x1234_5678), spread(grid, 0x5EED_1057)];
@@ -1406,7 +1679,7 @@ fn the_smallest_difference_the_slope_can_point_at() {
         let targets: Vec<Vec<u32>> = grids
             .iter()
             .map(|start| {
-                board.angle = (truth, swing);
+                board.tune(truth, swing);
                 board.run(start)
             })
             .collect();
@@ -1435,7 +1708,7 @@ fn the_smallest_difference_the_slope_can_point_at() {
             None => eprintln!("{depth:>7} {shown}  {:>8}", "none"),
         }
     }
-    board.angle = (truth, swing);
+    board.tune(truth, swing);
 
     for (depth, away) in &found {
         eprintln!("{depth:>5} steps: points home from {away} out, both ways, on both grids");
@@ -1457,7 +1730,14 @@ fn the_angle_is_found_by_walking_the_slope_that_was_checked() {
         built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
 
     let truth = TURNING / 64;
@@ -1469,6 +1749,7 @@ fn the_angle_is_found_by_walking_the_slope_that_was_checked() {
         depth: 1,
         angle: (truth, swing),
         loud: 1,
+        planted: false,
     };
     let start = spread(grid, 0x1234_5678);
 
@@ -1479,7 +1760,7 @@ fn the_angle_is_found_by_walking_the_slope_that_was_checked() {
     let mut told_reach = Vec::new();
     for depth in [1_u32, 16, 256, 1024] {
         board.depth = depth;
-        board.angle = (truth, swing);
+        board.tune(truth, swing);
         let target = board.run(&start);
 
         let mut here = truth + 16;
@@ -1557,7 +1838,14 @@ fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
         built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
 
     let base = TURNING / 64;
@@ -1569,6 +1857,7 @@ fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
         depth: 1,
         angle: (base, swing),
         loud: 1,
+        planted: false,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -1580,12 +1869,12 @@ fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
     let mut worst = 0.0_f64;
     for depth in [1_u32, 4, 16, 64, 256, 1024] {
         board.depth = depth;
-        board.angle = (base, swing);
+        board.tune(base, swing);
         let target = board.run(&start);
 
         for away in [16_u32, 64, 192] {
             let here = base + away;
-            board.angle = (here, swing);
+            board.tune(here, swing);
             let ended = board.run(&start);
             let weight: Vec<u32> = ended
                 .iter()
@@ -1596,9 +1885,9 @@ fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
             let (told, _) = board.told();
 
             let step = (away / 4).max(2);
-            board.angle = (here + step, swing);
+            board.tune(here + step, swing);
             let above = squared(&board.run(&start), &target);
-            board.angle = (here - step, swing);
+            board.tune(here - step, swing);
             let below = squared(&board.run(&start), &target);
             let nudged = (above - below) / f64::from(2 * step);
 
@@ -1625,7 +1914,14 @@ fn the_window_where_the_angle_can_be_asked_for() {
         built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
 
     let base = TURNING / 64;
@@ -1637,6 +1933,7 @@ fn the_window_where_the_angle_can_be_asked_for() {
         depth: 1,
         angle: (base, swing),
         loud: 1,
+        planted: false,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -1656,14 +1953,14 @@ fn the_window_where_the_angle_can_be_asked_for() {
     let mut told = Vec::new();
     for depth in [1_u32, 4, 16, 64, 256, 1024] {
         board.depth = depth;
-        board.angle = (base, swing);
+        board.tune(base, swing);
         let target = board.run(&start);
         let level = apart(&board.run(&stranger), &target);
 
         let mut walk = Vec::new();
         let mut shown = String::new();
         for away in aways {
-            board.angle = ((i64::from(base) + away) as u32, swing);
+            board.tune((i64::from(base) + away) as u32, swing);
             let loss = apart(&board.run(&start), &target);
             shown.push_str(&format!("{loss:>9.2}"));
             walk.push(loss);
@@ -1677,7 +1974,7 @@ fn the_window_where_the_angle_can_be_asked_for() {
             .map_or(0.0, |(_, loss)| *loss);
         told.push((depth, level, nearest));
     }
-    board.angle = (base, swing);
+    board.tune(base, swing);
 
     for (depth, level, nearest) in &told {
         eprintln!("{depth:>5} steps, saturated {level:.0}: one unit out is worth {nearest:.2}");
@@ -1701,7 +1998,14 @@ fn how_far_back_the_loss_can_still_see() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -1710,6 +2014,7 @@ fn how_far_back_the_loss_can_still_see() {
         depth: 1,
         angle: (TURNING, SWING),
         loud: 1,
+        planted: false,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -1734,10 +2039,10 @@ fn how_far_back_the_loss_can_still_see() {
         let mut level = 0.0_f64;
         for depth in depths {
             board.depth = depth;
-            board.angle = (base, SWING / share);
+            board.tune(base, SWING / share);
             let target = board.run(&start);
             level = apart(&board.run(&stranger), &target);
-            board.angle = (base + 8, SWING / share);
+            board.tune(base + 8, SWING / share);
             let loss = apart(&board.run(&start), &target);
             told.push_str(&format!("{loss:>9.0}"));
             if loss < level / 2.0 {
@@ -1769,7 +2074,14 @@ fn whether_the_loss_can_see_the_angle_it_was_made_with() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -1778,6 +2090,7 @@ fn whether_the_loss_can_see_the_angle_it_was_made_with() {
         depth: 32,
         angle: (TURNING, SWING),
         loud: 1,
+        planted: false,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -1789,12 +2102,12 @@ fn whether_the_loss_can_see_the_angle_it_was_made_with() {
         -4096_i64, -2048, -1024, -256, -64, -8, 0, 8, 64, 256, 1024, 2048, 4096,
     ] {
         let turning = (i64::from(TURNING) + away) as u32;
-        board.angle = (turning, SWING);
+        board.tune(turning, SWING);
         let loss = apart(&board.run(&start), &target);
         eprintln!("{turning:>9} {away:>9} {loss:>14.1}");
         seen.push((away, loss));
     }
-    board.angle = (TURNING, SWING);
+    board.tune(TURNING, SWING);
 
     let bottom = seen
         .iter()
@@ -1816,7 +2129,14 @@ fn whether_the_slope_points_home() {
     };
     let width = host.width();
     let grid = Grid::of(WIDE, DEEP);
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
 
     for kind in [Kind::Turn, Kind::Bound] {
         let passes = [
@@ -1833,6 +2153,7 @@ fn whether_the_slope_points_home() {
             depth: 32,
             angle: (TURNING, SWING),
             loud: 1,
+            planted: false,
         };
 
         let truth = spread(grid, 0x1234_5678);
@@ -1889,7 +2210,14 @@ fn whether_the_bounded_rule_is_stalled_or_only_slow() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
 
     eprintln!(
         "{:>7} {:>14} {:>14} {:>9}",
@@ -1905,6 +2233,7 @@ fn whether_the_bounded_rule_is_stalled_or_only_slow() {
             depth: 32,
             angle: (TURNING, SWING),
             loud: 1,
+            planted: false,
         };
         let (first, last, _, _) = descended(&mut board, grid, PACE, rounds);
         let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -1927,7 +2256,14 @@ fn the_step_the_bounded_rule_wants_is_a_smaller_one() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
 
     eprintln!(
         "{:>7} {:>6} {:>14} {:>14} {:>9}",
@@ -1944,6 +2280,7 @@ fn the_step_the_bounded_rule_wants_is_a_smaller_one() {
                 depth,
                 angle: (TURNING, SWING),
                 loud: 1,
+                planted: false,
             };
             let (first, last, _, _) = descended(&mut board, grid, pace, ROUNDS);
             let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -1967,7 +2304,14 @@ fn how_deep_the_descent_still_finds_its_way() {
     };
     let width = host.width();
     let grid = Grid::of(WIDE, DEEP);
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
 
     eprintln!(
         "{:>9} {:>7} {:>14} {:>14} {:>14} {:>14} {:>9}",
@@ -1997,6 +2341,7 @@ fn how_deep_the_descent_still_finds_its_way() {
                 depth,
                 angle: (TURNING, SWING),
                 loud: 1,
+                planted: false,
             };
             let (first, last, strength, reached) = descended(&mut board, grid, PACE, ROUNDS);
             let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -2040,7 +2385,14 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
         built(width, grid, Pass::Back, Kind::Product).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -2049,6 +2401,7 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
         depth: STEPS,
         angle: (TURNING, SWING),
         loud: 1,
+        planted: false,
     };
 
     let truth = spread(grid, 0x1234_5678);
