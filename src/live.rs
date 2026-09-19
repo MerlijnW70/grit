@@ -49,9 +49,7 @@ pub fn keeping(
     coarse: bool,
 ) -> Result<Keeping, LaneError> {
     use crate::Groups;
-    use crate::layout::{
-        BASES, GRAND, HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_TOTALS, TOTALS,
-    };
+    use crate::layout::{BASES, GRAND, HOT_BASES, HOT_COUNTS, HOT_DENSE, TOTALS};
     use crate::sweep::COUNTS;
 
     let (listed, hot) = if coarse {
@@ -71,21 +69,10 @@ pub fn keeping(
     let mut after: Stages = Vec::new();
     if coarse {
         after.push(vec![(mark(subgroup, Tier::COARSE, Over::Every)?, tiles)]);
-        if plan.hot_tiles == 1 {
-            after.push(vec![(
-                crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
-                one,
-            )]);
-        } else {
-            after.push(vec![(
-                crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
-                Groups::Fixed(plan.hot_tiles),
-            )]);
-            after.push(vec![(
-                crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
-                one,
-            )]);
-        }
+        after.push(vec![(
+            crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
+            one,
+        )]);
         after.push(vec![
             (
                 crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
@@ -157,7 +144,7 @@ pub fn arranged(
     coarse: bool,
 ) -> Result<Loop, LaneError> {
     use crate::Groups;
-    use crate::layout::{HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_TOTALS};
+    use crate::layout::{HOT_BASES, HOT_COUNTS, HOT_DENSE};
     use crate::sweep::COUNTS;
 
     let (listed, hot) = if coarse {
@@ -182,22 +169,9 @@ pub fn arranged(
         stage
     };
 
-    let hot_scan_counts = if coarse && plan.hot_tiles == 1 {
+    let hot_scan_counts = if coarse {
         vec![(
             crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
-            one,
-        )]
-    } else if coarse {
-        vec![(
-            crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
-            Groups::Fixed(plan.hot_tiles),
-        )]
-    } else {
-        Vec::new()
-    };
-    let hot_scan_totals = if coarse && plan.hot_tiles > 1 {
-        vec![(
-            crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
             one,
         )]
     } else {
@@ -262,7 +236,6 @@ pub fn arranged(
         vec![(settle(subgroup, grid)?, crate::compact::Plan::listed())],
         looking,
         hot_scan_counts,
-        hot_scan_totals,
         hot_gather,
         vec![(mark(subgroup, Tier::FINE, listed)?, hot)],
         fine_scan_counts,

@@ -402,3 +402,35 @@ fn a_stage_handed_over_empty_is_not_handed_back() {
     assert!(groups.iter().all(|stage| !stage.is_empty()));
     assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), wanted);
 }
+
+#[test]
+fn a_tier_of_tiles_is_always_one_tile() {
+    for width in [4_u32, 8, 16, 32, 64] {
+        let per = sweep::cells(width);
+        let most = Plan::over(width, per * per).unwrap();
+        assert_eq!(most.hot_tiles, 1, "{width}");
+        assert!(most.tiles <= per, "{width}");
+        assert!(Plan::over(width, per * per + 1).is_err(), "{width}");
+
+        let least = Plan::over(width, 1).unwrap();
+        assert_eq!(least.tiles, 1, "{width}");
+        assert_eq!(least.hot_tiles, 1, "{width}");
+    }
+}
+
+#[test]
+fn a_single_tile_is_scanned_in_one_go() {
+    let width = 32;
+    let per = sweep::cells(width);
+
+    let small = Plan::over(width, per).unwrap();
+    assert_eq!(small.tiles, 1);
+    let folded = live::keeping(width, &small, false).unwrap();
+
+    let wide = Plan::over(width, per * 4).unwrap();
+    assert!(wide.tiles > 1, "{}", wide.tiles);
+    let split = live::keeping(width, &wide, false).unwrap();
+
+    eprintln!("{} {}", folded.after.len(), split.after.len());
+    assert_eq!(split.after.len(), folded.after.len() + 1);
+}
