@@ -2,8 +2,6 @@
 
 `grit` is a sparse-grid cellular simulation on Vulkan compute, built on the `simdr` SPIR-V emitter. Each frame steps only the quads its work list names, and the list is rebuilt on the device by a two-level scan and gather. The crate is a library with five binaries: `scale`, `loop_cost` and `stages` measure it, `pour` and `spike` open a window on it.
 
-Anything under `demos` is a separate crate that depends on this one and is not part of it. Deleting a demo means deleting its directory.
-
 ## What a frame costs
 
 The premise is that the bill follows activity, not extent. `scale` pours sand into worlds of growing size while the awake set stays the same size, and reports the time the card spent:
