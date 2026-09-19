@@ -358,3 +358,47 @@ fn the_brush_wakes_the_ground_it_paints() {
     eprintln!("{moved}");
     assert!(moved > 0);
 }
+
+#[test]
+fn the_halves_a_rule_sits_between_carry_the_tier_they_were_asked_for() {
+    let width = 32;
+    let plan = Plan::over(width, COARSE_FROM).unwrap();
+
+    let fine = live::keeping(width, &plan, false).unwrap();
+    let coarse = live::keeping(width, &plan, true).unwrap();
+
+    assert_eq!(fine.before.len(), 1);
+    assert_eq!(coarse.before.len(), 1);
+    assert_eq!(fine.before[0].len(), 3);
+    assert_eq!(coarse.before[0].len(), 3);
+
+    eprintln!("{} {}", fine.after.len(), coarse.after.len());
+    assert_eq!(coarse.after.len(), fine.after.len() + 4);
+
+    let counted = |stages: &live::Stages| stages.iter().map(Vec::len).sum::<usize>();
+    assert_eq!(counted(&coarse.after), counted(&fine.after) + COARSE_PASSES);
+    assert_eq!(fine.over, Plan::listed());
+    assert_eq!(coarse.over, Plan::listed());
+    assert!(fine.after.iter().all(|stage| !stage.is_empty()));
+    assert!(coarse.after.iter().all(|stage| !stage.is_empty()));
+}
+
+#[test]
+fn a_stage_handed_over_empty_is_not_handed_back() {
+    let width = 32;
+    let plan = Plan::over(width, COARSE_FROM).unwrap();
+    let keeping = live::keeping(width, &plan, false).unwrap();
+
+    let mut stages = keeping.before;
+    stages.push(Vec::new());
+    stages.extend(keeping.after);
+    let wanted: usize = stages.iter().map(Vec::len).sum();
+    let held = stages.len();
+
+    let (passes, groups) = live::staged(stages);
+    eprintln!("{held} {} {}", groups.len(), passes.len());
+    assert_eq!(passes.len(), wanted);
+    assert_eq!(groups.len(), held - 1);
+    assert!(groups.iter().all(|stage| !stage.is_empty()));
+    assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), wanted);
+}
