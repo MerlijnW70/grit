@@ -215,6 +215,7 @@ struct Board<'host> {
     resident: grit::Resident<'host>,
     over: Groups,
     grid: Grid,
+    depth: u32,
 }
 
 impl Board<'_> {
@@ -222,7 +223,7 @@ impl Board<'_> {
         self.resident.write(STATE as usize, cells).unwrap();
         let ahead = [self.over, Groups::Fixed(0)];
         let stages: Vec<&[Groups]> = vec![&ahead];
-        for frame in 0..STEPS {
+        for frame in 0..self.depth {
             self.resident
                 .write_at(PARAMS as usize, 0, &[frame])
                 .unwrap();
@@ -246,7 +247,7 @@ impl Board<'_> {
 
         let back = [Groups::Fixed(0), self.over];
         let stages: Vec<&[Groups]> = vec![&back];
-        for frame in (0..STEPS).rev() {
+        for frame in (0..self.depth).rev() {
             self.resident
                 .write_at(PARAMS as usize, 0, &[frame])
                 .unwrap();
@@ -297,6 +298,7 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
         resident,
         over: Groups::Fixed(grid.quads().div_ceil(width)),
         grid,
+        depth: STEPS,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -340,6 +342,81 @@ const CEILING: u32 = 1 << 12;
 
 const PACE: u32 = 3;
 
+fn descended(board: &mut Board<'_>, grid: Grid) -> (f64, f64, f64) {
+    let truth = spread(grid, 0x1234_5678);
+    let target = board.run(&truth);
+    let drift = spread(grid, 0x0BAD_C0DE);
+    let mut guess: Vec<u32> = truth
+        .iter()
+        .zip(&drift)
+        .map(|(one, other)| one.wrapping_add(other >> 2))
+        .collect();
+
+    let first = apart(&board.run(&guess), &target);
+    let mut strength = 0.0;
+    let mut last = first;
+    for round in 0..ROUNDS {
+        let ended = board.run(&guess);
+        let weight: Vec<u32> = ended
+            .iter()
+            .zip(&target)
+            .map(|(one, other)| one.wrapping_sub(*other))
+            .collect();
+        let (slope, _) = board.carry(&guess, &weight);
+        if round == 0 {
+            strength = slope
+                .iter()
+                .map(|one| f64::from(*one as i32).abs())
+                .sum::<f64>()
+                / slope.len() as f64;
+        }
+        for (cell, step) in guess.iter_mut().zip(&slope) {
+            let moved = i64::from(*cell) - i64::from((*step as i32) >> PACE);
+            *cell = moved.clamp(0, i64::from(CEILING) - 1) as u32;
+        }
+        last = apart(&board.run(&guess), &target);
+    }
+    (first, last, strength)
+}
+
+#[test]
+fn how_deep_the_descent_still_finds_its_way() {
+    let Some(host) = device("how_deep_the_descent_still_finds_its_way") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead).unwrap(),
+        built(width, grid, Pass::Back).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells()];
+
+    eprintln!(
+        "{:>7} {:>12} {:>12} {:>12} {:>9}",
+        "steps", "slope", "error first", "error last", "shrank by"
+    );
+    let mut deepest = 0_u32;
+    for depth in [8_u32, 32, 128, 512] {
+        let resident = host.resident(&sizes, &modules).unwrap();
+        let mut board = Board {
+            resident,
+            over: Groups::Fixed(grid.quads().div_ceil(width)),
+            grid,
+            depth,
+        };
+        let (first, last, strength) = descended(&mut board, grid);
+        let shrank = if last > 0.0 { first / last } else { f64::MAX };
+        eprintln!("{depth:>7} {strength:>12.1} {first:>12.1} {last:>12.1} {shrank:>8.1}x");
+        if last < first / 10.0 {
+            deepest = depth;
+        }
+    }
+    eprintln!("the descent still arrives at {deepest} steps");
+    assert!(deepest >= 8);
+}
+
 fn worst(one: &[u32], other: &[u32]) -> f64 {
     one.iter()
         .zip(other)
@@ -373,6 +450,7 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
         resident,
         over: Groups::Fixed(grid.quads().div_ceil(width)),
         grid,
+        depth: STEPS,
     };
 
     let truth = spread(grid, 0x1234_5678);
@@ -408,7 +486,7 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
                 .map(|one| f64::from(*one as i32).abs())
                 .sum::<f64>()
                 / weight.len() as f64;
-            eprintln!("gewicht {pull:.1} helling {strength:.1}");
+            eprintln!("pull {pull:.1} slope {strength:.1}");
         }
         for (cell, step) in guess.iter_mut().zip(&slope) {
             let moved = i64::from(*cell) - i64::from((*step as i32) >> PACE);
