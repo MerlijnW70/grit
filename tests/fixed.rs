@@ -33,8 +33,6 @@ const STEP: u32 = 1 << 9;
 
 const GRAIN: u32 = 2;
 
-const FLOOR: f64 = 1.0;
-
 const SPARE: u32 = 8;
 
 const ROOM: u32 = 1 << 15;
@@ -1065,6 +1063,210 @@ fn how_rough_the_loss_is_close_up_at_each_depth() {
     }
 }
 
+fn muddied(target: &[u32], grid: Grid, seed: u32, loud: u32) -> Vec<u32> {
+    let noise = spread(grid, seed);
+    target
+        .iter()
+        .zip(&noise)
+        .map(|(one, other)| {
+            let span = 2 * loud + 1;
+            let off = (other % span) as i32 - loud as i32;
+            (*one as i32).wrapping_add(off) as u32
+        })
+        .collect()
+}
+
+fn hunted(board: &mut Board<'_>, start: &[u32], target: &[u32], from: u32) -> u32 {
+    let mut here = from;
+    let mut span = 1_i64;
+    let low;
+    let high;
+    let leaning = asking(board, start, target, here) > 0.0;
+    loop {
+        let next = if leaning {
+            i64::from(here) - span
+        } else {
+            i64::from(here) + span
+        };
+        let held = next.clamp(1, 4096) as u32;
+        let now = asking(board, start, target, held) > 0.0;
+        if now != leaning || span > 512 {
+            (low, high) = if leaning {
+                (i64::from(held), i64::from(here))
+            } else {
+                (i64::from(here), i64::from(held))
+            };
+            break;
+        }
+        here = held;
+        span *= 2;
+    }
+    let (mut low, mut high) = (low, high);
+    while high - low > 1 {
+        let middle = (low + high) / 2;
+        if asking(board, start, target, middle.clamp(1, 4096) as u32) > 0.0 {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    low as u32
+}
+
+#[test]
+fn what_depth_buys_is_signal_and_signal_buys_room_for_noise() {
+    let Some(host) = device("what_depth_buys_is_signal_and_signal_buys_room_for_noise") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let truth = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 1,
+        angle: (truth, swing),
+        loud: 1,
+    };
+    let start = spread(grid, 0x1234_5678);
+    let louds = [0_u32, 16, 64, 256, 1024, 4096];
+
+    eprintln!(
+        "{:>7} {}",
+        "steps",
+        louds
+            .iter()
+            .map(|one| format!("{:>10}", format!("noise {one}")))
+            .collect::<String>()
+    );
+
+    let mut told = Vec::new();
+    for depth in [1_u32, 16, 256, 1024] {
+        board.depth = depth;
+        board.angle = (truth, swing);
+        let clean = board.run(&start);
+
+        let mut shown = String::new();
+        let mut stood = 0_u32;
+        for loud in louds {
+            let target = if loud == 0 {
+                clean.clone()
+            } else {
+                muddied(&clean, grid, 0x0FFE_1234, loud)
+            };
+            let found = hunted(&mut board, &start, &target, truth + 16);
+            shown.push_str(&format!("{:>10}", found.abs_diff(truth)));
+            if found.abs_diff(truth) <= 1 {
+                stood = loud;
+            }
+        }
+        eprintln!("{depth:>7} {shown}");
+        told.push((depth, stood));
+    }
+    board.angle = (truth, swing);
+
+    for (depth, stood) in &told {
+        eprintln!("{depth:>5} steps: still lands on the answer through noise of {stood}");
+    }
+    let shallow = told.first().map_or(0, |(_, stood)| *stood);
+    let deep = told.last().map_or(0, |(_, stood)| *stood);
+    assert!(deep >= shallow, "{shallow} {deep}");
+}
+
+#[test]
+fn the_smallest_difference_the_slope_can_point_at() {
+    let Some(host) = device("the_smallest_difference_the_slope_can_point_at") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let truth = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 1,
+        angle: (truth, swing),
+        loud: 1,
+    };
+
+    let grids = [spread(grid, 0x1234_5678), spread(grid, 0x5EED_1057)];
+    let aways = [1_u32, 2, 4, 8, 16, 32, 64];
+
+    eprintln!(
+        "{:>7} {}  {:>8}",
+        "steps",
+        aways
+            .iter()
+            .map(|one| format!("{one:>5}"))
+            .collect::<String>(),
+        "finest"
+    );
+
+    let mut found = Vec::new();
+    for depth in [1_u32, 4, 16, 64, 256, 1024] {
+        board.depth = depth;
+        let targets: Vec<Vec<u32>> = grids
+            .iter()
+            .map(|start| {
+                board.angle = (truth, swing);
+                board.run(start)
+            })
+            .collect();
+
+        let mut shown = String::new();
+        let mut finest = None;
+        for away in aways {
+            let mut sound = true;
+            for (start, target) in grids.iter().zip(&targets) {
+                let above = asking(&mut board, start, target, truth + away);
+                let below = asking(&mut board, start, target, truth - away);
+                if above <= 0.0 || below >= 0.0 {
+                    sound = false;
+                }
+            }
+            shown.push_str(if sound { "    y" } else { "    ." });
+            if sound && finest.is_none() {
+                finest = Some(away);
+            }
+        }
+        match finest {
+            Some(away) => {
+                eprintln!("{depth:>7} {shown}  {away:>8}");
+                found.push((depth, away));
+            }
+            None => eprintln!("{depth:>7} {shown}  {:>8}", "none"),
+        }
+    }
+    board.angle = (truth, swing);
+
+    for (depth, away) in &found {
+        eprintln!("{depth:>5} steps: points home from {away} out, both ways, on both grids");
+    }
+    let coarse = found.first().map_or(0, |(_, away)| *away);
+    let fine = found.last().map_or(0, |(_, away)| *away);
+    assert!(coarse >= fine, "{coarse} {fine}");
+}
+
 #[test]
 fn the_angle_is_found_by_walking_the_slope_that_was_checked() {
     let Some(host) = device("the_angle_is_found_by_walking_the_slope_that_was_checked") else {
@@ -1290,29 +1492,23 @@ fn the_window_where_the_angle_can_be_asked_for() {
         }
         eprintln!("{depth:>7} {level:>10.0} {shown}");
 
-        let finest = aways
+        let nearest = aways
             .iter()
             .zip(&walk)
-            .filter(|(away, loss)| **away > 0 && **loss > FLOOR)
-            .map(|(away, _)| *away)
-            .min()
-            .unwrap_or(i64::MAX);
-        told.push((depth, level, finest));
+            .find(|(away, _)| **away == 1)
+            .map_or(0.0, |(_, loss)| *loss);
+        told.push((depth, level, nearest));
     }
     board.angle = (base, swing);
 
-    for (depth, level, finest) in &told {
-        if *finest == i64::MAX {
-            eprintln!("{depth:>5} steps: nothing this side of 64 shows at all");
-        } else {
-            eprintln!("{depth:>5} steps, saturated {level:.0}: tells {finest} apart from 0");
-        }
+    for (depth, level, nearest) in &told {
+        eprintln!("{depth:>5} steps, saturated {level:.0}: one unit out is worth {nearest:.2}");
     }
 
-    let coarse = told.first().map_or(0, |(_, _, finest)| *finest);
-    let fine = told.last().map_or(0, |(_, _, finest)| *finest);
-    assert!(coarse > fine, "{coarse} {fine}");
-    assert_eq!(fine, 1);
+    let least = told.first().map_or(0.0, |(_, _, near)| *near);
+    let most = told.last().map_or(0.0, |(_, _, near)| *near);
+    assert!(least > 0.0, "{least}");
+    assert!(most > least * 100.0, "{least} {most}");
 }
 
 #[test]
