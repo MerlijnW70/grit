@@ -23,6 +23,10 @@ const SHARE: u32 = 4;
 
 const SPREAD: [u32; 3] = [2, 3, 4];
 
+const TURNING: u32 = 8303;
+
+const SWING: u32 = 16384;
+
 const STEP: u32 = 1 << 9;
 
 const GRAIN: u32 = 2;
@@ -46,6 +50,87 @@ enum Kind {
     Product,
     Sum,
     Turn,
+    Bound,
+}
+
+type Pair<const LANES: u32> = (Vector<U32, LANES>, Vector<U32, LANES>);
+
+fn pinned<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    gate: Vector<U32, LANES>,
+) -> Result<Pair<LANES>, LaneError> {
+    let one = lanes.splat_bits::<U32, LANES>(1)?;
+    let on = lanes.equal(gate, one)?;
+    let turning = lanes.splat_bits::<U32, LANES>(TURNING)?;
+    let swing = lanes.splat_bits::<U32, LANES>(SWING)?;
+    let back_turning = lanes.splat_bits::<U32, LANES>(TURNING.wrapping_neg())?;
+    let back_swing = lanes.splat_bits::<U32, LANES>(SWING.wrapping_neg())?;
+    Ok((
+        lanes.select(on, turning, back_turning)?,
+        lanes.select(on, swing, back_swing)?,
+    ))
+}
+
+fn gated<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    first: Vector<U32, LANES>,
+    second: Vector<U32, LANES>,
+) -> Result<Vector<U32, LANES>, LaneError> {
+    let one = lanes.splat_bits::<U32, LANES>(1)?;
+    let sum = lanes.add(first, second)?;
+    lanes.and(sum, one)
+}
+
+fn scaled<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    one: Vector<U32, LANES>,
+    by: Vector<U32, LANES>,
+) -> Result<Vector<U32, LANES>, LaneError> {
+    let point = lanes.splat_bits::<U32, LANES>(POINT)?;
+    let held = lanes.mul(one, by)?;
+    lanes.shift_right_arithmetic(held, point)
+}
+
+fn spun<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    held: Pair<LANES>,
+    angle: Pair<LANES>,
+    back: bool,
+) -> Result<Pair<LANES>, LaneError> {
+    let (mut first, mut second) = held;
+    let (turning, swing) = angle;
+    if back {
+        let step = scaled::<LANES>(lanes, first, turning)?;
+        second = lanes.sub(second, step)?;
+        let step = scaled::<LANES>(lanes, second, swing)?;
+        first = lanes.add(first, step)?;
+        let step = scaled::<LANES>(lanes, first, turning)?;
+        second = lanes.sub(second, step)?;
+    } else {
+        let step = scaled::<LANES>(lanes, first, turning)?;
+        second = lanes.add(second, step)?;
+        let step = scaled::<LANES>(lanes, second, swing)?;
+        first = lanes.sub(first, step)?;
+        let step = scaled::<LANES>(lanes, first, turning)?;
+        second = lanes.add(second, step)?;
+    }
+    Ok((first, second))
+}
+
+fn slid<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    weight: Pair<LANES>,
+    angle: Pair<LANES>,
+) -> Result<Pair<LANES>, LaneError> {
+    let (mut first, mut second) = weight;
+    let (turning, swing) = angle;
+    let step = scaled::<LANES>(lanes, second, turning)?;
+    first = lanes.add(first, step)?;
+    let step = scaled::<LANES>(lanes, first, swing)?;
+    second = lanes.sub(second, step)?;
+    let step = scaled::<LANES>(lanes, second, turning)?;
+    first = lanes.add(first, step)?;
+    Ok((first, second))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +172,15 @@ fn onward<const LANES: u32>(
     if kind == Kind::Turn {
         return Ok([d, c, b, a]);
     }
+    if kind == Kind::Bound {
+        let gate = gated::<LANES>(lanes, c, d)?;
+        let angle = pinned::<LANES>(lanes, gate)?;
+        let (first, second) = spun::<LANES>(lanes, (a, b), angle, false)?;
+        let gate = gated::<LANES>(lanes, first, second)?;
+        let angle = pinned::<LANES>(lanes, gate)?;
+        let (third, fourth) = spun::<LANES>(lanes, (c, d), angle, false)?;
+        return Ok([fourth, third, second, first]);
+    }
     let step = mixed::<LANES>(lanes, kind, b, c, d)?;
     a = lanes.add(a, step)?;
     let step = mixed::<LANES>(lanes, kind, c, d, a)?;
@@ -110,6 +204,22 @@ fn backward<const LANES: u32>(
     let [mut ga, mut gb, mut gc, mut gd] = weight;
     if kind == Kind::Turn {
         return Ok(([d, c, b, a], [gd, gc, gb, ga]));
+    }
+    if kind == Kind::Bound {
+        let (first, second, third, fourth) = (d, c, b, a);
+        let (gfirst, gsecond, gthird, gfourth) = (gd, gc, gb, ga);
+        let gate = gated::<LANES>(lanes, first, second)?;
+        let later = pinned::<LANES>(lanes, gate)?;
+        let (third, fourth) = spun::<LANES>(lanes, (third, fourth), later, true)?;
+        let gate = gated::<LANES>(lanes, third, fourth)?;
+        let early = pinned::<LANES>(lanes, gate)?;
+        let (first, second) = spun::<LANES>(lanes, (first, second), early, true)?;
+        let (gthird, gfourth) = slid::<LANES>(lanes, (gthird, gfourth), later)?;
+        let (gfirst, gsecond) = slid::<LANES>(lanes, (gfirst, gsecond), early)?;
+        return Ok((
+            [first, second, third, fourth],
+            [gfirst, gsecond, gthird, gfourth],
+        ));
     }
     let wide = lanes.splat_bits::<U32, LANES>(PRODUCT)?;
     let narrow = lanes.splat_bits::<U32, LANES>(SHARE)?;
@@ -372,13 +482,66 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
     eprintln!("{worst:.4}");
 }
 
+#[test]
+fn the_bounded_rules_slope_is_the_slope_a_nudge_measures() {
+    let Some(host) = device("the_bounded_rules_slope_is_the_slope_a_nudge_measures") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Bound).unwrap(),
+        built(width, grid, Pass::Back, Kind::Bound).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+
+    let sizes = [8, grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: STEPS,
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    let watched = (grid.deep / 2 * grid.wide + grid.wide / 2) as usize;
+    let carried = board.slope(&start, watched);
+    let settled = board.run(&start)[watched];
+
+    let mut seen = 0;
+    let mut worst = 0.0_f64;
+    for at in 0..grid.cells() {
+        let told = carried[at];
+        if told == 0 || seen >= 6 {
+            continue;
+        }
+        let mut nudged = start.clone();
+        nudged[at] = nudged[at].wrapping_add(STEP);
+        let moved = board.run(&nudged)[watched].wrapping_sub(settled);
+        let wanted = (((told as i32) as i64 * i64::from(STEP)) >> POINT) as i32 as u32;
+        let apart = moved.abs_diff(wanted);
+        let share = f64::from(apart) / f64::from(moved.max(wanted).max(1));
+        eprintln!(
+            "{at} {} {} {} {apart} {share:.4}",
+            told as i32, moved as i32, wanted as i32
+        );
+        worst = worst.max(share);
+        seen += 1;
+    }
+
+    eprintln!("{seen} points, worst {worst:.4}");
+    assert!(seen >= 3);
+    assert!(worst < 0.05, "{worst}");
+}
+
 const ROUNDS: u32 = 40;
 
 const CEILING: u32 = 1 << 12;
 
 const PACE: u32 = 3;
 
-fn descended(board: &mut Board<'_>, grid: Grid) -> (f64, f64, f64, f64) {
+fn descended(board: &mut Board<'_>, grid: Grid, pace: u32, rounds: u32) -> (f64, f64, f64, f64) {
     let truth = spread(grid, 0x1234_5678);
     let target = board.run(&truth);
     let drift = spread(grid, 0x0BAD_C0DE);
@@ -397,7 +560,7 @@ fn descended(board: &mut Board<'_>, grid: Grid) -> (f64, f64, f64, f64) {
     let first = apart(&ended, &target);
     let mut strength = 0.0;
     let mut last = first;
-    for round in 0..ROUNDS {
+    for round in 0..rounds {
         let ended = board.run(&guess);
         let weight: Vec<u32> = ended
             .iter()
@@ -413,12 +576,91 @@ fn descended(board: &mut Board<'_>, grid: Grid) -> (f64, f64, f64, f64) {
                 / slope.len() as f64;
         }
         for (cell, step) in guess.iter_mut().zip(&slope) {
-            let moved = i64::from(*cell) - i64::from((*step as i32) >> PACE);
+            let moved = i64::from(*cell) - i64::from((*step as i32) >> pace);
             *cell = moved.clamp(0, i64::from(CEILING) - 1) as u32;
         }
         last = apart(&board.run(&guess), &target);
     }
     (first, last, strength, reached)
+}
+
+#[test]
+fn whether_the_bounded_rule_is_stalled_or_only_slow() {
+    let Some(host) = device("whether_the_bounded_rule_is_stalled_or_only_slow") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Bound).unwrap(),
+        built(width, grid, Pass::Back, Kind::Bound).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells()];
+
+    eprintln!(
+        "{:>7} {:>14} {:>14} {:>9}",
+        "rounds", "error first", "error last", "shrank"
+    );
+    let mut climbing = 0.0_f64;
+    for rounds in [40_u32, 160, 640] {
+        let resident = host.resident(&sizes, &modules).unwrap();
+        let mut board = Board {
+            resident,
+            over: Groups::Fixed(grid.quads().div_ceil(width)),
+            grid,
+            depth: 32,
+        };
+        let (first, last, _, _) = descended(&mut board, grid, PACE, rounds);
+        let shrank = if last > 0.0 { first / last } else { f64::MAX };
+        eprintln!("{rounds:>7} {first:>14.1} {last:>14.1} {shrank:>8.1}x");
+        climbing = climbing.max(shrank);
+    }
+    eprintln!("best {climbing:.1}x");
+    assert!(climbing > 1.0);
+}
+
+#[test]
+fn the_step_the_bounded_rule_wants_is_a_smaller_one() {
+    let Some(host) = device("the_step_the_bounded_rule_wants_is_a_smaller_one") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Bound).unwrap(),
+        built(width, grid, Pass::Back, Kind::Bound).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells()];
+
+    eprintln!(
+        "{:>7} {:>6} {:>14} {:>14} {:>9}",
+        "steps", "pace", "error first", "error last", "shrank"
+    );
+    let mut best = (0_u32, 0_u32, 1.0_f64);
+    for depth in [8_u32, 128] {
+        for pace in [0_u32, 1, 2, 3, 5] {
+            let resident = host.resident(&sizes, &modules).unwrap();
+            let mut board = Board {
+                resident,
+                over: Groups::Fixed(grid.quads().div_ceil(width)),
+                grid,
+                depth,
+            };
+            let (first, last, _, _) = descended(&mut board, grid, pace, ROUNDS);
+            let shrank = if last > 0.0 { first / last } else { f64::MAX };
+            eprintln!("{depth:>7} {pace:>6} {first:>14.1} {last:>14.1} {shrank:>8.1}x");
+            if shrank > best.2 {
+                best = (depth, pace, shrank);
+            }
+        }
+    }
+    eprintln!(
+        "best {:.1}x at {} steps with pace {}",
+        best.2, best.0, best.1
+    );
+    assert!(best.2 > 1.0);
 }
 
 #[test]
@@ -435,7 +677,7 @@ fn how_deep_the_descent_still_finds_its_way() {
         "rule", "steps", "state", "slope", "error first", "error last", "shrank by"
     );
     let mut reach = Vec::new();
-    for kind in [Kind::Product, Kind::Sum, Kind::Turn] {
+    for kind in [Kind::Product, Kind::Sum, Kind::Turn, Kind::Bound] {
         let passes = [
             built(width, grid, Pass::Ahead, kind).unwrap(),
             built(width, grid, Pass::Back, kind).unwrap(),
@@ -445,6 +687,7 @@ fn how_deep_the_descent_still_finds_its_way() {
             Kind::Product => "product",
             Kind::Sum => "sum",
             Kind::Turn => "turn",
+            Kind::Bound => "bound",
         };
         let mut deepest = 0_u32;
         for depth in [8_u32, 32, 128, 512] {
@@ -455,7 +698,7 @@ fn how_deep_the_descent_still_finds_its_way() {
                 grid,
                 depth,
             };
-            let (first, last, strength, reached) = descended(&mut board, grid);
+            let (first, last, strength, reached) = descended(&mut board, grid, PACE, ROUNDS);
             let shrank = if last > 0.0 { first / last } else { f64::MAX };
             eprintln!(
                 "{named:>9} {depth:>7} {reached:>14.1} {strength:>14.1} {first:>14.1} {last:>14.1} {shrank:>8.1}x"
