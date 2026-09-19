@@ -22,6 +22,8 @@ const ASKED_ABOVE: f64 = 0.25;
 
 const ASKING: u32 = 20;
 
+const COARSE_PASSES: usize = 5;
+
 const MARGIN: f64 = 0.10;
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
@@ -229,6 +231,7 @@ fn the_two_arrangements_a_choice_is_made_between_are_not_the_same_one() {
     }
     eprintln!("{} {}", with_stages.len(), without_stages.len());
     assert!(with_stages.len() > without_stages.len());
+    assert_eq!(with_passes.len(), without_passes.len() + COARSE_PASSES);
     let both = live::both(width, grid, &plan, None).unwrap();
 
     eprintln!(
