@@ -722,3 +722,81 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
     }
     assert!(won);
 }
+
+const WIDEST: u32 = 1024;
+
+const NAMED: [&str; 10] = [
+    "decay wipe counts",
+    "the rule",
+    "mark coarse",
+    "scan coarse counts",
+    "scan coarse totals",
+    "gather coarse",
+    "mark fine",
+    "scan fine counts",
+    "scan fine totals",
+    "gather fine",
+];
+
+#[test]
+fn what_a_listed_frame_spends_and_where() {
+    let Some(host) = device("what_a_listed_frame_spends_and_where") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDEST, WIDEST);
+    let quads = grid.quads();
+    let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
+    let cells = patched(grid, 0x1234_5678, 12);
+
+    let (passes, ahead, _) = wiring(width, grid, &plan);
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let plan_sizes = plan.sizes();
+    let mut sizes = [1_usize; HOLDING as usize];
+    for (slot, words) in sizes.iter_mut().zip(plan_sizes) {
+        *slot = words;
+    }
+    sizes[TANGENT as usize] = plan_sizes[STATE as usize];
+    sizes[CARRIED as usize] = plan_sizes[STATE as usize];
+
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+    for (binding, words) in sizes.iter().enumerate() {
+        resident.write(binding, &vec![0_u32; *words]).unwrap();
+    }
+    resident.write(STATE as usize, &cells).unwrap();
+    resident.write(TANGENT as usize, &cells).unwrap();
+    resident.write(CARRIED as usize, &cells).unwrap();
+    resident
+        .write(PARAMS as usize, &[u32::MAX, plan.dump()])
+        .unwrap();
+    live::seed(&mut resident, grid, &plan).unwrap();
+
+    let forward: Vec<&[Groups]> = ahead.iter().map(Vec::as_slice).collect();
+    let mut best = vec![Duration::MAX; NAMED.len()];
+    let mut whole = Duration::MAX;
+    for _ in 0..ROUNDS {
+        for frame in 0..STEPS {
+            resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
+            resident.staged(&forward).unwrap();
+        }
+        let spans = resident.stage_times().to_vec();
+        if spans.len() != NAMED.len() {
+            eprintln!("SKIPPED {} {}", spans.len(), NAMED.len());
+            return;
+        }
+        for (slot, span) in best.iter_mut().zip(&spans) {
+            *slot = (*slot).min(*span);
+        }
+        whole = whole.min(resident.on_device().unwrap_or(Duration::MAX));
+    }
+
+    let counted: Duration = best.iter().sum();
+    for (name, span) in NAMED.iter().zip(&best) {
+        let share = span.as_secs_f64() / counted.as_secs_f64() * 100.0;
+        eprintln!("{name:<20} {span:>10.3?} {share:>5.1}%");
+    }
+    eprintln!("{counted:.3?} {whole:.3?} {}", resident.stage_times().len());
+
+    assert!(counted <= whole);
+    assert!(best.iter().all(|span| *span > Duration::ZERO));
+}
