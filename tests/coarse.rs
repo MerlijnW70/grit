@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use grit::compact::Plan;
 use grit::layout::{BRUSH, GRAND, PARAMS, STATE};
-use grit::live::{COARSE_FROM, coarse_pays};
+use grit::live::{self, COARSE_FROM, coarse_pays};
 use grit::sand::{AIR, Grid, SAND, WALL};
 use grit::{Groups, Host, sweep};
 
@@ -193,4 +193,87 @@ fn the_threshold_is_where_the_two_arrangements_cross() {
     } else {
         eprintln!("{parted:?}");
     }
+}
+
+#[test]
+fn the_block_the_threshold_names_is_the_first_one_that_pays() {
+    assert!(!coarse_pays(COARSE_FROM - 1));
+    assert!(coarse_pays(COARSE_FROM));
+    assert!(coarse_pays(COARSE_FROM + 1));
+    assert!(!coarse_pays(0));
+}
+
+#[test]
+fn the_two_arrangements_a_choice_is_made_between_are_not_the_same_one() {
+    let Some(host) = device("the_two_arrangements_a_choice_is_made_between") else {
+        return;
+    };
+    let width = host.width();
+    let grid = sized(width, COARSE_FROM);
+    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
+
+    let (with_passes, _) = live::arranged(width, grid, &plan, None, true).unwrap();
+    let (without_passes, _) = live::arranged(width, grid, &plan, None, false).unwrap();
+    let both = live::both(width, grid, &plan, None).unwrap();
+
+    eprintln!(
+        "{} {} {}",
+        with_passes.len(),
+        without_passes.len(),
+        both.passes.len()
+    );
+    assert!(with_passes.len() > without_passes.len());
+    assert_eq!(both.passes.len(), with_passes.len() + without_passes.len());
+    assert_eq!(both.listed.len(), both.every.len());
+
+    let listed: usize = both
+        .listed
+        .iter()
+        .map(|stage| {
+            stage
+                .iter()
+                .filter(|held| !matches!(held, Groups::Fixed(0)))
+                .count()
+        })
+        .sum();
+    let every: usize = both
+        .every
+        .iter()
+        .map(|stage| {
+            stage
+                .iter()
+                .filter(|held| !matches!(held, Groups::Fixed(0)))
+                .count()
+        })
+        .sum();
+    assert_ne!(listed, every);
+}
+
+#[test]
+fn the_cheaper_arrangement_is_the_one_the_clock_named() {
+    let Some(host) = device("the_cheaper_arrangement_is_the_one_the_clock_named") else {
+        return;
+    };
+    let width = host.width();
+    let grid = sized(width, COARSE_FROM);
+    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
+    let both = live::both(width, grid, &plan, None).unwrap();
+
+    let modules: Vec<&[u32]> = both.passes.iter().map(Vec::as_slice).collect();
+    let sizes = plan.sizes();
+    let mut held = host.resident(&sizes, &modules).unwrap();
+    for (binding, words) in sizes.iter().enumerate() {
+        held.write(binding, &vec![0_u32; *words]).unwrap();
+    }
+    held.write(STATE as usize, &room(grid)).unwrap();
+    held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
+        .unwrap();
+    live::seed(&mut held, grid, &plan).unwrap();
+
+    let picked = live::cheaper(&mut held, &both, 4).unwrap();
+    eprintln!(
+        "{} {:.3?} {:.3?} {}",
+        picked.coarse, picked.listed, picked.every, picked.on_device
+    );
+    assert_eq!(picked.coarse, picked.listed < picked.every);
 }
