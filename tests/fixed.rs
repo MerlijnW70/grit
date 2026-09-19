@@ -1313,6 +1313,115 @@ fn strayed_where(one: &[u32], other: &[u32], live: &[bool]) -> f64 {
 }
 
 #[test]
+fn one_cells_share_of_the_slope_is_what_nudging_that_cell_measures() {
+    let Some(host) = device("one_cells_share_of_the_slope_is_what_nudging_that_cell_measures")
+    else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let base = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 64,
+        angle: (base, swing),
+        loud: 1,
+        planted: false,
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    let scatter = spread(grid, 0x00C0_FFEE);
+    let truth: Vec<u32> = scatter.iter().map(|one| base + (one % 33) - 16).collect();
+    board.tune(base, swing);
+    board.sow(&truth);
+    let target = board.run(&start);
+
+    let guess = vec![base; grid.cells()];
+    board.sow(&guess);
+    let ended = board.run(&start);
+    let weight: Vec<u32> = ended
+        .iter()
+        .zip(&target)
+        .map(|(one, other)| one.wrapping_sub(*other))
+        .collect();
+    board.sow(&guess);
+    board.carry(&start, &weight);
+    let told = board.told_each();
+    let back = f64::from(1_u32 << SPARE) * f64::from(board.loud);
+
+    let mut ranked: Vec<(usize, i32)> = told
+        .iter()
+        .enumerate()
+        .map(|(at, one)| (at, *one))
+        .collect();
+    ranked.sort_by_key(|(_, one)| -one.abs());
+
+    eprintln!(
+        "{:>8} {:>16} {:>16} {:>9}",
+        "cell", "its share", "nudging it says", "apart"
+    );
+    let mut told_worst = Vec::new();
+    for step in [8_i64, 32, 128] {
+        let mut worst = 0.0_f64;
+        let mut seen = 0_usize;
+        for (at, raw) in ranked.iter().take(6) {
+            let mine = f64::from(*raw) / back;
+
+            let mut above = guess.clone();
+            above[*at] = (i64::from(guess[*at]) + step) as u32;
+            board.sow(&above);
+            let high = squared(&board.run(&start), &target);
+
+            let mut below = guess.clone();
+            below[*at] = (i64::from(guess[*at]) - step) as u32;
+            board.sow(&below);
+            let low = squared(&board.run(&start), &target);
+
+            let nudged = (high - low) / (2.0 * step as f64);
+            let apart = (mine - nudged).abs() / mine.abs().max(nudged.abs()).max(1.0);
+            if step == 32 {
+                eprintln!("{at:>8} {mine:>16.1} {nudged:>16.1} {apart:>8.4}");
+            }
+            worst = worst.max(apart);
+            seen += 1;
+        }
+        eprintln!("a nudge of {step:>4}: worst of {seen} is {worst:.4}");
+        told_worst.push((step, worst));
+    }
+
+    let best = told_worst
+        .iter()
+        .map(|(_, one)| *one)
+        .fold(f64::MAX, f64::min);
+    let ends = told_worst
+        .iter()
+        .filter(|(step, _)| *step != 32)
+        .map(|(_, one)| *one)
+        .fold(0.0_f64, f64::max);
+    eprintln!("best {best:.4}, and worse at both ends, up to {ends:.4}");
+    assert!(best < 0.05, "{best}");
+    assert!(ends > best, "{best} {ends}");
+}
+
+#[test]
 fn many_numbers_at_once_are_what_the_walk_back_is_for() {
     let Some(host) = device("many_numbers_at_once_are_what_the_walk_back_is_for") else {
         return;
