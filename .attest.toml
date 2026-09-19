@@ -17,6 +17,12 @@ scope = ["src/live.rs", "src/resident.rs"]
 timeout = 1800
 
 [[benchmarks]]
+name = "stages"
+command = "cargo run --release --bin stages"
+scope = ["src/live.rs", "src/compact.rs", "src/sweep.rs"]
+timeout = 1800
+
+[[benchmarks]]
 name = "suite"
 command = "cargo test --quiet"
 scope = ["src", "tests"]
