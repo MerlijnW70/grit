@@ -14,7 +14,9 @@ const DEEP: u32 = 64;
 const STEPS: u32 = 8;
 
 const SLOPE: u32 = 2;
-const BINDINGS: u32 = 3;
+const TOLD_TURNING: u32 = 3;
+const TOLD_SWING: u32 = 4;
+const BINDINGS: u32 = 5;
 
 const POINT: u32 = 16;
 
@@ -32,6 +34,8 @@ const STEP: u32 = 1 << 9;
 const GRAIN: u32 = 2;
 
 const FLOOR: f64 = 1.0;
+
+const SPARE: u32 = 8;
 
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
@@ -95,6 +99,16 @@ fn scaled<const LANES: u32>(
     lanes.shift_right_arithmetic(held, point)
 }
 
+fn finer<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    one: Vector<U32, LANES>,
+    by: Vector<U32, LANES>,
+) -> Result<Vector<U32, LANES>, LaneError> {
+    let point = lanes.splat_bits::<U32, LANES>(POINT - SPARE)?;
+    let held = lanes.mul(one, by)?;
+    lanes.shift_right_arithmetic(held, point)
+}
+
 fn spun<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     held: Pair<LANES>,
@@ -121,20 +135,44 @@ fn spun<const LANES: u32>(
     Ok((first, second))
 }
 
-fn slid<const LANES: u32>(
+type Unwound<const LANES: u32> = (Pair<LANES>, Pair<LANES>, Pair<LANES>);
+
+fn unspun<const LANES: u32>(
     lanes: &mut Lanes<'_>,
+    held: Pair<LANES>,
     weight: Pair<LANES>,
     angle: Pair<LANES>,
-) -> Result<Pair<LANES>, LaneError> {
-    let (mut first, mut second) = weight;
+) -> Result<Unwound<LANES>, LaneError> {
+    let (mut first, mut second) = held;
+    let (mut gfirst, mut gsecond) = weight;
     let (turning, swing) = angle;
-    let step = scaled::<LANES>(lanes, second, turning)?;
-    first = lanes.add(first, step)?;
-    let step = scaled::<LANES>(lanes, first, swing)?;
+    let none = lanes.splat_bits::<U32, LANES>(0)?;
+
+    let mut told_turning = finer::<LANES>(lanes, gsecond, first)?;
+    let step = scaled::<LANES>(lanes, first, turning)?;
     second = lanes.sub(second, step)?;
-    let step = scaled::<LANES>(lanes, second, turning)?;
+    let step = scaled::<LANES>(lanes, gsecond, turning)?;
+    gfirst = lanes.add(gfirst, step)?;
+
+    let against = finer::<LANES>(lanes, gfirst, second)?;
+    let told_swing = lanes.sub(none, against)?;
+    let step = scaled::<LANES>(lanes, second, swing)?;
     first = lanes.add(first, step)?;
-    Ok((first, second))
+    let step = scaled::<LANES>(lanes, gfirst, swing)?;
+    gsecond = lanes.sub(gsecond, step)?;
+
+    let more = finer::<LANES>(lanes, gsecond, first)?;
+    told_turning = lanes.add(told_turning, more)?;
+    let step = scaled::<LANES>(lanes, first, turning)?;
+    second = lanes.sub(second, step)?;
+    let step = scaled::<LANES>(lanes, gsecond, turning)?;
+    gfirst = lanes.add(gfirst, step)?;
+
+    Ok((
+        (first, second),
+        (gfirst, gsecond),
+        (told_turning, told_swing),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +244,11 @@ fn onward<const LANES: u32>(
     Ok([a, b, c, d])
 }
 
-type Both<const LANES: u32> = ([Vector<U32, LANES>; 4], [Vector<U32, LANES>; 4]);
+type Both<const LANES: u32> = (
+    [Vector<U32, LANES>; 4],
+    [Vector<U32, LANES>; 4],
+    Pair<LANES>,
+);
 
 fn backward<const LANES: u32>(
     lanes: &mut Lanes<'_>,
@@ -218,7 +260,8 @@ fn backward<const LANES: u32>(
     let [mut a, mut b, mut c, mut d] = held;
     let [mut ga, mut gb, mut gc, mut gd] = weight;
     if kind == Kind::Turn {
-        return Ok(([d, c, b, a], [gd, gc, gb, ga]));
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        return Ok(([d, c, b, a], [gd, gc, gb, ga], (none, none)));
     }
     if kind == Kind::Bound || kind == Kind::Smooth {
         let steady = kind == Kind::Smooth;
@@ -230,19 +273,22 @@ fn backward<const LANES: u32>(
             gated::<LANES>(lanes, first, second)?
         };
         let later = pinned::<LANES>(lanes, gate, angle)?;
-        let (third, fourth) = spun::<LANES>(lanes, (third, fourth), later, true)?;
+        let ((third, fourth), (gthird, gfourth), late_told) =
+            unspun::<LANES>(lanes, (third, fourth), (gthird, gfourth), later)?;
         let gate = if steady {
             lanes.splat_bits::<U32, LANES>(1)?
         } else {
             gated::<LANES>(lanes, third, fourth)?
         };
         let early = pinned::<LANES>(lanes, gate, angle)?;
-        let (first, second) = spun::<LANES>(lanes, (first, second), early, true)?;
-        let (gthird, gfourth) = slid::<LANES>(lanes, (gthird, gfourth), later)?;
-        let (gfirst, gsecond) = slid::<LANES>(lanes, (gfirst, gsecond), early)?;
+        let ((first, second), (gfirst, gsecond), early_told) =
+            unspun::<LANES>(lanes, (first, second), (gfirst, gsecond), early)?;
+        let told_turning = lanes.add(late_told.0, early_told.0)?;
+        let told_swing = lanes.add(late_told.1, early_told.1)?;
         return Ok((
             [first, second, third, fourth],
             [gfirst, gsecond, gthird, gfourth],
+            (told_turning, told_swing),
         ));
     }
     let wide = lanes.splat_bits::<U32, LANES>(PRODUCT)?;
@@ -296,7 +342,8 @@ fn backward<const LANES: u32>(
     gc = lanes.add(gc, to_c)?;
     gd = lanes.add(gd, to_d)?;
 
-    Ok(([a, b, c, d], [ga, gb, gc, gd]))
+    let none = lanes.splat_bits::<U32, LANES>(0)?;
+    Ok(([a, b, c, d], [ga, gb, gc, gd], (none, none)))
 }
 
 fn built(subgroup: u32, grid: Grid, pass: Pass, kind: Kind) -> Result<Vec<u32>, LaneError> {
@@ -378,9 +425,9 @@ fn building<const LANES: u32>(
                     lanes.splat_id::<U32, LANES>(turning)?,
                     lanes.splat_id::<U32, LANES>(swing)?,
                 );
-                let (state_back, weight_back) =
+                let (state_back, weight_back, told) =
                     backward::<LANES>(&mut lanes, kind, held, weight, angle)?;
-                (state_back, Some(weight_back))
+                (state_back, Some((weight_back, told)))
             }
         }
     };
@@ -388,9 +435,19 @@ fn building<const LANES: u32>(
     for (place, value) in places.iter().zip(&state_next) {
         kernel.store_at(STATE, place.id(), value.id())?;
     }
-    if let Some(next) = weight_next {
+    if let Some((next, told)) = weight_next {
         for (place, value) in places.iter().zip(&next) {
             kernel.store_at(SLOPE, place.id(), value.id())?;
+        }
+        let here = places[0].id();
+        for (binding, part) in [(TOLD_TURNING, told.0), (TOLD_SWING, told.1)] {
+            let held = kernel.load_at(binding, here)?;
+            let piled = {
+                let mut lanes = kernel.lanes()?;
+                let before = lanes.splat_id::<U32, LANES>(held)?;
+                lanes.add(before, part)?
+            };
+            kernel.store_at(binding, here, piled.id())?;
         }
     }
     kernel.finish()
@@ -429,8 +486,29 @@ impl Board<'_> {
         self.carry(cells, &weight).0
     }
 
+    fn wipe(&mut self) {
+        let blank = vec![0_u32; self.grid.cells()];
+        self.resident.write(TOLD_TURNING as usize, &blank).unwrap();
+        self.resident.write(TOLD_SWING as usize, &blank).unwrap();
+    }
+
+    fn told(&mut self) -> (f64, f64) {
+        let piled = |held: Vec<u32>| held.iter().map(|one| f64::from(*one as i32)).sum::<f64>();
+        let turning = self
+            .resident
+            .read(TOLD_TURNING as usize, self.grid.cells())
+            .unwrap();
+        let swing = self
+            .resident
+            .read(TOLD_SWING as usize, self.grid.cells())
+            .unwrap();
+        let back = f64::from(1_u32 << SPARE);
+        (piled(turning) / back, piled(swing) / back)
+    }
+
     fn carry(&mut self, cells: &[u32], weight: &[u32]) -> (Vec<u32>, Vec<u32>) {
         let ended = self.run(cells);
+        self.wipe();
         self.resident.write(STATE as usize, &ended).unwrap();
         self.resident
             .write_at(PARAMS as usize, 4, &[self.angle.0, self.angle.1])
@@ -484,7 +562,7 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -542,7 +620,7 @@ fn the_bounded_rules_slope_is_the_slope_a_nudge_measures() {
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -711,7 +789,7 @@ fn only_the_last_depth_counts_and_the_shallowest_wins() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
     let rounds = 30_u32;
 
     let ways: [(&str, Vec<u32>); 7] = [
@@ -784,7 +862,7 @@ fn whether_the_descent_works_where_the_loss_can_still_see() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
 
     eprintln!(
         "{:>9} {:>7} {:>14} {:>14} {:>9}",
@@ -825,6 +903,86 @@ fn whether_the_descent_works_where_the_loss_can_still_see() {
     assert!(weak > strong, "{weak} {strong}");
 }
 
+fn squared(one: &[u32], other: &[u32]) -> f64 {
+    one.iter()
+        .zip(other)
+        .map(|(held, want)| {
+            let apart = f64::from(held.wrapping_sub(*want) as i32);
+            apart * apart
+        })
+        .sum::<f64>()
+        / 2.0
+}
+
+#[test]
+fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
+    let Some(host) = device("the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let base = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 1,
+        angle: (base, swing),
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    eprintln!(
+        "{:>7} {:>8} {:>16} {:>16} {:>9}",
+        "steps", "at", "told", "a nudge says", "apart"
+    );
+
+    let mut worst = 0.0_f64;
+    for depth in [1_u32, 4, 16, 64] {
+        board.depth = depth;
+        board.angle = (base, swing);
+        let target = board.run(&start);
+
+        for away in [64_u32, 192] {
+            let here = base + away;
+            board.angle = (here, swing);
+            let ended = board.run(&start);
+            let weight: Vec<u32> = ended
+                .iter()
+                .zip(&target)
+                .map(|(one, other)| one.wrapping_sub(*other))
+                .collect();
+            board.carry(&start, &weight);
+            let (told, _) = board.told();
+
+            let step = 16_u32;
+            board.angle = (here + step, swing);
+            let above = squared(&board.run(&start), &target);
+            board.angle = (here - step, swing);
+            let below = squared(&board.run(&start), &target);
+            let nudged = (above - below) / f64::from(2 * step);
+
+            let apart = (told - nudged).abs() / told.abs().max(nudged.abs()).max(1.0);
+            eprintln!("{depth:>7} {here:>8} {told:>16.1} {nudged:>16.1} {apart:>8.4}");
+            if away == 192 {
+                worst = worst.max(apart);
+            }
+            assert!(told * nudged > 0.0, "{depth} {here} {told} {nudged}");
+        }
+    }
+
+    eprintln!("worst disagreement well clear of the quantum {worst:.4}");
+    assert!(worst < 0.05, "{worst}");
+}
+
 #[test]
 fn the_window_where_the_angle_can_be_asked_for() {
     let Some(host) = device("the_window_where_the_angle_can_be_asked_for") else {
@@ -837,7 +995,7 @@ fn the_window_where_the_angle_can_be_asked_for() {
         built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
     let resident = host.resident(&sizes, &modules).unwrap();
 
     let base = TURNING / 64;
@@ -918,7 +1076,7 @@ fn how_far_back_the_loss_can_still_see() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -985,7 +1143,7 @@ fn whether_the_loss_can_see_the_angle_it_was_made_with() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -1031,7 +1189,7 @@ fn whether_the_slope_points_home() {
     };
     let width = host.width();
     let grid = Grid::of(WIDE, DEEP);
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
 
     for kind in [Kind::Turn, Kind::Bound] {
         let passes = [
@@ -1103,7 +1261,7 @@ fn whether_the_bounded_rule_is_stalled_or_only_slow() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
 
     eprintln!(
         "{:>7} {:>14} {:>14} {:>9}",
@@ -1140,7 +1298,7 @@ fn the_step_the_bounded_rule_wants_is_a_smaller_one() {
         built(width, grid, Pass::Back, Kind::Bound).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
 
     eprintln!(
         "{:>7} {:>6} {:>14} {:>14} {:>9}",
@@ -1179,7 +1337,7 @@ fn how_deep_the_descent_still_finds_its_way() {
     };
     let width = host.width();
     let grid = Grid::of(WIDE, DEEP);
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
 
     eprintln!(
         "{:>9} {:>7} {:>14} {:>14} {:>14} {:>14} {:>9}",
@@ -1251,7 +1409,7 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
         built(width, grid, Pass::Back, Kind::Product).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let sizes = [8, grid.cells(), grid.cells()];
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
     let resident = host.resident(&sizes, &modules).unwrap();
     let mut board = Board {
         resident,
@@ -1404,7 +1562,9 @@ fn over_listing<const LANES: u32>(
             }
             Pass::Back => {
                 let none = lanes.splat_bits::<U32, LANES>(0)?;
-                backward::<LANES>(&mut lanes, Kind::Product, block, along, (none, none))?
+                let (state, weight, _) =
+                    backward::<LANES>(&mut lanes, Kind::Product, block, along, (none, none))?;
+                (state, weight)
             }
         };
 
