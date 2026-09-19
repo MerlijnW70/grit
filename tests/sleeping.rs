@@ -1,10 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::compact::{Over, Plan, Tier};
-use grit::layout::{BASES, BINDINGS, COUNTS, DENSE, GRAND, PARAMS, STATE, TOTALS};
+use grit::compact::Plan;
+use grit::layout::{BINDINGS, DENSE, GRAND, PARAMS, STATE};
 use grit::live::{Waking, corners, wake};
 use grit::sand::{self, Grid};
-use grit::{Groups, Host, compact, live, sweep};
+use grit::{Groups, Host, live, sweep};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 
@@ -326,8 +326,6 @@ fn stepped(host: &Host, grid: Grid, cells: &[u32], sparse: bool, rule: Rule) -> 
     let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
 
     let one = Groups::Fixed(1);
-    let blocks = Groups::Fixed(plan.blocks);
-    let tiles = Groups::Fixed(plan.tiles);
     let over = Groups::Fixed(quads.div_ceil(width));
 
     let turning = if sparse {
@@ -335,21 +333,16 @@ fn stepped(host: &Host, grid: Grid, cells: &[u32], sparse: bool, rule: Rule) -> 
     } else {
         every(width, grid, false, rule).unwrap()
     };
-    let passes = if sparse {
-        vec![
-            live::tick(width).unwrap(),
-            live::decay(width, Over::Every).unwrap(),
-            live::wipe(width).unwrap(),
-            live::wipe_counts(width, COUNTS).unwrap(),
-            turning,
-            live::mark(width, Tier::FINE, Over::Every).unwrap(),
-            compact::scan(width, COUNTS, BASES, TOTALS).unwrap(),
-            compact::scan(width, TOTALS, TOTALS, GRAND).unwrap(),
-            compact::gather(width, Tier::FINE, Over::Every, plan.dump()).unwrap(),
-            compact::prepare(width, width, Tier::FINE).unwrap(),
-        ]
+    let (passes, stages) = if sparse {
+        let keeping = live::keeping(width, &plan, false).unwrap();
+        let mut stages = vec![vec![(live::tick(width).unwrap(), Groups::Fixed(1))]];
+        stages.extend(keeping.before);
+        stages.push(vec![(turning, keeping.over)]);
+        stages.extend(keeping.after);
+        let (passes, groups) = live::staged(stages);
+        (passes, Some(groups))
     } else {
-        vec![live::tick(width).unwrap(), turning]
+        (vec![live::tick(width).unwrap(), turning], None)
     };
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
@@ -364,18 +357,8 @@ fn stepped(host: &Host, grid: Grid, cells: &[u32], sparse: bool, rule: Rule) -> 
         .unwrap();
     live::seed(&mut resident, grid, &plan).unwrap();
 
-    let stages: Vec<Vec<Groups>> = if sparse {
-        vec![
-            vec![one, blocks, one, tiles],
-            vec![Plan::listed()],
-            vec![blocks],
-            vec![tiles],
-            vec![one],
-            vec![blocks, Groups::Counting(1)],
-        ]
-    } else {
-        vec![vec![one], vec![over]]
-    };
+    let plain = vec![vec![one], vec![over]];
+    let stages = stages.unwrap_or(plain);
     let staged: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
 
     for _ in 0..STEPS {
@@ -422,23 +405,17 @@ fn both_ways(host: &Host, grid: Grid, cells: &[u32], rule: Rule) -> (Vec<u32>, V
     let quads = grid.quads();
     let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
 
-    let one = Groups::Fixed(1);
-    let blocks = Groups::Fixed(plan.blocks);
-    let tiles = Groups::Fixed(plan.tiles);
     let none = Groups::Fixed(0);
 
-    let passes = vec![
-        live::decay(width, Over::Every).unwrap(),
-        live::wipe(width).unwrap(),
-        live::wipe_counts(width, COUNTS).unwrap(),
-        listed(width, grid, false, rule).unwrap(),
-        listed(width, grid, true, rule).unwrap(),
-        live::mark(width, Tier::FINE, Over::Every).unwrap(),
-        compact::scan(width, COUNTS, BASES, TOTALS).unwrap(),
-        compact::scan(width, TOTALS, TOTALS, GRAND).unwrap(),
-        compact::gather(width, Tier::FINE, Over::Every, plan.dump()).unwrap(),
-        compact::prepare(width, width, Tier::FINE).unwrap(),
+    let keeping = live::keeping(width, &plan, false).unwrap();
+    let rules = vec![
+        (listed(width, grid, false, rule).unwrap(), keeping.over),
+        (listed(width, grid, true, rule).unwrap(), none),
     ];
+    let mut ahead_stages = keeping.before.clone();
+    ahead_stages.push(rules.clone());
+    ahead_stages.extend(keeping.after.clone());
+    let (passes, ahead_groups) = live::staged(ahead_stages);
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
     let sizes = plan.sizes();
@@ -452,22 +429,17 @@ fn both_ways(host: &Host, grid: Grid, cells: &[u32], rule: Rule) -> (Vec<u32>, V
         .unwrap();
     live::seed(&mut resident, grid, &plan).unwrap();
 
-    let ahead: Vec<Vec<Groups>> = vec![
-        vec![blocks, one, tiles],
-        vec![Plan::listed(), none],
-        vec![blocks],
-        vec![tiles],
-        vec![one],
-        vec![blocks, Groups::Counting(1)],
-    ];
-    let back: Vec<Vec<Groups>> = vec![
-        vec![blocks, one, tiles],
-        vec![none, Plan::listed()],
-        vec![blocks],
-        vec![tiles],
-        vec![one],
-        vec![blocks, Groups::Counting(1)],
-    ];
+    let ahead = ahead_groups;
+    let back: Vec<Vec<Groups>> = ahead
+        .iter()
+        .map(|stage| {
+            if stage.len() == 2 && stage[1] == none {
+                vec![none, keeping.over]
+            } else {
+                stage.clone()
+            }
+        })
+        .collect();
     let forward: Vec<&[Groups]> = ahead.iter().map(Vec::as_slice).collect();
     let backward: Vec<&[Groups]> = back.iter().map(Vec::as_slice).collect();
 

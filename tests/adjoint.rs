@@ -2,14 +2,11 @@
 
 use std::time::Duration;
 
-use grit::compact::{Over, Plan, Tier};
-use grit::layout::{
-    BASES, BINDINGS, COUNTS, DENSE, GRAND, HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_TOTALS,
-    PARAMS, STATE, TOTALS,
-};
+use grit::compact::Plan;
+use grit::layout::{BINDINGS, DENSE, GRAND, PARAMS, STATE};
 use grit::live::{Waking, corners, wake};
 use grit::sand::Grid;
-use grit::{Groups, Host, compact, live, sweep};
+use grit::{Groups, Host, live, sweep};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 
@@ -513,49 +510,25 @@ const ROUNDS: u32 = 5;
 type Wiring = (Vec<Vec<u32>>, Vec<Vec<Groups>>, Vec<Vec<Groups>>);
 
 fn wiring(width: u32, grid: Grid, plan: &Plan) -> Wiring {
-    let one = Groups::Fixed(1);
-    let tiles = Groups::Fixed(plan.tiles);
-    let hot_tiles = Groups::Fixed(plan.hot_tiles);
-    let hot = Plan::hot_listed();
     let none = Groups::Fixed(0);
+    let keeping = live::keeping(width, plan, true).unwrap();
 
-    let passes = vec![
-        live::decay(width, Over::Listed(HOT_DENSE)).unwrap(),
-        live::wipe(width).unwrap(),
-        live::wipe_counts(width, COUNTS).unwrap(),
-        over_list(width, grid, Pass::Tangent).unwrap(),
-        over_list(width, grid, Pass::Adjoint).unwrap(),
-        live::mark(width, Tier::COARSE, Over::Every).unwrap(),
-        compact::scan(width, HOT_COUNTS, HOT_BASES, HOT_TOTALS).unwrap(),
-        compact::scan(width, HOT_TOTALS, HOT_TOTALS, HOT_GRAND).unwrap(),
-        compact::gather(width, Tier::COARSE, Over::Every, plan.hot_dump()).unwrap(),
-        compact::prepare(width, 1, Tier::COARSE).unwrap(),
-        live::mark(width, Tier::FINE, Over::Listed(HOT_DENSE)).unwrap(),
-        compact::scan(width, COUNTS, BASES, TOTALS).unwrap(),
-        compact::scan(width, TOTALS, TOTALS, GRAND).unwrap(),
-        compact::gather(width, Tier::FINE, Over::Listed(HOT_DENSE), plan.dump()).unwrap(),
-        compact::prepare(width, width, Tier::FINE).unwrap(),
-    ];
-
-    let shaped = |rule: [Groups; 2]| {
+    let rules = |first: Groups, second: Groups| {
         vec![
-            vec![hot, one, tiles],
-            vec![rule[0], rule[1]],
-            vec![tiles],
-            vec![hot_tiles],
-            vec![one],
-            vec![tiles, Groups::Counting(1)],
-            vec![hot],
-            vec![tiles],
-            vec![one],
-            vec![hot, Groups::Counting(1)],
+            (over_list(width, grid, Pass::Tangent).unwrap(), first),
+            (over_list(width, grid, Pass::Adjoint).unwrap(), second),
         ]
     };
-    (
-        passes,
-        shaped([Plan::listed(), none]),
-        shaped([none, Plan::listed()]),
-    )
+    let shaped = |first: Groups, second: Groups| {
+        let mut stages = keeping.before.clone();
+        stages.push(rules(first, second));
+        stages.extend(keeping.after.clone());
+        stages
+    };
+
+    let (passes, ahead) = live::staged(shaped(keeping.over, none));
+    let (_, back) = live::staged(shaped(none, keeping.over));
+    (passes, ahead, back)
 }
 
 fn ran_over(host: &Host, grid: Grid, held: [&[u32]; 3], sparse: bool, rounds: u32) -> Ran {

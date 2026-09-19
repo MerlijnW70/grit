@@ -35,6 +35,106 @@ pub fn wired(
     arranged(subgroup, grid, plan, picture, coarse_pays(plan.blocks))
 }
 
+pub type Stages = Vec<Vec<(Vec<u32>, crate::Groups)>>;
+
+pub struct Keeping {
+    pub before: Stages,
+    pub after: Stages,
+    pub over: crate::Groups,
+}
+
+pub fn keeping(
+    subgroup: u32,
+    plan: &crate::compact::Plan,
+    coarse: bool,
+) -> Result<Keeping, LaneError> {
+    use crate::Groups;
+    use crate::layout::{
+        BASES, GRAND, HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_TOTALS, TOTALS,
+    };
+    use crate::sweep::COUNTS;
+
+    let (listed, hot) = if coarse {
+        (Over::Listed(HOT_DENSE), crate::compact::Plan::hot_listed())
+    } else {
+        (Over::Every, Groups::Fixed(plan.blocks))
+    };
+    let tiles = Groups::Fixed(plan.tiles);
+    let one = Groups::Fixed(1);
+
+    let before = vec![vec![
+        (decay(subgroup, listed)?, hot),
+        (wipe(subgroup)?, one),
+        (wipe_counts(subgroup, COUNTS)?, tiles),
+    ]];
+
+    let mut after: Stages = Vec::new();
+    if coarse {
+        after.push(vec![(mark(subgroup, Tier::COARSE, Over::Every)?, tiles)]);
+        after.push(vec![(
+            crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
+            Groups::Fixed(plan.hot_tiles),
+        )]);
+        after.push(vec![(
+            crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
+            one,
+        )]);
+        after.push(vec![
+            (
+                crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
+                tiles,
+            ),
+            (
+                crate::compact::prepare(subgroup, 1, Tier::COARSE)?,
+                Groups::Counting(1),
+            ),
+        ]);
+    }
+    after.push(vec![(mark(subgroup, Tier::FINE, listed)?, hot)]);
+    after.push(vec![(
+        crate::compact::scan(subgroup, COUNTS, BASES, TOTALS)?,
+        tiles,
+    )]);
+    after.push(vec![(
+        crate::compact::scan(subgroup, TOTALS, TOTALS, GRAND)?,
+        one,
+    )]);
+    after.push(vec![
+        (
+            crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
+            hot,
+        ),
+        (
+            crate::compact::prepare(subgroup, subgroup, Tier::FINE)?,
+            Groups::Counting(1),
+        ),
+    ]);
+
+    Ok(Keeping {
+        before,
+        after,
+        over: crate::compact::Plan::listed(),
+    })
+}
+
+#[must_use]
+pub fn staged(stages: Stages) -> Loop {
+    let mut passes = Vec::new();
+    let mut groups = Vec::with_capacity(stages.len());
+    for stage in stages {
+        if stage.is_empty() {
+            continue;
+        }
+        let mut counts = Vec::with_capacity(stage.len());
+        for (module, over) in stage {
+            passes.push(module);
+            counts.push(over);
+        }
+        groups.push(counts);
+    }
+    (passes, groups)
+}
+
 pub fn arranged(
     subgroup: u32,
     grid: Grid,
