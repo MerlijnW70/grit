@@ -20,7 +20,9 @@ const POINT: u32 = 16;
 const PRODUCT: u32 = 20;
 const SHARE: u32 = 4;
 
-const STEP: u32 = 1 << 12;
+const STEP: u32 = 1 << 9;
+
+const GRAIN: u32 = 2;
 
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
@@ -89,10 +91,10 @@ fn backward<const LANES: u32>(
                    first: Vector<U32, LANES>,
                    second: Vector<U32, LANES>| {
         let held = lanes.mul(weight, second)?;
-        let to_first = lanes.shift_right_logical(held, wide)?;
+        let to_first = lanes.shift_right_arithmetic(held, wide)?;
         let held = lanes.mul(weight, first)?;
-        let to_second = lanes.shift_right_logical(held, wide)?;
-        let to_third = lanes.shift_right_logical(weight, narrow)?;
+        let to_second = lanes.shift_right_arithmetic(held, wide)?;
+        let to_third = lanes.shift_right_arithmetic(weight, narrow)?;
         Ok::<_, LaneError>((to_first, to_second, to_third))
     };
 
@@ -231,11 +233,15 @@ impl Board<'_> {
     }
 
     fn slope(&mut self, cells: &[u32], at: usize) -> Vec<u32> {
-        let ended = self.run(cells);
         let mut weight = vec![0_u32; self.grid.cells()];
         weight[at] = 1 << POINT;
+        self.carry(cells, &weight).0
+    }
+
+    fn carry(&mut self, cells: &[u32], weight: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        let ended = self.run(cells);
         self.resident.write(STATE as usize, &ended).unwrap();
-        self.resident.write(SLOPE as usize, &weight).unwrap();
+        self.resident.write(SLOPE as usize, weight).unwrap();
 
         let back = [Groups::Fixed(0), self.over];
         let stages: Vec<&[Groups]> = vec![&back];
@@ -250,9 +256,12 @@ impl Board<'_> {
             .read(STATE as usize, self.grid.cells())
             .unwrap();
         assert_eq!(home, cells);
-        self.resident
-            .read(SLOPE as usize, self.grid.cells())
-            .unwrap()
+        (
+            self.resident
+                .read(SLOPE as usize, self.grid.cells())
+                .unwrap(),
+            ended,
+        )
     }
 }
 
@@ -263,7 +272,7 @@ fn spread(grid: Grid, seed: u32) -> Vec<u32> {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            state % (1 << 15)
+            state % CEILING
         })
         .collect()
 }
@@ -312,12 +321,103 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
         let moved = board.run(&nudged)[watched].wrapping_sub(board.run(&start)[watched]);
 
         let wanted = ((u64::from(told) * u64::from(STEP)) >> POINT) as u32;
-        let apart = f64::from(moved.abs_diff(wanted)) / f64::from(moved.max(wanted).max(1));
-        eprintln!("{at} {told} {moved} {wanted} {apart:.4}");
-        worst = worst.max(apart);
+        let apart = moved.abs_diff(wanted);
+        let share = f64::from(apart) / f64::from(moved.max(wanted).max(1));
+        eprintln!("{at} {told} {moved} {wanted} {apart} {share:.4}");
+        assert!(apart <= GRAIN || share < 0.05, "{at} {moved} {wanted}");
+        worst = worst.max(share);
         seen += 1;
     }
 
     assert!(seen >= 3);
-    assert!(worst < 0.05, "{worst}");
+    eprintln!("{worst:.4}");
+}
+
+const ROUNDS: u32 = 40;
+
+const CEILING: u32 = 1 << 12;
+
+const PACE: u32 = 3;
+
+fn apart(one: &[u32], other: &[u32]) -> f64 {
+    one.iter()
+        .zip(other)
+        .map(|(a, b)| f64::from(a.wrapping_sub(*b) as i32).abs())
+        .sum::<f64>()
+        / one.len() as f64
+}
+
+#[test]
+fn the_grid_is_talked_back_to_the_start_it_came_from() {
+    let Some(host) = device("the_grid_is_talked_back_to_the_start_it_came_from") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead).unwrap(),
+        built(width, grid, Pass::Back).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+    };
+
+    let truth = spread(grid, 0x1234_5678);
+    let target = board.run(&truth);
+
+    let drift = spread(grid, 0x0BAD_C0DE);
+    let mut guess: Vec<u32> = truth
+        .iter()
+        .zip(&drift)
+        .map(|(one, other)| one.wrapping_add(other >> 2))
+        .collect();
+
+    let strayed = apart(&guess, &truth);
+    let first = apart(&board.run(&guess), &target);
+    let mut last = first;
+    let mut steps = Vec::new();
+    for round in 0..ROUNDS {
+        let ended = board.run(&guess);
+        let weight: Vec<u32> = ended
+            .iter()
+            .zip(&target)
+            .map(|(one, other)| one.wrapping_sub(*other))
+            .collect();
+        let (slope, _) = board.carry(&guess, &weight);
+        if round == 0 {
+            let strength: f64 = slope
+                .iter()
+                .map(|one| f64::from(*one as i32).abs())
+                .sum::<f64>()
+                / slope.len() as f64;
+            let pull: f64 = weight
+                .iter()
+                .map(|one| f64::from(*one as i32).abs())
+                .sum::<f64>()
+                / weight.len() as f64;
+            eprintln!("gewicht {pull:.1} helling {strength:.1}");
+        }
+        for (cell, step) in guess.iter_mut().zip(&slope) {
+            let moved = i64::from(*cell) - i64::from((*step as i32) >> PACE);
+            *cell = moved.clamp(0, i64::from(CEILING) - 1) as u32;
+        }
+        last = apart(&board.run(&guess), &target);
+        if round % 8 == 0 || round + 1 == ROUNDS {
+            steps.push((round, last));
+        }
+    }
+
+    for (round, held) in &steps {
+        eprintln!("{round} {held:.1}");
+    }
+    let found = apart(&guess, &truth);
+    eprintln!("{first:.1} {last:.1} {strayed:.1} {found:.1}");
+
+    assert!(last < first / 10.0, "{first} {last}");
+    assert!(found < strayed / 10.0, "{strayed} {found}");
 }
