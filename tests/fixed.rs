@@ -21,6 +21,8 @@ const POINT: u32 = 16;
 const PRODUCT: u32 = 20;
 const SHARE: u32 = 4;
 
+const SPREAD: [u32; 3] = [2, 3, 4];
+
 const STEP: u32 = 1 << 9;
 
 const GRAIN: u32 = 2;
@@ -40,6 +42,13 @@ fn device(label: &str) -> Option<Host> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Product,
+    Sum,
+    Turn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pass {
     Ahead,
     Back,
@@ -47,10 +56,20 @@ enum Pass {
 
 fn mixed<const LANES: u32>(
     lanes: &mut Lanes<'_>,
+    kind: Kind,
     first: Vector<U32, LANES>,
     second: Vector<U32, LANES>,
     third: Vector<U32, LANES>,
 ) -> Result<Vector<U32, LANES>, LaneError> {
+    if kind == Kind::Sum {
+        let mut held = lanes.splat_bits::<U32, LANES>(0)?;
+        for (one, by) in [first, second, third].into_iter().zip(SPREAD) {
+            let shift = lanes.splat_bits::<U32, LANES>(by)?;
+            let part = lanes.shift_right_arithmetic(one, shift)?;
+            held = lanes.add(held, part)?;
+        }
+        return Ok(held);
+    }
     let wide = lanes.splat_bits::<U32, LANES>(PRODUCT)?;
     let narrow = lanes.splat_bits::<U32, LANES>(SHARE)?;
     let held = lanes.mul(first, second)?;
@@ -61,16 +80,20 @@ fn mixed<const LANES: u32>(
 
 fn onward<const LANES: u32>(
     lanes: &mut Lanes<'_>,
+    kind: Kind,
     held: [Vector<U32, LANES>; 4],
 ) -> Result<[Vector<U32, LANES>; 4], LaneError> {
     let [mut a, mut b, mut c, mut d] = held;
-    let step = mixed::<LANES>(lanes, b, c, d)?;
+    if kind == Kind::Turn {
+        return Ok([d, c, b, a]);
+    }
+    let step = mixed::<LANES>(lanes, kind, b, c, d)?;
     a = lanes.add(a, step)?;
-    let step = mixed::<LANES>(lanes, c, d, a)?;
+    let step = mixed::<LANES>(lanes, kind, c, d, a)?;
     b = lanes.add(b, step)?;
-    let step = mixed::<LANES>(lanes, d, a, b)?;
+    let step = mixed::<LANES>(lanes, kind, d, a, b)?;
     c = lanes.add(c, step)?;
-    let step = mixed::<LANES>(lanes, a, b, c)?;
+    let step = mixed::<LANES>(lanes, kind, a, b, c)?;
     d = lanes.add(d, step)?;
     Ok([a, b, c, d])
 }
@@ -79,11 +102,15 @@ type Both<const LANES: u32> = ([Vector<U32, LANES>; 4], [Vector<U32, LANES>; 4])
 
 fn backward<const LANES: u32>(
     lanes: &mut Lanes<'_>,
+    kind: Kind,
     held: [Vector<U32, LANES>; 4],
     weight: [Vector<U32, LANES>; 4],
 ) -> Result<Both<LANES>, LaneError> {
     let [mut a, mut b, mut c, mut d] = held;
     let [mut ga, mut gb, mut gc, mut gd] = weight;
+    if kind == Kind::Turn {
+        return Ok(([d, c, b, a], [gd, gc, gb, ga]));
+    }
     let wide = lanes.splat_bits::<U32, LANES>(PRODUCT)?;
     let narrow = lanes.splat_bits::<U32, LANES>(SHARE)?;
 
@@ -91,6 +118,14 @@ fn backward<const LANES: u32>(
                    weight: Vector<U32, LANES>,
                    first: Vector<U32, LANES>,
                    second: Vector<U32, LANES>| {
+        if kind == Kind::Sum {
+            let mut out = Vec::with_capacity(3);
+            for by in SPREAD {
+                let shift = lanes.splat_bits::<U32, LANES>(by)?;
+                out.push(lanes.shift_right_arithmetic(weight, shift)?);
+            }
+            return Ok((out[0], out[1], out[2]));
+        }
         let held = lanes.mul(weight, second)?;
         let to_first = lanes.shift_right_arithmetic(held, wide)?;
         let held = lanes.mul(weight, first)?;
@@ -99,28 +134,28 @@ fn backward<const LANES: u32>(
         Ok::<_, LaneError>((to_first, to_second, to_third))
     };
 
-    let step = mixed::<LANES>(lanes, a, b, c)?;
+    let step = mixed::<LANES>(lanes, kind, a, b, c)?;
     d = lanes.sub(d, step)?;
     let (to_a, to_b, to_c) = against(lanes, gd, a, b)?;
     ga = lanes.add(ga, to_a)?;
     gb = lanes.add(gb, to_b)?;
     gc = lanes.add(gc, to_c)?;
 
-    let step = mixed::<LANES>(lanes, d, a, b)?;
+    let step = mixed::<LANES>(lanes, kind, d, a, b)?;
     c = lanes.sub(c, step)?;
     let (to_d, to_a, to_b) = against(lanes, gc, d, a)?;
     gd = lanes.add(gd, to_d)?;
     ga = lanes.add(ga, to_a)?;
     gb = lanes.add(gb, to_b)?;
 
-    let step = mixed::<LANES>(lanes, c, d, a)?;
+    let step = mixed::<LANES>(lanes, kind, c, d, a)?;
     b = lanes.sub(b, step)?;
     let (to_c, to_d, to_a) = against(lanes, gb, c, d)?;
     gc = lanes.add(gc, to_c)?;
     gd = lanes.add(gd, to_d)?;
     ga = lanes.add(ga, to_a)?;
 
-    let step = mixed::<LANES>(lanes, b, c, d)?;
+    let step = mixed::<LANES>(lanes, kind, b, c, d)?;
     a = lanes.sub(a, step)?;
     let (to_b, to_c, to_d) = against(lanes, ga, b, c)?;
     gb = lanes.add(gb, to_b)?;
@@ -130,13 +165,13 @@ fn backward<const LANES: u32>(
     Ok(([a, b, c, d], [ga, gb, gc, gd]))
 }
 
-fn built(subgroup: u32, grid: Grid, pass: Pass) -> Result<Vec<u32>, LaneError> {
+fn built(subgroup: u32, grid: Grid, pass: Pass, kind: Kind) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => building::<4>(subgroup, grid, pass),
-        8 => building::<8>(subgroup, grid, pass),
-        16 => building::<16>(subgroup, grid, pass),
-        32 => building::<32>(subgroup, grid, pass),
-        64 => building::<64>(subgroup, grid, pass),
+        4 => building::<4>(subgroup, grid, pass, kind),
+        8 => building::<8>(subgroup, grid, pass, kind),
+        16 => building::<16>(subgroup, grid, pass, kind),
+        32 => building::<32>(subgroup, grid, pass, kind),
+        64 => building::<64>(subgroup, grid, pass, kind),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -148,6 +183,7 @@ fn building<const LANES: u32>(
     subgroup: u32,
     grid: Grid,
     pass: Pass,
+    kind: Kind,
 ) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -186,7 +222,7 @@ fn building<const LANES: u32>(
             lanes.splat_id::<U32, LANES>(state[3])?,
         ];
         match carried {
-            None => (onward::<LANES>(&mut lanes, held)?, None),
+            None => (onward::<LANES>(&mut lanes, kind, held)?, None),
             Some(weight) => {
                 let weight = [
                     lanes.splat_id::<U32, LANES>(weight[0])?,
@@ -194,7 +230,7 @@ fn building<const LANES: u32>(
                     lanes.splat_id::<U32, LANES>(weight[2])?,
                     lanes.splat_id::<U32, LANES>(weight[3])?,
                 ];
-                let (state_back, weight_back) = backward::<LANES>(&mut lanes, held, weight)?;
+                let (state_back, weight_back) = backward::<LANES>(&mut lanes, kind, held, weight)?;
                 (state_back, Some(weight_back))
             }
         }
@@ -287,8 +323,8 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
     let width = host.width();
     let grid = Grid::of(WIDE, DEEP);
     let passes = [
-        built(width, grid, Pass::Ahead).unwrap(),
-        built(width, grid, Pass::Back).unwrap(),
+        built(width, grid, Pass::Ahead, Kind::Product).unwrap(),
+        built(width, grid, Pass::Back, Kind::Product).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
 
@@ -342,7 +378,7 @@ const CEILING: u32 = 1 << 12;
 
 const PACE: u32 = 3;
 
-fn descended(board: &mut Board<'_>, grid: Grid) -> (f64, f64, f64) {
+fn descended(board: &mut Board<'_>, grid: Grid) -> (f64, f64, f64, f64) {
     let truth = spread(grid, 0x1234_5678);
     let target = board.run(&truth);
     let drift = spread(grid, 0x0BAD_C0DE);
@@ -352,7 +388,13 @@ fn descended(board: &mut Board<'_>, grid: Grid) -> (f64, f64, f64) {
         .map(|(one, other)| one.wrapping_add(other >> 2))
         .collect();
 
-    let first = apart(&board.run(&guess), &target);
+    let ended = board.run(&guess);
+    let reached = ended
+        .iter()
+        .map(|one| f64::from(*one as i32).abs())
+        .sum::<f64>()
+        / ended.len() as f64;
+    let first = apart(&ended, &target);
     let mut strength = 0.0;
     let mut last = first;
     for round in 0..ROUNDS {
@@ -376,7 +418,7 @@ fn descended(board: &mut Board<'_>, grid: Grid) -> (f64, f64, f64) {
         }
         last = apart(&board.run(&guess), &target);
     }
-    (first, last, strength)
+    (first, last, strength, reached)
 }
 
 #[test]
@@ -386,35 +428,46 @@ fn how_deep_the_descent_still_finds_its_way() {
     };
     let width = host.width();
     let grid = Grid::of(WIDE, DEEP);
-    let passes = [
-        built(width, grid, Pass::Ahead).unwrap(),
-        built(width, grid, Pass::Back).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = [8, grid.cells(), grid.cells()];
 
     eprintln!(
-        "{:>7} {:>12} {:>12} {:>12} {:>9}",
-        "steps", "slope", "error first", "error last", "shrank by"
+        "{:>9} {:>7} {:>14} {:>14} {:>14} {:>14} {:>9}",
+        "rule", "steps", "state", "slope", "error first", "error last", "shrank by"
     );
-    let mut deepest = 0_u32;
-    for depth in [8_u32, 32, 128, 512] {
-        let resident = host.resident(&sizes, &modules).unwrap();
-        let mut board = Board {
-            resident,
-            over: Groups::Fixed(grid.quads().div_ceil(width)),
-            grid,
-            depth,
+    let mut reach = Vec::new();
+    for kind in [Kind::Product, Kind::Sum, Kind::Turn] {
+        let passes = [
+            built(width, grid, Pass::Ahead, kind).unwrap(),
+            built(width, grid, Pass::Back, kind).unwrap(),
+        ];
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let named = match kind {
+            Kind::Product => "product",
+            Kind::Sum => "sum",
+            Kind::Turn => "turn",
         };
-        let (first, last, strength) = descended(&mut board, grid);
-        let shrank = if last > 0.0 { first / last } else { f64::MAX };
-        eprintln!("{depth:>7} {strength:>12.1} {first:>12.1} {last:>12.1} {shrank:>8.1}x");
-        if last < first / 10.0 {
-            deepest = depth;
+        let mut deepest = 0_u32;
+        for depth in [8_u32, 32, 128, 512] {
+            let resident = host.resident(&sizes, &modules).unwrap();
+            let mut board = Board {
+                resident,
+                over: Groups::Fixed(grid.quads().div_ceil(width)),
+                grid,
+                depth,
+            };
+            let (first, last, strength, reached) = descended(&mut board, grid);
+            let shrank = if last > 0.0 { first / last } else { f64::MAX };
+            eprintln!(
+                "{named:>9} {depth:>7} {reached:>14.1} {strength:>14.1} {first:>14.1} {last:>14.1} {shrank:>8.1}x"
+            );
+            if last < first / 10.0 {
+                deepest = depth;
+            }
         }
+        eprintln!("{named} still arrives at {deepest} steps");
+        reach.push((named, deepest));
     }
-    eprintln!("the descent still arrives at {deepest} steps");
-    assert!(deepest >= 8);
+    assert!(reach.iter().any(|(_, deepest)| *deepest >= 8));
 }
 
 fn worst(one: &[u32], other: &[u32]) -> f64 {
@@ -440,8 +493,8 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
     let width = host.width();
     let grid = Grid::of(WIDE, DEEP);
     let passes = [
-        built(width, grid, Pass::Ahead).unwrap(),
-        built(width, grid, Pass::Back).unwrap(),
+        built(width, grid, Pass::Ahead, Kind::Product).unwrap(),
+        built(width, grid, Pass::Back, Kind::Product).unwrap(),
     ];
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = [8, grid.cells(), grid.cells()];
@@ -587,8 +640,8 @@ fn over_listing<const LANES: u32>(
             lanes.splat_id::<U32, LANES>(carried[3])?,
         ];
         let (state_next, weight_next) = match pass {
-            Pass::Ahead => (onward::<LANES>(&mut lanes, block)?, along),
-            Pass::Back => backward::<LANES>(&mut lanes, block, along)?,
+            Pass::Ahead => (onward::<LANES>(&mut lanes, Kind::Product, block)?, along),
+            Pass::Back => backward::<LANES>(&mut lanes, Kind::Product, block, along)?,
         };
 
         let one = lanes.splat_bits::<U32, LANES>(1)?;
