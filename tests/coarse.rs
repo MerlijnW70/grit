@@ -22,7 +22,7 @@ const ASKED_ABOVE: f64 = 0.25;
 
 const ASKING: u32 = 20;
 
-const COARSE_PASSES: usize = 5;
+const COARSE_PASSES: usize = 4;
 
 const MARGIN: f64 = 0.10;
 fn device(label: &str) -> Option<Host> {
@@ -373,7 +373,7 @@ fn the_halves_a_rule_sits_between_carry_the_tier_they_were_asked_for() {
     assert_eq!(coarse.before[0].len(), 3);
 
     eprintln!("{} {}", fine.after.len(), coarse.after.len());
-    assert_eq!(coarse.after.len(), fine.after.len() + 4);
+    assert_eq!(coarse.after.len(), fine.after.len() + 3);
 
     let counted = |stages: &live::Stages| stages.iter().map(Vec::len).sum::<usize>();
     assert_eq!(counted(&coarse.after), counted(&fine.after) + COARSE_PASSES);

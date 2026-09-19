@@ -194,11 +194,26 @@ impl Plan {
 
 pub fn scan(subgroup: u32, from: u32, into: u32, aggregate: u32) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => scanned::<4>(subgroup, from, into, aggregate),
-        8 => scanned::<8>(subgroup, from, into, aggregate),
-        16 => scanned::<16>(subgroup, from, into, aggregate),
-        32 => scanned::<32>(subgroup, from, into, aggregate),
-        64 => scanned::<64>(subgroup, from, into, aggregate),
+        4 => scanned::<4>(subgroup, from, into, aggregate, None),
+        8 => scanned::<8>(subgroup, from, into, aggregate, None),
+        16 => scanned::<16>(subgroup, from, into, aggregate, None),
+        32 => scanned::<32>(subgroup, from, into, aggregate, None),
+        64 => scanned::<64>(subgroup, from, into, aggregate, None),
+        other => Err(LaneError::NoMapping {
+            lanes: other,
+            width: subgroup,
+        }),
+    }
+}
+
+pub fn whole(subgroup: u32, from: u32, into: u32, tier: Tier) -> Result<Vec<u32>, LaneError> {
+    let held = Some((tier.totals, tier.grand));
+    match subgroup {
+        4 => scanned::<4>(subgroup, from, into, tier.totals, held),
+        8 => scanned::<8>(subgroup, from, into, tier.totals, held),
+        16 => scanned::<16>(subgroup, from, into, tier.totals, held),
+        32 => scanned::<32>(subgroup, from, into, tier.totals, held),
+        64 => scanned::<64>(subgroup, from, into, tier.totals, held),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -211,6 +226,7 @@ fn scanned<const LANES: u32>(
     from: u32,
     into: u32,
     aggregate: u32,
+    alone: Option<(u32, u32)>,
 ) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -250,7 +266,14 @@ fn scanned<const LANES: u32>(
         let total = lanes.reduce_sum::<U32, LANES>(carried)?;
         (before, total)
     };
-    kernel.store_at(aggregate, block, total)?;
+    match alone {
+        None => kernel.store_at(aggregate, block, total)?,
+        Some((totals, grand)) => {
+            let nothing = kernel.module().constant_u32(0)?;
+            kernel.store_at(totals, block, nothing)?;
+            kernel.store_at(grand, block, total)?;
+        }
+    }
 
     for (index, at) in addresses.iter().enumerate() {
         let Some(earlier) = serial.get(index).copied() else {

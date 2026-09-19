@@ -725,12 +725,11 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
 
 const WIDEST: u32 = 1024;
 
-const NAMED: [&str; 10] = [
+const NAMED: [&str; 9] = [
     "decay wipe counts",
     "the rule",
     "mark coarse",
-    "scan coarse counts",
-    "scan coarse totals",
+    "scan coarse",
     "gather coarse",
     "mark fine",
     "scan fine counts",

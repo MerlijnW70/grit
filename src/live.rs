@@ -71,14 +71,21 @@ pub fn keeping(
     let mut after: Stages = Vec::new();
     if coarse {
         after.push(vec![(mark(subgroup, Tier::COARSE, Over::Every)?, tiles)]);
-        after.push(vec![(
-            crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
-            Groups::Fixed(plan.hot_tiles),
-        )]);
-        after.push(vec![(
-            crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
-            one,
-        )]);
+        if plan.hot_tiles == 1 {
+            after.push(vec![(
+                crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
+                one,
+            )]);
+        } else {
+            after.push(vec![(
+                crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
+                Groups::Fixed(plan.hot_tiles),
+            )]);
+            after.push(vec![(
+                crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
+                one,
+            )]);
+        }
         after.push(vec![
             (
                 crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
@@ -91,14 +98,21 @@ pub fn keeping(
         ]);
     }
     after.push(vec![(mark(subgroup, Tier::FINE, listed)?, hot)]);
-    after.push(vec![(
-        crate::compact::scan(subgroup, COUNTS, BASES, TOTALS)?,
-        tiles,
-    )]);
-    after.push(vec![(
-        crate::compact::scan(subgroup, TOTALS, TOTALS, GRAND)?,
-        one,
-    )]);
+    if plan.tiles == 1 {
+        after.push(vec![(
+            crate::compact::whole(subgroup, COUNTS, BASES, Tier::FINE)?,
+            one,
+        )]);
+    } else {
+        after.push(vec![(
+            crate::compact::scan(subgroup, COUNTS, BASES, TOTALS)?,
+            tiles,
+        )]);
+        after.push(vec![(
+            crate::compact::scan(subgroup, TOTALS, TOTALS, GRAND)?,
+            one,
+        )]);
+    }
     after.push(vec![
         (
             crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
@@ -168,7 +182,12 @@ pub fn arranged(
         stage
     };
 
-    let hot_scan_counts = if coarse {
+    let hot_scan_counts = if coarse && plan.hot_tiles == 1 {
+        vec![(
+            crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
+            one,
+        )]
+    } else if coarse {
         vec![(
             crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
             Groups::Fixed(plan.hot_tiles),
@@ -176,7 +195,7 @@ pub fn arranged(
     } else {
         Vec::new()
     };
-    let hot_scan_totals = if coarse {
+    let hot_scan_totals = if coarse && plan.hot_tiles > 1 {
         vec![(
             crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
             one,
@@ -199,6 +218,36 @@ pub fn arranged(
         Vec::new()
     };
 
+    let fine_scan_counts = if plan.tiles == 1 {
+        vec![(
+            crate::compact::whole(subgroup, COUNTS, crate::layout::BASES, Tier::FINE)?,
+            one,
+        )]
+    } else {
+        vec![(
+            crate::compact::scan(
+                subgroup,
+                COUNTS,
+                crate::layout::BASES,
+                crate::layout::TOTALS,
+            )?,
+            tiles,
+        )]
+    };
+    let fine_scan_totals = if plan.tiles > 1 {
+        vec![(
+            crate::compact::scan(
+                subgroup,
+                crate::layout::TOTALS,
+                crate::layout::TOTALS,
+                crate::layout::GRAND,
+            )?,
+            one,
+        )]
+    } else {
+        Vec::new()
+    };
+
     let stages = vec![
         vec![
             (tick(subgroup)?, one),
@@ -216,24 +265,8 @@ pub fn arranged(
         hot_scan_totals,
         hot_gather,
         vec![(mark(subgroup, Tier::FINE, listed)?, hot)],
-        vec![(
-            crate::compact::scan(
-                subgroup,
-                COUNTS,
-                crate::layout::BASES,
-                crate::layout::TOTALS,
-            )?,
-            tiles,
-        )],
-        vec![(
-            crate::compact::scan(
-                subgroup,
-                crate::layout::TOTALS,
-                crate::layout::TOTALS,
-                crate::layout::GRAND,
-            )?,
-            one,
-        )],
+        fine_scan_counts,
+        fine_scan_totals,
         vec![
             (
                 crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
