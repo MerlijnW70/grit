@@ -77,6 +77,19 @@ pub enum Kind {
 
 pub const KNOB: u32 = 12;
 
+fn shifted_by<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    one: Vector<U32, LANES>,
+    by: Vector<U32, LANES>,
+    places: u32,
+) -> Result<Vector<U32, LANES>, LaneError> {
+    let amount = lanes.splat_bits::<U32, LANES>(places)?;
+    let half = lanes.splat_bits::<U32, LANES>(1 << (places - 1))?;
+    let held = lanes.mul(one, by)?;
+    let held = lanes.add(held, half)?;
+    lanes.shift_right_arithmetic(held, amount)
+}
+
 fn leaning_on<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     knob: Vector<U32, LANES>,
@@ -304,15 +317,35 @@ pub fn backward<const LANES: u32>(
         let (knob, _) = angle;
         let (first, second, third, fourth) = (d, c, b, a);
         let (gfirst, gsecond, gthird, gfourth) = (gd, gc, gb, ga);
+
         let later = leaning_on::<LANES>(lanes, knob, first)?;
-        let (third, fourth) = spun::<LANES>(lanes, (third, fourth), later, true)?;
+        let ((third, fourth), (gthird, gfourth), late) =
+            unspun::<LANES>(lanes, (third, fourth), (gthird, gfourth), later)?;
+        let late_turn = {
+            let twice = lanes.add(late.1, late.1)?;
+            lanes.add(late.0, twice)?
+        };
+        let told_late = shifted_by::<LANES>(lanes, late_turn, first, KNOB)?;
+        let feed = shifted_by::<LANES>(lanes, late_turn, knob, KNOB + SPARE)?;
+        let gfirst = lanes.add(gfirst, feed)?;
+
         let early = leaning_on::<LANES>(lanes, knob, third)?;
-        let (first, second) = spun::<LANES>(lanes, (first, second), early, true)?;
+        let ((first, second), (gfirst, gsecond), early_told) =
+            unspun::<LANES>(lanes, (first, second), (gfirst, gsecond), early)?;
+        let early_turn = {
+            let twice = lanes.add(early_told.1, early_told.1)?;
+            lanes.add(early_told.0, twice)?
+        };
+        let told_early = shifted_by::<LANES>(lanes, early_turn, third, KNOB)?;
+        let feed = shifted_by::<LANES>(lanes, early_turn, knob, KNOB + SPARE)?;
+        let gthird = lanes.add(gthird, feed)?;
+
+        let told_knob = lanes.add(told_late, told_early)?;
         let none = lanes.splat_bits::<U32, LANES>(0)?;
         return Ok((
             [first, second, third, fourth],
             [gfirst, gsecond, gthird, gfourth],
-            (none, none),
+            (told_knob, none),
         ));
     }
     if kind == Kind::Bound || kind == Kind::Smooth {

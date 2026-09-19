@@ -703,3 +703,100 @@ fn many_numbers_at_once_are_what_the_walk_back_is_for() {
     eprintln!("the loss went {began_loss:.3e} to {ended_loss:.3e}");
     assert!(ended_loss < began_loss, "{began_loss} {ended_loss}");
 }
+
+#[test]
+fn the_living_rules_knob_has_the_slope_a_nudge_measures() {
+    let Some(host) = device("the_living_rules_knob_has_the_slope_a_nudge_measures") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 4,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    let scatter = spread(grid, 0x00C0_FFEE);
+    let truth: Vec<u32> = scatter.iter().map(|one| base + (one % 65) - 32).collect();
+    let guess = vec![base; grid.cells()];
+
+    eprintln!(
+        "{:>7} {:>8} {:>16} {:>16} {:>9}",
+        "steps", "cell", "its share", "a nudge says", "apart"
+    );
+    let mut told = Vec::new();
+    for depth in [4_u32, 16, 64] {
+        board.depth = depth;
+        board.sow(&truth);
+        let aim = board.run(&start);
+        board.sow(&guess);
+        let ended = board.run(&start);
+        let weight: Vec<u32> = ended
+            .iter()
+            .zip(&aim)
+            .map(|(one, other)| one.wrapping_sub(*other))
+            .collect();
+        board.sow(&guess);
+        board.carry(&start, &weight);
+        let held = board.told_each();
+        let scale = f64::from(1_u32 << SPARE) * f64::from(board.loud);
+        let (spot, raw) = held
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, one)| one.abs())
+            .map_or((0, 0), |(spot, one)| (spot, *one));
+        let mine = f64::from(raw) / scale;
+
+        let step = 64_i64;
+        let mut above = guess.clone();
+        above[spot] = (i64::from(guess[spot]) + step) as u32;
+        board.sow(&above);
+        let high = squared(&board.run(&start), &aim);
+        let mut below = guess.clone();
+        below[spot] = (i64::from(guess[spot]) - step) as u32;
+        board.sow(&below);
+        let low = squared(&board.run(&start), &aim);
+        let nudged = (high - low) / (2.0 * step as f64);
+
+        let apart = (mine - nudged).abs() / mine.abs().max(nudged.abs()).max(1.0);
+        eprintln!("{depth:>7} {spot:>8} {mine:>16.2} {nudged:>16.2} {apart:>8.4}");
+        assert!(mine * nudged > 0.0, "{depth} {mine} {nudged}");
+        told.push((depth, apart));
+    }
+
+    let shallow = told
+        .iter()
+        .filter(|(depth, _)| *depth <= 16)
+        .map(|(_, apart)| *apart)
+        .fold(0.0_f64, f64::max);
+    let deep = told
+        .iter()
+        .filter(|(depth, _)| *depth > 16)
+        .map(|(_, apart)| *apart)
+        .fold(0.0_f64, f64::max);
+    eprintln!("within {shallow:.4} to sixteen steps and {deep:.4} at sixty four");
+    assert!(shallow < 0.05, "{shallow}");
+    assert!(deep < 0.20, "{deep}");
+}
