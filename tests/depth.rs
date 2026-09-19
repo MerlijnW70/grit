@@ -538,3 +538,107 @@ fn the_living_rule_does_not_obey_superposition_and_the_smooth_one_does() {
         assert!(living > smooth * 10.0, "{depth} {smooth} {living}");
     }
 }
+
+#[test]
+fn one_cells_knob_has_a_valley_of_its_own() {
+    let Some(host) = device("one_cells_knob_has_a_valley_of_its_own") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 64,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let start = spread(grid, 0x1234_5678);
+    let scatter = spread(grid, 0x00C0_FFEE);
+    let truth: Vec<u32> = scatter.iter().map(|one| base + (one % 65) - 32).collect();
+    board.tune(base, 0);
+    board.sow(&truth);
+    let target = board.run(&start);
+
+    let aways = [-64_i64, -16, -4, -1, 0, 1, 4, 16, 64];
+    eprintln!(
+        "{:>8} {:>7} {}",
+        "cell",
+        "its own",
+        aways
+            .iter()
+            .map(|one| format!("{one:>9}"))
+            .collect::<String>()
+    );
+
+    let mut live = Vec::new();
+    let mut looked = 0_usize;
+    for at in 0..grid.cells() {
+        if live.len() >= 4 {
+            break;
+        }
+        looked += 1;
+        let mut held = truth.clone();
+        held[at] = truth[at] + 64;
+        board.sow(&held);
+        if apart(&board.run(&start), &target) > 0.0 {
+            live.push(at);
+        }
+    }
+    eprintln!(
+        "{} of the first {looked} cells have their knob read",
+        live.len()
+    );
+
+    let mut bottoms = Vec::new();
+    for at in live {
+        let mut walk = Vec::new();
+        let mut shown = String::new();
+        for away in aways {
+            let mut held = truth.clone();
+            held[at] = (i64::from(truth[at]) + away) as u32;
+            board.sow(&held);
+            let loss = apart(&board.run(&start), &target);
+            shown.push_str(&format!("{loss:>9.3}"));
+            walk.push(loss);
+        }
+        eprintln!("{at:>8} {:>7} {shown}", truth[at]);
+        let bottom = walk
+            .iter()
+            .enumerate()
+            .min_by(|one, other| one.1.total_cmp(other.1))
+            .map_or(0, |(at, _)| at);
+        bottoms.push((at, aways[bottom], walk));
+    }
+    board.sow(&truth);
+
+    for (at, away, walk) in &bottoms {
+        let dents = (1..walk.len() - 1)
+            .filter(|held| {
+                walk[*held] > 0.0 && walk[*held] < walk[held - 1] && walk[*held] < walk[held + 1]
+            })
+            .count();
+        eprintln!("cell {at}: lowest at {away} out, {dents} dents besides it");
+        assert_eq!(*away, 0, "{at}");
+        assert_eq!(dents, 0, "{at}");
+    }
+}
