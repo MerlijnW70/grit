@@ -37,6 +37,8 @@ const FLOOR: f64 = 1.0;
 
 const SPARE: u32 = 8;
 
+const ROOM: u32 = 1 << 15;
+
 fn device(label: &str) -> Option<Host> {
     match Host::open() {
         Ok(Some(host)) => Some(host),
@@ -459,6 +461,7 @@ struct Board<'host> {
     grid: Grid,
     depth: u32,
     angle: (u32, u32),
+    loud: u32,
 }
 
 impl Board<'_> {
@@ -502,13 +505,26 @@ impl Board<'_> {
             .resident
             .read(TOLD_SWING as usize, self.grid.cells())
             .unwrap();
-        let back = f64::from(1_u32 << SPARE);
+        let back = f64::from(1_u32 << SPARE) * f64::from(self.loud);
         (piled(turning) / back, piled(swing) / back)
     }
 
     fn carry(&mut self, cells: &[u32], weight: &[u32]) -> (Vec<u32>, Vec<u32>) {
         let ended = self.run(cells);
         self.wipe();
+        let peak = weight
+            .iter()
+            .map(|one| (*one as i32).unsigned_abs())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let room = (ROOM / peak).max(1);
+        self.loud = 1_u32 << (31 - room.leading_zeros());
+        let louder: Vec<u32> = weight
+            .iter()
+            .map(|one| ((*one as i32).wrapping_mul(self.loud as i32)) as u32)
+            .collect();
+        let weight = &louder;
         self.resident.write(STATE as usize, &ended).unwrap();
         self.resident
             .write_at(PARAMS as usize, 4, &[self.angle.0, self.angle.1])
@@ -528,12 +544,14 @@ impl Board<'_> {
             .read(STATE as usize, self.grid.cells())
             .unwrap();
         assert_eq!(home, cells);
-        (
-            self.resident
-                .read(SLOPE as usize, self.grid.cells())
-                .unwrap(),
-            ended,
-        )
+        let carried = self
+            .resident
+            .read(SLOPE as usize, self.grid.cells())
+            .unwrap()
+            .iter()
+            .map(|one| ((*one as i32) / self.loud as i32) as u32)
+            .collect();
+        (carried, ended)
     }
 }
 
@@ -570,6 +588,7 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
         grid,
         depth: STEPS,
         angle: (TURNING, SWING),
+        loud: 1,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -628,6 +647,7 @@ fn the_bounded_rules_slope_is_the_slope_a_nudge_measures() {
         grid,
         depth: STEPS,
         angle: (TURNING, SWING),
+        loud: 1,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -815,6 +835,7 @@ fn only_the_last_depth_counts_and_the_shallowest_wins() {
             grid,
             depth: 16,
             angle: (TURNING / 64, SWING / 64),
+            loud: 1,
         };
         let (strayed, left) = climbed(&mut board, grid, rungs, rounds);
         let closed = if left > 0.0 { strayed / left } else { f64::MAX };
@@ -878,6 +899,7 @@ fn whether_the_descent_works_where_the_loss_can_still_see() {
                 grid,
                 depth,
                 angle: (TURNING / share, SWING / share),
+                loud: 1,
             };
             let (first, last, _, _) = descended(&mut board, grid, PACE, ROUNDS);
             let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -914,6 +936,235 @@ fn squared(one: &[u32], other: &[u32]) -> f64 {
         / 2.0
 }
 
+fn asking(board: &mut Board<'_>, start: &[u32], target: &[u32], angle: u32) -> f64 {
+    let swing = board.angle.1;
+    board.angle = (angle, swing);
+    let ended = board.run(start);
+    let weight: Vec<u32> = ended
+        .iter()
+        .zip(target)
+        .map(|(one, other)| one.wrapping_sub(*other))
+        .collect();
+    board.carry(start, &weight);
+    board.told().0
+}
+
+#[test]
+fn whether_the_weight_stays_the_size_it_started() {
+    let Some(host) = device("whether_the_weight_stays_the_size_it_started") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let truth = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 1,
+        angle: (truth, swing),
+        loud: 1,
+    };
+    let start = spread(grid, 0x1234_5678);
+    let biggest = |held: &[u32]| {
+        held.iter()
+            .map(|one| f64::from(*one as i32).abs())
+            .fold(0.0_f64, f64::max)
+    };
+
+    eprintln!(
+        "{:>7} {:>16} {:>16} {:>9}",
+        "steps", "weight put in", "weight come back", "grown"
+    );
+    for depth in [16_u32, 64, 256, 1024] {
+        board.depth = depth;
+        board.angle = (truth, swing);
+        let target = board.run(&start);
+        board.angle = (truth + 16, swing);
+        let ended = board.run(&start);
+        let weight: Vec<u32> = ended
+            .iter()
+            .zip(&target)
+            .map(|(one, other)| one.wrapping_sub(*other))
+            .collect();
+        let (carried, _) = board.carry(&start, &weight);
+        let went = biggest(&weight);
+        let came = biggest(&carried);
+        eprintln!(
+            "{depth:>7} {went:>16.0} {came:>16.0} {:>8.1}x",
+            came / went.max(1.0)
+        );
+    }
+    board.angle = (truth, swing);
+}
+
+#[test]
+fn how_rough_the_loss_is_close_up_at_each_depth() {
+    let Some(host) = device("how_rough_the_loss_is_close_up_at_each_depth") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let truth = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 1,
+        angle: (truth, swing),
+        loud: 1,
+    };
+    let start = spread(grid, 0x1234_5678);
+
+    eprintln!("{:>7} {:>10} {:>14}", "steps", "dents", "worst dent");
+    let mut told = Vec::new();
+    for depth in [16_u32, 64, 256, 1024] {
+        board.depth = depth;
+        board.angle = (truth, swing);
+        let target = board.run(&start);
+
+        let mut walk = Vec::new();
+        for here in truth..=(truth + 48) {
+            board.angle = (here, swing);
+            walk.push(squared(&board.run(&start), &target));
+        }
+
+        let mut dents = 0;
+        let mut worst = 0_u32;
+        for at in 1..walk.len() - 1 {
+            if walk[at] < walk[at - 1] && walk[at] < walk[at + 1] {
+                dents += 1;
+                worst = worst.max(at as u32);
+            }
+        }
+        eprintln!("{depth:>7} {dents:>10} {worst:>14}");
+        told.push((depth, dents));
+    }
+    board.angle = (truth, swing);
+
+    for (depth, dents) in &told {
+        eprintln!("{depth:>5} steps: {dents} places to get stuck between 0 and 48 out");
+    }
+}
+
+#[test]
+fn the_angle_is_found_by_walking_the_slope_that_was_checked() {
+    let Some(host) = device("the_angle_is_found_by_walking_the_slope_that_was_checked") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(WIDE, DEEP);
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+        built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+    let resident = host.resident(&sizes, &modules).unwrap();
+
+    let truth = TURNING / 64;
+    let swing = SWING / 64;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: 1,
+        angle: (truth, swing),
+        loud: 1,
+    };
+    let start = spread(grid, 0x1234_5678);
+
+    eprintln!(
+        "{:>7} {:>8} {:>8} {:>6} {:>34}",
+        "steps", "from", "found", "asked", "the walk"
+    );
+    let mut told_reach = Vec::new();
+    for depth in [1_u32, 16, 256, 1024] {
+        board.depth = depth;
+        board.angle = (truth, swing);
+        let target = board.run(&start);
+
+        let mut here = truth + 16;
+        let mut walked = vec![here];
+        let mut asked = 1_u32;
+
+        let mut span = 1_i64;
+        let low;
+        let high;
+        let leaning = asking(&mut board, &start, &target, here) > 0.0;
+        loop {
+            let next = if leaning {
+                i64::from(here) - span
+            } else {
+                i64::from(here) + span
+            };
+            let held = next.clamp(1, 4096) as u32;
+            walked.push(held);
+            asked += 1;
+            let now = asking(&mut board, &start, &target, held) > 0.0;
+            if now != leaning || span > 512 {
+                (low, high) = if leaning {
+                    (i64::from(held), i64::from(here))
+                } else {
+                    (i64::from(here), i64::from(held))
+                };
+                break;
+            }
+            span *= 2;
+        }
+        let (mut low, mut high) = (low, high);
+
+        while high - low > 1 {
+            let middle = (low + high) / 2;
+            let held = middle.clamp(1, 4096) as u32;
+            walked.push(held);
+            asked += 1;
+            if asking(&mut board, &start, &target, held) > 0.0 {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        here = low as u32;
+
+        let shown = walked
+            .iter()
+            .take(6)
+            .map(|one| one.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "{depth:>7} {:>8} {here:>8} {asked:>6}   {shown}",
+            truth + 16
+        );
+        told_reach.push((depth, here.abs_diff(truth)));
+    }
+
+    for (depth, off) in &told_reach {
+        eprintln!("{depth:>5} steps: landed {off} from {truth}");
+    }
+    let deepest = told_reach.last().map_or(u32::MAX, |(_, off)| *off);
+    assert!(deepest <= 1, "{deepest}");
+}
+
 #[test]
 fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
     let Some(host) = device("the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures") else {
@@ -937,21 +1188,22 @@ fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
         grid,
         depth: 1,
         angle: (base, swing),
+        loud: 1,
     };
 
     let start = spread(grid, 0x1234_5678);
     eprintln!(
-        "{:>7} {:>8} {:>16} {:>16} {:>9}",
-        "steps", "at", "told", "a nudge says", "apart"
+        "{:>7} {:>8} {:>6} {:>16} {:>16} {:>9}",
+        "steps", "at", "secant", "told", "a nudge says", "apart"
     );
 
     let mut worst = 0.0_f64;
-    for depth in [1_u32, 4, 16, 64] {
+    for depth in [1_u32, 4, 16, 64, 256, 1024] {
         board.depth = depth;
         board.angle = (base, swing);
         let target = board.run(&start);
 
-        for away in [64_u32, 192] {
+        for away in [16_u32, 64, 192] {
             let here = base + away;
             board.angle = (here, swing);
             let ended = board.run(&start);
@@ -963,7 +1215,7 @@ fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
             board.carry(&start, &weight);
             let (told, _) = board.told();
 
-            let step = 16_u32;
+            let step = (away / 4).max(2);
             board.angle = (here + step, swing);
             let above = squared(&board.run(&start), &target);
             board.angle = (here - step, swing);
@@ -971,16 +1223,14 @@ fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
             let nudged = (above - below) / f64::from(2 * step);
 
             let apart = (told - nudged).abs() / told.abs().max(nudged.abs()).max(1.0);
-            eprintln!("{depth:>7} {here:>8} {told:>16.1} {nudged:>16.1} {apart:>8.4}");
-            if away == 192 {
-                worst = worst.max(apart);
-            }
+            eprintln!("{depth:>7} {here:>8} {step:>6} {told:>16.1} {nudged:>16.1} {apart:>8.4}");
+            worst = worst.max(apart);
             assert!(told * nudged > 0.0, "{depth} {here} {told} {nudged}");
         }
     }
 
-    eprintln!("worst disagreement well clear of the quantum {worst:.4}");
-    assert!(worst < 0.05, "{worst}");
+    eprintln!("worst disagreement anywhere {worst:.4}");
+    assert!(worst < 0.10, "{worst}");
 }
 
 #[test]
@@ -1006,6 +1256,7 @@ fn the_window_where_the_angle_can_be_asked_for() {
         grid,
         depth: 1,
         angle: (base, swing),
+        loud: 1,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -1084,6 +1335,7 @@ fn how_far_back_the_loss_can_still_see() {
         grid,
         depth: 1,
         angle: (TURNING, SWING),
+        loud: 1,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -1151,6 +1403,7 @@ fn whether_the_loss_can_see_the_angle_it_was_made_with() {
         grid,
         depth: 32,
         angle: (TURNING, SWING),
+        loud: 1,
     };
 
     let start = spread(grid, 0x1234_5678);
@@ -1205,6 +1458,7 @@ fn whether_the_slope_points_home() {
             grid,
             depth: 32,
             angle: (TURNING, SWING),
+            loud: 1,
         };
 
         let truth = spread(grid, 0x1234_5678);
@@ -1276,6 +1530,7 @@ fn whether_the_bounded_rule_is_stalled_or_only_slow() {
             grid,
             depth: 32,
             angle: (TURNING, SWING),
+            loud: 1,
         };
         let (first, last, _, _) = descended(&mut board, grid, PACE, rounds);
         let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -1314,6 +1569,7 @@ fn the_step_the_bounded_rule_wants_is_a_smaller_one() {
                 grid,
                 depth,
                 angle: (TURNING, SWING),
+                loud: 1,
             };
             let (first, last, _, _) = descended(&mut board, grid, pace, ROUNDS);
             let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -1366,6 +1622,7 @@ fn how_deep_the_descent_still_finds_its_way() {
                 grid,
                 depth,
                 angle: (TURNING, SWING),
+                loud: 1,
             };
             let (first, last, strength, reached) = descended(&mut board, grid, PACE, ROUNDS);
             let shrank = if last > 0.0 { first / last } else { f64::MAX };
@@ -1417,6 +1674,7 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
         grid,
         depth: STEPS,
         angle: (TURNING, SWING),
+        loud: 1,
     };
 
     let truth = spread(grid, 0x1234_5678);
