@@ -1364,8 +1364,6 @@ fn many_numbers_at_once_are_what_the_walk_back_is_for() {
         .zip(&scatter)
         .map(|(on, one)| if *on { base + (one % 33) - 16 } else { base })
         .collect();
-    board.sow(&truth);
-    let target = board.run(&start);
 
     eprintln!("{:>7} {:>10} {:>12}", "steps", "have one", "point right");
     for depth in [16_u32, 64, 256, 1024] {
