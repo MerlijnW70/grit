@@ -1184,6 +1184,87 @@ fn what_depth_buys_is_signal_and_signal_buys_room_for_noise() {
 }
 
 #[test]
+fn the_angle_is_found_where_the_tape_would_not_fit() {
+    let Some(host) = device("the_angle_is_found_where_the_tape_would_not_fit") else {
+        return;
+    };
+    let width = host.width();
+    let truth = TURNING / 64;
+    let swing = SWING / 64;
+    let depth = 1024_u32;
+
+    eprintln!(
+        "{:>12} {:>10} {:>12} {:>8} {:>8} {:>10}",
+        "cells", "held", "a tape", "found", "times", "took"
+    );
+
+    let mut told = Vec::new();
+    for side in [64_u32, 512, 2048, 4096] {
+        let grid = Grid::of(side, side);
+        let passes = [
+            built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
+            built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
+        ];
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let sizes = [8, grid.cells(), grid.cells(), grid.cells(), grid.cells()];
+        let resident = host.resident(&sizes, &modules).unwrap();
+        let mut board = Board {
+            resident,
+            over: Groups::Fixed(grid.quads().div_ceil(width)),
+            grid,
+            depth,
+            angle: (truth, swing),
+            loud: 1,
+        };
+
+        let start = spread(grid, 0x1234_5678);
+        board.angle = (truth, swing);
+        let target = board.run(&start);
+
+        let began = std::time::Instant::now();
+        let found = hunted(&mut board, &start, &target, truth + 16);
+        let took = began.elapsed();
+
+        let held = (grid.cells() * size_of::<u32>() * 4) as f64 / (1 << 20) as f64;
+        let tape = f64::from(depth) * (grid.cells() * size_of::<u32>()) as f64 / (1 << 30) as f64;
+        eprintln!(
+            "{:>12} {held:>7.0} MiB {tape:>9.1} GiB {found:>8} {:>8.0} {took:>10.2?}",
+            grid.cells(),
+            tape * 1024.0 / held
+        );
+        told.push((grid.cells(), found));
+
+        if side == 4096 {
+            let away = 192_u32;
+            let here = truth + away;
+            let slope = asking(&mut board, &start, &target, here);
+            let step = away / 4;
+            board.angle = (here + step, swing);
+            let above = squared(&board.run(&start), &target);
+            board.angle = (here - step, swing);
+            let below = squared(&board.run(&start), &target);
+            let nudged = (above - below) / f64::from(2 * step);
+            let apart = (slope - nudged).abs() / slope.abs().max(nudged.abs()).max(1.0);
+            eprintln!(
+                "at {} cells the slope says {slope:.0} and a nudge says {nudged:.0}, {apart:.4} apart",
+                grid.cells()
+            );
+            assert!(apart < 0.10, "{apart}");
+        }
+    }
+
+    for (cells, found) in &told {
+        eprintln!(
+            "{cells} cells: landed {} from {truth}",
+            found.abs_diff(truth)
+        );
+    }
+    for (_, found) in &told {
+        assert_eq!(*found, truth);
+    }
+}
+
+#[test]
 fn the_smallest_difference_the_slope_can_point_at() {
     let Some(host) = device("the_smallest_difference_the_slope_can_point_at") else {
         return;
