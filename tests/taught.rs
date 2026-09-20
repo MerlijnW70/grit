@@ -1873,3 +1873,187 @@ fn where_between_four_and_sixteen_the_step_stops_paying() {
     let last = told.last().map_or(0.0, |one| one.4);
     assert!(last < 0.60, "the coarsest step held on to its peak: {last}");
 }
+
+#[test]
+fn whether_a_shrinking_step_keeps_what_the_coarse_one_found() {
+    let Some(host) = device("whether_a_shrinking_step_keeps_what_the_coarse_one_found") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let judge = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        let (left, right) = parted(board, &taught, &seen);
+        let line = (left + right) / 2.0;
+        (
+            told_on(board, &taught, &seen, middle),
+            scored(board, &fresh, &seen, line),
+        )
+    };
+
+    let (loss_flat, fresh_flat) = judge(&mut board, &flat);
+    eprintln!(
+        "the plain field reads {:.0}% at loss {loss_flat:.4e}; held at 16 the descent peaked at 91% by round 20 and ended at 55%",
+        fresh_flat * 100.0
+    );
+
+    eprintln!(
+        "{:>16} {:>7} {:>6} {:>13} {:>9}",
+        "way", "round", "step", "loss", "fresh"
+    );
+    let mut told = Vec::new();
+    for (named, from, shrink) in [
+        ("held at 4", PACE, Shrink::Never),
+        ("held at 16", 16, Shrink::Never),
+        ("halved each ten", 16, Shrink::Each(10)),
+        ("halved on plateau", 16, Shrink::Stalled(3)),
+    ] {
+        let mut knobs = flat.clone();
+        let mut step = from;
+        let mut lowest = f64::MAX;
+        let mut waited = 0_u32;
+        let mut top = (0.0_f64, 0_u32);
+        let mut ending = (0.0_f64, 0.0_f64);
+        for round in 0..ROUNDS {
+            for one in &taught {
+                let piled = slope_of(
+                    &mut board,
+                    core::slice::from_ref(one),
+                    &seen,
+                    &knobs,
+                    middle,
+                );
+                for (knob, slope) in knobs.iter_mut().zip(&piled) {
+                    if *slope == 0.0 {
+                        continue;
+                    }
+                    let held = i64::from(*knob) - slope.signum() as i64 * step;
+                    *knob = held.clamp(1, 4096) as u32;
+                }
+            }
+            match shrink {
+                Shrink::Never => {}
+                Shrink::Each(every) => {
+                    if round % every == every - 1 {
+                        step = (step / 2).max(1);
+                    }
+                }
+                Shrink::Stalled(patience) => {
+                    board.sow(&knobs);
+                    let loss = told_on(&mut board, &taught, &seen, middle);
+                    if loss < lowest {
+                        lowest = loss;
+                        waited = 0;
+                    } else {
+                        waited += 1;
+                        if waited >= patience {
+                            step = (step / 2).max(1);
+                            waited = 0;
+                        }
+                    }
+                }
+            }
+            if round % 10 == 9 {
+                let (loss, on_fresh) = judge(&mut board, &knobs);
+                if on_fresh > top.0 {
+                    top = (on_fresh, round + 1);
+                }
+                ending = (loss, on_fresh);
+                eprintln!(
+                    "{named:>16} {:>7} {step:>6} {loss:>13.4e} {:>8.0}%",
+                    round + 1,
+                    on_fresh * 100.0
+                );
+            }
+        }
+        told.push((named, top.0, top.1, ending.1, ending.0));
+    }
+
+    eprintln!(
+        "{:>16} {:>10} {:>9} {:>10} {:>13}",
+        "way", "peak", "at round", "at sixty", "loss at sixty"
+    );
+    for (named, peak, at, ending, loss) in &told {
+        eprintln!(
+            "{named:>16} {:>9.0}% {at:>9} {:>9.0}% {loss:>13.4e}",
+            peak * 100.0,
+            ending * 100.0
+        );
+    }
+    let way = |want: &str| {
+        told.iter()
+            .find(|(named, _, _, _, _)| *named == want)
+            .map_or(("none", 0.0, 0_u32, 0.0, 0.0), |one| *one)
+    };
+    let coarse = way("held at 16");
+    let shrunk = way("halved each ten");
+    let slow = way("held at 4");
+    eprintln!(
+        "shrinking keeps {:.0}% where holding kept {:.0}%, and arrives at round {} where a step of 4 takes {}",
+        shrunk.3 * 100.0,
+        coarse.3 * 100.0,
+        shrunk.2,
+        slow.2
+    );
+    assert!(
+        coarse.3 < 0.60,
+        "the coarse step held on to its peak after all: {}",
+        coarse.3
+    );
+    assert!(
+        shrunk.3 > 0.85,
+        "shrinking did not keep what the coarse step found: {}",
+        shrunk.3
+    );
+    assert!(
+        shrunk.2 < slow.2,
+        "shrinking was no faster than a step of 4: round {} against {}",
+        shrunk.2,
+        slow.2
+    );
+    let high = told.iter().fold(0.0_f64, |held, one| held.max(one.1));
+    assert!(high < 0.95, "the ceiling moved after all: {high}");
+}
+
+#[derive(Clone, Copy)]
+enum Shrink {
+    Never,
+    Each(u32),
+    Stalled(u32),
+}
