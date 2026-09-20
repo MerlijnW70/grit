@@ -2057,3 +2057,200 @@ enum Shrink {
     Each(u32),
     Stalled(u32),
 }
+
+#[test]
+fn how_far_down_a_step_finer_than_a_knob_can_go() {
+    let Some(host) = device("how_far_down_a_step_finer_than_a_knob_can_go") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let judge = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        let (left, right) = parted(board, &taught, &seen);
+        let line = (left + right) / 2.0;
+        (
+            told_on(board, &taught, &seen, middle),
+            scored(board, &fresh, &seen, line),
+        )
+    };
+    let cast = |shadow: &[f64]| -> Vec<u32> {
+        shadow
+            .iter()
+            .map(|one| one.round().clamp(1.0, 4096.0) as u32)
+            .collect()
+    };
+
+    let (loss_flat, fresh_flat) = judge(&mut board, &flat);
+    eprintln!(
+        "the plain field reads {:.0}% at loss {loss_flat:.4e}; a whole-knob step reached 91% and could not stay",
+        fresh_flat * 100.0
+    );
+
+    eprintln!(
+        "{:>7} {:>7} {:>7} {:>13} {:>9} {:>10}",
+        "by", "pace", "round", "loss", "fresh", "moved"
+    );
+    let mut told = Vec::new();
+    for (named, from, by_sign, halve_each, floor_at) in [
+        ("size", 1.0_f64, false, 0_u32, 0.0_f64),
+        ("size", 16.0, false, 0, 0.0),
+        ("sign", 0.25, true, 0, 0.0),
+        ("sign", 1.0, true, 0, 0.0),
+        ("sign", 4.0, true, 0, 0.0),
+        ("sign", 16.0, true, 0, 0.0),
+        ("to 1", 16.0, true, 10, 1.0),
+        ("to 1/8", 16.0, true, 10, 0.125),
+    ] {
+        let mut pace = from;
+        let mut shadow: Vec<f64> = flat.iter().map(|one| f64::from(*one)).collect();
+        let mut top = (0.0_f64, 0_u32);
+        let mut floor = f64::MAX;
+        let mut ending = (0.0_f64, 0.0_f64);
+        for round in 0..ROUNDS {
+            for one in &taught {
+                let knobs = cast(&shadow);
+                let piled = slope_of(
+                    &mut board,
+                    core::slice::from_ref(one),
+                    &seen,
+                    &knobs,
+                    middle,
+                );
+                let widest = piled.iter().fold(0.0_f64, |held, one| held.max(one.abs()));
+                if widest <= 0.0 {
+                    continue;
+                }
+                let rate = pace / widest;
+                for (held, slope) in shadow.iter_mut().zip(&piled) {
+                    let by = if by_sign {
+                        pace * slope.signum()
+                    } else {
+                        rate * slope
+                    };
+                    if *slope == 0.0 {
+                        continue;
+                    }
+                    *held = (*held - by).clamp(1.0, 4096.0);
+                }
+            }
+            if halve_each > 0 && round % halve_each == halve_each - 1 {
+                pace = (pace / 2.0).max(floor_at);
+            }
+            if round % 10 == 9 {
+                let knobs = cast(&shadow);
+                let (loss, on_fresh) = judge(&mut board, &knobs);
+                let moved = shadow
+                    .iter()
+                    .map(|one| (one - f64::from(base)).abs())
+                    .sum::<f64>()
+                    / shadow.len() as f64;
+                if on_fresh > top.0 {
+                    top = (on_fresh, round + 1);
+                }
+                floor = floor.min(loss);
+                ending = (loss, on_fresh);
+                eprintln!(
+                    "{named:>7} {pace:>7.2} {:>7} {loss:>13.4e} {:>8.0}% {moved:>10.2}",
+                    round + 1,
+                    on_fresh * 100.0
+                );
+            }
+        }
+        told.push((named, pace, top.0, top.1, ending.1, floor));
+    }
+
+    eprintln!(
+        "{:>7} {:>7} {:>10} {:>9} {:>10} {:>13}",
+        "by", "pace", "peak", "at round", "at sixty", "lowest loss"
+    );
+    for (named, pace, peak, at, ending, floor) in &told {
+        eprintln!(
+            "{named:>7} {pace:>7.2} {:>9.0}% {at:>9} {:>9.0}% {floor:>13.4e}",
+            peak * 100.0,
+            ending * 100.0
+        );
+    }
+    let lowest = told.iter().fold(f64::MAX, |held, one| held.min(one.5));
+    eprintln!("the lowest loss anything reached is {lowest:.4e}");
+    let by = |want: &str| {
+        told.iter()
+            .filter(|(named, _, _, _, _, _)| *named == want)
+            .fold((0.0_f64, f64::MAX), |held, one| {
+                (held.0.max(one.2), held.1.min(one.5))
+            })
+    };
+    let size = by("size");
+    let sign = by("sign");
+    eprintln!(
+        "moving by size peaks at {:.0}% and bottoms at {:.4e}; by sign, {:.0}% and {:.4e}",
+        size.0 * 100.0,
+        size.1,
+        sign.0 * 100.0,
+        sign.1
+    );
+    assert!(
+        size.0 < fresh_flat + 0.01,
+        "moving by size read better than the plain field after all: {}",
+        size.0
+    );
+    assert!(
+        sign.0 > 0.82,
+        "a shadow field stepped by sign failed to beat the bar chance set: {}",
+        sign.0
+    );
+    let whole = by("to 1");
+    let fine = by("to 1/8");
+    eprintln!(
+        "shrinking to a whole knob bottoms at {:.4e}, shrinking to an eighth at {:.4e}",
+        whole.1, fine.1
+    );
+    assert!(
+        (fine.1 - whole.1).abs() / whole.1 < 0.01,
+        "carrying the field finer than a knob found a different floor: {} against {}",
+        fine.1,
+        whole.1
+    );
+    assert!(
+        fine.1 > sign.1,
+        "the finest shrinking beat the coarse step's floor after all: {} against {}",
+        fine.1,
+        sign.1
+    );
+}
