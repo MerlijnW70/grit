@@ -64,7 +64,15 @@ fn the_server_names_the_three_tools_it_has() {
         .iter()
         .filter_map(|one| one.get("name").and_then(Json::text))
         .collect();
-    assert_eq!(names, vec!["grit_synthesise", "grit_least", "grit_check"]);
+    assert_eq!(
+        names,
+        vec![
+            "grit_machine",
+            "grit_synthesise",
+            "grit_least",
+            "grit_check"
+        ]
+    );
 }
 
 #[test]
@@ -124,6 +132,89 @@ fn synthesising_an_adder_returns_a_circuit_the_host_marked_itself() {
         written(&marked)
     );
     assert_eq!(marked.counted("marks"), held.counted("of"));
+}
+
+fn counting(steps: u32) -> String {
+    let mut runs = Vec::new();
+    for seed in 0..4_u32 {
+        let mut state = (seed * 2_654_435_761) | 1;
+        let mut count = 0_u32;
+        let mut feed = Vec::new();
+        let mut want = Vec::new();
+        for _ in 0..steps {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let on = state & 1;
+            want.push(count);
+            feed.push(on);
+            if on == 1 {
+                count = (count + 1) & 3;
+            }
+        }
+        let feed: Vec<String> = feed.iter().map(u32::to_string).collect();
+        let want: Vec<String> = want.iter().map(u32::to_string).collect();
+        runs.push(format!(
+            "{{\"feed\":[{}],\"want\":[{}]}}",
+            feed.join(","),
+            want.join(",")
+        ));
+    }
+    runs.join(",")
+}
+
+#[test]
+fn a_machine_that_counts_when_told_to_is_found_from_its_runs() {
+    let Some(host) = device("a_machine_that_counts_when_told_to_is_found_from_its_runs") else {
+        return;
+    };
+    let arguments = format!(
+        "{{\"state\":2,\"inputs\":1,\"outputs\":2,\"gates\":12,\"traces\":[{}],\"crowd\":65536,\"rounds\":2000}}",
+        counting(16)
+    );
+    let held = structured(&call(Some(&host), "grit_machine", &arguments));
+    eprintln!(
+        "solved {:?} marks {:?} of {:?} in {:?} rounds over {:?} runs",
+        held.get("solved"),
+        held.counted("marks"),
+        held.counted("of"),
+        held.counted("rounds"),
+        held.counted("traces")
+    );
+    let said = held.get("said").and_then(Json::list).unwrap();
+    eprintln!("the first run comes back as {}", written(&said[0]));
+    assert_eq!(
+        held.get("solved"),
+        Some(&Json::Bool(true)),
+        "{}",
+        written(&held)
+    );
+    assert_eq!(held.counted("marks"), held.counted("of"));
+    assert_eq!(held.get("wrong").and_then(Json::list).unwrap().len(), 0);
+    assert_eq!(held.get("checked_on_the_host"), Some(&Json::Bool(true)));
+    assert_eq!(said.len(), 4, "one answer a run");
+}
+
+#[test]
+fn a_machine_with_no_room_to_remember_cannot_count_and_says_which_steps_it_missed() {
+    let Some(host) =
+        device("a_machine_with_no_room_to_remember_cannot_count_and_says_which_steps_it_missed")
+    else {
+        return;
+    };
+    let arguments = format!(
+        "{{\"state\":0,\"inputs\":1,\"outputs\":2,\"gates\":8,\"traces\":[{}],\"crowd\":4096,\"rounds\":400}}",
+        counting(16)
+    );
+    let held = structured(&call(Some(&host), "grit_machine", &arguments));
+    eprintln!(
+        "with nothing to remember: marks {:?} of {:?}, {} steps wrong",
+        held.counted("marks"),
+        held.counted("of"),
+        held.get("wrong").and_then(Json::list).unwrap().len()
+    );
+    assert_eq!(held.get("solved"), Some(&Json::Bool(false)));
+    assert!(!held.get("wrong").and_then(Json::list).unwrap().is_empty());
 }
 
 #[test]
