@@ -1589,3 +1589,145 @@ fn whether_the_summed_slope_is_signal_or_its_own_error() {
     assert!(one > 70.0, "{one}");
     assert!(lots < 50.0, "{lots}");
 }
+
+#[test]
+fn whether_one_lesson_at_a_time_gets_anywhere() {
+    let Some(host) = device("whether_one_lesson_at_a_time_gets_anywhere") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let judge = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        let (left, right) = parted(board, &taught, &seen);
+        let line = (left + right) / 2.0;
+        (
+            told_on(board, &taught, &seen, middle),
+            scored(board, &fresh, &seen, line),
+        )
+    };
+
+    let (loss_flat, fresh_flat) = judge(&mut board, &flat);
+    eprintln!(
+        "the plain field reads {:.0}% of the fresh set at loss {loss_flat:.4e}, and twenty guesses found 82%",
+        fresh_flat * 100.0
+    );
+
+    eprintln!("{:>6} {:>7} {:>13} {:>9}", "step", "round", "loss", "fresh");
+    let mut told = Vec::new();
+    let mut best = (0.0_f64, 0_i64, 0_u32);
+    for step in [1_i64, PACE, 16, 64] {
+        let mut knobs = flat.clone();
+        for round in 0..ROUNDS {
+            for one in &taught {
+                let piled = slope_of(
+                    &mut board,
+                    core::slice::from_ref(one),
+                    &seen,
+                    &knobs,
+                    middle,
+                );
+                for (knob, slope) in knobs.iter_mut().zip(&piled) {
+                    if *slope == 0.0 {
+                        continue;
+                    }
+                    let held = i64::from(*knob) - slope.signum() as i64 * step;
+                    *knob = held.clamp(1, 4096) as u32;
+                }
+            }
+            if round % 20 == 19 {
+                let (loss, on_fresh) = judge(&mut board, &knobs);
+                if on_fresh > best.0 {
+                    best = (on_fresh, step, round + 1);
+                }
+                eprintln!(
+                    "{step:>6} {:>7} {loss:>13.4e} {:>8.0}%",
+                    round + 1,
+                    on_fresh * 100.0
+                );
+            }
+        }
+        let (loss, on_fresh) = judge(&mut board, &knobs);
+        let travelled = knobs
+            .iter()
+            .map(|one| f64::from(*one as i32) - f64::from(base))
+            .map(f64::abs)
+            .sum::<f64>()
+            / knobs.len() as f64;
+        told.push((step, loss, on_fresh, travelled));
+    }
+
+    eprintln!(
+        "plain {:.0}% at loss {loss_flat:.4e}; guessing 82%; sixty batch rounds ended at 67%",
+        fresh_flat * 100.0
+    );
+    for (step, loss, on_fresh, travelled) in &told {
+        eprintln!(
+            "a step of {step} taken one lesson at a time ends at {:.0}% and loss {loss:.4e}, each knob having moved {travelled:.1}",
+            on_fresh * 100.0
+        );
+    }
+    eprintln!(
+        "the best reading is {:.0}% at a step of {} after {} rounds",
+        best.0 * 100.0,
+        best.1,
+        best.2
+    );
+    let held = told
+        .iter()
+        .find(|(step, _, _, _)| *step == PACE)
+        .map_or((0, 0.0, 0.0, 0.0), |one| *one);
+    assert!(
+        held.2 > fresh_flat,
+        "a step of {} read no better than the plain field: {} against {fresh_flat}",
+        PACE,
+        held.2
+    );
+    assert!(
+        held.1 < loss_flat,
+        "a step of {} did not go downhill: {} against {loss_flat}",
+        PACE,
+        held.1
+    );
+    assert!(
+        best.0 > 0.82,
+        "one lesson at a time never beat the bar chance set: {}",
+        best.0
+    );
+}
