@@ -15,12 +15,11 @@ const GATES: u32 = 10;
 fn budget() -> u32 {
     let mut held = std::env::args();
     while let Some(one) = held.next() {
-        if one == "--gates" {
-            if let Some(many) = held.next() {
-                if let Ok(many) = many.parse::<u32>() {
-                    return many.clamp(4, 64);
-                }
-            }
+        if one != "--gates" {
+            continue;
+        }
+        if let Some(Ok(many)) = held.next().map(|many| many.parse::<u32>()) {
+            return many.clamp(4, 64);
         }
     }
     GATES
