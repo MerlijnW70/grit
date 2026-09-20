@@ -5,6 +5,7 @@ pub mod layout;
 pub mod live;
 pub mod netlist;
 pub mod resident;
+pub mod rule;
 pub mod sand;
 pub mod sweep;
 
