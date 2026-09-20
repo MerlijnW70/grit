@@ -24,7 +24,7 @@ const ROUNDS: u32 = 60;
 
 const PACE: i64 = 4;
 
-fn blotted(grid: Grid, rows: (u32, u32), seed: u32) -> Vec<u32> {
+fn blotted_in(grid: Grid, rows: (u32, u32), seed: u32, haze: u32) -> Vec<u32> {
     let across = 16;
     let mut state = seed | 1;
     let mut cells: Vec<u32> = (0..grid.cells())
@@ -32,7 +32,7 @@ fn blotted(grid: Grid, rows: (u32, u32), seed: u32) -> Vec<u32> {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            GROUND + state % HAZE.max(1)
+            GROUND + state % haze.max(1)
         })
         .collect();
     for down in [rows.0, rows.1] {
@@ -68,18 +68,26 @@ struct Lesson {
     left: bool,
 }
 
-fn lessons(grid: Grid, from: u32, count: u32) -> Vec<Lesson> {
+fn blotted(grid: Grid, rows: (u32, u32), seed: u32) -> Vec<u32> {
+    blotted_in(grid, rows, seed, HAZE)
+}
+
+fn lessons_in(grid: Grid, from: u32, count: u32, haze: u32) -> Vec<Lesson> {
     (0..count)
         .map(|at| {
             let near = at % 2 == 0;
             let top = 4 + (at * 5) % 12;
             let gap = if near { BLOB + 2 } else { SIDE / 2 };
             Lesson {
-                start: blotted(grid, (top, top + gap), from + at * 7919),
+                start: blotted_in(grid, (top, top + gap), from + at * 7919, haze),
                 left: near,
             }
         })
         .collect()
+}
+
+fn lessons(grid: Grid, from: u32, count: u32) -> Vec<Lesson> {
+    lessons_in(grid, from, count, HAZE)
 }
 
 const SPLIT: f64 = 300.0;
@@ -824,4 +832,104 @@ fn whether_any_field_at_all_can_answer_it() {
         ever * 100.0
     );
     assert!(ever < 0.60, "a field generalises after all: {ever}");
+}
+
+#[test]
+fn where_between_too_clear_and_too_hazy_a_field_could_matter() {
+    let Some(host) = device("where_between_too_clear_and_too_hazy_a_field_could_matter") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+    let seen = window(grid);
+
+    let scattered = |seed: u32, span: u32| {
+        let mut state = seed | 1;
+        (0..grid.cells())
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let off = (state % (2 * span + 1)) as i64 - i64::from(span);
+                (i64::from(base) + off).clamp(1, 4096) as u32
+            })
+            .collect::<Vec<u32>>()
+    };
+
+    eprintln!(
+        "{:>8} {:>10} {:>12} {:>12}",
+        "haze", "plain", "best found", "it gained"
+    );
+    let mut told = Vec::new();
+    for over in 9_u32..=13 {
+        let haze = 1 << over;
+        let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+        let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+
+        let line_of = |board: &mut Board<'_>, knobs: &[u32]| {
+            board.sow(knobs);
+            let (left, right) = parted(board, &taught, &seen);
+            (left + right) / 2.0
+        };
+
+        let flat = vec![base; grid.cells()];
+        let line = line_of(&mut board, &flat);
+        let plain = scored(&mut board, &fresh, &seen, line);
+
+        let mut picked = (0.0_f64, flat.clone(), 0.0_f64);
+        for go in 0..20_u32 {
+            let knobs = scattered(0xC0FF_EE00 + go * 7919, 1 << (9 + go % 3));
+            let line = line_of(&mut board, &knobs);
+            let on_taught = scored(&mut board, &taught, &seen, line);
+            if on_taught > picked.0 {
+                picked = (on_taught, knobs, line);
+            }
+        }
+        board.sow(&picked.1);
+        let picked = (picked.0, scored(&mut board, &fresh, &seen, picked.2));
+        eprintln!(
+            "{haze:>8} {:>9.0}% {:>11.0}% {:>11.0}%",
+            plain * 100.0,
+            picked.1 * 100.0,
+            (picked.1 - plain) * 100.0
+        );
+        told.push((haze, plain, picked.1));
+    }
+
+    let best = told
+        .iter()
+        .max_by(|one, other| (one.2 - one.1).total_cmp(&(other.2 - other.1)))
+        .copied()
+        .unwrap_or_default();
+    eprintln!(
+        "the most a field ever gained over the plain one is {:.0} points, at haze {}",
+        (best.2 - best.1) * 100.0,
+        best.0
+    );
+    assert!(best.2 - best.1 > 0.05, "{best:?}");
+    assert!(best.1 > 0.5 && best.1 < 0.9, "{best:?}");
 }
