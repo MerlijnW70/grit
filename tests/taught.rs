@@ -558,3 +558,101 @@ fn how_many_knobs_the_lessons_agree_about() {
         "the lessons are not evenly split after all: {split} of {named}"
     );
 }
+
+#[test]
+fn which_half_of_the_knobs_the_rule_leaves_silent() {
+    let Some(host) = device("which_half_of_the_knobs_the_rule_leaves_silent") else {
+        return;
+    };
+    let grid = Grid::of(SIDE, SIDE);
+    let base = 256_u32;
+    let seen = window(grid);
+    let flat = vec![base; grid.cells()];
+    let haze = 1024_u32;
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+
+    eprintln!(
+        "{:>8} {:>6} {:>8} {:>9} {:>11} {:>11} {:>11}",
+        "rule", "depth", "heard", "of them", "even sum", "even row", "even column"
+    );
+    let mut told = Vec::new();
+    for kind in [Kind::Living, Kind::Smooth] {
+        let mut reached = Vec::new();
+        for depth in [1_u32, 4, 16, DEPTH] {
+            let mut board = seated(&host, grid, kind, (base, 0), depth);
+            board.sow(&flat);
+            let middle = {
+                let (left, right) = parted(&mut board, &taught, &seen);
+                (left + right) / 2.0
+            };
+            let piled = slope_of(&mut board, &taught, &seen, &flat, middle);
+            let heard: Vec<usize> = piled
+                .iter()
+                .enumerate()
+                .filter(|(_, one)| **one != 0.0)
+                .map(|(at, _)| at)
+                .collect();
+            let share = |pick: &dyn Fn(u32, u32) -> bool| {
+                let held = heard
+                    .iter()
+                    .filter(|at| {
+                        let row = **at as u32 / grid.wide;
+                        let column = **at as u32 % grid.wide;
+                        pick(row, column)
+                    })
+                    .count();
+                held as f64 * 100.0 / heard.len().max(1) as f64
+            };
+            let evenly = share(&|row, column| (row + column).is_multiple_of(2));
+            eprintln!(
+                "{:>8} {depth:>6} {:>8} {:>8.0}% {evenly:>10.0}% {:>10.0}% {:>10.0}%",
+                format!("{kind:?}"),
+                heard.len(),
+                heard.len() as f64 * 100.0 / grid.cells() as f64,
+                share(&|row, _| row.is_multiple_of(2)),
+                share(&|_, column| column.is_multiple_of(2))
+            );
+            reached.push(heard.len());
+            told.push((kind, depth, heard.len(), evenly));
+        }
+        assert!(
+            reached.windows(2).all(|two| two[0] < two[1]),
+            "the slope does not reach further with depth: {reached:?}"
+        );
+    }
+
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let piled = slope_of(&mut board, &taught, &seen, &flat, middle);
+    eprintln!("the first four rows, a dot where the slope is silent:");
+    for row in 0..4_u32 {
+        let mut drawn = String::new();
+        for column in 0..grid.wide.min(48) {
+            let at = (row * grid.wide + column) as usize;
+            drawn.push(if piled[at] == 0.0 { '.' } else { '#' });
+        }
+        eprintln!("  {row:>2} {drawn}");
+    }
+    eprintln!(
+        "the rule loads its knob at the corner of the block, and `corners` puts that corner at"
+    );
+    eprintln!("(2a + phase, 2d + phase), which has an even sum in both phases");
+
+    for (kind, depth, heard, evenly) in &told {
+        assert!(
+            (evenly - 100.0).abs() < f64::EPSILON,
+            "{kind:?} at depth {depth} hears a knob off the even sublattice: {evenly}%"
+        );
+        if *depth == DEPTH {
+            assert_eq!(
+                *heard,
+                grid.cells() / 2,
+                "{kind:?} at depth {depth} hears other than one sublattice"
+            );
+        }
+    }
+}
