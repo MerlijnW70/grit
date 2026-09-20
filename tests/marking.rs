@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::marking::{BINDINGS, GATES, SCORE, VALUES, WANTED, marked};
-use grit::netlist::{Chip, Exam, Gate, Netlist, drawn};
+use grit::netlist::{Chip, Exam, Gate, Netlist, drawn, turned};
 use grit::{Groups, Host};
 
 const CROWD: u32 = 256;
@@ -137,4 +137,94 @@ fn a_gate_packed_by_the_host_is_the_gate_the_device_reads() {
     };
     assert_eq!(Gate::unpack(gate.pack()), gate);
     assert!(shape.checked(4, gate).is_ok());
+}
+
+fn marking_on(host: &Host, shape: Netlist) -> (Vec<u32>, [usize; 4]) {
+    let module = marked(host.width(), shape).unwrap();
+    let sizes = [
+        (CROWD * shape.gates) as usize,
+        (CROWD * shape.sources()) as usize,
+        shape.outputs as usize,
+        CROWD as usize,
+    ];
+    (module, sizes)
+}
+
+#[test]
+fn whether_a_crowd_of_climbers_finds_the_table() {
+    let Some(host) = device("whether_a_crowd_of_climbers_finds_the_table") else {
+        return;
+    };
+    let width = host.width();
+    let shape = shape();
+    let exam = asked(shape);
+    let (module, sizes) = marking_on(&host, shape);
+    let modules: Vec<&[u32]> = vec![&module];
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+    resident.write(WANTED as usize, &columns(&exam)).unwrap();
+    resident
+        .write(VALUES as usize, &vec![0_u32; sizes[VALUES as usize]])
+        .unwrap();
+    let over = [Groups::Fixed(CROWD.div_ceil(width))];
+    let stages: Vec<&[Groups]> = vec![&over];
+
+    let marks = |resident: &mut grit::Resident<'_>, held: &[u32]| {
+        resident.write(GATES as usize, held).unwrap();
+        resident.staged(&stages).unwrap();
+        resident.read(SCORE as usize, CROWD as usize).unwrap()
+    };
+
+    let mut held = crowd(shape, 0x1234_5678);
+    let mut best = marks(&mut resident, &held);
+    let mut state = 0x0BAD_C0DE_u32;
+    let full = exam.marks();
+    eprintln!(
+        "{:>7} {:>8} {:>9} {:>9}",
+        "round", "best", "average", "solved"
+    );
+    let mut rounds = 0_u32;
+    for round in 0..2000_u32 {
+        rounds = round + 1;
+        let mut trial = held.clone();
+        for who in 0..CROWD as usize {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let at = state % shape.gates;
+            let place = who * shape.gates as usize + at as usize;
+            let gate = Gate::unpack(trial[place]);
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            trial[place] = turned(&shape, at, gate, state).pack();
+        }
+        let got = marks(&mut resident, &trial);
+        for who in 0..CROWD as usize {
+            if got[who] >= best[who] {
+                best[who] = got[who];
+                let from = who * shape.gates as usize;
+                let to = from + shape.gates as usize;
+                held[from..to].copy_from_slice(&trial[from..to]);
+            }
+        }
+        let top = best.iter().copied().max().unwrap_or(0);
+        let solved = best.iter().filter(|one| **one == full).count();
+        if round % 200 == 199 || solved > 0 {
+            let sum: u32 = best.iter().sum();
+            eprintln!(
+                "{:>7} {top:>8} {:>9.1} {solved:>9}",
+                round + 1,
+                f64::from(sum) / f64::from(CROWD)
+            );
+        }
+        if solved > 0 {
+            break;
+        }
+    }
+    let top = best.iter().copied().max().unwrap_or(0);
+    let solved = best.iter().filter(|one| **one == full).count();
+    eprintln!(
+        "after {rounds} rounds {solved} of {CROWD} climbers hold a perfect {full}, the best is {top}"
+    );
+    assert!(top > 23, "the crowd never beat the best drawn chip: {top}");
 }
