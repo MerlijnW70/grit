@@ -598,3 +598,143 @@ fn how_far_a_slope_from_a_small_window_reaches() {
     let far = told.last().map_or(0, |(_, spoke)| *spoke);
     eprintln!("from {near} at one step to {far} at forty");
 }
+
+fn slope_of(
+    board: &mut Board<'_>,
+    held: &[Lesson],
+    seen: &[usize],
+    knobs: &[u32],
+    middle: f64,
+) -> Vec<f64> {
+    let mut piled = vec![0.0_f64; knobs.len()];
+    for one in held {
+        board.sow(knobs);
+        let got = read_out(&board.run(&one.start), seen);
+        let off = got - wanted(one.left, middle);
+        let share = (off / seen.len() as f64 * PITCH).round() as i32;
+        let mut weight = vec![0_u32; knobs.len()];
+        for at in seen {
+            weight[*at] = share as u32;
+        }
+        board.sow(knobs);
+        board.carry(&one.start, &weight);
+        let scale = f64::from(1_u32 << SPARE) * f64::from(board.loud) * PITCH;
+        for (into, slope) in piled.iter_mut().zip(board.told_each()) {
+            *into += f64::from(slope) / scale;
+        }
+    }
+    piled
+}
+
+#[test]
+fn a_handful_at_a_time_is_what_the_slope_will_pay_for() {
+    let Some(host) = device("a_handful_at_a_time_is_what_the_slope_will_pay_for") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let seen = window(grid);
+    let taught = lessons(grid, 0x1234_5678, 8);
+    let fresh = lessons(grid, 0x0BAD_C0DE, 32);
+    let mut knobs = vec![base; grid.cells()];
+
+    board.sow(&knobs);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let judge = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        let loss = told_on(board, &taught, &seen, middle);
+        let (left, right) = parted(board, &taught, &seen);
+        let line = (left + right) / 2.0;
+        (loss, left - right, scored(board, &fresh, &seen, line))
+    };
+
+    let (loss_first, gap_first, fresh_first) = judge(&mut board, &knobs);
+    eprintln!("{:>7} {:>13} {:>9} {:>9}", "moved", "loss", "gap", "fresh");
+    eprintln!(
+        "{:>7} {loss_first:>13.4e} {gap_first:>9.1} {:>8.0}%",
+        0,
+        fresh_first * 100.0
+    );
+
+    let mut touched = std::collections::BTreeSet::new();
+    let handful = 16_usize;
+    let sweeps = 256_u32;
+    let live: Vec<usize> = slope_of(&mut board, &taught, &seen, &knobs, middle)
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| **one != 0.0)
+        .map(|(at, _)| at)
+        .collect();
+    eprintln!(
+        "{} knobs answer at all, taken {handful} at a time in turn",
+        live.len()
+    );
+    for sweep in 0..sweeps {
+        let piled = slope_of(&mut board, &taught, &seen, &knobs, middle);
+        let from = (sweep as usize * handful) % live.len();
+        for step in 0..handful {
+            let at = live[(from + step) % live.len()];
+            let slope = piled[at];
+            if slope == 0.0 {
+                continue;
+            }
+            let held = i64::from(knobs[at]) - slope.signum() as i64;
+            knobs[at] = held.clamp(1, 4096) as u32;
+            touched.insert(at);
+        }
+        if sweep % 64 == 63 {
+            let (loss, gap, on_fresh) = judge(&mut board, &knobs);
+            eprintln!(
+                "{:>7} {loss:>13.4e} {gap:>9.1} {:>8.0}%",
+                (sweep + 1) as usize * handful,
+                on_fresh * 100.0
+            );
+        }
+    }
+
+    let (loss_last, gap_last, fresh_last) = judge(&mut board, &knobs);
+    eprintln!(
+        "loss {loss_first:.4e} to {loss_last:.4e}, gap {gap_first:.1} to {gap_last:.1}, fresh {:.0}% to {:.0}%",
+        fresh_first * 100.0,
+        fresh_last * 100.0
+    );
+    let strayed = knobs.iter().filter(|one| **one != base).count();
+    eprintln!(
+        "{} different knobs were moved, {strayed} ended away from where they began, and the loss moved {:.5} of itself",
+        touched.len(),
+        (loss_last - loss_first).abs() / loss_first
+    );
+    assert_eq!(touched.len(), live.len(), "{}", touched.len());
+    assert!(
+        (loss_last - loss_first).abs() < loss_first * 1e-4,
+        "{loss_first} {loss_last}"
+    );
+}
