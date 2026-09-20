@@ -2,7 +2,6 @@
 
 mod lifting;
 
-use grit::Groups;
 use grit::sand::Grid;
 use lifting::*;
 
@@ -149,32 +148,9 @@ fn where_the_blot_has_got_to_by_each_depth() {
     let Some(host) = device("where_the_blot_has_got_to_by_each_depth") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: 1,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), 1);
     board.tune(base, 0);
 
     let seen = window(grid);
@@ -198,32 +174,9 @@ fn how_much_haze_it_takes_to_blind_the_window() {
     let Some(host) = device("how_much_haze_it_takes_to_blind_the_window") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
     board.tune(base, 0);
     let seen = window(grid);
 
@@ -254,32 +207,9 @@ fn whether_a_step_down_the_slope_lowers_the_loss_at_all() {
     let Some(host) = device("whether_a_step_down_the_slope_lowers_the_loss_at_all") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let seen = window(grid);
     let taught = lessons(grid, 0x1234_5678, 16);
@@ -411,33 +341,9 @@ fn a_field_of_knobs_is_taught_to_say_which_side_the_blot_was_on() {
     let Some(host) = device("a_field_of_knobs_is_taught_to_say_which_side_the_blot_was_on") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
-
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let seen = window(grid);
     let taught = lessons(grid, 0x1234_5678, 16);
@@ -546,32 +452,9 @@ fn how_far_a_slope_from_a_small_window_reaches() {
     let Some(host) = device("how_far_a_slope_from_a_small_window_reaches") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: 1,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), 1);
     board.tune(base, 0);
 
     let seen = window(grid);
@@ -639,32 +522,9 @@ fn a_handful_at_a_time_is_what_the_slope_will_pay_for() {
     let Some(host) = device("a_handful_at_a_time_is_what_the_slope_will_pay_for") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let seen = window(grid);
     let taught = lessons(grid, 0x1234_5678, 8);
@@ -752,32 +612,9 @@ fn whether_any_field_at_all_can_answer_it() {
     let Some(host) = device("whether_any_field_at_all_can_answer_it") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let seen = window(grid);
     let taught = lessons(grid, 0x1234_5678, 8);
@@ -839,32 +676,9 @@ fn where_between_too_clear_and_too_hazy_a_field_could_matter() {
     let Some(host) = device("where_between_too_clear_and_too_hazy_a_field_could_matter") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
     let seen = window(grid);
 
     let scattered = |seed: u32, span: u32| {
@@ -939,32 +753,9 @@ fn the_slope_against_the_bar_that_chance_set() {
     let Some(host) = device("the_slope_against_the_bar_that_chance_set") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -1063,16 +854,7 @@ fn which_of_them_takes_the_promise_out_of_the_slope() {
     let Some(host) = device("which_of_them_takes_the_promise_out_of_the_slope") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
     let seen = window(grid);
     let base = 256_u32;
     let start = blotted_in(grid, (6, 26), 0x1234_5678, 1024);
@@ -1083,23 +865,9 @@ fn which_of_them_takes_the_promise_out_of_the_slope() {
     );
     let mut told = Vec::new();
     for (named, kind) in [("smooth", Kind::Smooth), ("living", Kind::Living)] {
-        let passes = [
-            built(width, grid, Pass::Ahead, kind).unwrap(),
-            built(width, grid, Pass::Back, kind).unwrap(),
-        ];
-        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
         for whole in [true, false] {
             for depth in [16_u32, 64] {
-                let resident = host.resident(&sizes, &modules).unwrap();
-                let mut board = Board {
-                    resident,
-                    over: Groups::Fixed(grid.quads().div_ceil(width)),
-                    grid,
-                    depth,
-                    angle: (base, SWING / 64),
-                    loud: 1,
-                    planted: false,
-                };
+                let mut board = seated(&host, grid, kind, (base, SWING / 64), depth);
                 let kept = kept_of(grid, whole, &seen);
 
                 let truth: Vec<u32> = (0..grid.cells())
@@ -1172,21 +940,7 @@ fn what_it_is_about_the_lesson_that_breaks_the_promise() {
     let Some(host) = device("what_it_is_about_the_lesson_that_breaks_the_promise") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let base = 256_u32;
     let seen = window(grid);
     let haze = 1024_u32;
@@ -1204,16 +958,7 @@ fn what_it_is_about_the_lesson_that_breaks_the_promise() {
         ("sixteen, moved by size", 16, false, true),
         ("sixteen that agree", 16, false, false),
     ] {
-        let resident = host.resident(&sizes, &modules).unwrap();
-        let mut board = Board {
-            resident,
-            over: Groups::Fixed(grid.quads().div_ceil(width)),
-            grid,
-            depth: DEPTH,
-            angle: (base, 0),
-            loud: 1,
-            planted: false,
-        };
+        let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
         let mut held = lessons_in(grid, 0x1234_5678, many as u32, haze);
         if named == "sixteen that agree" {
             for one in &mut held {
@@ -1339,32 +1084,9 @@ fn a_shadow_field_finer_than_a_whole_knob() {
     let Some(host) = device("a_shadow_field_finer_than_a_whole_knob") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -1451,32 +1173,9 @@ fn whether_the_summed_slope_is_signal_or_its_own_error() {
     let Some(host) = device("whether_the_summed_slope_is_signal_or_its_own_error") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
     let haze = 1024_u32;
     let seen = window(grid);
     let knobs = vec![base; grid.cells()];
@@ -1595,32 +1294,9 @@ fn whether_one_lesson_at_a_time_gets_anywhere() {
     let Some(host) = device("whether_one_lesson_at_a_time_gets_anywhere") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -1737,32 +1413,9 @@ fn where_between_four_and_sixteen_the_step_stops_paying() {
     let Some(host) = device("where_between_four_and_sixteen_the_step_stops_paying") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -1879,32 +1532,9 @@ fn whether_a_shrinking_step_keeps_what_the_coarse_one_found() {
     let Some(host) = device("whether_a_shrinking_step_keeps_what_the_coarse_one_found") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -2063,32 +1693,9 @@ fn how_far_down_a_step_finer_than_a_knob_can_go() {
     let Some(host) = device("how_far_down_a_step_finer_than_a_knob_can_go") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -2288,32 +1895,9 @@ fn whether_the_place_it_leaves_is_a_minimum_at_all() {
     let Some(host) = device("whether_the_place_it_leaves_is_a_minimum_at_all") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -2477,32 +2061,9 @@ fn whether_the_whole_descent_is_one_direction() {
     let Some(host) = device("whether_the_whole_descent_is_one_direction") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -2596,32 +2157,9 @@ fn whether_the_knobs_the_slope_never_names_matter_at_all() {
     let Some(host) = device("whether_the_knobs_the_slope_never_names_matter_at_all") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -2731,32 +2269,9 @@ fn how_many_knobs_the_lessons_agree_about() {
     let Some(host) = device("how_many_knobs_the_lessons_agree_about") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -2875,32 +2390,9 @@ fn whether_a_second_direction_gets_past_the_ceiling() {
     let Some(host) = device("whether_a_second_direction_gets_past_the_ceiling") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -3229,32 +2721,9 @@ fn whether_it_is_the_walking_that_turns_the_direction_round() {
     let Some(host) = device("whether_it_is_the_walking_that_turns_the_direction_round") else {
         return;
     };
-    let width = host.width();
     let grid = Grid::of(SIDE, SIDE);
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
-        built(width, grid, Pass::Back, Kind::Living).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
     let base = 256_u32;
-    let mut board = Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth: DEPTH,
-        angle: (base, 0),
-        loud: 1,
-        planted: false,
-    };
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
 
     let haze = 1024_u32;
     let seen = window(grid);

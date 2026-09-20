@@ -547,6 +547,33 @@ pub struct Board<'host> {
     pub planted: bool,
 }
 
+pub fn seated(host: &Host, grid: Grid, kind: Kind, angle: (u32, u32), depth: u32) -> Board<'_> {
+    let width = host.width();
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, kind).unwrap(),
+        built(width, grid, Pass::Back, kind).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth,
+        angle,
+        loud: 1,
+        planted: false,
+    }
+}
+
 impl Board<'_> {
     pub fn tune(&mut self, turning: u32, swing: u32) {
         self.angle = (turning, swing);
