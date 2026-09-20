@@ -157,6 +157,34 @@ pub fn sought(
     Ok(found)
 }
 
+pub struct Rung {
+    pub gates: u32,
+    pub found: Found,
+}
+
+pub fn least(
+    host: &Host,
+    shape: Netlist,
+    table: &[u32],
+    many: u32,
+    rounds: u32,
+) -> Result<Vec<Rung>, Box<dyn std::error::Error>> {
+    let mut rungs = Vec::new();
+    let mut gates = shape.gates;
+    while gates >= shape.outputs.max(1) {
+        let narrowed = Netlist::over(shape.inputs, shape.outputs, gates, shape.kinds)?;
+        let exam = Exam::of(narrowed, table.to_vec())?;
+        let found = sought(host, narrowed, &exam, many, rounds)?;
+        let solved = found.marks >= found.full;
+        rungs.push(Rung { gates, found });
+        if !solved {
+            break;
+        }
+        gates -= 1;
+    }
+    Ok(rungs)
+}
+
 fn told(found: &Found, sought: bool) -> Json {
     let gates = Json::List(
         found
@@ -273,6 +301,13 @@ fn tools() -> Json {
             ),
         ])
     };
+    let mut laddering = checking.clone();
+    laddering.retain(|(name, _)| *name != "chip");
+    laddering.push(("crowd", counting("how many candidates to search with")));
+    laddering.push((
+        "rounds",
+        counting("how many generations to allow at each rung"),
+    ));
     Json::List(vec![
         map(vec![
             ("name", text("grit_synthesise")),
@@ -283,6 +318,16 @@ fn tools() -> Json {
                 ),
             ),
             ("inputSchema", held(seeking)),
+        ]),
+        map(vec![
+            ("name", text("grit_least")),
+            (
+                "description",
+                text(
+                    "Walk the gate budget down from the one given, searching at each rung, and stop at the first budget that does not solve. Returns the ladder, the smallest budget that did solve, and its circuit. A rung that did not solve means not found within the rounds and crowd spent, which the answer carries, and never that no such circuit exists.",
+                ),
+            ),
+            ("inputSchema", held(laddering)),
         ]),
         map(vec![
             ("name", text("grit_check")),
@@ -343,6 +388,52 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
             let many = held.counted("crowd").unwrap_or(CROWD).clamp(64, 1 << 20);
             let rounds = held.counted("rounds").unwrap_or(ROUNDS).clamp(1, 1 << 20);
             Ok(told(&sought(host, shape, &exam, many, rounds)?, true))
+        }
+        "grit_least" => {
+            let Some(host) = host else {
+                return Err(Box::new(crate::host::Error::NoComputeDevice));
+            };
+            let many = held.counted("crowd").unwrap_or(CROWD).clamp(64, 1 << 20);
+            let rounds = held.counted("rounds").unwrap_or(ROUNDS).clamp(1, 1 << 20);
+            let table: Vec<u32> = (0..shape.words()).map(|row| exam.asked(row)).collect();
+            let rungs = least(host, shape, &table, many, rounds)?;
+            let smallest = rungs
+                .iter()
+                .filter(|rung| rung.found.marks >= rung.found.full)
+                .map(|rung| rung.gates)
+                .min();
+            let ladder = Json::List(
+                rungs
+                    .iter()
+                    .map(|rung| {
+                        map(vec![
+                            ("gates", counted(rung.gates)),
+                            ("solved", Json::Bool(rung.found.marks >= rung.found.full)),
+                            ("marks", counted(rung.found.marks)),
+                            ("of", counted(rung.found.full)),
+                            ("rounds", counted(rung.found.rounds)),
+                        ])
+                    })
+                    .collect(),
+            );
+            let best = rungs
+                .iter()
+                .filter(|rung| rung.found.marks >= rung.found.full)
+                .min_by_key(|rung| rung.gates)
+                .map_or(Json::Null, |rung| told(&rung.found, true));
+            Ok(map(vec![
+                ("smallest_that_solved", smallest.map_or(Json::Null, counted)),
+                ("ladder", ladder),
+                ("circuit", best),
+                ("crowd", counted(many)),
+                ("rounds_each", counted(rounds)),
+                (
+                    "a_rung_that_did_not_solve",
+                    text(
+                        "means not found within these rounds and this crowd, not that none exists",
+                    ),
+                ),
+            ]))
         }
         other => Err(Box::new(crate::netlist::TooWide::Kinds {
             kinds: other.len() as u32,

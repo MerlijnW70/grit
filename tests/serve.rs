@@ -51,7 +51,7 @@ fn a_torn_line_is_read_back_as_it_was_written() {
 }
 
 #[test]
-fn the_server_names_its_two_tools() {
+fn the_server_names_the_three_tools_it_has() {
     let asked = read("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}").unwrap();
     let answer = handle(None, &asked).unwrap();
     let tools = answer
@@ -64,7 +64,7 @@ fn the_server_names_its_two_tools() {
         .iter()
         .filter_map(|one| one.get("name").and_then(Json::text))
         .collect();
-    assert_eq!(names, vec!["grit_synthesise", "grit_check"]);
+    assert_eq!(names, vec!["grit_synthesise", "grit_least", "grit_check"]);
 }
 
 #[test]
@@ -124,6 +124,53 @@ fn synthesising_an_adder_returns_a_circuit_the_host_marked_itself() {
         written(&marked)
     );
     assert_eq!(marked.counted("marks"), held.counted("of"));
+}
+
+#[test]
+fn the_ladder_walks_the_budget_down_and_stops_where_it_cannot() {
+    let Some(host) = device("the_ladder_walks_the_budget_down_and_stops_where_it_cannot") else {
+        return;
+    };
+    let arguments = format!(
+        "{{\"inputs\":4,\"outputs\":3,\"gates\":10,\"table\":[{}],\"crowd\":16384,\"rounds\":1500}}",
+        adder()
+    );
+    let held = structured(&call(Some(&host), "grit_least", &arguments));
+    let rungs = held.get("ladder").and_then(Json::list).unwrap().to_vec();
+    eprintln!(
+        "{:>7} {:>8} {:>8} {:>8}",
+        "gates", "solved", "marks", "rounds"
+    );
+    for rung in &rungs {
+        eprintln!(
+            "{:>7} {:>8} {:>8} {:>8}",
+            rung.counted("gates").unwrap(),
+            matches!(rung.get("solved"), Some(Json::Bool(true))),
+            rung.counted("marks").unwrap(),
+            rung.counted("rounds").unwrap()
+        );
+    }
+    let smallest = held.counted("smallest_that_solved").unwrap();
+    eprintln!("the smallest budget that solved it is {smallest} gates");
+
+    assert!(rungs.len() >= 2, "the ladder has only one rung");
+    let last = rungs.last().unwrap();
+    assert_eq!(
+        last.get("solved"),
+        Some(&Json::Bool(false)),
+        "the ladder should stop on a rung it could not solve"
+    );
+    for rung in &rungs[..rungs.len() - 1] {
+        assert_eq!(rung.get("solved"), Some(&Json::Bool(true)));
+    }
+    assert_eq!(smallest, last.counted("gates").unwrap() + 1);
+    let circuit = held.get("circuit").unwrap();
+    assert_eq!(circuit.get("solved"), Some(&Json::Bool(true)));
+    assert_eq!(
+        circuit.get("gates").and_then(Json::list).unwrap().len(),
+        smallest as usize
+    );
+    assert_eq!(circuit.get("checked_on_the_host"), Some(&Json::Bool(true)));
 }
 
 #[test]
