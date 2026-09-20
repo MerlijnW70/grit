@@ -1049,3 +1049,287 @@ fn the_slope_against_the_bar_that_chance_set() {
         assert!(*loss > loss_flat, "{named} went downhill after all: {loss}");
     }
 }
+
+fn kept_of(grid: Grid, whole: bool, seen: &[usize]) -> Vec<usize> {
+    if whole {
+        (0..grid.cells()).collect()
+    } else {
+        seen.to_vec()
+    }
+}
+
+#[test]
+fn which_of_them_takes_the_promise_out_of_the_slope() {
+    let Some(host) = device("which_of_them_takes_the_promise_out_of_the_slope") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let seen = window(grid);
+    let base = 256_u32;
+    let start = blotted_in(grid, (6, 26), 0x1234_5678, 1024);
+
+    eprintln!(
+        "{:>8} {:>8} {:>7} {:>14} {:>14} {:>9}",
+        "rule", "loss on", "steps", "promised", "delivered", "of it"
+    );
+    let mut told = Vec::new();
+    for (named, kind) in [("smooth", Kind::Smooth), ("living", Kind::Living)] {
+        let passes = [
+            built(width, grid, Pass::Ahead, kind).unwrap(),
+            built(width, grid, Pass::Back, kind).unwrap(),
+        ];
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        for whole in [true, false] {
+            for depth in [16_u32, 64] {
+                let resident = host.resident(&sizes, &modules).unwrap();
+                let mut board = Board {
+                    resident,
+                    over: Groups::Fixed(grid.quads().div_ceil(width)),
+                    grid,
+                    depth,
+                    angle: (base, SWING / 64),
+                    loud: 1,
+                    planted: false,
+                };
+                let kept = kept_of(grid, whole, &seen);
+
+                let truth: Vec<u32> = (0..grid.cells())
+                    .map(|at| base + ((at as u32 * 2654435761) % 129) - 64)
+                    .collect();
+                board.sow(&truth);
+                let target = board.run(&start);
+
+                let knobs = vec![base; grid.cells()];
+                board.sow(&knobs);
+                let ended = board.run(&start);
+                let loss = |held: &[u32]| {
+                    kept.iter()
+                        .map(|at| {
+                            let off = f64::from(held[*at].wrapping_sub(target[*at]) as i32);
+                            off * off / 2.0
+                        })
+                        .sum::<f64>()
+                };
+                let began = loss(&ended);
+
+                let mut weight = vec![0_u32; grid.cells()];
+                for at in &kept {
+                    weight[*at] = ended[*at].wrapping_sub(target[*at]);
+                }
+                board.sow(&knobs);
+                board.carry(&start, &weight);
+                let scale = f64::from(1_u32 << SPARE) * f64::from(board.loud);
+                let piled: Vec<f64> = board
+                    .told_each()
+                    .iter()
+                    .map(|one| f64::from(*one) / scale)
+                    .collect();
+
+                let promised: f64 = -piled.iter().map(|one| one.abs()).sum::<f64>();
+                let moved: Vec<u32> = knobs
+                    .iter()
+                    .zip(&piled)
+                    .map(|(knob, slope)| {
+                        let held = i64::from(*knob) - slope.signum() as i64;
+                        held.clamp(1, 4096) as u32
+                    })
+                    .collect();
+                board.sow(&moved);
+                let delivered = loss(&board.run(&start)) - began;
+                let of_it = delivered / promised;
+                let on = if whole { "whole" } else { "window" };
+                eprintln!(
+                    "{named:>8} {on:>8} {depth:>7} {promised:>14.1} {delivered:>14.1} {of_it:>9.3}"
+                );
+                told.push((named, on, depth, of_it));
+            }
+        }
+    }
+
+    for (named, on, depth, of_it) in &told {
+        if *of_it > 0.5 {
+            eprintln!("{named} on the {on} at {depth} steps keeps {of_it:.2} of its promise");
+        }
+    }
+    let best = told
+        .iter()
+        .map(|(_, _, _, one)| *one)
+        .fold(f64::MIN, f64::max);
+    eprintln!("the most any of them delivers is {best:.3} of what it promised");
+}
+
+#[test]
+fn what_it_is_about_the_lesson_that_breaks_the_promise() {
+    let Some(host) = device("what_it_is_about_the_lesson_that_breaks_the_promise") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let base = 256_u32;
+    let seen = window(grid);
+    let haze = 1024_u32;
+
+    eprintln!(
+        "{:>22} {:>7} {:>14} {:>14} {:>9}",
+        "asked", "lessons", "promised", "delivered", "of it"
+    );
+    let mut told = Vec::new();
+    for (named, many, reachable, by_size) in [
+        ("a grid it can reach", 1_usize, true, false),
+        ("a number it cannot", 1, false, false),
+        ("that, four times", 4, false, false),
+        ("that, sixteen times", 16, false, false),
+        ("sixteen, moved by size", 16, false, true),
+        ("sixteen that agree", 16, false, false),
+    ] {
+        let resident = host.resident(&sizes, &modules).unwrap();
+        let mut board = Board {
+            resident,
+            over: Groups::Fixed(grid.quads().div_ceil(width)),
+            grid,
+            depth: DEPTH,
+            angle: (base, 0),
+            loud: 1,
+            planted: false,
+        };
+        let mut held = lessons_in(grid, 0x1234_5678, many as u32, haze);
+        if named == "sixteen that agree" {
+            for one in &mut held {
+                one.left = true;
+            }
+        }
+        let knobs = vec![base; grid.cells()];
+
+        let truth: Vec<u32> = (0..grid.cells())
+            .map(|at| base + ((at as u32 * 2654435761) % 129) - 64)
+            .collect();
+        board.sow(&truth);
+        let aim = board.run(&held[0].start);
+        board.sow(&knobs);
+        let middle = {
+            let (left, right) = parted(&mut board, &held, &seen);
+            (left + right) / 2.0
+        };
+
+        let loss = |board: &mut Board<'_>, field: &[u32]| {
+            board.sow(field);
+            let mut sum = 0.0;
+            for one in &held {
+                let ended = board.run(&one.start);
+                if reachable {
+                    sum += seen
+                        .iter()
+                        .map(|at| {
+                            let off = f64::from(ended[*at].wrapping_sub(aim[*at]) as i32);
+                            off * off / 2.0
+                        })
+                        .sum::<f64>();
+                } else {
+                    let got = read_out(&ended, &seen);
+                    let off = got - wanted(one.left, middle);
+                    sum += off * off / 2.0;
+                }
+            }
+            sum
+        };
+
+        let began = loss(&mut board, &knobs);
+        let mut piled = vec![0.0_f64; grid.cells()];
+        for one in &held {
+            board.sow(&knobs);
+            let ended = board.run(&one.start);
+            let mut weight = vec![0_u32; grid.cells()];
+            if reachable {
+                for at in &seen {
+                    weight[*at] = ended[*at].wrapping_sub(aim[*at]);
+                }
+            } else {
+                let got = read_out(&ended, &seen);
+                let off = got - wanted(one.left, middle);
+                let share = (off / seen.len() as f64 * PITCH).round() as i32;
+                for at in &seen {
+                    weight[*at] = share as u32;
+                }
+            }
+            board.sow(&knobs);
+            board.carry(&one.start, &weight);
+            let mut scale = f64::from(1_u32 << SPARE) * f64::from(board.loud);
+            if !reachable {
+                scale *= PITCH;
+            }
+            for (into, slope) in piled.iter_mut().zip(board.told_each()) {
+                *into += f64::from(slope) / scale;
+            }
+        }
+
+        let widest = piled.iter().fold(0.0_f64, |held, one| held.max(one.abs()));
+        let promised: f64 = if by_size {
+            -piled.iter().map(|one| one * one).sum::<f64>() / widest.max(f64::MIN_POSITIVE)
+        } else {
+            -piled.iter().map(|one| one.abs()).sum::<f64>()
+        };
+        let moved: Vec<u32> = knobs
+            .iter()
+            .zip(&piled)
+            .map(|(knob, slope)| {
+                let step = if by_size {
+                    (slope / widest.max(f64::MIN_POSITIVE)).round() as i64
+                } else {
+                    slope.signum() as i64
+                };
+                let held = i64::from(*knob) - step;
+                held.clamp(1, 4096) as u32
+            })
+            .collect();
+        let delivered = loss(&mut board, &moved) - began;
+        let of_it = delivered / promised;
+        eprintln!("{named:>22} {many:>7} {promised:>14.1} {delivered:>14.1} {of_it:>9.3}");
+        told.push((named, of_it));
+    }
+
+    for (named, of_it) in &told {
+        eprintln!("{named}: {of_it:.3}");
+    }
+    let held = |want: &str| {
+        told.iter()
+            .find(|(named, _)| *named == want)
+            .map_or(0.0, |(_, of_it)| *of_it)
+    };
+    assert!(
+        held("a number it cannot") > 0.5,
+        "{}",
+        held("a number it cannot")
+    );
+    assert!(
+        held("sixteen that agree") > 0.5,
+        "{}",
+        held("sixteen that agree")
+    );
+    assert!(
+        held("that, sixteen times") < 0.0,
+        "{}",
+        held("that, sixteen times")
+    );
+}
