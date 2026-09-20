@@ -46,6 +46,12 @@ pub enum Error {
         given: usize,
         held: usize,
     },
+    Strayed {
+        at: usize,
+        was: u32,
+        now: u32,
+    },
+    Lane(simdr::lanes::LaneError),
 }
 
 impl std::fmt::Display for Error {
@@ -80,6 +86,8 @@ impl std::fmt::Display for Error {
                 Some(one) => write!(out, "{ticket} {one}"),
                 None => write!(out, "{ticket}"),
             },
+            Self::Strayed { at, was, now } => write!(out, "{at} {was} {now}"),
+            Self::Lane(why) => write!(out, "{why:?}"),
         }
     }
 }
@@ -89,6 +97,12 @@ impl std::error::Error for Error {}
 impl From<vk::Result> for Error {
     fn from(code: vk::Result) -> Self {
         Self::Vulkan(code)
+    }
+}
+
+impl From<simdr::lanes::LaneError> for Error {
+    fn from(why: simdr::lanes::LaneError) -> Self {
+        Self::Lane(why)
     }
 }
 

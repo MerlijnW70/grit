@@ -14,20 +14,20 @@ fn a_handful_at_a_time_is_what_the_slope_will_pay_for() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let seen = window(grid);
     let taught = lessons(grid, 0x1234_5678, 8);
     let fresh = lessons(grid, 0x0BAD_C0DE, 32);
     let mut knobs = vec![base; grid.cells()];
 
-    board.sow(&knobs);
+    board.sow(&knobs).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
     };
     let judge = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let loss = told_on(board, &taught, &seen, middle);
         let (left, right) = parted(board, &taught, &seen);
         let line = (left + right) / 2.0;
@@ -104,7 +104,7 @@ fn whether_any_field_at_all_can_answer_it() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let seen = window(grid);
     let taught = lessons(grid, 0x1234_5678, 8);
@@ -138,7 +138,7 @@ fn whether_any_field_at_all_can_answer_it() {
             } else {
                 scattered(0xC0FF_EE00 + go * 7919, span)
             };
-            board.sow(&knobs);
+            board.sow(&knobs).unwrap();
             let (left, right) = parted(&mut board, &taught, &seen);
             let line = (left + right) / 2.0;
             let on_taught = scored(&mut board, &taught, &seen, line);
@@ -168,7 +168,7 @@ fn where_between_too_clear_and_too_hazy_a_field_could_matter() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
     let seen = window(grid);
 
     let scattered = |seed: u32, span: u32| {
@@ -195,7 +195,7 @@ fn where_between_too_clear_and_too_hazy_a_field_could_matter() {
         let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
         let line_of = |board: &mut Board<'_>, knobs: &[u32]| {
-            board.sow(knobs);
+            board.sow(knobs).unwrap();
             let (left, right) = parted(board, &taught, &seen);
             (left + right) / 2.0
         };
@@ -213,7 +213,7 @@ fn where_between_too_clear_and_too_hazy_a_field_could_matter() {
                 picked = (on_taught, knobs, line);
             }
         }
-        board.sow(&picked.1);
+        board.sow(&picked.1).unwrap();
         let picked = (picked.0, scored(&mut board, &fresh, &seen, picked.2));
         eprintln!(
             "{haze:>8} {:>9.0}% {:>11.0}% {:>11.0}%",
@@ -245,7 +245,7 @@ fn the_slope_against_the_bar_that_chance_set() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -253,13 +253,13 @@ fn the_slope_against_the_bar_that_chance_set() {
     let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
     };
     let judge = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let (left, right) = parted(board, &taught, &seen);
         let line = (left + right) / 2.0;
         (
@@ -349,18 +349,18 @@ fn which_of_them_takes_the_promise_out_of_the_slope() {
     for (named, kind) in [("smooth", Kind::Smooth), ("living", Kind::Living)] {
         for whole in [true, false] {
             for depth in [16_u32, 64] {
-                let mut board = seated(&host, grid, kind, (base, SWING / 64), depth);
+                let mut board = seated(&host, grid, kind, (base, SWING / 64), depth).unwrap();
                 let kept = kept_of(grid, whole, &seen);
 
                 let truth: Vec<u32> = (0..grid.cells())
                     .map(|at| base + ((at as u32 * 2654435761) % 129) - 64)
                     .collect();
-                board.sow(&truth);
-                let target = board.run(&start);
+                board.sow(&truth).unwrap();
+                let target = board.run(&start).unwrap();
 
                 let knobs = vec![base; grid.cells()];
-                board.sow(&knobs);
-                let ended = board.run(&start);
+                board.sow(&knobs).unwrap();
+                let ended = board.run(&start).unwrap();
                 let loss = |held: &[u32]| {
                     kept.iter()
                         .map(|at| {
@@ -375,11 +375,12 @@ fn which_of_them_takes_the_promise_out_of_the_slope() {
                 for at in &kept {
                     weight[*at] = ended[*at].wrapping_sub(target[*at]);
                 }
-                board.sow(&knobs);
-                board.carry(&start, &weight);
+                board.sow(&knobs).unwrap();
+                board.carry(&start, &weight).unwrap();
                 let scale = f64::from(1_u32 << SPARE) * f64::from(board.loud);
                 let piled: Vec<f64> = board
                     .told_each()
+                    .unwrap()
                     .iter()
                     .map(|one| f64::from(*one) / scale)
                     .collect();
@@ -393,8 +394,8 @@ fn which_of_them_takes_the_promise_out_of_the_slope() {
                         held.clamp(1, 4096) as u32
                     })
                     .collect();
-                board.sow(&moved);
-                let delivered = loss(&board.run(&start)) - began;
+                board.sow(&moved).unwrap();
+                let delivered = loss(&board.run(&start).unwrap()) - began;
                 let of_it = delivered / promised;
                 let on = if whole { "whole" } else { "window" };
                 eprintln!(
@@ -440,7 +441,7 @@ fn what_it_is_about_the_lesson_that_breaks_the_promise() {
         ("sixteen, moved by size", 16, false, true),
         ("sixteen that agree", 16, false, false),
     ] {
-        let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+        let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
         let mut held = lessons_in(grid, 0x1234_5678, many as u32, haze);
         if named == "sixteen that agree" {
             for one in &mut held {
@@ -452,19 +453,19 @@ fn what_it_is_about_the_lesson_that_breaks_the_promise() {
         let truth: Vec<u32> = (0..grid.cells())
             .map(|at| base + ((at as u32 * 2654435761) % 129) - 64)
             .collect();
-        board.sow(&truth);
-        let aim = board.run(&held[0].start);
-        board.sow(&knobs);
+        board.sow(&truth).unwrap();
+        let aim = board.run(&held[0].start).unwrap();
+        board.sow(&knobs).unwrap();
         let middle = {
             let (left, right) = parted(&mut board, &held, &seen);
             (left + right) / 2.0
         };
 
         let loss = |board: &mut Board<'_>, field: &[u32]| {
-            board.sow(field);
+            board.sow(field).unwrap();
             let mut sum = 0.0;
             for one in &held {
-                let ended = board.run(&one.start);
+                let ended = board.run(&one.start).unwrap();
                 if reachable {
                     sum += seen
                         .iter()
@@ -485,8 +486,8 @@ fn what_it_is_about_the_lesson_that_breaks_the_promise() {
         let began = loss(&mut board, &knobs);
         let mut piled = vec![0.0_f64; grid.cells()];
         for one in &held {
-            board.sow(&knobs);
-            let ended = board.run(&one.start);
+            board.sow(&knobs).unwrap();
+            let ended = board.run(&one.start).unwrap();
             let mut weight = vec![0_u32; grid.cells()];
             if reachable {
                 for at in &seen {
@@ -500,13 +501,13 @@ fn what_it_is_about_the_lesson_that_breaks_the_promise() {
                     weight[*at] = share as u32;
                 }
             }
-            board.sow(&knobs);
-            board.carry(&one.start, &weight);
+            board.sow(&knobs).unwrap();
+            board.carry(&one.start, &weight).unwrap();
             let mut scale = f64::from(1_u32 << SPARE) * f64::from(board.loud);
             if !reachable {
                 scale *= PITCH;
             }
-            for (into, slope) in piled.iter_mut().zip(board.told_each()) {
+            for (into, slope) in piled.iter_mut().zip(board.told_each().unwrap()) {
                 *into += f64::from(slope) / scale;
             }
         }
@@ -568,7 +569,7 @@ fn a_shadow_field_finer_than_a_whole_knob() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -576,13 +577,13 @@ fn a_shadow_field_finer_than_a_whole_knob() {
     let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
     };
     let judge = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let (left, right) = parted(board, &taught, &seen);
         let line = (left + right) / 2.0;
         (
@@ -657,7 +658,7 @@ fn whether_the_summed_slope_is_signal_or_its_own_error() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
     let haze = 1024_u32;
     let seen = window(grid);
     let knobs = vec![base; grid.cells()];
@@ -669,21 +670,21 @@ fn whether_the_summed_slope_is_signal_or_its_own_error() {
     let mut told_all = Vec::new();
     for many in [1_usize, 16] {
         let held = lessons_in(grid, 0x1234_5678, many as u32, haze);
-        board.sow(&knobs);
+        board.sow(&knobs).unwrap();
         let middle = {
             let (left, right) = parted(&mut board, &held, &seen);
             (left + right) / 2.0
         };
         let loss = |board: &mut Board<'_>, field: &[u32]| {
-            board.sow(field);
+            board.sow(field).unwrap();
             told_on(board, &held, &seen, middle) * held.len() as f64
         };
 
         let gathered = |board: &mut Board<'_>, evenly: bool| {
             let mut piled = vec![0.0_f64; grid.cells()];
             for one in &held {
-                board.sow(&knobs);
-                let ended = board.run(&one.start);
+                board.sow(&knobs).unwrap();
+                let ended = board.run(&one.start).unwrap();
                 let got = read_out(&ended, &seen);
                 let off = got - wanted(one.left, middle);
                 let level = if evenly { 4096.0 } else { PITCH };
@@ -696,15 +697,15 @@ fn whether_the_summed_slope_is_signal_or_its_own_error() {
                 for at in &seen {
                     weight[*at] = share as u32;
                 }
-                board.sow(&knobs);
-                board.carry(&one.start, &weight);
+                board.sow(&knobs).unwrap();
+                board.carry(&one.start, &weight).unwrap();
                 let mut scale = f64::from(1_u32 << SPARE) * f64::from(board.loud);
                 if evenly {
                     scale *= level * seen.len() as f64 / off.abs().max(f64::MIN_POSITIVE);
                 } else {
                     scale *= level;
                 }
-                for (into, slope) in piled.iter_mut().zip(board.told_each()) {
+                for (into, slope) in piled.iter_mut().zip(board.told_each().unwrap()) {
                     *into += f64::from(slope) / scale;
                 }
             }
@@ -778,7 +779,7 @@ fn whether_one_lesson_at_a_time_gets_anywhere() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -786,13 +787,13 @@ fn whether_one_lesson_at_a_time_gets_anywhere() {
     let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
     };
     let judge = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let (left, right) = parted(board, &taught, &seen);
         let line = (left + right) / 2.0;
         (
@@ -897,7 +898,7 @@ fn where_between_four_and_sixteen_the_step_stops_paying() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -905,13 +906,13 @@ fn where_between_four_and_sixteen_the_step_stops_paying() {
     let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
     };
     let judge = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let (left, right) = parted(board, &taught, &seen);
         let line = (left + right) / 2.0;
         (
@@ -1016,7 +1017,7 @@ fn whether_a_shrinking_step_keeps_what_the_coarse_one_found() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -1024,13 +1025,13 @@ fn whether_a_shrinking_step_keeps_what_the_coarse_one_found() {
     let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
     };
     let judge = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let (left, right) = parted(board, &taught, &seen);
         let line = (left + right) / 2.0;
         (
@@ -1087,7 +1088,7 @@ fn whether_a_shrinking_step_keeps_what_the_coarse_one_found() {
                     }
                 }
                 Shrink::Stalled(patience) => {
-                    board.sow(&knobs);
+                    board.sow(&knobs).unwrap();
                     let loss = told_on(&mut board, &taught, &seen, middle);
                     if loss < lowest {
                         lowest = loss;
@@ -1177,7 +1178,7 @@ fn how_far_down_a_step_finer_than_a_knob_can_go() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -1185,13 +1186,13 @@ fn how_far_down_a_step_finer_than_a_knob_can_go() {
     let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
     };
     let judge = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let (left, right) = parted(board, &taught, &seen);
         let line = (left + right) / 2.0;
         (
@@ -1351,7 +1352,7 @@ fn whether_the_place_it_leaves_is_a_minimum_at_all() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -1359,7 +1360,7 @@ fn whether_the_place_it_leaves_is_a_minimum_at_all() {
     let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
@@ -1371,11 +1372,11 @@ fn whether_the_place_it_leaves_is_a_minimum_at_all() {
             .collect()
     };
     let loss_at = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         told_on(board, &taught, &seen, middle)
     };
     let reads = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let (left, right) = parted(board, &taught, &seen);
         scored(board, &fresh, &seen, (left + right) / 2.0)
     };
@@ -1462,7 +1463,7 @@ fn whether_the_place_it_leaves_is_a_minimum_at_all() {
 
     let nudge = 16_i64;
     let summed = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         told_on(board, &taught, &seen, middle) * taught.len() as f64
     };
     let truly = |board: &mut Board<'_>, knobs: &[u32]| {
@@ -1517,7 +1518,7 @@ fn whether_the_whole_descent_is_one_direction() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -1525,13 +1526,13 @@ fn whether_the_whole_descent_is_one_direction() {
     let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
     };
     let judge = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let (left, right) = parted(board, &taught, &seen);
         let line = (left + right) / 2.0;
         (
@@ -1613,7 +1614,7 @@ fn whether_a_second_direction_gets_past_the_ceiling() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
@@ -1621,7 +1622,7 @@ fn whether_a_second_direction_gets_past_the_ceiling() {
     let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
@@ -1634,12 +1635,12 @@ fn whether_a_second_direction_gets_past_the_ceiling() {
     };
     let loss_at = |board: &mut Board<'_>, shadow: &[f64]| {
         let knobs = cast(shadow);
-        board.sow(&knobs);
+        board.sow(&knobs).unwrap();
         told_on(board, &taught, &seen, middle)
     };
     let reads = |board: &mut Board<'_>, shadow: &[f64]| {
         let knobs = cast(shadow);
-        board.sow(&knobs);
+        board.sow(&knobs).unwrap();
         let (left, right) = parted(board, &taught, &seen);
         scored(board, &fresh, &seen, (left + right) / 2.0)
     };
@@ -1844,7 +1845,7 @@ fn whether_a_second_direction_gets_past_the_ceiling() {
 
     let again = lessons_in(grid, 0xFEED_FACE, 128, haze);
     let ended = cast(&held);
-    board.sow(&ended);
+    board.sow(&ended).unwrap();
     let line = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
@@ -1883,14 +1884,14 @@ fn whether_it_is_the_walking_that_turns_the_direction_round() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
     let taught = lessons_in(grid, 0x1234_5678, 16, haze);
 
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
@@ -1969,7 +1970,7 @@ fn whether_it_is_the_walking_that_turns_the_direction_round() {
                     .zip(way.iter())
                     .map(|(one, step)| (one + at * step).clamp(1.0, 4096.0).round() as u32)
                     .collect();
-                board.sow(&put);
+                board.sow(&put).unwrap();
                 told_on(board, &taught, &seen, middle)
             };
             let high = leaning(&mut board, close);
@@ -1988,7 +1989,7 @@ fn whether_it_is_the_walking_that_turns_the_direction_round() {
             .zip(way)
             .map(|(one, step)| (one + at * step).clamp(1.0, 4096.0).round() as u32)
             .collect();
-        board.sow(&put);
+        board.sow(&put).unwrap();
         told_on(board, on, &seen, middle)
     };
     let mut own = Vec::new();
@@ -2081,8 +2082,8 @@ fn whether_twice_the_knobs_reach_past_ninety_nine() {
     );
     let mut told = Vec::new();
     for kind in [Kind::Living, Kind::Twinned] {
-        let mut board = seated(&host, grid, kind, (base, 0), DEPTH);
-        board.sow(&flat);
+        let mut board = seated(&host, grid, kind, (base, 0), DEPTH).unwrap();
+        board.sow(&flat).unwrap();
         let middle = {
             let (left, right) = parted(&mut board, &taught, &seen);
             (left + right) / 2.0
@@ -2092,7 +2093,7 @@ fn whether_twice_the_knobs_reach_past_ninety_nine() {
                 .iter()
                 .map(|one| one.round().clamp(1.0, 4096.0) as u32)
                 .collect();
-            board.sow(&knobs);
+            board.sow(&knobs).unwrap();
             let (left, right) = parted(board, &taught, &seen);
             scored(board, on, &seen, (left + right) / 2.0)
         };

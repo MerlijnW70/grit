@@ -101,7 +101,7 @@ pub fn spread_of(board: &mut Board<'_>, held: &[Lesson], seen: &[usize], left: b
     let mut low = f64::MAX;
     let mut high = f64::MIN;
     for one in held.iter().filter(|one| one.left == left) {
-        let got = read_out(&board.run(&one.start), seen);
+        let got = read_out(&board.run(&one.start).unwrap(), seen);
         low = low.min(got);
         high = high.max(got);
     }
@@ -112,7 +112,7 @@ pub fn parted(board: &mut Board<'_>, held: &[Lesson], seen: &[usize]) -> (f64, f
     let mut left = (0.0_f64, 0.0_f64);
     let mut right = (0.0_f64, 0.0_f64);
     for one in held {
-        let got = read_out(&board.run(&one.start), seen);
+        let got = read_out(&board.run(&one.start).unwrap(), seen);
         if one.left {
             left = (left.0 + got, left.1 + 1.0);
         } else {
@@ -125,7 +125,7 @@ pub fn parted(board: &mut Board<'_>, held: &[Lesson], seen: &[usize]) -> (f64, f
 pub fn scored(board: &mut Board<'_>, held: &[Lesson], seen: &[usize], line: f64) -> f64 {
     let mut right = 0.0;
     for one in held {
-        let got = read_out(&board.run(&one.start), seen);
+        let got = read_out(&board.run(&one.start).unwrap(), seen);
         if (got > line) == one.left {
             right += 1.0;
         }
@@ -136,7 +136,7 @@ pub fn scored(board: &mut Board<'_>, held: &[Lesson], seen: &[usize], line: f64)
 pub fn told_on(board: &mut Board<'_>, held: &[Lesson], seen: &[usize], middle: f64) -> f64 {
     let mut loss = 0.0;
     for one in held {
-        let got = read_out(&board.run(&one.start), seen);
+        let got = read_out(&board.run(&one.start).unwrap(), seen);
         let want = wanted(one.left, middle);
         loss += (got - want) * (got - want);
     }
@@ -152,18 +152,18 @@ pub fn slope_of(
 ) -> Vec<f64> {
     let mut piled = vec![0.0_f64; knobs.len()];
     for one in held {
-        board.sow(knobs);
-        let got = read_out(&board.run(&one.start), seen);
+        board.sow(knobs).unwrap();
+        let got = read_out(&board.run(&one.start).unwrap(), seen);
         let off = got - wanted(one.left, middle);
         let share = (off / seen.len() as f64 * PITCH).round() as i32;
         let mut weight = vec![0_u32; knobs.len()];
         for at in seen {
             weight[*at] = share as u32;
         }
-        board.sow(knobs);
-        board.carry(&one.start, &weight);
+        board.sow(knobs).unwrap();
+        board.carry(&one.start, &weight).unwrap();
         let scale = f64::from(1_u32 << SPARE) * f64::from(board.loud) * PITCH;
-        for (into, slope) in piled.iter_mut().zip(board.told_each()) {
+        for (into, slope) in piled.iter_mut().zip(board.told_each().unwrap()) {
             *into += f64::from(slope) / scale;
         }
     }
@@ -253,7 +253,7 @@ pub fn best_along(
                     .clamp(1.0, 4096.0) as u32
             })
             .collect();
-        board.sow(&put);
+        board.sow(&put).unwrap();
         told_on(board, held, seen, middle)
     };
     let mut reach = 4.0_f64;

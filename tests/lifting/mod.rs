@@ -15,6 +15,8 @@ use simdr::kernel::{Kernel, Shape};
 
 use simdr::lanes::{LaneError, U32};
 
+pub use grit::board::*;
+
 pub use grit::rule::*;
 
 pub const WIDE: u32 = 64;
@@ -45,160 +47,6 @@ pub fn device(label: &str) -> Option<Host> {
     }
 }
 
-pub struct Board<'host> {
-    pub resident: grit::Resident<'host>,
-    pub over: Groups,
-    pub grid: Grid,
-    pub depth: u32,
-    pub angle: (u32, u32),
-    pub loud: u32,
-    pub planted: bool,
-}
-
-pub fn seated(host: &Host, grid: Grid, kind: Kind, angle: (u32, u32), depth: u32) -> Board<'_> {
-    let width = host.width();
-    let sizes = [
-        8,
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-        grid.cells(),
-    ];
-    let passes = [
-        built(width, grid, Pass::Ahead, kind).unwrap(),
-        built(width, grid, Pass::Back, kind).unwrap(),
-    ];
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let resident = host.resident(&sizes, &modules).unwrap();
-    Board {
-        resident,
-        over: Groups::Fixed(grid.quads().div_ceil(width)),
-        grid,
-        depth,
-        angle,
-        loud: 1,
-        planted: false,
-    }
-}
-
-impl Board<'_> {
-    pub fn tune(&mut self, turning: u32, swing: u32) {
-        self.angle = (turning, swing);
-        let field = vec![turning; self.grid.cells()];
-        self.resident.write(FIELD as usize, &field).unwrap();
-        self.planted = true;
-    }
-
-    pub fn sow(&mut self, field: &[u32]) {
-        self.resident.write(FIELD as usize, field).unwrap();
-        self.planted = true;
-    }
-
-    pub fn run(&mut self, cells: &[u32]) -> Vec<u32> {
-        if !self.planted {
-            let field = vec![self.angle.0; self.grid.cells()];
-            self.resident.write(FIELD as usize, &field).unwrap();
-            self.planted = true;
-        }
-        self.resident.write(STATE as usize, cells).unwrap();
-        self.resident
-            .write_at(PARAMS as usize, 4, &[self.angle.0, self.angle.1])
-            .unwrap();
-        let ahead = [self.over, Groups::Fixed(0)];
-        let stages: Vec<&[Groups]> = vec![&ahead];
-        for frame in 0..self.depth {
-            self.resident
-                .write_at(PARAMS as usize, 0, &[frame])
-                .unwrap();
-            self.resident.staged(&stages).unwrap();
-        }
-        self.resident
-            .read(STATE as usize, self.grid.cells())
-            .unwrap()
-    }
-
-    pub fn slope(&mut self, cells: &[u32], at: usize) -> Vec<u32> {
-        let mut weight = vec![0_u32; self.grid.cells()];
-        weight[at] = 1 << POINT;
-        self.carry(cells, &weight).0
-    }
-
-    pub fn wipe(&mut self) {
-        let blank = vec![0_u32; self.grid.cells()];
-        self.resident.write(TOLD_TURNING as usize, &blank).unwrap();
-        self.resident.write(TOLD_SWING as usize, &blank).unwrap();
-    }
-
-    pub fn told_each(&mut self) -> Vec<i32> {
-        self.resident
-            .read(TOLD_TURNING as usize, self.grid.cells())
-            .unwrap()
-            .iter()
-            .map(|one| *one as i32)
-            .collect()
-    }
-
-    pub fn told(&mut self) -> (f64, f64) {
-        let piled = |held: Vec<u32>| held.iter().map(|one| f64::from(*one as i32)).sum::<f64>();
-        let turning = self
-            .resident
-            .read(TOLD_TURNING as usize, self.grid.cells())
-            .unwrap();
-        let swing = self
-            .resident
-            .read(TOLD_SWING as usize, self.grid.cells())
-            .unwrap();
-        let back = f64::from(1_u32 << SPARE) * f64::from(self.loud);
-        (piled(turning) / back, piled(swing) / back)
-    }
-
-    pub fn carry(&mut self, cells: &[u32], weight: &[u32]) -> (Vec<u32>, Vec<u32>) {
-        let ended = self.run(cells);
-        self.wipe();
-        let peak = weight
-            .iter()
-            .map(|one| (*one as i32).unsigned_abs())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let room = (ROOM / peak).max(1);
-        self.loud = 1_u32 << (31 - room.leading_zeros());
-        let louder: Vec<u32> = weight
-            .iter()
-            .map(|one| ((*one as i32).wrapping_mul(self.loud as i32)) as u32)
-            .collect();
-        let weight = &louder;
-        self.resident.write(STATE as usize, &ended).unwrap();
-        self.resident
-            .write_at(PARAMS as usize, 4, &[self.angle.0, self.angle.1])
-            .unwrap();
-        self.resident.write(SLOPE as usize, weight).unwrap();
-
-        let back = [Groups::Fixed(0), self.over];
-        let stages: Vec<&[Groups]> = vec![&back];
-        for frame in (0..self.depth).rev() {
-            self.resident
-                .write_at(PARAMS as usize, 0, &[frame])
-                .unwrap();
-            self.resident.staged(&stages).unwrap();
-        }
-        let home = self
-            .resident
-            .read(STATE as usize, self.grid.cells())
-            .unwrap();
-        assert_eq!(home, cells);
-        let carried = self
-            .resident
-            .read(SLOPE as usize, self.grid.cells())
-            .unwrap()
-            .iter()
-            .map(|one| ((*one as i32) / self.loud as i32) as u32)
-            .collect();
-        (carried, ended)
-    }
-}
-
 pub fn spread(grid: Grid, seed: u32) -> Vec<u32> {
     let mut state = seed;
     (0..grid.cells())
@@ -224,7 +72,7 @@ pub fn descended(
     rounds: u32,
 ) -> (f64, f64, f64, f64) {
     let truth = spread(grid, 0x1234_5678);
-    let target = board.run(&truth);
+    let target = board.run(&truth).unwrap();
     let drift = spread(grid, 0x0BAD_C0DE);
     let mut guess: Vec<u32> = truth
         .iter()
@@ -232,7 +80,7 @@ pub fn descended(
         .map(|(one, other)| one.wrapping_add(other >> 2))
         .collect();
 
-    let ended = board.run(&guess);
+    let ended = board.run(&guess).unwrap();
     let reached = ended
         .iter()
         .map(|one| f64::from(*one as i32).abs())
@@ -242,13 +90,13 @@ pub fn descended(
     let mut strength = 0.0;
     let mut last = first;
     for round in 0..rounds {
-        let ended = board.run(&guess);
+        let ended = board.run(&guess).unwrap();
         let weight: Vec<u32> = ended
             .iter()
             .zip(&target)
             .map(|(one, other)| one.wrapping_sub(*other))
             .collect();
-        let (slope, _) = board.carry(&guess, &weight);
+        let (slope, _) = board.carry(&guess, &weight).unwrap();
         if round == 0 {
             strength = slope
                 .iter()
@@ -260,7 +108,7 @@ pub fn descended(
             let moved = i64::from(*cell) - i64::from((*step as i32) >> pace);
             *cell = moved.clamp(0, i64::from(CEILING) - 1) as u32;
         }
-        last = apart(&board.run(&guess), &target);
+        last = apart(&board.run(&guess).unwrap(), &target);
     }
     (first, last, strength, reached)
 }
@@ -307,15 +155,15 @@ pub fn squared(one: &[u32], other: &[u32]) -> f64 {
 
 pub fn asking(board: &mut Board<'_>, start: &[u32], target: &[u32], angle: u32) -> f64 {
     let swing = board.angle.1;
-    board.tune(angle, swing);
-    let ended = board.run(start);
+    board.tune(angle, swing).unwrap();
+    let ended = board.run(start).unwrap();
     let weight: Vec<u32> = ended
         .iter()
         .zip(target)
         .map(|(one, other)| one.wrapping_sub(*other))
         .collect();
-    board.carry(start, &weight);
-    board.told().0
+    board.carry(start, &weight).unwrap();
+    board.told().unwrap().0
 }
 
 pub fn hunted(board: &mut Board<'_>, start: &[u32], target: &[u32], from: u32) -> u32 {
@@ -358,9 +206,9 @@ pub fn hunted(board: &mut Board<'_>, start: &[u32], target: &[u32], from: u32) -
 pub fn narrowed(board: &mut Board<'_>, start: &[u32], target: &[u32], from: u32) -> (u32, u32) {
     let mut runs = 0_u32;
     let loss = |board: &mut Board<'_>, at: u32, runs: &mut u32| {
-        board.tune(at, board.angle.1);
+        board.tune(at, board.angle.1).unwrap();
         *runs += 1;
-        squared(&board.run(start), target)
+        squared(&board.run(start).unwrap(), target)
     };
 
     let mut low = 1_i64;

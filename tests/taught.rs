@@ -14,8 +14,8 @@ fn where_the_blot_has_got_to_by_each_depth() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), 1);
-    board.tune(base, 0);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), 1).unwrap();
+    board.tune(base, 0).unwrap();
 
     let seen = window(grid);
     let left = blotted(grid, (6, 14), 0x1234_5678);
@@ -27,8 +27,8 @@ fn where_the_blot_has_got_to_by_each_depth() {
     );
     for depth in [4_u32, 8, 16, 24, 32, 40, 48, 56, 64] {
         board.depth = depth;
-        let a = read_out(&board.run(&left), &seen);
-        let b = read_out(&board.run(&right), &seen);
+        let a = read_out(&board.run(&left).unwrap(), &seen);
+        let b = read_out(&board.run(&right).unwrap(), &seen);
         eprintln!("{depth:>7} {a:>14.0} {b:>14.0} {:>14.0}", (a - b).abs());
     }
 }
@@ -40,8 +40,8 @@ fn how_much_haze_it_takes_to_blind_the_window() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
-    board.tune(base, 0);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
+    board.tune(base, 0).unwrap();
     let seen = window(grid);
 
     eprintln!(
@@ -55,7 +55,7 @@ fn how_much_haze_it_takes_to_blind_the_window() {
         for seed in 0..16_u32 {
             let top = 4 + (seed * 5) % 12;
             let start = blotted(grid, (top, top + gap), 0x1234_5678 + seed * 7919);
-            let got = read_out(&board.run(&start), &seen);
+            let got = read_out(&board.run(&start).unwrap(), &seen);
             low = low.min(got);
             high = high.max(got);
         }
@@ -73,8 +73,8 @@ fn how_far_a_slope_from_a_small_window_reaches() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), 1);
-    board.tune(base, 0);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), 1).unwrap();
+    board.tune(base, 0).unwrap();
 
     let seen = window(grid);
     let start = blotted(grid, (6, 14), 0x1234_5678);
@@ -90,8 +90,8 @@ fn how_far_a_slope_from_a_small_window_reaches() {
         for at in &seen {
             weight[*at] = (-11_i32) as u32;
         }
-        board.carry(&start, &weight);
-        let held = board.told_each();
+        board.carry(&start, &weight).unwrap();
+        let held = board.told_each().unwrap();
         let spoke = held.iter().filter(|one| **one != 0).count();
         let widest = held.iter().map(|one| one.abs()).max().unwrap_or(0);
         eprintln!("{depth:>7} {spoke:>10} {widest:>12} {:>10}", board.loud);
@@ -116,13 +116,13 @@ fn whether_a_step_down_the_slope_lowers_the_loss_at_all() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let seen = window(grid);
     let taught = lessons(grid, 0x1234_5678, 16);
     let knobs = vec![base; grid.cells()];
 
-    board.sow(&knobs);
+    board.sow(&knobs).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
@@ -131,18 +131,18 @@ fn whether_a_step_down_the_slope_lowers_the_loss_at_all() {
 
     let mut piled = vec![0.0_f64; grid.cells()];
     for one in &taught {
-        board.sow(&knobs);
-        let got = read_out(&board.run(&one.start), &seen);
+        board.sow(&knobs).unwrap();
+        let got = read_out(&board.run(&one.start).unwrap(), &seen);
         let off = got - wanted(one.left, middle);
         let share = (off / seen.len() as f64 * PITCH).round() as i32;
         let mut weight = vec![0_u32; grid.cells()];
         for at in &seen {
             weight[*at] = share as u32;
         }
-        board.sow(&knobs);
-        board.carry(&one.start, &weight);
+        board.sow(&knobs).unwrap();
+        board.carry(&one.start, &weight).unwrap();
         let scale = f64::from(1_u32 << SPARE) * f64::from(board.loud) * PITCH;
-        for (into, slope) in piled.iter_mut().zip(board.told_each()) {
+        for (into, slope) in piled.iter_mut().zip(board.told_each().unwrap()) {
             *into += f64::from(slope) / scale;
         }
     }
@@ -165,7 +165,7 @@ fn whether_a_step_down_the_slope_lowers_the_loss_at_all() {
                 held.clamp(1.0, 4096.0) as u32
             })
             .collect();
-        board.sow(&moved);
+        board.sow(&moved).unwrap();
         let loss = told_on(&mut board, &taught, &seen, middle);
         let promised = -rate * square;
         let delivered = loss - began;
@@ -194,7 +194,7 @@ fn whether_a_step_down_the_slope_lowers_the_loss_at_all() {
             let held = i64::from(knobs[*at]) - slope.signum() as i64;
             moved[*at] = held.clamp(1, 4096) as u32;
         }
-        board.sow(&moved);
+        board.sow(&moved).unwrap();
         let loss = told_on(&mut board, &taught, &seen, middle);
         let delivered = loss - began;
         eprintln!(
@@ -226,11 +226,11 @@ fn whether_a_step_down_the_slope_lowers_the_loss_at_all() {
         for (at, mine) in ranked.iter().take(4) {
             let mut above = knobs.clone();
             above[*at] = (i64::from(knobs[*at]) + step) as u32;
-            board.sow(&above);
+            board.sow(&above).unwrap();
             let high = told_on(&mut board, &taught, &seen, middle);
             let mut below = knobs.clone();
             below[*at] = (i64::from(knobs[*at]) - step) as u32;
-            board.sow(&below);
+            board.sow(&below).unwrap();
             let low = told_on(&mut board, &taught, &seen, middle);
             let nudged = (high - low) / (2.0 * step as f64) * taught.len() as f64 / 2.0;
             let apart = (mine - nudged).abs() / mine.abs().max(nudged.abs()).max(f64::MIN_POSITIVE);
@@ -250,21 +250,21 @@ fn a_field_of_knobs_is_taught_to_say_which_side_the_blot_was_on() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let seen = window(grid);
     let taught = lessons(grid, 0x1234_5678, 16);
     let fresh = lessons(grid, 0x0BAD_C0DE, 32);
 
     let mut knobs = vec![base; grid.cells()];
-    board.sow(&knobs);
+    board.sow(&knobs).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
     };
     eprintln!("the window sits around {middle:.0}, so it is asked for {SPLIT:.0} either side");
     let judge = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         let loss = told_on(board, &taught, &seen, middle);
         let (left, right) = parted(board, &taught, &seen);
         let line = (left + right) / 2.0;
@@ -289,8 +289,8 @@ fn a_field_of_knobs_is_taught_to_say_which_side_the_blot_was_on() {
         let mut spoke_at = 0_usize;
         for one in &taught {
             let mut piled = vec![0.0_f64; grid.cells()];
-            board.sow(&knobs);
-            let ended = board.run(&one.start);
+            board.sow(&knobs).unwrap();
+            let ended = board.run(&one.start).unwrap();
             let got = read_out(&ended, &seen);
             let off = got - wanted(one.left, middle);
             let share = (off / seen.len() as f64 * PITCH).round() as i32;
@@ -298,10 +298,10 @@ fn a_field_of_knobs_is_taught_to_say_which_side_the_blot_was_on() {
             for at in &seen {
                 weight[*at] = share as u32;
             }
-            board.sow(&knobs);
-            board.carry(&one.start, &weight);
+            board.sow(&knobs).unwrap();
+            board.carry(&one.start, &weight).unwrap();
             let scale = f64::from(1_u32 << SPARE) * f64::from(board.loud) * PITCH;
-            for (into, slope) in piled.iter_mut().zip(board.told_each()) {
+            for (into, slope) in piled.iter_mut().zip(board.told_each().unwrap()) {
                 *into += f64::from(slope) / scale;
             }
             spoke_at = spoke_at.max(piled.iter().filter(|one| **one != 0.0).count());
@@ -328,7 +328,7 @@ fn a_field_of_knobs_is_taught_to_say_which_side_the_blot_was_on() {
 
     let (loss_last, gap_last, taught_last, fresh_last) = judge(&mut board, &knobs);
     eprintln!("loss {loss_first:.3e} to {loss_last:.3e}, gap {gap_first:.0} to {gap_last:.0}");
-    board.sow(&knobs);
+    board.sow(&knobs).unwrap();
     let lows = spread_of(&mut board, &taught, &seen, true);
     let highs = spread_of(&mut board, &taught, &seen, false);
     eprintln!(
@@ -361,13 +361,13 @@ fn whether_the_knobs_the_slope_never_names_matter_at_all() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
     let taught = lessons_in(grid, 0x1234_5678, 16, haze);
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
@@ -408,7 +408,7 @@ fn whether_the_knobs_the_slope_never_names_matter_at_all() {
 
     let nudge = 16_i64;
     let summed = |board: &mut Board<'_>, knobs: &[u32]| {
-        board.sow(knobs);
+        board.sow(knobs).unwrap();
         told_on(board, &taught, &seen, middle) * taught.len() as f64
     };
     let sampled = |held: &[usize], want: usize| -> Vec<usize> {
@@ -473,13 +473,13 @@ fn how_many_knobs_the_lessons_agree_about() {
     };
     let grid = Grid::of(SIDE, SIDE);
     let base = 256_u32;
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
 
     let haze = 1024_u32;
     let seen = window(grid);
     let taught = lessons_in(grid, 0x1234_5678, 16, haze);
     let flat = vec![base; grid.cells()];
-    board.sow(&flat);
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
@@ -579,8 +579,8 @@ fn which_half_of_the_knobs_the_rule_leaves_silent() {
     for kind in [Kind::Living, Kind::Smooth] {
         let mut reached = Vec::new();
         for depth in [1_u32, 4, 16, DEPTH] {
-            let mut board = seated(&host, grid, kind, (base, 0), depth);
-            board.sow(&flat);
+            let mut board = seated(&host, grid, kind, (base, 0), depth).unwrap();
+            board.sow(&flat).unwrap();
             let middle = {
                 let (left, right) = parted(&mut board, &taught, &seen);
                 (left + right) / 2.0
@@ -621,8 +621,8 @@ fn which_half_of_the_knobs_the_rule_leaves_silent() {
         );
     }
 
-    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH);
-    board.sow(&flat);
+    let mut board = seated(&host, grid, Kind::Living, (base, 0), DEPTH).unwrap();
+    board.sow(&flat).unwrap();
     let middle = {
         let (left, right) = parted(&mut board, &taught, &seen);
         (left + right) / 2.0
@@ -675,8 +675,8 @@ fn whether_a_twinned_rule_hears_every_knob_and_tells_the_truth() {
     );
     let mut reach = Vec::new();
     for kind in [Kind::Living, Kind::Twinned] {
-        let mut board = seated(&host, grid, kind, (base, 0), DEPTH);
-        board.sow(&flat);
+        let mut board = seated(&host, grid, kind, (base, 0), DEPTH).unwrap();
+        board.sow(&flat).unwrap();
         let middle = {
             let (left, right) = parted(&mut board, &held, &seen);
             (left + right) / 2.0
@@ -717,15 +717,15 @@ fn whether_a_twinned_rule_hears_every_knob_and_tells_the_truth() {
         (Kind::Twinned, "even sum", true),
         (Kind::Twinned, "odd sum", false),
     ] {
-        let mut board = seated(&host, grid, kind, (base, 0), DEPTH);
-        board.sow(&flat);
+        let mut board = seated(&host, grid, kind, (base, 0), DEPTH).unwrap();
+        board.sow(&flat).unwrap();
         let middle = {
             let (left, right) = parted(&mut board, &held, &seen);
             (left + right) / 2.0
         };
         let piled = slope_of(&mut board, &held, &seen, &flat, middle);
         let losing = |board: &mut Board<'_>, field: &[u32]| {
-            board.sow(field);
+            board.sow(field).unwrap();
             told_on(board, &held, &seen, middle)
         };
         {

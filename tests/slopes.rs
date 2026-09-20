@@ -49,26 +49,26 @@ fn the_angles_slope_is_the_slope_a_nudge_to_the_angle_measures() {
     let mut worst = 0.0_f64;
     for depth in [1_u32, 4, 16, 64, 256, 1024] {
         board.depth = depth;
-        board.tune(base, swing);
-        let target = board.run(&start);
+        board.tune(base, swing).unwrap();
+        let target = board.run(&start).unwrap();
 
         for away in [16_u32, 64, 192] {
             let here = base + away;
-            board.tune(here, swing);
-            let ended = board.run(&start);
+            board.tune(here, swing).unwrap();
+            let ended = board.run(&start).unwrap();
             let weight: Vec<u32> = ended
                 .iter()
                 .zip(&target)
                 .map(|(one, other)| one.wrapping_sub(*other))
                 .collect();
-            board.carry(&start, &weight);
-            let (told, _) = board.told();
+            board.carry(&start, &weight).unwrap();
+            let (told, _) = board.told().unwrap();
 
             let step = (away / 4).max(2);
-            board.tune(here + step, swing);
-            let above = squared(&board.run(&start), &target);
-            board.tune(here - step, swing);
-            let below = squared(&board.run(&start), &target);
+            board.tune(here + step, swing).unwrap();
+            let above = squared(&board.run(&start).unwrap(), &target);
+            board.tune(here - step, swing).unwrap();
+            let below = squared(&board.run(&start).unwrap(), &target);
             let nudged = (above - below) / f64::from(2 * step);
 
             let apart = (told - nudged).abs() / told.abs().max(nudged.abs()).max(1.0);
@@ -124,8 +124,8 @@ fn the_angle_is_found_by_walking_the_slope_that_was_checked() {
     let mut told_reach = Vec::new();
     for depth in [1_u32, 16, 256, 1024] {
         board.depth = depth;
-        board.tune(truth, swing);
-        let target = board.run(&start);
+        board.tune(truth, swing).unwrap();
+        let target = board.run(&start).unwrap();
 
         let mut here = truth + 16;
         let mut walked = vec![here];
@@ -243,8 +243,8 @@ fn the_smallest_difference_the_slope_can_point_at() {
         let targets: Vec<Vec<u32>> = grids
             .iter()
             .map(|start| {
-                board.tune(truth, swing);
-                board.run(start)
+                board.tune(truth, swing).unwrap();
+                board.run(start).unwrap()
             })
             .collect();
 
@@ -272,7 +272,7 @@ fn the_smallest_difference_the_slope_can_point_at() {
             None => eprintln!("{depth:>7} {shown}  {:>8}", "none"),
         }
     }
-    board.tune(truth, swing);
+    board.tune(truth, swing).unwrap();
 
     for (depth, away) in &found {
         eprintln!("{depth:>5} steps: points home from {away} out, both ways, on both grids");
@@ -326,8 +326,8 @@ fn the_angle_is_found_where_the_tape_would_not_fit() {
         };
 
         let start = spread(grid, 0x1234_5678);
-        board.tune(truth, swing);
-        let target = board.run(&start);
+        board.tune(truth, swing).unwrap();
+        let target = board.run(&start).unwrap();
 
         let began = std::time::Instant::now();
         let found = hunted(&mut board, &start, &target, truth + 16);
@@ -347,10 +347,10 @@ fn the_angle_is_found_where_the_tape_would_not_fit() {
             let here = truth + away;
             let slope = asking(&mut board, &start, &target, here);
             let step = away / 4;
-            board.tune(here + step, swing);
-            let above = squared(&board.run(&start), &target);
-            board.tune(here - step, swing);
-            let below = squared(&board.run(&start), &target);
+            board.tune(here + step, swing).unwrap();
+            let above = squared(&board.run(&start).unwrap(), &target);
+            board.tune(here - step, swing).unwrap();
+            let below = squared(&board.run(&start).unwrap(), &target);
             let nudged = (above - below) / f64::from(2 * step);
             let apart = (slope - nudged).abs() / slope.abs().max(nudged.abs()).max(1.0);
             eprintln!(
@@ -414,8 +414,8 @@ fn what_the_same_answer_costs_without_any_gradient_at_all() {
         };
 
         let start = spread(grid, 0x1234_5678);
-        board.tune(truth, swing);
-        let target = board.run(&start);
+        board.tune(truth, swing).unwrap();
+        let target = board.run(&start).unwrap();
 
         let began = std::time::Instant::now();
         let found = hunted(&mut board, &start, &target, truth + 16);
@@ -481,21 +481,21 @@ fn one_cells_share_of_the_slope_is_what_nudging_that_cell_measures() {
     let start = spread(grid, 0x1234_5678);
     let scatter = spread(grid, 0x00C0_FFEE);
     let truth: Vec<u32> = scatter.iter().map(|one| base + (one % 33) - 16).collect();
-    board.tune(base, swing);
-    board.sow(&truth);
-    let target = board.run(&start);
+    board.tune(base, swing).unwrap();
+    board.sow(&truth).unwrap();
+    let target = board.run(&start).unwrap();
 
     let guess = vec![base; grid.cells()];
-    board.sow(&guess);
-    let ended = board.run(&start);
+    board.sow(&guess).unwrap();
+    let ended = board.run(&start).unwrap();
     let weight: Vec<u32> = ended
         .iter()
         .zip(&target)
         .map(|(one, other)| one.wrapping_sub(*other))
         .collect();
-    board.sow(&guess);
-    board.carry(&start, &weight);
-    let told = board.told_each();
+    board.sow(&guess).unwrap();
+    board.carry(&start, &weight).unwrap();
+    let told = board.told_each().unwrap();
     let back = f64::from(1_u32 << SPARE) * f64::from(board.loud);
 
     let mut ranked: Vec<(usize, i32)> = told
@@ -518,13 +518,13 @@ fn one_cells_share_of_the_slope_is_what_nudging_that_cell_measures() {
 
             let mut above = guess.clone();
             above[*at] = (i64::from(guess[*at]) + step) as u32;
-            board.sow(&above);
-            let high = squared(&board.run(&start), &target);
+            board.sow(&above).unwrap();
+            let high = squared(&board.run(&start).unwrap(), &target);
 
             let mut below = guess.clone();
             below[*at] = (i64::from(guess[*at]) - step) as u32;
-            board.sow(&below);
-            let low = squared(&board.run(&start), &target);
+            board.sow(&below).unwrap();
+            let low = squared(&board.run(&start).unwrap(), &target);
 
             let nudged = (high - low) / (2.0 * step as f64);
             let apart = (mine - nudged).abs() / mine.abs().max(nudged.abs()).max(1.0);
@@ -590,13 +590,18 @@ fn many_numbers_at_once_are_what_the_walk_back_is_for() {
     let scatter = spread(grid, 0x00C0_FFEE);
 
     let probe: Vec<u32> = scatter.iter().map(|one| base + (one % 33) - 16).collect();
-    board.tune(base, swing);
-    board.sow(&probe);
-    let seen = board.run(&start);
+    board.tune(base, swing).unwrap();
+    board.sow(&probe).unwrap();
+    let seen = board.run(&start).unwrap();
     let weight: Vec<u32> = seen.iter().map(|one| one.wrapping_sub(base)).collect();
-    board.sow(&probe);
-    board.carry(&start, &weight);
-    let live: Vec<bool> = board.told_each().iter().map(|one| *one != 0).collect();
+    board.sow(&probe).unwrap();
+    board.carry(&start, &weight).unwrap();
+    let live: Vec<bool> = board
+        .told_each()
+        .unwrap()
+        .iter()
+        .map(|one| *one != 0)
+        .collect();
     let counted = live.iter().filter(|one| **one).count();
 
     let truth: Vec<u32> = live
@@ -608,19 +613,19 @@ fn many_numbers_at_once_are_what_the_walk_back_is_for() {
     eprintln!("{:>7} {:>10} {:>12}", "steps", "have one", "point right");
     for depth in [16_u32, 64, 256, 1024] {
         board.depth = depth;
-        board.sow(&truth);
-        let aim = board.run(&start);
+        board.sow(&truth).unwrap();
+        let aim = board.run(&start).unwrap();
         let guess = vec![base; grid.cells()];
-        board.sow(&guess);
-        let ended = board.run(&start);
+        board.sow(&guess).unwrap();
+        let ended = board.run(&start).unwrap();
         let weight: Vec<u32> = ended
             .iter()
             .zip(&aim)
             .map(|(one, other)| one.wrapping_sub(*other))
             .collect();
-        board.sow(&guess);
-        board.carry(&start, &weight);
-        let told = board.told_each();
+        board.sow(&guess).unwrap();
+        board.carry(&start, &weight).unwrap();
+        let told = board.told_each().unwrap();
         let mut agreed = 0_usize;
         let mut spoke = 0_usize;
         for (((slope, held), want), on) in told.iter().zip(&guess).zip(&truth).zip(&live) {
@@ -639,8 +644,8 @@ fn many_numbers_at_once_are_what_the_walk_back_is_for() {
         );
     }
     board.depth = 1024;
-    board.sow(&truth);
-    let target = board.run(&start);
+    board.sow(&truth).unwrap();
+    let target = board.run(&start).unwrap();
 
     let mut guess = vec![base; grid.cells()];
     let first = strayed_where(&guess, &truth, &live);
@@ -649,24 +654,24 @@ fn many_numbers_at_once_are_what_the_walk_back_is_for() {
     let began = std::time::Instant::now();
     let mut walk: Vec<(f64, f64)> = Vec::new();
     for step in schedule {
-        board.sow(&guess);
-        let ended = board.run(&start);
+        board.sow(&guess).unwrap();
+        let ended = board.run(&start).unwrap();
         let weight: Vec<u32> = ended
             .iter()
             .zip(&target)
             .map(|(one, other)| one.wrapping_sub(*other))
             .collect();
-        board.sow(&guess);
-        board.carry(&start, &weight);
-        let told = board.told_each();
+        board.sow(&guess).unwrap();
+        board.carry(&start, &weight).unwrap();
+        let told = board.told_each().unwrap();
         for (held, slope) in guess.iter_mut().zip(&told) {
             let moved = i64::from(*held) - i64::from(slope.signum()) * i64::from(step);
             *held = moved.clamp(1, 4096) as u32;
         }
-        board.sow(&guess);
+        board.sow(&guess).unwrap();
         walk.push((
             strayed_where(&guess, &truth, &live),
-            squared(&board.run(&start), &target),
+            squared(&board.run(&start).unwrap(), &target),
         ));
     }
     let took = began.elapsed();
@@ -749,18 +754,18 @@ fn the_living_rules_knob_has_the_slope_a_nudge_measures() {
     let mut told = Vec::new();
     for depth in [4_u32, 16, 64] {
         board.depth = depth;
-        board.sow(&truth);
-        let aim = board.run(&start);
-        board.sow(&guess);
-        let ended = board.run(&start);
+        board.sow(&truth).unwrap();
+        let aim = board.run(&start).unwrap();
+        board.sow(&guess).unwrap();
+        let ended = board.run(&start).unwrap();
         let weight: Vec<u32> = ended
             .iter()
             .zip(&aim)
             .map(|(one, other)| one.wrapping_sub(*other))
             .collect();
-        board.sow(&guess);
-        board.carry(&start, &weight);
-        let held = board.told_each();
+        board.sow(&guess).unwrap();
+        board.carry(&start, &weight).unwrap();
+        let held = board.told_each().unwrap();
         let scale = f64::from(1_u32 << SPARE) * f64::from(board.loud);
         let (spot, raw) = held
             .iter()
@@ -772,12 +777,12 @@ fn the_living_rules_knob_has_the_slope_a_nudge_measures() {
         let step = 64_i64;
         let mut above = guess.clone();
         above[spot] = (i64::from(guess[spot]) + step) as u32;
-        board.sow(&above);
-        let high = squared(&board.run(&start), &aim);
+        board.sow(&above).unwrap();
+        let high = squared(&board.run(&start).unwrap(), &aim);
         let mut below = guess.clone();
         below[spot] = (i64::from(guess[spot]) - step) as u32;
-        board.sow(&below);
-        let low = squared(&board.run(&start), &aim);
+        board.sow(&below).unwrap();
+        let low = squared(&board.run(&start).unwrap(), &aim);
         let nudged = (high - low) / (2.0 * step as f64);
 
         let apart = (mine - nudged).abs() / mine.abs().max(nudged.abs()).max(1.0);

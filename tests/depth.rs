@@ -100,7 +100,7 @@ fn whether_the_slope_points_home() {
         };
 
         let truth = spread(grid, 0x1234_5678);
-        let target = board.run(&truth);
+        let target = board.run(&truth).unwrap();
         let drift = spread(grid, 0x0BAD_C0DE);
         let guess: Vec<u32> = truth
             .iter()
@@ -108,19 +108,19 @@ fn whether_the_slope_points_home() {
             .map(|(one, other)| one.wrapping_add(other >> 2))
             .collect();
 
-        let ended = board.run(&guess);
+        let ended = board.run(&guess).unwrap();
         let weight: Vec<u32> = ended
             .iter()
             .zip(&target)
             .map(|(one, other)| one.wrapping_sub(*other))
             .collect();
-        let (slope, _) = board.carry(&guess, &weight);
+        let (slope, _) = board.carry(&guess, &weight).unwrap();
         let points = leaning(&slope, &guess, &truth);
 
         let mut walk = Vec::new();
         for part in [0.0_f64, 0.25, 0.5, 0.75, 1.0] {
             let held = blended(&truth, &guess, part);
-            walk.push(apart(&board.run(&held), &target));
+            walk.push(apart(&board.run(&held).unwrap(), &target));
         }
         eprintln!(
             "{named:>6} points home {points:+.4}   loss along the way {:?}",
@@ -194,11 +194,11 @@ fn how_far_back_the_loss_can_still_see() {
         let mut level = 0.0_f64;
         for depth in depths {
             board.depth = depth;
-            board.tune(base, SWING / share);
-            let target = board.run(&start);
-            level = apart(&board.run(&stranger), &target);
-            board.tune(base + 8, SWING / share);
-            let loss = apart(&board.run(&start), &target);
+            board.tune(base, SWING / share).unwrap();
+            let target = board.run(&start).unwrap();
+            level = apart(&board.run(&stranger).unwrap(), &target);
+            board.tune(base + 8, SWING / share).unwrap();
+            let loss = apart(&board.run(&start).unwrap(), &target);
             told.push_str(&format!("{loss:>9.0}"));
             if loss < level / 2.0 {
                 reach = depth;
@@ -249,7 +249,7 @@ fn whether_the_loss_can_see_the_angle_it_was_made_with() {
     };
 
     let start = spread(grid, 0x1234_5678);
-    let target = board.run(&start);
+    let target = board.run(&start).unwrap();
 
     eprintln!("{:>9} {:>9} {:>14}", "turning", "away", "loss");
     let mut seen: Vec<(i64, f64)> = Vec::new();
@@ -257,12 +257,12 @@ fn whether_the_loss_can_see_the_angle_it_was_made_with() {
         -4096_i64, -2048, -1024, -256, -64, -8, 0, 8, 64, 256, 1024, 2048, 4096,
     ] {
         let turning = (i64::from(TURNING) + away) as u32;
-        board.tune(turning, SWING);
-        let loss = apart(&board.run(&start), &target);
+        board.tune(turning, SWING).unwrap();
+        let loss = apart(&board.run(&start).unwrap(), &target);
         eprintln!("{turning:>9} {away:>9} {loss:>14.1}");
         seen.push((away, loss));
     }
-    board.tune(TURNING, SWING);
+    board.tune(TURNING, SWING).unwrap();
 
     let bottom = seen
         .iter()
@@ -328,15 +328,15 @@ fn the_window_where_the_angle_can_be_asked_for() {
     let mut told = Vec::new();
     for depth in [1_u32, 4, 16, 64, 256, 1024] {
         board.depth = depth;
-        board.tune(base, swing);
-        let target = board.run(&start);
-        let level = apart(&board.run(&stranger), &target);
+        board.tune(base, swing).unwrap();
+        let target = board.run(&start).unwrap();
+        let level = apart(&board.run(&stranger).unwrap(), &target);
 
         let mut walk = Vec::new();
         let mut shown = String::new();
         for away in aways {
-            board.tune((i64::from(base) + away) as u32, swing);
-            let loss = apart(&board.run(&start), &target);
+            board.tune((i64::from(base) + away) as u32, swing).unwrap();
+            let loss = apart(&board.run(&start).unwrap(), &target);
             shown.push_str(&format!("{loss:>9.2}"));
             walk.push(loss);
         }
@@ -349,7 +349,7 @@ fn the_window_where_the_angle_can_be_asked_for() {
             .map_or(0.0, |(_, loss)| *loss);
         told.push((depth, level, nearest));
     }
-    board.tune(base, swing);
+    board.tune(base, swing).unwrap();
 
     for (depth, level, nearest) in &told {
         eprintln!("{depth:>5} steps, saturated {level:.0}: one unit out is worth {nearest:.2}");
@@ -409,8 +409,8 @@ fn a_rule_can_be_rough_in_its_state_and_smooth_in_its_number() {
     let mut told = Vec::new();
     for depth in [16_u32, 64, 256] {
         board.depth = depth;
-        board.tune(truth, 0);
-        let target = board.run(&start);
+        board.tune(truth, 0).unwrap();
+        let target = board.run(&start).unwrap();
         let reached = target
             .iter()
             .map(|one| f64::from(*one as i32).abs())
@@ -420,15 +420,15 @@ fn a_rule_can_be_rough_in_its_state_and_smooth_in_its_number() {
         let mut walk = Vec::new();
         let mut shown = String::new();
         for away in aways {
-            board.tune((i64::from(truth) + away) as u32, 0);
-            let loss = apart(&board.run(&start), &target);
+            board.tune((i64::from(truth) + away) as u32, 0).unwrap();
+            let loss = apart(&board.run(&start).unwrap(), &target);
             shown.push_str(&format!("{loss:>9.2}"));
             walk.push(loss);
         }
         eprintln!("{depth:>7} {reached:>10.1} {shown}");
         told.push((depth, reached, walk));
     }
-    board.tune(truth, 0);
+    board.tune(truth, 0).unwrap();
 
     for (depth, _, walk) in &told {
         let dents = (1..walk.len() - 1)
@@ -492,14 +492,14 @@ fn the_living_rule_does_not_obey_superposition_and_the_smooth_one_does() {
             loud: 1,
             planted: false,
         };
-        board.tune(knob, SWING / 64);
+        board.tune(knob, SWING / 64).unwrap();
 
         for depth in [4_u32, 16, 64] {
             board.depth = depth;
-            let ran_both = board.run(&both);
-            let ran_one = board.run(&one);
-            let ran_other = board.run(&other);
-            let ran_none = board.run(&nothing);
+            let ran_both = board.run(&both).unwrap();
+            let ran_one = board.run(&one).unwrap();
+            let ran_other = board.run(&other).unwrap();
+            let ran_none = board.run(&nothing).unwrap();
 
             let mut left = 0.0_f64;
             let mut size = 0.0_f64;
@@ -575,9 +575,9 @@ fn one_cells_knob_has_a_valley_of_its_own() {
     let start = spread(grid, 0x1234_5678);
     let scatter = spread(grid, 0x00C0_FFEE);
     let truth: Vec<u32> = scatter.iter().map(|one| base + (one % 65) - 32).collect();
-    board.tune(base, 0);
-    board.sow(&truth);
-    let target = board.run(&start);
+    board.tune(base, 0).unwrap();
+    board.sow(&truth).unwrap();
+    let target = board.run(&start).unwrap();
 
     let aways = [-64_i64, -16, -4, -1, 0, 1, 4, 16, 64];
     eprintln!(
@@ -599,8 +599,8 @@ fn one_cells_knob_has_a_valley_of_its_own() {
         looked += 1;
         let mut held = truth.clone();
         held[at] = truth[at] + 64;
-        board.sow(&held);
-        if apart(&board.run(&start), &target) > 0.0 {
+        board.sow(&held).unwrap();
+        if apart(&board.run(&start).unwrap(), &target) > 0.0 {
             live.push(at);
         }
     }
@@ -616,8 +616,8 @@ fn one_cells_knob_has_a_valley_of_its_own() {
         for away in aways {
             let mut held = truth.clone();
             held[at] = (i64::from(truth[at]) + away) as u32;
-            board.sow(&held);
-            let loss = apart(&board.run(&start), &target);
+            board.sow(&held).unwrap();
+            let loss = apart(&board.run(&start).unwrap(), &target);
             shown.push_str(&format!("{loss:>9.3}"));
             walk.push(loss);
         }
@@ -629,7 +629,7 @@ fn one_cells_knob_has_a_valley_of_its_own() {
             .map_or(0, |(at, _)| at);
         bottoms.push((at, aways[bottom], walk));
     }
-    board.sow(&truth);
+    board.sow(&truth).unwrap();
 
     for (at, away, walk) in &bottoms {
         let dents = (1..walk.len() - 1)

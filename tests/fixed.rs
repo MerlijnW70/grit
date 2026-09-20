@@ -43,7 +43,7 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
 
     let start = spread(grid, 0x1234_5678);
     let watched = (grid.deep / 2 * grid.wide + grid.wide / 2) as usize;
-    let carried = board.slope(&start, watched);
+    let carried = board.slope(&start, watched).unwrap();
 
     let mut seen = 0;
     let mut worst = 0.0_f64;
@@ -61,7 +61,8 @@ fn the_slope_the_weights_report_is_the_slope_a_nudge_measures() {
         }
         let mut nudged = start.clone();
         nudged[at] = nudged[at].wrapping_add(STEP);
-        let moved = board.run(&nudged)[watched].wrapping_sub(board.run(&start)[watched]);
+        let moved =
+            board.run(&nudged).unwrap()[watched].wrapping_sub(board.run(&start).unwrap()[watched]);
 
         let wanted = ((u64::from(told) * u64::from(STEP)) >> POINT) as u32;
         let apart = moved.abs_diff(wanted);
@@ -110,8 +111,8 @@ fn the_bounded_rules_slope_is_the_slope_a_nudge_measures() {
 
     let start = spread(grid, 0x1234_5678);
     let watched = (grid.deep / 2 * grid.wide + grid.wide / 2) as usize;
-    let carried = board.slope(&start, watched);
-    let settled = board.run(&start)[watched];
+    let carried = board.slope(&start, watched).unwrap();
+    let settled = board.run(&start).unwrap()[watched];
 
     let mut seen = 0;
     let mut worst = 0.0_f64;
@@ -122,7 +123,7 @@ fn the_bounded_rules_slope_is_the_slope_a_nudge_measures() {
         }
         let mut nudged = start.clone();
         nudged[at] = nudged[at].wrapping_add(STEP);
-        let moved = board.run(&nudged)[watched].wrapping_sub(settled);
+        let moved = board.run(&nudged).unwrap()[watched].wrapping_sub(settled);
         let wanted = (((told as i32) as i64 * i64::from(STEP)) >> POINT) as i32 as u32;
         let apart = moved.abs_diff(wanted);
         let share = f64::from(apart) / f64::from(moved.max(wanted).max(1));
@@ -185,16 +186,16 @@ fn whether_the_weight_stays_the_size_it_started() {
     );
     for depth in [16_u32, 64, 256, 1024] {
         board.depth = depth;
-        board.tune(truth, swing);
-        let target = board.run(&start);
-        board.tune(truth + 16, swing);
-        let ended = board.run(&start);
+        board.tune(truth, swing).unwrap();
+        let target = board.run(&start).unwrap();
+        board.tune(truth + 16, swing).unwrap();
+        let ended = board.run(&start).unwrap();
         let weight: Vec<u32> = ended
             .iter()
             .zip(&target)
             .map(|(one, other)| one.wrapping_sub(*other))
             .collect();
-        let (carried, _) = board.carry(&start, &weight);
+        let (carried, _) = board.carry(&start, &weight).unwrap();
         let went = biggest(&weight);
         let came = biggest(&carried);
         eprintln!(
@@ -202,7 +203,7 @@ fn whether_the_weight_stays_the_size_it_started() {
             came / went.max(1.0)
         );
     }
-    board.tune(truth, swing);
+    board.tune(truth, swing).unwrap();
 }
 
 #[test]
@@ -237,7 +238,7 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
     };
 
     let truth = spread(grid, 0x1234_5678);
-    let target = board.run(&truth);
+    let target = board.run(&truth).unwrap();
 
     let drift = spread(grid, 0x0BAD_C0DE);
     let mut guess: Vec<u32> = truth
@@ -247,17 +248,17 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
         .collect();
 
     let strayed = apart(&guess, &truth);
-    let first = apart(&board.run(&guess), &target);
+    let first = apart(&board.run(&guess).unwrap(), &target);
     let mut last = first;
     let mut steps = Vec::new();
     for round in 0..ROUNDS {
-        let ended = board.run(&guess);
+        let ended = board.run(&guess).unwrap();
         let weight: Vec<u32> = ended
             .iter()
             .zip(&target)
             .map(|(one, other)| one.wrapping_sub(*other))
             .collect();
-        let (slope, _) = board.carry(&guess, &weight);
+        let (slope, _) = board.carry(&guess, &weight).unwrap();
         if round == 0 {
             let strength: f64 = slope
                 .iter()
@@ -275,7 +276,7 @@ fn the_grid_is_talked_back_to_the_start_it_came_from() {
             let moved = i64::from(*cell) - i64::from((*step as i32) >> PACE);
             *cell = moved.clamp(0, i64::from(CEILING) - 1) as u32;
         }
-        last = apart(&board.run(&guess), &target);
+        last = apart(&board.run(&guess).unwrap(), &target);
         if round % 8 == 0 || round + 1 == ROUNDS {
             steps.push((round, last));
         }

@@ -1,3 +1,4 @@
+pub mod board;
 pub mod compact;
 pub mod gate;
 pub mod host;
