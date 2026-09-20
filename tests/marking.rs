@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::marking::{
-    BEST, BINDINGS, HELD, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked, turned_on,
+    BEST, BINDINGS, HELD, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked, turned_on, words_of,
 };
 use grit::netlist::{Chip, Exam, Gate, Netlist, drawn, turned};
 use grit::{Groups, Host};
@@ -39,13 +39,21 @@ fn asked(shape: Netlist) -> Exam {
 
 fn columns(exam: &Exam) -> Vec<u32> {
     let shape = exam.shape();
-    (0..shape.outputs)
-        .map(|output| {
-            (0..shape.words()).fold(0_u32, |held, row| {
-                held | (((exam.asked(row) >> output) & 1) << row)
-            })
-        })
-        .collect()
+    let wide = words_of(shape);
+    let mut held = Vec::new();
+    for output in 0..shape.outputs {
+        for word in 0..wide {
+            let mut one = 0_u32;
+            for bit in 0..32_u32 {
+                let row = word * 32 + bit;
+                if row < shape.words() && (exam.asked(row) >> output) & 1 == 1 {
+                    one |= 1 << bit;
+                }
+            }
+            held.push(one);
+        }
+    }
+    held
 }
 
 fn crowd_of(shape: Netlist, seed: u32, many: u32) -> Vec<u32> {
@@ -72,8 +80,8 @@ fn room_for(shape: Netlist, many: u32) -> [usize; BINDINGS as usize] {
     [
         (many * shape.gates) as usize,
         (many * shape.gates) as usize,
-        (many * shape.sources()) as usize,
-        shape.outputs as usize,
+        (many * shape.sources() * words_of(shape)) as usize,
+        (shape.outputs * words_of(shape)) as usize,
         many as usize,
         many as usize,
         many as usize,
@@ -86,6 +94,77 @@ fn room(shape: Netlist) -> [usize; BINDINGS as usize] {
 
 fn named(shape: Netlist) -> Vec<u32> {
     (shape.gates - shape.outputs..shape.gates).collect()
+}
+
+fn asked_of(shape: Netlist) -> Exam {
+    let answers: Vec<u32> = (0..shape.words())
+        .map(|row| {
+            let parity = (0..shape.inputs).fold(0, |held, bit| held ^ ((row >> bit) & 1));
+            let all = (0..shape.inputs).fold(1, |held, bit| held & ((row >> bit) & 1));
+            parity | (all << 1)
+        })
+        .collect();
+    Exam::of(shape, answers).unwrap()
+}
+
+#[test]
+fn a_table_too_wide_for_one_word_is_marked_the_same_on_both_sides() {
+    let Some(host) = device("a_table_too_wide_for_one_word_is_marked_the_same_on_both_sides")
+    else {
+        return;
+    };
+    let width = host.width();
+    eprintln!(
+        "{:>8} {:>7} {:>7} {:>8} {:>10}",
+        "inputs", "rows", "words", "chips", "apart"
+    );
+    for inputs in [4_u32, 5, 6, 8, 10] {
+        let shape = Netlist::over(inputs, 2, 8, 16).unwrap();
+        let exam = asked_of(shape);
+        let held = crowd(shape, 0x1234_5678 ^ inputs);
+        let module = marked(width, shape).unwrap();
+        let modules: Vec<&[u32]> = vec![&module];
+        let sizes = room(shape);
+        let mut resident = host.resident(&sizes, &modules).unwrap();
+        resident.write(TRIAL as usize, &held).unwrap();
+        resident
+            .write(VALUES as usize, &vec![0_u32; sizes[VALUES as usize]])
+            .unwrap();
+        resident.write(WANTED as usize, &columns(&exam)).unwrap();
+        resident
+            .write(SCORE as usize, &vec![0_u32; CROWD as usize])
+            .unwrap();
+        let over = [Groups::Fixed(CROWD.div_ceil(width))];
+        let stages: Vec<&[Groups]> = vec![&over];
+        resident.staged(&stages).unwrap();
+        let scored = resident.read(SCORE as usize, CROWD as usize).unwrap();
+
+        let outputs = named(shape);
+        let mut apart = 0_usize;
+        for who in 0..CROWD as usize {
+            let gates = held[who * shape.gates as usize..(who + 1) * shape.gates as usize].to_vec();
+            let chip = Chip::of(shape, gates, outputs.clone()).unwrap();
+            let want = exam.scored(&chip.table());
+            if scored[who] != want {
+                if apart < 3 {
+                    eprintln!(
+                        "  {inputs} inputs, chip {who}: device {} host {want}",
+                        scored[who]
+                    );
+                }
+                apart += 1;
+            }
+        }
+        eprintln!(
+            "{inputs:>8} {:>7} {:>7} {CROWD:>8} {apart:>10}",
+            shape.words(),
+            words_of(shape)
+        );
+        assert_eq!(
+            apart, 0,
+            "{inputs} inputs: {apart} chips marked differently"
+        );
+    }
 }
 
 #[test]

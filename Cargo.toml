@@ -49,3 +49,7 @@ required-features = ["window"]
 [[bin]]
 name = "climb"
 required-features = ["window"]
+
+[[bin]]
+name = "grit-mcp"
+path = "src/bin/grit-mcp.rs"

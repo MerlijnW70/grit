@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use grit::marking::{
-    BEST, BINDINGS, HELD, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked, turned_on,
+    BEST, BINDINGS, HELD, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked, turned_on, words_of,
 };
 use grit::netlist::{Chip, Exam, Gate, Netlist, drawn};
 use grit::{Groups, Host};
@@ -47,13 +47,21 @@ fn adding(shape: Netlist) -> Result<Exam, Box<dyn std::error::Error>> {
 
 fn columns(exam: &Exam) -> Vec<u32> {
     let shape = exam.shape();
-    (0..shape.outputs)
-        .map(|output| {
-            (0..shape.words()).fold(0_u32, |held, row| {
-                held | (((exam.asked(row) >> output) & 1) << row)
-            })
-        })
-        .collect()
+    let wide = words_of(shape);
+    let mut held = Vec::new();
+    for output in 0..shape.outputs {
+        for word in 0..wide {
+            let mut one = 0_u32;
+            for bit in 0..32_u32 {
+                let row = word * 32 + bit;
+                if row < shape.words() && (exam.asked(row) >> output) & 1 == 1 {
+                    one |= 1 << bit;
+                }
+            }
+            held.push(one);
+        }
+    }
+    held
 }
 
 fn crowd(shape: Netlist, seed: u32) -> Vec<u32> {
@@ -76,8 +84,8 @@ fn room(shape: Netlist) -> [usize; BINDINGS as usize] {
     [
         (CROWD * shape.gates) as usize,
         (CROWD * shape.gates) as usize,
-        (CROWD * shape.sources()) as usize,
-        shape.outputs as usize,
+        (CROWD * shape.sources() * words_of(shape)) as usize,
+        (shape.outputs * words_of(shape)) as usize,
         CROWD as usize,
         CROWD as usize,
         CROWD as usize,

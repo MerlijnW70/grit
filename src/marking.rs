@@ -37,14 +37,26 @@ impl std::fmt::Display for TooDeep {
 impl std::error::Error for TooDeep {}
 
 #[must_use]
-pub fn column(input: u32) -> u32 {
-    (0..ROWS)
-        .filter(|row| (row >> input) & 1 == 1)
-        .fold(0_u32, |held, row| held | (1 << row))
+pub fn words_of(shape: Netlist) -> u32 {
+    shape.words().div_ceil(ROWS).max(1)
 }
 
 #[must_use]
-pub fn rows_of(shape: Netlist) -> u32 {
+pub fn column(input: u32, word: u32) -> u32 {
+    if input < 5 {
+        (0..ROWS)
+            .filter(|row| (row >> input) & 1 == 1)
+            .fold(0_u32, |held, row| held | (1 << row))
+    } else if (word >> (input - 5)) & 1 == 1 {
+        u32::MAX
+    } else {
+        0
+    }
+}
+
+#[must_use]
+pub fn rows_of(shape: Netlist, word: u32) -> u32 {
+    let _ = word;
     if shape.inputs >= 5 {
         u32::MAX
     } else {
@@ -83,10 +95,10 @@ fn counted<const LANES: u32>(
 }
 
 pub fn marked(subgroup: u32, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    if shape.inputs > 5 {
+    if shape.inputs > 12 {
         return Err(Box::new(TooDeep::Inputs {
             inputs: shape.inputs,
-            limit: 5,
+            limit: 12,
         }));
     }
     Ok(match subgroup {
@@ -153,16 +165,19 @@ pub fn marking<const LANES: u32>(
     let base = kernel.module().i_mul(uint, group, width)?;
     let who = kernel.module().i_add(uint, base, lane)?;
 
-    let sources = kernel.module().constant_u32(shape.sources())?;
+    let wide = words_of(shape);
+    let sources = kernel.module().constant_u32(shape.sources() * wide)?;
     let mine = kernel.module().i_mul(uint, who, sources)?;
     let count = kernel.module().constant_u32(shape.gates)?;
     let ours = kernel.module().i_mul(uint, who, count)?;
 
     for input in 0..shape.inputs {
-        let step = kernel.module().constant_u32(input)?;
-        let place = kernel.module().i_add(uint, mine, step)?;
-        let value = kernel.module().constant_u32(column(input))?;
-        kernel.store_at(VALUES, place, value)?;
+        for word in 0..wide {
+            let step = kernel.module().constant_u32(input * wide + word)?;
+            let place = kernel.module().i_add(uint, mine, step)?;
+            let value = kernel.module().constant_u32(column(input, word))?;
+            kernel.store_at(VALUES, place, value)?;
+        }
     }
 
     for at in 0..shape.gates {
@@ -178,12 +193,16 @@ pub fn marking<const LANES: u32>(
             let far = lanes.splat_bits::<U32, LANES>(KIND_BITS + SOURCE_BITS)?;
             let mask = lanes.splat_bits::<U32, LANES>((1 << SOURCE_BITS) - 1)?;
 
+            let spanning = lanes.splat_bits::<U32, LANES>(wide)?;
+
             let shifted = lanes.shift_right_logical(word, by)?;
             let left = lanes.and(shifted, mask)?;
+            let left = lanes.mul(left, spanning)?;
             let left = lanes.add(row, left)?;
 
             let shifted = lanes.shift_right_logical(word, far)?;
             let right = lanes.and(shifted, mask)?;
+            let right = lanes.mul(right, spanning)?;
             let right = lanes.add(row, right)?;
 
             let mut kinds = Vec::with_capacity(4);
@@ -200,58 +219,67 @@ pub fn marking<const LANES: u32>(
             (left.id(), right.id(), kinds)
         };
 
-        let low = kernel.load_at(VALUES, left)?;
-        let high = kernel.load_at(VALUES, right)?;
+        for word in 0..wide {
+            let step = kernel.module().constant_u32(word)?;
+            let here = kernel.module().i_add(uint, left, step)?;
+            let there = kernel.module().i_add(uint, right, step)?;
+            let low = kernel.load_at(VALUES, here)?;
+            let high = kernel.load_at(VALUES, there)?;
 
-        let answered = {
-            let mut lanes = kernel.lanes()?;
-            let low = lanes.splat_id::<U32, LANES>(low)?;
-            let high = lanes.splat_id::<U32, LANES>(high)?;
-            let not_low = lanes.not(low)?;
-            let not_high = lanes.not(high)?;
-            let mut held = lanes.splat_bits::<U32, LANES>(0)?;
-            for (bit, kind) in kinds.iter().enumerate() {
-                let kind = lanes.splat_id::<U32, LANES>(*kind)?;
-                let one = if bit & 1 == 0 { not_low } else { low };
-                let other = if bit & 2 == 0 { not_high } else { high };
-                let both = lanes.and(one, other)?;
-                let part = lanes.and(kind, both)?;
-                held = lanes.or(held, part)?;
-            }
-            held.id()
-        };
+            let answered = {
+                let mut lanes = kernel.lanes()?;
+                let low = lanes.splat_id::<U32, LANES>(low)?;
+                let high = lanes.splat_id::<U32, LANES>(high)?;
+                let not_low = lanes.not(low)?;
+                let not_high = lanes.not(high)?;
+                let mut held = lanes.splat_bits::<U32, LANES>(0)?;
+                for (bit, kind) in kinds.iter().enumerate() {
+                    let kind = lanes.splat_id::<U32, LANES>(*kind)?;
+                    let one = if bit & 1 == 0 { not_low } else { low };
+                    let other = if bit & 2 == 0 { not_high } else { high };
+                    let both = lanes.and(one, other)?;
+                    let part = lanes.and(kind, both)?;
+                    held = lanes.or(held, part)?;
+                }
+                held.id()
+            };
 
-        let step = kernel.module().constant_u32(shape.inputs + at)?;
-        let place = kernel.module().i_add(uint, mine, step)?;
-        kernel.store_at(VALUES, place, answered)?;
+            let step = kernel
+                .module()
+                .constant_u32((shape.inputs + at) * wide + word)?;
+            let place = kernel.module().i_add(uint, mine, step)?;
+            kernel.store_at(VALUES, place, answered)?;
+        }
     }
 
     let mut total = None;
     for output in 0..shape.outputs {
         let named = shape.inputs + shape.gates - shape.outputs + output;
-        let step = kernel.module().constant_u32(named)?;
-        let place = kernel.module().i_add(uint, mine, step)?;
-        let got = kernel.load_at(VALUES, place)?;
-        let asked = kernel.module().constant_u32(output)?;
-        let wanted = kernel.load_at(WANTED, asked)?;
-        let marks = {
-            let mut lanes = kernel.lanes()?;
-            let got = lanes.splat_id::<U32, LANES>(got)?;
-            let wanted = lanes.splat_id::<U32, LANES>(wanted)?;
-            let rows = lanes.splat_bits::<U32, LANES>(rows_of(shape))?;
-            let apart = lanes.xor(got, wanted)?;
-            let same = lanes.not(apart)?;
-            let same = lanes.and(same, rows)?;
-            let marks = counted::<LANES>(&mut lanes, same)?;
-            match total {
-                None => marks.id(),
-                Some(before) => {
-                    let before = lanes.splat_id::<U32, LANES>(before)?;
-                    lanes.add(before, marks)?.id()
+        for word in 0..wide {
+            let step = kernel.module().constant_u32(named * wide + word)?;
+            let place = kernel.module().i_add(uint, mine, step)?;
+            let got = kernel.load_at(VALUES, place)?;
+            let asked = kernel.module().constant_u32(output * wide + word)?;
+            let wanted = kernel.load_at(WANTED, asked)?;
+            let marks = {
+                let mut lanes = kernel.lanes()?;
+                let got = lanes.splat_id::<U32, LANES>(got)?;
+                let wanted = lanes.splat_id::<U32, LANES>(wanted)?;
+                let rows = lanes.splat_bits::<U32, LANES>(rows_of(shape, word))?;
+                let apart = lanes.xor(got, wanted)?;
+                let same = lanes.not(apart)?;
+                let same = lanes.and(same, rows)?;
+                let marks = counted::<LANES>(&mut lanes, same)?;
+                match total {
+                    None => marks.id(),
+                    Some(before) => {
+                        let before = lanes.splat_id::<U32, LANES>(before)?;
+                        lanes.add(before, marks)?.id()
+                    }
                 }
-            }
-        };
-        total = Some(marks);
+            };
+            total = Some(marks);
+        }
     }
     if let Some(marks) = total {
         kernel.store_at(SCORE, who, marks)?;
