@@ -120,13 +120,18 @@ pub fn turned_on(subgroup: u32, shape: Netlist) -> Result<Vec<u32>, Box<dyn std:
     })
 }
 
-pub fn chosen(subgroup: u32, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+pub fn chosen(
+    subgroup: u32,
+    shape: Netlist,
+    spread: u32,
+    crowd: u32,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     Ok(match subgroup {
-        4 => choosing::<4>(subgroup, shape)?,
-        8 => choosing::<8>(subgroup, shape)?,
-        16 => choosing::<16>(subgroup, shape)?,
-        32 => choosing::<32>(subgroup, shape)?,
-        64 => choosing::<64>(subgroup, shape)?,
+        4 => choosing::<4>(subgroup, shape, spread, crowd)?,
+        8 => choosing::<8>(subgroup, shape, spread, crowd)?,
+        16 => choosing::<16>(subgroup, shape, spread, crowd)?,
+        32 => choosing::<32>(subgroup, shape, spread, crowd)?,
+        64 => choosing::<64>(subgroup, shape, spread, crowd)?,
         other => {
             return Err(Box::new(LaneError::NoMapping {
                 lanes: other,
@@ -363,6 +368,8 @@ pub fn turning<const LANES: u32>(
 pub fn choosing<const LANES: u32>(
     subgroup: u32,
     shape: Netlist,
+    spread: u32,
+    crowd: u32,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -374,32 +381,59 @@ pub fn choosing<const LANES: u32>(
     let count = kernel.module().constant_u32(shape.gates)?;
     let ours = kernel.module().i_mul(uint, who, count)?;
 
+    let beside = {
+        let mut lanes = kernel.lanes()?;
+        let who = lanes.splat_id::<U32, LANES>(who)?;
+        let by = lanes.splat_bits::<U32, LANES>(spread.max(1))?;
+        let all = lanes.splat_bits::<U32, LANES>(crowd.max(1))?;
+        let past = lanes.add(who, by)?;
+        modulo::<LANES>(&mut lanes, past, all)?.id()
+    };
+    let theirs = kernel.module().i_mul(uint, beside, count)?;
+
     let score = kernel.load_at(SCORE, who)?;
     let best = kernel.load_at(BEST, who)?;
-    let (keeping, kept) = {
+    let other = kernel.load_at(SCORE, beside)?;
+    let (keeping, taking, kept) = {
         let mut lanes = kernel.lanes()?;
         let score = lanes.splat_id::<U32, LANES>(score)?;
         let best = lanes.splat_id::<U32, LANES>(best)?;
-        let keep = lanes.greater_equal(score, best)?;
         let one = lanes.splat_bits::<U32, LANES>(1)?;
         let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let other = if spread == 0 {
+            none
+        } else {
+            lanes.splat_id::<U32, LANES>(other)?
+        };
+        let over = lanes.greater_than(other, score)?;
+        let near = lanes.select(over, other, score)?;
+        let keep = lanes.greater_equal(near, best)?;
+        let from_other = lanes.select(over, one, none)?;
         let keeping = lanes.select(keep, one, none)?;
-        (keeping.id(), lanes.select(keep, score, best)?.id())
+        let take = lanes.and(from_other, keeping)?;
+        let kept = lanes.select(keep, near, best)?;
+        (keeping.id(), take.id(), kept.id())
     };
     kernel.store_at(BEST, who, kept)?;
 
     for at in 0..shape.gates {
         let step = kernel.module().constant_u32(at)?;
         let place = kernel.module().i_add(uint, ours, step)?;
-        let trial = kernel.load_at(TRIAL, place)?;
+        let yonder = kernel.module().i_add(uint, theirs, step)?;
+        let mine = kernel.load_at(TRIAL, place)?;
+        let other = kernel.load_at(TRIAL, yonder)?;
         let held = kernel.load_at(HELD, place)?;
         let taken = {
             let mut lanes = kernel.lanes()?;
-            let keeping = lanes.splat_id::<U32, LANES>(keeping)?;
             let one = lanes.splat_bits::<U32, LANES>(1)?;
+            let keeping = lanes.splat_id::<U32, LANES>(keeping)?;
+            let taking = lanes.splat_id::<U32, LANES>(taking)?;
             let keep = lanes.equal(keeping, one)?;
-            let trial = lanes.splat_id::<U32, LANES>(trial)?;
+            let take = lanes.equal(taking, one)?;
+            let mine = lanes.splat_id::<U32, LANES>(mine)?;
+            let other = lanes.splat_id::<U32, LANES>(other)?;
             let held = lanes.splat_id::<U32, LANES>(held)?;
+            let trial = lanes.select(take, other, mine)?;
             lanes.select(keep, trial, held)?.id()
         };
         kernel.store_at(HELD, place, taken)?;

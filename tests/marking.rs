@@ -249,7 +249,7 @@ fn whether_the_crowd_climbs_without_the_host() {
     let exam = asked(shape);
     let turn = turned_on(width, shape).unwrap();
     let mark = marked(width, shape).unwrap();
-    let pick = chosen(width, shape).unwrap();
+    let pick = chosen(width, shape, 0, CROWD).unwrap();
     let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
     let sizes = room(shape);
     let mut resident = host.resident(&sizes, &modules).unwrap();
@@ -340,7 +340,7 @@ fn how_wide_the_crowd_can_be_and_how_fast_it_climbs() {
     let full = exam.marks();
     let turn = turned_on(width, shape).unwrap();
     let mark = marked(width, shape).unwrap();
-    let pick = chosen(width, shape).unwrap();
+    let pick = chosen(width, shape, 0, CROWD).unwrap();
     let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
 
     eprintln!(

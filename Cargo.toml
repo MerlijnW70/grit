@@ -45,3 +45,7 @@ required-features = ["window"]
 [[bin]]
 name = "back"
 required-features = ["window"]
+
+[[bin]]
+name = "climb"
+required-features = ["window"]
