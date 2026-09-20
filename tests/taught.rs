@@ -1731,3 +1731,145 @@ fn whether_one_lesson_at_a_time_gets_anywhere() {
         best.0
     );
 }
+
+#[test]
+fn where_between_four_and_sixteen_the_step_stops_paying() {
+    let Some(host) = device("where_between_four_and_sixteen_the_step_stops_paying") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let judge = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        let (left, right) = parted(board, &taught, &seen);
+        let line = (left + right) / 2.0;
+        (
+            told_on(board, &taught, &seen, middle),
+            scored(board, &fresh, &seen, line),
+        )
+    };
+
+    let (loss_flat, fresh_flat) = judge(&mut board, &flat);
+    eprintln!(
+        "the plain field reads {:.0}% at loss {loss_flat:.4e}; a step of 4 ended at 90% and one of 16 peaked at 91% and left",
+        fresh_flat * 100.0
+    );
+
+    eprintln!(
+        "{:>6} {:>7} {:>13} {:>9} {:>9}",
+        "step", "round", "loss", "fresh", "moved"
+    );
+    let travel = |knobs: &[u32]| {
+        knobs
+            .iter()
+            .map(|one| f64::from(*one as i32) - f64::from(base))
+            .map(f64::abs)
+            .sum::<f64>()
+            / knobs.len() as f64
+    };
+    let mut told = Vec::new();
+    for step in [PACE, 6, 8, 12, 16] {
+        let mut knobs = flat.clone();
+        let mut top = (0.0_f64, 0_u32, 0.0_f64);
+        let mut ending = (0.0_f64, 0.0_f64);
+        for round in 0..ROUNDS {
+            for one in &taught {
+                let piled = slope_of(
+                    &mut board,
+                    core::slice::from_ref(one),
+                    &seen,
+                    &knobs,
+                    middle,
+                );
+                for (knob, slope) in knobs.iter_mut().zip(&piled) {
+                    if *slope == 0.0 {
+                        continue;
+                    }
+                    let held = i64::from(*knob) - slope.signum() as i64 * step;
+                    *knob = held.clamp(1, 4096) as u32;
+                }
+            }
+            if round % 10 == 9 {
+                let (loss, on_fresh) = judge(&mut board, &knobs);
+                let moved = travel(&knobs);
+                if on_fresh > top.0 {
+                    top = (on_fresh, round + 1, moved);
+                }
+                ending = (loss, on_fresh);
+                eprintln!(
+                    "{step:>6} {:>7} {loss:>13.4e} {:>8.0}% {moved:>9.1}",
+                    round + 1,
+                    on_fresh * 100.0
+                );
+            }
+        }
+        told.push((step, top.0, top.1, top.2, ending.1));
+    }
+
+    eprintln!(
+        "{:>6} {:>10} {:>9} {:>10} {:>10}",
+        "step", "peak", "at round", "moved by", "at sixty"
+    );
+    for (step, peak, at, moved, ending) in &told {
+        eprintln!(
+            "{step:>6} {:>9.0}% {at:>9} {moved:>10.1} {:>9.0}%",
+            peak * 100.0,
+            ending * 100.0
+        );
+    }
+    let high = told.iter().fold(0.0_f64, |held, one| held.max(one.1));
+    let low = told.iter().fold(1.0_f64, |held, one| held.min(one.1));
+    let far = told.iter().fold(0.0_f64, |held, one| held.max(one.3));
+    let near = told.iter().fold(f64::MAX, |held, one| held.min(one.3));
+    eprintln!(
+        "every step in the band peaks between {:.0}% and {:.0}%, having moved each knob between {near:.1} and {far:.1}",
+        low * 100.0,
+        high * 100.0
+    );
+    assert!(
+        low > 0.82,
+        "a step in the band failed to beat the bar chance set: {low}"
+    );
+    assert!(
+        high - low < 0.05,
+        "the band has a best step after all: {low} to {high}"
+    );
+    let last = told.last().map_or(0.0, |one| one.4);
+    assert!(last < 0.60, "the coarsest step held on to its peak: {last}");
+}
