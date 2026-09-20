@@ -89,6 +89,7 @@ fn room(shape: Netlist) -> [usize; BINDINGS as usize] {
         CROWD as usize,
         CROWD as usize,
         CROWD as usize,
+        1,
     ]
 }
 

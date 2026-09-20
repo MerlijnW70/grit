@@ -1,3 +1,4 @@
+use crate::machine::Machine;
 use crate::netlist::{KIND_BITS, Netlist, SOURCE_BITS};
 
 use simdr::kernel::{Kernel, Shape};
@@ -17,7 +18,9 @@ pub const BEST: u32 = 5;
 
 pub const SEED: u32 = 6;
 
-pub const BINDINGS: u32 = 7;
+pub const FEED: u32 = 7;
+
+pub const BINDINGS: u32 = 8;
 
 pub const ROWS: u32 = 32;
 
@@ -181,75 +184,7 @@ pub fn marking<const LANES: u32>(
     }
 
     for at in 0..shape.gates {
-        let step = kernel.module().constant_u32(at)?;
-        let place = kernel.module().i_add(uint, ours, step)?;
-        let packed = kernel.load_at(TRIAL, place)?;
-
-        let (left, right, kinds) = {
-            let mut lanes = kernel.lanes()?;
-            let word = lanes.splat_id::<U32, LANES>(packed)?;
-            let row = lanes.splat_id::<U32, LANES>(mine)?;
-            let by = lanes.splat_bits::<U32, LANES>(KIND_BITS)?;
-            let far = lanes.splat_bits::<U32, LANES>(KIND_BITS + SOURCE_BITS)?;
-            let mask = lanes.splat_bits::<U32, LANES>((1 << SOURCE_BITS) - 1)?;
-
-            let spanning = lanes.splat_bits::<U32, LANES>(wide)?;
-
-            let shifted = lanes.shift_right_logical(word, by)?;
-            let left = lanes.and(shifted, mask)?;
-            let left = lanes.mul(left, spanning)?;
-            let left = lanes.add(row, left)?;
-
-            let shifted = lanes.shift_right_logical(word, far)?;
-            let right = lanes.and(shifted, mask)?;
-            let right = lanes.mul(right, spanning)?;
-            let right = lanes.add(row, right)?;
-
-            let mut kinds = Vec::with_capacity(4);
-            for bit in 0..4_u32 {
-                let by = lanes.splat_bits::<U32, LANES>(bit)?;
-                let one = lanes.splat_bits::<U32, LANES>(1)?;
-                let none = lanes.splat_bits::<U32, LANES>(0)?;
-                let all = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
-                let shifted = lanes.shift_right_logical(word, by)?;
-                let set = lanes.and(shifted, one)?;
-                let live = lanes.equal(set, one)?;
-                kinds.push(lanes.select(live, all, none)?.id());
-            }
-            (left.id(), right.id(), kinds)
-        };
-
-        for word in 0..wide {
-            let step = kernel.module().constant_u32(word)?;
-            let here = kernel.module().i_add(uint, left, step)?;
-            let there = kernel.module().i_add(uint, right, step)?;
-            let low = kernel.load_at(VALUES, here)?;
-            let high = kernel.load_at(VALUES, there)?;
-
-            let answered = {
-                let mut lanes = kernel.lanes()?;
-                let low = lanes.splat_id::<U32, LANES>(low)?;
-                let high = lanes.splat_id::<U32, LANES>(high)?;
-                let not_low = lanes.not(low)?;
-                let not_high = lanes.not(high)?;
-                let mut held = lanes.splat_bits::<U32, LANES>(0)?;
-                for (bit, kind) in kinds.iter().enumerate() {
-                    let kind = lanes.splat_id::<U32, LANES>(*kind)?;
-                    let one = if bit & 1 == 0 { not_low } else { low };
-                    let other = if bit & 2 == 0 { not_high } else { high };
-                    let both = lanes.and(one, other)?;
-                    let part = lanes.and(kind, both)?;
-                    held = lanes.or(held, part)?;
-                }
-                held.id()
-            };
-
-            let step = kernel
-                .module()
-                .constant_u32((shape.inputs + at) * wide + word)?;
-            let place = kernel.module().i_add(uint, mine, step)?;
-            kernel.store_at(VALUES, place, answered)?;
-        }
+        gated_at::<LANES>(&mut kernel, uint, mine, ours, at, wide, shape.inputs)?;
     }
 
     let mut total = None;
@@ -481,6 +416,199 @@ pub fn choosing<const LANES: u32>(
             lanes.select(keep, trial, held)?.id()
         };
         kernel.store_at(HELD, place, taken)?;
+    }
+    Ok(kernel.finish()?)
+}
+
+fn gated_at<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    uint: simdr::module::Id,
+    mine: simdr::module::Id,
+    ours: simdr::module::Id,
+    at: u32,
+    wide: u32,
+    from: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let step = kernel.module().constant_u32(at)?;
+    let place = kernel.module().i_add(uint, ours, step)?;
+    let packed = kernel.load_at(TRIAL, place)?;
+
+    let (left, right, kinds) = {
+        let mut lanes = kernel.lanes()?;
+        let word = lanes.splat_id::<U32, LANES>(packed)?;
+        let row = lanes.splat_id::<U32, LANES>(mine)?;
+        let by = lanes.splat_bits::<U32, LANES>(KIND_BITS)?;
+        let far = lanes.splat_bits::<U32, LANES>(KIND_BITS + SOURCE_BITS)?;
+        let mask = lanes.splat_bits::<U32, LANES>((1 << SOURCE_BITS) - 1)?;
+        let spanning = lanes.splat_bits::<U32, LANES>(wide)?;
+
+        let shifted = lanes.shift_right_logical(word, by)?;
+        let left = lanes.and(shifted, mask)?;
+        let left = lanes.mul(left, spanning)?;
+        let left = lanes.add(row, left)?;
+
+        let shifted = lanes.shift_right_logical(word, far)?;
+        let right = lanes.and(shifted, mask)?;
+        let right = lanes.mul(right, spanning)?;
+        let right = lanes.add(row, right)?;
+
+        let mut kinds = Vec::with_capacity(4);
+        for bit in 0..4_u32 {
+            let by = lanes.splat_bits::<U32, LANES>(bit)?;
+            let one = lanes.splat_bits::<U32, LANES>(1)?;
+            let none = lanes.splat_bits::<U32, LANES>(0)?;
+            let all = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
+            let shifted = lanes.shift_right_logical(word, by)?;
+            let set = lanes.and(shifted, one)?;
+            let live = lanes.equal(set, one)?;
+            kinds.push(lanes.select(live, all, none)?.id());
+        }
+        (left.id(), right.id(), kinds)
+    };
+
+    for word in 0..wide {
+        let step = kernel.module().constant_u32(word)?;
+        let here = kernel.module().i_add(uint, left, step)?;
+        let there = kernel.module().i_add(uint, right, step)?;
+        let low = kernel.load_at(VALUES, here)?;
+        let high = kernel.load_at(VALUES, there)?;
+
+        let answered = {
+            let mut lanes = kernel.lanes()?;
+            let low = lanes.splat_id::<U32, LANES>(low)?;
+            let high = lanes.splat_id::<U32, LANES>(high)?;
+            let not_low = lanes.not(low)?;
+            let not_high = lanes.not(high)?;
+            let mut held = lanes.splat_bits::<U32, LANES>(0)?;
+            for (bit, kind) in kinds.iter().enumerate() {
+                let kind = lanes.splat_id::<U32, LANES>(*kind)?;
+                let one = if bit & 1 == 0 { not_low } else { low };
+                let other = if bit & 2 == 0 { not_high } else { high };
+                let both = lanes.and(one, other)?;
+                let part = lanes.and(kind, both)?;
+                held = lanes.or(held, part)?;
+            }
+            held.id()
+        };
+        let step = kernel.module().constant_u32((from + at) * wide + word)?;
+        let place = kernel.module().i_add(uint, mine, step)?;
+        kernel.store_at(VALUES, place, answered)?;
+    }
+    Ok(())
+}
+
+pub fn stepped(
+    subgroup: u32,
+    held: Machine,
+    wide: u32,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    Ok(match subgroup {
+        4 => stepping::<4>(subgroup, held, wide)?,
+        8 => stepping::<8>(subgroup, held, wide)?,
+        16 => stepping::<16>(subgroup, held, wide)?,
+        32 => stepping::<32>(subgroup, held, wide)?,
+        64 => stepping::<64>(subgroup, held, wide)?,
+        other => {
+            return Err(Box::new(LaneError::NoMapping {
+                lanes: other,
+                width: subgroup,
+            }));
+        }
+    })
+}
+
+pub fn stepping<const LANES: u32>(
+    subgroup: u32,
+    held: Machine,
+    wide: u32,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let shape = held.shape()?;
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let uint = kernel.index_type();
+    let group = kernel.workgroup_index();
+    let lane = kernel.local_index();
+    let width = kernel.module().constant_u32(subgroup)?;
+    let base = kernel.module().i_mul(uint, group, width)?;
+    let who = kernel.module().i_add(uint, base, lane)?;
+
+    let sources = kernel.module().constant_u32(shape.sources() * wide)?;
+    let mine = kernel.module().i_mul(uint, who, sources)?;
+    let count = kernel.module().constant_u32(shape.gates)?;
+    let ours = kernel.module().i_mul(uint, who, count)?;
+
+    let blank = kernel.module().constant_u32(0)?;
+    for bit in 0..held.state {
+        for word in 0..wide {
+            let step = kernel.module().constant_u32(bit * wide + word)?;
+            let place = kernel.module().i_add(uint, mine, step)?;
+            kernel.store_at(VALUES, place, blank)?;
+        }
+    }
+
+    let mut total = None;
+    for tick in 0..held.steps {
+        for input in 0..held.inputs {
+            for word in 0..wide {
+                let asked = kernel
+                    .module()
+                    .constant_u32((tick * held.inputs + input) * wide + word)?;
+                let given = kernel.load_at(FEED, asked)?;
+                let step = kernel
+                    .module()
+                    .constant_u32((held.state + input) * wide + word)?;
+                let place = kernel.module().i_add(uint, mine, step)?;
+                kernel.store_at(VALUES, place, given)?;
+            }
+        }
+
+        for at in 0..shape.gates {
+            gated_at::<LANES>(&mut kernel, uint, mine, ours, at, wide, shape.inputs)?;
+        }
+
+        for output in 0..held.outputs {
+            let from = shape.inputs + shape.gates - held.outputs + output;
+            for word in 0..wide {
+                let step = kernel.module().constant_u32(from * wide + word)?;
+                let place = kernel.module().i_add(uint, mine, step)?;
+                let got = kernel.load_at(VALUES, place)?;
+                let asked = kernel
+                    .module()
+                    .constant_u32((tick * held.outputs + output) * wide + word)?;
+                let wanted = kernel.load_at(WANTED, asked)?;
+                let marks = {
+                    let mut lanes = kernel.lanes()?;
+                    let got = lanes.splat_id::<U32, LANES>(got)?;
+                    let wanted = lanes.splat_id::<U32, LANES>(wanted)?;
+                    let apart = lanes.xor(got, wanted)?;
+                    let same = lanes.not(apart)?;
+                    let marks = counted::<LANES>(&mut lanes, same)?;
+                    match total {
+                        None => marks.id(),
+                        Some(before) => {
+                            let before = lanes.splat_id::<U32, LANES>(before)?;
+                            lanes.add(before, marks)?.id()
+                        }
+                    }
+                };
+                total = Some(marks);
+            }
+        }
+
+        for bit in 0..held.state {
+            let from = shape.inputs + shape.gates - held.outputs - held.state + bit;
+            for word in 0..wide {
+                let step = kernel.module().constant_u32(from * wide + word)?;
+                let place = kernel.module().i_add(uint, mine, step)?;
+                let value = kernel.load_at(VALUES, place)?;
+                let step = kernel.module().constant_u32(bit * wide + word)?;
+                let place = kernel.module().i_add(uint, mine, step)?;
+                kernel.store_at(VALUES, place, value)?;
+            }
+        }
+    }
+
+    if let Some(marks) = total {
+        kernel.store_at(SCORE, who, marks)?;
     }
     Ok(kernel.finish()?)
 }

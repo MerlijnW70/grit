@@ -67,6 +67,7 @@ fn room(shape: Netlist, many: u32) -> [usize; BINDINGS as usize] {
         many as usize,
         many as usize,
         many as usize,
+        1,
     ]
 }
 

@@ -4,6 +4,7 @@ pub mod gate;
 pub mod host;
 pub mod layout;
 pub mod live;
+pub mod machine;
 pub mod marking;
 pub mod netlist;
 pub mod resident;
