@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::marking::{BINDINGS, GATES, SCORE, VALUES, WANTED, marked};
+use grit::marking::{
+    BEST, BINDINGS, HELD, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked, turned_on,
+};
 use grit::netlist::{Chip, Exam, Gate, Netlist, drawn, turned};
 use grit::{Groups, Host};
 
@@ -46,9 +48,9 @@ fn columns(exam: &Exam) -> Vec<u32> {
         .collect()
 }
 
-fn crowd(shape: Netlist, seed: u32) -> Vec<u32> {
+fn crowd_of(shape: Netlist, seed: u32, many: u32) -> Vec<u32> {
     let mut state = seed | 1;
-    (0..CROWD)
+    (0..many)
         .flat_map(|_| {
             (0..shape.gates)
                 .map(|at| {
@@ -60,6 +62,26 @@ fn crowd(shape: Netlist, seed: u32) -> Vec<u32> {
                 .collect::<Vec<u32>>()
         })
         .collect()
+}
+
+fn crowd(shape: Netlist, seed: u32) -> Vec<u32> {
+    crowd_of(shape, seed, CROWD)
+}
+
+fn room_for(shape: Netlist, many: u32) -> [usize; BINDINGS as usize] {
+    [
+        (many * shape.gates) as usize,
+        (many * shape.gates) as usize,
+        (many * shape.sources()) as usize,
+        shape.outputs as usize,
+        many as usize,
+        many as usize,
+        many as usize,
+    ]
+}
+
+fn room(shape: Netlist) -> [usize; BINDINGS as usize] {
+    room_for(shape, CROWD)
 }
 
 fn named(shape: Netlist) -> Vec<u32> {
@@ -78,16 +100,11 @@ fn the_device_marks_every_chip_exactly_as_the_host_does() {
 
     let module = marked(width, shape).unwrap();
     let modules: Vec<&[u32]> = vec![&module];
-    let sizes = [
-        (CROWD * shape.gates) as usize,
-        (CROWD * shape.sources()) as usize,
-        shape.outputs as usize,
-        CROWD as usize,
-    ];
+    let sizes = room(shape);
     assert_eq!(sizes.len(), BINDINGS as usize);
     let mut resident = host.resident(&sizes, &modules).unwrap();
 
-    resident.write(GATES as usize, &held).unwrap();
+    resident.write(TRIAL as usize, &held).unwrap();
     resident
         .write(VALUES as usize, &vec![0_u32; sizes[VALUES as usize]])
         .unwrap();
@@ -139,15 +156,8 @@ fn a_gate_packed_by_the_host_is_the_gate_the_device_reads() {
     assert!(shape.checked(4, gate).is_ok());
 }
 
-fn marking_on(host: &Host, shape: Netlist) -> (Vec<u32>, [usize; 4]) {
-    let module = marked(host.width(), shape).unwrap();
-    let sizes = [
-        (CROWD * shape.gates) as usize,
-        (CROWD * shape.sources()) as usize,
-        shape.outputs as usize,
-        CROWD as usize,
-    ];
-    (module, sizes)
+fn marking_on(host: &Host, shape: Netlist) -> (Vec<u32>, [usize; BINDINGS as usize]) {
+    (marked(host.width(), shape).unwrap(), room(shape))
 }
 
 #[test]
@@ -169,7 +179,7 @@ fn whether_a_crowd_of_climbers_finds_the_table() {
     let stages: Vec<&[Groups]> = vec![&over];
 
     let marks = |resident: &mut grit::Resident<'_>, held: &[u32]| {
-        resident.write(GATES as usize, held).unwrap();
+        resident.write(TRIAL as usize, held).unwrap();
         resident.staged(&stages).unwrap();
         resident.read(SCORE as usize, CROWD as usize).unwrap()
     };
@@ -227,4 +237,156 @@ fn whether_a_crowd_of_climbers_finds_the_table() {
         "after {rounds} rounds {solved} of {CROWD} climbers hold a perfect {full}, the best is {top}"
     );
     assert!(top > 23, "the crowd never beat the best drawn chip: {top}");
+}
+
+#[test]
+fn whether_the_crowd_climbs_without_the_host() {
+    let Some(host) = device("whether_the_crowd_climbs_without_the_host") else {
+        return;
+    };
+    let width = host.width();
+    let shape = shape();
+    let exam = asked(shape);
+    let turn = turned_on(width, shape).unwrap();
+    let mark = marked(width, shape).unwrap();
+    let pick = chosen(width, shape).unwrap();
+    let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
+    let sizes = room(shape);
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+
+    let over = Groups::Fixed(CROWD.div_ceil(width));
+    let turning = [over];
+    let marking = [over];
+    let choosing = [over];
+    let stages: Vec<&[Groups]> = vec![&turning, &marking, &choosing];
+
+    resident
+        .write(HELD as usize, &crowd(shape, 0x1234_5678))
+        .unwrap();
+    resident
+        .write(TRIAL as usize, &vec![0_u32; sizes[TRIAL as usize]])
+        .unwrap();
+    resident
+        .write(VALUES as usize, &vec![0_u32; sizes[VALUES as usize]])
+        .unwrap();
+    resident.write(WANTED as usize, &columns(&exam)).unwrap();
+    resident
+        .write(SCORE as usize, &vec![0_u32; CROWD as usize])
+        .unwrap();
+    resident
+        .write(BEST as usize, &vec![0_u32; CROWD as usize])
+        .unwrap();
+    let seeds: Vec<u32> = (0..CROWD).map(|who| (who * 2_654_435_761) | 1).collect();
+    resident.write(SEED as usize, &seeds).unwrap();
+
+    let full = exam.marks();
+    let batch = 100_u32;
+    let started = std::time::Instant::now();
+    eprintln!(
+        "{:>8} {:>8} {:>9} {:>9}",
+        "rounds", "best", "average", "solved"
+    );
+    let mut done = 0_u32;
+    let mut top = 0_u32;
+    let mut solved = 0_usize;
+    for _ in 0..30_u32 {
+        resident.staged_frames(&stages, batch).unwrap();
+        done += batch;
+        let best = resident.read(BEST as usize, CROWD as usize).unwrap();
+        top = best.iter().copied().max().unwrap_or(0);
+        solved = best.iter().filter(|one| **one == full).count();
+        let sum: u32 = best.iter().copied().sum();
+        eprintln!(
+            "{done:>8} {top:>8} {:>9.1} {solved:>9}",
+            f64::from(sum) / f64::from(CROWD)
+        );
+        if solved > 0 {
+            break;
+        }
+    }
+    let took = started.elapsed();
+    eprintln!("{done} rounds on the device in {took:?}, {solved} of {CROWD} hold a perfect {full}");
+
+    let held = resident.read(HELD as usize, sizes[HELD as usize]).unwrap();
+    let best = resident.read(BEST as usize, CROWD as usize).unwrap();
+    let outputs = named(shape);
+    let mut checked = 0_usize;
+    for (who, mark) in best.iter().enumerate() {
+        if *mark != full {
+            continue;
+        }
+        let gates = held[who * shape.gates as usize..(who + 1) * shape.gates as usize].to_vec();
+        let chip = Chip::of(shape, gates, outputs.clone()).unwrap();
+        assert_eq!(
+            exam.scored(&chip.table()),
+            full,
+            "chip {who} is held to be perfect and is not"
+        );
+        checked += 1;
+    }
+    eprintln!("{checked} of them are perfect when the host marks them itself");
+    assert!(top > 23, "the crowd never beat the best drawn chip: {top}");
+    assert!(checked > 0, "nothing solved it");
+}
+
+#[test]
+fn how_wide_the_crowd_can_be_and_how_fast_it_climbs() {
+    let Some(host) = device("how_wide_the_crowd_can_be_and_how_fast_it_climbs") else {
+        return;
+    };
+    let width = host.width();
+    let shape = shape();
+    let exam = asked(shape);
+    let full = exam.marks();
+    let turn = turned_on(width, shape).unwrap();
+    let mark = marked(width, shape).unwrap();
+    let pick = chosen(width, shape).unwrap();
+    let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
+
+    eprintln!(
+        "{:>9} {:>8} {:>12} {:>13} {:>9}",
+        "crowd", "rounds", "took", "a round", "solved"
+    );
+    let mut told = Vec::new();
+    for many in [256_u32, 4096, 65536] {
+        let sizes = room_for(shape, many);
+        let mut resident = host.resident(&sizes, &modules).unwrap();
+        resident
+            .write(HELD as usize, &crowd_of(shape, 0x1234_5678, many))
+            .unwrap();
+        for binding in [TRIAL, VALUES, SCORE, BEST] {
+            resident
+                .write(binding as usize, &vec![0_u32; sizes[binding as usize]])
+                .unwrap();
+        }
+        resident.write(WANTED as usize, &columns(&exam)).unwrap();
+        let seeds: Vec<u32> = (0..many).map(|who| (who * 2_654_435_761) | 1).collect();
+        resident.write(SEED as usize, &seeds).unwrap();
+
+        let over = Groups::Fixed(many.div_ceil(width));
+        let turning = [over];
+        let marking = [over];
+        let choosing = [over];
+        let stages: Vec<&[Groups]> = vec![&turning, &marking, &choosing];
+
+        let rounds = 1000_u32;
+        let started = std::time::Instant::now();
+        resident.staged_frames(&stages, rounds).unwrap();
+        let best = resident.read(BEST as usize, many as usize).unwrap();
+        let took = started.elapsed();
+        let solved = best.iter().filter(|one| **one == full).count();
+        eprintln!(
+            "{many:>9} {rounds:>8} {took:>12?} {:>13?} {solved:>9}",
+            took / rounds,
+        );
+        told.push((many, solved, took));
+    }
+    for (many, solved, took) in &told {
+        eprintln!("{many} climbers, {solved} of them perfect, in {took:?}");
+    }
+    let (_, solved, _) = told
+        .last()
+        .copied()
+        .unwrap_or((0, 0, std::time::Duration::ZERO));
+    assert!(solved > 0, "the widest crowd solved nothing");
 }
