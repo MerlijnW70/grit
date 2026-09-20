@@ -242,6 +242,163 @@ fn how_much_haze_it_takes_to_blind_the_window() {
 }
 
 #[test]
+fn whether_a_step_down_the_slope_lowers_the_loss_at_all() {
+    let Some(host) = device("whether_a_step_down_the_slope_lowers_the_loss_at_all") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let seen = window(grid);
+    let taught = lessons(grid, 0x1234_5678, 16);
+    let knobs = vec![base; grid.cells()];
+
+    board.sow(&knobs);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let began = told_on(&mut board, &taught, &seen, middle);
+
+    let mut piled = vec![0.0_f64; grid.cells()];
+    for one in &taught {
+        board.sow(&knobs);
+        let got = read_out(&board.run(&one.start), &seen);
+        let off = got - wanted(one.left, middle);
+        let share = (off / seen.len() as f64 * PITCH).round() as i32;
+        let mut weight = vec![0_u32; grid.cells()];
+        for at in &seen {
+            weight[*at] = share as u32;
+        }
+        board.sow(&knobs);
+        board.carry(&one.start, &weight);
+        let scale = f64::from(1_u32 << SPARE) * f64::from(board.loud) * PITCH;
+        for (into, slope) in piled.iter_mut().zip(board.told_each()) {
+            *into += f64::from(slope) / scale;
+        }
+    }
+    let widest = piled.iter().fold(0.0_f64, |held, one| held.max(one.abs()));
+    eprintln!("the widest slope is {widest:.3e}, the loss is {began:.4e}");
+
+    let square: f64 = piled.iter().map(|one| one * one).sum();
+    eprintln!(
+        "{:>12} {:>14} {:>14} {:>10}",
+        "step", "promised", "delivered", "of it"
+    );
+    let mut best = (0.0, began);
+    for over in [1_i32, 2, 4, 8, 16, 32, 64, 128] {
+        let rate = f64::from(over) / widest.max(f64::MIN_POSITIVE);
+        let moved: Vec<u32> = knobs
+            .iter()
+            .zip(&piled)
+            .map(|(knob, slope)| {
+                let held = f64::from(*knob) - rate * slope;
+                held.clamp(1.0, 4096.0) as u32
+            })
+            .collect();
+        board.sow(&moved);
+        let loss = told_on(&mut board, &taught, &seen, middle);
+        let promised = -rate * square;
+        let delivered = loss - began;
+        eprintln!(
+            "{over:>12} {promised:>14.1} {delivered:>14.1} {:>9.3}",
+            delivered / promised
+        );
+        if loss < best.1 {
+            best = (f64::from(over), loss);
+        }
+    }
+    eprintln!(
+        "the best move takes the loss to {:.4} of what it was, at a widest step of {:.0}",
+        best.1 / began,
+        best.0
+    );
+
+    let mut ranked: Vec<(usize, f64)> = piled.iter().copied().enumerate().collect();
+    ranked.sort_by(|one, other| other.1.abs().total_cmp(&one.1.abs()));
+
+    eprintln!("{:>8} {:>14} {:>10}", "moved", "delivered", "per knob");
+    let mut apiece = Vec::new();
+    for many in [1_usize, 4, 16, 64, 256, 1024, 2048] {
+        let mut moved = knobs.clone();
+        for (at, slope) in ranked.iter().take(many) {
+            let held = i64::from(knobs[*at]) - slope.signum() as i64;
+            moved[*at] = held.clamp(1, 4096) as u32;
+        }
+        board.sow(&moved);
+        let loss = told_on(&mut board, &taught, &seen, middle);
+        let delivered = loss - began;
+        eprintln!(
+            "{many:>8} {delivered:>14.2} {:>10.3}",
+            delivered / many as f64
+        );
+        apiece.push((many, delivered / many as f64));
+    }
+    let few = apiece
+        .iter()
+        .filter(|(many, _)| *many <= 16)
+        .map(|(_, one)| *one)
+        .fold(f64::MAX, f64::min);
+    let lots = apiece
+        .iter()
+        .filter(|(many, _)| *many >= 256)
+        .map(|(_, one)| *one)
+        .fold(f64::MIN, f64::max);
+    eprintln!("a few knobs pay {few:.3} apiece and many of them pay {lots:.3}");
+    assert!(few < 0.0, "{few}");
+    assert!(lots > 0.0, "{lots}");
+
+    eprintln!(
+        "{:>8} {:>14} {:>14} {:>9}",
+        "knob", "its share", "a nudge says", "apart"
+    );
+    for step in [1_i64, 8, 64] {
+        let mut worst = 0.0_f64;
+        for (at, mine) in ranked.iter().take(4) {
+            let mut above = knobs.clone();
+            above[*at] = (i64::from(knobs[*at]) + step) as u32;
+            board.sow(&above);
+            let high = told_on(&mut board, &taught, &seen, middle);
+            let mut below = knobs.clone();
+            below[*at] = (i64::from(knobs[*at]) - step) as u32;
+            board.sow(&below);
+            let low = told_on(&mut board, &taught, &seen, middle);
+            let nudged = (high - low) / (2.0 * step as f64) * taught.len() as f64 / 2.0;
+            let apart = (mine - nudged).abs() / mine.abs().max(nudged.abs()).max(f64::MIN_POSITIVE);
+            if step == 8 {
+                eprintln!("{at:>8} {mine:>14.4} {nudged:>14.4} {apart:>8.4}");
+            }
+            worst = worst.max(apart);
+        }
+        eprintln!("a nudge of {step:>3}: worst of four is {worst:.4}");
+    }
+}
+
+#[test]
 fn a_field_of_knobs_is_taught_to_say_which_side_the_blot_was_on() {
     let Some(host) = device("a_field_of_knobs_is_taught_to_say_which_side_the_blot_was_on") else {
         return;
