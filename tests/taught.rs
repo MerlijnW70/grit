@@ -2254,3 +2254,590 @@ fn how_far_down_a_step_finer_than_a_knob_can_go() {
         sign.1
     );
 }
+
+fn settled_by(
+    board: &mut Board<'_>,
+    held: &[Lesson],
+    seen: &[usize],
+    from: &[u32],
+    middle: f64,
+    pace: f64,
+    rounds: u32,
+) -> Vec<f64> {
+    let mut shadow: Vec<f64> = from.iter().map(|one| f64::from(*one)).collect();
+    for _ in 0..rounds {
+        for one in held {
+            let knobs: Vec<u32> = shadow
+                .iter()
+                .map(|one| one.round().clamp(1.0, 4096.0) as u32)
+                .collect();
+            let piled = slope_of(board, core::slice::from_ref(one), seen, &knobs, middle);
+            for (into, slope) in shadow.iter_mut().zip(&piled) {
+                if *slope == 0.0 {
+                    continue;
+                }
+                *into = (*into - pace * slope.signum()).clamp(1.0, 4096.0);
+            }
+        }
+    }
+    shadow
+}
+
+#[test]
+fn whether_the_place_it_leaves_is_a_minimum_at_all() {
+    let Some(host) = device("whether_the_place_it_leaves_is_a_minimum_at_all") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let cast = |shadow: &[f64]| -> Vec<u32> {
+        shadow
+            .iter()
+            .map(|one| one.round().clamp(1.0, 4096.0) as u32)
+            .collect()
+    };
+    let loss_at = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        told_on(board, &taught, &seen, middle)
+    };
+    let reads = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        let (left, right) = parted(board, &taught, &seen);
+        scored(board, &fresh, &seen, (left + right) / 2.0)
+    };
+
+    let settled = settled_by(&mut board, &taught, &seen, &flat, middle, 16.0, 20);
+    let rested = cast(&settled);
+    let loss_settled = loss_at(&mut board, &rested);
+    let fresh_settled = reads(&mut board, &rested);
+    eprintln!(
+        "twenty rounds at a pace of 16 leave the field at loss {loss_settled:.4e} reading {:.0}%",
+        fresh_settled * 100.0
+    );
+
+    eprintln!(
+        "{:>7} {:>7} {:>13} {:>10} {:>10}",
+        "pace", "round", "loss", "net", "path"
+    );
+    let mut told = Vec::new();
+    for pace in [0.25_f64, 1.0, 4.0, 16.0] {
+        let mut shadow = settled.clone();
+        let mut path = 0.0_f64;
+        let mut rise = Vec::new();
+        for round in 0..20_u32 {
+            let before = shadow.clone();
+            for one in &taught {
+                let knobs = cast(&shadow);
+                let piled = slope_of(
+                    &mut board,
+                    core::slice::from_ref(one),
+                    &seen,
+                    &knobs,
+                    middle,
+                );
+                for (into, slope) in shadow.iter_mut().zip(&piled) {
+                    if *slope == 0.0 {
+                        continue;
+                    }
+                    *into = (*into - pace * slope.signum()).clamp(1.0, 4096.0);
+                }
+            }
+            path += shadow
+                .iter()
+                .zip(&before)
+                .map(|(now, then)| (now - then).abs())
+                .sum::<f64>()
+                / shadow.len() as f64;
+            if round % 5 == 4 {
+                let knobs = cast(&shadow);
+                let loss = loss_at(&mut board, &knobs);
+                let net = shadow
+                    .iter()
+                    .zip(&settled)
+                    .map(|(now, then)| (now - then).abs())
+                    .sum::<f64>()
+                    / shadow.len() as f64;
+                rise.push(loss);
+                eprintln!(
+                    "{pace:>7.2} {:>7} {loss:>13.4e} {net:>10.2} {path:>10.2}",
+                    round + 1
+                );
+            }
+        }
+        let net = shadow
+            .iter()
+            .zip(&settled)
+            .map(|(now, then)| (now - then).abs())
+            .sum::<f64>()
+            / shadow.len() as f64;
+        let ended = rise.last().copied().unwrap_or(loss_settled);
+        told.push((pace, ended - loss_settled, net, path));
+    }
+
+    eprintln!(
+        "{:>7} {:>14} {:>14} {:>10} {:>10} {:>10}",
+        "pace", "loss risen by", "per pace", "net", "path", "net/path"
+    );
+    for (pace, risen, net, path) in &told {
+        eprintln!(
+            "{pace:>7.2} {risen:>14.1} {:>14.1} {net:>10.2} {path:>10.2} {:>10.3}",
+            risen / pace,
+            net / path.max(f64::MIN_POSITIVE)
+        );
+    }
+
+    let nudge = 16_i64;
+    let summed = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        told_on(board, &taught, &seen, middle) * taught.len() as f64
+    };
+    let truly = |board: &mut Board<'_>, knobs: &[u32]| {
+        let mut sizes = Vec::new();
+        for at in (0..grid.cells()).step_by(grid.cells() / 16) {
+            let mut above = knobs.to_vec();
+            above[at] = (i64::from(knobs[at]) + nudge).clamp(1, 4096) as u32;
+            let high = summed(board, &above);
+            let mut below = knobs.to_vec();
+            below[at] = (i64::from(knobs[at]) - nudge).clamp(1, 4096) as u32;
+            let low = summed(board, &below);
+            sizes.push((high - low) / (2.0 * nudge as f64));
+        }
+        let wide = sizes.iter().map(|one| one.abs()).sum::<f64>() / sizes.len() as f64;
+        let leaning = sizes.iter().sum::<f64>() / sizes.len() as f64;
+        (wide, leaning)
+    };
+    let (wide_flat, lean_flat) = truly(&mut board, &flat);
+    let (wide_rest, lean_rest) = truly(&mut board, &rested);
+    eprintln!(
+        "nudging sixteen knobs, the true slope averages {wide_flat:.3} at the plain field and {wide_rest:.3} at the settled one"
+    );
+    eprintln!("and leans {lean_flat:.3} against {lean_rest:.3}");
+    let straightest = told.iter().fold(1.0_f64, |held, (_, _, net, path)| {
+        held.min(net / path.max(f64::MIN_POSITIVE))
+    });
+    assert!(
+        straightest > 0.8,
+        "the field wanders rather than walks: {straightest}"
+    );
+    let stepped: Vec<f64> = told
+        .iter()
+        .filter(|(pace, _, _, _)| *pace >= 1.0)
+        .map(|(pace, risen, _, _)| risen / pace)
+        .collect();
+    let most = stepped.iter().fold(0.0_f64, |held, one| held.max(*one));
+    let least = stepped.iter().fold(f64::MAX, |held, one| held.min(*one));
+    assert!(
+        most < least * 2.0,
+        "the rise is not linear in the pace: {least} to {most}"
+    );
+    assert!(
+        wide_rest > 0.4,
+        "the settled field is flat after all: {wide_rest}"
+    );
+}
+
+#[test]
+fn whether_the_whole_descent_is_one_direction() {
+    let Some(host) = device("whether_the_whole_descent_is_one_direction") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let judge = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        let (left, right) = parted(board, &taught, &seen);
+        let line = (left + right) / 2.0;
+        (
+            told_on(board, &taught, &seen, middle),
+            scored(board, &fresh, &seen, line),
+        )
+    };
+
+    let settled = settled_by(&mut board, &taught, &seen, &flat, middle, 16.0, 20);
+    let rested: Vec<u32> = settled
+        .iter()
+        .map(|one| one.round().clamp(1.0, 4096.0) as u32)
+        .collect();
+    let onward = settled_by(&mut board, &taught, &seen, &rested, middle, 16.0, 20);
+
+    let early: Vec<f64> = settled.iter().map(|one| one - f64::from(base)).collect();
+    let later: Vec<f64> = onward
+        .iter()
+        .zip(&settled)
+        .map(|(now, then)| now - then)
+        .collect();
+    let agreed = early
+        .iter()
+        .zip(&later)
+        .filter(|(one, other)| one.signum() == other.signum() && **one != 0.0)
+        .count();
+    let stirred = early.iter().filter(|one| **one != 0.0).count();
+    eprintln!(
+        "of {stirred} knobs the descent moved in its first twenty rounds, {agreed} are still moving the same way in the next twenty"
+    );
+
+    let (loss_flat, fresh_flat) = judge(&mut board, &flat);
+    let (loss_rest, fresh_rest) = judge(&mut board, &rested);
+    eprintln!(
+        "the plain field reads {:.0}% at {loss_flat:.4e} and the settled one {:.0}% at {loss_rest:.4e}",
+        fresh_flat * 100.0,
+        fresh_rest * 100.0
+    );
+
+    eprintln!("{:>7} {:>13} {:>9}", "along", "loss", "fresh");
+    let mut best = (0.0_f64, f64::MAX, 0.0_f64);
+    for tenth in 0..=24_u32 {
+        let along = f64::from(tenth) / 8.0;
+        let knobs: Vec<u32> = early
+            .iter()
+            .map(|one| (f64::from(base) + along * one).round().clamp(1.0, 4096.0) as u32)
+            .collect();
+        let (loss, on_fresh) = judge(&mut board, &knobs);
+        if loss < best.1 {
+            best = (along, loss, on_fresh);
+        }
+        if tenth % 2 == 0 {
+            eprintln!("{along:>7.3} {loss:>13.4e} {:>8.0}%", on_fresh * 100.0);
+        }
+    }
+    eprintln!(
+        "the best point on the line is {:.3} of the way along, at loss {:.4e} reading {:.0}%",
+        best.0,
+        best.1,
+        best.2 * 100.0
+    );
+    eprintln!("sixty rounds of descent never read better than 91%");
+    assert!(
+        best.1 < loss_rest,
+        "the line holds nothing the descent did not already have: {} against {loss_rest}",
+        best.1
+    );
+    assert!(
+        best.2 >= 0.90,
+        "walking the line does not reach what the descent reached: {}",
+        best.2
+    );
+}
+
+#[test]
+fn whether_the_knobs_the_slope_never_names_matter_at_all() {
+    let Some(host) = device("whether_the_knobs_the_slope_never_names_matter_at_all") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+
+    let piled = slope_of(&mut board, &taught, &seen, &flat, middle);
+    let named: Vec<usize> = piled
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| **one != 0.0)
+        .map(|(at, _)| at)
+        .collect();
+    let silent: Vec<usize> = piled
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| **one == 0.0)
+        .map(|(at, _)| at)
+        .collect();
+    eprintln!(
+        "of {} knobs the summed slope names {} and leaves {} silent",
+        grid.cells(),
+        named.len(),
+        silent.len()
+    );
+
+    let mut one_at_a_time = 0_usize;
+    for lesson in &taught {
+        let each = slope_of(
+            &mut board,
+            core::slice::from_ref(lesson),
+            &seen,
+            &flat,
+            middle,
+        );
+        one_at_a_time = one_at_a_time.max(each.iter().filter(|one| **one != 0.0).count());
+    }
+    eprintln!("the widest a single lesson names is {one_at_a_time}");
+
+    let nudge = 16_i64;
+    let summed = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        told_on(board, &taught, &seen, middle) * taught.len() as f64
+    };
+    let sampled = |held: &[usize], want: usize| -> Vec<usize> {
+        if held.len() <= want {
+            return held.to_vec();
+        }
+        let every = held.len() / want;
+        held.iter().step_by(every).take(want).copied().collect()
+    };
+    let truly = |board: &mut Board<'_>, at: usize| {
+        let mut above = flat.clone();
+        above[at] = (i64::from(flat[at]) + nudge).clamp(1, 4096) as u32;
+        let high = summed(board, &above);
+        let mut below = flat.clone();
+        below[at] = (i64::from(flat[at]) - nudge).clamp(1, 4096) as u32;
+        let low = summed(board, &below);
+        (high - low) / (2.0 * nudge as f64)
+    };
+
+    eprintln!(
+        "{:>10} {:>8} {:>14} {:>14}",
+        "knobs", "looked", "mean |slope|", "ever moved"
+    );
+    let mut told = Vec::new();
+    for (what, held) in [("named", &named), ("silent", &silent)] {
+        let picked = sampled(held, 24);
+        let mut sizes = Vec::new();
+        for at in &picked {
+            sizes.push(truly(&mut board, *at));
+        }
+        let wide = sizes.iter().map(|one| one.abs()).sum::<f64>() / sizes.len() as f64;
+        let moved = sizes.iter().filter(|one| **one != 0.0).count();
+        eprintln!("{what:>10} {:>8} {wide:>14.4} {moved:>14}", picked.len());
+        told.push((what, wide, moved, picked.len()));
+    }
+
+    let named_wide = told.first().map_or(0.0, |one| one.1);
+    let silent_wide = told.get(1).map_or(0.0, |one| one.1);
+    let silent_moved = told.get(1).map_or(0, |one| one.2);
+    eprintln!(
+        "a knob the slope never names still moves the loss by {silent_wide:.4} against {named_wide:.4} for one it does, and {silent_moved} of the sampled silent ones move it at all"
+    );
+    assert_eq!(
+        named.len(),
+        grid.cells() / 2,
+        "the slope names other than half the knobs"
+    );
+    assert_eq!(
+        silent_moved, 0,
+        "a knob the slope never names moves the loss, so the silence is a truncation"
+    );
+    assert!(
+        named_wide > 0.4,
+        "the knobs the slope does name move the loss by nothing: {named_wide}"
+    );
+}
+
+#[test]
+fn how_many_knobs_the_lessons_agree_about() {
+    let Some(host) = device("how_many_knobs_the_lessons_agree_about") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+
+    let mut each = Vec::new();
+    for lesson in &taught {
+        each.push(slope_of(
+            &mut board,
+            core::slice::from_ref(lesson),
+            &seen,
+            &flat,
+            middle,
+        ));
+    }
+
+    let mut leaning = vec![0_i32; grid.cells()];
+    let mut heard = vec![0_i32; grid.cells()];
+    for piled in &each {
+        for (at, slope) in piled.iter().enumerate() {
+            if *slope > 0.0 {
+                leaning[at] += 1;
+                heard[at] += 1;
+            } else if *slope < 0.0 {
+                leaning[at] -= 1;
+                heard[at] += 1;
+            }
+        }
+    }
+
+    let named = heard.iter().filter(|one| **one > 0).count();
+    eprintln!("of {} knobs, {named} hear any lesson at all", grid.cells());
+
+    eprintln!("{:>10} {:>10} {:>12}", "agreed", "knobs", "of the named");
+    let mut level = Vec::new();
+    for least in [8_i32, 10, 12, 14, 16] {
+        let held = leaning
+            .iter()
+            .zip(&heard)
+            .filter(|(lean, heard)| **heard > 0 && lean.abs() >= least)
+            .count();
+        eprintln!(
+            "{least:>9}+ {held:>10} {:>11.0}%",
+            held as f64 * 100.0 / named.max(1) as f64
+        );
+        level.push((least, held));
+    }
+
+    let split = leaning
+        .iter()
+        .zip(&heard)
+        .filter(|(lean, heard)| **heard > 0 && lean.abs() <= 2)
+        .count();
+    eprintln!("{split} of the named knobs are pulled within one lesson of evenly, and go nowhere");
+    eprintln!("twenty rounds of descent left 367 knobs somewhere other than where they started");
+    let firm = level
+        .iter()
+        .find(|(least, _)| *least == 12)
+        .map_or(0, |(_, held)| *held);
+    eprintln!("the knobs twelve or more lessons agree about number {firm}");
+    assert_eq!(
+        named,
+        grid.cells() / 2,
+        "other than half the knobs hear a lesson"
+    );
+    let ten = level
+        .iter()
+        .find(|(least, _)| *least == 10)
+        .map_or(usize::MAX, |(_, held)| *held);
+    assert_eq!(
+        ten, 0,
+        "there is a knob ten of the sixteen lessons agree about after all"
+    );
+    assert!(
+        split as f64 > named as f64 * 0.9,
+        "the lessons are not evenly split after all: {split} of {named}"
+    );
+}
