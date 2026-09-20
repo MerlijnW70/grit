@@ -933,3 +933,119 @@ fn where_between_too_clear_and_too_hazy_a_field_could_matter() {
     assert!(best.2 - best.1 > 0.05, "{best:?}");
     assert!(best.1 > 0.5 && best.1 < 0.9, "{best:?}");
 }
+
+#[test]
+fn the_slope_against_the_bar_that_chance_set() {
+    let Some(host) = device("the_slope_against_the_bar_that_chance_set") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let judge = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        let (left, right) = parted(board, &taught, &seen);
+        let line = (left + right) / 2.0;
+        (
+            told_on(board, &taught, &seen, middle),
+            scored(board, &fresh, &seen, line),
+        )
+    };
+
+    let (loss_flat, fresh_flat) = judge(&mut board, &flat);
+    eprintln!(
+        "the plain field reads {:.0}% of the fresh set, and twenty guesses found 82%",
+        fresh_flat * 100.0
+    );
+
+    eprintln!("{:>10} {:>7} {:>13} {:>9}", "way", "round", "loss", "fresh");
+    let mut told = Vec::new();
+    for (named, handful) in [("all of them", 0_usize), ("best sixteen", 16)] {
+        let mut knobs = flat.clone();
+        for round in 0..60_u32 {
+            let piled = slope_of(&mut board, &taught, &seen, &knobs, middle);
+            if handful == 0 {
+                for (knob, slope) in knobs.iter_mut().zip(&piled) {
+                    if *slope == 0.0 {
+                        continue;
+                    }
+                    let held = i64::from(*knob) - slope.signum() as i64;
+                    *knob = held.clamp(1, 4096) as u32;
+                }
+            } else {
+                let mut ranked: Vec<(usize, f64)> = piled.iter().copied().enumerate().collect();
+                ranked.sort_by(|one, other| other.1.abs().total_cmp(&one.1.abs()));
+                for (at, slope) in ranked.iter().take(handful) {
+                    let held = i64::from(knobs[*at]) - slope.signum() as i64;
+                    knobs[*at] = held.clamp(1, 4096) as u32;
+                }
+            }
+            if round % 20 == 19 {
+                let (loss, on_fresh) = judge(&mut board, &knobs);
+                eprintln!(
+                    "{named:>10} {:>7} {loss:>13.4e} {:>8.0}%",
+                    round + 1,
+                    on_fresh * 100.0
+                );
+            }
+        }
+        let (loss, on_fresh) = judge(&mut board, &knobs);
+        let travelled = knobs
+            .iter()
+            .map(|one| f64::from(*one as i32) - f64::from(base))
+            .map(f64::abs)
+            .sum::<f64>()
+            / knobs.len() as f64;
+        told.push((named, loss, on_fresh, travelled));
+    }
+
+    eprintln!(
+        "plain {:.0}% at loss {loss_flat:.4e}; guessing 82%",
+        fresh_flat * 100.0
+    );
+    for (named, loss, on_fresh, travelled) in &told {
+        eprintln!(
+            "{named} {:.0}% at loss {loss:.4e}, having moved each knob {travelled:.1} on average",
+            on_fresh * 100.0
+        );
+    }
+    eprintln!("the fields that beat the plain one were scattered by 512 to 2048");
+    for (named, loss, _, _) in &told {
+        assert!(*loss > loss_flat, "{named} went downhill after all: {loss}");
+    }
+}
