@@ -181,35 +181,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     window.set_target_fps(30);
 
     let mut showing: Option<Vec<u32>> = None;
+    let mut asked: Option<u32> = None;
     while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
         if window.is_key_pressed(minifb::Key::Space, minifb::KeyRepeat::Yes) {
             board.depth = 1;
             state = board.run(&state)?;
             board.depth = depth;
             showing = None;
+            asked = None;
         }
         if window.is_key_pressed(minifb::Key::Up, minifb::KeyRepeat::No) {
             depth = (depth * 2).min(256);
             board.depth = depth;
             showing = None;
+            asked = None;
         }
         if window.is_key_pressed(minifb::Key::Down, minifb::KeyRepeat::No) {
             depth = (depth / 2).max(1);
             board.depth = depth;
             showing = None;
+            asked = None;
         }
         if window.get_mouse_down(minifb::MouseButton::Left)
             && let Some((x, y)) = window.get_mouse_pos(minifb::MouseMode::Discard)
         {
             let at = (y as u32).min(grid.deep - 1) * grid.wide + (x as u32).min(grid.wide - 1);
-            let ticking = Instant::now();
-            let slope = board.slope(&state, at as usize)?;
-            let (heard, far) = reach(grid, &slope, at as usize);
-            println!(
-                "depth {depth}: {heard} cells reach it, {far} away, in {:?}",
-                ticking.elapsed()
-            );
-            showing = Some(lit(&slope));
+            if asked != Some(at) {
+                asked = Some(at);
+                let ticking = Instant::now();
+                let slope = board.slope(&state, at as usize)?;
+                let (heard, far) = reach(grid, &slope, at as usize);
+                println!(
+                    "depth {depth}: {heard} cells reach it, {far} away, in {:?}",
+                    ticking.elapsed()
+                );
+                showing = Some(lit(&slope));
+            }
         }
         let frame = match &showing {
             Some(held) => held.clone(),
