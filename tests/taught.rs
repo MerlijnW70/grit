@@ -738,3 +738,90 @@ fn a_handful_at_a_time_is_what_the_slope_will_pay_for() {
         "{loss_first} {loss_last}"
     );
 }
+
+#[test]
+fn whether_any_field_at_all_can_answer_it() {
+    let Some(host) = device("whether_any_field_at_all_can_answer_it") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let seen = window(grid);
+    let taught = lessons(grid, 0x1234_5678, 8);
+    let fresh = lessons(grid, 0x0BAD_C0DE, 32);
+
+    let scattered = |seed: u32, span: u32| {
+        let mut state = seed | 1;
+        (0..grid.cells())
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let off = (state % (2 * span + 1)) as i64 - i64::from(span);
+                (i64::from(base) + off).clamp(1, 4096) as u32
+            })
+            .collect::<Vec<u32>>()
+    };
+
+    eprintln!(
+        "{:>8} {:>8} {:>10} {:>10} {:>10}",
+        "spread", "tries", "best gap", "on taught", "then fresh"
+    );
+    let mut ever = 0.0_f64;
+    for span in [0_u32, 64, 255, 1023, 2047] {
+        let tries = if span == 0 { 1 } else { 24 };
+        let mut best_gap = 0.0_f64;
+        let mut picked = (0.0_f64, 0.0_f64);
+        for go in 0..tries {
+            let knobs = if span == 0 {
+                vec![base; grid.cells()]
+            } else {
+                scattered(0xC0FF_EE00 + go * 7919, span)
+            };
+            board.sow(&knobs);
+            let (left, right) = parted(&mut board, &taught, &seen);
+            let line = (left + right) / 2.0;
+            let on_taught = scored(&mut board, &taught, &seen, line);
+            best_gap = best_gap.max((left - right).abs());
+            if on_taught > picked.0 {
+                picked = (on_taught, scored(&mut board, &fresh, &seen, line));
+            }
+        }
+        eprintln!(
+            "{span:>8} {tries:>8} {best_gap:>10.1} {:>9.0}% {:>9.0}%",
+            picked.0 * 100.0,
+            picked.1 * 100.0
+        );
+        ever = ever.max(picked.1);
+    }
+    eprintln!(
+        "picking each spread's best on the taught set, the fresh set gives at most {:.0}%",
+        ever * 100.0
+    );
+    assert!(ever < 0.60, "a field generalises after all: {ever}");
+}
