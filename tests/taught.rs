@@ -1333,3 +1333,259 @@ fn what_it_is_about_the_lesson_that_breaks_the_promise() {
         held("that, sixteen times")
     );
 }
+
+#[test]
+fn a_shadow_field_finer_than_a_whole_knob() {
+    let Some(host) = device("a_shadow_field_finer_than_a_whole_knob") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let judge = |board: &mut Board<'_>, knobs: &[u32]| {
+        board.sow(knobs);
+        let (left, right) = parted(board, &taught, &seen);
+        let line = (left + right) / 2.0;
+        (
+            told_on(board, &taught, &seen, middle),
+            scored(board, &fresh, &seen, line),
+        )
+    };
+    let (loss_flat, fresh_flat) = judge(&mut board, &flat);
+
+    let mut shadow: Vec<f64> = flat.iter().map(|one| f64::from(*one)).collect();
+    let cast = |shadow: &[f64]| -> Vec<u32> {
+        shadow
+            .iter()
+            .map(|one| one.round().clamp(1.0, 4096.0) as u32)
+            .collect()
+    };
+
+    eprintln!(
+        "{:>7} {:>13} {:>9} {:>10}",
+        "round", "loss", "fresh", "travelled"
+    );
+    eprintln!(
+        "{:>7} {loss_flat:>13.4e} {:>8.0}% {:>10.2}",
+        0,
+        fresh_flat * 100.0,
+        0.0
+    );
+
+    let rounds = 100_u32;
+    for round in 0..rounds {
+        let knobs = cast(&shadow);
+        let piled = slope_of(&mut board, &taught, &seen, &knobs, middle);
+        let widest = piled.iter().fold(0.0_f64, |held, one| held.max(one.abs()));
+        if widest <= 0.0 {
+            break;
+        }
+        let rate = 0.1 / widest;
+        for (held, slope) in shadow.iter_mut().zip(&piled) {
+            *held -= rate * slope;
+        }
+        if round % 25 == 24 {
+            let knobs = cast(&shadow);
+            let (loss, on_fresh) = judge(&mut board, &knobs);
+            let travelled = shadow
+                .iter()
+                .map(|one| (one - f64::from(base)).abs())
+                .sum::<f64>()
+                / shadow.len() as f64;
+            eprintln!(
+                "{:>7} {loss:>13.4e} {:>8.0}% {travelled:>10.2}",
+                round + 1,
+                on_fresh * 100.0
+            );
+        }
+    }
+
+    let knobs = cast(&shadow);
+    let (loss_last, fresh_last) = judge(&mut board, &knobs);
+    let stirred = knobs.iter().filter(|one| **one != base).count();
+    eprintln!(
+        "loss {loss_flat:.4e} to {loss_last:.4e}, fresh {:.0}% to {:.0}%, {stirred} knobs ended elsewhere",
+        fresh_flat * 100.0,
+        fresh_last * 100.0
+    );
+    eprintln!("the plain field reads 72% and twenty guesses found 82%");
+}
+
+#[test]
+fn whether_the_summed_slope_is_signal_or_its_own_error() {
+    let Some(host) = device("whether_the_summed_slope_is_signal_or_its_own_error") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let knobs = vec![base; grid.cells()];
+
+    eprintln!(
+        "{:>8} {:>10} {:>10} {:>12}",
+        "lessons", "told", "by nudging", "signs agree"
+    );
+    let mut told_all = Vec::new();
+    for many in [1_usize, 16] {
+        let held = lessons_in(grid, 0x1234_5678, many as u32, haze);
+        board.sow(&knobs);
+        let middle = {
+            let (left, right) = parted(&mut board, &held, &seen);
+            (left + right) / 2.0
+        };
+        let loss = |board: &mut Board<'_>, field: &[u32]| {
+            board.sow(field);
+            told_on(board, &held, &seen, middle) * held.len() as f64
+        };
+
+        let gathered = |board: &mut Board<'_>, evenly: bool| {
+            let mut piled = vec![0.0_f64; grid.cells()];
+            for one in &held {
+                board.sow(&knobs);
+                let ended = board.run(&one.start);
+                let got = read_out(&ended, &seen);
+                let off = got - wanted(one.left, middle);
+                let level = if evenly { 4096.0 } else { PITCH };
+                let share = if evenly {
+                    (off.signum() * level).round() as i32
+                } else {
+                    (off / seen.len() as f64 * level).round() as i32
+                };
+                let mut weight = vec![0_u32; grid.cells()];
+                for at in &seen {
+                    weight[*at] = share as u32;
+                }
+                board.sow(&knobs);
+                board.carry(&one.start, &weight);
+                let mut scale = f64::from(1_u32 << SPARE) * f64::from(board.loud);
+                if evenly {
+                    scale *= level * seen.len() as f64 / off.abs().max(f64::MIN_POSITIVE);
+                } else {
+                    scale *= level;
+                }
+                for (into, slope) in piled.iter_mut().zip(board.told_each()) {
+                    *into += f64::from(slope) / scale;
+                }
+            }
+            piled
+        };
+        let piled = gathered(&mut board, false);
+        let evenly = gathered(&mut board, true);
+
+        let mut ranked: Vec<(usize, f64)> = piled.iter().copied().enumerate().collect();
+        ranked.sort_by(|one, other| other.1.abs().total_cmp(&one.1.abs()));
+
+        let step = 16_i64;
+        let mut agreed = 0_usize;
+        let mut looked = 0_usize;
+        let mut told_size = (0.0_f64, 0.0_f64);
+        for (at, mine) in ranked.iter().take(32) {
+            let mut above = knobs.clone();
+            above[*at] = (i64::from(knobs[*at]) + step) as u32;
+            let high = loss(&mut board, &above);
+            let mut below = knobs.clone();
+            below[*at] = (i64::from(knobs[*at]) - step) as u32;
+            let low = loss(&mut board, &below);
+            let nudged = (high - low) / (2.0 * step as f64);
+            if nudged != 0.0 {
+                looked += 1;
+                if mine.signum() == nudged.signum() {
+                    agreed += 1;
+                }
+                told_size = (told_size.0 + mine.abs(), told_size.1 + nudged.abs());
+            }
+        }
+        let mut agreed_evenly = 0_usize;
+        for (at, _) in ranked.iter().take(32) {
+            let mut above = knobs.clone();
+            above[*at] = (i64::from(knobs[*at]) + step) as u32;
+            let high = loss(&mut board, &above);
+            let mut below = knobs.clone();
+            below[*at] = (i64::from(knobs[*at]) - step) as u32;
+            let low = loss(&mut board, &below);
+            let nudged = (high - low) / (2.0 * step as f64);
+            if nudged != 0.0 && evenly[*at].signum() == nudged.signum() {
+                agreed_evenly += 1;
+            }
+        }
+        let share = agreed as f64 * 100.0 / looked.max(1) as f64;
+        let share_evenly = agreed_evenly as f64 * 100.0 / looked.max(1) as f64;
+        eprintln!("    the same lessons weighed evenly agree {share_evenly:.0}%");
+        eprintln!(
+            "{many:>8} {:>10.3} {:>10.3} {share:>11.0}%",
+            told_size.0 / looked.max(1) as f64,
+            told_size.1 / looked.max(1) as f64
+        );
+        told_all.push((many, share));
+    }
+
+    for (many, share) in &told_all {
+        eprintln!(
+            "with {many} lessons the summed slope points the way a nudge does {share:.0}% of the time"
+        );
+    }
+    let one = told_all.first().map_or(0.0, |(_, share)| *share);
+    let lots = told_all.last().map_or(0.0, |(_, share)| *share);
+    assert!(one > 70.0, "{one}");
+    assert!(lots < 50.0, "{lots}");
+}
