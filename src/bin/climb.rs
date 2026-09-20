@@ -10,14 +10,28 @@ const SIDE: u32 = 256;
 
 const CROWD: u32 = SIDE * SIDE;
 
-const GATES: u32 = 12;
+const GATES: u32 = 10;
+
+fn budget() -> u32 {
+    let mut held = std::env::args();
+    while let Some(one) = held.next() {
+        if one == "--gates" {
+            if let Some(many) = held.next() {
+                if let Ok(many) = many.parse::<u32>() {
+                    return many.clamp(4, 64);
+                }
+            }
+        }
+    }
+    GATES
+}
 
 const KINDS: u32 = 16;
 
 const EACH: u32 = 1;
 
 fn shape() -> Result<Netlist, Box<dyn std::error::Error>> {
-    Ok(Netlist::over(5, 3, GATES, KINDS)?)
+    Ok(Netlist::over(5, 3, budget(), KINDS)?)
 }
 
 fn adding(shape: Netlist) -> Result<Exam, Box<dyn std::error::Error>> {
@@ -111,10 +125,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exam = adding(shape)?;
     let full = exam.marks();
     let still = std::env::args().any(|one| one == "--still");
+    let alone = std::env::args().any(|one| one == "--alone");
 
     let turn = turned_on(width, shape)?;
     let mark = marked(width, shape)?;
-    let pick = chosen(width, shape, SIDE, CROWD)?;
+    let pick = chosen(width, shape, if alone { 0 } else { SIDE }, CROWD)?;
     let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
     let sizes = room(shape);
     let mut resident = host.resident(&sizes, &modules)?;
@@ -134,7 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let choosing = [over];
     let stages: Vec<&[Groups]> = vec![&turning, &marking, &choosing];
 
-    println!("{CROWD} climbers of {GATES} gates, {full} marks for a two bit adder with a carry in",);
+    println!(
+        "{CROWD} climbers of {} gates, {full} marks for a two bit adder with a carry in",
+        shape.gates
+    );
 
     let mut rounds = 0_u32;
     let telling = |best: &[u32]| {

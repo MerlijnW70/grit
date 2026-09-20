@@ -381,52 +381,46 @@ pub fn choosing<const LANES: u32>(
     let count = kernel.module().constant_u32(shape.gates)?;
     let ours = kernel.module().i_mul(uint, who, count)?;
 
-    let mut beside = Vec::new();
-    for by in [
-        1,
-        crowd.saturating_sub(1),
-        spread,
-        crowd.saturating_sub(spread),
-    ] {
-        if spread == 0 {
-            break;
+    let seed = kernel.load_at(SEED, who)?;
+    let beside = {
+        let mut lanes = kernel.lanes()?;
+        let who = lanes.splat_id::<U32, LANES>(who)?;
+        let all = lanes.splat_bits::<U32, LANES>(crowd.max(1))?;
+        let three = lanes.splat_bits::<U32, LANES>(3)?;
+        let seed = lanes.splat_id::<U32, LANES>(seed)?;
+        let which = lanes.and(seed, three)?;
+        let mut by = lanes.splat_bits::<U32, LANES>(1)?;
+        for (at, step) in [
+            crowd.saturating_sub(1),
+            spread,
+            crowd.saturating_sub(spread),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let named = lanes.splat_bits::<U32, LANES>(at as u32 + 1)?;
+            let step = lanes.splat_bits::<U32, LANES>(step)?;
+            let picked = lanes.equal(which, named)?;
+            by = lanes.select(picked, step, by)?;
         }
-        let near = {
-            let mut lanes = kernel.lanes()?;
-            let who = lanes.splat_id::<U32, LANES>(who)?;
-            let by = lanes.splat_bits::<U32, LANES>(by)?;
-            let all = lanes.splat_bits::<U32, LANES>(crowd.max(1))?;
-            let past = lanes.add(who, by)?;
-            modulo::<LANES>(&mut lanes, past, all)?.id()
-        };
-        let mark = kernel.load_at(SCORE, near)?;
-        beside.push((near, mark));
-    }
-
+        let past = lanes.add(who, by)?;
+        modulo::<LANES>(&mut lanes, past, all)?.id()
+    };
+    let other = kernel.load_at(SCORE, beside)?;
     let score = kernel.load_at(SCORE, who)?;
     let best = kernel.load_at(BEST, who)?;
-    let (other, theirs) = {
-        let mut lanes = kernel.lanes()?;
-        let none = lanes.splat_bits::<U32, LANES>(0)?;
-        let mut most = none;
-        let mut from = lanes.splat_id::<U32, LANES>(who)?;
-        for (near, mark) in &beside {
-            let near = lanes.splat_id::<U32, LANES>(*near)?;
-            let mark = lanes.splat_id::<U32, LANES>(*mark)?;
-            let over = lanes.greater_than(mark, most)?;
-            most = lanes.select(over, mark, most)?;
-            from = lanes.select(over, near, from)?;
-        }
-        (most.id(), from.id())
-    };
-    let theirs = kernel.module().i_mul(uint, theirs, count)?;
+    let theirs = kernel.module().i_mul(uint, beside, count)?;
     let (keeping, taking, kept) = {
         let mut lanes = kernel.lanes()?;
         let score = lanes.splat_id::<U32, LANES>(score)?;
         let best = lanes.splat_id::<U32, LANES>(best)?;
         let one = lanes.splat_bits::<U32, LANES>(1)?;
         let none = lanes.splat_bits::<U32, LANES>(0)?;
-        let other = lanes.splat_id::<U32, LANES>(other)?;
+        let other = if spread == 0 {
+            none
+        } else {
+            lanes.splat_id::<U32, LANES>(other)?
+        };
         let over = lanes.greater_than(other, score)?;
         let near = lanes.select(over, other, score)?;
         let keep = lanes.greater_equal(near, best)?;
