@@ -3162,3 +3162,272 @@ fn whether_a_second_direction_gets_past_the_ceiling() {
         "two legs did not reach past the loss one leg reaches: {deep}"
     );
 }
+
+fn best_along(
+    board: &mut Board<'_>,
+    held: &[Lesson],
+    seen: &[usize],
+    middle: f64,
+    from: &[f64],
+    way: &[f64],
+) -> (f64, f64, bool) {
+    let loss_of = |board: &mut Board<'_>, along: f64| {
+        let put: Vec<u32> = from
+            .iter()
+            .zip(way)
+            .map(|(one, step)| {
+                (one + along * step)
+                    .clamp(1.0, 4096.0)
+                    .round()
+                    .clamp(1.0, 4096.0) as u32
+            })
+            .collect();
+        board.sow(&put);
+        told_on(board, held, seen, middle)
+    };
+    let mut reach = 4.0_f64;
+    let mut best = (0.0_f64, loss_of(board, 0.0));
+    loop {
+        let mut found = best;
+        let mut at = -reach;
+        while at <= reach {
+            if at != 0.0 {
+                let loss = loss_of(board, at);
+                if loss < found.1 {
+                    found = (at, loss);
+                }
+            }
+            at += reach / 16.0;
+        }
+        best = found;
+        if best.0.abs() < reach - reach / 16.0 || reach >= 512.0 {
+            break;
+        }
+        reach *= 2.0;
+    }
+    let mut span = reach / 16.0;
+    while span > 1.0 / 64.0 {
+        let mut found = best;
+        for step in [-2_i32, -1, 1, 2] {
+            let at = best.0 + f64::from(step) * span / 2.0;
+            if at == 0.0 {
+                continue;
+            }
+            let loss = loss_of(board, at);
+            if loss < found.1 {
+                found = (at, loss);
+            }
+        }
+        best = found;
+        span /= 2.0;
+    }
+    (best.0, best.1, best.0.abs() >= reach - reach / 16.0)
+}
+
+#[test]
+fn whether_it_is_the_walking_that_turns_the_direction_round() {
+    let Some(host) = device("whether_it_is_the_walking_that_turns_the_direction_round") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(SIDE, SIDE);
+    let sizes = [
+        8,
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+        grid.cells(),
+    ];
+    let passes = [
+        built(width, grid, Pass::Ahead, Kind::Living).unwrap(),
+        built(width, grid, Pass::Back, Kind::Living).unwrap(),
+    ];
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let resident = host.resident(&sizes, &modules).unwrap();
+    let base = 256_u32;
+    let mut board = Board {
+        resident,
+        over: Groups::Fixed(grid.quads().div_ceil(width)),
+        grid,
+        depth: DEPTH,
+        angle: (base, 0),
+        loud: 1,
+        planted: false,
+    };
+
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+
+    let flat = vec![base; grid.cells()];
+    board.sow(&flat);
+    let middle = {
+        let (left, right) = parted(&mut board, &taught, &seen);
+        (left + right) / 2.0
+    };
+    let cast = |shadow: &[f64]| -> Vec<u32> {
+        shadow
+            .iter()
+            .map(|one| one.round().clamp(1.0, 4096.0) as u32)
+            .collect()
+    };
+
+    let start: Vec<f64> = flat.iter().map(|one| f64::from(*one)).collect();
+    let first = carried_from(&mut board, &taught, &seen, &start, middle, 16.0, 20);
+    let way_one: Vec<f64> = first.iter().zip(&start).map(|(a, b)| a - b).collect();
+    let (along_one, loss_one, _) = best_along(&mut board, &taught, &seen, middle, &start, &way_one);
+    let stood: Vec<f64> = start
+        .iter()
+        .zip(&way_one)
+        .map(|(one, step)| (one + along_one * step).clamp(1.0, 4096.0))
+        .collect();
+    eprintln!("the first leg stops at {along_one:.4} along, at loss {loss_one:.4e}");
+
+    let walked = carried_from(&mut board, &taught, &seen, &stood, middle, 16.0, 20);
+    let by_walking: Vec<f64> = walked.iter().zip(&stood).map(|(a, b)| a - b).collect();
+
+    let knobs = cast(&stood);
+    let mut by_standing = vec![0.0_f64; grid.cells()];
+    for one in &taught {
+        let piled = slope_of(
+            &mut board,
+            core::slice::from_ref(one),
+            &seen,
+            &knobs,
+            middle,
+        );
+        for (into, slope) in by_standing.iter_mut().zip(&piled) {
+            *into -= slope.signum() * 16.0;
+        }
+    }
+
+    eprintln!(
+        "{:>12} {:>10} {:>13} {:>8}",
+        "direction", "along", "loss", "where"
+    );
+    let mut told = Vec::new();
+    for (named, way) in [("by walking", &by_walking), ("by standing", &by_standing)] {
+        let (along, loss, edged) = best_along(&mut board, &taught, &seen, middle, &stood, way);
+        eprintln!(
+            "{named:>12} {along:>10.4} {loss:>13.4e} {:>8}",
+            if edged { "edge" } else { "inside" }
+        );
+        told.push((named, along, loss));
+    }
+
+    let agreed = by_walking
+        .iter()
+        .zip(&by_standing)
+        .filter(|(one, other)| **one != 0.0 && **other != 0.0 && one.signum() == other.signum())
+        .count();
+    let both = by_walking
+        .iter()
+        .zip(&by_standing)
+        .filter(|(one, other)| **one != 0.0 && **other != 0.0)
+        .count();
+    eprintln!(
+        "of {both} knobs both directions move, {agreed} are moved the same way, {:.0}%",
+        agreed as f64 * 100.0 / both.max(1) as f64
+    );
+
+    eprintln!("{:>12} {:>8} {:>14}", "direction", "step", "slope along it");
+    for (named, way) in [("by walking", &by_walking), ("by standing", &by_standing)] {
+        for close in [0.25_f64, 0.5, 1.0] {
+            let leaning = |board: &mut Board<'_>, at: f64| {
+                let put: Vec<u32> = stood
+                    .iter()
+                    .zip(way.iter())
+                    .map(|(one, step)| (one + at * step).clamp(1.0, 4096.0).round() as u32)
+                    .collect();
+                board.sow(&put);
+                told_on(board, &taught, &seen, middle)
+            };
+            let high = leaning(&mut board, close);
+            let low = leaning(&mut board, -close);
+            eprintln!(
+                "{named:>12} {close:>8.2} {:>14.1}",
+                (high - low) / (2.0 * close)
+            );
+        }
+    }
+
+    let close = 0.25_f64;
+    let leaning = |board: &mut Board<'_>, way: &[f64], at: f64, on: &[Lesson]| {
+        let put: Vec<u32> = stood
+            .iter()
+            .zip(way)
+            .map(|(one, step)| (one + at * step).clamp(1.0, 4096.0).round() as u32)
+            .collect();
+        board.sow(&put);
+        told_on(board, on, &seen, middle)
+    };
+    let mut own = Vec::new();
+    let mut all = Vec::new();
+    for one in &taught {
+        let piled = slope_of(
+            &mut board,
+            core::slice::from_ref(one),
+            &seen,
+            &knobs,
+            middle,
+        );
+        let way: Vec<f64> = piled.iter().map(|slope| -slope.signum() * 16.0).collect();
+        let mine = core::slice::from_ref(one);
+        own.push(
+            (leaning(&mut board, &way, close, mine) - leaning(&mut board, &way, -close, mine))
+                / (2.0 * close),
+        );
+        all.push(
+            (leaning(&mut board, &way, close, &taught)
+                - leaning(&mut board, &way, -close, &taught))
+                / (2.0 * close),
+        );
+    }
+    let mean = |held: &[f64]| held.iter().sum::<f64>() / held.len() as f64;
+    let uphill = all.iter().filter(|one| **one > 0.0).count();
+    let helps = own.iter().filter(|one| **one < 0.0).count();
+    eprintln!(
+        "a lesson's own way moves its own loss by {:.1} on average and all sixteen by {:.1}",
+        mean(&own),
+        mean(&all)
+    );
+    eprintln!(
+        "{helps} of {} lessons go downhill on themselves, and {uphill} of them go uphill on the sixteen",
+        taught.len()
+    );
+    let others: Vec<f64> = own
+        .iter()
+        .zip(&all)
+        .map(|(mine, whole)| whole * taught.len() as f64 - mine)
+        .collect();
+    eprintln!(
+        "the same way moves the other {} by {:.1} together, {:.1} each, against {:.1} it wins on itself",
+        taught.len() - 1,
+        mean(&others),
+        mean(&others) / (taught.len() - 1) as f64,
+        mean(&own)
+    );
+    assert_eq!(
+        helps,
+        taught.len(),
+        "a lesson's own way does not go downhill on its own loss"
+    );
+    assert!(
+        mean(&all) > 0.0,
+        "a lesson's own way goes downhill on the sixteen after all: {}",
+        mean(&all)
+    );
+    assert!(
+        mean(&others) > -mean(&own),
+        "the cost to the others does not outweigh the gain: {} against {}",
+        mean(&others),
+        -mean(&own)
+    );
+    let walking = told.first().map_or(0.0, |one| one.1);
+    let standing = told.get(1).map_or(0.0, |one| one.1);
+    assert!(
+        walking < 0.0 && standing < 0.0,
+        "a direction wants walking forwards after all: {walking} and {standing}"
+    );
+}
