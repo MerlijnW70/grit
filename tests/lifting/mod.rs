@@ -73,6 +73,7 @@ pub enum Kind {
     Bound,
     Smooth,
     Living,
+    Twinned,
 }
 
 pub const KNOB: u32 = 12;
@@ -252,10 +253,19 @@ pub fn onward<const LANES: u32>(
     kind: Kind,
     held: [Vector<U32, LANES>; 4],
     angle: Pair<LANES>,
+    twin: Vector<U32, LANES>,
 ) -> Result<[Vector<U32, LANES>; 4], LaneError> {
     let [mut a, mut b, mut c, mut d] = held;
     if kind == Kind::Turn {
         return Ok([d, c, b, a]);
+    }
+    if kind == Kind::Twinned {
+        let (knob, _) = angle;
+        let turned = leaning_on::<LANES>(lanes, knob, c)?;
+        let (first, second) = spun::<LANES>(lanes, (a, b), turned, false)?;
+        let turned = leaning_on::<LANES>(lanes, twin, first)?;
+        let (third, fourth) = spun::<LANES>(lanes, (c, d), turned, false)?;
+        return Ok([fourth, third, second, first]);
     }
     if kind == Kind::Living {
         let (knob, _) = angle;
@@ -306,9 +316,43 @@ pub fn backward<const LANES: u32>(
     held: [Vector<U32, LANES>; 4],
     weight: [Vector<U32, LANES>; 4],
     angle: Pair<LANES>,
+    twin: Vector<U32, LANES>,
 ) -> Result<Both<LANES>, LaneError> {
     let [mut a, mut b, mut c, mut d] = held;
     let [mut ga, mut gb, mut gc, mut gd] = weight;
+    if kind == Kind::Twinned {
+        let (knob, _) = angle;
+        let (first, second, third, fourth) = (d, c, b, a);
+        let (gfirst, gsecond, gthird, gfourth) = (gd, gc, gb, ga);
+
+        let later = leaning_on::<LANES>(lanes, twin, first)?;
+        let ((third, fourth), (gthird, gfourth), late) =
+            unspun::<LANES>(lanes, (third, fourth), (gthird, gfourth), later)?;
+        let late_turn = {
+            let twice = lanes.add(late.1, late.1)?;
+            lanes.add(late.0, twice)?
+        };
+        let told_late = shifted_by::<LANES>(lanes, late_turn, first, KNOB)?;
+        let feed = shifted_by::<LANES>(lanes, late_turn, twin, KNOB + SPARE)?;
+        let gfirst = lanes.add(gfirst, feed)?;
+
+        let early = leaning_on::<LANES>(lanes, knob, third)?;
+        let ((first, second), (gfirst, gsecond), early_told) =
+            unspun::<LANES>(lanes, (first, second), (gfirst, gsecond), early)?;
+        let early_turn = {
+            let twice = lanes.add(early_told.1, early_told.1)?;
+            lanes.add(early_told.0, twice)?
+        };
+        let told_early = shifted_by::<LANES>(lanes, early_turn, third, KNOB)?;
+        let feed = shifted_by::<LANES>(lanes, early_turn, knob, KNOB + SPARE)?;
+        let gthird = lanes.add(gthird, feed)?;
+
+        return Ok((
+            [first, second, third, fourth],
+            [gfirst, gsecond, gthird, gfourth],
+            (told_early, told_late),
+        ));
+    }
     if kind == Kind::Turn {
         let none = lanes.splat_bits::<U32, LANES>(0)?;
         return Ok(([d, c, b, a], [gd, gc, gb, ga], (none, none)));
@@ -465,6 +509,12 @@ pub fn building<const LANES: u32>(
     let swing = kernel.load_at(PARAMS, at_swing)?;
     let places = corners::<LANES>(&mut kernel, grid, quad, frame)?.places;
     let turning = kernel.load_at(FIELD, places[0].id())?;
+    let twinned = kind == Kind::Twinned;
+    let twin = if twinned {
+        kernel.load_at(FIELD, places[1].id())?
+    } else {
+        turning
+    };
 
     let state = [
         kernel.load_at(STATE, places[0].id())?,
@@ -496,7 +546,8 @@ pub fn building<const LANES: u32>(
                     lanes.splat_id::<U32, LANES>(turning)?,
                     lanes.splat_id::<U32, LANES>(swing)?,
                 );
-                (onward::<LANES>(&mut lanes, kind, held, angle)?, None)
+                let twin = lanes.splat_id::<U32, LANES>(twin)?;
+                (onward::<LANES>(&mut lanes, kind, held, angle, twin)?, None)
             }
             Some(weight) => {
                 let weight = [
@@ -509,8 +560,9 @@ pub fn building<const LANES: u32>(
                     lanes.splat_id::<U32, LANES>(turning)?,
                     lanes.splat_id::<U32, LANES>(swing)?,
                 );
+                let twin = lanes.splat_id::<U32, LANES>(twin)?;
                 let (state_back, weight_back, told) =
-                    backward::<LANES>(&mut lanes, kind, held, weight, angle)?;
+                    backward::<LANES>(&mut lanes, kind, held, weight, angle, twin)?;
                 (state_back, Some((weight_back, told)))
             }
         }
@@ -523,8 +575,18 @@ pub fn building<const LANES: u32>(
         for (place, value) in places.iter().zip(&next) {
             kernel.store_at(SLOPE, place.id(), value.id())?;
         }
-        let here = places[0].id();
-        for (binding, part) in [(TOLD_TURNING, told.0), (TOLD_SWING, told.1)] {
+        let piling = if twinned {
+            [
+                (TOLD_TURNING, places[0].id(), told.0),
+                (TOLD_TURNING, places[1].id(), told.1),
+            ]
+        } else {
+            [
+                (TOLD_TURNING, places[0].id(), told.0),
+                (TOLD_SWING, places[0].id(), told.1),
+            ]
+        };
+        for (binding, here, part) in piling {
             let held = kernel.load_at(binding, here)?;
             let piled = {
                 let mut lanes = kernel.lanes()?;
@@ -990,14 +1052,14 @@ pub fn over_listing<const LANES: u32>(
             Pass::Ahead => {
                 let none = lanes.splat_bits::<U32, LANES>(0)?;
                 (
-                    onward::<LANES>(&mut lanes, Kind::Product, block, (none, none))?,
+                    onward::<LANES>(&mut lanes, Kind::Product, block, (none, none), none)?,
                     along,
                 )
             }
             Pass::Back => {
                 let none = lanes.splat_bits::<U32, LANES>(0)?;
                 let (state, weight, _) =
-                    backward::<LANES>(&mut lanes, Kind::Product, block, along, (none, none))?;
+                    backward::<LANES>(&mut lanes, Kind::Product, block, along, (none, none), none)?;
                 (state, weight)
             }
         };

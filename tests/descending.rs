@@ -2060,3 +2060,154 @@ fn whether_it_is_the_walking_that_turns_the_direction_round() {
         "a direction wants walking forwards after all: {walking} and {standing}"
     );
 }
+
+#[test]
+fn whether_twice_the_knobs_reach_past_ninety_nine() {
+    let Some(host) = device("whether_twice_the_knobs_reach_past_ninety_nine") else {
+        return;
+    };
+    let grid = Grid::of(SIDE, SIDE);
+    let base = 256_u32;
+    let haze = 1024_u32;
+    let seen = window(grid);
+    let taught = lessons_in(grid, 0x1234_5678, 16, haze);
+    let fresh = lessons_in(grid, 0x0BAD_C0DE, 128, haze);
+    let again = lessons_in(grid, 0xFEED_FACE, 128, haze);
+    let flat = vec![base; grid.cells()];
+
+    eprintln!(
+        "{:>10} {:>5} {:>10} {:>13} {:>9} {:>8}",
+        "rule", "leg", "along", "loss", "fresh", "where"
+    );
+    let mut told = Vec::new();
+    for kind in [Kind::Living, Kind::Twinned] {
+        let mut board = seated(&host, grid, kind, (base, 0), DEPTH);
+        board.sow(&flat);
+        let middle = {
+            let (left, right) = parted(&mut board, &taught, &seen);
+            (left + right) / 2.0
+        };
+        let reads = |board: &mut Board<'_>, shadow: &[f64], on: &[Lesson]| {
+            let knobs: Vec<u32> = shadow
+                .iter()
+                .map(|one| one.round().clamp(1.0, 4096.0) as u32)
+                .collect();
+            board.sow(&knobs);
+            let (left, right) = parted(board, &taught, &seen);
+            scored(board, on, &seen, (left + right) / 2.0)
+        };
+
+        let start: Vec<f64> = flat.iter().map(|one| f64::from(*one)).collect();
+        let plain = reads(&mut board, &start, &fresh);
+        let mut drawn = (0.0_f64, 0.0_f64);
+        for draw in 0..20_u32 {
+            let mut state = 0xC0FF_EE00_u32 + draw * 7919;
+            let field: Vec<f64> = (0..grid.cells())
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let off = (state % 2049) as i64 - 1024;
+                    (f64::from(base) + off as f64).clamp(1.0, 4096.0)
+                })
+                .collect();
+            let on_taught = reads(&mut board, &field, &taught);
+            if on_taught > drawn.0 {
+                drawn = (on_taught, reads(&mut board, &field, &fresh));
+            }
+        }
+        eprintln!(
+            "{:>10} plain reads {:.0}%, and the best of twenty draws reads {:.0}%",
+            format!("{kind:?}"),
+            plain * 100.0,
+            drawn.1 * 100.0
+        );
+
+        let mut held = start;
+        let mut best = (0.0_f64, f64::MAX);
+        for leg in 1..=4_u32 {
+            let walked = carried_from(&mut board, &taught, &seen, &held, middle, 16.0, 20);
+            let way: Vec<f64> = walked.iter().zip(&held).map(|(a, b)| a - b).collect();
+            if way.iter().all(|one| *one == 0.0) {
+                break;
+            }
+            let (along, loss, edged) = best_along(&mut board, &taught, &seen, middle, &held, &way);
+            held = held
+                .iter()
+                .zip(&way)
+                .map(|(one, step)| (one + along * step).clamp(1.0, 4096.0))
+                .collect();
+            let on_fresh = reads(&mut board, &held, &fresh);
+            eprintln!(
+                "{:>10} {leg:>5} {along:>10.4} {loss:>13.4e} {:>8.0}% {:>8}",
+                format!("{kind:?}"),
+                on_fresh * 100.0,
+                if edged { "edge" } else { "inside" }
+            );
+            if on_fresh > best.0 {
+                best = (on_fresh, loss);
+            }
+            if along == 0.0 {
+                break;
+            }
+        }
+        let on_again = reads(&mut board, &held, &again);
+        let on_taught = reads(&mut board, &held, &taught);
+        eprintln!(
+            "{:>10} ends reading {:.0}% of its own sixteen, {:.0}% of one unseen set and {:.0}% of another",
+            format!("{kind:?}"),
+            on_taught * 100.0,
+            best.0 * 100.0,
+            on_again * 100.0
+        );
+        told.push((kind, best.0, best.1, on_again, plain, drawn.1));
+    }
+
+    eprintln!(
+        "{:>10} {:>8} {:>9} {:>9} {:>9} {:>13}",
+        "rule", "plain", "guessing", "descent", "again", "loss"
+    );
+    for (kind, high, deep, on_again, plain, drawn) in &told {
+        eprintln!(
+            "{:>10} {:>7.0}% {:>8.0}% {:>8.0}% {:>8.0}% {deep:>13.4e}",
+            format!("{kind:?}"),
+            plain * 100.0,
+            drawn * 100.0,
+            high * 100.0,
+            on_again * 100.0
+        );
+    }
+    eprintln!("the two draws are the same twenty fields at a spread of 1024 under either rule");
+    let old = told
+        .first()
+        .copied()
+        .unwrap_or((Kind::Living, 0.0, 0.0, 0.0, 0.0, 0.0));
+    let new = told
+        .get(1)
+        .copied()
+        .unwrap_or((Kind::Twinned, 0.0, 0.0, 0.0, 0.0, 0.0));
+    assert!(
+        (old.4 - new.4).abs() < 0.02,
+        "the two rules do not start from the same plain reading: {} and {}",
+        old.4,
+        new.4
+    );
+    assert!(
+        old.1 > old.5 + 0.1,
+        "the old rule's descent no longer beats its draws: {} against {}",
+        old.1,
+        old.5
+    );
+    assert!(
+        new.5 > new.1,
+        "twice the knobs did not leave the draws ahead of the descent: {} against {}",
+        new.5,
+        new.1
+    );
+    assert!(
+        new.2 > old.2,
+        "twice the knobs reached a lower loss after all: {} against {}",
+        new.2,
+        old.2
+    );
+}

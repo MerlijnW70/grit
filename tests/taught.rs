@@ -656,3 +656,138 @@ fn which_half_of_the_knobs_the_rule_leaves_silent() {
         }
     }
 }
+
+#[test]
+fn whether_a_twinned_rule_hears_every_knob_and_tells_the_truth() {
+    let Some(host) = device("whether_a_twinned_rule_hears_every_knob_and_tells_the_truth") else {
+        return;
+    };
+    let grid = Grid::of(SIDE, SIDE);
+    let base = 256_u32;
+    let seen = window(grid);
+    let flat = vec![base; grid.cells()];
+    let haze = 1024_u32;
+    let held = lessons_in(grid, 0x1234_5678, 1, haze);
+
+    eprintln!(
+        "{:>10} {:>8} {:>9} {:>11}",
+        "rule", "heard", "of them", "even sum"
+    );
+    let mut reach = Vec::new();
+    for kind in [Kind::Living, Kind::Twinned] {
+        let mut board = seated(&host, grid, kind, (base, 0), DEPTH);
+        board.sow(&flat);
+        let middle = {
+            let (left, right) = parted(&mut board, &held, &seen);
+            (left + right) / 2.0
+        };
+        let piled = slope_of(&mut board, &held, &seen, &flat, middle);
+        let heard: Vec<usize> = piled
+            .iter()
+            .enumerate()
+            .filter(|(_, one)| **one != 0.0)
+            .map(|(at, _)| at)
+            .collect();
+        let evenly = heard
+            .iter()
+            .filter(|at| {
+                let row = **at as u32 / grid.wide;
+                let column = **at as u32 % grid.wide;
+                (row + column).is_multiple_of(2)
+            })
+            .count();
+        eprintln!(
+            "{:>10} {:>8} {:>8.0}% {:>10.0}%",
+            format!("{kind:?}"),
+            heard.len(),
+            heard.len() as f64 * 100.0 / grid.cells() as f64,
+            evenly as f64 * 100.0 / heard.len().max(1) as f64
+        );
+        reach.push((kind, heard.len()));
+    }
+
+    let nudge = 16_i64;
+    eprintln!(
+        "{:>10} {:>10} {:>8} {:>14} {:>14} {:>13}",
+        "rule", "sublattice", "looked", "mean told", "mean nudged", "signs agree"
+    );
+    let mut told = Vec::new();
+    for (kind, named, even) in [
+        (Kind::Living, "even sum", true),
+        (Kind::Twinned, "even sum", true),
+        (Kind::Twinned, "odd sum", false),
+    ] {
+        let mut board = seated(&host, grid, kind, (base, 0), DEPTH);
+        board.sow(&flat);
+        let middle = {
+            let (left, right) = parted(&mut board, &held, &seen);
+            (left + right) / 2.0
+        };
+        let piled = slope_of(&mut board, &held, &seen, &flat, middle);
+        let losing = |board: &mut Board<'_>, field: &[u32]| {
+            board.sow(field);
+            told_on(board, &held, &seen, middle)
+        };
+        {
+            let picked: Vec<usize> = (0..grid.cells())
+                .filter(|at| {
+                    let row = *at as u32 / grid.wide;
+                    let column = *at as u32 % grid.wide;
+                    (row + column).is_multiple_of(2) == even && piled[*at] != 0.0
+                })
+                .step_by(97)
+                .take(24)
+                .collect();
+            let mut mine = 0.0_f64;
+            let mut truly = 0.0_f64;
+            let mut agreed = 0_usize;
+            let mut looked = 0_usize;
+            for at in &picked {
+                let mut above = flat.clone();
+                above[*at] = (i64::from(flat[*at]) + nudge).clamp(1, 4096) as u32;
+                let high = losing(&mut board, &above);
+                let mut below = flat.clone();
+                below[*at] = (i64::from(flat[*at]) - nudge).clamp(1, 4096) as u32;
+                let low = losing(&mut board, &below);
+                let nudged = (high - low) / (2.0 * nudge as f64);
+                if nudged == 0.0 {
+                    continue;
+                }
+                looked += 1;
+                mine += piled[*at].abs();
+                truly += nudged.abs();
+                if piled[*at].signum() == nudged.signum() {
+                    agreed += 1;
+                }
+            }
+            let share = agreed as f64 * 100.0 / looked.max(1) as f64;
+            eprintln!(
+                "{:>10} {named:>10} {looked:>8} {:>14.4} {:>14.4} {share:>12.0}%",
+                format!("{kind:?}"),
+                mine / looked.max(1) as f64,
+                truly / looked.max(1) as f64
+            );
+            told.push((kind, named, looked, share));
+        }
+    }
+
+    for (kind, heard) in &reach {
+        let want = if *kind == Kind::Twinned {
+            grid.cells()
+        } else {
+            grid.cells() / 2
+        };
+        assert_eq!(*heard, want, "{kind:?} hears {heard} knobs");
+    }
+    let old = told.first().map_or(0.0, |one| one.3);
+    for (kind, named, looked, share) in &told {
+        assert!(
+            *looked >= 16,
+            "{kind:?} {named}: only {looked} knobs to look at"
+        );
+        assert!(
+            *share > old * 0.8,
+            "{kind:?} {named} agrees {share}% where the old rule agrees {old}%"
+        );
+    }
+}
