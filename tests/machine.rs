@@ -6,7 +6,7 @@ use grit::netlist::{Chip, Gate};
 fn counter() -> (Machine, Chip) {
     let held = Machine::over(2, 0, 2, 4, 16, 8).unwrap();
     let shape = held.shape().unwrap();
-    let gates = vec![
+    let gates = [
         Gate {
             kind: 0b0001,
             left: 0,
