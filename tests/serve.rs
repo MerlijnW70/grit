@@ -257,6 +257,38 @@ fn a_machine_with_no_room_to_remember_cannot_count_and_says_which_steps_it_misse
     );
     assert_eq!(held.get("solved"), Some(&Json::Bool(false)));
     assert!(!held.get("wrong").and_then(Json::list).unwrap().is_empty());
+    assert_eq!(
+        held.counted("crowd"),
+        Some(65536),
+        "a machine that cannot be found is pressed to the ceiling before it is called impossible: {}",
+        written(&held)
+    );
+}
+
+#[test]
+fn a_machine_that_is_found_keeps_the_crowd_it_was_given() {
+    let Some(host) = device("a_machine_that_is_found_keeps_the_crowd_it_was_given") else {
+        return;
+    };
+    let arguments = "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":3,\"crowd\":4096,\"rounds\":600,\"traces\":[{\"feed\":[1,0,1,1,0],\"want\":[0,1,0,1,1]},{\"feed\":[0,0,1,0,1],\"want\":[0,0,0,1,0]}]}";
+    let held = structured(&call(Some(&host), "grit_machine", arguments));
+    eprintln!(
+        "a one step delay: solved {:?}, crowd {:?}",
+        held.get("solved"),
+        held.counted("crowd")
+    );
+    assert_eq!(
+        held.get("solved"),
+        Some(&Json::Bool(true)),
+        "one bit of memory is enough to say back what it was just told: {}",
+        written(&held)
+    );
+    assert_eq!(
+        held.counted("crowd"),
+        Some(4096),
+        "nothing to raise when it solved: {}",
+        written(&held)
+    );
 }
 
 #[test]
@@ -330,7 +362,12 @@ fn a_budget_that_cannot_hold_it_comes_back_as_evidence_rather_than_a_guess() {
     assert_eq!(held.get("solved"), Some(&Json::Bool(false)));
     assert!(held.counted("marks").unwrap() < held.counted("of").unwrap());
     assert_eq!(held.counted("rounds"), Some(600));
-    assert_eq!(held.counted("crowd"), Some(4096));
+    assert_eq!(
+        held.counted("crowd"),
+        Some(65536),
+        "evidence about a gate budget means the crowd was pressed to the ceiling, not that 4096 was asked for: {}",
+        written(&held)
+    );
     assert!(
         !held
             .get("wrong_rows")
@@ -419,8 +456,8 @@ fn a_ladder_that_solves_nothing_still_hands_back_what_it_reached() {
     assert!(best.counted("marks").unwrap() < best.counted("of").unwrap());
     assert_eq!(
         best.counted("crowd"),
-        Some(64),
-        "what it reached says what it was spent: {}",
+        Some(65536),
+        "a rung that ends the ladder is pressed to the ceiling before it gives up, whatever crowd the caller asked for: {}",
         written(best)
     );
     assert_eq!(best.counted("rounds"), Some(1), "{}", written(best));
@@ -440,5 +477,89 @@ fn every_candidate_starts_from_its_own_odd_seed() {
         apart.len(),
         64,
         "two candidates on one seed search the same ground"
+    );
+}
+
+#[test]
+fn a_search_that_has_not_solved_raises_its_own_crowd_before_it_answers() {
+    let Some(host) = device("a_search_that_has_not_solved_raises_its_own_crowd_before_it_answers")
+    else {
+        return;
+    };
+    let arguments = format!(
+        "{{\"inputs\":4,\"outputs\":3,\"gates\":3,\"table\":[{}],\"crowd\":64,\"rounds\":1}}",
+        adder()
+    );
+    let held = structured(&call(Some(&host), "grit_synthesise", &arguments));
+    eprintln!("asked for 64, spent {:?}", held.counted("crowd"));
+    assert_eq!(held.get("solved"), Some(&Json::Bool(false)));
+    assert_eq!(
+        held.counted("crowd"),
+        Some(65536),
+        "a caller who picks a small crowd must not be told a budget is impossible: {}",
+        written(&held)
+    );
+}
+
+#[test]
+fn a_search_that_solves_stops_at_the_crowd_it_was_given() {
+    let Some(host) = device("a_search_that_solves_stops_at_the_crowd_it_was_given") else {
+        return;
+    };
+    let table: Vec<String> = (0..16_u32)
+        .map(|row| (row.count_ones() % 2).to_string())
+        .collect();
+    let arguments = format!(
+        "{{\"inputs\":4,\"outputs\":1,\"gates\":3,\"table\":[{}],\"crowd\":4096,\"rounds\":2000}}",
+        table.join(",")
+    );
+    let held = structured(&call(Some(&host), "grit_synthesise", &arguments));
+    eprintln!("{}", written(&held));
+    assert_eq!(
+        held.get("solved"),
+        Some(&Json::Bool(true)),
+        "exclusive or over four inputs is three gates: {}",
+        written(&held)
+    );
+    assert_eq!(
+        held.counted("crowd"),
+        Some(4096),
+        "nothing to raise when it solved: {}",
+        written(&held)
+    );
+}
+
+#[test]
+fn a_crowd_too_small_for_the_optimum_no_longer_hides_it() {
+    let Some(host) = device("a_crowd_too_small_for_the_optimum_no_longer_hides_it") else {
+        return;
+    };
+    let table: Vec<String> = (0..16_u32)
+        .map(|row| ((row & 3) * ((row >> 2) & 3)).to_string())
+        .collect();
+    let arguments = format!(
+        "{{\"inputs\":4,\"outputs\":4,\"gates\":7,\"table\":[{}],\"crowd\":500,\"rounds\":800}}",
+        table.join(",")
+    );
+    let held = structured(&call(Some(&host), "grit_synthesise", &arguments));
+    eprintln!(
+        "two by two at seven gates: solved {:?}, crowd {:?}, rounds {:?}",
+        held.get("solved"),
+        held.counted("crowd"),
+        held.counted("rounds")
+    );
+    assert_eq!(
+        held.get("solved"),
+        Some(&Json::Bool(true)),
+        "seven gates is the optimum for a two by two multiplier and a small crowd used to hide it: {}",
+        written(&held)
+    );
+    assert!(
+        held.counted("crowd").unwrap() > 500,
+        "it got there by raising the crowd it was given"
+    );
+    assert_eq!(
+        held.get("wrong_rows").and_then(Json::list).unwrap().len(),
+        0
     );
 }

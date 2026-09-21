@@ -167,6 +167,23 @@ pub fn sought(
     Ok(found)
 }
 
+pub fn pressed(
+    host: &Host,
+    shape: Netlist,
+    exam: &Exam,
+    many: u32,
+    rounds: u32,
+) -> Result<Found, Box<dyn std::error::Error>> {
+    let mut crowd = many;
+    loop {
+        let found = sought(host, shape, exam, crowd, rounds)?;
+        if found.marks >= found.full || crowd >= CROWD {
+            return Ok(found);
+        }
+        crowd = crowd.saturating_mul(2).min(CROWD);
+    }
+}
+
 pub struct Rung {
     pub gates: u32,
     pub found: Found,
@@ -184,7 +201,7 @@ pub fn least(
     while gates >= shape.outputs.max(1) {
         let narrowed = Netlist::over(shape.inputs, shape.outputs, gates, shape.kinds)?;
         let exam = Exam::of(narrowed, table.to_vec())?;
-        let found = sought(host, narrowed, &exam, many, rounds)?;
+        let found = pressed(host, narrowed, &exam, many, rounds)?;
         let solved = found.marks >= found.full;
         rungs.push(Rung { gates, found });
         if !solved {
@@ -353,6 +370,23 @@ pub fn machined(
     told_of(held, traces, &chip, &gates, done, many)
 }
 
+pub fn pressed_machine(
+    host: &Host,
+    held: Machine,
+    traces: &[(Vec<u32>, Vec<u32>)],
+    many: u32,
+    rounds: u32,
+) -> Result<Ran, Box<dyn std::error::Error>> {
+    let mut crowd = many;
+    loop {
+        let ran = machined(host, held, traces, crowd, rounds)?;
+        if ran.marks >= ran.full || crowd >= CROWD {
+            return Ok(ran);
+        }
+        crowd = crowd.saturating_mul(2).min(CROWD);
+    }
+}
+
 fn told(found: &Found, sought: bool) -> Json {
     let gates = Json::List(
         found
@@ -446,7 +480,7 @@ fn tools() -> Json {
         ("table", table),
     ];
     let mut seeking = shape.clone();
-    seeking.push(("crowd", counting("how many candidates to search with")));
+    seeking.push(("crowd", counting("how many candidates to start the search with; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent")));
     seeking.push(("rounds", counting("how many generations to allow")));
     let mut checking = shape;
     checking.push((
@@ -476,7 +510,7 @@ fn tools() -> Json {
     };
     let mut laddering = checking.clone();
     laddering.retain(|(name, _)| *name != "chip");
-    laddering.push(("crowd", counting("how many candidates to search with")));
+    laddering.push(("crowd", counting("how many candidates to start the search with; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent")));
     laddering.push((
         "rounds",
         counting("how many generations to allow at each rung"),
@@ -526,7 +560,12 @@ fn tools() -> Json {
         ("gates", counting("how many two-input gates it may use")),
         ("steps", counting("how many steps a run lasts")),
         ("traces", trace),
-        ("crowd", counting("how many candidates to search with")),
+        (
+            "crowd",
+            counting(
+                "how many candidates to start the search with; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent",
+            ),
+        ),
         ("rounds", counting("how many generations to allow")),
         (
             "chip",
@@ -573,7 +612,7 @@ fn tools() -> Json {
             (
                 "description",
                 text(
-                    "Search for a circuit of two-input gates that answers a truth table exactly. Returns the circuit and the marks it scores, checked on the host, or the best it reached with the rounds and crowd it spent. A result that is not solved is evidence about the gate budget, not a guess.",
+                    "Search for a circuit of two-input gates that answers a truth table exactly. Returns the circuit and the marks it scores, checked on the host, or the best it reached with the rounds and crowd it spent. While it has not solved, the search doubles the crowd itself up to 65536 before giving an answer, so a result that is not solved is evidence about the gate budget rather than about a crowd the caller happened to pick.",
                 ),
             ),
             ("inputSchema", held(seeking)),
@@ -583,7 +622,7 @@ fn tools() -> Json {
             (
                 "description",
                 text(
-                    "Walk the gate budget down from the one given, searching at each rung, and stop at the first budget that does not solve. Returns the ladder, the smallest budget that did solve, and its circuit. A rung that did not solve means not found within the rounds and crowd spent, which the answer carries, and never that no such circuit exists.",
+                    "Walk the gate budget down from the one given, searching at each rung, and stop at the first budget that does not solve. Returns the ladder, the smallest budget that did solve, and its circuit. Each rung doubles its crowd up to 65536 before it gives up, so the rung that ends the ladder has been pressed rather than merely tried. A rung that did not solve means not found within the rounds and crowd spent, which the answer carries, and never that no such circuit exists.",
                 ),
             ),
             ("inputSchema", held(laddering)),
@@ -679,7 +718,7 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
             };
             let many = held.counted("crowd").unwrap_or(CROWD).clamp(64, 1 << 20);
             let rounds = held.counted("rounds").unwrap_or(ROUNDS).clamp(1, 1 << 20);
-            machined(host, machine, &traces, many, rounds)?
+            pressed_machine(host, machine, &traces, many, rounds)?
         };
         return Ok(map(vec![
             ("solved", Json::Bool(told.marks >= told.full)),
@@ -738,7 +777,7 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
             };
             let many = held.counted("crowd").unwrap_or(CROWD).clamp(64, 1 << 20);
             let rounds = held.counted("rounds").unwrap_or(ROUNDS).clamp(1, 1 << 20);
-            Ok(told(&sought(host, shape, &exam, many, rounds)?, true))
+            Ok(told(&pressed(host, shape, &exam, many, rounds)?, true))
         }
         "grit_least" => {
             let Some(host) = host else {
@@ -781,7 +820,7 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
                 (
                     "a_rung_that_did_not_solve",
                     text(
-                        "means not found within these rounds and this crowd, not that none exists",
+                        "means not found within these rounds and the crowd the rung reached after doubling, not that none exists",
                     ),
                 ),
             ];
