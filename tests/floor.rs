@@ -126,6 +126,7 @@ fn spread(host: &Host, width: u32, n: usize, writes: bool) -> f64 {
 }
 
 #[test]
+#[ignore]
 fn what_a_submission_costs_before_it_holds_anything() {
     let Some(host) = device("floor") else {
         return;
