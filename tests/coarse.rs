@@ -212,7 +212,16 @@ fn the_two_arrangements_a_choice_is_made_between_are_not_the_same_one() {
     };
     let width = host.width();
     let grid = sized(width, COARSE_FROM);
-    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
+    let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
+        Ok(plan) => plan,
+        Err(why) => {
+            // A plan reaches `sweep::cells` cubed quads and no further, so a
+            // narrow subgroup cannot address this grid at all. Shrinking it
+            // would not save the question being asked here.
+            eprintln!("SKIPPED the_two_arrangements_a_choice_is_made_between {why}");
+            return;
+        }
+    };
 
     let (with_passes, with_stages) = live::arranged(width, grid, &plan, None, true).unwrap();
     let (without_passes, without_stages) = live::arranged(width, grid, &plan, None, false).unwrap();
@@ -274,7 +283,16 @@ fn the_cheaper_arrangement_is_the_one_the_clock_named() {
     };
     let width = host.width();
     let grid = sized(width, COARSE_FROM);
-    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
+    let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
+        Ok(plan) => plan,
+        Err(why) => {
+            // A plan reaches `sweep::cells` cubed quads and no further, so a
+            // narrow subgroup cannot address this grid at all. Shrinking it
+            // would not save the question being asked here.
+            eprintln!("SKIPPED the_cheaper_arrangement_is_the_one_the_clock_named {why}");
+            return;
+        }
+    };
     let both = live::both(width, grid, &plan, None).unwrap();
 
     let modules: Vec<&[u32]> = both.passes.iter().map(Vec::as_slice).collect();

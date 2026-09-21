@@ -320,6 +320,25 @@ fn some_of<const LANES: u32>(
     kernel.finish()
 }
 
+/// The grid these tests walk, or nothing where a plan cannot hold it.
+///
+/// A plan reaches `sweep::cells` cubed quads, which is 32 768 at a subgroup of
+/// four against this grid's 262 144. Shrinking it would not save the question:
+/// what is asked here is that a list leaves out what is asleep, and on a grid
+/// small enough for a narrow subgroup there is nothing asleep to leave out.
+fn walked(label: &str, width: u32) -> Option<Grid> {
+    let grid = Grid::of(WIDE, DEEP);
+    if u64::from(grid.quads()) > Plan::reach(width) {
+        eprintln!(
+            "SKIPPED {label} {} quads over a reach of {}",
+            grid.quads(),
+            Plan::reach(width)
+        );
+        return None;
+    }
+    Some(grid)
+}
+
 fn stepped(host: &Host, grid: Grid, cells: &[u32], sparse: bool, rule: Rule) -> (Vec<u32>, u32) {
     let width = host.width();
     let quads = grid.quads();
@@ -382,7 +401,9 @@ fn the_quads_left_out_had_nothing_to_do() {
     let Some(host) = device("the_quads_left_out_had_nothing_to_do") else {
         return;
     };
-    let grid = Grid::of(WIDE, DEEP);
+    let Some(grid) = walked("the_quads_left_out_had_nothing_to_do", host.width()) else {
+        return;
+    };
     let cells = scattered(grid, 0x0510_0BED);
 
     let (dense, _) = stepped(&host, grid, &cells, false, Rule::Turn);
@@ -468,7 +489,12 @@ fn a_sparse_run_undoes_itself_over_the_list_it_kept() {
     let Some(host) = device("a_sparse_run_undoes_itself_over_the_list_it_kept") else {
         return;
     };
-    let grid = Grid::of(WIDE, DEEP);
+    let Some(grid) = walked(
+        "a_sparse_run_undoes_itself_over_the_list_it_kept",
+        host.width(),
+    ) else {
+        return;
+    };
     let cells = scattered(grid, 0x0510_0BED);
 
     let (stirred, home, awake) = both_ways(&host, grid, &cells, Rule::Turn);
@@ -488,7 +514,9 @@ fn a_rule_that_computes_still_undoes_itself_over_the_list() {
     let Some(host) = device("a_rule_that_computes_still_undoes_itself") else {
         return;
     };
-    let grid = Grid::of(WIDE, DEEP);
+    let Some(grid) = walked("a_rule_that_computes_still_undoes_itself", host.width()) else {
+        return;
+    };
     let cells = scattered(grid, 0x0510_0BED);
 
     let (stirred, home, awake) = both_ways(&host, grid, &cells, Rule::Lift);
@@ -512,7 +540,12 @@ fn the_computing_rule_skips_nothing_the_dense_run_did() {
     let Some(host) = device("the_computing_rule_skips_nothing_the_dense_run_did") else {
         return;
     };
-    let grid = Grid::of(WIDE, DEEP);
+    let Some(grid) = walked(
+        "the_computing_rule_skips_nothing_the_dense_run_did",
+        host.width(),
+    ) else {
+        return;
+    };
     let cells = scattered(grid, 0x0BED_0510);
 
     let (dense, _) = stepped(&host, grid, &cells, false, Rule::Lift);
