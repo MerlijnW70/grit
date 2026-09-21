@@ -136,6 +136,24 @@ CHECKS: list[tuple[str, str]] = [
 ]
 
 
+def parted(rule: str, held: list) -> bool:
+    """Do the scenes actually differ in the thing this rule marks on?
+
+    Twice now a description was marked against a set that held one answer. A
+    shelf that was meant to split a heap did not, so every scene had one heap
+    and "split into more than one" had nothing to find; and an earlier set
+    varied only the spout width, so asking which was wide and low was a
+    question with no answer in it. Both times the numbers were there to see
+    beforehand. This is that look, made to happen.
+    """
+    way, _, name = rule.partition(" ")
+    measure = MEASURED.get(name)
+    if measure is None:
+        return True
+    seen = {measure(one) for one in held}
+    return len(seen) > 1
+
+
 def picked(rule: str, held: list) -> int:
     """Work out which scene a description means, from what was counted.
 
@@ -287,9 +305,17 @@ def marked(tried: list[Poured], args) -> int:
 
     checks = load_checks(args.cases) if args.cases else CHECKS
     right = 0
+    unanswerable = 0
     spreads: list[tuple[float, bool]] = []
     with TypeSafeClient() as client:
         for wanted, chooser in checks:
+            if not parted(chooser, tried):
+                _, _, name = chooser.partition(" ")
+                print(f"  ---- {'':>4} {'':>21}  {wanted}   [{chooser}]")
+                print(f"         every scene has the same {name}, so this asks "
+                      "something the set cannot answer")
+                unanswerable += 1
+                continue
             says, sure = judge(client, wanted, tried, args.model)
             kept = max(range(len(tried)), key=lambda n: says[n])
             wants = picked(chooser, tried)
@@ -306,11 +332,14 @@ def marked(tried: list[Poured], args) -> int:
                 print(f"         kept   {tried[kept].scene}")
                 print(f"         wanted {tried[wants].scene}")
     print()
-    print(f"{right}/{len(checks)} descriptions matched the scene its rule picks.")
+    asked = len(checks) - unanswerable
+    print(f"{right}/{asked} descriptions matched the scene its rule picks"
+          + (f", and {unanswerable} could not be asked of this set." if unanswerable
+             else "."))
     say_spread(spreads)
     print("Those rules are proxies, named beside each line. Where one loses an "
           "argument with a sentence the mark belongs on the proxy.")
-    return 0 if right == len(checks) else 1
+    return 0 if right == asked and not unanswerable else 1
 
 
 def main(argv: list[str] | None = None) -> int:

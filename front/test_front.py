@@ -29,6 +29,7 @@ from typesafe_sdk import Choice
 import bench
 import machine
 import spec
+import world
 
 NO_LADDER = {"smallest_that_solved": None, "ladder": [{"gates": 4, "solved": False}],
              "circuit": None}
@@ -440,5 +441,44 @@ class Shape(unittest.TestCase):
         self.assertGreater(0.43, machine.TABLE_FLOOR, "a real three-deep table must pass")
 
 
+class Asking(unittest.TestCase):
+    """A set has to differ in a thing before a description can be marked on it."""
+
+    def scene(self, rows, columns, water=0, sand=0, listed=0):
+        return world.Poured(scene="made up", rows=rows, columns=columns,
+                            tally={"water": water, "sand": sand}, listed=listed)
+
+    def test_a_set_that_all_holds_one_heap_cannot_be_asked_about_heaps(self):
+        # Two scenes, both a single run of columns. Asking which has the more
+        # heaps is a question with no answer in the set, and it went unnoticed
+        # twice before this said so: a shelf meant to split a pile did not.
+        held = [self.scene([3, 3], [2, 2, 2, 0, 0]),
+                self.scene([4, 2], [3, 3, 0, 0, 0])]
+        self.assertEqual([one.clumps for one in held], [1, 1])
+        self.assertFalse(world.parted("max clumps", held))
+        self.assertTrue(world.parted("max widest", held),
+                        "they do differ in how wide they lie, so that can be asked")
+
+    def test_a_set_that_differs_can_be_asked(self):
+        held = [self.scene([3, 3], [2, 2, 2, 0, 0]),
+                self.scene([2, 2], [2, 0, 2, 0, 2])]
+        self.assertEqual([one.clumps for one in held], [1, 3])
+        self.assertTrue(world.parted("max clumps", held))
+
+    def test_clumps_counts_runs_and_not_columns(self):
+        one = self.scene([1], [1, 1, 0, 0, 1, 1, 1, 0, 2])
+        self.assertEqual(one.clumps, 3, "three runs, whatever they hold")
+        self.assertEqual(self.scene([0], [0, 0, 0]).clumps, 0)
+
+    def test_an_unknown_measure_is_left_to_the_rule_to_refuse(self):
+        # parted says nothing about a rule it does not know; picked is the one
+        # that names it, so the message comes from one place.
+        self.assertTrue(world.parted("max wetness", []))
+        with self.assertRaises(SystemExit):
+            world.picked("max wetness", [])
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
