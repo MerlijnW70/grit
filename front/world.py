@@ -154,6 +154,57 @@ def parted(rule: str, held: list) -> bool:
     return len(seen) > 1
 
 
+# What each counted thing is, said so a sentence can be held against it.
+SAID = {
+    "rows": "how many rows of the room hold anything at all - how tall it stands",
+    "widest": "how many cells lie side by side in its widest row - how wide it gets",
+    "settled": "how many cells of sand and water came to rest in the room",
+    "water": "how many cells of water there are",
+    "sand": "how many cells of sand there are",
+    "listed": "how many quads the engine had to step on an average frame - how "
+              "much work the room cost it",
+    "slenderness": "how tall it stands against how wide it gets - how much like a "
+                   "column rather than a layer",
+    "flatness": "how wide it gets against how tall it stands - how much like a "
+                "layer rather than a column",
+    "clumps": "how many separate heaps it settled into, with empty floor between",
+}
+
+
+def read_rule(client, wanted: str, model=None) -> tuple[str, float]:
+    """Turn the sentence into one of the things that were counted.
+
+    The other way round asks which room a sentence means, and every room's
+    numbers have to be weighed inside the answer. That leaves the arithmetic
+    where it is weakest: the miss that survived every other fix was a room
+    holding three times as much being passed over, which is not a close call.
+
+    This asks only what the sentence is about. The comparing is then code's,
+    where it is exact and free, and a sentence about a hop - how long a room
+    would take to clear out - has to land on something that was counted before
+    it can pick anything at all.
+    """
+    options = {}
+    for name, told_as in SAID.items():
+        options[f"max {name}"] = f"it asks for the most of this: {told_as}"
+        options[f"min {name}"] = f"it asks for the least of this: {told_as}"
+    answer = client.system_one(
+        state={"wanted": wanted},
+        questions={
+            "rule": Choice(
+                instructions=("`wanted` describes a room of settled sand or water. "
+                              "Which one of these does it ask for? Each option names "
+                              "something that was counted and whether the most or the "
+                              "least of it is wanted."),
+                criteria=options,
+            )
+        },
+        model=model,
+    )
+    kept = answer.choices["rule"]
+    return kept.choice, kept.confidence
+
+
 def would_pick(held: list, want: int) -> list[str]:
     """Which rules, if any, would have chosen this scene.
 
@@ -332,20 +383,32 @@ def marked(tried: list[Poured], args) -> int:
                       "something the set cannot answer")
                 unanswerable += 1
                 continue
-            says, sure = judge(client, wanted, tried, args.model)
-            kept = max(range(len(tried)), key=lambda n: says[n])
             wants = picked(chooser, tried)
+            if args.how == "rule":
+                told_rule, sure = read_rule(client, wanted, args.model)
+                try:
+                    kept = picked(told_rule, tried)
+                except SystemExit:
+                    kept = -1
+                says = {kept: sure}
+                asked_as = told_rule
+            else:
+                says, sure = judge(client, wanted, tried, args.model)
+                kept = max(range(len(tried)), key=lambda n: says[n])
+                asked_as = chooser
             hit = kept == wants
             right += hit
-            rest = [says[n] for n in range(len(tried)) if n != kept]
+            rest = [says[n] for n in range(len(tried)) if n != kept and n in says]
             margin = says[kept] - max(rest, default=0.0)
             told_sure = "   too flat to say" if sure < TELLING else ""
-            print(f"  {'ok  ' if hit else 'MISS'} {says[kept]:.2f} "
+            shown = f"[{chooser}]" if args.how != "rule" else f"[{chooser} -> {asked_as}]"
+            print(f"  {'ok  ' if hit else 'MISS'} {says.get(kept, 0.0):.2f} "
                   f"(next {margin:+.2f}, sure {sure:.2f})  {wanted}   "
-                  f"[{chooser}]{told_sure}")
+                  f"{shown}{told_sure}")
             spreads.append((sure, hit))
             if not hit:
-                print(f"         kept   {tried[kept].scene}")
+                print(f"         kept   "
+                      f"{tried[kept].scene if kept >= 0 else 'nothing it could apply'}")
                 print(f"         wanted {tried[wants].scene}")
                 instead = [one for one in would_pick(tried, kept) if one != chooser]
                 if instead:
@@ -369,6 +432,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="what the settled room should be like, in plain English")
     parser.add_argument("--cases", help="JSON file of your own descriptions and the "
                                         "rule each is marked against")
+    parser.add_argument("--how", default="scene", choices=["scene", "rule"],
+                        help="scene asks which room the sentence means; rule asks "
+                             "which counted thing it is about and lets code do the "
+                             "comparing")
     parser.add_argument("--check", action="store_true",
                         help="run the descriptions whose answer is arithmetic over what "
                              "was counted, and mark the judging against them")
