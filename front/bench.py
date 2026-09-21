@@ -621,13 +621,16 @@ def bench_hard(client) -> dict:
                 if row.outs[out] != want[j]:
                     wrong.append((row.index, out))
             stopped += [(row.index, name) for name in row.unclear(spec.UNDECIDED_FLOOR)]
-        stopped_by_arithmetic = shape["arithmetic"] > spec.ARITHMETIC_CEILING
+        through = max(shape["through"].values(), default=0.0)
+        stopped_by_arithmetic = (shape["arithmetic"] > spec.ARITHMETIC_CEILING
+                                 or through > spec.THROUGH_CEILING)
         cases.append({"rule": rule[:56], "inputs": len(inputs),
                       "outputs": len(outputs),
                       "bits": 2 ** len(inputs) * len(outputs),
                       "wrong": len(wrong), "first_wrong": wrong[:4],
                       "stopped": len(stopped), "exact": not wrong,
                       "arithmetic": round(shape["arithmetic"], 2),
+                      "through": round(through, 2),
                       "counting": round(shape["counting"], 2),
                       "guarded": stopped_by_arithmetic,
                       # The guard earns its place by stopping what came back
@@ -653,7 +656,8 @@ def say_hard(found: dict) -> None:
         flag = "STOPPED" if case["guarded"] else "let through"
         missed = "" if case["guard_right"] else "  <- guard wrong"
         print(f"  {mark} {case['inputs']}in {case['outputs']}out{note}")
-        print(f"        guard: arithmetic {case['arithmetic']:.2f} -> {flag}{missed}")
+        print(f"        guard: arithmetic {case['arithmetic']:.2f}, in-between "
+              f"{case['through']:.2f} -> {flag}{missed}")
         print(f"        {case['rule']}")
         if case["first_wrong"]:
             print("        first wrong: " + ", ".join(f"row {r} `{o}`"

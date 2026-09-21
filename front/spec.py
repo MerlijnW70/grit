@@ -78,6 +78,21 @@ PRUNE_FLOOR = 0.25
 # in the adder is not the thing this question asks about, so read the table.
 ARITHMETIC_CEILING = 0.50
 
+# Above this, deciding an output means finding something in between first: a
+# carry, a count, a value that is neither an input nor the answer. It is the
+# failure the arithmetic question rightly misses - a two-bit adder is a circuit
+# over bits and not number-level reasoning, and arithmetic reads it at fifteen
+# hundredths, while every wrong bit in it is in an output needing the carry.
+#
+# On its own this does not separate. Over the five specs with known tables the
+# exact ones read forty eight and fifty five while the wrong ones read forty
+# eight, fifty six and eighty six: an exact spec sits above a wrong one. It is
+# set where it catches the adder and alarms on neither exact spec, which leaves
+# two wrong specs below it - and those are the two the arithmetic question
+# catches at sixty nine and eighty two. The pair covers all five; neither does
+# alone, and fifty five against fifty six is not a margin to lean on.
+THROUGH_CEILING = 0.60
+
 
 def read_shape(client: TypeSafeClient, rule: str, inputs: list[str],
                outputs: list[str], model: str | None = None) -> dict:
@@ -97,9 +112,22 @@ def read_shape(client: TypeSafeClient, rule: str, inputs: list[str],
                 "Applying the rule in `rule` means counting how many inputs are 1 and "
                 "comparing that count against a number."
             )),
+            # A different failure from arithmetic, and the one arithmetic misses.
+            # A two-bit adder is not number-level reasoning - it is a circuit over
+            # bits, and the arithmetic question rightly said so at eighteen
+            # hundredths - yet every wrong bit in it was in the one output that
+            # needs the carry worked out first. That is a hop, not a sum.
+            **{f"through_{out}": Noul(instructions=(
+                f"Deciding the output bit `{out}` from the rule in `rule` means first "
+                "working out something that is not one of the inputs and is not the "
+                "answer either - a carry, a running count, an intermediate value that "
+                "has to be found before the answer can be. Reading the inputs and "
+                "combining them directly is not enough."
+            )) for out in outputs},
         })
     return {"arithmetic": answers.nouls["arithmetic"].noul,
-            "counting": answers.nouls["counting"].noul}
+            "counting": answers.nouls["counting"].noul,
+            "through": {out: answers.nouls[f"through_{out}"].noul for out in outputs}}
 
 
 def _whole_question() -> Noul:
@@ -398,7 +426,25 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with TypeSafeClient() as client:
                 shape = read_shape(client, args.rule, inputs, outputs, args.model)
-                report["shape"] = {k: round(v, 3) for k, v in shape.items()}
+                report["shape"] = {
+                    k: ({one: round(held, 3) for one, held in v.items()}
+                        if isinstance(v, dict) else round(v, 3))
+                    for k, v in shape.items()}
+                through = [out for out, held in shape["through"].items()
+                           if held > THROUGH_CEILING]
+                if through and shape["arithmetic"] <= ARITHMETIC_CEILING                         and not args.force:
+                    if args.json:
+                        print(json.dumps({**report, "searched": False}, indent=2))
+                    else:
+                        print("Deciding " + ", ".join(f"`{one}`" for one in through)
+                              + " means working out something in between first - a "
+                              "carry, a count, a value that is neither an input nor "
+                              "the answer. Measured on specs with known tables, that "
+                              "is where the wrong rows are, and no later check here "
+                              "would catch it. Say the rule in terms of the inputs "
+                              "themselves, name the in-between value as an input of "
+                              "its own, or pass --table. --force searches anyway.")
+                    return 3
                 if shape["arithmetic"] > ARITHMETIC_CEILING and not args.force:
                     if args.json:
                         print(json.dumps({**report, "searched": False}, indent=2))
