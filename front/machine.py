@@ -273,6 +273,36 @@ def check_pruning(client: TypeSafeClient, rule: str, k: int, names: list[str],
     return sorted(mattered)
 
 
+def deep_enough(client: TypeSafeClient, rule: str, k: int, names: list[str],
+                model: str | None = None) -> float:
+    """Is a window of k steps enough for this rule, asked straight out.
+
+    The depth is the one mistake nothing downstream can catch: the labels are a
+    lookup and so are self-consistent at any depth, the search solves them, and
+    the unseen-run probe is built from the same table. The guard on it is the
+    table's own worst margin, which was measured overlapping almost completely
+    between depths that can carry a rule and depths that provably cannot.
+
+    This is a second reading of the same question, asked about the depth rather
+    than read off how undecided the answers came back.
+    """
+    told = "the input at this step" if k == 1 else (
+        f"the inputs at this step and the {k - 1} step"
+        + ("s" if k > 2 else "") + " before it")
+    answers = client.system_one(
+        state={"rule": rule, "inputs": names},
+        model=model,
+        questions={
+            "enough": Noul(instructions=(
+                f"Knowing {told} is enough to decide the output of the rule in `rule` "
+                "at this step. Nothing from further back is needed: two moments that "
+                "agree on all of those always want the same output under this rule, "
+                "whatever happened before them."
+            ))
+        })
+    return answers.nouls["enough"].noul
+
+
 def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
                  outputs: list[str], model: str | None = None,
                  relevance: dict[tuple[int, str], float] | None = None
@@ -456,6 +486,25 @@ def main(argv: list[str] | None = None) -> int:
                           "of a shallower window if you can, or hand grit the runs yourself.")
                 return 3
             k = shape["span"] or 4
+            # Asked straight out rather than read off how undecided the table
+            # came back: eleven of eleven against the margin's seven, and where
+            # the two agree nothing has been wrong. So this decides and the
+            # margin corroborates.
+            enough = deep_enough(client, args.rule, k, names, args.model)
+            if enough < 0.5 and not args.force:
+                if args.json:
+                    print(json.dumps({"rule": args.rule, "shape": shape,
+                                      "window": k, "deep_enough": round(enough, 3),
+                                      "labelled": False}, indent=2))
+                else:
+                    print(f"\nAsked straight out, {k} steps is not enough "
+                          f"for this rule (P={enough:.2f}). A table built at a "
+                          "depth that cannot carry the rule is the one mistake "
+                          "nothing after it can see: the labels stay consistent, "
+                          "the search still solves, and the probe is built from "
+                          "the same table. Say the rule over a shallower window "
+                          "if you can, or hand grit the runs yourself.")
+                return 3
             relevance = (read_relevance(client, args.rule, k, names, args.model)
                          if args.prune else None)
             if relevance is not None:
@@ -474,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
                       + f"{2 ** (k * len(names))})")
             table, worst, run_in = window_table(client, args.rule, k, names,
                                                 outputs, args.model, relevance)
-            if worst < TABLE_FLOOR and not args.force:
+            if worst < TABLE_FLOOR and enough >= 0.5 and not args.force:
                 if args.json:
                     print(json.dumps({"rule": args.rule, "shape": shape,
                                       "window": k, "worst_margin": round(worst, 3),

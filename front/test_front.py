@@ -305,7 +305,7 @@ class Refusing(Driving_machine, unittest.TestCase):
     def test_a_table_of_coin_flips_is_refused(self):
         # Every window answered at dead centre: nothing to build a machine on.
         code, said, _ = self.drive(
-            {"span": "2", "route": "window", "noul": lambda q: 0.95 if q == "windowed"
+            {"span": "2", "route": "window", "noul": lambda q: 0.95 if q in ("windowed", "enough")
                 else 0.05 if q == "accumulates" else 0.5},
             ["something the window cannot carry"])
         self.assertEqual(code, 3)
@@ -313,7 +313,7 @@ class Refusing(Driving_machine, unittest.TestCase):
 
     def test_a_clean_window_rule_reaches_grit(self):
         code, said, _ = self.drive(
-            {"span": "2", "route": "window", "noul": lambda q: 0.95 if q == "windowed"
+            {"span": "2", "route": "window", "noul": lambda q: 0.95 if q in ("windowed", "enough")
                 else 0.05 if q == "accumulates" else (0.95 if q.startswith("w2") else 0.02)},
             ["a plain window rule", "--runs", "2", "--steps", "6"])
         self.assertIn(code, (0, 1))
@@ -330,6 +330,8 @@ class Pruning(Driving_machine, unittest.TestCase):
                     return 0.95
                 if q == "accumulates":
                     return 0.05
+                if q == "enough":
+                    return 0.95
                 if q.startswith("rel"):
                     return 0.95 if (q.startswith("rel0") or not only_now) else 0.02
                 return 0.95 if q.startswith("w2") else 0.02

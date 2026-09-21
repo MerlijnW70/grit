@@ -384,6 +384,7 @@ def bench_depth(client) -> dict:
     for rule, depth, truth in DEPTHS:
         for k in {depth, depth - 1} - {0}:
             adequate = k >= depth
+            enough = machine.deep_enough(client, rule, k, ["x"])
             table, worst, run_in = machine.window_table(client, rule, k, ["x"], ["out"])
             # At an adequate depth the whole table is checkable against truth.
             wrong = None
@@ -397,10 +398,18 @@ def bench_depth(client) -> dict:
                           "adequate": adequate, "worst_margin": round(worst, 2),
                           "run_in_margin": round(run_in, 2),
                           "wrong_patterns": wrong,
-                          "accepted": worst >= machine.TABLE_FLOOR})
+                          "accepted": worst >= machine.TABLE_FLOOR,
+                          "enough": round(enough, 2),
+                          "enough_right": (enough > 0.5) == adequate,
+                          "agreed": (enough > 0.5) == (worst >= machine.TABLE_FLOOR)})
     scored = [(case["worst_margin"], not case["adequate"]) for case in cases]
     return {"cases": cases, "pairs": len(cases),
             "floor": machine.TABLE_FLOOR,
+            "enough_right": sum(1 for case in cases if case["enough_right"]),
+            "agreed": sum(1 for case in cases if case["agreed"]),
+            "wrong_where_agreed": sum(
+                1 for case in cases
+                if case["agreed"] and case["accepted"] != case["adequate"]),
             "as_intended": sum(1 for case in cases
                                if case["accepted"] == case["adequate"]),
             "sweep": cut(scored, reject_above=False)}
@@ -418,6 +427,10 @@ def say_depth(found: dict) -> None:
               f"{str(case['adequate']):>9} {case['worst_margin']:>7.2f} "
               f"{verdict:>9}{mark}{extra}")
         print(f"        {case['rule']}")
+    print(f"\nasked straight out whether the depth is enough: "
+          f"{found['enough_right']}/{found['pairs']} right")
+    print(f"  the two readings agreed on {found['agreed']}/{found['pairs']}, "
+          f"{found['wrong_where_agreed']} wrong there")
     say_sweep(found["sweep"], found["floor"])
 
 
@@ -475,6 +488,10 @@ def say_route(found: dict) -> None:
               f"{str(case['span_choice']):>5}{mark}")
         print(f"        {case['rule']}")
     print("\npredictor the tool uses - min(windowed, 1 - accumulates):")
+    print(f"\nasked straight out whether the depth is enough: "
+          f"{found['enough_right']}/{found['pairs']} right")
+    print(f"  the two readings agreed on {found['agreed']}/{found['pairs']}, "
+          f"{found['wrong_where_agreed']} wrong there")
     say_sweep(found["sweep"], found["floor"])
     print("\ncheaper predictor - whichever noul is larger:")
     say_sweep(found["sweep_gap"])
