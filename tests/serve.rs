@@ -563,3 +563,36 @@ fn a_crowd_too_small_for_the_optimum_no_longer_hides_it() {
         0
     );
 }
+
+#[test]
+fn the_budget_that_fooled_a_reader_is_reached_by_raising_the_crowd() {
+    let Some(host) = device("the_budget_that_fooled_a_reader_is_reached_by_raising_the_crowd")
+    else {
+        return;
+    };
+    let table: Vec<String> = (0..32_u32)
+        .map(|row| u32::from(row.count_ones() >= 3).to_string())
+        .collect();
+    let arguments = format!(
+        "{{\"inputs\":5,\"outputs\":1,\"gates\":12,\"table\":[{}],\"crowd\":8000,\"rounds\":4000}}",
+        table.join(",")
+    );
+    let held = structured(&call(Some(&host), "grit_synthesise", &arguments));
+    eprintln!(
+        "majority of five at twelve gates: solved {:?}, crowd {:?}, rounds {:?}",
+        held.get("solved"),
+        held.counted("crowd"),
+        held.counted("rounds")
+    );
+    assert_eq!(
+        held.get("solved"),
+        Some(&Json::Bool(true)),
+        "twelve gates holds a majority of five, and a crowd of 8000 over 4000 rounds says it does not: {}",
+        written(&held)
+    );
+    assert!(held.counted("crowd").unwrap() > 8000);
+    assert_eq!(
+        held.get("wrong_rows").and_then(Json::list).unwrap().len(),
+        0
+    );
+}
