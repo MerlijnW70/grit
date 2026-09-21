@@ -378,6 +378,35 @@ class Pruning(Driving_machine, unittest.TestCase):
         self.assertEqual(machine.relevant_slots(nothing, 2, ["a"]), [(0, "a")])
 
 
+class Running(unittest.TestCase):
+    """Every bench suite runs against a scripted model, so a signature can move.
+
+    Changing what read_intent hands back broke two suites and the tests said
+    nothing, because a suite needs a key and nothing here had ever called one.
+    These do not check any answer - the answers are made up - only that the
+    suites still run end to end.
+    """
+
+    def client(self):
+        def noul(qid):
+            if qid in ("windowed", "enough", "singles"):
+                return 0.95
+            if qid in ("accumulates", "arithmetic", "counting", "whole"):
+                return 0.05
+            return 0.9 if qid.startswith(("v", "w", "p", "chk")) else 0.1
+        return FakeClient({"span": "2", "route": "window", "noul": noul})
+
+    def test_every_suite_runs_without_a_key(self):
+        for name, (run, say) in bench.SUITES.items():
+            with self.subTest(suite=name):
+                found = run(self.client())
+                self.assertIsInstance(found, dict, name)
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    say(found)
+                self.assertTrue(out.getvalue().strip(), f"{name} printed nothing")
+
+
 class Sweep(unittest.TestCase):
     """The sweep is a cut over peaks, so it can be checked without any model."""
 

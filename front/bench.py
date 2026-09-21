@@ -327,7 +327,7 @@ def bench_table(client) -> dict:
     cases = []
     exact = 0
     for rule, names, truth in TABLES:
-        rows = spec.read_intent(client, rule, names, ["out"])
+        rows, _ = spec.read_intent(client, rule, names, ["out"])
         got = [row.outs["out"] for row in rows]
         want = [truth(*[(r >> i) & 1 for i in range(len(names))])
                 for r in range(2 ** len(names))]
@@ -488,13 +488,12 @@ def say_route(found: dict) -> None:
               f"{str(case['span_choice']):>5}{mark}")
         print(f"        {case['rule']}")
     print("\npredictor the tool uses - min(windowed, 1 - accumulates):")
-    print(f"\nasked straight out whether the depth is enough: "
-          f"{found['enough_right']}/{found['pairs']} right")
-    print(f"  the two readings agreed on {found['agreed']}/{found['pairs']}, "
-          f"{found['wrong_where_agreed']} wrong there")
     say_sweep(found["sweep"], found["floor"])
     print("\ncheaper predictor - whichever noul is larger:")
     say_sweep(found["sweep_gap"])
+    print(f"\nasked as one Choice instead of two Nouls - "
+          f"{found['route_right']}/{found['rules']} routed right on the answer itself:")
+    say_sweep(found["sweep_asked"])
 
 
 def bench_prune(client) -> dict:
