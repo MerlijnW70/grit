@@ -119,8 +119,53 @@ def read_shape(client: TypeSafeClient, rule: str, model: str | None = None) -> d
             "span_confidence": span.confidence}
 
 
+def read_relevance(client: TypeSafeClient, rule: str, k: int, names: list[str],
+                   model: str | None = None) -> dict[tuple[int, str], float]:
+    """Which of the k*n values in a window the rule actually reads.
+
+    A window of k steps over n inputs is 2^(k*n) patterns, which is the ceiling
+    on how wide a machine this can spec. Most rules do not read most of those
+    values: "a is 1 now and b was 1 before" reads two of its four. Asking k*n
+    cheap questions first can turn the enumeration into 2^(how many matter).
+    """
+    questions = {}
+    for lag in range(k):
+        when = ("at this step" if lag == 0 else
+                "at the step immediately before this one" if lag == 1 else
+                f"{lag} steps before this one")
+        for name in names:
+            questions[f"rel{lag}_{name}"] = Noul(instructions=(
+                f"Under the rule in `rule`, the value of input `{name}` {when} can change "
+                "what the output at this step should be. That is: there are two situations "
+                f"differing only in `{name}` {when}, everything else the same, where the "
+                "rule calls for different outputs."
+            ))
+    answers = client.system_one(state={"rule": rule}, questions=questions, model=model)
+    return {(lag, name): answers.nouls[f"rel{lag}_{name}"].noul
+            for lag in range(k) for name in names}
+
+
+# Relevance is kept deliberately low, because its two errors are not the same
+# size. Keeping a value that does not matter costs questions and nothing else.
+# Dropping one that does matter flattens the rule silently: the labels stay
+# self-consistent, so the search still solves and the unseen-run probe, built
+# from the same table, still agrees. Measured, the true values scored well
+# clear of this and a false keep landed between - which is the harmless side.
+PRUNE_FLOOR = 0.25
+
+
+def relevant_slots(relevance: dict[tuple[int, str], float], length: int,
+                   names: list[str], floor: float = PRUNE_FLOOR) -> list[tuple[int, str]]:
+    """The values a window of this length must carry. Never empty."""
+    kept = sorted(slot for slot, p in relevance.items()
+                  if p > floor and slot[0] < length)
+    # A rule that reads nothing still has to read the current step.
+    return kept or [(0, names[0])]
+
+
 def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
-                 outputs: list[str], model: str | None = None
+                 outputs: list[str], model: str | None = None,
+                 relevance: dict[tuple[int, str], float] | None = None
                  ) -> tuple[dict[int, dict], float, float]:
     """Every window the run can present, judged once, keyed by how long it is.
 
@@ -138,18 +183,25 @@ def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
     """
     questions, shapes = {}, {}
     for length in range(1, k + 1):
-        for r in range(len(names) and 2 ** (length * len(names))):
+        slots = (relevant_slots(relevance, length, names) if relevance is not None
+                 else [(lag, name) for lag in range(length) for name in names])
+        for r in range(2 ** len(slots)):
             # A window is `length` words, newest first; each word packs one bit
-            # per named input, lowest bit first.
-            window = tuple((r >> (step * len(names))) & (2 ** len(names) - 1)
-                           for step in range(length))
+            # per named input, lowest bit first. Only the slots being carried
+            # get a value; anything pruned stays 0 and is never mentioned.
+            bits = dict(zip(slots, ((r >> i) & 1 for i in range(len(slots)))))
+            window = tuple(
+                sum(bits.get((step, name), 0) << bit for bit, name in enumerate(names))
+                for step in range(length))
+            key_of = tuple(bits[slot] for slot in slots)
             # Each step is named by how far back it is, rather than left to be
             # recovered from an ordering. Said as a bare sequence, a two-input
             # rule came back reading every input as belonging to the current
             # step, and the table fired on the newest word alone.
             said = [", ".join(f"{name}={(word >> bit) & 1}"
-                              for bit, name in enumerate(names))
-                    for word in window]
+                              for bit, name in enumerate(names)
+                              if relevance is None or (step, name) in bits)
+                    for step, word in enumerate(window)]
             def when(ago: int) -> str:
                 if ago == 0:
                     return "at this step"
@@ -157,8 +209,8 @@ def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
                     return "at the step immediately before this one"
                 return f"{ago} steps before this one"
             told = "; ".join(f"{when(ago)}, {said[ago]}"
-                             for ago in reversed(range(length)))
-            if len(names) == 1:
+                             for ago in reversed(range(length)) if said[ago])
+            if len(names) == 1 and relevance is None:
                 # A rule written as a sequence ("1 then 0 then 1") is answered
                 # far more sharply when the window is shown as one too. The
                 # per-step naming alone cost a 101 detector most of its margin.
@@ -172,10 +224,12 @@ def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
                          f"at all, and the inputs were: {told}")
             for out in outputs:
                 key = f"w{length}_{r}_{out}"
-                shapes[key] = (length, window, out)
+                shapes[key] = (length, key_of if relevance is not None else window, out)
                 questions[key] = Noul(instructions=(
-                    f"Applying the rule in `rule`: {where}. "
-                    f"The output bit `{out}` at this step is 1."
+                    f"Applying the rule in `rule`: {where}."
+                    + (" No other input value is needed to decide this."
+                       if relevance is not None else "")
+                    + f" The output bit `{out}` at this step is 1."
                 ))
     answers = client.system_one(state={"rule": rule}, questions=questions, model=model)
     tables: dict[int, dict] = {length: {} for length in range(1, k + 1)}
@@ -196,22 +250,33 @@ def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
     return tables, full, run_in
 
 
-def label(feed: list[int], tables: dict[int, dict], k: int) -> list[int]:
-    """Each step reads the window it actually has, short ones included."""
+def label(feed: list[int], tables: dict[int, dict], k: int,
+          relevance: dict[tuple[int, str], float] | None = None,
+          names: list[str] | None = None) -> list[int]:
+    """Each step reads the window it actually has, short ones included.
+
+    With a relevance map the key is not the window but the values in it the
+    rule was said to read, in the same order the table was built with.
+    """
     out = []
     for t in range(len(feed)):
         length = min(t + 1, k)
-        out.append(tables[length][tuple(feed[t - i] for i in range(length))])
+        if relevance is None:
+            key = tuple(feed[t - i] for i in range(length))
+        else:
+            key = tuple((feed[t - lag] >> names.index(name)) & 1
+                        for lag, name in relevant_slots(relevance, length, names))
+        out.append(tables[length][key])
     return out
 
 
 def make_runs(rng: random.Random, many: int, steps: int, table: dict[int, dict],
-              k: int, inputs: int = 1) -> list[dict]:
+              k: int, inputs: int = 1, relevance=None, names=None) -> list[dict]:
     """A feed is one word a step, not one bit: each word packs every input."""
     runs = []
     for _ in range(many):
         feed = [rng.randrange(2 ** inputs) for _ in range(steps)]
-        runs.append({"feed": feed, "want": label(feed, table, k)})
+        runs.append({"feed": feed, "want": label(feed, table, k, relevance, names)})
     return runs
 
 
@@ -232,6 +297,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--crowd", type=int, default=4096)
     parser.add_argument("--rounds", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--prune", action="store_true",
+                        help="ask which values in the window the rule reads, and "
+                             "enumerate only those; cuts the question count sharply "
+                             "on rules that ignore most of their window")
     parser.add_argument("--force", action="store_true",
                         help="label even a rule that needs a running tally")
     parser.add_argument("--json", action="store_true")
@@ -277,8 +346,15 @@ def main(argv: list[str] | None = None) -> int:
                           "of a shallower window if you can, or hand grit the runs yourself.")
                 return 3
             k = shape["span"] or 4
+            relevance = (read_relevance(client, args.rule, k, names, args.model)
+                         if args.prune else None)
+            if relevance is not None and not args.json:
+                kept = relevant_slots(relevance, k, names)
+                print("reads: " + ", ".join(f"{name}@-{lag}" for lag, name in kept)
+                      + f"  ({2 ** len(kept)} full windows instead of "
+                      + f"{2 ** (k * len(names))})")
             table, worst, run_in = window_table(client, args.rule, k, names,
-                                                outputs, args.model)
+                                                outputs, args.model, relevance)
             if worst < TABLE_FLOOR and not args.force:
                 if args.json:
                     print(json.dumps({"rule": args.rule, "shape": shape,
@@ -295,19 +371,23 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if not args.json:
-        print(f"\nwindow tables, {sum(2 ** (n * len(names)) for n in range(1, k + 1))} windows "
+        print(f"\nwindow tables, {sum(len(one) for one in table.values())} windows "
               f"(full windows close to {worst:.2f}, run-in to {run_in:.2f}), "
               f"newest input first:")
         for length in sorted(table):
             head = "full window" if length == k else f"run-in, {length} so far"
             print(f"  {head}:")
             for window, word in sorted(table[length].items()):
-                shown = " ".join(f"{w:0{len(names)}b}" for w in reversed(window))
+                shown = (" ".join(f"{w:0{len(names)}b}" for w in reversed(window))
+                         if relevance is None else
+                         "".join(str(bit) for bit in window))
                 print(f"    {shown} -> {word:0{len(outputs)}b}")
 
     rng = random.Random(args.seed)
-    taught = make_runs(rng, args.runs, args.steps, table, k, len(names))
-    probes = make_runs(rng, args.probe_runs, args.probe_steps, table, k, len(names))
+    taught = make_runs(rng, args.runs, args.steps, table, k, len(names),
+                       relevance, names)
+    probes = make_runs(rng, args.probe_runs, args.probe_steps, table, k, len(names),
+                       relevance, names)
 
     ask = {"state": args.state, "inputs": len(names), "outputs": len(outputs),
            "gates": args.gates,

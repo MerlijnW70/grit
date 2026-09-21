@@ -195,7 +195,7 @@ class Bench(unittest.TestCase):
 
     def test_every_suite_is_reachable_and_prints(self):
         # A suite in the registry but not in --suite is one nobody can run.
-        self.assertEqual(set(bench.SUITES), {"spec", "table", "trace", "depth", "route"})
+        self.assertEqual(set(bench.SUITES), {"spec", "table", "trace", "depth", "route", "prune"})
         for name, (run, say) in bench.SUITES.items():
             self.assertTrue(callable(run), name)
             self.assertTrue(callable(say), name)

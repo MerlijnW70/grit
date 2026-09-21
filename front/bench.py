@@ -1,10 +1,10 @@
 """Re-measure the numbers the README quotes.
 
-Every claim in front/README.md about how well the model answers comes from
-here. They are not asserted in test_front.py on purpose: a threshold pinned in
-a test breaks on a model update rather than on a bug. But a number nobody can
-reproduce is just a story, so this runs the same cases on demand and prints the
-model that answered them.
+Every threshold in this front door was set from here, and none of the numbers
+are written down anywhere else. They are not asserted in test_front.py on
+purpose: a threshold pinned in a test breaks on a model update rather than on a
+bug, and a number copied into prose is wrong by the next release. So the cases
+live here and the measurement is run on demand, against the model it names.
 
     python front/bench.py                        # everything
     python front/bench.py --suite spec           # the undecided detector
@@ -147,6 +147,23 @@ ROUTES = [
      "three", "accumulate"),
     ("output 1 at a step exactly when an odd number of 1s have arrived so far",
      "accumulate"),
+]
+
+
+# Rules with a known relevant set: exactly which values in the window decide
+# the output. Dropping one of these is the failure that matters; keeping a
+# spare only costs questions.
+PRUNES = [
+    ("output 1 at a step exactly when a is 1 at that step and b was 1 at the step "
+     "before it", 2, ["a", "b"], {(0, "a"), (1, "b")}),
+    ("output 1 at a step exactly when b is 1 at that step, whatever a does",
+     2, ["a", "b"], {(0, "b")}),
+    ("output 1 at a step exactly when the last three inputs, ending at that step, "
+     "were 1 then 0 then 1", 3, ["x"], {(0, "x"), (1, "x"), (2, "x")}),
+    ("output 1 at a step exactly when a was 1 two steps before this one, no matter "
+     "what has happened since", 3, ["a", "b"], {(2, "a")}),
+    ("output 1 at a step exactly when a and b are both 1 at this step",
+     2, ["a", "b"], {(0, "a"), (0, "b")}),
 ]
 
 
@@ -393,6 +410,52 @@ def say_route(found: dict) -> None:
     say_sweep(found["sweep_gap"])
 
 
+def bench_prune(client) -> dict:
+    """Does asking what the rule reads cut the enumeration without losing a value?
+
+    The two errors are not the same size, so they are counted apart. A dropped
+    value flattens the rule and nothing downstream sees it; a kept spare costs
+    questions. Savings are reported against the full enumeration.
+    """
+    cases = []
+    for rule, k, names, want in PRUNES:
+        relevance = machine.read_relevance(client, rule, k, names)
+        kept = set(machine.relevant_slots(relevance, k, names))
+        dropped = sorted(want - kept)
+        spare = sorted(kept - want)
+        full = sum(2 ** (n * len(names)) for n in range(1, k + 1))
+        pruned = sum(2 ** len(machine.relevant_slots(relevance, n, names))
+                     for n in range(1, k + 1))
+        cases.append({"rule": rule[:54], "kept": sorted(kept), "want": sorted(want),
+                      "dropped": dropped, "spare": spare,
+                      "full_windows": full, "pruned_windows": pruned,
+                      "saved": round(1 - pruned / full, 2),
+                      "safe": not dropped})
+    return {"rules": len(cases), "cases": cases,
+            "safe": sum(1 for case in cases if case["safe"]),
+            "exact": sum(1 for case in cases if case["safe"] and not case["spare"]),
+            "windows_full": sum(case["full_windows"] for case in cases),
+            "windows_pruned": sum(case["pruned_windows"] for case in cases)}
+
+
+def say_prune(found: dict) -> None:
+    saved = 1 - found["windows_pruned"] / found["windows_full"]
+    print(f"\nrelevance pruning - {found['safe']}/{found['rules']} lost nothing, "
+          f"{found['exact']}/{found['rules']} exactly right, "
+          f"{found['windows_full']} windows down to {found['windows_pruned']} "
+          f"({saved:.0%} fewer)")
+    for case in found["cases"]:
+        mark = "ok  " if case["safe"] else "LOST"
+        note = ""
+        if case["dropped"]:
+            note += "  dropped " + ", ".join(f"{n}@-{l}" for l, n in case["dropped"])
+        if case["spare"]:
+            note += "  kept spare " + ", ".join(f"{n}@-{l}" for l, n in case["spare"])
+        print(f"  {mark} {case['full_windows']:>4} -> {case['pruned_windows']:<4}"
+              f"{note}")
+        print(f"        {case['rule']}")
+
+
 def say_spec(found: dict) -> None:
     print("\nundecided detector "
           f"(floor {spec.UNDECIDED_FLOOR}) - {found['as_intended']}/{found['specs']} as intended")
@@ -451,7 +514,7 @@ def say_trace(found: dict) -> None:
 # Module level so the CLI choices and the registry cannot drift apart.
 SUITES = {"spec": (bench_spec, say_spec), "table": (bench_table, say_table),
           "trace": (bench_trace, say_trace), "depth": (bench_depth, say_depth),
-          "route": (bench_route, say_route)}
+          "route": (bench_route, say_route), "prune": (bench_prune, say_prune)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -509,8 +572,10 @@ def main(argv: list[str] | None = None) -> int:
         SUITES[name][1](report[name])
     print(f"\n{client.calls} requests, {client.input} input tokens, "
           f"{client.output} output tokens")
-    print("These are the numbers front/README.md quotes. If they have moved, the "
-          "README is what needs editing.")
+    print("Each suite sweeps its own floor above. Where a sweep says the "
+          "populations interleave, the floor in use is a preference rather "
+          "than a cut: set it from your own cases with --cases, and re-read "
+          "a saved run with --sweep-from.")
     return 0
 
 
