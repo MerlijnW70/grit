@@ -365,10 +365,18 @@ def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
             for out in outputs:
                 key = f"w{length}_{r}_{out}"
                 shapes[key] = (length, key_of if relevance is not None else window, out)
+                # Only when something really was left out. The same line in
+                # spec.py was being said to every case, including the ones where
+                # nothing had been dropped, and there it was measurably harmful:
+                # a rule's outputs that read all of their inputs got worse purely
+                # from being told the rest did not matter. Here the run-in
+                # windows are short enough that a length often keeps everything.
+                dropped_here = [(lag, name) for lag in range(length)
+                                for name in names if (lag, name) not in bits]
                 questions[key] = Noul(instructions=(
                     f"Applying the rule in `rule`: {where}."
-                    + (" No other input value is needed to decide this."
-                       if relevance is not None else "")
+                    + (" Nothing else about those steps decides this."
+                       if dropped_here else "")
                     + f" The output bit `{out}` at this step is 1."
                 ))
     answers = client.system_one(state={"rule": rule}, questions=questions, model=model)
