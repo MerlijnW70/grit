@@ -491,12 +491,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with TypeSafeClient() as client:
             says, sure = judge(client, args.wanted, tried, args.model)
+            # The two routes fail at different things, and over the descriptions
+            # this has been measured on every wrong answer sat where they parted.
+            # So the second one is asked too, and a disagreement is handed over
+            # rather than settled: which of them is right when they differ is not
+            # something this has ever been able to tell.
+            told_rule, rule_sure = read_rule(client, args.wanted, args.model)
     except TypeSafeAPIError as error:
         print(f"TypeSafe error {error.status} (request {error.request_id})", file=sys.stderr)
         return 2
 
     ranked = sorted(range(len(tried)), key=lambda n: -says[n])
     best = tried[ranked[0]] if ranked else None
+    try:
+        by_rule = picked(told_rule, tried)
+    except SystemExit:
+        by_rule = -1
+    agreed = bool(ranked) and by_rule == ranked[0]
     report = {
         "wanted": args.wanted,
         "tried": [
@@ -507,6 +518,9 @@ def main(argv: list[str] | None = None) -> int:
         ],
         "kept": None if best is None else
         {"scene": best.scene, "matches": round(says[ranked[0]], 3)},
+        "by_rule": {"rule": told_rule, "sure": round(rule_sure, 3),
+                    "scene": tried[by_rule].scene if by_rule >= 0 else None},
+        "agreed": agreed,
     }
     if args.json:
         print(json.dumps(report, indent=2))
@@ -518,11 +532,21 @@ def main(argv: list[str] | None = None) -> int:
         one = tried[n]
         print(f"  {says[n]:>6.2f} {one.widest:>7} {one.tall:>5} "
               f"{one.standing:>8}  {one.scene}")
-    if best is not None:
-        print(f"\nkept: {best.named()}")
-        print("Everything in those columns was counted on the host. Only the "
-              "match was judged, and\nonly against the numbers beside it - no "
-              "scenario was told what it was called.")
+    if best is not None and not agreed:
+        print()
+        print("the two routes part here, and nothing below settles which is right.")
+        print(f"  by the rooms: {best.named()}")
+        told = tried[by_rule].scene if by_rule >= 0 else "nothing it could apply"
+        print(f"  by the rule:  {told}   ({told_rule}, sure {rule_sure:.2f})")
+        print("  Every wrong answer this has been measured on sat in a "
+              "disagreement like this one.")
+    elif best is not None:
+        print()
+        print(f"kept: {best.named()}")
+        print(f"  both routes agree; the rule route read it as {told_rule}.")
+    print("Everything in those columns was counted on the host. Only the match "
+          "was judged, and only against")
+    print("the numbers beside it - no scene was told what it was called.")
     return 0
 
 
