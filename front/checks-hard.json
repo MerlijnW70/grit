@@ -1,0 +1,37 @@
+{
+  "checks": [
+    {
+      "wanted": "the room that would take the longest to clear out",
+      "pick": "max settled"
+    },
+    {
+      "wanted": "sand that has not gathered into a single heap",
+      "pick": "max clumps"
+    },
+    {
+      "wanted": "the emptiest room here",
+      "pick": "min settled"
+    },
+    {
+      "wanted": "not sand at all",
+      "pick": "max water"
+    },
+    {
+      "wanted": "something that fell straight down without spreading out",
+      "pick": "max slenderness"
+    },
+    {
+      "wanted": "as close to a flat sheet as this gets",
+      "pick": "max flatness"
+    },
+    {
+      "wanted": "the room the engine had to work hardest on",
+      "pick": "max listed"
+    },
+    {
+      "wanted": "a heap you could not step over",
+      "pick": "max rows"
+    }
+  ],
+  "note": "Descriptions written to be hard, after the tool was finished, to answer the obvious objection to the set built into world.py: that it was written by the same hand. Negations, synonyms, a figure of speech, and one indirection. Seven of eight. The one that misses asks how long a room would take to clear out, which is a hop from how much is in it, and the pick goes to the water rather than to the room holding three times as much - not a close comparison, a hop too many. Two of the eight were marked wrong at first and both were the rule, not the judging: stepping over a heap is about its height and was marked on slenderness."
+}
