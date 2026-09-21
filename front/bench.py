@@ -575,6 +575,7 @@ def bench_hard(client) -> dict:
     """Specs past the toy range, marked against ground truth."""
     cases = []
     for rule, inputs, outputs, truth in HARD:
+        shape = spec.read_shape(client, rule, inputs, outputs)
         rows = spec.read_intent(client, rule, inputs, outputs)
         wrong, stopped = [], []
         for row in rows:
@@ -583,13 +584,23 @@ def bench_hard(client) -> dict:
                 if row.outs[out] != want[j]:
                     wrong.append((row.index, out))
             stopped += [(row.index, name) for name in row.unclear(spec.UNDECIDED_FLOOR)]
+        stopped_by_arithmetic = shape["arithmetic"] > spec.ARITHMETIC_CEILING
         cases.append({"rule": rule[:56], "inputs": len(inputs),
                       "outputs": len(outputs),
                       "bits": 2 ** len(inputs) * len(outputs),
                       "wrong": len(wrong), "first_wrong": wrong[:4],
-                      "stopped": len(stopped), "exact": not wrong})
+                      "stopped": len(stopped), "exact": not wrong,
+                      "arithmetic": round(shape["arithmetic"], 2),
+                      "counting": round(shape["counting"], 2),
+                      "guarded": stopped_by_arithmetic,
+                      # The guard earns its place by stopping what came back
+                      # wrong and letting through what came back exact.
+                      "guard_right": stopped_by_arithmetic == bool(wrong)})
     return {"specs": len(cases), "cases": cases,
             "exact": sum(1 for case in cases if case["exact"]),
+            "guard_right": sum(1 for case in cases if case["guard_right"]),
+            "guard_sweep": cut([(case["arithmetic"], bool(case["wrong"]))
+                                for case in cases], reject_above=True),
             "bits": sum(case["bits"] for case in cases),
             "wrong": sum(case["wrong"] for case in cases)}
 
@@ -602,11 +613,15 @@ def say_hard(found: dict) -> None:
         note = f"  {case['wrong']}/{case['bits']} bits wrong" if case["wrong"] else ""
         if case["stopped"]:
             note += f"  ({case['stopped']} rows called undecided)"
+        flag = "STOPPED" if case["guarded"] else "let through"
+        missed = "" if case["guard_right"] else "  <- guard wrong"
         print(f"  {mark} {case['inputs']}in {case['outputs']}out{note}")
+        print(f"        guard: arithmetic {case['arithmetic']:.2f} -> {flag}{missed}")
         print(f"        {case['rule']}")
         if case["first_wrong"]:
             print("        first wrong: " + ", ".join(f"row {r} `{o}`"
                                                       for r, o in case["first_wrong"]))
+    say_sweep(found["guard_sweep"], spec.ARITHMETIC_CEILING)
 
 
 def say_spec(found: dict) -> None:

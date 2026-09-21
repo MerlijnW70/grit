@@ -63,6 +63,45 @@ NARROW_MARGIN = 0.15
 PRUNE_FLOOR = 0.25
 
 
+# Above this, the rule wants arithmetic on a number spelled out in the inputs,
+# which is where the answers stop being reliable: measured on specs with known
+# tables, the ones that decode bits into a number and test a property of it got
+# rows wrong while conditions stated over the bits came back exact. Nothing
+# else catches this - the undecided question asks whether the rule decides the
+# case, and these rules decide it perfectly well. The model just answers wrong.
+#
+# It is a partial guard, and `bench.py --suite hard` shows where it stops. It
+# catches "these bits are a number, is it prime" and "is it nine or less". It
+# does not catch a two-bit adder, which scored low and got six of forty eight
+# bits wrong - and answering low there is defensible, because an adder really
+# is a per-bit circuit rather than number-level reasoning. Whatever went wrong
+# in the adder is not the thing this question asks about, so read the table.
+ARITHMETIC_CEILING = 0.50
+
+
+def read_shape(client: TypeSafeClient, rule: str, inputs: list[str],
+               outputs: list[str], model: str | None = None) -> dict:
+    """Does this rule want the inputs read as a number and computed with?"""
+    answers = client.system_one(
+        state={"rule": rule, "inputs": inputs, "outputs": outputs},
+        model=model,
+        questions={
+            "arithmetic": Noul(instructions=(
+                "Applying the rule in `rule` means reading the inputs together as the "
+                "digits of a number, and then doing arithmetic with that number - "
+                "adding it, comparing its size, or testing a property of it such as "
+                "being prime or being in a range. It is not enough to look at the "
+                "individual inputs and combine them with and, or and not."
+            )),
+            "counting": Noul(instructions=(
+                "Applying the rule in `rule` means counting how many inputs are 1 and "
+                "comparing that count against a number."
+            )),
+        })
+    return {"arithmetic": answers.nouls["arithmetic"].noul,
+            "counting": answers.nouls["counting"].noul}
+
+
 def read_relevance(client: TypeSafeClient, rule: str, inputs: list[str],
                    outputs: list[str], model: str | None = None) -> dict[tuple[str, str], float]:
     """Which inputs each output actually reads."""
@@ -327,6 +366,22 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             with TypeSafeClient() as client:
+                shape = read_shape(client, args.rule, inputs, outputs, args.model)
+                report["shape"] = {k: round(v, 3) for k, v in shape.items()}
+                if shape["arithmetic"] > ARITHMETIC_CEILING and not args.force:
+                    if args.json:
+                        print(json.dumps({**report, "searched": False}, indent=2))
+                    else:
+                        print("This rule reads the inputs as a number and computes "
+                              f"with it (P={shape['arithmetic']:.2f}). Measured on "
+                              "specs with known tables, that is where the answers stop "
+                              "being right, and nothing later here would catch it: grit "
+                              "marks the circuit against whatever table it is handed." + 
+                              "\n\n"
+                              "State the condition over the inputs themselves if you "
+                              "can, or pass --table to give the table yourself. "
+                              "--force searches anyway.")
+                    return 3
                 relevance = (read_relevance(client, args.rule, inputs, outputs, args.model)
                              if args.prune else None)
                 if relevance is not None:
