@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
+import types
 import textwrap
 import unittest
 from contextlib import redirect_stdout
@@ -199,6 +201,137 @@ class Bench(unittest.TestCase):
         for name, (run, say) in bench.SUITES.items():
             self.assertTrue(callable(run), name)
             self.assertTrue(callable(say), name)
+
+
+class FakeAnswer:
+    def __init__(self, noul=None, choice=None, confidence=1.0):
+        self.noul, self.choice, self.confidence = noul, choice, confidence
+
+
+class FakeResponse:
+    def __init__(self, nouls, choices):
+        self.nouls, self.choices = nouls, choices
+        self.model = "fake-1"
+        self.usage = types.SimpleNamespace(input_tokens=0, output_tokens=0)
+
+
+class FakeClient:
+    """Answers whatever is asked, from a script keyed by question id prefix.
+
+    machine.main builds its own client, so this stands in for the module's
+    TypeSafeClient. It also records every question, which is how the pruning
+    test checks that fewer windows were actually enumerated.
+    """
+
+    def __init__(self, script):
+        self.script, self.asked = script, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *rest):
+        return False
+
+    def __call__(self, *rest, **kw):
+        return self
+
+    def system_one(self, state=None, questions=None, model=None, **kw):
+        self.asked.append(list(questions))
+        nouls, choices = {}, {}
+        for qid in questions:
+            if qid == "span":
+                choices[qid] = FakeAnswer(choice=self.script["span"],
+                                          confidence=self.script.get("span_confidence", 1.0))
+            else:
+                nouls[qid] = FakeAnswer(noul=self.script["noul"](qid))
+        return FakeResponse(nouls, choices)
+
+
+class Driving_machine:
+    """Runs machine.main against a scripted model and a stubbed grit."""
+
+    def drive(self, script, argv):
+        client = FakeClient(script)
+        real_client, real_grit = machine.TypeSafeClient, machine.grit
+        had_key = os.environ.get("TYPESAFE_API_KEY")
+        os.environ["TYPESAFE_API_KEY"] = "not-a-real-key"
+        machine.TypeSafeClient = client
+        machine.grit = lambda tool, arguments, binary, timeout=900: {
+            "solved": True, "marks": 1, "of": 1, "gates": [], "traces": arguments["traces"]}
+        try:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = machine.main(argv)
+            return code, out.getvalue(), client
+        finally:
+            machine.TypeSafeClient, machine.grit = real_client, real_grit
+            if had_key is None:
+                del os.environ["TYPESAFE_API_KEY"]
+            else:
+                os.environ["TYPESAFE_API_KEY"] = had_key
+
+class Refusing(Driving_machine, unittest.TestCase):
+    """machine.main's three refusals, and the exit code each one carries."""
+
+    def test_an_accumulating_rule_is_refused(self):
+        code, said, _ = self.drive(
+            {"span": "2", "noul": lambda q: 0.05 if q == "windowed" else 0.9},
+            ["counts the 1s so far"])
+        self.assertEqual(code, 3)
+        self.assertIn("running tally", said)
+
+    def test_a_window_deeper_than_the_options_is_refused(self):
+        code, said, _ = self.drive(
+            {"span": "more", "noul": lambda q: 0.95 if q == "windowed" else 0.05},
+            ["looks a long way back"])
+        self.assertEqual(code, 3)
+        self.assertIn("further back", said)
+
+    def test_a_table_of_coin_flips_is_refused(self):
+        # Every window answered at dead centre: nothing to build a machine on.
+        code, said, _ = self.drive(
+            {"span": "2", "noul": lambda q: 0.95 if q == "windowed"
+                else 0.05 if q == "accumulates" else 0.5},
+            ["something the window cannot carry"])
+        self.assertEqual(code, 3)
+        self.assertIn("full windows close to", said)
+
+    def test_a_clean_window_rule_reaches_grit(self):
+        code, said, _ = self.drive(
+            {"span": "2", "noul": lambda q: 0.95 if q == "windowed"
+                else 0.05 if q == "accumulates" else (0.95 if q.startswith("w2") else 0.02)},
+            ["a plain window rule", "--runs", "2", "--steps", "6"])
+        self.assertIn(code, (0, 1))
+        self.assertIn("window tables", said)
+
+
+class Pruning(Driving_machine, unittest.TestCase):
+    def test_pruning_asks_about_fewer_windows(self):
+        # Two inputs, two steps: four slots, so sixteen full windows. Saying
+        # only the current step matters must cut what gets enumerated.
+        def script(only_now):
+            def noul(q):
+                if q == "windowed":
+                    return 0.95
+                if q == "accumulates":
+                    return 0.05
+                if q.startswith("rel"):
+                    return 0.95 if (q.startswith("rel0") or not only_now) else 0.02
+                return 0.95 if q.startswith("w2") else 0.02
+            return {"span": "2", "noul": noul}
+
+        argv = ["a rule", "-i", "a,b", "--runs", "2", "--steps", "6", "--prune"]
+        _, _, wide = self.drive(script(only_now=False), argv)
+        _, _, narrow = self.drive(script(only_now=True), argv)
+        # The last request of each run is the window enumeration.
+        self.assertLess(len(narrow.asked[-1]), len(wide.asked[-1]),
+                        "dropping two of four slots must ask about fewer windows")
+
+    def test_a_dropped_slot_never_empties_the_window(self):
+        # Relevance can come back saying nothing matters. The lookup still
+        # needs a key, so the current step is kept regardless.
+        nothing = {(0, "a"): 0.01, (1, "a"): 0.01}
+        self.assertEqual(machine.relevant_slots(nothing, 2, ["a"]), [(0, "a")])
 
 
 class Sweep(unittest.TestCase):
