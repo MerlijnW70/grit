@@ -48,29 +48,43 @@ fn runs(from: u32, many: u32, steps: u32) -> String {
 }
 
 fn tried(host: Option<&Host>, many: u32, steps: u32) -> (bool, u32, u32) {
-    let taught = structured(&call(
+    // The whole answer is kept, not just the structured part of it. A search
+    // that fails comes back as an error and `structured` turns that into null,
+    // so reaching for a field of it says only that a field was missing. What is
+    // wanted at that point is what the tool said.
+    let searched = call(
         host,
         "grit_machine",
         &format!(
             "{{\"state\":2,\"inputs\":1,\"outputs\":1,\"gates\":6,\"crowd\":4096,\"rounds\":2000,\"traces\":[{}]}}",
             runs(0, many, steps)
         ),
-    ));
+    );
+    let taught = structured(&searched);
     let fit = taught.get("solved") == Some(&Json::Bool(true));
-    let gates = written(taught.get("gates").unwrap());
-    let held = structured(&call(
+    let Some(found) = taught.get("gates") else {
+        panic!(
+            "the search for a {many} by {steps} detector came back with no chip: {}",
+            written(&searched)
+        )
+    };
+    let gates = written(found);
+    let marked = call(
         None,
         "grit_machine",
         &format!(
             "{{\"state\":2,\"inputs\":1,\"outputs\":1,\"gates\":6,\"chip\":{gates},\"traces\":[{}]}}",
             runs(500, 8, 32)
         ),
-    ));
-    (
-        fit,
-        held.counted("marks").unwrap(),
-        held.counted("of").unwrap(),
-    )
+    );
+    let held = structured(&marked);
+    let (Some(marks), Some(of)) = (held.counted("marks"), held.counted("of")) else {
+        panic!(
+            "the chip was marked on runs it never saw and the answer held no count: {}",
+            written(&marked)
+        )
+    };
+    (fit, marks, of)
 }
 
 #[test]
