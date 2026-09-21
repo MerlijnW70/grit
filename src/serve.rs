@@ -184,6 +184,8 @@ pub fn pressed(
     }
 }
 
+pub const PATIENCE: u32 = 2;
+
 pub struct Rung {
     pub gates: u32,
     pub found: Found,
@@ -198,14 +200,17 @@ pub fn least(
 ) -> Result<Vec<Rung>, Box<dyn std::error::Error>> {
     let mut rungs = Vec::new();
     let mut gates = shape.gates;
-    while gates >= shape.outputs.max(1) {
+    let mut missed = 0;
+    while gates >= shape.outputs.max(1) && missed < PATIENCE {
         let narrowed = Netlist::over(shape.inputs, shape.outputs, gates, shape.kinds)?;
         let exam = Exam::of(narrowed, table.to_vec())?;
         let found = pressed(host, narrowed, &exam, many, rounds)?;
         let solved = found.marks >= found.full;
         rungs.push(Rung { gates, found });
-        if !solved {
-            break;
+        if solved {
+            missed = 0;
+        } else {
+            missed += 1;
         }
         gates -= 1;
     }
@@ -627,7 +632,7 @@ fn tools() -> Json {
             (
                 "description",
                 text(
-                    "Walk the gate budget down from the one given, searching at each rung, and stop at the first budget that does not solve. Returns the ladder, the smallest budget that did solve, and its circuit. Each rung doubles its crowd up to 65536 before it gives up, so the rung that ends the ladder has been pressed rather than merely tried. A rung that did not solve means not found within the rounds and crowd spent, which the answer carries, and never that no such circuit exists.",
+                    "Walk the gate budget down from the one given, searching at each rung, and keep going past a rung that fails until two in a row fail. Solving is not monotone in the budget: a smaller circuit can be found where a larger one was not, so stopping at the first failure names the edge of a hole rather than the floor. Returns the ladder, which shows any holes, the smallest budget that did solve, and its circuit. Each rung doubles its crowd up to 65536 before it gives up, so a rung that fails has been pressed rather than merely tried. A rung that did not solve means not found within the rounds and crowd spent, which the answer carries, and never that no such circuit exists.",
                 ),
             ),
             ("inputSchema", held(laddering)),
@@ -844,7 +849,7 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
                 held.push((
                     "nothing_solved",
                     text(
-                        "the ladder stops at the first budget that does not solve, so a first rung that fails ends it at once and leaves no circuit; start the ladder from more gates, or raise crowd, and ask again",
+                        "the ladder ends after two rungs in a row fail, so starting on a budget that cannot be met leaves no circuit; start the ladder from more gates, or raise crowd, and ask again",
                     ),
                 ));
             }

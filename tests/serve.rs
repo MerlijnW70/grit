@@ -292,8 +292,9 @@ fn a_machine_that_is_found_keeps_the_crowd_it_was_given() {
 }
 
 #[test]
-fn the_ladder_walks_the_budget_down_and_stops_where_it_cannot() {
-    let Some(host) = device("the_ladder_walks_the_budget_down_and_stops_where_it_cannot") else {
+fn the_ladder_walks_the_budget_down_and_ends_on_two_failures_in_a_row() {
+    let Some(host) = device("the_ladder_walks_the_budget_down_and_ends_on_two_failures_in_a_row")
+    else {
         return;
     };
     let arguments = format!(
@@ -318,17 +319,36 @@ fn the_ladder_walks_the_budget_down_and_stops_where_it_cannot() {
     let smallest = held.counted("smallest_that_solved").unwrap();
     eprintln!("the smallest budget that solved it is {smallest} gates");
 
-    assert!(rungs.len() >= 2, "the ladder has only one rung");
-    let last = rungs.last().unwrap();
-    assert_eq!(
-        last.get("solved"),
-        Some(&Json::Bool(false)),
-        "the ladder should stop on a rung it could not solve"
+    assert!(
+        rungs.len() >= 3,
+        "the ladder is too short to have been walked"
     );
-    for rung in &rungs[..rungs.len() - 1] {
-        assert_eq!(rung.get("solved"), Some(&Json::Bool(true)));
+    for rung in &rungs[rungs.len() - 2..] {
+        assert_eq!(
+            rung.get("solved"),
+            Some(&Json::Bool(false)),
+            "the ladder ends only after two rungs in a row fail"
+        );
     }
-    assert_eq!(smallest, last.counted("gates").unwrap() + 1);
+    assert_eq!(
+        rungs
+            .iter()
+            .rev()
+            .take_while(|rung| matches!(rung.get("solved"), Some(Json::Bool(false))))
+            .count(),
+        2,
+        "two failures in a row end it: not one, and not every rung down to the floor"
+    );
+    let standing: Vec<u32> = rungs
+        .iter()
+        .filter(|rung| matches!(rung.get("solved"), Some(Json::Bool(true))))
+        .map(|rung| rung.counted("gates").unwrap())
+        .collect();
+    assert_eq!(
+        smallest,
+        standing.iter().copied().min().unwrap(),
+        "the smallest is the smallest that solved anywhere on the ladder, hole or no hole"
+    );
     assert!(
         held.get("best_attempt").is_none(),
         "a ladder that solved something answers with the circuit, not with what it reached"
@@ -633,4 +653,48 @@ fn the_machine_tool_says_what_solved_does_not_cover() {
         .and_then(Json::text)
         .unwrap();
     assert!(steps.contains("longer runs"), "{steps}");
+}
+
+#[test]
+fn the_ladder_steps_over_a_budget_that_fails_to_reach_one_below_it_that_does_not() {
+    let Some(host) =
+        device("the_ladder_steps_over_a_budget_that_fails_to_reach_one_below_it_that_does_not")
+    else {
+        return;
+    };
+    let table: Vec<String> = (0..32_u32)
+        .map(|row| row.count_ones().to_string())
+        .collect();
+    let arguments = format!(
+        "{{\"inputs\":5,\"outputs\":3,\"gates\":14,\"table\":[{}],\"crowd\":65536,\"rounds\":4000}}",
+        table.join(",")
+    );
+    let held = structured(&call(Some(&host), "grit_least", &arguments));
+    for rung in held.get("ladder").and_then(Json::list).unwrap() {
+        eprintln!(
+            "{:>3} gates: solved {:?}, {:?} of {:?}",
+            rung.counted("gates").unwrap(),
+            matches!(rung.get("solved"), Some(Json::Bool(true))),
+            rung.counted("marks").unwrap(),
+            rung.counted("of").unwrap()
+        );
+    }
+    assert_eq!(
+        held.counted("smallest_that_solved"),
+        Some(11),
+        "popcount of five is not found at twelve gates and is found at eleven, so a ladder that stops at the first failure answers thirteen: {}",
+        written(&held)
+    );
+    let twelve = held
+        .get("ladder")
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .find(|rung| rung.counted("gates") == Some(12))
+        .unwrap();
+    assert_eq!(
+        twelve.get("solved"),
+        Some(&Json::Bool(false)),
+        "the hole is on the ladder for the caller to see"
+    );
 }
