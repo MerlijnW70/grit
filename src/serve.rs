@@ -1124,6 +1124,12 @@ fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>>
         let gap = apart(&ended, &want);
         let (_, walked) = board.carry(&cells, &pushed(&ended, &want))?;
         let (down_turning, down_swing, over) = board.told_parts()?;
+        // Read before the push: the round that just walked has to be compared
+        // with the one before it, and after the push the last entry is itself.
+        let before = trail
+            .last()
+            .and_then(|one: &Json| one.get("apart"))
+            .and_then(Json::int);
         trail.push(map(vec![
             ("turning", counted(turning)),
             ("swing", counted(swing)),
@@ -1133,12 +1139,7 @@ fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>>
             ("over", Json::Int(over)),
         ]));
         let _ = walked;
-        if trail
-            .last()
-            .and_then(|one| one.get("apart"))
-            .and_then(Json::int)
-            .is_some_and(|held| held == gap)
-        {
+        if before.is_some_and(|held| held == gap) {
             unmoved += 1;
         }
         let (from_turning, from_swing, downhill) =

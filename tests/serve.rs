@@ -922,8 +922,10 @@ fn a_parameter_with_no_purchase_is_counted_rather_than_mistaken_for_an_answer() 
     };
     // At small cell values the distance does not move at all across a wide
     // stretch of turning: the parameter has no grip there. That reads exactly
-    // like having arrived, so it is counted and said rather than left to look
-    // like success. Measured: forty unit steps of turning, every one flat.
+    // like having arrived, so it is said rather than left to look like success.
+    // Measured: the distance is 1101 at turning 12, 20, 30 and 40, at swing 0,
+    // 2, 3, 5 and 8, and at depth 6, 8 and 10. Nothing the walk can move moves
+    // it, so the first round has nowhere to step and the walk says it stalled.
     let start = "[{\"at\":528,\"is\":600},{\"at\":529,\"is\":500}]";
     let answer = structured(&call(
         Some(&host),
@@ -932,9 +934,23 @@ fn a_parameter_with_no_purchase_is_counted_rather_than_mistaken_for_an_answer() 
             "{{\"wide\":32,\"deep\":32,\"depth\":6,\"turning\":20,\"rounds\":8,\"step\":4,\"fill\":0,\"cells\":{start},\"want\":[{{\"at\":528,\"is\":1}}]}}"
         ),
     ));
-    assert!(
-        answer.counted("unmoved").unwrap_or(0) > 0,
+    assert_eq!(
+        answer.get("stalled"),
+        Some(&Json::Bool(true)),
         "moving the parameters changed nothing, and the answer has to say so"
+    );
+    assert_eq!(
+        answer.get("closed"),
+        Some(&Json::Bool(false)),
+        "no grip is not arrival and must not read like it"
+    );
+    let trail = answer.get("trail").and_then(Json::list).unwrap();
+    assert_eq!(trail.len(), 1, "there was nowhere to step from the start");
+    assert_eq!(trail[0].counted("turning"), Some(20), "it never left");
+    assert_eq!(
+        answer.counted("unmoved"),
+        Some(0),
+        "one round holds no step between rounds to have stood still across"
     );
 }
 
@@ -1230,6 +1246,11 @@ fn a_walk_that_still_has_rounds_left_has_not_stalled() {
         Some(3),
         "a round that went the wrong way tries the other way before giving up any step"
     );
+    assert_eq!(
+        held.counted("unmoved"),
+        Some(5),
+        "this walk never shifts the distance at all, so every one of the five steps between its six rounds stood still"
+    );
     assert_eq!(held.get("checked_on_the_host"), Some(&Json::Bool(true)));
 }
 
@@ -1303,4 +1324,35 @@ fn the_last_cell_of_the_grid_is_inside_it_and_the_one_after_is_not() {
         .and_then(Json::text)
         .unwrap();
     assert!(said.contains("256"), "{said}");
+}
+
+#[test]
+fn a_round_counts_as_unmoved_only_when_the_distance_stayed_where_it_was() {
+    let Some(host) = device("a_round_counts_as_unmoved_only_when_the_distance_stayed_where_it_was")
+    else {
+        return;
+    };
+    let held = structured(&call(
+        Some(&host),
+        "grit_settle",
+        "{\"wide\":16,\"deep\":16,\"kind\":\"bound\",\"depth\":5,\"rounds\":8,\"turning\":8,\"swing\":2,\"step\":2,\"fill\":3,\"cells\":[{\"at\":34,\"is\":7},{\"at\":51,\"is\":2}],\"want\":[{\"at\":51,\"is\":9},{\"at\":67,\"is\":5},{\"at\":83,\"is\":12}]}",
+    ));
+    let gaps: Vec<i64> = held
+        .get("trail")
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .map(|one| one.get("apart").and_then(Json::int).unwrap())
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![759, 1292, 759, 759, 759],
+        "this walk goes off, comes back, and then sits still: {}",
+        written(&held)
+    );
+    assert_eq!(
+        held.counted("unmoved"),
+        Some(2),
+        "five rounds hold four steps between them, and two of those four left the distance where it was; a counter that says five is counting rounds rather than stillness"
+    );
 }
