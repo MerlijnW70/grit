@@ -106,7 +106,7 @@ jobs:
           LP_NATIVE_VECTOR_WIDTH: ${{ matrix.vector }}
         run: |
           set -o pipefail
-          cargo test --release --no-default-features --no-fail-fast -- --nocapture \
+          cargo test --release --no-default-features --features deep --no-fail-fast -- --nocapture \
             2>&1 | tee "$RUNNER_TEMP/suite.log"
           skipped=$(grep -o 'SKIPPED ' "$RUNNER_TEMP/suite.log" | wc -l)
           echo "$skipped ${{ matrix.skips }}"

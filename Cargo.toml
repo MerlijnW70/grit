@@ -21,6 +21,7 @@ ash = "0.38"
 [features]
 default = ["window"]
 window = ["dep:minifb"]
+deep = []
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -53,3 +54,7 @@ required-features = ["window"]
 [[bin]]
 name = "grit-mcp"
 path = "src/bin/grit-mcp.rs"
+
+[[test]]
+name = "descending"
+required-features = ["deep"]
