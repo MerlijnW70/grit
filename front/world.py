@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from typesafe_sdk import Choice, TypeSafeAPIError, TypeSafeClient
+    from typesafe_sdk import Choice, Noul, TypeSafeAPIError, TypeSafeClient
 except ImportError:
     sys.exit("typesafe-sdk is not installed: pip install typesafe-sdk")
 
@@ -169,6 +169,50 @@ SAID = {
                 "layer rather than a column",
     "clumps": "how many separate heaps it settled into, with empty floor between",
 }
+
+
+def read_rule_apart(client, wanted: str, model=None) -> tuple[str, float]:
+    """The same rule, asked as what it is about and which way it wants it.
+
+    This was tried because a negation lands on the way rather than on the what:
+    "sand that has not gathered into a single heap" answers the fewest heaps,
+    reading past the "not". Asking the way on its own should leave it nothing
+    else to attend to.
+
+    It does not work, and the measurement is left here so nobody tries it twice.
+    Over the awkward set it scores six of eight against the single question's
+    seven, and it is less sure of everything. The error moves rather than going:
+    the same negation comes back with the right way and the wrong thing - asked
+    only what the sentence is about, "has not gathered into a single heap" reads
+    as being about sand - and "not sand at all" goes from right to wrong outright.
+
+    Which is to say the what and the way are not two questions. The eighteen
+    options carry a reading of the sentence that neither half holds alone.
+
+    Both halves go in one request even so.
+    """
+    answer = client.system_one(
+        state={"wanted": wanted},
+        questions={
+            "about": Choice(
+                instructions=("`wanted` describes a room of settled sand or water. "
+                              "Which one of these counted things is it about?"),
+                criteria={name: told for name, told in SAID.items()},
+            ),
+            "least": Noul(instructions=(
+                "`wanted` asks for the room with the LEAST of whatever it is about, "
+                "not the most. Read any negation in it carefully: a sentence saying "
+                "something has not happened, or is not the case, is often asking for "
+                "more of the opposite rather than less of what it names."
+            )),
+        },
+        model=model,
+    )
+    about = answer.choices["about"]
+    least = answer.nouls["least"].noul
+    way = "min" if least > 0.5 else "max"
+    # Sure of both halves, which is the weaker of the two.
+    return f"{way} {about.choice}", min(about.confidence, abs(least - 0.5) * 2)
 
 
 def read_rule(client, wanted: str, model=None) -> tuple[str, float]:
@@ -408,7 +452,8 @@ def marked(tried: list[Poured], args) -> int:
                 right += by_scene == wants
                 continue
             if args.how == "rule":
-                told_rule, sure = read_rule(client, wanted, args.model)
+                reader = read_rule_apart if args.apart else read_rule
+                told_rule, sure = reader(client, wanted, args.model)
                 try:
                     kept = picked(told_rule, tried)
                 except SystemExit:
@@ -467,6 +512,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="what the settled room should be like, in plain English")
     parser.add_argument("--cases", help="JSON file of your own descriptions and the "
                                         "rule each is marked against")
+    parser.add_argument("--apart", action="store_true",
+                        help="ask what the sentence is about and which way it wants "
+                             "it as two questions instead of one")
     parser.add_argument("--how", default="scene", choices=["scene", "rule", "both"],
                         help="scene asks which room the sentence means; rule asks "
                              "which counted thing it is about and lets code do the "
