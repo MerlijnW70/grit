@@ -75,12 +75,11 @@ NARROW_MARGIN = 0.15
 # So it sits between three and twelve, which is a thinner gap than the one that
 # first showed up and is the one the measurements actually support.
 #
-# And it is only trustworthy for a spec asked whole. There it is nine of nine.
-# On a staged spec it is not: the staged adder answers between twelve and
-# fifteen hundredths from the middle from one run to the next and is exact in
-# some of those runs and not others, so thinness and wrongness stop tracking
-# each other. Staging trades a table that is confidently wrong for one that is
-# unsurely right, and this guard cannot tell the second from a third thing.
+# The caveat that stood here - that a staged spec sits inside the gap and is
+# right anyway - was true of a staged spec that asked all its outputs at once.
+# Asking each one on its own moved the adder from twelve hundredths to thirty
+# three, above where clean tables asked whole sit, and made it exact in four
+# runs of four. The exception went away rather than being worked around.
 THIN_TABLE = 0.06
 
 # An output that reads three of six inputs needs eight rows asked, not sixty
@@ -462,29 +461,45 @@ def staged(client: TypeSafeClient, rule: str, inputs: list[str], outputs: list[s
             if key in cases[out]:
                 continue
             cases[out][key] = len(cases[out])
+    # One request an output, naming only that output. The cases it asks are the
+    # same either way; what changes is what else is in view. Measured on the
+    # middle sum bit of an adder, the same eight cases asked with all three
+    # outputs named close to twenty five hundredths of the middle and asked with
+    # only their own named close to thirty seven. Thin answers are what a rerun
+    # crosses, so the room is the point.
+    asked_per: dict[str, dict] = {}
     for out in outputs:
         held_back = [name for name in known if name not in reads[out]]
         for key, n in cases[out].items():
             here = ", ".join(f"{name}={bit}" for name, bit in zip(reads[out], key))
-            questions[f"v{out}_{n}"] = Noul(instructions=(
+            asked_per.setdefault(out, {})[f"v{out}_{n}"] = Noul(instructions=(
                 f"For the rule in `rule`, with {here}, the output bit `{out}` is 1."
                 + (f" The other values, {', '.join(held_back)}, do not matter to "
                    f"`{out}`." if held_back else "")
             ))
-            questions[f"u{out}_{n}"] = _undecided_question(out, here)
-    answers = client.system_one(
-        state={"rule": rule, "inputs": known, "outputs": outputs,
-               "worked_out_first": [one["via"] for one in worked]},
-        questions=questions, model=model)
+            asked_per[out][f"u{out}_{n}"] = _undecided_question(out, here)
+    held_answers = {}
+    whole = 0.0
+    for out in outputs:
+        asked = dict(asked_per.get(out, {}))
+        if not held_answers:
+            asked["whole"] = questions["whole"]
+        answers = client.system_one(
+            state={"rule": rule, "inputs": reads[out], "outputs": [out],
+                   "worked_out_first": [one["via"] for one in worked]},
+            questions=asked, model=model)
+        if "whole" in asked:
+            whole = answers.nouls["whole"].noul
+        held_answers.update({key: answers.nouls[key].noul for key in asked_per.get(out, {})})
     for row in rows:
         held = carried[row.index]
         for out in outputs:
             n = cases[out][tuple(held[name] for name in reads[out])]
-            p = answers.nouls[f"v{out}_{n}"].noul
+            p = held_answers[f"v{out}_{n}"]
             row.probs[out] = p
             row.outs[out] = 1 if p > 0.5 else 0
-            row.undecided[out] = answers.nouls[f"u{out}_{n}"].noul
-    return rows, answers.nouls["whole"].noul, worked
+            row.undecided[out] = held_answers[f"u{out}_{n}"]
+    return rows, whole, worked
 
 def grit(tool: str, arguments: dict, binary: str | list[str], timeout: int = 900) -> dict:
     """Speak MCP to grit over stdio. Its answer is the authority on circuits."""
