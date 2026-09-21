@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::Host;
-use grit::serve::handle;
+use grit::serve::{handle, seeded};
 use grit::wire::{Json, read, written};
 
 fn device(label: &str) -> Option<Host> {
@@ -137,7 +137,7 @@ fn synthesising_an_adder_returns_a_circuit_the_host_marked_itself() {
 fn counting(steps: u32) -> String {
     let mut runs = Vec::new();
     for seed in 0..4_u32 {
-        let mut state = (seed * 2_654_435_761) | 1;
+        let mut state = seed.wrapping_mul(2_654_435_761) | 1;
         let mut count = 0_u32;
         let mut feed = Vec::new();
         let mut want = Vec::new();
@@ -297,6 +297,14 @@ fn the_ladder_walks_the_budget_down_and_stops_where_it_cannot() {
         assert_eq!(rung.get("solved"), Some(&Json::Bool(true)));
     }
     assert_eq!(smallest, last.counted("gates").unwrap() + 1);
+    assert!(
+        held.get("best_attempt").is_none(),
+        "a ladder that solved something answers with the circuit, not with what it reached"
+    );
+    assert!(
+        held.get("nothing_solved").is_none(),
+        "nothing to explain when a budget did solve"
+    );
     let circuit = held.get("circuit").unwrap();
     assert_eq!(circuit.get("solved"), Some(&Json::Bool(true)));
     assert_eq!(
@@ -329,5 +337,108 @@ fn a_budget_that_cannot_hold_it_comes_back_as_evidence_rather_than_a_guess() {
             .and_then(Json::list)
             .unwrap()
             .is_empty()
+    );
+}
+
+fn tool(named: &str) -> Json {
+    let asked = read("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}").unwrap();
+    let answer = handle(None, &asked).unwrap();
+    answer
+        .get("result")
+        .and_then(|one| one.get("tools"))
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .find(|one| one.get("name").and_then(Json::text) == Some(named))
+        .cloned()
+        .unwrap()
+}
+
+#[test]
+fn the_machine_tool_says_it_can_mark_a_chip_it_is_handed() {
+    let held = tool("grit_machine");
+    let properties = held
+        .get("inputSchema")
+        .and_then(|one| one.get("properties"))
+        .unwrap();
+    assert!(
+        properties.get("chip").is_some(),
+        "a machine can be marked rather than searched, so the schema must offer it: {}",
+        written(&held)
+    );
+    let said = held.get("description").and_then(Json::text).unwrap();
+    assert!(said.contains("chip"), "{said}");
+}
+
+#[test]
+fn a_budget_refused_before_any_search_says_what_is_wrong_in_words() {
+    let answer = call(
+        None,
+        "grit_synthesise",
+        "{\"inputs\":2,\"outputs\":1,\"gates\":0,\"table\":[0,1,1,0]}",
+    );
+    let result = answer.get("result").unwrap();
+    assert_eq!(result.get("isError"), Some(&Json::Bool(true)));
+    let said = result
+        .get("content")
+        .and_then(Json::list)
+        .unwrap()
+        .first()
+        .and_then(|one| one.get("text"))
+        .and_then(Json::text)
+        .unwrap();
+    eprintln!("{said}");
+    assert!(said.contains("outputs"), "{said}");
+    assert!(said.contains("gates"), "{said}");
+    assert!(
+        said.split_whitespace().count() > 4,
+        "a caller cannot act on bare numbers: {said}"
+    );
+}
+
+#[test]
+fn a_ladder_that_solves_nothing_still_hands_back_what_it_reached() {
+    let Some(host) = device("a_ladder_that_solves_nothing_still_hands_back_what_it_reached") else {
+        return;
+    };
+    let arguments = format!(
+        "{{\"inputs\":4,\"outputs\":3,\"gates\":3,\"table\":[{}],\"crowd\":64,\"rounds\":1}}",
+        adder()
+    );
+    let held = structured(&call(Some(&host), "grit_least", &arguments));
+    eprintln!("{}", written(&held));
+    assert_eq!(held.get("smallest_that_solved"), Some(&Json::Null));
+    assert_eq!(held.get("circuit"), Some(&Json::Null));
+    let best = held.get("best_attempt").unwrap();
+    assert_eq!(
+        best.get("gates").and_then(Json::list).unwrap().len(),
+        3,
+        "the best it reached is still a circuit: {}",
+        written(best)
+    );
+    assert!(best.counted("marks").unwrap() < best.counted("of").unwrap());
+    assert_eq!(
+        best.counted("crowd"),
+        Some(64),
+        "what it reached says what it was spent: {}",
+        written(best)
+    );
+    assert_eq!(best.counted("rounds"), Some(1), "{}", written(best));
+    assert!(held.get("nothing_solved").and_then(Json::text).is_some());
+}
+
+#[test]
+fn every_candidate_starts_from_its_own_odd_seed() {
+    let seeds = seeded(64);
+    assert_eq!(seeds.len(), 64);
+    assert!(
+        seeds.iter().all(|one| one & 1 == 1),
+        "an even seed leaves the xorshift stuck at zero"
+    );
+    let apart: std::collections::BTreeSet<u32> = seeds.iter().copied().collect();
+    assert_eq!(
+        apart.len(),
+        64,
+        "two candidates on one seed search the same ground"
     );
 }

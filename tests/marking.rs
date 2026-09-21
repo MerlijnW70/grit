@@ -356,7 +356,9 @@ fn whether_the_crowd_climbs_without_the_host() {
     resident
         .write(BEST as usize, &vec![0_u32; CROWD as usize])
         .unwrap();
-    let seeds: Vec<u32> = (0..CROWD).map(|who| (who * 2_654_435_761) | 1).collect();
+    let seeds: Vec<u32> = (0..CROWD)
+        .map(|who| who.wrapping_mul(2_654_435_761) | 1)
+        .collect();
     resident.write(SEED as usize, &seeds).unwrap();
 
     let full = exam.marks();
@@ -440,7 +442,9 @@ fn how_wide_the_crowd_can_be_and_how_fast_it_climbs() {
                 .unwrap();
         }
         resident.write(WANTED as usize, &columns(&exam)).unwrap();
-        let seeds: Vec<u32> = (0..many).map(|who| (who * 2_654_435_761) | 1).collect();
+        let seeds: Vec<u32> = (0..many)
+            .map(|who| who.wrapping_mul(2_654_435_761) | 1)
+            .collect();
         resident.write(SEED as usize, &seeds).unwrap();
 
         let over = Groups::Fixed(many.div_ceil(width));

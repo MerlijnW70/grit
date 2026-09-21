@@ -283,7 +283,9 @@ fn a_counter_that_holds_when_it_is_not_told_to_count_is_found_by_searching() {
     }
     resident.write(WANTED as usize, &want).unwrap();
     resident.write(FEED as usize, &feed).unwrap();
-    let seeds: Vec<u32> = (0..many).map(|who| (who * 2_654_435_761) | 1).collect();
+    let seeds: Vec<u32> = (0..many)
+        .map(|who| who.wrapping_mul(2_654_435_761) | 1)
+        .collect();
     resident.write(SEED as usize, &seeds).unwrap();
 
     let over = Groups::Fixed(many.div_ceil(width));

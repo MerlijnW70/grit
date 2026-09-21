@@ -295,15 +295,30 @@ fn what_they_say_when_they_are_printed() {
         names: 12,
         below: 12,
     };
-    assert_eq!(ahead.to_string(), "1 12 12");
-    assert_eq!(Fault::NoSuchKind { kind: 9, kinds: 4 }.to_string(), "9 4");
+    assert_eq!(
+        ahead.to_string(),
+        "the right input names source 12, which is not below 12; a gate may only read an input or a gate before it"
+    );
+    assert_eq!(
+        Fault::Ahead {
+            side: 0,
+            names: 12,
+            below: 12
+        }
+        .to_string(),
+        "the left input names source 12, which is not below 12; a gate may only read an input or a gate before it"
+    );
+    assert_eq!(
+        Fault::NoSuchKind { kind: 9, kinds: 4 }.to_string(),
+        "kind 9 is not one of the 4 kinds in the kit, which are numbered 0 to 3"
+    );
     assert_eq!(
         TooWide::Outputs {
             outputs: 9,
             gates: 8
         }
         .to_string(),
-        "9 8"
+        "9 outputs asked of a circuit holding 8 gates; every output is a gate, so gates must be at least outputs"
     );
 }
 
@@ -472,7 +487,7 @@ fn what_a_refused_table_says() {
             wanted: 32
         }
         .to_string(),
-        "16 32"
+        "the table holds 16 rows, but this many inputs needs exactly 32; one row for every combination of the inputs"
     );
     assert_eq!(
         NotAnExam::Stray {
@@ -481,7 +496,7 @@ fn what_a_refused_table_says() {
             outputs: 1
         }
         .to_string(),
-        "9 0x2 1"
+        "row 9 is 0x2, which sets a bit that no output holds; with 1 outputs a row may only name bits 0 to 0"
     );
 }
 
@@ -722,7 +737,7 @@ fn what_a_refused_chip_says() {
             wanted: 4
         }
         .to_string(),
-        "3 4"
+        "the chip holds 3 gates, but 4 were asked for"
     );
     assert_eq!(
         NotAChip::NoSuchGate {
@@ -731,7 +746,7 @@ fn what_a_refused_chip_says() {
             gates: 4
         }
         .to_string(),
-        "0 4 4"
+        "output 0 names gate 4, but the chip holds 4 gates, numbered 0 to 3"
     );
     assert_eq!(
         NotAChip::Gate {
@@ -739,7 +754,15 @@ fn what_a_refused_chip_says() {
             fault: Fault::NoSuchKind { kind: 9, kinds: 4 }
         }
         .to_string(),
-        "1 9 4"
+        "gate 1 is not legal: kind 9 is not one of the 4 kinds in the kit, which are numbered 0 to 3"
+    );
+    assert_eq!(
+        NotAChip::Outputs {
+            given: 1,
+            wanted: 2
+        }
+        .to_string(),
+        "1 gates are named as outputs, but 2 were asked for"
     );
 }
 

@@ -59,6 +59,13 @@ fn crowd_of(shape: Netlist, seed: u32, many: u32) -> Vec<u32> {
         .collect()
 }
 
+#[must_use]
+pub fn seeded(many: u32) -> Vec<u32> {
+    (0..many)
+        .map(|who| who.wrapping_mul(2_654_435_761) | 1)
+        .collect()
+}
+
 fn room(shape: Netlist, many: u32) -> [usize; BINDINGS as usize] {
     let wide = words_of(shape);
     [
@@ -123,7 +130,7 @@ pub fn sought(
         resident.write(binding as usize, &vec![0_u32; held])?;
     }
     resident.write(WANTED as usize, &columns(exam))?;
-    let seeds: Vec<u32> = (0..many).map(|who| (who * 2_654_435_761) | 1).collect();
+    let seeds = seeded(many);
     resident.write(SEED as usize, &seeds)?;
 
     let over = Groups::Fixed(many.div_ceil(width));
@@ -310,7 +317,7 @@ pub fn machined(
     if !feed.is_empty() {
         resident.write(FEED as usize, &feed)?;
     }
-    let seeds: Vec<u32> = (0..many).map(|who| (who * 2_654_435_761) | 1).collect();
+    let seeds = seeded(many);
     resident.write(SEED as usize, &seeds)?;
 
     let over = Groups::Fixed(many.div_ceil(width));
@@ -428,7 +435,12 @@ fn tools() -> Json {
     ]);
     let counting = |what: &str| map(vec![("type", text("integer")), ("description", text(what))]);
     let shape = vec![
-        ("inputs", counting("how many inputs, at most five")),
+        (
+            "inputs",
+            counting(
+                "how many inputs; the table grows as two to this power, so every added input doubles the rows to mark",
+            ),
+        ),
         ("outputs", counting("how many outputs")),
         ("gates", counting("how many two-input gates it may use")),
         ("table", table),
@@ -516,6 +528,18 @@ fn tools() -> Json {
         ("traces", trace),
         ("crowd", counting("how many candidates to search with")),
         ("rounds", counting("how many generations to allow")),
+        (
+            "chip",
+            map(vec![
+                ("type", text("array")),
+                (
+                    "description",
+                    text(
+                        "the gates of a machine to mark, each an object of kind, left and right; give this and nothing is searched, the machine is only run on the traces and marked, which is how a machine found on one set of runs is tried on runs it has never seen",
+                    ),
+                ),
+            ]),
+        ),
     ];
     Json::List(vec![
         map(vec![
@@ -523,7 +547,7 @@ fn tools() -> Json {
             (
                 "description",
                 text(
-                    "Search for a synchronous machine, a circuit with state, that answers every run it is given. A run is a feed of input words and the output words wanted at each step; the machine starts from a state of all zeros. Returns the gates, what the best machine says on each run, and which step of which run it gets wrong, all marked on the host.",
+                    "Search for a synchronous machine, a circuit with state, that answers every run it is given. A run is a feed of input words and the output words wanted at each step; the machine starts from a state of all zeros. Returns the gates, what the best machine says on each run, and which step of which run it gets wrong, all marked on the host. Pass chip to mark a machine you already hold instead of searching for one.",
                 ),
             ),
             (
@@ -748,7 +772,7 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
                 .filter(|rung| rung.found.marks >= rung.found.full)
                 .min_by_key(|rung| rung.gates)
                 .map_or(Json::Null, |rung| told(&rung.found, true));
-            Ok(map(vec![
+            let mut held = vec![
                 ("smallest_that_solved", smallest.map_or(Json::Null, counted)),
                 ("ladder", ladder),
                 ("circuit", best),
@@ -760,7 +784,19 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
                         "means not found within these rounds and this crowd, not that none exists",
                     ),
                 ),
-            ]))
+            ];
+            if smallest.is_none() {
+                if let Some(rung) = rungs.iter().max_by_key(|rung| rung.found.marks) {
+                    held.push(("best_attempt", told(&rung.found, true)));
+                }
+                held.push((
+                    "nothing_solved",
+                    text(
+                        "the ladder stops at the first budget that does not solve, so a first rung that fails ends it at once and leaves no circuit; start the ladder from more gates, or raise crowd, and ask again",
+                    ),
+                ));
+            }
+            Ok(map(held))
         }
         other => Err(Box::new(crate::netlist::TooWide::Kinds {
             kinds: other.len() as u32,

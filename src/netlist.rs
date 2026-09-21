@@ -42,9 +42,17 @@ pub enum Fault {
 impl fmt::Display for Fault {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ahead { side, names, below } => write!(out, "{side} {names} {below}"),
+            Self::Ahead { side, names, below } => write!(
+                out,
+                "the {} input names source {names}, which is not below {below}; a gate may only read an input or a gate before it",
+                if *side == 0 { "left" } else { "right" }
+            ),
             Self::NoSuchKind { kind, kinds } => {
-                write!(out, "{kind} {kinds}")
+                write!(
+                    out,
+                    "kind {kind} is not one of the {kinds} kinds in the kit, which are numbered 0 to {}",
+                    kinds.saturating_sub(1)
+                )
             }
         }
     }
@@ -62,10 +70,19 @@ pub enum TooWide {
 impl fmt::Display for TooWide {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sources { sources, limit } => write!(out, "{sources} {SOURCE_BITS} {limit}"),
-            Self::Kinds { kinds, limit } => write!(out, "{kinds} {KIND_BITS} {limit}"),
+            Self::Sources { sources, limit } => write!(
+                out,
+                "inputs plus gates is {sources}, over the {limit} a {SOURCE_BITS} bit source field can name"
+            ),
+            Self::Kinds { kinds, limit } => write!(
+                out,
+                "{kinds} gate kinds asked for, over the {limit} a {KIND_BITS} bit kind field can name"
+            ),
             Self::Outputs { outputs, gates } => {
-                write!(out, "{outputs} {gates}")
+                write!(
+                    out,
+                    "{outputs} outputs asked of a circuit holding {gates} gates; every output is a gate, so gates must be at least outputs"
+                )
             }
         }
     }
@@ -217,13 +234,20 @@ impl fmt::Display for NotAnExam {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rows { given, wanted } => {
-                write!(out, "{given} {wanted}")
+                write!(
+                    out,
+                    "the table holds {given} rows, but this many inputs needs exactly {wanted}; one row for every combination of the inputs"
+                )
             }
             Self::Stray {
                 row,
                 holds,
                 outputs,
-            } => write!(out, "{row} {holds:#x} {outputs}"),
+            } => write!(
+                out,
+                "row {row} is {holds:#x}, which sets a bit that no output holds; with {outputs} outputs a row may only name bits 0 to {}",
+                outputs.saturating_sub(1)
+            ),
         }
     }
 }
@@ -306,17 +330,27 @@ impl fmt::Display for NotAChip {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Gates { given, wanted } => {
-                write!(out, "{given} {wanted}")
+                write!(
+                    out,
+                    "the chip holds {given} gates, but {wanted} were asked for"
+                )
             }
-            Self::Gate { at, fault } => write!(out, "{at} {fault}"),
+            Self::Gate { at, fault } => write!(out, "gate {at} is not legal: {fault}"),
             Self::Outputs { given, wanted } => {
-                write!(out, "{given} {wanted}")
+                write!(
+                    out,
+                    "{given} gates are named as outputs, but {wanted} were asked for"
+                )
             }
             Self::NoSuchGate {
                 output,
                 names,
                 gates,
-            } => write!(out, "{output} {names} {gates}"),
+            } => write!(
+                out,
+                "output {output} names gate {names}, but the chip holds {gates} gates, numbered 0 to {}",
+                gates.saturating_sub(1)
+            ),
         }
     }
 }
