@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     from typesafe_sdk import Choice, TypeSafeAPIError, TypeSafeClient
@@ -58,24 +59,63 @@ SCENES: list[tuple[str, dict]] = [
       "brush": {"at": 16 * 128 + 64, "is": "water", "span": 97, "frames": 250}}),
 ]
 
-# Descriptions whose answer is arithmetic over what was counted, so the judging
-# can be marked rather than admired. The rule picks the scene, never the model.
-CHECKS: list[tuple[str, object]] = [
-    ("the sand lying flat, in as few rows as it can",
-     lambda held: min(range(len(held)), key=lambda n: held[n].tall)),
-    ("the tallest, narrowest column of sand",
-     lambda held: max(range(len(held)),
-                      key=lambda n: held[n].tall / max(held[n].widest, 1))),
-    ("the room with the most settled in it",
-     lambda held: max(range(len(held)), key=lambda n: held[n].standing)),
-    ("the widest spread across the room",
-     lambda held: max(range(len(held)), key=lambda n: held[n].widest)),
-    ("water rather than sand",
-     lambda held: max(range(len(held)),
-                      key=lambda n: held[n].tally.get("water", 0))),
-    ("barely anything settled at all",
-     lambda held: min(range(len(held)), key=lambda n: held[n].standing)),
+# What a description can be marked against. Every one of these is arithmetic
+# over what grit counted, so the mark is on the judging and never on the pour.
+# They are proxies, and naming them out loud matters: the one disagreement this
+# suite has ever found was the proxy losing an argument with the sentence, not
+# the model getting it wrong.
+MEASURED = {
+    "rows": lambda one: one.tall,
+    "widest": lambda one: one.widest,
+    "settled": lambda one: one.standing,
+    "water": lambda one: one.tally.get("water", 0),
+    "sand": lambda one: one.tally.get("sand", 0),
+    "listed": lambda one: one.listed,
+    # Tall against wide, for the descriptions that are about the shape rather
+    # than about any one side of it.
+    "slenderness": lambda one: one.tall / max(one.widest, 1),
+    "flatness": lambda one: one.widest / max(one.tall, 1),
+}
+
+CHECKS: list[tuple[str, str]] = [
+    ("the sand lying flat, in as few rows as it can", "min rows"),
+    ("the tallest, narrowest column of sand", "max slenderness"),
+    ("the room with the most settled in it", "max settled"),
+    ("the widest spread across the room", "max flatness"),
+    ("water rather than sand", "max water"),
+    ("barely anything settled at all", "min settled"),
 ]
+
+
+def picked(rule: str, held: list) -> int:
+    """Work out which scene a description means, from what was counted.
+
+    Every measurable named here is also spelled out in the question the model
+    is asked, and that is not a coincidence to be kept by hand: a rule marking
+    on something the question never says is unanswerable rather than hard.
+    """
+    way, _, name = rule.partition(" ")
+    measure = MEASURED.get(name)
+    if measure is None or way not in ("min", "max"):
+        raise SystemExit(
+            f"{rule!r} is not a rule: say min or max, then one of "
+            + ", ".join(sorted(MEASURED))
+        )
+    chosen = min if way == "min" else max
+    return chosen(range(len(held)), key=lambda n: measure(held[n]))
+
+
+def load_checks(path: str) -> list[tuple[str, str]]:
+    """Your descriptions instead of mine.
+
+    Six descriptions invented by whoever wrote the tool, marked against proxies
+    the same person chose, is enough to find a wrong primitive - it did - and
+    not enough to put a number on. Bring your own:
+
+    {"checks": [{"wanted": "a flat sheet of water", "pick": "min rows"}]}
+    """
+    held = json.loads(Path(path).read_text(encoding="utf-8"))
+    return [(one["wanted"], one["pick"]) for one in held["checks"]]
 
 
 @dataclass
@@ -119,10 +159,14 @@ def pour(binary, scene: str, arguments: dict) -> Poured:
 
 def told(one: "Poured") -> str:
     """What was counted, said the same way for every scene."""
+    # Everything a description can be marked against has to be in here.
+    # A check once marked on how much work the engine did while the question
+    # never mentioned it, which is not a hard question but an unanswerable one.
     return (f"{one.tally.get('water', 0)} cells of water and "
             f"{one.tally.get('sand', 0)} of sand settled; the widest row holds "
-            f"{one.widest} cells; they lie across {one.tall} rows; the skyline "
-            f"from the top down reads {one.shape()}")
+            f"{one.widest} cells; they lie across {one.tall} rows; the engine "
+            f"stepped {one.listed} quads on an average frame; the skyline from "
+            f"the top down reads {one.shape()}")
 
 
 def judge(client, wanted: str, poured: list["Poured"], model=None) -> dict[int, float]:
@@ -176,24 +220,27 @@ def marked(tried: list[Poured], args) -> int:
     print("  before it can be asked about, and the first one here did not.")
     print()
 
+    checks = load_checks(args.cases) if args.cases else CHECKS
     right = 0
     with TypeSafeClient() as client:
-        for wanted, chooser in CHECKS:
+        for wanted, chooser in checks:
             says = judge(client, wanted, tried, args.model)
             kept = max(range(len(tried)), key=lambda n: says[n])
-            wants = chooser(tried)
+            wants = picked(chooser, tried)
             hit = kept == wants
             right += hit
             rest = [says[n] for n in range(len(tried)) if n != kept]
             margin = says[kept] - max(rest, default=0.0)
             print(f"  {'ok  ' if hit else 'MISS'} {says[kept]:.2f} "
-                  f"(next {margin:+.2f})  {wanted}")
+                  f"(next {margin:+.2f})  {wanted}   [{chooser}]")
             if not hit:
                 print(f"         kept   {tried[kept].scene}")
                 print(f"         wanted {tried[wants].scene}")
     print()
-    print(f"{right}/{len(CHECKS)} descriptions matched the scene the arithmetic picks.")
-    return 0 if right == len(CHECKS) else 1
+    print(f"{right}/{len(checks)} descriptions matched the scene its rule picks.")
+    print("Those rules are proxies, named beside each line. Where one loses an "
+          "argument with a sentence the mark belongs on the proxy.")
+    return 0 if right == len(checks) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -201,6 +248,8 @@ def main(argv: list[str] | None = None) -> int:
         prog="world", description="Pour a room several ways and keep the one that was meant.")
     parser.add_argument("wanted", nargs="?", default="",
                         help="what the settled room should be like, in plain English")
+    parser.add_argument("--cases", help="JSON file of your own descriptions and the "
+                                        "rule each is marked against")
     parser.add_argument("--check", action="store_true",
                         help="run the descriptions whose answer is arithmetic over what "
                              "was counted, and mark the judging against them")
