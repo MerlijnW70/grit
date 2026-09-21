@@ -271,9 +271,17 @@ def _read_pruned(client, rule, inputs, outputs, rows, relevance, model):
         for r in range(2 ** len(kept[out])):
             case = {name: (r >> i) & 1 for i, name in enumerate(kept[out])}
             seen = ", ".join(f"{name}={bit}" for name, bit in case.items())
+            # Only say this when something was actually left out. Said while
+            # every input is named it is both false and harmful: measured on a
+            # two-bit adder, the two outputs that read all four inputs - where
+            # the cases asked are identical to the unpruned ones - went from one
+            # and five bits wrong to six and eight. The output that really does
+            # read two of four was perfect either way.
+            held_back = [name for name in inputs if name not in kept[out]]
             questions[f"v{out}_{r}"] = Noul(instructions=(
-                f"For the rule in `rule`, with {seen}, the output bit `{out}` is 1. "
-                "No other input matters to this output."
+                f"For the rule in `rule`, with {seen}, the output bit `{out}` is 1."
+                + (f" The other inputs, {', '.join(held_back)}, do not matter to "
+                   f"`{out}`." if held_back else "")
             ))
             questions[f"u{out}_{r}"] = Noul(instructions=(
                 "Read the rule in `rule` under the usual convention: it names the cases "
