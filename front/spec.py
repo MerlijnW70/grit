@@ -124,8 +124,19 @@ THROUGH_CEILING = 0.60
 
 
 def read_shape(client: TypeSafeClient, rule: str, inputs: list[str],
-               outputs: list[str], model: str | None = None) -> dict:
-    """Does this rule want the inputs read as a number and computed with?"""
+               outputs: list[str], model: str | None = None,
+               worked: list[str] | None = None) -> dict:
+    """Does this rule want the inputs read as a number and computed with?
+
+    `worked` names values that have already been worked out and handed over. The
+    in-between question has to know about them or it refuses the very thing it
+    asked for: a parity spec staged on its own exclusive-or was told that
+    deciding its output needs something found in between, while that something
+    was sitting in the inputs under the name the caller gave it.
+    """
+    worked = worked or []
+    given = (f" The values {', '.join(worked)} have already been worked out and "
+             "are given to you as inputs." if worked else "")
     answers = client.system_one(
         state={"rule": rule, "inputs": inputs, "outputs": outputs},
         model=model,
@@ -151,7 +162,7 @@ def read_shape(client: TypeSafeClient, rule: str, inputs: list[str],
                 "working out something that is not one of the inputs and is not the "
                 "answer either - a carry, a running count, an intermediate value that "
                 "has to be found before the answer can be. Reading the inputs and "
-                "combining them directly is not enough."
+                "combining them directly is not enough." + given
             )) for out in outputs},
         })
     return {"arithmetic": answers.nouls["arithmetic"].noul,
@@ -194,16 +205,29 @@ def _whole_question() -> Noul:
 
 
 def read_relevance(client: TypeSafeClient, rule: str, inputs: list[str],
-                   outputs: list[str], model: str | None = None) -> dict[tuple[str, str], float]:
-    """Which inputs each output actually reads."""
+                   outputs: list[str], model: str | None = None,
+                   known: list[str] | None = None) -> dict[tuple[str, str], float]:
+    """Which inputs each output actually reads.
+
+    With in-between values worked out, the question has to say so. A parity spec
+    staged on p, where p is a exclusive-or b, was keeping a and b for an output
+    that reads only p and c - and rightly, because a does change the answer,
+    through p. Once p is known it does not, and that is the question worth
+    asking. The check that puts values back cannot fix this: it only ever adds.
+    """
+    worked = [name for name in (known or []) if name not in inputs]
     questions = {}
     for name in inputs:
         for out in outputs:
             questions[f"rel_{name}_{out}"] = Noul(instructions=(
-                f"Under the rule in `rule`, the value of input `{name}` can change what "
+                (f"The values {', '.join(worked)} have already been worked out and are "
+                 f"known. Given them, under the rule in `rule`, " if worked
+                 else f"Under the rule in `rule`, ")
+                + f"the value of input `{name}` can change what "
                 f"output `{out}` should be. That is: there are two cases differing only "
-                f"in `{name}`, every other input the same, where the rule calls for a "
-                f"different `{out}`."
+                f"in `{name}`, with every other value including "
+                + (", ".join(worked) if worked else "every other input")
+                + f" the same, where the rule calls for a different `{out}`."
             ))
     answers = client.system_one(state={"rule": rule, "inputs": inputs,
                                        "outputs": outputs},
@@ -381,6 +405,30 @@ def _read_pruned(client, rule, inputs, outputs, rows, relevance, model):
     return rows, answers.nouls["whole"].noul
 
 
+def loosened(kept: list[str], reachable: list[dict[str, int]]) -> list[str]:
+    """Drop values that cannot tell two reachable cases apart, by arithmetic.
+
+    A value worked out from the inputs is tied to them: with p the exclusive-or
+    of a and b, no two cases differ in a alone, so asking whether a can change
+    the answer with p held still asks about a pair that does not exist. The
+    model reads it as true - a does change the answer, through p - and it is
+    right about the rule and answering a different question. No wording fixes
+    an unsatisfiable premise.
+
+    So it is not asked. A value can go when what is left still tells every
+    reachable case apart, which is decided here and is exact. It is careful
+    rather than clever: it never collapses two cases on the chance that they
+    agree, so it drops a or b and not both.
+    """
+    held = list(kept)
+    for name in list(kept):
+        rest = [one for one in held if one != name]
+        seen = {tuple(case[one] for one in rest) for case in reachable}
+        if len(seen) == len(reachable):
+            held = rest
+    return held
+
+
 def reachable_cases(client: TypeSafeClient, inputs: list[str],
                     vias: list[tuple[str, str]], model: str | None = None
                     ) -> list[dict[str, int]]:
@@ -472,6 +520,8 @@ def staged(client: TypeSafeClient, rule: str, inputs: list[str], outputs: list[s
             for r in range(2 ** len(inputs))]
     reads = {out: (relevant_inputs(relevance, out, known) if relevance is not None
                    else known) for out in outputs}
+    # Anything the arithmetic can drop for free goes before anything is asked.
+    reads = {out: loosened(one, carried) for out, one in reads.items()}
     cases: dict[str, dict[tuple, int]] = {out: {} for out in outputs}
     questions = {"whole": _whole_question()}
     for row in rows:
@@ -519,6 +569,11 @@ def staged(client: TypeSafeClient, rule: str, inputs: list[str], outputs: list[s
             row.probs[out] = p
             row.outs[out] = 1 if p > 0.5 else 0
             row.undecided[out] = held_answers[f"u{out}_{n}"]
+    # What each output was actually asked over, after everything that could be
+    # dropped was. Handed back so a caller reports what happened rather than
+    # working it out again a slightly different way.
+    for one in worked:
+        one["reads"] = {out: list(reads[out]) for out in outputs}
     return rows, whole, worked
 
 def grit(tool: str, arguments: dict, binary: str | list[str], timeout: int = 900) -> dict:
@@ -629,13 +684,21 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with TypeSafeClient() as client:
                 named = inputs + [name for name, _ in vias]
-                shape = read_shape(client, args.rule, named, outputs, args.model)
+                shape = read_shape(client, args.rule, named, outputs, args.model,
+                                   [name for name, _ in vias])
                 report["shape"] = {
                     k: ({one: round(held, 3) for one, held in v.items()}
                         if isinstance(v, dict) else round(v, 3))
                     for k, v in shape.items()}
+                # Not asked once in-between values have been named. The question
+                # is "you need one of these", and the answer is "I gave you one" -
+                # a spec staged on its own exclusive-or was refused for needing
+                # the very value sitting in its inputs under the name the caller
+                # chose. What the naming does not settle is whether each stage is
+                # sound, and whether enough of them were named; the first is now
+                # guarded stage by stage and the second shows up as a thin table.
                 through = [out for out, held in shape["through"].items()
-                           if held > THROUGH_CEILING]
+                           if held > THROUGH_CEILING] if not vias else []
                 if through and shape["arithmetic"] <= ARITHMETIC_CEILING                         and not args.force:
                     if args.json:
                         print(json.dumps({**report, "searched": False}, indent=2))
@@ -665,7 +728,8 @@ def main(argv: list[str] | None = None) -> int:
                     return 3
                 # With stages, relevance is read over the in-between values too,
                 # since an output may read one of those and not the inputs under it.
-                relevance = (read_relevance(client, args.rule, named, outputs, args.model)
+                relevance = (read_relevance(client, args.rule, named, outputs,
+                                            args.model, named if vias else None)
                              if args.prune else None)
                 if relevance is not None:
                     # With stages the named values are not free of each other,
