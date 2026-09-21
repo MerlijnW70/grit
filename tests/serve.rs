@@ -1031,7 +1031,11 @@ fn a_cell_that_landed_under_the_target_pulls_the_other_way_from_one_that_landed_
         ),
     ));
     let trail = answer.get("trail").and_then(Json::list).unwrap();
-    assert_eq!(trail.len(), 4, "the walk it makes when the signs are kept apart");
+    assert_eq!(
+        trail.len(),
+        4,
+        "the walk it makes when the signs are kept apart"
+    );
     assert_eq!(
         trail[2].counted("turning"),
         Some(8),

@@ -1,15 +1,15 @@
 use crate::board::seated;
+use crate::compact::Plan;
 use crate::host::Host;
+use crate::layout::{BRUSH, GRAND, PARAMS, STATE};
 use crate::machine::Machine;
 use crate::marking::{
     BEST, BINDINGS, FEED, HELD, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked, stepped,
     turned_on, words_of,
 };
 use crate::netlist::{Chip, Exam, Gate, Netlist, drawn};
-use crate::rule::{KNOB, Kind, POINT};
 use crate::resident::Groups;
-use crate::compact::Plan;
-use crate::layout::{BRUSH, GRAND, PARAMS, STATE};
+use crate::rule::{KNOB, Kind, POINT};
 use crate::sand::{AIR, Grid, SAND, WALL, WATER};
 use crate::sweep;
 use crate::wire::{Json, counted, map, text};
@@ -658,31 +658,124 @@ fn tools() -> Json {
                     (
                         "properties",
                         map(vec![
-                            ("wide", map(vec![("type", text("integer")), ("description", text("cells across; rounded up to a power of two"))])),
-                            ("deep", map(vec![("type", text("integer")), ("description", text("cells down; rounded up to a power of two"))])),
+                            (
+                                "wide",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("cells across; rounded up to a power of two"),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "deep",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("cells down; rounded up to a power of two"),
+                                    ),
+                                ]),
+                            ),
                             (
                                 "kind",
                                 map(vec![
                                     ("type", text("string")),
-                                    ("enum", Json::List(KINDS_NAMED.iter().map(|one| text(one)).collect())),
+                                    (
+                                        "enum",
+                                        Json::List(
+                                            KINDS_NAMED.iter().map(|one| text(one)).collect(),
+                                        ),
+                                    ),
                                     ("description", text("which rule the cells follow")),
                                 ]),
                             ),
-                            ("turning", map(vec![("type", text("integer")), ("description", text("the first rule parameter, the one the gradient calls turning"))])),
-                            ("swing", map(vec![("type", text("integer")), ("description", text("the second rule parameter"))])),
-                            ("depth", map(vec![("type", text("integer")), ("description", text("how many frames to walk"))])),
-                            ("at", map(vec![("type", text("integer")), ("description", text("the cell whose weight is carried back; the middle of the grid if left out"))])),
-                            ("fill", map(vec![("type", text("integer")), ("description", text("what every cell holds before the named ones are set"))])),
+                            (
+                                "turning",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text(
+                                            "the first rule parameter, the one the gradient calls turning",
+                                        ),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "swing",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    ("description", text("the second rule parameter")),
+                                ]),
+                            ),
+                            (
+                                "depth",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    ("description", text("how many frames to walk")),
+                                ]),
+                            ),
+                            (
+                                "at",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text(
+                                            "the cell whose weight is carried back; the middle of the grid if left out",
+                                        ),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "fill",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("what every cell holds before the named ones are set"),
+                                    ),
+                                ]),
+                            ),
                             (
                                 "cells",
                                 map(vec![
                                     ("type", text("array")),
-                                    ("description", text("the cells to set before the walk, each an object of at and is; everything else takes fill")),
+                                    (
+                                        "description",
+                                        text(
+                                            "the cells to set before the walk, each an object of at and is; everything else takes fill",
+                                        ),
+                                    ),
                                     ("items", map(vec![("type", text("object"))])),
                                 ]),
                             ),
-                            ("carry", map(vec![("type", text("boolean")), ("description", text("false walks forward only and answers without a slope"))])),
-                            ("most", map(vec![("type", text("integer")), ("description", text("how many cells to name in each answer, loudest first"))])),
+                            (
+                                "carry",
+                                map(vec![
+                                    ("type", text("boolean")),
+                                    (
+                                        "description",
+                                        text(
+                                            "false walks forward only and answers without a slope",
+                                        ),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "most",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text(
+                                            "how many cells to name in each answer, loudest first",
+                                        ),
+                                    ),
+                                ]),
+                            ),
                         ]),
                     ),
                 ]),
@@ -703,28 +796,109 @@ fn tools() -> Json {
                     (
                         "properties",
                         map(vec![
-                            ("wide", map(vec![("type", text("integer")), ("description", text("cells across; rounded up to a power of two"))])),
-                            ("deep", map(vec![("type", text("integer")), ("description", text("cells down; rounded up to a power of two"))])),
+                            (
+                                "wide",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("cells across; rounded up to a power of two"),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "deep",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("cells down; rounded up to a power of two"),
+                                    ),
+                                ]),
+                            ),
                             (
                                 "kind",
                                 map(vec![
                                     ("type", text("string")),
-                                    ("enum", Json::List(KINDS_NAMED.iter().map(|one| text(one)).collect())),
+                                    (
+                                        "enum",
+                                        Json::List(
+                                            KINDS_NAMED.iter().map(|one| text(one)).collect(),
+                                        ),
+                                    ),
                                     ("description", text("which rule the cells follow")),
                                 ]),
                             ),
-                            ("turning", map(vec![("type", text("integer")), ("description", text("where the first rule parameter starts"))])),
-                            ("swing", map(vec![("type", text("integer")), ("description", text("where the second rule parameter starts"))])),
-                            ("depth", map(vec![("type", text("integer")), ("description", text("how many frames each round walks"))])),
-                            ("rounds", map(vec![("type", text("integer")), ("description", text("how many downhill steps to take"))])),
-                            ("step", map(vec![("type", text("integer")), ("description", text("how far a parameter moves in one round; they are whole numbers, so this is whole too"))])),
-                            ("ceiling", map(vec![("type", text("integer")), ("description", text("how high a parameter may climb"))])),
-                            ("fill", map(vec![("type", text("integer")), ("description", text("what every cell holds before the named ones are set, in both grids"))])),
+                            (
+                                "turning",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    ("description", text("where the first rule parameter starts")),
+                                ]),
+                            ),
+                            (
+                                "swing",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("where the second rule parameter starts"),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "depth",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    ("description", text("how many frames each round walks")),
+                                ]),
+                            ),
+                            (
+                                "rounds",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    ("description", text("how many downhill steps to take")),
+                                ]),
+                            ),
+                            (
+                                "step",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text(
+                                            "how far a parameter moves in one round; they are whole numbers, so this is whole too",
+                                        ),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "ceiling",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    ("description", text("how high a parameter may climb")),
+                                ]),
+                            ),
+                            (
+                                "fill",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text(
+                                            "what every cell holds before the named ones are set, in both grids",
+                                        ),
+                                    ),
+                                ]),
+                            ),
                             (
                                 "cells",
                                 map(vec![
                                     ("type", text("array")),
-                                    ("description", text("the grid to start from, each an object of at and is")),
+                                    (
+                                        "description",
+                                        text("the grid to start from, each an object of at and is"),
+                                    ),
                                     ("items", map(vec![("type", text("object"))])),
                                 ]),
                             ),
@@ -732,7 +906,12 @@ fn tools() -> Json {
                                 "want",
                                 map(vec![
                                     ("type", text("array")),
-                                    ("description", text("the grid to land on, each an object of at and is; this is what the rounds walk towards")),
+                                    (
+                                        "description",
+                                        text(
+                                            "the grid to land on, each an object of at and is; this is what the rounds walk towards",
+                                        ),
+                                    ),
                                     ("items", map(vec![("type", text("object"))])),
                                 ]),
                             ),
@@ -757,15 +936,55 @@ fn tools() -> Json {
                     (
                         "properties",
                         map(vec![
-                            ("wide", map(vec![("type", text("integer")), ("description", text("cells across; rounded up to a power of two"))])),
-                            ("deep", map(vec![("type", text("integer")), ("description", text("cells down; rounded up to a power of two"))])),
-                            ("frames", map(vec![("type", text("integer")), ("description", text("how many frames to step"))])),
-                            ("walls", map(vec![("type", text("boolean")), ("description", text("a floor and two sides, so falling things land; false lets everything leave by the bottom"))])),
+                            (
+                                "wide",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("cells across; rounded up to a power of two"),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "deep",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("cells down; rounded up to a power of two"),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "frames",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    ("description", text("how many frames to step")),
+                                ]),
+                            ),
+                            (
+                                "walls",
+                                map(vec![
+                                    ("type", text("boolean")),
+                                    (
+                                        "description",
+                                        text(
+                                            "a floor and two sides, so falling things land; false lets everything leave by the bottom",
+                                        ),
+                                    ),
+                                ]),
+                            ),
                             (
                                 "cells",
                                 map(vec![
                                     ("type", text("array")),
-                                    ("description", text("what to place before the first frame, each an object of at and is, where is names one of air, water, sand, wall")),
+                                    (
+                                        "description",
+                                        text(
+                                            "what to place before the first frame, each an object of at and is, where is names one of air, water, sand, wall",
+                                        ),
+                                    ),
                                     ("items", map(vec![("type", text("object"))])),
                                 ]),
                             ),
@@ -773,11 +992,34 @@ fn tools() -> Json {
                                 "brush",
                                 map(vec![
                                     ("type", text("object")),
-                                    ("description", text("a spout that pours: at names the cell it pours from, is what it pours, span how wide, frames how long it keeps pouring before it shuts off")),
+                                    (
+                                        "description",
+                                        text(
+                                            "a spout that pours: at names the cell it pours from, is what it pours, span how wide, frames how long it keeps pouring before it shuts off",
+                                        ),
+                                    ),
                                 ]),
                             ),
-                            ("most", map(vec![("type", text("integer")), ("description", text("how many settled cells to name one by one"))])),
-                            ("batch", map(vec![("type", text("integer")), ("description", text("how many frames go to the device at a time"))])),
+                            (
+                                "most",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("how many settled cells to name one by one"),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "batch",
+                                map(vec![
+                                    ("type", text("integer")),
+                                    (
+                                        "description",
+                                        text("how many frames go to the device at a time"),
+                                    ),
+                                ]),
+                            ),
                         ]),
                     ),
                 ]),
@@ -886,9 +1128,9 @@ fn sown(held: &Json, grid: Grid, fill: u32) -> Result<Vec<u32>, Box<dyn std::err
     for one in held.get("cells").and_then(Json::list).unwrap_or(&[]) {
         let at = one.counted("at").ok_or("a cell needs an at")? as usize;
         let value = one.counted("is").unwrap_or(1);
-        let held = cells.get_mut(at).ok_or_else(|| {
-            format!("at {at} is outside the {} cells of this grid", grid.cells())
-        })?;
+        let held = cells
+            .get_mut(at)
+            .ok_or_else(|| format!("at {at} is outside the {} cells of this grid", grid.cells()))?;
         *held = value;
     }
     Ok(cells)
@@ -899,9 +1141,9 @@ fn wanted(held: &Json, grid: Grid, fill: u32) -> Result<Vec<u32>, Box<dyn std::e
     for one in held.get("want").and_then(Json::list).unwrap_or(&[]) {
         let at = one.counted("at").ok_or("a wanted cell needs an at")? as usize;
         let value = one.counted("is").unwrap_or(1);
-        let held = cells.get_mut(at).ok_or_else(|| {
-            format!("at {at} is outside the {} cells of this grid", grid.cells())
-        })?;
+        let held = cells
+            .get_mut(at)
+            .ok_or_else(|| format!("at {at} is outside the {} cells of this grid", grid.cells()))?;
         *held = value;
     }
     Ok(cells)
@@ -955,12 +1197,8 @@ fn slid(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
     let deep = held.counted("deep").unwrap_or(32).clamp(2, 256);
     let grid = Grid::of(wide, deep);
     let named = held.get("kind").and_then(Json::text).unwrap_or("living");
-    let kind = kind_named(named).ok_or_else(|| {
-        format!(
-            "kind {named} is not one of {}",
-            KINDS_NAMED.join(", ")
-        )
-    })?;
+    let kind = kind_named(named)
+        .ok_or_else(|| format!("kind {named} is not one of {}", KINDS_NAMED.join(", ")))?;
     let turning = held.counted("turning").unwrap_or(KNOB);
     let swing = held.counted("swing").unwrap_or(0);
     let depth = held.counted("depth").unwrap_or(16).clamp(1, 1 << 12);
@@ -1073,7 +1311,11 @@ fn pushed(ended: &[u32], want: &[u32]) -> Vec<u32> {
 /// Downhill, by whole numbers, because the parameters are whole numbers.
 /// `against` turns the step around, for when the slope pointed the wrong way.
 fn moved(now: u32, slope: i64, step: u32, most: u32, against: bool) -> u32 {
-    let down = if against { -slope.signum() } else { slope.signum() };
+    let down = if against {
+        -slope.signum()
+    } else {
+        slope.signum()
+    };
     match down {
         1 => now.saturating_sub(step),
         -1 => now.saturating_add(step).min(most),
@@ -1086,8 +1328,8 @@ fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>>
     let deep = held.counted("deep").unwrap_or(32).clamp(2, 256);
     let grid = Grid::of(wide, deep);
     let named = held.get("kind").and_then(Json::text).unwrap_or("living");
-    let kind =
-        kind_named(named).ok_or_else(|| format!("kind {named} is not one of {}", KINDS_NAMED.join(", ")))?;
+    let kind = kind_named(named)
+        .ok_or_else(|| format!("kind {named} is not one of {}", KINDS_NAMED.join(", ")))?;
     let depth = held.counted("depth").unwrap_or(16).clamp(1, 1 << 12);
     let rounds = held.counted("rounds").unwrap_or(8).clamp(1, 1 << 10);
     let step = held.counted("step").unwrap_or(1).clamp(1, 1 << 16);
@@ -1185,7 +1427,10 @@ fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>>
     }
 
     let (gap, turning, swing, _, _) = best.ok_or("no round was walked")?;
-    let first = trail.first().and_then(|one| one.get("apart")).and_then(Json::int);
+    let first = trail
+        .first()
+        .and_then(|one| one.get("apart"))
+        .and_then(Json::int);
     Ok(map(vec![
         (
             "grid",
@@ -1211,11 +1456,15 @@ fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>>
         ("checked_on_the_host", Json::Bool(true)),
         (
             "apart_means",
-            text("how far the walked grid is from the one asked for, counted a cell at a time; it is the thing the rounds walk downhill, and it is exact"),
+            text(
+                "how far the walked grid is from the one asked for, counted a cell at a time; it is the thing the rounds walk downhill, and it is exact",
+            ),
         ),
         (
             "a_round_that_did_not_close",
-            text("means these rule parameters, at this step and this many rounds, did not get nearer - not that no parameters would. Stalled means the step had nowhere smaller to go, so more rounds would not help; a step that ran out of rounds instead would. turned_around counts the rounds where the slope pointed uphill and the distance, which is exact, said otherwise. unmoved counts rounds where moving the parameters changed the distance by nothing at all, which means they have no purchase at this depth and these cell values rather than that they are right."),
+            text(
+                "means these rule parameters, at this step and this many rounds, did not get nearer - not that no parameters would. Stalled means the step had nowhere smaller to go, so more rounds would not help; a step that ran out of rounds instead would. turned_around counts the rounds where the slope pointed uphill and the distance, which is exact, said otherwise. unmoved counts rounds where moving the parameters changed the distance by nothing at all, which means they have no purchase at this depth and these cell values rather than that they are right.",
+            ),
         ),
     ]))
 }
@@ -1242,9 +1491,7 @@ fn walled(grid: Grid, walls: bool) -> Vec<u32> {
     for row in 0..grid.deep {
         for column in 0..grid.wide {
             let edge = row + 1 >= grid.deep || column == 0 || column + 1 >= grid.wide;
-            if edge
-                && let Some(slot) = cells.get_mut((row * grid.wide + column) as usize)
-            {
+            if edge && let Some(slot) = cells.get_mut((row * grid.wide + column) as usize) {
                 *slot = WALL;
             }
         }
@@ -1293,9 +1540,9 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
     // The brush is what pours. Left out, whatever the caller placed is all
     // there is, and the answer is about how that settles.
     let brush = held.get("brush");
-    let spout = brush.and_then(|one| one.counted("at")).map(|at| {
-        (at % grid.wide, at / grid.wide)
-    });
+    let spout = brush
+        .and_then(|one| one.counted("at"))
+        .map(|at| (at % grid.wide, at / grid.wide));
     let span = brush.and_then(|one| one.counted("span")).unwrap_or(49);
     let pouring = brush
         .and_then(|one| one.counted("frames"))
@@ -1383,7 +1630,10 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
             "tally",
             map(vec![
                 ("air", Json::Int(tally.first().copied().unwrap_or(0) as i64)),
-                ("water", Json::Int(tally.get(1).copied().unwrap_or(0) as i64)),
+                (
+                    "water",
+                    Json::Int(tally.get(1).copied().unwrap_or(0) as i64),
+                ),
                 ("sand", Json::Int(tally.get(2).copied().unwrap_or(0) as i64)),
                 ("wall", Json::Int(tally.get(3).copied().unwrap_or(0) as i64)),
             ]),
@@ -1407,19 +1657,20 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
                     .collect(),
             ),
         ),
-        (
-            "listed",
-            Json::Int((listed / looked.max(1)) as i64),
-        ),
+        ("listed", Json::Int((listed / looked.max(1)) as i64)),
         ("of_quads", counted(quads)),
         ("checked_on_the_host", Json::Bool(true)),
         (
             "listed_means",
-            text("how many quads the work list named on an average look, out of of_quads in the whole grid; the engine steps what the list names, so this is what the frame actually cost rather than how big the grid is"),
+            text(
+                "how many quads the work list named on an average look, out of of_quads in the whole grid; the engine steps what the list names, so this is what the frame actually cost rather than how big the grid is",
+            ),
         ),
         (
             "rows_means",
-            text("how many cells of sand or water lie in each row, top row first, and in each column left to right; a pile and a puddle hold the same count and do not lie down the same way, and two heaps and one wide one fill the same rows while the columns between them are empty"),
+            text(
+                "how many cells of sand or water lie in each row, top row first, and in each column left to right; a pile and a puddle hold the same count and do not lie down the same way, and two heaps and one wide one fill the same rows while the columns between them are empty",
+            ),
         ),
     ]))
 }
