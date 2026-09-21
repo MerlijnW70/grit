@@ -290,7 +290,7 @@ def bench_spec(client, groups=None) -> dict:
     for name, specs, should_stop in groups:
         rows_out, peaks, stopped_count = [], [], 0
         for rule, names in specs:
-            rows = spec.read_intent(client, rule, names, ["out"])
+            rows, whole = spec.read_intent(client, rule, names, ["out"])
             flagged = [r for r in rows if r.unclear(spec.UNDECIDED_FLOOR)]
             peak = max((max(r.undecided.values()) for r in rows), default=0.0)
             stopped = bool(flagged)
@@ -298,14 +298,25 @@ def bench_spec(client, groups=None) -> dict:
             wrong = stopped != should_stop
             out["wrong"] += wrong
             peaks.append(peak)
+            by_whole = whole > 0.5
             rows_out.append({"rule": rule, "stopped": stopped, "peak": round(peak, 2),
-                             "as_intended": not wrong})
+                             "as_intended": not wrong,
+                             "whole": round(whole, 2), "stopped_whole": by_whole,
+                             "agreed": by_whole == stopped,
+                             "whole_right": by_whole == should_stop})
         out["groups"].append({
             "group": name, "specs": len(specs), "stopped": stopped_count,
             "should_stop": should_stop, "peak_low": round(min(peaks), 2),
             "peak_high": round(max(peaks), 2), "cases": rows_out})
     out["specs"] = sum(len(s) for _, s, _ in groups)
     out["as_intended"] = out["specs"] - out["wrong"]
+    seen = [case for group in out["groups"] for case in group["cases"]]
+    out["whole_right"] = sum(1 for case in seen if case["whole_right"])
+    out["agreed"] = sum(1 for case in seen if case["agreed"])
+    out["wrong_where_agreed"] = sum(
+        1 for case in seen if case["agreed"] and not case["as_intended"])
+    out["wrong_where_parted"] = sum(
+        1 for case in seen if not case["agreed"] and not case["as_intended"])
     out["floor"] = spec.UNDECIDED_FLOOR
     out["sweep"] = sweep(out)
     return out
@@ -542,7 +553,7 @@ def bench_wide(client) -> dict:
         for slot in put_back:
             relevance[slot] = 1.0
         kept = set(spec.relevant_inputs(relevance, "out", inputs))
-        rows = spec.read_intent(client, rule, inputs, ["out"], relevance=relevance)
+        rows, _ = spec.read_intent(client, rule, inputs, ["out"], relevance=relevance)
         got = [row.outs["out"] for row in rows]
         wanted = [truth(r) for r in range(2 ** len(inputs))]
         cases.append({"rule": rule[:52], "inputs": len(inputs),
@@ -586,7 +597,7 @@ def bench_hard(client) -> dict:
     cases = []
     for rule, inputs, outputs, truth in HARD:
         shape = spec.read_shape(client, rule, inputs, outputs)
-        rows = spec.read_intent(client, rule, inputs, outputs)
+        rows, _ = spec.read_intent(client, rule, inputs, outputs)
         wrong, stopped = [], []
         for row in rows:
             want = truth(row.index)
@@ -646,6 +657,11 @@ def say_spec(found: dict) -> None:
             if not case["as_intended"]:
                 miss = "FALSE ALARM" if case["stopped"] else "MISSED"
                 print(f"  {miss}: {case['rule']}  peak {case['peak']:.2f}")
+    print(f"\nasked of the whole rule instead of a row at a time: "
+          f"{found['whole_right']}/{found['specs']} right")
+    print(f"  the two readings agreed on {found['agreed']}/{found['specs']}; "
+          f"{found['wrong_where_agreed']} wrong there and "
+          f"{found['wrong_where_parted']} where they parted")
     say_sweep(found["sweep"], found.get("floor"))
 
 

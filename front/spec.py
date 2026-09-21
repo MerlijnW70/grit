@@ -102,6 +102,27 @@ def read_shape(client: TypeSafeClient, rule: str, inputs: list[str],
             "counting": answers.nouls["counting"].noul}
 
 
+def _whole_question() -> Noul:
+    """Is the rule vague, asked once of the rule rather than a row at a time.
+
+    Measured over fourteen specs this is right about all fourteen where walking
+    the rows is right about twelve, and the two readings agree on twelve with
+    every wrong answer living in the two they part on. So this decides.
+    What it cannot do is say which case is the vague one, and that is the whole
+    use of the answer - so the rows still carry it, and name the ones nearest
+    the middle when this stops a spec.
+    """
+    return Noul(instructions=(
+                "Read the rule in `rule` under the usual convention: it names the "
+                "cases where an output is 1, and the output is 0 in every case it "
+                "does not name. Even so, there is at least one combination of the "
+                "inputs where the rule's own words do not settle what the output "
+                "should be - two careful readers could apply it there and get "
+                "different answers. This is about the rule being incomplete or "
+                "vague, not about it being unusual or hard to build."
+    ))
+
+
 def read_relevance(client: TypeSafeClient, rule: str, inputs: list[str],
                    outputs: list[str], model: str | None = None) -> dict[tuple[str, str], float]:
     """Which inputs each output actually reads."""
@@ -184,7 +205,8 @@ class Row:
 
 def read_intent(client: TypeSafeClient, rule: str, inputs: list[str],
                 outputs: list[str], model: str | None = None,
-                relevance: dict[tuple[str, str], float] | None = None) -> list[Row]:
+                relevance: dict[tuple[str, str], float] | None = None,
+                ) -> tuple[list[Row], float]:
     """One request. Every (case, output bit) pair is an independent judgement.
 
     The rows are always all 2^n of them - they are the deliverable, and code
@@ -205,7 +227,7 @@ def read_intent(client: TypeSafeClient, rule: str, inputs: list[str],
         "outputs": outputs,
         "bit_order": "inputs[0] is bit 0, the lowest bit of the row index",
     }
-    questions = {}
+    questions = {"whole": _whole_question()}
     for row in rows:
         seen = ", ".join(f"{n}={v}" for n, v in row.bits.items())
         for out in outputs:
@@ -238,7 +260,7 @@ def read_intent(client: TypeSafeClient, rule: str, inputs: list[str],
             row.probs[out] = p
             row.outs[out] = 1 if p > 0.5 else 0
             row.undecided[out] = answers.nouls[f"u{row.index}_{out}"].noul
-    return rows
+    return rows, answers.nouls["whole"].noul
 
 
 def _read_pruned(client, rule, inputs, outputs, rows, relevance, model):
@@ -260,6 +282,7 @@ def _read_pruned(client, rule, inputs, outputs, rows, relevance, model):
                 f"{seen}: the rule's own words leave this case genuinely open, so two "
                 "careful readers could apply it here and get different answers."
             ))
+    questions["whole"] = _whole_question()
     answers = client.system_one(state={"rule": rule, "inputs": inputs,
                                        "outputs": outputs},
                                 questions=questions, model=model)
@@ -270,7 +293,7 @@ def _read_pruned(client, rule, inputs, outputs, rows, relevance, model):
             row.probs[out] = p
             row.outs[out] = 1 if p > 0.5 else 0
             row.undecided[out] = answers.nouls[f"u{out}_{r}"].noul
-    return rows
+    return rows, answers.nouls["whole"].noul
 
 
 def grit(tool: str, arguments: dict, binary: str | list[str], timeout: int = 900) -> dict:
@@ -398,8 +421,8 @@ def main(argv: list[str] | None = None) -> int:
                             for out in outputs)
                             + f"  ({asked} cases instead of "
                             + f"{2 ** len(inputs) * len(outputs)})")
-                rows = read_intent(client, args.rule, inputs, outputs, args.model,
-                                   relevance)
+                rows, whole = read_intent(client, args.rule, inputs, outputs,
+                                          args.model, relevance)
         except TypeSafeAPIError as error:
             print(f"TypeSafe error {error.status} (request {error.request_id})",
                   file=sys.stderr)
@@ -407,7 +430,14 @@ def main(argv: list[str] | None = None) -> int:
         table = [row.word(outputs) for row in rows]
         report["table_from"] = "jev"
 
+        # The whole-rule reading decides; the rows say where. They are right
+        # together twelve times in fourteen and every wrong answer measured sat
+        # where they parted, so a parting is worth printing rather than hiding.
+        stopping = whole > 0.5
         unclear = [row for row in rows if row.unclear(args.margin)]
+        report["whole"] = round(whole, 3)
+        report["readings_agree"] = stopping == bool(unclear)
+        nearest = sorted(rows, key=lambda row: -max(row.undecided.values()))[:3]
         report["unclear"] = [
             {"row": row.index, "bits": row.bits, "bit": name,
              "p": round(row.probs[name], 3),
@@ -416,17 +446,20 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if not args.json:
             print(render(rows, inputs, outputs))
-        if unclear and not args.force:
+        if stopping and not args.force:
             if args.json:
                 print(json.dumps({**report, "table": table, "searched": False}, indent=2))
             else:
                 print()
-                for row in unclear:
-                    for name in row.unclear(args.margin):
+                print(f"  read whole, this rule leaves something open (P={whole:.2f}).")
+                if not unclear:
+                    print("  No single row reads that way, which is a parting "
+                          "worth knowing about; these are the nearest the middle:")
+                for row in (unclear or nearest):
+                    for name, held in sorted(row.undecided.items(), key=lambda one: -one[1]):
                         seen = ", ".join(f"{n}={v}" for n, v in row.bits.items())
-                        print(f"  undecided: with {seen}, the rule does not say what "
-                              f"`{name}` is  (P={row.undecided[name]:.2f}; "
-                              f"it leaned {row.outs[name]} at {row.probs[name]:.2f})")
+                        print(f"  with {seen}: `{name}` at {held:.2f} undecided "
+                              f"(it leaned {row.outs[name]} at {row.probs[name]:.2f})")
                 print("\nThe rule does not decide these rows. Say what they should be and\n"
                       "ask again, or pass --table to state the whole table yourself.\n"
                       "Nothing was searched: an unreviewed row becomes a gate that is\n"
