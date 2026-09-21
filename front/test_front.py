@@ -304,12 +304,14 @@ class Refusing(Driving_machine, unittest.TestCase):
 
     def test_a_table_of_coin_flips_is_refused(self):
         # Every window answered at dead centre: nothing to build a machine on.
+        # This is all the table floor claims now. It used to stand in for
+        # whether the depth was enough and measured neither that nor wrongness.
         code, said, _ = self.drive(
             {"span": "2", "route": "window", "noul": lambda q: 0.95 if q in ("windowed", "enough")
                 else 0.05 if q == "accumulates" else 0.5},
             ["something the window cannot carry"])
         self.assertEqual(code, 3)
-        self.assertIn("full windows close to", said)
+        self.assertIn("on the fence", said)
 
     def test_a_clean_window_rule_reaches_grit(self):
         code, said, _ = self.drive(
@@ -467,9 +469,13 @@ class Shape(unittest.TestCase):
         deepest = max(int(n) for n in machine.SPANS if n.isdigit())
         self.assertEqual(deepest, 4)
 
-    def test_the_table_floor_sits_between_what_was_measured(self):
-        self.assertLess(0.03, machine.TABLE_FLOOR, "the forced four-deep table must fail")
-        self.assertGreater(0.43, machine.TABLE_FLOOR, "a real three-deep table must pass")
+    def test_the_table_floor_only_catches_a_table_of_coin_flips(self):
+        # It used to stand in for whether the depth was enough and measured
+        # neither that nor wrongness. What is left claims only to stop a table
+        # the model had nothing to say about, so it sits below every margin the
+        # depth suite has ever produced - the thinnest real one was 0.18.
+        self.assertLess(machine.TABLE_FLOOR, 0.18)
+        self.assertGreater(machine.TABLE_FLOOR, 0.0)
 
 
 class Asking(unittest.TestCase):

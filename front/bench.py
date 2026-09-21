@@ -8,7 +8,7 @@ live here and the measurement is run on demand, against the model it names.
 
     python front/bench.py                        # everything
     python front/bench.py --suite spec           # the undecided detector
-    python front/bench.py --suite depth          # how good a guard TABLE_FLOOR is
+    python front/bench.py --suite depth          # whether a depth carries a rule
     python front/bench.py --cases mine.json      # your specs instead of these
     python front/bench.py --save run.json        # keep a run
     python front/bench.py --sweep-from run.json  # re-read it; no key, no requests
@@ -99,7 +99,7 @@ TRACES = [
 # Window rules with a known true depth. Each is asked at its own depth, where a
 # table can carry it, and at one shallower, where no table can: the answer then
 # depends on an input the window does not show. That makes a labelled set for
-# TABLE_FLOOR without anyone deciding by eye what "coin flips" means.
+# the depth question without anyone deciding by eye what "coin flips" means.
 DEPTHS = [
     ("output 1 at a step exactly when the input at that step is 1",
      1, lambda p: p[-1]),
@@ -415,13 +415,15 @@ def bench_depth(client) -> dict:
                           "adequate": adequate, "worst_margin": round(worst, 2),
                           "run_in_margin": round(run_in, 2),
                           "wrong_patterns": wrong,
-                          "accepted": worst >= machine.TABLE_FLOOR,
+                          "accepted": enough > 0.5,
                           "enough": round(enough, 2),
                           "enough_right": (enough > 0.5) == adequate,
-                          "agreed": (enough > 0.5) == (worst >= machine.TABLE_FLOOR)})
+                          # Kept as a number to look at, not as a second opinion:
+                          # it predicted neither adequacy nor wrongness.
+                          "agreed": True})
     scored = [(case["worst_margin"], not case["adequate"]) for case in cases]
     return {"cases": cases, "pairs": len(cases),
-            "floor": machine.TABLE_FLOOR,
+            "floor": 0.5,
             "enough_right": sum(1 for case in cases if case["enough_right"]),
             "agreed": sum(1 for case in cases if case["agreed"]),
             "wrong_where_agreed": sum(
@@ -433,22 +435,23 @@ def bench_depth(client) -> dict:
 
 
 def say_depth(found: dict) -> None:
-    print(f"\ntable margin as a depth check (floor {found['floor']}) - "
-          f"{found['as_intended']}/{found['pairs']} as intended")
-    print(f"  {'depth':>5} {'asked':>5} {'adequate':>9} {'margin':>7} {'verdict':>9}")
+    print(f"\nis this depth enough - {found['enough_right']}/{found['pairs']} right")
+    print(f"  {'depth':>5} {'asked':>5} {'adequate':>9} {'said':>9} {'margin':>7}")
     for case in found["cases"]:
-        verdict = "accept" if case["accepted"] else "reject"
+        said = "enough" if case["accepted"] else "not"
         mark = " " if case["accepted"] == case["adequate"] else "<"
-        extra = "" if case["wrong_patterns"] is None else f"  {case['wrong_patterns']} wrong"
+        extra = ("" if case["wrong_patterns"] is None
+                 else f"  {case['wrong_patterns']} wrong")
         print(f"  {case['true_depth']:>5} {case['asked_at']:>5} "
-              f"{str(case['adequate']):>9} {case['worst_margin']:>7.2f} "
-              f"{verdict:>9}{mark}{extra}")
+              f"{str(case['adequate']):>9} {said:>9}{mark} "
+              f"{case['worst_margin']:>7.2f}{extra}")
         print(f"        {case['rule']}")
-    print(f"\nasked straight out whether the depth is enough: "
-          f"{found['enough_right']}/{found['pairs']} right")
-    print(f"  the two readings agreed on {found['agreed']}/{found['pairs']}, "
-          f"{found['wrong_where_agreed']} wrong there")
-    say_sweep(found["sweep"], found["floor"])
+    print("  The margin beside each row gates nothing. It predicted neither "
+          "adequacy nor")
+    print("  wrongness: a margin measures doubt, and a depth that cannot carry "
+          "a rule")
+    print("  leaves nothing to doubt - the model picks what fits most cases and "
+          "is sure.")
 
 
 def bench_route(client) -> dict:

@@ -29,8 +29,8 @@ correctly. `bench.py --suite trace` re-measures that.
 Getting the DEPTH wrong is the one mistake nothing downstream can see. The
 labels come from a lookup, so they are self-consistent at any depth: grit
 always solves them, and the unseen-run probe is built from the same table, so
-it agrees. Both checks are blind here. TABLE_FLOOR guards it and guards it
-weakly - `bench.py --suite depth` measures how weakly. Read the printed table.
+it agrees. Both checks are blind here. The depth is asked about directly
+instead, and `bench.py --suite depth` measures that. Read the printed table.
 
 Exit codes: 0 held on everything unseen, 1 taught but left a gap, 2 TypeSafe or
 key trouble, 3 refused - an accumulating rule, a window deeper than the options
@@ -80,22 +80,33 @@ SPANS = {"1": "only what arrives at this step matters, with no earlier step need
          # none of these, so it says the nearest one and sounds certain.
          "more": "it needs to look further back than the three steps before this one"}
 
-# A weak guard, and weaker than it used to be. `bench.py --suite depth` asks
-# rules of known depth at their own depth and at one shallower, where provably
-# no table can carry them, and the two populations now overlap almost entirely:
-# an impossible window scores about what a correct one does.
+# There is no floor on the table's margins here, and there was one for a long
+# time. It never measured anything.
 #
-# That got worse on purpose. Naming each step by how far back it is, rather
-# than leaving the order to be recovered from a list, fixed a two-input rule
-# that had been reading every value as belonging to the current step - and it
-# also made the model decisive about windows it cannot possibly decide. Clearer
-# questions bought better labels and cost most of this signal.
+# Asked to predict whether a depth is adequate it manages six to eight of
+# eleven from run to run, which is noise. Asked instead to predict whether the
+# table is wrong - the use that works in spec.py, where a thin table is a wrong
+# table and it separates nine of nine - it does no better: over the same eleven
+# the adequate depths close to between thirty seven and forty seven hundredths
+# of the middle and the too-shallow ones to between eighteen and forty eight,
+# and the one adequate depth that produced a wrong pattern closed to forty six.
+# Thick and wrong.
 #
-# So it is kept as a catastrophe detector rather than a depth check: at this
-# floor it rejects nothing that was adequate and still catches the worst of the
-# inadequate. The depth question itself is the real guard, and the routing
-# suite shows it answering with confidence and answering right. Read the table.
-TABLE_FLOOR = 0.30
+# The reason is worth keeping. A margin measures doubt, and at a depth that
+# cannot carry a rule there is nothing to doubt: the question has no right
+# answer, so the model picks the one that fits most of the cases and is sure of
+# it. In spec.py the wrong tables came from questions that did have a right
+# answer and were not certain of it. Doubt is informative where an answer
+# exists and silent where none does.
+#
+# The depth question asks the thing directly and is eleven of eleven, so it
+# decides. What is left here is a floor at the pathological end: a table whose
+# every answer sits on the fence is a table the model had nothing to say about,
+# and that is worth stopping whatever the depth question thinks. It is set below
+# anything the measurement ever produced - the thinnest real table closed to
+# eighteen hundredths - so it fires on nothing that was measured and on a table
+# of coin flips, which is all it claims to do.
+TABLE_FLOOR = 0.05
 
 
 def read_shape(client: TypeSafeClient, rule: str, model: str | None = None) -> dict:
@@ -382,7 +393,8 @@ def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
     answers = client.system_one(state={"rule": rule}, questions=questions, model=model)
     tables: dict[int, dict] = {length: {} for length in range(1, k + 1)}
     # Kept apart on purpose. The full windows answer "is this depth enough",
-    # which is what TABLE_FLOOR guards. The run-in answers "does the rule say
+    # which used to be gated on and is now only reported. The run-in answers
+    # "does the rule say
     # what happens before it has its history", a harder and different question
     # whose uncertainty says nothing about the depth.
     full, run_in = 1.0, 1.0
@@ -531,16 +543,16 @@ def main(argv: list[str] | None = None) -> int:
                       + f"{2 ** (k * len(names))})")
             table, worst, run_in = window_table(client, args.rule, k, names,
                                                 outputs, args.model, relevance)
-            if worst < TABLE_FLOOR and enough >= 0.5 and not args.force:
+            if worst < TABLE_FLOOR and not args.force:
                 if args.json:
                     print(json.dumps({"rule": args.rule, "shape": shape,
                                       "window": k, "worst_margin": round(worst, 3),
                                       "labelled": False}, indent=2))
                 else:
-                    print(f"\nThe {2 ** (k * len(names))} full windows close to "
-                          f"{worst:.2f} of the middle. The answer depends on "
-                          f"something\nthese {k} steps do not show, so nothing was taught: a machine "
-                          "fitted to coin flips still solves.")
+                    print(f"\nEvery window came back on the fence, the closest "
+                          f"{worst:.2f} from the middle. That is a table the model "
+                          "had nothing to say about rather than one it got wrong, "
+                          "and a machine fitted to it still solves.")
                 return 3
     except TypeSafeAPIError as error:
         print(f"TypeSafe error {error.status} (request {error.request_id})", file=sys.stderr)
