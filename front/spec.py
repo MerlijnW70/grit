@@ -55,6 +55,34 @@ UNDECIDED_FLOOR = 0.45
 # Kept only as a secondary display signal, never as the gate.
 NARROW_MARGIN = 0.15
 
+# How near the middle the closest answer in a table may sit.
+#
+# This is a margin, and margins standing in for other questions have lost every
+# comparison in this front door - a whole-rule reading beat a row-by-row one, a
+# direct depth question beat a table margin. This one is not standing in for
+# anything. A bit answered at fifty one hundredths is a bit that nearly came
+# back the other way, and that is the whole of what is being said.
+#
+# Over nine specs asked whole it separates completely: every exact table has
+# its closest call at twenty six hundredths from the middle or further, every
+# table with a wrong row has one at three hundredths or nearer.
+#
+# That gap is not where the floor goes, because a spec worked in stages falls
+# inside it and is right. The two-bit adder staged with its carry named answers
+# some cases at twelve hundredths from the middle and comes back exact, four
+# times in four. Put at fifteen it refuses that, which is a spec that works.
+#
+# So it sits between three and twelve, which is a thinner gap than the one that
+# first showed up and is the one the measurements actually support.
+#
+# And it is only trustworthy for a spec asked whole. There it is nine of nine.
+# On a staged spec it is not: the staged adder answers between twelve and
+# fifteen hundredths from the middle from one run to the next and is exact in
+# some of those runs and not others, so thinness and wrongness stop tracking
+# each other. Staging trades a table that is confidently wrong for one that is
+# unsurely right, and this guard cannot tell the second from a third thing.
+THIN_TABLE = 0.06
+
 # An output that reads three of six inputs needs eight rows asked, not sixty
 # four. As in machine.py the two errors differ in size: keeping a spare input
 # costs questions, dropping a real one flattens the spec where grit cannot see
@@ -645,6 +673,9 @@ def main(argv: list[str] | None = None) -> int:
         # The whole-rule reading decides; the rows say where. They are right
         # together twelve times in fourteen and every wrong answer measured sat
         # where they parted, so a parting is worth printing rather than hiding.
+        thinnest = min((abs(p - 0.5) for row in rows for p in row.probs.values()),
+                       default=0.5)
+        report["thinnest"] = round(thinnest, 3)
         stopping = whole > 0.5
         unclear = [row for row in rows if row.unclear(args.margin)]
         report["whole"] = round(whole, 3)
@@ -658,6 +689,23 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if not args.json:
             print(render(rows, inputs, outputs))
+        if thinnest < THIN_TABLE and not args.force:
+            if args.json:
+                print(json.dumps({**report, "searched": False}, indent=2))
+            else:
+                near = min(((abs(p - 0.5), row, name)
+                            for row in rows for name, p in row.probs.items()),
+                           key=lambda one: one[0])
+                seen = ", ".join(f"{n}={v}" for n, v in near[1].bits.items())
+                print(f"\nThe closest answer in this table sits {thinnest:.2f} from "
+                      f"the middle: with {seen}, `{near[2]}` came back at "
+                      f"{near[1].probs[near[2]]:.2f}. Over the specs measured here, "
+                      "every table with a call that near has a wrong row in it and "
+                      "every table without one is exact. Nothing later catches it: "
+                      "grit marks the circuit against whatever table it is handed. "
+                      "Say the rule more plainly, work an in-between value out first "
+                      "with --via, or pass --table. --force searches anyway.")
+            return 3
         if stopping and not args.force:
             if args.json:
                 print(json.dumps({**report, "table": table, "searched": False}, indent=2))
