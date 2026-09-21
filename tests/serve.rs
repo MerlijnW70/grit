@@ -72,6 +72,7 @@ fn the_server_names_every_tool_it_has() {
             "grit_least",
             "grit_slope",
             "grit_settle",
+            "grit_pour",
             "grit_check"
         ]
     );
@@ -934,5 +935,101 @@ fn a_parameter_with_no_purchase_is_counted_rather_than_mistaken_for_an_answer() 
     assert!(
         answer.counted("unmoved").unwrap_or(0) > 0,
         "moving the parameters changed nothing, and the answer has to say so"
+    );
+}
+
+fn poured(host: Option<&Host>, arguments: &str) -> Json {
+    structured(&call(host, "grit_pour", arguments))
+}
+
+#[test]
+fn nothing_is_made_or_lost_while_it_pours() {
+    let Some(host) = device("pour tally") else {
+        return;
+    };
+    let answer = poured(
+        Some(&host),
+        "{\"wide\":64,\"deep\":64,\"frames\":120,\"brush\":{\"at\":544,\"is\":\"sand\",\"span\":25,\"frames\":80}}",
+    );
+    let tally = answer.get("tally").unwrap();
+    let held: i64 = ["air", "water", "sand", "wall"]
+        .iter()
+        .filter_map(|one| tally.get(one).and_then(Json::int))
+        .sum();
+    let cells = answer
+        .get("grid")
+        .and_then(|one| one.counted("cells"))
+        .unwrap();
+    assert_eq!(
+        held,
+        i64::from(cells),
+        "every cell holds exactly one of the four things, before and after"
+    );
+    assert!(
+        tally.get("sand").and_then(Json::int).unwrap_or(0) > 0,
+        "the brush poured, so there is sand to find"
+    );
+}
+
+#[test]
+fn the_bill_follows_what_is_moving_rather_than_how_big_the_grid_is() {
+    let Some(host) = device("pour listed") else {
+        return;
+    };
+    // The engine's claim, in the one number that can show it: the work list
+    // names the quads worth stepping, and a room that is mostly still air is
+    // mostly not stepped at all.
+    let answer = poured(
+        Some(&host),
+        "{\"wide\":128,\"deep\":128,\"frames\":200,\"brush\":{\"at\":2112,\"is\":\"sand\",\"span\":25,\"frames\":120}}",
+    );
+    let listed = answer.get("listed").and_then(Json::int).unwrap();
+    let quads = i64::from(answer.counted("of_quads").unwrap());
+    assert!(listed > 0, "something was stepped");
+    assert!(
+        listed < quads,
+        "a grid that is mostly still costs less than all of it: {listed} of {quads}"
+    );
+}
+
+#[test]
+fn sand_ends_up_lower_than_it_started() {
+    let Some(host) = device("pour falls") else {
+        return;
+    };
+    // Placed high, with a floor under it and no brush pouring, it has one way
+    // to go. The rows say where it went.
+    let answer = poured(
+        Some(&host),
+        "{\"wide\":64,\"deep\":64,\"frames\":200,\"cells\":[{\"at\":160,\"is\":\"sand\"},{\"at\":161,\"is\":\"sand\"},{\"at\":162,\"is\":\"sand\"}]}",
+    );
+    let rows = answer.get("rows").and_then(Json::list).unwrap();
+    let lowest = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| one.int().unwrap_or(0) > 0)
+        .map(|(row, _)| row)
+        .next_back()
+        .unwrap_or(0);
+    assert!(
+        lowest > 2,
+        "it started in the third row and had two hundred frames to fall: it ended in row {lowest}"
+    );
+}
+
+#[test]
+fn a_thing_that_is_not_in_the_room_is_named_rather_than_poured() {
+    let Some(host) = device("pour stuff") else {
+        return;
+    };
+    let answer = call(
+        Some(&host),
+        "grit_pour",
+        "{\"wide\":64,\"deep\":64,\"frames\":2,\"cells\":[{\"at\":160,\"is\":\"treacle\"}]}",
+    );
+    let said = written(&answer);
+    assert!(
+        said.contains("treacle"),
+        "it has four things in it and treacle is not one: {said}"
     );
 }

@@ -8,7 +8,10 @@ use crate::marking::{
 use crate::netlist::{Chip, Exam, Gate, Netlist, drawn};
 use crate::rule::{KNOB, Kind, POINT};
 use crate::resident::Groups;
-use crate::sand::Grid;
+use crate::compact::Plan;
+use crate::layout::{BRUSH, GRAND, PARAMS, STATE};
+use crate::sand::{AIR, Grid, SAND, WALL, WATER};
+use crate::sweep;
 use crate::wire::{Json, counted, map, text};
 
 pub const CROWD: u32 = 65536;
@@ -740,6 +743,47 @@ fn tools() -> Json {
             ),
         ]),
         map(vec![
+            ("name", text("grit_pour")),
+            (
+                "description",
+                text(
+                    "Pour sand or water into a room and step it until it settles. Returns how much of each thing ended where, how many cells of sand and water lie in each row, and how many quads the work list actually named on an average look. That last number is the point of the engine rather than a detail of it: the frame costs what is moving, not what the grid could hold, so a settled room is cheap however large it is. Nothing is searched and nothing is judged; this is what happened.",
+                ),
+            ),
+            (
+                "inputSchema",
+                map(vec![
+                    ("type", text("object")),
+                    (
+                        "properties",
+                        map(vec![
+                            ("wide", map(vec![("type", text("integer")), ("description", text("cells across; rounded up to a power of two"))])),
+                            ("deep", map(vec![("type", text("integer")), ("description", text("cells down; rounded up to a power of two"))])),
+                            ("frames", map(vec![("type", text("integer")), ("description", text("how many frames to step"))])),
+                            ("walls", map(vec![("type", text("boolean")), ("description", text("a floor and two sides, so falling things land; false lets everything leave by the bottom"))])),
+                            (
+                                "cells",
+                                map(vec![
+                                    ("type", text("array")),
+                                    ("description", text("what to place before the first frame, each an object of at and is, where is names one of air, water, sand, wall")),
+                                    ("items", map(vec![("type", text("object"))])),
+                                ]),
+                            ),
+                            (
+                                "brush",
+                                map(vec![
+                                    ("type", text("object")),
+                                    ("description", text("a spout that pours: at names the cell it pours from, is what it pours, span how wide, frames how long it keeps pouring before it shuts off")),
+                                ]),
+                            ),
+                            ("most", map(vec![("type", text("integer")), ("description", text("how many settled cells to name one by one"))])),
+                            ("batch", map(vec![("type", text("integer")), ("description", text("how many frames go to the device at a time"))])),
+                        ]),
+                    ),
+                ]),
+            ),
+        ]),
+        map(vec![
             ("name", text("grit_check")),
             (
                 "description",
@@ -1175,12 +1219,207 @@ fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>>
     ]))
 }
 
+pub const STUFF_NAMED: [&str; 4] = ["air", "water", "sand", "wall"];
+
+fn stuff_named(name: &str) -> Option<u32> {
+    match name {
+        "air" => Some(AIR),
+        "water" => Some(WATER),
+        "sand" => Some(SAND),
+        "wall" => Some(WALL),
+        _ => None,
+    }
+}
+
+/// A room with a floor and two sides, which is what a falling thing needs to
+/// land on. Without it everything leaves by the bottom and the answer is empty.
+fn walled(grid: Grid, walls: bool) -> Vec<u32> {
+    let mut cells = vec![AIR; grid.cells()];
+    if !walls {
+        return cells;
+    }
+    for row in 0..grid.deep {
+        for column in 0..grid.wide {
+            let edge = row + 1 >= grid.deep || column == 0 || column + 1 >= grid.wide;
+            if edge
+                && let Some(slot) = cells.get_mut((row * grid.wide + column) as usize)
+            {
+                *slot = WALL;
+            }
+        }
+    }
+    cells
+}
+
+fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+    let width = host.width();
+    let wide = held.counted("wide").unwrap_or(128).clamp(16, 1024);
+    let deep = held.counted("deep").unwrap_or(128).clamp(16, 1024);
+    let grid = Grid::of(wide, deep);
+    let frames = held.counted("frames").unwrap_or(200).clamp(1, 1 << 14);
+    let batch = held.counted("batch").unwrap_or(20).clamp(1, 256);
+    let most = held.counted("most").unwrap_or(64).clamp(1, 1 << 14) as usize;
+    let walls = !matches!(held.get("walls"), Some(Json::Bool(false)));
+
+    let quads = grid.quads();
+    let plan = Plan::over(width, quads.div_ceil(sweep::cells(width)))?;
+    let (passes, stages) = crate::live::wired(width, grid, &plan, None)?;
+    let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = plan.sizes();
+    let mut resident = host.resident(&sizes, &modules)?;
+    for (binding, words) in sizes.iter().enumerate() {
+        resident.write(binding, &vec![0_u32; *words])?;
+    }
+
+    let mut cells = walled(grid, walls);
+    for one in held.get("cells").and_then(Json::list).unwrap_or(&[]) {
+        let at = one.counted("at").ok_or("a cell needs an at")? as usize;
+        let named = one.get("is").and_then(Json::text).unwrap_or("sand");
+        let stuff = stuff_named(named)
+            .ok_or_else(|| format!("{named} is not one of {}", STUFF_NAMED.join(", ")))?;
+        let slot = cells
+            .get_mut(at)
+            .ok_or_else(|| format!("at {at} is outside the {} cells", grid.cells()))?;
+        *slot = stuff;
+    }
+
+    resident.write(STATE as usize, &cells)?;
+    resident.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
+    crate::live::seed(&mut resident, grid, &plan)?;
+    resident.staged(&groups)?;
+
+    // The brush is what pours. Left out, whatever the caller placed is all
+    // there is, and the answer is about how that settles.
+    let brush = held.get("brush");
+    let spout = brush.and_then(|one| one.counted("at")).map(|at| {
+        (at % grid.wide, at / grid.wide)
+    });
+    let span = brush.and_then(|one| one.counted("span")).unwrap_or(49);
+    let pouring = brush
+        .and_then(|one| one.counted("frames"))
+        .unwrap_or(frames / 2)
+        .min(frames);
+    let named = brush
+        .and_then(|one| one.get("is"))
+        .and_then(Json::text)
+        .unwrap_or("sand");
+    let stuff = stuff_named(named)
+        .ok_or_else(|| format!("{named} is not one of {}", STUFF_NAMED.join(", ")))?;
+
+    let mut listed = 0_u64;
+    let mut looked = 0_u64;
+    for frame in (0..frames).step_by(batch as usize) {
+        if let Some((x, y)) = spout {
+            let material = if frame < pouring { stuff } else { AIR };
+            resident.write_at(PARAMS as usize, BRUSH, &[x, y, span, material])?;
+        }
+        resident.staged_frames(&groups, batch)?;
+        listed += u64::from(
+            resident
+                .read(GRAND as usize, 1)?
+                .first()
+                .copied()
+                .unwrap_or(0),
+        );
+        looked += 1;
+    }
+
+    let ended = resident.read(STATE as usize, grid.cells())?;
+    let mut tally = [0_u64; 4];
+    for one in &ended {
+        if let Some(slot) = tally.get_mut(*one as usize) {
+            *slot += 1;
+        }
+    }
+    // Where the settled stuff lies, a row at a time. A pile and a puddle hold
+    // the same number of cells and do not look the same lying down.
+    let rows: Vec<Json> = (0..grid.deep)
+        .map(|row| {
+            let held = (0..grid.wide)
+                .filter(|column| {
+                    ended
+                        .get((row * grid.wide + column) as usize)
+                        .is_some_and(|one| *one == SAND || *one == WATER)
+                })
+                .count();
+            counted(held as u32)
+        })
+        .collect();
+    let standing: Vec<(usize, u32)> = ended
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| **one != AIR && **one != WALL)
+        .map(|(at, one)| (at, *one))
+        .take(most)
+        .collect();
+
+    Ok(map(vec![
+        (
+            "grid",
+            map(vec![
+                ("wide", counted(grid.wide)),
+                ("deep", counted(grid.deep)),
+                ("cells", counted(grid.cells() as u32)),
+            ]),
+        ),
+        ("frames", counted(frames)),
+        (
+            "tally",
+            map(vec![
+                ("air", Json::Int(tally.first().copied().unwrap_or(0) as i64)),
+                ("water", Json::Int(tally.get(1).copied().unwrap_or(0) as i64)),
+                ("sand", Json::Int(tally.get(2).copied().unwrap_or(0) as i64)),
+                ("wall", Json::Int(tally.get(3).copied().unwrap_or(0) as i64)),
+            ]),
+        ),
+        ("rows", Json::List(rows)),
+        (
+            "standing",
+            Json::List(
+                standing
+                    .iter()
+                    .map(|(at, one)| {
+                        map(vec![
+                            ("at", counted(*at as u32)),
+                            (
+                                "is",
+                                text(STUFF_NAMED.get(*one as usize).copied().unwrap_or("air")),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "listed",
+            Json::Int((listed / looked.max(1)) as i64),
+        ),
+        ("of_quads", counted(quads)),
+        ("checked_on_the_host", Json::Bool(true)),
+        (
+            "listed_means",
+            text("how many quads the work list named on an average look, out of of_quads in the whole grid; the engine steps what the list names, so this is what the frame actually cost rather than how big the grid is"),
+        ),
+        (
+            "rows_means",
+            text("how many cells of sand or water lie in each row, top row first; a pile and a puddle hold the same count and do not lie down the same way"),
+        ),
+    ]))
+}
+
 fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
     if name == "grit_slope" {
         let Some(host) = host else {
             return Err(Box::new(crate::host::Error::NoComputeDevice));
         };
         return slid(host, held);
+    }
+    if name == "grit_pour" {
+        let Some(host) = host else {
+            return Err(Box::new(crate::host::Error::NoComputeDevice));
+        };
+        return poured(host, held);
     }
     if name == "grit_settle" {
         let Some(host) = host else {
