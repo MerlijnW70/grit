@@ -1,3 +1,4 @@
+use crate::board::seated;
 use crate::host::Host;
 use crate::machine::Machine;
 use crate::marking::{
@@ -5,7 +6,9 @@ use crate::marking::{
     turned_on, words_of,
 };
 use crate::netlist::{Chip, Exam, Gate, Netlist, drawn};
+use crate::rule::{KNOB, Kind, POINT};
 use crate::resident::Groups;
+use crate::sand::Grid;
 use crate::wire::{Json, counted, map, text};
 
 pub const CROWD: u32 = 65536;
@@ -638,6 +641,51 @@ fn tools() -> Json {
             ("inputSchema", held(laddering)),
         ]),
         map(vec![
+            ("name", text("grit_slope")),
+            (
+                "description",
+                text(
+                    "Step a grid of cells forward under one of the rules and carry a weight back through the same walk, which is how far the cell you name depends on everything else. Returns where the grid ended, which cells the weight reached and how loudly, how far it travelled, and the two rule gradients as an exact fraction. The walk back is not a second model of the first: the frames are undone and recomputed, so a depth that would not fit on the card as a tape still runs. Nothing is searched and nothing is fitted; this is the derivative, and what to do with it is the caller's.",
+                ),
+            ),
+            (
+                "inputSchema",
+                map(vec![
+                    ("type", text("object")),
+                    (
+                        "properties",
+                        map(vec![
+                            ("wide", map(vec![("type", text("integer")), ("description", text("cells across; rounded up to a power of two"))])),
+                            ("deep", map(vec![("type", text("integer")), ("description", text("cells down; rounded up to a power of two"))])),
+                            (
+                                "kind",
+                                map(vec![
+                                    ("type", text("string")),
+                                    ("enum", Json::List(KINDS_NAMED.iter().map(|one| text(one)).collect())),
+                                    ("description", text("which rule the cells follow")),
+                                ]),
+                            ),
+                            ("turning", map(vec![("type", text("integer")), ("description", text("the first rule parameter, the one the gradient calls turning"))])),
+                            ("swing", map(vec![("type", text("integer")), ("description", text("the second rule parameter"))])),
+                            ("depth", map(vec![("type", text("integer")), ("description", text("how many frames to walk"))])),
+                            ("at", map(vec![("type", text("integer")), ("description", text("the cell whose weight is carried back; the middle of the grid if left out"))])),
+                            ("fill", map(vec![("type", text("integer")), ("description", text("what every cell holds before the named ones are set"))])),
+                            (
+                                "cells",
+                                map(vec![
+                                    ("type", text("array")),
+                                    ("description", text("the cells to set before the walk, each an object of at and is; everything else takes fill")),
+                                    ("items", map(vec![("type", text("object"))])),
+                                ]),
+                            ),
+                            ("carry", map(vec![("type", text("boolean")), ("description", text("false walks forward only and answers without a slope"))])),
+                            ("most", map(vec![("type", text("integer")), ("description", text("how many cells to name in each answer, loudest first"))])),
+                        ]),
+                    ),
+                ]),
+            ),
+        ]),
+        map(vec![
             ("name", text("grit_check")),
             (
                 "description",
@@ -716,7 +764,174 @@ fn asked_machine(held: &Json) -> Result<(Machine, Runs), Box<dyn std::error::Err
     Ok((machine, traces))
 }
 
+fn kind_named(name: &str) -> Option<Kind> {
+    Some(match name {
+        "product" => Kind::Product,
+        "sum" => Kind::Sum,
+        "turn" => Kind::Turn,
+        "bound" => Kind::Bound,
+        "smooth" => Kind::Smooth,
+        "living" => Kind::Living,
+        "twinned" => Kind::Twinned,
+        _ => return None,
+    })
+}
+
+pub const KINDS_NAMED: [&str; 7] = [
+    "product", "sum", "turn", "bound", "smooth", "living", "twinned",
+];
+
+/// A cell and what is in it, so neither the start nor the answer has to spell
+/// out every cell of the grid. The engine is sparse and so is this.
+fn sown(held: &Json, grid: Grid, fill: u32) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let mut cells = vec![fill; grid.cells()];
+    for one in held.get("cells").and_then(Json::list).unwrap_or(&[]) {
+        let at = one.counted("at").ok_or("a cell needs an at")? as usize;
+        let value = one.counted("is").unwrap_or(1);
+        let held = cells.get_mut(at).ok_or_else(|| {
+            format!("at {at} is outside the {} cells of this grid", grid.cells())
+        })?;
+        *held = value;
+    }
+    Ok(cells)
+}
+
+/// The non-zero entries, loudest first, and no more than `most` of them.
+fn loudest(held: &[i32], most: usize) -> (Json, u32) {
+    let mut heard: Vec<(usize, i32)> = held
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| **one != 0)
+        .map(|(at, one)| (at, *one))
+        .collect();
+    let count = heard.len() as u32;
+    heard.sort_by_key(|(at, one)| (std::cmp::Reverse(one.unsigned_abs()), *at));
+    heard.truncate(most);
+    (
+        Json::List(
+            heard
+                .iter()
+                .map(|(at, one)| {
+                    map(vec![
+                        ("at", counted(*at as u32)),
+                        ("is", Json::Int(i64::from(*one))),
+                    ])
+                })
+                .collect(),
+        ),
+        count,
+    )
+}
+
+/// How far from `at` the weight reached, in cells, along the grid.
+fn reached(grid: Grid, slope: &[i32], at: usize) -> u32 {
+    let named = |one: usize| (one as u32 % grid.wide, one as u32 / grid.wide);
+    let (home_x, home_y) = named(at);
+    slope
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| **one != 0)
+        .map(|(one, _)| {
+            let (x, y) = named(one);
+            x.abs_diff(home_x).max(y.abs_diff(home_y))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn slid(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+    let wide = held.counted("wide").unwrap_or(32).clamp(2, 256);
+    let deep = held.counted("deep").unwrap_or(32).clamp(2, 256);
+    let grid = Grid::of(wide, deep);
+    let named = held.get("kind").and_then(Json::text).unwrap_or("living");
+    let kind = kind_named(named).ok_or_else(|| {
+        format!(
+            "kind {named} is not one of {}",
+            KINDS_NAMED.join(", ")
+        )
+    })?;
+    let turning = held.counted("turning").unwrap_or(KNOB);
+    let swing = held.counted("swing").unwrap_or(0);
+    let depth = held.counted("depth").unwrap_or(16).clamp(1, 1 << 12);
+    let most = held.counted("most").unwrap_or(32).clamp(1, 4096) as usize;
+    let middle = (grid.deep / 2 * grid.wide + grid.wide / 2) as usize;
+    let at = held.counted("at").unwrap_or(middle as u32) as usize;
+    if at >= grid.cells() {
+        return Err(format!("at {at} is outside the {} cells of this grid", grid.cells()).into());
+    }
+    let cells = sown(held, grid, held.counted("fill").unwrap_or(0))?;
+
+    let mut board = seated(host, grid, kind, (turning, swing), depth)?;
+    // Json carries no bool accessor, and adding one for this would be a change
+    // to the wire format's shape rather than to this tool.
+    let carrying = !matches!(held.get("carry"), Some(Json::Bool(false)));
+    let (ended, slope) = if carrying {
+        let mut weight = vec![0_u32; grid.cells()];
+        let seat = weight.get_mut(at).ok_or("at is outside the grid")?;
+        *seat = 1 << POINT;
+        // carry answers with the weight it carried back first and the grid it
+        // ended on second. Both are as many u32 as there are cells, so taking
+        // them the other way round compiles and quietly reports each as the
+        // other: the grid looked like a slope that reached every cell in one
+        // frame, and the slope looked like a grid.
+        let (slope, ended) = board.carry(&cells, &weight)?;
+        let slope: Vec<i32> = slope.iter().map(|one| *one as i32).collect();
+        (ended, Some(slope))
+    } else {
+        (board.run(&cells)?, None)
+    };
+
+    let settled: Vec<i32> = ended.iter().map(|one| *one as i32).collect();
+    let (shown, standing) = loudest(&settled, most);
+    let mut answer = vec![
+        (
+            "grid",
+            map(vec![
+                ("wide", counted(grid.wide)),
+                ("deep", counted(grid.deep)),
+                ("cells", counted(grid.cells() as u32)),
+            ]),
+        ),
+        ("kind", text(named)),
+        ("depth", counted(depth)),
+        ("at", counted(at as u32)),
+        ("ended", shown),
+        ("standing", counted(standing)),
+        ("checked_on_the_host", Json::Bool(true)),
+    ];
+    if let Some(slope) = slope {
+        let (shown, heard) = loudest(&slope, most);
+        let (turning, swing, over) = board.told_parts()?;
+        answer.push(("slope", shown));
+        answer.push(("heard", counted(heard)));
+        answer.push(("reach", counted(reached(grid, &slope, at))));
+        answer.push((
+            "told",
+            map(vec![
+                ("turning", Json::Int(turning)),
+                ("swing", Json::Int(swing)),
+                ("over", Json::Int(over)),
+                (
+                    "read_it_as",
+                    text("turning and swing are each divided by over; they are kept apart so nothing is rounded here"),
+                ),
+            ]),
+        ));
+        answer.push((
+            "heard_means",
+            text("how many cells the weight at `at` reached after `depth` frames, which is what that cell's future is made of"),
+        ));
+    }
+    Ok(map(answer))
+}
+
 fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+    if name == "grit_slope" {
+        let Some(host) = host else {
+            return Err(Box::new(crate::host::Error::NoComputeDevice));
+        };
+        return slid(host, held);
+    }
     if name == "grit_machine" {
         let (machine, traces) = asked_machine(held)?;
         let steps = machine.steps;

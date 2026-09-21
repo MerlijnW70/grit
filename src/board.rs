@@ -111,6 +111,20 @@ impl Board<'_> {
             .collect())
     }
 
+    /// The two gradients as an exact fraction, for callers that cannot hold a
+    /// float. `told` is this divided out; the parts are the same numbers before
+    /// the division, so nothing is rounded on the way to a caller that wants to
+    /// do the arithmetic itself.
+    pub fn told_parts(&mut self) -> Result<(i64, i64, i64), Error> {
+        let piled = |held: Vec<u32>| held.iter().map(|one| i64::from(*one as i32)).sum::<i64>();
+        let turning = self
+            .resident
+            .read(TOLD_TURNING as usize, self.grid.cells())?;
+        let swing = self.resident.read(TOLD_SWING as usize, self.grid.cells())?;
+        let back = i64::from(1_u32 << SPARE) * i64::from(self.loud);
+        Ok((piled(turning), piled(swing), back))
+    }
+
     pub fn told(&mut self) -> Result<(f64, f64), Error> {
         let piled = |held: Vec<u32>| held.iter().map(|one| f64::from(*one as i32)).sum::<f64>();
         let turning = self

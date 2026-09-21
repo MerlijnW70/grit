@@ -51,7 +51,7 @@ fn a_torn_line_is_read_back_as_it_was_written() {
 }
 
 #[test]
-fn the_server_names_the_three_tools_it_has() {
+fn the_server_names_every_tool_it_has() {
     let asked = read("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}").unwrap();
     let answer = handle(None, &asked).unwrap();
     let tools = answer
@@ -70,6 +70,7 @@ fn the_server_names_the_three_tools_it_has() {
             "grit_machine",
             "grit_synthesise",
             "grit_least",
+            "grit_slope",
             "grit_check"
         ]
     );
@@ -696,5 +697,124 @@ fn the_ladder_steps_over_a_budget_that_fails_to_reach_one_below_it_that_does_not
         twelve.get("solved"),
         Some(&Json::Bool(false)),
         "the hole is on the ladder for the caller to see"
+    );
+}
+
+fn sloped(host: Option<&Host>, arguments: &str) -> Json {
+    structured(&call(host, "grit_slope", arguments))
+}
+
+#[test]
+fn the_slope_names_the_cells_the_weight_reached_and_counts_the_ones_it_does_not_name() {
+    let Some(host) = device("slope") else {
+        return;
+    };
+    let answer = sloped(
+        Some(&host),
+        "{\"wide\":32,\"deep\":32,\"kind\":\"living\",\"depth\":8,\"fill\":1000,\"cells\":[{\"at\":528,\"is\":60000}],\"most\":4}",
+    );
+    let named = answer.get("slope").and_then(Json::list).unwrap().len();
+    let heard = answer.counted("heard").unwrap();
+    assert_eq!(named, 4, "most is a cap on what is named");
+    assert!(
+        heard > named as u32,
+        "heard counts every cell the weight reached, not only the four it named"
+    );
+    assert_eq!(answer.counted("at").unwrap(), 528);
+    assert_eq!(
+        answer.get("kind").and_then(Json::text).unwrap(),
+        "living",
+        "the rule it walked comes back with the answer"
+    );
+    assert_eq!(answer.get("checked_on_the_host"), Some(&Json::Bool(true)));
+}
+
+#[test]
+fn the_weight_reaches_exactly_one_cell_a_frame() {
+    let Some(host) = device("slope reach") else {
+        return;
+    };
+    // A 128 wide grid, because reach cannot exceed half the grid and a 32 wide
+    // one is already saturated after two frames.
+    let asked = |depth: u32| {
+        sloped(
+            Some(&host),
+            &format!(
+                "{{\"wide\":128,\"deep\":128,\"depth\":{depth},\"fill\":1000,\"cells\":[{{\"at\":8256,\"is\":60000}}]}}"
+            ),
+        )
+        .counted("reach")
+        .unwrap()
+    };
+    // The walk back has a light cone: a cell's future is made of what is within
+    // one cell a frame of it, and no more. That is a property of the rule rather
+    // than of this tool, which makes it worth pinning - it would catch the grid
+    // and the slope being answered as each other, since the grid is non-zero
+    // everywhere and would read as a cone that swallowed the board in one frame.
+    for depth in [1_u32, 2, 4, 12] {
+        assert_eq!(
+            asked(depth),
+            depth,
+            "the weight reaches exactly one cell a frame, so depth {depth} reaches {depth}"
+        );
+    }
+}
+
+#[test]
+fn walking_forward_only_answers_without_a_slope() {
+    let Some(host) = device("slope forward") else {
+        return;
+    };
+    let answer = sloped(
+        Some(&host),
+        "{\"wide\":32,\"deep\":32,\"depth\":4,\"fill\":1000,\"carry\":false}",
+    );
+    assert_eq!(answer.get("slope"), None, "nothing was carried back");
+    assert_eq!(answer.get("told"), None);
+    assert!(answer.get("ended").is_some(), "the walk still happened");
+}
+
+#[test]
+fn the_two_gradients_come_back_as_a_fraction_that_is_never_rounded() {
+    let Some(host) = device("slope told") else {
+        return;
+    };
+    let answer = sloped(
+        Some(&host),
+        "{\"wide\":32,\"deep\":32,\"depth\":8,\"fill\":1000,\"cells\":[{\"at\":528,\"is\":60000}]}",
+    );
+    let told = answer.get("told").unwrap();
+    let over = told.get("over").and_then(Json::int).unwrap();
+    assert!(over > 0, "a fraction needs a divisor");
+    assert!(
+        told.get("turning").and_then(Json::int).is_some(),
+        "turning is an integer, so the caller does the division and nothing is lost here"
+    );
+}
+
+#[test]
+fn a_kind_that_is_not_in_the_kit_is_named_rather_than_guessed_at() {
+    let answer = call(None, "grit_slope", "{\"kind\":\"treacle\"}");
+    let said = written(&answer);
+    assert!(
+        said.contains("treacle") || said.contains("NoComputeDevice"),
+        "either it names the kind it does not know, or it says it has no device: {said}"
+    );
+}
+
+#[test]
+fn a_cell_outside_the_grid_is_refused_rather_than_wrapped() {
+    let Some(host) = device("slope outside") else {
+        return;
+    };
+    let answer = call(
+        Some(&host),
+        "grit_slope",
+        "{\"wide\":32,\"deep\":32,\"cells\":[{\"at\":99999,\"is\":1}]}",
+    );
+    let said = written(&answer);
+    assert!(
+        said.contains("outside"),
+        "setting a cell off the grid has to be said, not folded back in: {said}"
     );
 }
