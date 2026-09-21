@@ -16,6 +16,7 @@ somebody meant by "a tall heap", and that is the whole of what gets asked.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -338,8 +339,28 @@ class Poured:
         return self.scene
 
 
-def pour(binary, scene: str, arguments: dict) -> Poured:
-    answer = grit("grit_pour", arguments, binary)
+def kept_at(arguments: dict) -> Path:
+    """Where a scene's outcome is remembered, named after what made it."""
+    named = hashlib.sha1(json.dumps(arguments, sort_keys=True).encode()).hexdigest()
+    return Path(os.environ.get("GRIT_POURS", Path(__file__).parent / ".pours")) / f"{named}.json"
+
+
+def pour(binary, scene: str, arguments: dict, again: bool = False) -> Poured:
+    """Pour a scene, or read back the one poured from exactly these arguments.
+
+    A scene is a function of its arguments and the engine is deterministic, so
+    pouring it twice is the same room twice. Asking one set of scenes a dozen
+    questions used to pour them a dozen times; now it pours them once. The name
+    of the file is the arguments, so changing anything about a scene misses the
+    cache rather than returning the old room under the new name.
+    """
+    held = kept_at(arguments)
+    if not again and held.exists():
+        answer = json.loads(held.read_text(encoding="utf-8"))
+    else:
+        answer = grit("grit_pour", arguments, binary)
+        held.parent.mkdir(parents=True, exist_ok=True)
+        held.write_text(json.dumps(answer), encoding="utf-8")
     return Poured(scene=scene,
                   rows=list(answer.get("rows", [])),
                   columns=list(answer.get("columns", [])),
@@ -512,6 +533,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="what the settled room should be like, in plain English")
     parser.add_argument("--cases", help="JSON file of your own descriptions and the "
                                         "rule each is marked against")
+    parser.add_argument("--again", action="store_true",
+                        help="pour the scenes again rather than reading back the "
+                             "rooms these same arguments made last time")
     parser.add_argument("--apart", action="store_true",
                         help="ask what the sentence is about and which way it wants "
                              "it as two questions instead of one")
@@ -531,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
         print("TYPESAFE_API_KEY is not set (console.typesafe.ai/keys)", file=sys.stderr)
         return 2
 
-    tried = [pour(args.mcp, scene, arguments) for scene, arguments in SCENES]
+    tried = [pour(args.mcp, scene, arguments, args.again) for scene, arguments in SCENES]
 
     if args.check:
         return marked(tried, args)

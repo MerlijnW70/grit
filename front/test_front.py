@@ -488,6 +488,43 @@ class Asking(unittest.TestCase):
         # middle one is the extreme of nothing.
         self.assertEqual(world.would_pick(same, 1), [])
 
+    def test_a_remembered_room_is_named_after_what_made_it(self):
+        one = {"wide": 64, "frames": 100}
+        same = {"frames": 100, "wide": 64}
+        other = {"wide": 64, "frames": 101}
+        self.assertEqual(world.kept_at(one), world.kept_at(same),
+                         "the same arguments in another order are the same scene")
+        self.assertNotEqual(world.kept_at(one), world.kept_at(other),
+                            "one frame more is a different room and must miss")
+
+    def test_a_remembered_room_is_read_back_rather_than_poured_again(self):
+        from tempfile import mkdtemp
+        held = mkdtemp()
+        was = os.environ.get("GRIT_POURS")
+        os.environ["GRIT_POURS"] = held
+        real = world.grit
+        poured = []
+
+        def once(tool, arguments, binary, timeout=900):
+            poured.append(tool)
+            return {"rows": [1, 2], "columns": [1, 1, 0], "tally": {"sand": 3},
+                    "listed": 7}
+        world.grit = once
+        try:
+            first = world.pour("unused", "a scene", {"wide": 8, "frames": 3})
+            second = world.pour("unused", "a scene", {"wide": 8, "frames": 3})
+            self.assertEqual(len(poured), 1, "the second read the first one back")
+            self.assertEqual(first.rows, second.rows)
+            self.assertEqual(second.listed, 7)
+            world.pour("unused", "a scene", {"wide": 8, "frames": 3}, again=True)
+            self.assertEqual(len(poured), 2, "--again pours it whatever is held")
+        finally:
+            world.grit = real
+            if was is None:
+                del os.environ["GRIT_POURS"]
+            else:
+                os.environ["GRIT_POURS"] = was
+
     def test_an_unknown_measure_is_left_to_the_rule_to_refuse(self):
         # parted says nothing about a rule it does not know; picked is the one
         # that names it, so the message comes from one place.
