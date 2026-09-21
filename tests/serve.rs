@@ -196,6 +196,48 @@ fn a_machine_that_counts_when_told_to_is_found_from_its_runs() {
 }
 
 #[test]
+fn a_machine_given_its_gates_is_marked_rather_than_searched_and_needs_no_device() {
+    let counter = "[{\"kind\":8,\"left\":0,\"right\":2},{\"kind\":6,\"left\":0,\"right\":2},{\"kind\":6,\"left\":1,\"right\":3},{\"kind\":8,\"left\":0,\"right\":0},{\"kind\":8,\"left\":1,\"right\":1}]";
+    let arguments = format!(
+        "{{\"state\":2,\"inputs\":1,\"outputs\":2,\"gates\":5,\"traces\":[{}],\"chip\":{counter}}}",
+        counting(16)
+    );
+    let held = structured(&call(None, "grit_machine", &arguments));
+    eprintln!("{}", written(&held));
+    assert_eq!(
+        held.get("solved"),
+        Some(&Json::Bool(true)),
+        "a counter written out by hand should count: {}",
+        written(&held)
+    );
+    assert_eq!(held.counted("marks"), held.counted("of"));
+    assert_eq!(held.counted("rounds"), Some(0), "nothing was searched");
+    assert_eq!(held.get("wrong").and_then(Json::list).unwrap().len(), 0);
+
+    let broken = counter.replace(
+        "{\"kind\":6,\"left\":0,\"right\":2}",
+        "{\"kind\":8,\"left\":0,\"right\":2}",
+    );
+    let arguments = format!(
+        "{{\"state\":2,\"inputs\":1,\"outputs\":2,\"gates\":5,\"traces\":[{}],\"chip\":{broken}}}",
+        counting(16)
+    );
+    let held = structured(&call(None, "grit_machine", &arguments));
+    assert_eq!(
+        held.get("solved"),
+        Some(&Json::Bool(false)),
+        "one gate turned from xor to and should stop it counting"
+    );
+    let wrong = held.get("wrong").and_then(Json::list).unwrap();
+    eprintln!(
+        "the broken one misses {} steps, first {}",
+        wrong.len(),
+        written(&wrong[0])
+    );
+    assert!(!wrong.is_empty(), "it should name the steps it missed");
+}
+
+#[test]
 fn a_machine_with_no_room_to_remember_cannot_count_and_says_which_steps_it_missed() {
     let Some(host) =
         device("a_machine_with_no_room_to_remember_cannot_count_and_says_which_steps_it_missed")

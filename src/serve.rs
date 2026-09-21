@@ -231,6 +231,49 @@ fn laid(held: Machine, traces: &[(Vec<u32>, Vec<u32>)], wide: u32) -> (Vec<u32>,
     (feed, want)
 }
 
+pub fn marked_machine(
+    held: Machine,
+    traces: &[(Vec<u32>, Vec<u32>)],
+    gates: &[u32],
+) -> Result<Ran, Box<dyn std::error::Error>> {
+    let shape = held.shape()?;
+    let chip = Chip::of(shape, gates.to_vec(), held.named())?;
+    told_of(held, traces, &chip, gates, 0, 0)
+}
+
+fn told_of(
+    held: Machine,
+    traces: &[(Vec<u32>, Vec<u32>)],
+    chip: &Chip,
+    gates: &[u32],
+    rounds: u32,
+    crowd: u32,
+) -> Result<Ran, Box<dyn std::error::Error>> {
+    let mut marks = 0_u32;
+    let mut said = Vec::new();
+    let mut wrong = Vec::new();
+    for (at, (given, wanted)) in traces.iter().enumerate() {
+        let answers = held.ran(chip, given);
+        marks += held.scored(chip, given, wanted);
+        for (tick, one) in answers.iter().enumerate() {
+            if wanted.get(tick).copied() != Some(*one) {
+                wrong.push((u32::try_from(at)?, u32::try_from(tick)?));
+            }
+        }
+        said.push(answers);
+    }
+    Ok(Ran {
+        marks,
+        full: held.marks() * u32::try_from(traces.len())?,
+        rounds,
+        crowd,
+        traces: u32::try_from(traces.len())?,
+        gates: gates.iter().map(|one| Gate::unpack(*one)).collect(),
+        said,
+        wrong,
+    })
+}
+
 pub fn machined(
     host: &Host,
     held: Machine,
@@ -300,30 +343,7 @@ pub fn machined(
     let to = from + shape.gates as usize;
     let gates = chips.get(from..to).unwrap_or(&[]).to_vec();
     let chip = Chip::of(shape, gates.clone(), held.named())?;
-
-    let mut marks = 0_u32;
-    let mut said = Vec::new();
-    let mut wrong = Vec::new();
-    for (at, (given, wanted)) in traces.iter().enumerate() {
-        let answers = held.ran(&chip, given);
-        marks += held.scored(&chip, given, wanted);
-        for (tick, one) in answers.iter().enumerate() {
-            if wanted.get(tick).copied() != Some(*one) {
-                wrong.push((u32::try_from(at)?, u32::try_from(tick)?));
-            }
-        }
-        said.push(answers);
-    }
-    Ok(Ran {
-        marks,
-        full: held.marks() * u32::try_from(traces.len())?,
-        rounds: done,
-        crowd: many,
-        traces: u32::try_from(traces.len())?,
-        gates: gates.iter().map(|one| Gate::unpack(*one)).collect(),
-        said,
-        wrong,
-    })
+    told_of(held, traces, &chip, &gates, done, many)
 }
 
 fn told(found: &Found, sought: bool) -> Json {
@@ -625,13 +645,18 @@ fn asked_machine(held: &Json) -> Result<(Machine, Runs), Box<dyn std::error::Err
 
 fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
     if name == "grit_machine" {
-        let Some(host) = host else {
-            return Err(Box::new(crate::host::Error::NoComputeDevice));
-        };
         let (machine, traces) = asked_machine(held)?;
-        let many = held.counted("crowd").unwrap_or(CROWD).clamp(64, 1 << 20);
-        let rounds = held.counted("rounds").unwrap_or(ROUNDS).clamp(1, 1 << 20);
-        let told = machined(host, machine, &traces, many, rounds)?;
+        let told = if held.get("chip").is_some() {
+            let shape = machine.shape()?;
+            marked_machine(machine, &traces, &given(held, shape)?)?
+        } else {
+            let Some(host) = host else {
+                return Err(Box::new(crate::host::Error::NoComputeDevice));
+            };
+            let many = held.counted("crowd").unwrap_or(CROWD).clamp(64, 1 << 20);
+            let rounds = held.counted("rounds").unwrap_or(ROUNDS).clamp(1, 1 << 20);
+            machined(host, machine, &traces, many, rounds)?
+        };
         return Ok(map(vec![
             ("solved", Json::Bool(told.marks >= told.full)),
             ("marks", counted(told.marks)),
