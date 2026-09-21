@@ -24,6 +24,8 @@ from tempfile import mkdtemp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from typesafe_sdk import Choice
+
 import bench
 import machine
 import spec
@@ -204,8 +206,9 @@ class Bench(unittest.TestCase):
 
 
 class FakeAnswer:
-    def __init__(self, noul=None, choice=None, confidence=1.0):
+    def __init__(self, noul=None, choice=None, confidence=1.0, probabilities=None):
         self.noul, self.choice, self.confidence = noul, choice, confidence
+        self.probabilities = probabilities or {}
 
 
 class FakeResponse:
@@ -239,9 +242,17 @@ class FakeClient:
         self.asked.append(list(questions))
         nouls, choices = {}, {}
         for qid in questions:
-            if qid == "span":
-                choices[qid] = FakeAnswer(choice=self.script["span"],
-                                          confidence=self.script.get("span_confidence", 1.0))
+            # Branch on what kind of question it is, not on its name, so a new
+            # question of an existing kind does not need this stand-in changed.
+            if isinstance(questions[qid], Choice):
+                picked = self.script.get(qid, next(iter(questions[qid].criteria)))
+                choices[qid] = FakeAnswer(
+                    choice=picked,
+                    confidence=self.script.get(f"{qid}_confidence", 1.0),
+                    probabilities={
+                        name: (1.0 if name == picked else 0.0)
+                        for name in questions[qid].criteria
+                    })
             elif "by_text" in self.script:
                 nouls[qid] = FakeAnswer(
                     noul=self.script["by_text"](qid, questions[qid].instructions))
@@ -278,14 +289,14 @@ class Refusing(Driving_machine, unittest.TestCase):
 
     def test_an_accumulating_rule_is_refused(self):
         code, said, _ = self.drive(
-            {"span": "2", "noul": lambda q: 0.05 if q == "windowed" else 0.9},
+            {"span": "2", "route": "carried", "noul": lambda q: 0.05 if q == "windowed" else 0.9},
             ["counts the 1s so far"])
         self.assertEqual(code, 3)
         self.assertIn("running tally", said)
 
     def test_a_window_deeper_than_the_options_is_refused(self):
         code, said, _ = self.drive(
-            {"span": "more", "noul": lambda q: 0.95 if q == "windowed" else 0.05},
+            {"span": "more", "route": "window", "noul": lambda q: 0.95 if q == "windowed" else 0.05},
             ["looks a long way back"])
         self.assertEqual(code, 3)
         self.assertIn("further back", said)
@@ -293,7 +304,7 @@ class Refusing(Driving_machine, unittest.TestCase):
     def test_a_table_of_coin_flips_is_refused(self):
         # Every window answered at dead centre: nothing to build a machine on.
         code, said, _ = self.drive(
-            {"span": "2", "noul": lambda q: 0.95 if q == "windowed"
+            {"span": "2", "route": "window", "noul": lambda q: 0.95 if q == "windowed"
                 else 0.05 if q == "accumulates" else 0.5},
             ["something the window cannot carry"])
         self.assertEqual(code, 3)
@@ -301,7 +312,7 @@ class Refusing(Driving_machine, unittest.TestCase):
 
     def test_a_clean_window_rule_reaches_grit(self):
         code, said, _ = self.drive(
-            {"span": "2", "noul": lambda q: 0.95 if q == "windowed"
+            {"span": "2", "route": "window", "noul": lambda q: 0.95 if q == "windowed"
                 else 0.05 if q == "accumulates" else (0.95 if q.startswith("w2") else 0.02)},
             ["a plain window rule", "--runs", "2", "--steps", "6"])
         self.assertIn(code, (0, 1))
@@ -321,7 +332,7 @@ class Pruning(Driving_machine, unittest.TestCase):
                 if q.startswith("rel"):
                     return 0.95 if (q.startswith("rel0") or not only_now) else 0.02
                 return 0.95 if q.startswith("w2") else 0.02
-            return {"span": "2", "noul": noul}
+            return {"span": "2", "route": "window", "noul": noul}
 
         argv = ["a rule", "-i", "a,b", "--runs", "2", "--steps", "6", "--prune"]
         _, _, wide = self.drive(script(only_now=False), argv)
@@ -337,7 +348,7 @@ class Pruning(Driving_machine, unittest.TestCase):
         def noul(qid, text):
             return 0.95 if "the step immediately before this one, a=0, b=1" in text else 0.05
 
-        client = FakeClient({"span": "2", "noul": lambda q: 0.5, "by_text": noul})
+        client = FakeClient({"span": "2", "route": "window", "noul": lambda q: 0.5, "by_text": noul})
         honest = {(0, "a"): 0.9, (1, "b"): 0.9, (0, "b"): 0.01, (1, "a"): 0.01}
         lied = dict(honest)
         lied[(1, "b")] = 0.0
@@ -351,7 +362,7 @@ class Pruning(Driving_machine, unittest.TestCase):
     def test_the_check_pays_for_every_probe_it_reads(self):
         # It once asked every background and compared only the first few, so
         # exhaustive coverage was bought and thrown away.
-        client = FakeClient({"span": "2", "noul": lambda q: 0.05})
+        client = FakeClient({"span": "2", "route": "window", "noul": lambda q: 0.05})
         machine.check_pruning(client, "r", 2, ["a", "b"], ["out"],
                               {(0, "a"): 0.9, (0, "b"): 0.01, (1, "a"): 0.01, (1, "b"): 0.01})
         asked = len(client.asked[-1])

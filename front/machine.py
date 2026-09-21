@@ -49,20 +49,26 @@ from typesafe_sdk import Choice, Noul, TypeSafeAPIError, TypeSafeClient
 
 from spec import DEFAULT_MCP, grit
 
-# Unlike the other two thresholds in this tool, this one is a real cut and not a
-# preference. `bench.py --suite route` stresses the boundary from both sides -
+# The decision is the Choice, and this is the floor on the share it gives the
+# window. Unlike the other two thresholds in this tool, this one is a real cut
+# and not a preference. `bench.py --suite route` stresses the boundary from both sides -
 # windows worded like accumulators ("at least two of the last three", "the last
 # four add up to more than two") and accumulators worded like windows ("three 1s
 # have arrived in a row at some point, and it stays 1 from then on") - and the
 # two populations land at opposite ends with nothing in between. Almost any
 # floor separates them, so this number is not delicate.
 #
-# `windowed` carries the decision. `accumulates` is corroboration and is read
-# literally: a latch that remembers whether something ever happened is a single
-# remembered bit rather than a running tally, so it scores low on a question
-# about tallies while still being no kind of window. Taking the pair together -
-# min(windowed, 1 - accumulates) - routes it correctly where either noul alone
-# would not.
+# It used to be two separate yes-or-no questions read together, and that worked
+# while resting on a known crack: `accumulates` asks about a running tally, and
+# a latch that only remembers whether something ever happened is a single
+# remembered bit rather than a tally. Both latch rules in the suite answered it
+# under a half - the question said no to rules it should have said yes to - and
+# only `windowed` being low saved the routing.
+#
+# Asked instead as one Choice between two accounts of the rule, with the latch
+# named in the option itself, the same ten rules separate completely: every
+# window at one, every carried rule at zero. The Nouls are still asked and still
+# reported, but they no longer decide.
 WINDOW_FLOOR = 0.50
 
 SPANS = {"1": "only what arrives at this step matters, with no earlier step needed",
@@ -106,14 +112,29 @@ def read_shape(client: TypeSafeClient, rule: str, model: str | None = None) -> d
             "other value accumulated over every input seen so far. Remembering only the "
             "last few inputs would not be enough to apply it."
         )),
+        "route": Choice(
+            instructions=("How does the rule in `rule` decide a step's output: from a "
+                          "bounded number of the most recent inputs, or from something "
+                          "carried along the whole run?"),
+            criteria={
+                "window": "only the last few inputs matter; two moments sharing them "
+                          "always get the same output, whatever came before",
+                "carried": "something has to be remembered across the whole run - a "
+                           "running tally, or whether some event has ever happened - "
+                           "and the last few inputs are not enough",
+            }),
         "span": Choice(
             instructions=("How many steps of history does the rule in `rule` need to "
                           "decide a step's output, counting that step itself?"),
             criteria=SPANS),
     })
     span = answers.choices["span"]
+    route = answers.choices["route"]
     return {"windowed": answers.nouls["windowed"].noul,
             "accumulates": answers.nouls["accumulates"].noul,
+            "route": route.choice,
+            "route_confidence": route.confidence,
+            "route_window": route.probabilities.get("window", 0.0),
             "span": None if span.choice == "more" else int(span.choice),
             "span_choice": span.choice,
             "span_confidence": span.confidence}
@@ -408,11 +429,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with TypeSafeClient() as client:
             shape = read_shape(client, args.rule, args.model)
-            windowed = (shape["windowed"] > WINDOW_FLOOR
-                        and shape["accumulates"] < WINDOW_FLOOR)
+            windowed = shape["route_window"] > WINDOW_FLOOR
             if not args.json:
-                print(f"rule shape: windowed={shape['windowed']:.2f} "
-                      f"accumulates={shape['accumulates']:.2f} "
+                print(f"rule shape: {shape['route']} at {shape['route_window']:.2f} "
+                      f"(windowed={shape['windowed']:.2f} "
+                      f"accumulates={shape['accumulates']:.2f}) "
                       f"span={shape['span']} (confidence {shape['span_confidence']:.2f})")
             if not windowed and not args.force:
                 if args.json:

@@ -335,8 +335,7 @@ def bench_trace(client) -> dict:
     routed = labelled_right = windows = 0
     for rule, truth, expected in TRACES:
         shape = machine.read_shape(client, rule)
-        kind = ("window" if shape["windowed"] > machine.WINDOW_FLOOR
-                and shape["accumulates"] < machine.WINDOW_FLOOR else "accumulate")
+        kind = "window" if shape["route_window"] > machine.WINDOW_FLOOR else "accumulate"
         ok = kind == expected
         routed += ok
         case = {"rule": rule[:56], "expected": expected, "routed": kind,
@@ -424,12 +423,19 @@ def bench_route(client) -> dict:
     for rule, expected in ROUTES:
         shape = machine.read_shape(client, rule)
         both = min(shape["windowed"], 1 - shape["accumulates"])
+        # The same decision asked as one comparison instead of two separate
+        # yes-or-no questions. A route is a choice between two accounts of the
+        # rule, and a Choice is the primitive that weighs options against each
+        # other rather than each on its own.
+        asked = shape["route_window"]
         gap = (shape["windowed"] - shape["accumulates"] + 1) / 2
         routed = ("window" if both > machine.WINDOW_FLOOR else "accumulate")
         cases.append({"rule": rule[:58], "expected": expected, "routed": routed,
                       "windowed": round(shape["windowed"], 2),
                       "accumulates": round(shape["accumulates"], 2),
                       "both": round(both, 2), "gap": round(gap, 2),
+                      "asked": round(asked, 2), "route": shape["route"],
+                      "route_right": (shape["route"] == "window") == (expected == "window"),
                       "span_choice": shape["span_choice"],
                       "as_intended": routed == expected})
     accumulating = [case["expected"] == "accumulate" for case in cases]
@@ -440,7 +446,11 @@ def bench_route(client) -> dict:
                          reject_above=False),
             "sweep_gap": cut([(case["gap"], stop)
                               for case, stop in zip(cases, accumulating)],
-                             reject_above=False)}
+                             reject_above=False),
+            "route_right": sum(1 for case in cases if case["route_right"]),
+            "sweep_asked": cut([(case["asked"], stop)
+                                for case, stop in zip(cases, accumulating)],
+                               reject_above=False)}
 
 
 def say_route(found: dict) -> None:
