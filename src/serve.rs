@@ -1142,38 +1142,38 @@ fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>>
         if before.is_some_and(|held| held == gap) {
             unmoved += 1;
         }
-        let (from_turning, from_swing, downhill) =
-            if best.is_none_or(|(held, _, _, _, _)| gap < held) {
+        let here = (turning, swing, (down_turning, down_swing));
+        // Every branch below but the first reads `best`, and the first is the
+        // one that runs while it is still empty, so there is no arm here for a
+        // round that has nothing to go back to.
+        let (from_turning, from_swing, downhill) = match best {
+            None => {
                 best = Some((gap, turning, swing, down_turning, down_swing));
-                (turning, swing, (down_turning, down_swing))
-            } else if !against {
-                against = true;
-                turned_around += 1;
-                match best {
-                    Some((_, held_turning, held_swing, held_down, held_swung)) => {
-                        (held_turning, held_swing, (held_down, held_swung))
-                    }
-                    None => {
-                        stalled = true;
-                        break;
-                    }
+                here
+            }
+            Some((held, held_turning, held_swing, held_down, held_swung)) => {
+                let there = (held_turning, held_swing, (held_down, held_swung));
+                if gap < held {
+                    best = Some((gap, turning, swing, down_turning, down_swing));
+                    here
+                } else if !against {
+                    against = true;
+                    turned_around += 1;
+                    there
+                } else {
+                    // Both ways were worse, so the step is too long. Sign-only
+                    // steps on whole numbers overshoot and then sit swinging
+                    // between two values; going back with half the step turns
+                    // that into an answer.
+                    against = false;
+                    step /= 2;
+                    // No guard on the halved step reaching nothing: a step of
+                    // nothing moves neither parameter, and the check below
+                    // that nothing moved is the one that stops the walk.
+                    there
                 }
-            } else {
-                // Both ways were worse, so the step is too long. Sign-only steps
-                // on whole numbers overshoot and then sit swinging between two
-                // values; going back with half the step turns that into an answer.
-                against = false;
-                step /= 2;
-                match best {
-                    Some((_, held_turning, held_swing, held_down, held_swung)) if step > 0 => {
-                        (held_turning, held_swing, (held_down, held_swung))
-                    }
-                    _ => {
-                        stalled = true;
-                        break;
-                    }
-                }
-            };
+            }
+        };
         let moved_turning = moved(from_turning, downhill.0, step, ceiling, against);
         let moved_swing = moved(from_swing, downhill.1, step, ceiling, against);
         if moved_turning == from_turning && moved_swing == from_swing {

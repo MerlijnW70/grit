@@ -885,6 +885,11 @@ fn the_distance_is_believed_over_the_slope_when_they_disagree() {
         apart < started,
         "it began where the slope lies and still got nearer: {started} then {apart}"
     );
+    assert_eq!(
+        answer.get("closed"),
+        Some(&Json::Bool(true)),
+        "and a walk that got nearer is what the word closed is for"
+    );
 }
 
 #[test]
@@ -951,6 +956,96 @@ fn a_parameter_with_no_purchase_is_counted_rather_than_mistaken_for_an_answer() 
         answer.counted("unmoved"),
         Some(0),
         "one round holds no step between rounds to have stood still across"
+    );
+}
+
+#[test]
+fn a_step_halved_down_to_nothing_stops_the_walk_where_its_best_round_was() {
+    let Some(host) = device("settle step to nothing") else {
+        return;
+    };
+    // The grid the rule makes at a turning of eight, with one cell moved
+    // nineteen along, so no whole turning lands on it exactly and the walk has
+    // to run its step down instead of arriving. From nine with a step of one:
+    // ten is worse, eight is the best it finds, seven is worse again, and
+    // halving a step of one leaves nothing to step by.
+    let start = "[{\"at\":528,\"is\":60000},{\"at\":529,\"is\":50000},{\"at\":560,\"is\":40000}]";
+    let want = "[{\"at\":726,\"is\":59900},{\"at\":715,\"is\":50142},{\"at\":374,\"is\":40000},{\"at\":363,\"is\":140}]";
+    let answer = structured(&call(
+        Some(&host),
+        "grit_settle",
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"depth\":6,\"turning\":9,\"rounds\":12,\"step\":1,\"fill\":0,\"cells\":{start},\"want\":{want}}}"
+        ),
+    ));
+    assert_eq!(
+        answer.counted("step"),
+        Some(0),
+        "the step was halved until there was none of it left"
+    );
+    assert_eq!(
+        answer.get("stalled"),
+        Some(&Json::Bool(true)),
+        "a step of nothing moves nothing, so the walk stops rather than spending its rounds"
+    );
+    assert_eq!(
+        answer.counted("rounds"),
+        Some(4),
+        "it gave up on the fourth round and did not walk the other eight"
+    );
+    assert_eq!(
+        answer.counted("turning"),
+        Some(8),
+        "and it hands back the best round it walked, not the last one"
+    );
+    assert_eq!(answer.get("apart").and_then(Json::int), Some(19));
+    assert_eq!(
+        answer.counted("turned_around"),
+        Some(1),
+        "one round went uphill and was sent back the other way"
+    );
+}
+
+#[test]
+fn a_cell_that_landed_under_the_target_pulls_the_other_way_from_one_that_landed_over_it() {
+    let Some(host) = device("settle residual sign") else {
+        return;
+    };
+    // The weight carried back is the sign of the residual, a cell at a time,
+    // and the two signs have to be different weights or the gradient is not
+    // the gradient of anything. On this grid at a turning of nine the residual
+    // has both: cell 726 lands on 59868 against a want of 59900, so it is
+    // thirty-two under, while 715 lands sixteen over and 363 eighteen over.
+    //
+    // Measured: the walk finds its best round at a turning of eight, where the
+    // slope reads negative, and steps down from there to seven. Carrying the
+    // under-shooting cell back with the same sign as the over-shooting ones
+    // turns that slope positive and the walk steps up to nine instead.
+    let start = "[{\"at\":528,\"is\":60000},{\"at\":529,\"is\":50000},{\"at\":560,\"is\":40000}]";
+    let want = "[{\"at\":726,\"is\":59900},{\"at\":715,\"is\":50142},{\"at\":374,\"is\":40000},{\"at\":363,\"is\":140}]";
+    let answer = structured(&call(
+        Some(&host),
+        "grit_settle",
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"depth\":6,\"turning\":9,\"rounds\":12,\"step\":1,\"fill\":0,\"cells\":{start},\"want\":{want}}}"
+        ),
+    ));
+    let trail = answer.get("trail").and_then(Json::list).unwrap();
+    assert_eq!(trail.len(), 4, "the walk it makes when the signs are kept apart");
+    assert_eq!(
+        trail[2].counted("turning"),
+        Some(8),
+        "the third round is the best one it finds"
+    );
+    let downhill = trail[2].get("down_turning").and_then(Json::int).unwrap();
+    assert!(
+        downhill < 0,
+        "downhill from the best round points at a smaller turning, not a larger one: {downhill}"
+    );
+    assert_eq!(
+        trail[3].counted("turning"),
+        Some(7),
+        "so the round after it steps down rather than back up to nine"
     );
 }
 
