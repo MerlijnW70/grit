@@ -694,7 +694,10 @@ def bench_staged(client) -> dict:
     for rule, inputs, outputs, vias, truth in STAGED:
         named = inputs + [name for name, _ in vias]
         within = spec.reachable_cases(client, inputs, vias)
-        relevance = spec.read_relevance(client, rule, named, outputs)
+        # The same call the tool makes, in the same shape: with stages named,
+        # relevance is read knowing they are given. A suite that asks a slightly
+        # different question measures a slightly different tool.
+        relevance = spec.read_relevance(client, rule, named, outputs, None, named)
         for slot in spec.check_pruning(client, rule, named, outputs, relevance,
                                        None, within):
             relevance[slot] = 1.0
@@ -704,22 +707,34 @@ def bench_staged(client) -> dict:
                  if row.outs[out] != truth(row.index)[j]]
         thin = min((abs(p - 0.5) for row in rows for p in row.probs.values()),
                    default=0.5)
+        # What the tool would do, not only what the table says. A thin table is
+        # refused rather than handed over, so a run that comes back wrong and
+        # thin is the tool working - and a run that comes back wrong and thick
+        # is the failure that matters.
+        stopped = thin < spec.THIN_TABLE
         cases.append({"rule": rule[:52], "vias": [one["via"] for one in worked],
                       "bits": 2 ** len(inputs) * len(outputs),
                       "wrong": len(wrong), "exact": not wrong,
+                      "stopped": stopped, "got_through": bool(wrong) and not stopped,
                       "thinnest": round(thin, 2),
-                      "reads": {out: spec.relevant_inputs(relevance, out, named)
-                                for out in outputs},
+                      "reads": worked[-1]["reads"] if worked else {},
                       "whole": round(whole, 2)})
     return {"specs": len(cases), "cases": cases,
-            "exact": sum(1 for case in cases if case["exact"])}
+            "exact": sum(1 for case in cases if case["exact"]),
+            "stopped": sum(1 for case in cases if case["stopped"]),
+            "got_through": sum(1 for case in cases if case["got_through"])}
 
 
 def say_staged(found: dict) -> None:
-    print(f"\nspecs worked in stages - {found['exact']}/{found['specs']} exact")
+    print(f"\nspecs worked in stages - {found['exact']}/{found['specs']} exact, "
+          f"{found['stopped']} refused for a thin table, "
+          f"{found['got_through']} wrong and handed over")
     for case in found["cases"]:
-        mark = "ok   " if case["exact"] else "WRONG"
-        note = "" if case["exact"] else f"  {case['wrong']}/{case['bits']} bits wrong"
+        mark = ("ok   " if case["exact"] else
+                "thin " if case["stopped"] else "WRONG")
+        note = ("" if case["exact"] else
+                f"  {case['wrong']}/{case['bits']} bits wrong"
+                + ("  refused" if case["stopped"] else "  HANDED OVER"))
         print(f"  {mark} closest call {case['thinnest']:.2f} from the middle"
               f"{note}   worked out first: {', '.join(case['vias'])}")
         for out, reads in case["reads"].items():
