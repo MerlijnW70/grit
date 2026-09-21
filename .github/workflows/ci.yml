@@ -108,7 +108,10 @@ jobs:
           set -o pipefail
           cargo test --release --no-default-features --features deep --no-fail-fast -- --nocapture \
             2>&1 | tee "$RUNNER_TEMP/suite.log"
-          skipped=$(grep -o 'SKIPPED ' "$RUNNER_TEMP/suite.log" | wc -l)
+          # Counted so that none is a count. `grep` reports no match by
+          # failing, `pipefail` hands that on, and `-e` would take the whole
+          # step down before the comparison below is ever reached.
+          skipped=$({ grep -o 'SKIPPED ' "$RUNNER_TEMP/suite.log" || true; } | wc -l)
           echo "$skipped ${{ matrix.skips }}"
           if [ "$skipped" -ne "${{ matrix.skips }}" ]; then
             echo "::error::$skipped != ${{ matrix.skips }}"
