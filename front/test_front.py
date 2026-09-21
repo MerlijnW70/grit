@@ -29,6 +29,7 @@ from typesafe_sdk import Choice
 import bench
 import machine
 import spec
+import survivors
 import world
 
 NO_LADDER = {"smallest_that_solved": None, "ladder": [{"gates": 4, "solved": False}],
@@ -407,6 +408,35 @@ class Running(unittest.TestCase):
                 with redirect_stdout(out):
                     say(found)
                 self.assertTrue(out.getvalue().strip(), f"{name} printed nothing")
+
+
+class Surviving(unittest.TestCase):
+    """The survivor triage, on the parts that need no model and no noha."""
+
+    def test_the_enclosing_function_is_found_by_walking_back(self):
+        lines = ["fn one() {", "    let a = 1;", "}", "",
+                 "pub fn two() {", "    let b = 2;", "    let c = 3;", "}"]
+        start, end = survivors.enclosing(lines, 6)
+        self.assertEqual(lines[start], "pub fn two() {")
+        self.assertEqual(end, 7)
+
+    def test_a_line_outside_any_function_walks_back_to_the_top(self):
+        start, _ = survivors.enclosing(["const A: u32 = 1;", "const B: u32 = 2;"], 1)
+        self.assertEqual(start, 0)
+
+    def test_the_names_worth_looking_up_leave_out_the_grammar(self):
+        held = survivors.named_on("if relevance[(name, out)] > PRUNE_FLOOR {")
+        self.assertIn("relevance", held)
+        self.assertIn("PRUNE_FLOOR", held)
+        self.assertNotIn("if", held)
+
+    def test_every_marked_mutant_carries_the_facts_it_turns_on(self):
+        # The whole finding: without the surrounding facts it scored four of
+        # eight and said "a gap" to everything. A marked case with no facts
+        # would be measuring the wrong thing.
+        for one in survivors.MARKED:
+            self.assertTrue(one["facts"], one["before"])
+            self.assertIn("equivalent", one)
 
 
 class Sweep(unittest.TestCase):
