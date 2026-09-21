@@ -216,6 +216,23 @@ HARD = [
 ]
 
 
+# Specs the guards refuse when asked whole, with the in-between value named so
+# they can be worked in stages. Ground truth over the row index, as everywhere.
+STAGED = [
+    ("s0 is 1 when exactly one of a0 and b0 is 1; s1 is 1 when an odd number of "
+     "a1, b1 and c1 are 1; s2 is 1 when at least two of a1, b1 and c1 are 1",
+     ["a0", "a1", "b0", "b1"], ["s0", "s1", "s2"],
+     [("c1", "c1 is 1 exactly when both a0 and b0 are 1")],
+     lambda r: [((((r >> 1) & 1) * 2 + (r & 1))
+                 + ((((r >> 3) & 1) * 2 + ((r >> 2) & 1)))) >> i & 1 for i in range(3)]),
+    ("p is 1 when exactly one of a and b is 1; out is 1 when exactly one of p "
+     "and c is 1",
+     ["a", "b", "c"], ["out"],
+     [("p", "p is 1 when exactly one of a and b is 1")],
+     lambda r: [((r & 1) + ((r >> 1) & 1) + ((r >> 2) & 1)) % 2]),
+]
+
+
 class Metered:
     """Duck-types the client so the suites can be billed as well as scored."""
 
@@ -665,6 +682,51 @@ def say_hard(found: dict) -> None:
     say_sweep(found["guard_sweep"], spec.ARITHMETIC_CEILING)
 
 
+def bench_staged(client) -> dict:
+    """Specs worked in stages, marked against tables that are known.
+
+    Each of these is refused when asked whole, and the refusal is right: asked
+    whole the adder is six of forty eight bits wrong. The question here is
+    whether naming the in-between value makes them come out, and how much room
+    the answers have when they do.
+    """
+    cases = []
+    for rule, inputs, outputs, vias, truth in STAGED:
+        named = inputs + [name for name, _ in vias]
+        within = spec.reachable_cases(client, inputs, vias)
+        relevance = spec.read_relevance(client, rule, named, outputs)
+        for slot in spec.check_pruning(client, rule, named, outputs, relevance,
+                                       None, within):
+            relevance[slot] = 1.0
+        rows, whole, worked = spec.staged(client, rule, inputs, outputs, vias,
+                                          None, relevance)
+        wrong = [(row.index, out) for row in rows for j, out in enumerate(outputs)
+                 if row.outs[out] != truth(row.index)[j]]
+        thin = min((abs(p - 0.5) for row in rows for p in row.probs.values()),
+                   default=0.5)
+        cases.append({"rule": rule[:52], "vias": [one["via"] for one in worked],
+                      "bits": 2 ** len(inputs) * len(outputs),
+                      "wrong": len(wrong), "exact": not wrong,
+                      "thinnest": round(thin, 2),
+                      "reads": {out: spec.relevant_inputs(relevance, out, named)
+                                for out in outputs},
+                      "whole": round(whole, 2)})
+    return {"specs": len(cases), "cases": cases,
+            "exact": sum(1 for case in cases if case["exact"])}
+
+
+def say_staged(found: dict) -> None:
+    print(f"\nspecs worked in stages - {found['exact']}/{found['specs']} exact")
+    for case in found["cases"]:
+        mark = "ok   " if case["exact"] else "WRONG"
+        note = "" if case["exact"] else f"  {case['wrong']}/{case['bits']} bits wrong"
+        print(f"  {mark} closest call {case['thinnest']:.2f} from the middle"
+              f"{note}   worked out first: {', '.join(case['vias'])}")
+        for out, reads in case["reads"].items():
+            print(f"        {out} <- {', '.join(reads)}")
+        print(f"        {case['rule']}")
+
+
 def say_spec(found: dict) -> None:
     print("\nundecided detector "
           f"(floor {spec.UNDECIDED_FLOOR}) - {found['as_intended']}/{found['specs']} as intended")
@@ -729,7 +791,8 @@ def say_trace(found: dict) -> None:
 SUITES = {"spec": (bench_spec, say_spec), "table": (bench_table, say_table),
           "trace": (bench_trace, say_trace), "depth": (bench_depth, say_depth),
           "route": (bench_route, say_route), "prune": (bench_prune, say_prune),
-          "wide": (bench_wide, say_wide), "hard": (bench_hard, say_hard)}
+          "wide": (bench_wide, say_wide), "hard": (bench_hard, say_hard),
+          "staged": (bench_staged, say_staged)}
 
 
 def main(argv: list[str] | None = None) -> int:
