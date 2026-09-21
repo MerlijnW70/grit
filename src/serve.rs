@@ -1346,6 +1346,20 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
             counted(held as u32)
         })
         .collect();
+    // Rows say how it lies down and cannot say how many heaps there are: two
+    // piles and one wide one fill the same rows. Columns can.
+    let columns: Vec<Json> = (0..grid.wide)
+        .map(|column| {
+            let held = (0..grid.deep)
+                .filter(|row| {
+                    ended
+                        .get((row * grid.wide + column) as usize)
+                        .is_some_and(|one| *one == SAND || *one == WATER)
+                })
+                .count();
+            counted(held as u32)
+        })
+        .collect();
     let standing: Vec<(usize, u32)> = ended
         .iter()
         .enumerate()
@@ -1374,6 +1388,7 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
             ]),
         ),
         ("rows", Json::List(rows)),
+        ("columns", Json::List(columns)),
         (
             "standing",
             Json::List(
@@ -1403,7 +1418,7 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
         ),
         (
             "rows_means",
-            text("how many cells of sand or water lie in each row, top row first; a pile and a puddle hold the same count and do not lie down the same way"),
+            text("how many cells of sand or water lie in each row, top row first, and in each column left to right; a pile and a puddle hold the same count and do not lie down the same way, and two heaps and one wide one fill the same rows while the columns between them are empty"),
         ),
     ]))
 }

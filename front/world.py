@@ -57,6 +57,23 @@ SCENES: list[tuple[str, dict]] = [
     ("a wide spout of water",
      {"wide": 128, "deep": 128, "frames": 300, "most": 1,
       "brush": {"at": 16 * 128 + 64, "is": "water", "span": 97, "frames": 250}}),
+    # A spout makes one heap however it is aimed, so a set built only from
+    # spouts cannot be asked how many heaps there are. Stacks laid apart fall
+    # straight down and land apart. A shelf across the middle was tried first
+    # and split nothing: the sand piles on it and pours around it and the
+    # columns stay joined. That is why a set is counted before it is asked
+    # about - the scene was named after what it was meant to do.
+    ("two stacks of sand laid far apart",
+     {"wide": 128, "deep": 128, "frames": 300, "most": 1,
+      "cells": [{"at": row * 128 + column, "is": "sand"}
+                for row in range(4, 12)
+                for column in list(range(18, 30)) + list(range(98, 110))]}),
+    ("three stacks of sand laid apart",
+     {"wide": 128, "deep": 128, "frames": 300, "most": 1,
+      "cells": [{"at": row * 128 + column, "is": "sand"}
+                for row in range(4, 12)
+                for column in list(range(14, 22)) + list(range(60, 68))
+                + list(range(106, 114))]}),
 ]
 
 # Below this the Choice has spread itself thin across the rooms, which means the
@@ -105,6 +122,7 @@ MEASURED = {
     # than about any one side of it.
     "slenderness": lambda one: one.tall / max(one.widest, 1),
     "flatness": lambda one: one.widest / max(one.tall, 1),
+    "clumps": lambda one: one.clumps,
 }
 
 CHECKS: list[tuple[str, str]] = [
@@ -114,6 +132,7 @@ CHECKS: list[tuple[str, str]] = [
     ("the widest spread across the room", "max flatness"),
     ("water rather than sand", "max water"),
     ("barely anything settled at all", "min settled"),
+    ("the sand split into more than one heap", "max clumps"),
 ]
 
 
@@ -152,8 +171,19 @@ def load_checks(path: str) -> list[tuple[str, str]]:
 class Poured:
     scene: str
     rows: list[int]
+    columns: list[int]
     tally: dict
     listed: int
+
+    @property
+    def clumps(self) -> int:
+        """How many separate heaps, counted as runs of columns holding anything."""
+        held, running = 0, False
+        for one in self.columns:
+            if one and not running:
+                held += 1
+            running = bool(one)
+        return held
 
     @property
     def standing(self) -> int:
@@ -183,6 +213,7 @@ def pour(binary, scene: str, arguments: dict) -> Poured:
     answer = grit("grit_pour", arguments, binary)
     return Poured(scene=scene,
                   rows=list(answer.get("rows", [])),
+                  columns=list(answer.get("columns", [])),
                   tally=answer.get("tally", {}),
                   listed=answer.get("listed", 0))
 
@@ -194,7 +225,8 @@ def told(one: "Poured") -> str:
     # never mentioned it, which is not a hard question but an unanswerable one.
     return (f"{one.tally.get('water', 0)} cells of water and "
             f"{one.tally.get('sand', 0)} of sand settled; the widest row holds "
-            f"{one.widest} cells; they lie across {one.tall} rows; the engine "
+            f"{one.widest} cells; they lie across {one.tall} rows in "
+            f"{one.clumps} separate heaps; the engine "
             f"stepped {one.listed} quads on an average frame; the skyline from "
             f"the top down reads {one.shape()}")
 
