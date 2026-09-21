@@ -59,6 +59,36 @@ SCENES: list[tuple[str, dict]] = [
       "brush": {"at": 16 * 128 + 64, "is": "water", "span": 97, "frames": 250}}),
 ]
 
+# Below this the Choice has spread itself thin across the rooms, which means the
+# description does not tell them apart rather than that its answer is close.
+#
+# Measured over nine descriptions, this catches one kind of wrong pick and not
+# the other. "Heaped up rather than lying flat" spread a hundredth across two
+# scenes and was wrong; that is what a floor is for. "The room where the engine
+# did the least work" was wrong at eighty one hundredths of certainty, because
+# it is eighty three quads against seventy two and close numbers compared
+# against each other is the standing weakness. Nothing about a spread says that.
+#
+# The floor sits at the edge of the band that drops only the wrong one: a step
+# higher and it starts dropping right answers. --check prints the whole sweep.
+TELLING = 0.20
+
+
+def say_spread(held: list[tuple[float, bool]]) -> None:
+    """Does a thin spread say the pick is not to be trusted?"""
+    if not held:
+        return
+    print()
+    print(f"  {'floor':>6} {'dropped':>8} {'of them wrong':>14} {'kept wrong':>11}")
+    for floor in [round(0.05 * n, 2) for n in range(1, 13)]:
+        dropped = [hit for sure, hit in held if sure < floor]
+        kept = [hit for sure, hit in held if sure >= floor]
+        print(f"  {floor:>6.2f} {len(dropped):>8} "
+              f"{sum(1 for hit in dropped if not hit):>14} "
+              f"{sum(1 for hit in kept if not hit):>11}")
+    print("  A floor worth having drops the wrong picks and keeps the right ones.")
+
+
 # What a description can be marked against. Every one of these is arithmetic
 # over what grit counted, so the mark is on the judging and never on the pour.
 # They are proxies, and naming them out loud matters: the one disagreement this
@@ -169,7 +199,8 @@ def told(one: "Poured") -> str:
             f"the top down reads {one.shape()}")
 
 
-def judge(client, wanted: str, poured: list["Poured"], model=None) -> dict[int, float]:
+def judge(client, wanted: str, poured: list["Poured"],
+          model=None) -> tuple[dict[int, float], float]:
     """One request, one question, every outcome as an option beside the others.
 
     This was a Noul each to begin with, asked on its own. That cannot answer a
@@ -196,8 +227,10 @@ def judge(client, wanted: str, poured: list["Poured"], model=None) -> dict[int, 
         },
         model=model,
     )
-    spread = answer.choices["kept"].probabilities
-    return {n: spread.get(f"o{n}", 0.0) for n in range(len(poured))}
+    kept = answer.choices["kept"]
+    spread = kept.probabilities
+    return ({n: spread.get(f"o{n}", 0.0) for n in range(len(poured))},
+            kept.confidence)
 
 
 def marked(tried: list[Poured], args) -> int:
@@ -222,22 +255,27 @@ def marked(tried: list[Poured], args) -> int:
 
     checks = load_checks(args.cases) if args.cases else CHECKS
     right = 0
+    spreads: list[tuple[float, bool]] = []
     with TypeSafeClient() as client:
         for wanted, chooser in checks:
-            says = judge(client, wanted, tried, args.model)
+            says, sure = judge(client, wanted, tried, args.model)
             kept = max(range(len(tried)), key=lambda n: says[n])
             wants = picked(chooser, tried)
             hit = kept == wants
             right += hit
             rest = [says[n] for n in range(len(tried)) if n != kept]
             margin = says[kept] - max(rest, default=0.0)
+            told_sure = "   too flat to say" if sure < TELLING else ""
             print(f"  {'ok  ' if hit else 'MISS'} {says[kept]:.2f} "
-                  f"(next {margin:+.2f})  {wanted}   [{chooser}]")
+                  f"(next {margin:+.2f}, sure {sure:.2f})  {wanted}   "
+                  f"[{chooser}]{told_sure}")
+            spreads.append((sure, hit))
             if not hit:
                 print(f"         kept   {tried[kept].scene}")
                 print(f"         wanted {tried[wants].scene}")
     print()
     print(f"{right}/{len(checks)} descriptions matched the scene its rule picks.")
+    say_spread(spreads)
     print("Those rules are proxies, named beside each line. Where one loses an "
           "argument with a sentence the mark belongs on the proxy.")
     return 0 if right == len(checks) else 1
@@ -269,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with TypeSafeClient() as client:
-            says = judge(client, args.wanted, tried, args.model)
+            says, sure = judge(client, args.wanted, tried, args.model)
     except TypeSafeAPIError as error:
         print(f"TypeSafe error {error.status} (request {error.request_id})", file=sys.stderr)
         return 2
