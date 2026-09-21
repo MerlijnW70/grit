@@ -49,8 +49,20 @@ from typesafe_sdk import Choice, Noul, TypeSafeAPIError, TypeSafeClient
 
 from spec import DEFAULT_MCP, grit
 
-# Below this on `windowed`, or above it on `accumulates`, the rule is not one
-# a recent-input table can carry.
+# Unlike the other two thresholds in this tool, this one is a real cut and not a
+# preference. `bench.py --suite route` stresses the boundary from both sides -
+# windows worded like accumulators ("at least two of the last three", "the last
+# four add up to more than two") and accumulators worded like windows ("three 1s
+# have arrived in a row at some point, and it stays 1 from then on") - and the
+# two populations land at opposite ends with nothing in between. Almost any
+# floor separates them, so this number is not delicate.
+#
+# `windowed` carries the decision. `accumulates` is corroboration and is read
+# literally: a latch that remembers whether something ever happened is a single
+# remembered bit rather than a running tally, so it scores low on a question
+# about tallies while still being no kind of window. Taking the pair together -
+# min(windowed, 1 - accumulates) - routes it correctly where either noul alone
+# would not.
 WINDOW_FLOOR = 0.50
 
 SPANS = {"1": "only the input at this step matters",

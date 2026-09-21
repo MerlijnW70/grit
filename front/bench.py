@@ -121,6 +121,35 @@ DEPTHS = [
 ]
 
 
+# The routing boundary, stressed from both sides. A rule that says "count" but
+# only ever looks at a few inputs is a window; a rule that sounds local but has
+# to remember whether something ever happened is not.
+ROUTES = [
+    # Windows wearing an accumulator's words.
+    ("output 1 at a step exactly when at least two of the last three inputs, "
+     "ending at that step, were 1", "window"),
+    ("output 1 at a step exactly when an odd number of the last two inputs, "
+     "ending at that step, were 1", "window"),
+    ("output 1 at a step exactly when the last four inputs, ending at that step, "
+     "add up to more than two", "window"),
+    ("output 1 at a step exactly when none of the last three inputs were 1", "window"),
+    # Plain windows.
+    ("output 1 at a step exactly when the input at that step is 1 and the one "
+     "before it was 0", "window"),
+    # Accumulators wearing a window's words.
+    ("output 1 at a step exactly when a 1 has arrived at some point, at that step "
+     "or any earlier one, and once that has happened it stays 1 forever", "accumulate"),
+    ("output 1 at a step exactly when three 1s have arrived in a row at some point "
+     "in the run so far, and it stays 1 from then on", "accumulate"),
+    ("output 1 at a step exactly when more 1s than 0s have arrived so far", "accumulate"),
+    # Plain accumulators.
+    ("output 1 at a step exactly when the number of 1s so far is a multiple of "
+     "three", "accumulate"),
+    ("output 1 at a step exactly when an odd number of 1s have arrived so far",
+     "accumulate"),
+]
+
+
 class Metered:
     """Duck-types the client so the suites can be billed as well as scored."""
 
@@ -316,6 +345,54 @@ def say_depth(found: dict) -> None:
     say_sweep(found["sweep"], found["floor"])
 
 
+def bench_route(client) -> dict:
+    """Does the window/accumulate routing hold at the boundary, and on what?
+
+    Two predictors are scored on the same answers. `both` is what the tool
+    uses: a window needs `windowed` over the floor AND `accumulates` under its
+    mirror, which is min(windowed, 1 - accumulates) against one number, and at
+    0.50 that is exactly the current rule. `gap` is the cheaper idea of just
+    taking whichever noul is larger, scored as (windowed - accumulates + 1) / 2.
+    """
+    cases = []
+    for rule, expected in ROUTES:
+        shape = machine.read_shape(client, rule)
+        both = min(shape["windowed"], 1 - shape["accumulates"])
+        gap = (shape["windowed"] - shape["accumulates"] + 1) / 2
+        routed = ("window" if both > machine.WINDOW_FLOOR else "accumulate")
+        cases.append({"rule": rule[:58], "expected": expected, "routed": routed,
+                      "windowed": round(shape["windowed"], 2),
+                      "accumulates": round(shape["accumulates"], 2),
+                      "both": round(both, 2), "gap": round(gap, 2),
+                      "span_choice": shape["span_choice"],
+                      "as_intended": routed == expected})
+    accumulating = [case["expected"] == "accumulate" for case in cases]
+    return {"rules": len(cases), "cases": cases, "floor": machine.WINDOW_FLOOR,
+            "as_intended": sum(1 for case in cases if case["as_intended"]),
+            "sweep": cut([(case["both"], stop)
+                          for case, stop in zip(cases, accumulating)],
+                         reject_above=False),
+            "sweep_gap": cut([(case["gap"], stop)
+                              for case, stop in zip(cases, accumulating)],
+                             reject_above=False)}
+
+
+def say_route(found: dict) -> None:
+    print(f"\nrouting at the boundary (floor {found['floor']}) - "
+          f"{found['as_intended']}/{found['rules']} as intended")
+    print(f"  {'want':>10} {'got':>10} {'wndw':>5} {'accum':>6} {'both':>5} {'span':>5}")
+    for case in found["cases"]:
+        mark = " " if case["as_intended"] else "<"
+        print(f"  {case['expected']:>10} {case['routed']:>10} {case['windowed']:>5.2f} "
+              f"{case['accumulates']:>6.2f} {case['both']:>5.2f} "
+              f"{str(case['span_choice']):>5}{mark}")
+        print(f"        {case['rule']}")
+    print("\npredictor the tool uses - min(windowed, 1 - accumulates):")
+    say_sweep(found["sweep"], found["floor"])
+    print("\ncheaper predictor - whichever noul is larger:")
+    say_sweep(found["sweep_gap"])
+
+
 def say_spec(found: dict) -> None:
     print("\nundecided detector "
           f"(floor {spec.UNDECIDED_FLOOR}) - {found['as_intended']}/{found['specs']} as intended")
@@ -373,7 +450,8 @@ def say_trace(found: dict) -> None:
 
 # Module level so the CLI choices and the registry cannot drift apart.
 SUITES = {"spec": (bench_spec, say_spec), "table": (bench_table, say_table),
-          "trace": (bench_trace, say_trace), "depth": (bench_depth, say_depth)}
+          "trace": (bench_trace, say_trace), "depth": (bench_depth, say_depth),
+          "route": (bench_route, say_route)}
 
 
 def main(argv: list[str] | None = None) -> int:
