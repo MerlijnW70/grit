@@ -167,6 +167,23 @@ PRUNES = [
 ]
 
 
+# Wide combinational specs where the answer, and which inputs decide it, are
+# both known. The table is still every row: what pruning changes is how many
+# cases get asked about before the rest are projected.
+WIDE = [
+    ("output 1 when d and f are both 1, ignoring every other input",
+     ["a", "b", "c", "d", "e", "f"], {"d", "f"},
+     lambda r: int(((r >> 3) & 1) and ((r >> 5) & 1))),
+    ("output 1 when exactly one of a and b is 1; c, d and e are irrelevant",
+     ["a", "b", "c", "d", "e"], {"a", "b"},
+     lambda r: (r & 1) ^ ((r >> 1) & 1)),
+    ("output 1 when at least two of a, b and c are 1, whatever d does",
+     ["a", "b", "c", "d"], {"a", "b", "c"},
+     lambda r: int((r & 1) + ((r >> 1) & 1) + ((r >> 2) & 1) >= 2)),
+    ("output 1 when a is 1", ["a", "b", "c", "d"], {"a"}, lambda r: r & 1),
+]
+
+
 class Metered:
     """Duck-types the client so the suites can be billed as well as scored."""
 
@@ -474,6 +491,54 @@ def say_prune(found: dict) -> None:
         print(f"        {case['rule']}")
 
 
+def bench_wide(client) -> dict:
+    """Pruning a wide truth table: does it stay exact, and how much is saved?"""
+    cases = []
+    for rule, inputs, want, truth in WIDE:
+        relevance = spec.read_relevance(client, rule, inputs, ["out"])
+        put_back = spec.check_pruning(client, rule, inputs, ["out"], relevance)
+        for slot in put_back:
+            relevance[slot] = 1.0
+        kept = set(spec.relevant_inputs(relevance, "out", inputs))
+        rows = spec.read_intent(client, rule, inputs, ["out"], relevance=relevance)
+        got = [row.outs["out"] for row in rows]
+        wanted = [truth(r) for r in range(2 ** len(inputs))]
+        cases.append({"rule": rule[:52], "inputs": len(inputs),
+                      "kept": sorted(kept), "want": sorted(want),
+                      "dropped": sorted(want - kept),
+                      "spare": sorted(kept - want),
+                      "put_back": [name for name, _ in put_back],
+                      "full_cases": 2 ** len(inputs), "asked": 2 ** len(kept),
+                      "exact": got == wanted,
+                      "wrong_rows": [i for i, (a, b) in enumerate(zip(got, wanted))
+                                     if a != b]})
+    return {"specs": len(cases), "cases": cases,
+            "exact": sum(1 for case in cases if case["exact"]),
+            "safe": sum(1 for case in cases if not case["dropped"]),
+            "full": sum(case["full_cases"] for case in cases),
+            "asked": sum(case["asked"] for case in cases)}
+
+
+def say_wide(found: dict) -> None:
+    saved = 1 - found["asked"] / found["full"]
+    print(f"\nwide specs pruned - {found['exact']}/{found['specs']} tables exact, "
+          f"{found['safe']}/{found['specs']} lost nothing, "
+          f"{found['full']} cases down to {found['asked']} ({saved:.0%} fewer)")
+    for case in found["cases"]:
+        mark = "ok  " if case["exact"] and not case["dropped"] else "WRONG"
+        note = ""
+        if case["dropped"]:
+            note += "  dropped " + ", ".join(case["dropped"])
+        if case["spare"]:
+            note += "  kept spare " + ", ".join(case["spare"])
+        if case["put_back"]:
+            note += "  check put back " + ", ".join(case["put_back"])
+        if case["wrong_rows"]:
+            note += f"  {len(case['wrong_rows'])} rows wrong"
+        print(f"  {mark} {case['full_cases']:>3} -> {case['asked']:<3}{note}")
+        print(f"        {case['rule']}")
+
+
 def say_spec(found: dict) -> None:
     print("\nundecided detector "
           f"(floor {spec.UNDECIDED_FLOOR}) - {found['as_intended']}/{found['specs']} as intended")
@@ -532,7 +597,8 @@ def say_trace(found: dict) -> None:
 # Module level so the CLI choices and the registry cannot drift apart.
 SUITES = {"spec": (bench_spec, say_spec), "table": (bench_table, say_table),
           "trace": (bench_trace, say_trace), "depth": (bench_depth, say_depth),
-          "route": (bench_route, say_route), "prune": (bench_prune, say_prune)}
+          "route": (bench_route, say_route), "prune": (bench_prune, say_prune),
+          "wide": (bench_wide, say_wide)}
 
 
 def main(argv: list[str] | None = None) -> int:

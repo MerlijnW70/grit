@@ -55,6 +55,74 @@ UNDECIDED_FLOOR = 0.45
 # Kept only as a secondary display signal, never as the gate.
 NARROW_MARGIN = 0.15
 
+# An output that reads three of six inputs needs eight rows asked, not sixty
+# four. As in machine.py the two errors differ in size: keeping a spare input
+# costs questions, dropping a real one flattens the spec where grit cannot see
+# it, since the projected table is consistent by construction and marks clean.
+# So the floor is low and every drop is checked afterwards.
+PRUNE_FLOOR = 0.25
+
+
+def read_relevance(client: TypeSafeClient, rule: str, inputs: list[str],
+                   outputs: list[str], model: str | None = None) -> dict[tuple[str, str], float]:
+    """Which inputs each output actually reads."""
+    questions = {}
+    for name in inputs:
+        for out in outputs:
+            questions[f"rel_{name}_{out}"] = Noul(instructions=(
+                f"Under the rule in `rule`, the value of input `{name}` can change what "
+                f"output `{out}` should be. That is: there are two cases differing only "
+                f"in `{name}`, every other input the same, where the rule calls for a "
+                f"different `{out}`."
+            ))
+    answers = client.system_one(state={"rule": rule, "inputs": inputs,
+                                       "outputs": outputs},
+                                questions=questions, model=model)
+    return {(name, out): answers.nouls[f"rel_{name}_{out}"].noul
+            for name in inputs for out in outputs}
+
+
+def relevant_inputs(relevance: dict[tuple[str, str], float], out: str,
+                    inputs: list[str], floor: float = PRUNE_FLOOR) -> list[str]:
+    """The inputs an output is asked about. Never empty: a constant still needs a row."""
+    kept = [name for name in inputs if relevance[(name, out)] > floor]
+    return kept or [inputs[0]]
+
+
+def check_pruning(client: TypeSafeClient, rule: str, inputs: list[str],
+                  outputs: list[str], relevance: dict[tuple[str, str], float],
+                  model: str | None = None) -> list[tuple[str, str]]:
+    """Put each dropped input to the test: does flipping it ever change the output?
+
+    The pruned enumeration never asks a pair differing only in a dropped input,
+    so the claim that it does not matter goes unchecked. Every background of the
+    other inputs is tried, which is exhaustive and still far cheaper than the
+    full table whenever the pruning saved anything at all.
+    """
+    questions, pairs = {}, {}
+    for out in outputs:
+        kept = relevant_inputs(relevance, out, inputs)
+        for name in inputs:
+            if name in kept:
+                continue
+            rest = [other for other in inputs if other != name]
+            for r in range(2 ** len(rest)):
+                background = {other: (r >> i) & 1 for i, other in enumerate(rest)}
+                for value in (0, 1):
+                    key = f"chk_{name}_{out}_{r}_{value}"
+                    pairs[key] = (name, out, r, value)
+                    seen = ", ".join(f"{one}={value if one == name else background[one]}"
+                                     for one in inputs)
+                    questions[key] = Noul(instructions=(
+                        f"For the rule in `rule`, with {seen}, the output bit `{out}` is 1."
+                    ))
+    if not questions:
+        return []
+    answers = client.system_one(state={"rule": rule}, questions=questions, model=model)
+    said = {key: answers.nouls[key].noul > 0.5 for key in questions}
+    return sorted({(name, out) for key, (name, out, r, value) in pairs.items()
+                   if value == 0 and said[key] != said[f"chk_{name}_{out}_{r}_1"]})
+
 
 @dataclass
 class Row:
@@ -76,12 +144,22 @@ class Row:
 
 
 def read_intent(client: TypeSafeClient, rule: str, inputs: list[str],
-                outputs: list[str], model: str | None = None) -> list[Row]:
-    """One request. Every (row, output bit) pair is an independent judgement."""
+                outputs: list[str], model: str | None = None,
+                relevance: dict[tuple[str, str], float] | None = None) -> list[Row]:
+    """One request. Every (case, output bit) pair is an independent judgement.
+
+    The rows are always all 2^n of them - they are the deliverable, and code
+    enumerates them so none can go missing. What a relevance map changes is
+    which *cases* get asked about: an output reading three of six inputs is
+    eight questions, and the rows it does not distinguish are filled by
+    projecting onto the inputs it reads.
+    """
     rows = [
         Row(index=r, bits={n: (r >> i) & 1 for i, n in enumerate(inputs)})
         for r in range(2 ** len(inputs))
     ]
+    if relevance is not None:
+        return _read_pruned(client, rule, inputs, outputs, rows, relevance, model)
     state = {
         "rule": rule,
         "inputs": inputs,
@@ -121,6 +199,38 @@ def read_intent(client: TypeSafeClient, rule: str, inputs: list[str],
             row.probs[out] = p
             row.outs[out] = 1 if p > 0.5 else 0
             row.undecided[out] = answers.nouls[f"u{row.index}_{out}"].noul
+    return rows
+
+
+def _read_pruned(client, rule, inputs, outputs, rows, relevance, model):
+    """Ask once per case an output can tell apart, then project onto every row."""
+    kept = {out: relevant_inputs(relevance, out, inputs) for out in outputs}
+    questions = {}
+    for out in outputs:
+        for r in range(2 ** len(kept[out])):
+            case = {name: (r >> i) & 1 for i, name in enumerate(kept[out])}
+            seen = ", ".join(f"{name}={bit}" for name, bit in case.items())
+            questions[f"v{out}_{r}"] = Noul(instructions=(
+                f"For the rule in `rule`, with {seen}, the output bit `{out}` is 1. "
+                "No other input matters to this output."
+            ))
+            questions[f"u{out}_{r}"] = Noul(instructions=(
+                "Read the rule in `rule` under the usual convention: it names the cases "
+                f"where `{out}` is 1, and `{out}` is 0 in every case it does not name. "
+                f"Even under that convention, the rule fails to settle `{out}` when "
+                f"{seen}: the rule's own words leave this case genuinely open, so two "
+                "careful readers could apply it here and get different answers."
+            ))
+    answers = client.system_one(state={"rule": rule, "inputs": inputs,
+                                       "outputs": outputs},
+                                questions=questions, model=model)
+    for row in rows:
+        for out in outputs:
+            r = sum(row.bits[name] << i for i, name in enumerate(kept[out]))
+            p = answers.nouls[f"v{out}_{r}"].noul
+            row.probs[out] = p
+            row.outs[out] = 1 if p > 0.5 else 0
+            row.undecided[out] = answers.nouls[f"u{out}_{r}"].noul
     return rows
 
 
@@ -189,6 +299,9 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"flag a row when P(undecided) exceeds this (default {UNDECIDED_FLOOR})")
     parser.add_argument("--force", action="store_true",
                         help="search even where intent was unclear (it becomes a gate)")
+    parser.add_argument("--prune", action="store_true",
+                        help="ask which inputs each output reads and enumerate only "
+                             "those cases; the table is still every row")
     parser.add_argument("--table", help="skip the model and use this comma-separated table")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument("--model", help="TypeSafe model (default jev-latest)")
@@ -214,7 +327,24 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             with TypeSafeClient() as client:
-                rows = read_intent(client, args.rule, inputs, outputs, args.model)
+                relevance = (read_relevance(client, args.rule, inputs, outputs, args.model)
+                             if args.prune else None)
+                if relevance is not None:
+                    for name, out in check_pruning(client, args.rule, inputs, outputs,
+                                                   relevance, args.model):
+                        relevance[(name, out)] = 1.0
+                        if not args.json:
+                            print(f"put back: `{name}` decides `{out}` after all")
+                    if not args.json:
+                        asked = sum(2 ** len(relevant_inputs(relevance, out, inputs))
+                                    for out in outputs)
+                        print("reads: " + "; ".join(
+                            f"{out} <- " + ", ".join(relevant_inputs(relevance, out, inputs))
+                            for out in outputs)
+                            + f"  ({asked} cases instead of "
+                            + f"{2 ** len(inputs) * len(outputs)})")
+                rows = read_intent(client, args.rule, inputs, outputs, args.model,
+                                   relevance)
         except TypeSafeAPIError as error:
             print(f"TypeSafe error {error.status} (request {error.request_id})",
                   file=sys.stderr)
