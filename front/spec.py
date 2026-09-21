@@ -67,20 +67,22 @@ NARROW_MARGIN = 0.15
 # its closest call at twenty six hundredths from the middle or further, every
 # table with a wrong row has one at three hundredths or nearer.
 #
-# That gap is not where the floor goes, because a spec worked in stages falls
-# inside it and is right. The two-bit adder staged with its carry named answers
-# some cases at twelve hundredths from the middle and comes back exact, four
-# times in four. Put at fifteen it refuses that, which is a spec that works.
+# It stood at six for a while, because a staged spec then answered at twelve
+# hundredths and was right, and fifteen would have refused a spec that works.
+# Asking each output on its own moved those answers out to between thirty two
+# and forty four, and took the reason for six away with them.
 #
-# So it sits between three and twelve, which is a thinner gap than the one that
-# first showed up and is the one the measurements actually support.
+# Where it sits now, everything measured separates. Exact tables, staged or
+# whole, have their closest call at twenty six hundredths or further. Wrong
+# tables asked whole have one at three or nearer, and the one staged run in
+# four that comes back wrong has one at nine - which six let through and this
+# does not.
 #
 # The caveat that stood here - that a staged spec sits inside the gap and is
 # right anyway - was true of a staged spec that asked all its outputs at once.
 # Asking each one on its own moved the adder from twelve hundredths to thirty
-# three, above where clean tables asked whole sit, and made it exact in four
-# runs of four. The exception went away rather than being worked around.
-THIN_TABLE = 0.06
+# three, and the exception went away rather than being worked around.
+THIN_TABLE = 0.15
 
 # An output that reads three of six inputs needs eight rows asked, not sixty
 # four. As in machine.py the two errors differ in size: keeping a spare input
@@ -437,13 +439,25 @@ def staged(client: TypeSafeClient, rule: str, inputs: list[str], outputs: list[s
     ]
 
     for name, told in vias:
+        # A stage is a spec, so it is guarded like one. Without this the whole
+        # arithmetic simply moves into the stage: asked to work out "big is 1
+        # when the number is ten or more" the stage comes back wrong on two rows
+        # while the step that reads it - out is 1 when big is 0 - is easy and
+        # sure, so the finished table is wrong and its closest call is forty four
+        # hundredths from the middle. Nothing downstream sees that either.
+        stage_shape = read_shape(client, told, known, [name], model)
         stage_rows, stage_whole = read_intent(client, told, known, [name], model)
+        stage_thin = min((abs(p - 0.5) for row in stage_rows
+                          for p in row.probs.values()), default=0.5)
         table = {tuple(row.bits[one] for one in known): row.outs[name]
                  for row in stage_rows}
         for row in carried:
             row[name] = table[tuple(row[one] for one in known)]
         worked.append({"via": name, "rule": told, "over": list(known),
                        "whole": round(stage_whole, 3),
+                       "arithmetic": round(stage_shape["arithmetic"], 3),
+                       "through": round(max(stage_shape["through"].values()), 3),
+                       "thinnest": round(stage_thin, 3),
                        "table": [stage_rows[r].outs[name] for r in range(len(stage_rows))]})
         known = known + [name]
 
@@ -676,6 +690,29 @@ def main(argv: list[str] | None = None) -> int:
                     rows, whole, worked = staged(client, args.rule, inputs, outputs,
                                                  vias, args.model, relevance)
                     report["worked_out_first"] = worked
+                    amiss = [one for one in worked
+                             if one["arithmetic"] > ARITHMETIC_CEILING
+                             or one["through"] > THROUGH_CEILING
+                             or one["thinnest"] < THIN_TABLE
+                             or one["whole"] > 0.5]
+                    if amiss and not args.force:
+                        if args.json:
+                            print(json.dumps({**report, "searched": False}, indent=2))
+                        else:
+                            for one in amiss:
+                                print(f"\nWorking out `{one['via']}` is itself a spec "
+                                      "this would refuse: arithmetic "
+                                      f"{one['arithmetic']:.2f}, in-between "
+                                      f"{one['through']:.2f}, leaves something open "
+                                      f"{one['whole']:.2f}, closest call "
+                                      f"{one['thinnest']:.2f} from the middle.")
+                            print("A stage that is wrong makes the whole table wrong, "
+                                  "and the step that reads it can be easy and sure "
+                                  "while it is - so neither the closest call in the "
+                                  "finished table nor anything after it would catch "
+                                  "this. Say the stage over the inputs themselves, or "
+                                  "work it out in stages of its own.")
+                        return 3
                     if not args.json:
                         for one in worked:
                             print(f"worked out `{one['via']}` over "
