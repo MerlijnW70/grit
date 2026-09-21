@@ -130,6 +130,19 @@ def read_shape(client: TypeSafeClient, rule: str, inputs: list[str],
             "through": {out: answers.nouls[f"through_{out}"].noul for out in outputs}}
 
 
+def _undecided_question(out: str, seen: str) -> Noul:
+    """Does the rule settle this one case. Asked the same way wherever it is asked."""
+    return Noul(instructions=(
+        "Read the rule in `rule` under the usual convention: it names the cases "
+        f"where `{out}` is 1, and `{out}` is 0 in every case it does not name. "
+        f"Even under that convention, the rule fails to settle `{out}` when "
+        f"{seen}: the rule's own words leave this case genuinely open, so two "
+        "careful readers could apply it here and get different answers. This is "
+        "about the rule being incomplete or vague, not about the case being rare "
+        f"or about `{out}` simply being 0 here."
+    ))
+
+
 def _whole_question() -> Noul:
     """Is the rule vague, asked once of the rule rather than a row at a time.
 
@@ -179,7 +192,9 @@ def relevant_inputs(relevance: dict[tuple[str, str], float], out: str,
 
 def check_pruning(client: TypeSafeClient, rule: str, inputs: list[str],
                   outputs: list[str], relevance: dict[tuple[str, str], float],
-                  model: str | None = None) -> list[tuple[str, str]]:
+                  model: str | None = None,
+                  reachable: list[dict[str, int]] | None = None
+                  ) -> list[tuple[str, str]]:
     """Put each dropped input to the test: does flipping it ever change the output?
 
     The pruned enumeration never asks a pair differing only in a dropped input,
@@ -194,8 +209,21 @@ def check_pruning(client: TypeSafeClient, rule: str, inputs: list[str],
             if name in kept:
                 continue
             rest = [other for other in inputs if other != name]
-            for r in range(2 ** len(rest)):
-                background = {other: (r >> i) & 1 for i, other in enumerate(rest)}
+            # Every background, unless some of these values are not free of each
+            # other. An in-between value is not: a carry is whatever the bits
+            # under it make it, so flipping one of those while holding the carry
+            # still asks about a case that cannot happen - and the answer came
+            # back putting both bits back as decisive, which is true of the rule
+            # and false of the question. When the reachable cases are known, only
+            # pairs that both occur are put.
+            grounds = ([one for one in reachable] if reachable is not None
+                       else [{other: (r >> i) & 1 for i, other in enumerate(rest)}
+                             for r in range(2 ** len(rest))])
+            for r, background in enumerate(grounds):
+                if reachable is not None and not any(
+                        all(one[other] == background[other] for other in rest)
+                        and one[name] != background[name] for one in reachable):
+                    continue
                 for value in (0, 1):
                     key = f"chk_{name}_{out}_{r}_{value}"
                     pairs[key] = (name, out, r, value)
@@ -272,15 +300,7 @@ def read_intent(client: TypeSafeClient, rule: str, inputs: list[str],
             # a rule saying "output 1 when at least two inputs are 1" does not,
             # read literally, say anything about the rows where it is 0, and
             # the model answers the question as written.
-            questions[f"u{row.index}_{out}"] = Noul(instructions=(
-                "Read the rule in `rule` under the usual convention: it names the cases "
-                f"where `{out}` is 1, and `{out}` is 0 in every case it does not name. "
-                f"Even under that convention, the rule fails to settle `{out}` when "
-                f"{seen}: the rule's own words leave this case genuinely open, so two "
-                "careful readers could apply it here and get different answers. This is "
-                "about the rule being incomplete or vague, not about the case being rare "
-                f"or about `{out}` simply being 0 here."
-            ))
+            questions[f"u{row.index}_{out}"] = _undecided_question(out, seen)
     answers = client.system_one(state=state, questions=questions, model=model)
     for row in rows:
         for out in outputs:
@@ -331,6 +351,112 @@ def _read_pruned(client, rule, inputs, outputs, rows, relevance, model):
             row.undecided[out] = answers.nouls[f"u{out}_{r}"].noul
     return rows, answers.nouls["whole"].noul
 
+
+def reachable_cases(client: TypeSafeClient, inputs: list[str],
+                    vias: list[tuple[str, str]], model: str | None = None
+                    ) -> list[dict[str, int]]:
+    """Every case that can actually happen once the in-between values are worked out.
+
+    There are 2^inputs of them and no more, however many in-between values are
+    named, because each is a function of what came before it.
+    """
+    known = list(inputs)
+    carried = [{name: (r >> i) & 1 for i, name in enumerate(inputs)}
+               for r in range(2 ** len(inputs))]
+    for name, told in vias:
+        stage_rows, _ = read_intent(client, told, known, [name], model)
+        table = {tuple(row.bits[one] for one in known): row.outs[name]
+                 for row in stage_rows}
+        for row in carried:
+            row[name] = table[tuple(row[one] for one in known)]
+        known = known + [name]
+    return carried
+
+
+def staged(client: TypeSafeClient, rule: str, inputs: list[str], outputs: list[str],
+           vias: list[tuple[str, str]], model: str | None = None,
+           relevance: dict[tuple[str, str], float] | None = None
+           ) -> tuple[list[Row], float, list[dict]]:
+    """Work out the named in-between values first, then the outputs given them.
+
+    The guard refuses a spec whose outputs need something found in between - a
+    carry, a count - because that is where the wrong rows are. Naming that value
+    is a judgement about the rule and belongs to whoever wrote it; working it out
+    and carrying it through is arithmetic and belongs here.
+
+    Measured on a two-bit adder, which the guard refuses and which came back six
+    of forty eight bits wrong when asked whole: the carry on its own is exact,
+    the middle sum bit given the carry is exact, and the carry out given the
+    carry is exact. Every stage passes both guards with room to spare.
+
+    Each stage is a spec in its own right, asked over the original inputs and
+    any in-between values named before it. The last stage is asked once per row
+    of the real table, with the in-between values spelled out as facts about
+    that row, so the table that comes out is over the inputs the caller named
+    and nothing else. grit still marks the circuit against it.
+    """
+    known: list[str] = list(inputs)
+    worked: list[dict] = []
+    # Every row of the real table, carrying whatever has been worked out so far.
+    carried: list[dict[str, int]] = [
+        {name: (r >> i) & 1 for i, name in enumerate(inputs)}
+        for r in range(2 ** len(inputs))
+    ]
+
+    for name, told in vias:
+        stage_rows, stage_whole = read_intent(client, told, known, [name], model)
+        table = {tuple(row.bits[one] for one in known): row.outs[name]
+                 for row in stage_rows}
+        for row in carried:
+            row[name] = table[tuple(row[one] for one in known)]
+        worked.append({"via": name, "rule": told, "over": list(known),
+                       "whole": round(stage_whole, 3),
+                       "table": [stage_rows[r].outs[name] for r in range(len(stage_rows))]})
+        known = known + [name]
+
+    # The last stage asks once per distinct case an output can tell apart, not
+    # once per row. With an in-between value worked out, several rows present
+    # the same case to an output - the carry-out of an adder sees the same three
+    # values from four different rows - and asking each of them separately is
+    # asking one question four times and letting the answers differ. Measured,
+    # that is where the wrong rows came from: the same stage asked once per case
+    # in isolation was exact, and asked once per row was one to three rows out.
+    rows = [Row(index=r, bits={name: carried[r][name] for name in inputs})
+            for r in range(2 ** len(inputs))]
+    reads = {out: (relevant_inputs(relevance, out, known) if relevance is not None
+                   else known) for out in outputs}
+    cases: dict[str, dict[tuple, int]] = {out: {} for out in outputs}
+    questions = {"whole": _whole_question()}
+    for row in rows:
+        held = carried[row.index]
+        for out in outputs:
+            key = tuple(held[name] for name in reads[out])
+            if key in cases[out]:
+                continue
+            cases[out][key] = len(cases[out])
+    for out in outputs:
+        held_back = [name for name in known if name not in reads[out]]
+        for key, n in cases[out].items():
+            here = ", ".join(f"{name}={bit}" for name, bit in zip(reads[out], key))
+            questions[f"v{out}_{n}"] = Noul(instructions=(
+                f"For the rule in `rule`, with {here}, the output bit `{out}` is 1."
+                + (f" The other values, {', '.join(held_back)}, do not matter to "
+                   f"`{out}`." if held_back else "")
+            ))
+            questions[f"u{out}_{n}"] = _undecided_question(out, here)
+    answers = client.system_one(
+        state={"rule": rule, "inputs": known, "outputs": outputs,
+               "worked_out_first": [one["via"] for one in worked]},
+        questions=questions, model=model)
+    for row in rows:
+        held = carried[row.index]
+        for out in outputs:
+            n = cases[out][tuple(held[name] for name in reads[out])]
+            p = answers.nouls[f"v{out}_{n}"].noul
+            row.probs[out] = p
+            row.outs[out] = 1 if p > 0.5 else 0
+            row.undecided[out] = answers.nouls[f"u{out}_{n}"].noul
+    return rows, answers.nouls["whole"].noul, worked
 
 def grit(tool: str, arguments: dict, binary: str | list[str], timeout: int = 900) -> dict:
     """Speak MCP to grit over stdio. Its answer is the authority on circuits."""
@@ -397,6 +523,11 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"flag a row when P(undecided) exceeds this (default {UNDECIDED_FLOOR})")
     parser.add_argument("--force", action="store_true",
                         help="search even where intent was unclear (it becomes a gate)")
+    parser.add_argument("--via", action="append", default=[], metavar="NAME=RULE",
+                        help="an in-between value to work out first, as name=rule; "
+                             "repeatable, and each may use the ones before it. The "
+                             "guard refuses specs that need one of these, and naming "
+                             "it is the judgement it cannot make for you")
     parser.add_argument("--prune", action="store_true",
                         help="ask which inputs each output reads and enumerate only "
                              "those cases; the table is still every row")
@@ -412,6 +543,15 @@ def main(argv: list[str] | None = None) -> int:
     if not inputs or not outputs:
         parser.error("need at least one input and one output")
 
+    vias: list[tuple[str, str]] = []
+    for one in args.via:
+        name, sep, told = one.partition("=")
+        if not sep or not name.strip() or not told.strip():
+            parser.error(f"--via wants name=rule, not {one!r}")
+        if name.strip() in inputs or name.strip() in outputs:
+            parser.error(f"{name.strip()} is already an input or an output")
+        vias.append((name.strip(), told.strip()))
+
     report: dict = {"rule": args.rule, "inputs": inputs, "outputs": outputs}
 
     if args.table:
@@ -425,7 +565,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             with TypeSafeClient() as client:
-                shape = read_shape(client, args.rule, inputs, outputs, args.model)
+                named = inputs + [name for name, _ in vias]
+                shape = read_shape(client, args.rule, named, outputs, args.model)
                 report["shape"] = {
                     k: ({one: round(held, 3) for one, held in v.items()}
                         if isinstance(v, dict) else round(v, 3))
@@ -459,24 +600,41 @@ def main(argv: list[str] | None = None) -> int:
                               "can, or pass --table to give the table yourself. "
                               "--force searches anyway.")
                     return 3
-                relevance = (read_relevance(client, args.rule, inputs, outputs, args.model)
+                # With stages, relevance is read over the in-between values too,
+                # since an output may read one of those and not the inputs under it.
+                relevance = (read_relevance(client, args.rule, named, outputs, args.model)
                              if args.prune else None)
                 if relevance is not None:
-                    for name, out in check_pruning(client, args.rule, inputs, outputs,
-                                                   relevance, args.model):
+                    # With stages the named values are not free of each other,
+                    # so the check is given the cases that can actually happen.
+                    within = None
+                    if vias:
+                        within = reachable_cases(client, inputs, vias, args.model)
+                    for name, out in check_pruning(client, args.rule, named, outputs,
+                                                   relevance, args.model, within):
                         relevance[(name, out)] = 1.0
                         if not args.json:
                             print(f"put back: `{name}` decides `{out}` after all")
                     if not args.json:
-                        asked = sum(2 ** len(relevant_inputs(relevance, out, inputs))
+                        asked = sum(2 ** len(relevant_inputs(relevance, out, named))
                                     for out in outputs)
                         print("reads: " + "; ".join(
-                            f"{out} <- " + ", ".join(relevant_inputs(relevance, out, inputs))
+                            f"{out} <- " + ", ".join(relevant_inputs(relevance, out, named))
                             for out in outputs)
                             + f"  ({asked} cases instead of "
                             + f"{2 ** len(inputs) * len(outputs)})")
-                rows, whole = read_intent(client, args.rule, inputs, outputs,
-                                          args.model, relevance)
+                if vias:
+                    rows, whole, worked = staged(client, args.rule, inputs, outputs,
+                                                 vias, args.model, relevance)
+                    report["worked_out_first"] = worked
+                    if not args.json:
+                        for one in worked:
+                            print(f"worked out `{one['via']}` over "
+                                  + ", ".join(one["over"])
+                                  + f": {one['table']}")
+                else:
+                    rows, whole = read_intent(client, args.rule, inputs, outputs,
+                                              args.model, relevance)
         except TypeSafeAPIError as error:
             print(f"TypeSafe error {error.status} (request {error.request_id})",
                   file=sys.stderr)
