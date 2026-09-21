@@ -71,6 +71,7 @@ fn the_server_names_every_tool_it_has() {
             "grit_synthesise",
             "grit_least",
             "grit_slope",
+            "grit_settle",
             "grit_check"
         ]
     );
@@ -816,5 +817,122 @@ fn a_cell_outside_the_grid_is_refused_rather_than_wrapped() {
     assert!(
         said.contains("outside"),
         "setting a cell off the grid has to be said, not folded back in: {said}"
+    );
+}
+
+#[test]
+fn settling_walks_back_to_the_parameters_the_target_was_made_with() {
+    let Some(host) = device("settle round trip") else {
+        return;
+    };
+    // Make a grid with the rule itself at a turning of eight, then hand that
+    // grid back as the thing to land on and start somewhere else entirely.
+    // Nothing here tells it eight; the only thing it is given is the grid.
+    let start = "[{\"at\":528,\"is\":60000},{\"at\":529,\"is\":50000},{\"at\":560,\"is\":40000}]";
+    let made = sloped(
+        Some(&host),
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"depth\":6,\"turning\":8,\"fill\":0,\"carry\":false,\"most\":1024,\"cells\":{start}}}"
+        ),
+    );
+    let want = written(made.get("ended").unwrap());
+    let answer = structured(&call(
+        Some(&host),
+        "grit_settle",
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"depth\":6,\"turning\":60,\"rounds\":40,\"step\":16,\"fill\":0,\"cells\":{start},\"want\":{want}}}"
+        ),
+    ));
+    assert_eq!(
+        answer.get("apart").and_then(Json::int),
+        Some(0),
+        "the grid was made by this rule, so some parameters land on it exactly"
+    );
+    assert_eq!(
+        answer.counted("turning"),
+        Some(8),
+        "and they are the ones it was made with"
+    );
+}
+
+#[test]
+fn the_distance_is_believed_over_the_slope_when_they_disagree() {
+    let Some(host) = device("settle turns around") else {
+        return;
+    };
+    // Between forty and fifty two the walk back points uphill while the
+    // distance, which is counted exactly, falls the other way. Starting inside
+    // that stretch is the case a tool that only followed the slope would lose.
+    let start = "[{\"at\":528,\"is\":60000},{\"at\":529,\"is\":50000},{\"at\":560,\"is\":40000}]";
+    let made = sloped(
+        Some(&host),
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"depth\":6,\"turning\":8,\"fill\":0,\"carry\":false,\"most\":1024,\"cells\":{start}}}"
+        ),
+    );
+    let want = written(made.get("ended").unwrap());
+    let answer = structured(&call(
+        Some(&host),
+        "grit_settle",
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"depth\":6,\"turning\":44,\"rounds\":40,\"step\":16,\"fill\":0,\"cells\":{start},\"want\":{want}}}"
+        ),
+    ));
+    let apart = answer.get("apart").and_then(Json::int).unwrap();
+    let started = answer.get("started_apart").and_then(Json::int).unwrap();
+    assert!(
+        apart < started,
+        "it began where the slope lies and still got nearer: {started} then {apart}"
+    );
+}
+
+#[test]
+fn a_target_it_is_already_standing_on_is_left_alone() {
+    let Some(host) = device("settle already there") else {
+        return;
+    };
+    let start = "[{\"at\":528,\"is\":60000}]";
+    let made = sloped(
+        Some(&host),
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"depth\":4,\"turning\":12,\"fill\":0,\"carry\":false,\"most\":1024,\"cells\":{start}}}"
+        ),
+    );
+    let want = written(made.get("ended").unwrap());
+    let answer = structured(&call(
+        Some(&host),
+        "grit_settle",
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"depth\":4,\"turning\":12,\"rounds\":6,\"step\":4,\"fill\":0,\"cells\":{start},\"want\":{want}}}"
+        ),
+    ));
+    assert_eq!(answer.get("apart").and_then(Json::int), Some(0));
+    assert_eq!(
+        answer.counted("turning"),
+        Some(12),
+        "it started on the answer and had no reason to leave"
+    );
+}
+
+#[test]
+fn a_parameter_with_no_purchase_is_counted_rather_than_mistaken_for_an_answer() {
+    let Some(host) = device("settle unmoved") else {
+        return;
+    };
+    // At small cell values the distance does not move at all across a wide
+    // stretch of turning: the parameter has no grip there. That reads exactly
+    // like having arrived, so it is counted and said rather than left to look
+    // like success. Measured: forty unit steps of turning, every one flat.
+    let start = "[{\"at\":528,\"is\":600},{\"at\":529,\"is\":500}]";
+    let answer = structured(&call(
+        Some(&host),
+        "grit_settle",
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"depth\":6,\"turning\":20,\"rounds\":8,\"step\":4,\"fill\":0,\"cells\":{start},\"want\":[{{\"at\":528,\"is\":1}}]}}"
+        ),
+    ));
+    assert!(
+        answer.counted("unmoved").unwrap_or(0) > 0,
+        "moving the parameters changed nothing, and the answer has to say so"
     );
 }

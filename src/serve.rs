@@ -686,6 +686,60 @@ fn tools() -> Json {
             ),
         ]),
         map(vec![
+            ("name", text("grit_settle")),
+            (
+                "description",
+                text(
+                    "Walk a grid forward, see how far it landed from the one you asked for, and move the two rule parameters downhill against that distance. The step is taken from the walk's own adjoint rather than from a guess: the weight carried back is the sign of the residual a cell at a time, so what comes back is the gradient of the distance with respect to the parameters. Returns the trail it walked, the nearest it got, and the parameters that got it there. Distance is counted exactly on the host. A run that did not close means these parameters, at this step and this many rounds, did not get nearer - never that none would.",
+                ),
+            ),
+            (
+                "inputSchema",
+                map(vec![
+                    ("type", text("object")),
+                    (
+                        "properties",
+                        map(vec![
+                            ("wide", map(vec![("type", text("integer")), ("description", text("cells across; rounded up to a power of two"))])),
+                            ("deep", map(vec![("type", text("integer")), ("description", text("cells down; rounded up to a power of two"))])),
+                            (
+                                "kind",
+                                map(vec![
+                                    ("type", text("string")),
+                                    ("enum", Json::List(KINDS_NAMED.iter().map(|one| text(one)).collect())),
+                                    ("description", text("which rule the cells follow")),
+                                ]),
+                            ),
+                            ("turning", map(vec![("type", text("integer")), ("description", text("where the first rule parameter starts"))])),
+                            ("swing", map(vec![("type", text("integer")), ("description", text("where the second rule parameter starts"))])),
+                            ("depth", map(vec![("type", text("integer")), ("description", text("how many frames each round walks"))])),
+                            ("rounds", map(vec![("type", text("integer")), ("description", text("how many downhill steps to take"))])),
+                            ("step", map(vec![("type", text("integer")), ("description", text("how far a parameter moves in one round; they are whole numbers, so this is whole too"))])),
+                            ("ceiling", map(vec![("type", text("integer")), ("description", text("how high a parameter may climb"))])),
+                            ("fill", map(vec![("type", text("integer")), ("description", text("what every cell holds before the named ones are set, in both grids"))])),
+                            (
+                                "cells",
+                                map(vec![
+                                    ("type", text("array")),
+                                    ("description", text("the grid to start from, each an object of at and is")),
+                                    ("items", map(vec![("type", text("object"))])),
+                                ]),
+                            ),
+                            (
+                                "want",
+                                map(vec![
+                                    ("type", text("array")),
+                                    ("description", text("the grid to land on, each an object of at and is; this is what the rounds walk towards")),
+                                    ("items", map(vec![("type", text("object"))])),
+                                ]),
+                            ),
+                        ]),
+                    ),
+                    ("required", Json::List(vec![text("want")])),
+                ]),
+            ),
+        ]),
+        map(vec![
             ("name", text("grit_check")),
             (
                 "description",
@@ -787,6 +841,19 @@ fn sown(held: &Json, grid: Grid, fill: u32) -> Result<Vec<u32>, Box<dyn std::err
     let mut cells = vec![fill; grid.cells()];
     for one in held.get("cells").and_then(Json::list).unwrap_or(&[]) {
         let at = one.counted("at").ok_or("a cell needs an at")? as usize;
+        let value = one.counted("is").unwrap_or(1);
+        let held = cells.get_mut(at).ok_or_else(|| {
+            format!("at {at} is outside the {} cells of this grid", grid.cells())
+        })?;
+        *held = value;
+    }
+    Ok(cells)
+}
+
+fn wanted(held: &Json, grid: Grid, fill: u32) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let mut cells = vec![fill; grid.cells()];
+    for one in held.get("want").and_then(Json::list).unwrap_or(&[]) {
+        let at = one.counted("at").ok_or("a wanted cell needs an at")? as usize;
         let value = one.counted("is").unwrap_or(1);
         let held = cells.get_mut(at).ok_or_else(|| {
             format!("at {at} is outside the {} cells of this grid", grid.cells())
@@ -925,12 +992,201 @@ fn slid(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
     Ok(map(answer))
 }
 
+/// One cell's worth of push, big enough that the weight does not round away.
+const PUSH: i32 = 1 << POINT;
+
+/// How far apart two grids are, counted a cell at a time.
+fn apart(ended: &[u32], want: &[u32]) -> i64 {
+    ended
+        .iter()
+        .zip(want)
+        .map(|(one, other)| i64::from(*one as i32 - *other as i32).abs())
+        .sum()
+}
+
+/// The subgradient of that distance: which way each cell wants to move.
+///
+/// This is what makes the walk back do anything useful. `carry` takes any
+/// weight, not only a single cell lit up, so seeding it with the sign of the
+/// residual makes `told` the gradient of the distance above with respect to
+/// the two rule parameters. Nothing here is a model of the simulation; it is
+/// the simulation's own adjoint, asked a different question.
+fn pushed(ended: &[u32], want: &[u32]) -> Vec<u32> {
+    ended
+        .iter()
+        .zip(want)
+        .map(|(one, other)| {
+            let gap = *one as i32 - *other as i32;
+            (match gap.signum() {
+                1 => PUSH,
+                -1 => -PUSH,
+                _ => 0,
+            }) as u32
+        })
+        .collect()
+}
+
+/// Downhill, by whole numbers, because the parameters are whole numbers.
+/// `against` turns the step around, for when the slope pointed the wrong way.
+fn moved(now: u32, slope: i64, step: u32, most: u32, against: bool) -> u32 {
+    let down = if against { -slope.signum() } else { slope.signum() };
+    match down {
+        1 => now.saturating_sub(step),
+        -1 => now.saturating_add(step).min(most),
+        _ => now,
+    }
+}
+
+fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+    let wide = held.counted("wide").unwrap_or(32).clamp(2, 256);
+    let deep = held.counted("deep").unwrap_or(32).clamp(2, 256);
+    let grid = Grid::of(wide, deep);
+    let named = held.get("kind").and_then(Json::text).unwrap_or("living");
+    let kind =
+        kind_named(named).ok_or_else(|| format!("kind {named} is not one of {}", KINDS_NAMED.join(", ")))?;
+    let depth = held.counted("depth").unwrap_or(16).clamp(1, 1 << 12);
+    let rounds = held.counted("rounds").unwrap_or(8).clamp(1, 1 << 10);
+    let step = held.counted("step").unwrap_or(1).clamp(1, 1 << 16);
+    let ceiling = held.counted("ceiling").unwrap_or(1 << 14);
+    let fill = held.counted("fill").unwrap_or(0);
+    let cells = sown(held, grid, fill)?;
+    let want = wanted(held, grid, fill)?;
+
+    let mut turning = held.counted("turning").unwrap_or(KNOB).min(ceiling);
+    let mut swing = held.counted("swing").unwrap_or(0).min(ceiling);
+    let mut board = seated(host, grid, kind, (turning, swing), depth)?;
+
+    let mut trail = Vec::new();
+    // The gap it reached, where it was, and which way it was pointing there.
+    // The slope is kept with the point because a round that overshoots goes
+    // back to the best one and tries again shorter, and it must not re-walk
+    // the grid to remember which way downhill was.
+    let mut best: Option<(i64, u32, u32, i64, i64)> = None;
+    let mut step = step;
+    let mut stalled = false;
+    // Measured on a target the rule itself made: the distance falls all the way
+    // to zero at the parameters that made it, and the walk back agrees about
+    // which way that is over most of the range and disagrees over part of it.
+    // The distance is exact and the slope is a hint, so a round that went the
+    // wrong way tries the other way before it gives up any step.
+    let mut against = false;
+    let mut turned_around = 0_u32;
+    let mut unmoved = 0_u32;
+    for _ in 0..rounds {
+        board.tune(turning, swing)?;
+        // Forward once to see where it lands, then again inside carry, which
+        // cannot know the residual before the grid has been walked.
+        let ended = board.run(&cells)?;
+        let gap = apart(&ended, &want);
+        let (_, walked) = board.carry(&cells, &pushed(&ended, &want))?;
+        let (down_turning, down_swing, over) = board.told_parts()?;
+        trail.push(map(vec![
+            ("turning", counted(turning)),
+            ("swing", counted(swing)),
+            ("apart", Json::Int(gap)),
+            ("down_turning", Json::Int(down_turning)),
+            ("down_swing", Json::Int(down_swing)),
+            ("over", Json::Int(over)),
+        ]));
+        let _ = walked;
+        if trail
+            .last()
+            .and_then(|one| one.get("apart"))
+            .and_then(Json::int)
+            .is_some_and(|held| held == gap)
+        {
+            unmoved += 1;
+        }
+        let (from_turning, from_swing, downhill) =
+            if best.is_none_or(|(held, _, _, _, _)| gap < held) {
+                best = Some((gap, turning, swing, down_turning, down_swing));
+                (turning, swing, (down_turning, down_swing))
+            } else if !against {
+                against = true;
+                turned_around += 1;
+                match best {
+                    Some((_, held_turning, held_swing, held_down, held_swung)) => {
+                        (held_turning, held_swing, (held_down, held_swung))
+                    }
+                    None => {
+                        stalled = true;
+                        break;
+                    }
+                }
+            } else {
+                // Both ways were worse, so the step is too long. Sign-only steps
+                // on whole numbers overshoot and then sit swinging between two
+                // values; going back with half the step turns that into an answer.
+                against = false;
+                step /= 2;
+                match best {
+                    Some((_, held_turning, held_swing, held_down, held_swung)) if step > 0 => {
+                        (held_turning, held_swing, (held_down, held_swung))
+                    }
+                    _ => {
+                        stalled = true;
+                        break;
+                    }
+                }
+            };
+        let moved_turning = moved(from_turning, downhill.0, step, ceiling, against);
+        let moved_swing = moved(from_swing, downhill.1, step, ceiling, against);
+        if moved_turning == from_turning && moved_swing == from_swing {
+            stalled = true;
+            break;
+        }
+        turning = moved_turning;
+        swing = moved_swing;
+    }
+
+    let (gap, turning, swing, _, _) = best.ok_or("no round was walked")?;
+    let first = trail.first().and_then(|one| one.get("apart")).and_then(Json::int);
+    Ok(map(vec![
+        (
+            "grid",
+            map(vec![
+                ("wide", counted(grid.wide)),
+                ("deep", counted(grid.deep)),
+                ("cells", counted(grid.cells() as u32)),
+            ]),
+        ),
+        ("kind", text(named)),
+        ("depth", counted(depth)),
+        ("rounds", counted(trail.len() as u32)),
+        ("turning", counted(turning)),
+        ("swing", counted(swing)),
+        ("apart", Json::Int(gap)),
+        ("started_apart", first.map_or(Json::Null, Json::Int)),
+        ("closed", Json::Bool(first.is_some_and(|one| gap < one))),
+        ("stalled", Json::Bool(stalled)),
+        ("turned_around", counted(turned_around)),
+        ("unmoved", counted(unmoved)),
+        ("step", counted(step)),
+        ("trail", Json::List(trail)),
+        ("checked_on_the_host", Json::Bool(true)),
+        (
+            "apart_means",
+            text("how far the walked grid is from the one asked for, counted a cell at a time; it is the thing the rounds walk downhill, and it is exact"),
+        ),
+        (
+            "a_round_that_did_not_close",
+            text("means these rule parameters, at this step and this many rounds, did not get nearer - not that no parameters would. Stalled means the step had nowhere smaller to go, so more rounds would not help; a step that ran out of rounds instead would. turned_around counts the rounds where the slope pointed uphill and the distance, which is exact, said otherwise. unmoved counts rounds where moving the parameters changed the distance by nothing at all, which means they have no purchase at this depth and these cell values rather than that they are right."),
+        ),
+    ]))
+}
+
 fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
     if name == "grit_slope" {
         let Some(host) = host else {
             return Err(Box::new(crate::host::Error::NoComputeDevice));
         };
         return slid(host, held);
+    }
+    if name == "grit_settle" {
+        let Some(host) = host else {
+            return Err(Box::new(crate::host::Error::NoComputeDevice));
+        };
+        return settled(host, held);
     }
     if name == "grit_machine" {
         let (machine, traces) = asked_machine(held)?;
