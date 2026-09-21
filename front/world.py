@@ -373,6 +373,7 @@ def marked(tried: list[Poured], args) -> int:
     checks = load_checks(args.cases) if args.cases else CHECKS
     right = 0
     unanswerable = 0
+    both: list[tuple[bool, bool, bool]] = []
     spreads: list[tuple[float, bool]] = []
     with TypeSafeClient() as client:
         for wanted, chooser in checks:
@@ -384,6 +385,28 @@ def marked(tried: list[Poured], args) -> int:
                 unanswerable += 1
                 continue
             wants = picked(chooser, tried)
+            if args.how == "both":
+                says, sure = judge(client, wanted, tried, args.model)
+                by_scene = max(range(len(tried)), key=lambda n: says[n])
+                told_rule, rule_sure = read_rule(client, wanted, args.model)
+                try:
+                    by_rule = picked(told_rule, tried)
+                except SystemExit:
+                    by_rule = -1
+                agreed = by_scene == by_rule
+                kept, asked_as = by_scene, f"{chooser} | {told_rule}"
+                sure = min(sure, rule_sure)
+                both.append((agreed, by_scene == wants, by_rule == wants))
+                print(f"  {'agree ' if agreed else 'DIFFER'} "
+                      f"{'scene ok ' if by_scene == wants else 'scene no '}"
+                      f"{'rule ok ' if by_rule == wants else 'rule no '}  {wanted}")
+                if not agreed:
+                    print(f"         by the rooms  {tried[by_scene].scene}")
+                    print(f"         by the rule   "
+                          f"{tried[by_rule].scene if by_rule >= 0 else 'nothing'}"
+                          f"  ({told_rule})")
+                right += by_scene == wants
+                continue
             if args.how == "rule":
                 told_rule, sure = read_rule(client, wanted, args.model)
                 try:
@@ -420,6 +443,18 @@ def marked(tried: list[Poured], args) -> int:
           + (f", and {unanswerable} could not be asked of this set." if unanswerable
              else "."))
     say_spread(spreads)
+    if both:
+        agreed = [one for one in both if one[0]]
+        parted_ways = [one for one in both if not one[0]]
+        print()
+        print(f"  the two routes agreed on {len(agreed)} of {len(both)}")
+        print(f"    where they agreed:  {sum(1 for one in agreed if not one[1])} "
+              f"of {len(agreed)} wrong by the rooms, "
+              f"{sum(1 for one in agreed if not one[2])} wrong by the rule")
+        print(f"    where they differed: {sum(1 for one in parted_ways if not one[1])} "
+              f"of {len(parted_ways)} wrong by the rooms, "
+              f"{sum(1 for one in parted_ways if not one[2])} wrong by the rule")
+        print("  Disagreement is worth having only if the wrong answers live in it.")
     print("Those rules are proxies, named beside each line. Where one loses an "
           "argument with a sentence the mark belongs on the proxy.")
     return 0 if right == asked and not unanswerable else 1
@@ -432,10 +467,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="what the settled room should be like, in plain English")
     parser.add_argument("--cases", help="JSON file of your own descriptions and the "
                                         "rule each is marked against")
-    parser.add_argument("--how", default="scene", choices=["scene", "rule"],
+    parser.add_argument("--how", default="scene", choices=["scene", "rule", "both"],
                         help="scene asks which room the sentence means; rule asks "
                              "which counted thing it is about and lets code do the "
-                             "comparing")
+                             "comparing; both runs the two and says where they part")
     parser.add_argument("--check", action="store_true",
                         help="run the descriptions whose answer is arithmetic over what "
                              "was counted, and mark the judging against them")
