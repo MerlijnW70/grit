@@ -65,23 +65,30 @@ from spec import DEFAULT_MCP, grit
 # would not.
 WINDOW_FLOOR = 0.50
 
-SPANS = {"1": "only the input at this step matters",
+SPANS = {"1": "only what arrives at this step matters, with no earlier step needed",
          "2": "this step and the one before it",
          "3": "this step and the two before it",
          "4": "this step and the three before it",
          # Without this, a deeper rule is answered with the deepest option on
          # offer, and answered confidently - a forced choice has no way to say
          # none of these, so it says the nearest one and sounds certain.
-         "more": "it needs to look further back than the three before this step"}
+         "more": "it needs to look further back than the three steps before this one"}
 
-# A weak guard, and known to be weak. `bench.py --suite depth` asks rules of
-# known depth at their own depth and at one shallower, where provably no table
-# can carry them, and the two populations interleave: a correct table over a
-# short window scores about what an impossible one does, because the margin
-# sags at both ends - few patterns, and many. It catches the extreme cases and
-# nothing subtler. The floor sits where nothing inadequate got through, since a
-# rejection costs a --force and an undersized window costs a machine that is
-# wrong wherever the rule actually mattered.
+# A weak guard, and weaker than it used to be. `bench.py --suite depth` asks
+# rules of known depth at their own depth and at one shallower, where provably
+# no table can carry them, and the two populations now overlap almost entirely:
+# an impossible window scores about what a correct one does.
+#
+# That got worse on purpose. Naming each step by how far back it is, rather
+# than leaving the order to be recovered from a list, fixed a two-input rule
+# that had been reading every value as belonging to the current step - and it
+# also made the model decisive about windows it cannot possibly decide. Clearer
+# questions bought better labels and cost most of this signal.
+#
+# So it is kept as a catastrophe detector rather than a depth check: at this
+# floor it rejects nothing that was adequate and still catches the worst of the
+# inadequate. The depth question itself is the real guard, and the routing
+# suite shows it answering with confidence and answering right. Read the table.
 TABLE_FLOOR = 0.30
 
 
@@ -100,7 +107,8 @@ def read_shape(client: TypeSafeClient, rule: str, model: str | None = None) -> d
             "last few inputs would not be enough to apply it."
         )),
         "span": Choice(
-            instructions="How many of the most recent inputs does the rule in `rule` need?",
+            instructions=("How many steps of history does the rule in `rule` need to "
+                          "decide a step's output, counting that step itself?"),
             criteria=SPANS),
     })
     span = answers.choices["span"]
@@ -111,8 +119,9 @@ def read_shape(client: TypeSafeClient, rule: str, model: str | None = None) -> d
             "span_confidence": span.confidence}
 
 
-def window_table(client: TypeSafeClient, rule: str, k: int,
-                 model: str | None = None) -> tuple[dict[int, dict], float, float]:
+def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
+                 outputs: list[str], model: str | None = None
+                 ) -> tuple[dict[int, dict], float, float]:
     """Every window the run can present, judged once, keyed by how long it is.
 
     Not just the 2^k full windows. The first k-1 steps of a run have less
@@ -122,26 +131,52 @@ def window_table(client: TypeSafeClient, rule: str, k: int,
     imaginary zeros are indeed all the same. The rule means no such thing.
 
     So a short prefix is asked about as a short prefix: this is the start, only
-    this many inputs have happened. Costs 2^(k+1)-2 questions in one request,
-    still flat in how many runs get labelled afterwards.
+    this many steps have happened. With n named inputs a window of k steps is
+    k*n bits, so the count is sum over lengths of 2^(length*n), in one request
+    and still flat in how many runs get labelled afterwards. It grows fast in
+    both k and n, which is the real limit on how wide a machine this can spec.
     """
     questions, shapes = {}, {}
     for length in range(1, k + 1):
-        for r in range(2 ** length):
-            pattern = tuple((r >> i) & 1 for i in range(length))
-            key = f"w{length}_{r}"
-            shapes[key] = (length, pattern)
-            oldest_first = ", ".join(str(b) for b in reversed(pattern))
+        for r in range(len(names) and 2 ** (length * len(names))):
+            # A window is `length` words, newest first; each word packs one bit
+            # per named input, lowest bit first.
+            window = tuple((r >> (step * len(names))) & (2 ** len(names) - 1)
+                           for step in range(length))
+            # Each step is named by how far back it is, rather than left to be
+            # recovered from an ordering. Said as a bare sequence, a two-input
+            # rule came back reading every input as belonging to the current
+            # step, and the table fired on the newest word alone.
+            said = [", ".join(f"{name}={(word >> bit) & 1}"
+                              for bit, name in enumerate(names))
+                    for word in window]
+            def when(ago: int) -> str:
+                if ago == 0:
+                    return "at this step"
+                if ago == 1:
+                    return "at the step immediately before this one"
+                return f"{ago} steps before this one"
+            told = "; ".join(f"{when(ago)}, {said[ago]}"
+                             for ago in reversed(range(length)))
+            if len(names) == 1:
+                # A rule written as a sequence ("1 then 0 then 1") is answered
+                # far more sharply when the window is shown as one too. The
+                # per-step naming alone cost a 101 detector most of its margin.
+                run = " then ".join(str((word >> 0) & 1) for word in reversed(window))
+                told = f"in order, oldest first, the inputs were {run} - that is, {told}"
             if length == k:
-                where = f"the last {k} inputs, oldest first, were {oldest_first}"
+                where = f"the inputs were: {told}" if len(names) > 1 else told
             else:
-                many = "input has" if length == 1 else f"{length} inputs have"
-                where = (f"this is the very start of the run - only {many} arrived so "
-                         f"far, and in order they were {oldest_first}")
-            questions[key] = Noul(instructions=(
-                f"Applying the rule in `rule`: {where}, so the input at this step is "
-                f"{pattern[0]}. The output at this step is 1."
-            ))
+                many = "step has" if length == 1 else f"{length} steps have"
+                where = (f"this is the very start of the run, so only {many} happened "
+                         f"at all, and the inputs were: {told}")
+            for out in outputs:
+                key = f"w{length}_{r}_{out}"
+                shapes[key] = (length, window, out)
+                questions[key] = Noul(instructions=(
+                    f"Applying the rule in `rule`: {where}. "
+                    f"The output bit `{out}` at this step is 1."
+                ))
     answers = client.system_one(state={"rule": rule}, questions=questions, model=model)
     tables: dict[int, dict] = {length: {} for length in range(1, k + 1)}
     # Kept apart on purpose. The full windows answer "is this depth enough",
@@ -149,9 +184,11 @@ def window_table(client: TypeSafeClient, rule: str, k: int,
     # what happens before it has its history", a harder and different question
     # whose uncertainty says nothing about the depth.
     full, run_in = 1.0, 1.0
-    for key, (length, pattern) in shapes.items():
+    for key, (length, window, out) in shapes.items():
         p = answers.nouls[key].noul
-        tables[length][pattern] = 1 if p > 0.5 else 0
+        word = tables[length].setdefault(window, 0)
+        if p > 0.5:
+            tables[length][window] = word | (1 << outputs.index(out))
         if length == k:
             full = min(full, abs(p - 0.5))
         else:
@@ -168,11 +205,12 @@ def label(feed: list[int], tables: dict[int, dict], k: int) -> list[int]:
     return out
 
 
-def make_runs(rng: random.Random, many: int, steps: int,
-              table: dict[int, dict], k: int) -> list[dict]:
+def make_runs(rng: random.Random, many: int, steps: int, table: dict[int, dict],
+              k: int, inputs: int = 1) -> list[dict]:
+    """A feed is one word a step, not one bit: each word packs every input."""
     runs = []
     for _ in range(many):
-        feed = [rng.randint(0, 1) for _ in range(steps)]
+        feed = [rng.randrange(2 ** inputs) for _ in range(steps)]
         runs.append({"feed": feed, "want": label(feed, table, k)})
     return runs
 
@@ -181,6 +219,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="machine", description="Synthesise a machine from an English rule, then probe it.")
     parser.add_argument("rule", help="the rule, in plain English")
+    parser.add_argument("-i", "--inputs", default="x",
+                        help="comma-separated input names, lowest bit first")
+    parser.add_argument("-o", "--outputs", default="out",
+                        help="comma-separated output names, lowest bit first")
     parser.add_argument("--state", type=int, default=2, help="state bits")
     parser.add_argument("-g", "--gates", type=int, default=6, help="gate budget")
     parser.add_argument("--runs", type=int, default=3, help="how many runs to teach on")
@@ -196,6 +238,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", help="TypeSafe model (default jev-latest)")
     parser.add_argument("--mcp", default=os.environ.get("GRIT_MCP", DEFAULT_MCP))
     args = parser.parse_args(argv)
+    names = [n.strip() for n in args.inputs.split(",") if n.strip()]
+    outputs = [n.strip() for n in args.outputs.split(",") if n.strip()]
+    if not names or not outputs:
+        parser.error("need at least one input and one output")
 
     if not os.environ.get("TYPESAFE_API_KEY"):
         print("TYPESAFE_API_KEY is not set (console.typesafe.ai/keys)", file=sys.stderr)
@@ -231,17 +277,17 @@ def main(argv: list[str] | None = None) -> int:
                           "of a shallower window if you can, or hand grit the runs yourself.")
                 return 3
             k = shape["span"] or 4
-            table, worst, run_in = window_table(client, args.rule, k, args.model)
+            table, worst, run_in = window_table(client, args.rule, k, names,
+                                                outputs, args.model)
             if worst < TABLE_FLOOR and not args.force:
                 if args.json:
                     print(json.dumps({"rule": args.rule, "shape": shape,
                                       "window": k, "worst_margin": round(worst, 3),
                                       "labelled": False}, indent=2))
                 else:
-                    print(f"\nThe {2 ** k}-pattern table's closest call is {worst:.2f} from "
-                          f"the middle.\nPatterns this undecided mean the window does not "
-                          "carry the rule:\nthe answer depends on something these "
-                          f"{k} inputs do not show.\nNothing was taught, because a machine "
+                    print(f"\nThe {2 ** (k * len(names))} full windows close to "
+                          f"{worst:.2f} of the middle. The answer depends on "
+                          f"something\nthese {k} steps do not show, so nothing was taught: a machine "
                           "fitted to coin flips still solves.")
                 return 3
     except TypeSafeAPIError as error:
@@ -249,20 +295,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if not args.json:
-        print(f"\nwindow tables, {2 ** (k + 1) - 2} patterns "
+        print(f"\nwindow tables, {sum(2 ** (n * len(names)) for n in range(1, k + 1))} windows "
               f"(full windows close to {worst:.2f}, run-in to {run_in:.2f}), "
               f"newest input first:")
         for length in sorted(table):
             head = "full window" if length == k else f"run-in, {length} so far"
             print(f"  {head}:")
-            for pattern, bit in sorted(table[length].items()):
-                print(f"    {''.join(str(b) for b in pattern)} -> {bit}")
+            for window, word in sorted(table[length].items()):
+                shown = " ".join(f"{w:0{len(names)}b}" for w in reversed(window))
+                print(f"    {shown} -> {word:0{len(outputs)}b}")
 
     rng = random.Random(args.seed)
-    taught = make_runs(rng, args.runs, args.steps, table, k)
-    probes = make_runs(rng, args.probe_runs, args.probe_steps, table, k)
+    taught = make_runs(rng, args.runs, args.steps, table, k, len(names))
+    probes = make_runs(rng, args.probe_runs, args.probe_steps, table, k, len(names))
 
-    ask = {"state": args.state, "inputs": 1, "outputs": 1, "gates": args.gates,
+    ask = {"state": args.state, "inputs": len(names), "outputs": len(outputs),
+           "gates": args.gates,
            "crowd": args.crowd, "rounds": args.rounds, "traces": taught}
     found = grit("grit_machine", ask, args.mcp)
     solved = bool(found.get("solved"))

@@ -280,7 +280,7 @@ def bench_trace(client) -> dict:
                 "as_intended": ok}
         if kind == "window" and ok and shape["span"]:
             windows += 1
-            tables, worst, _ = machine.window_table(client, rule, shape["span"])
+            tables, worst, _ = machine.window_table(client, rule, shape["span"], ["x"], ["out"])
             steps = wrong = 0
             for feed in feeds:
                 got = machine.label(feed, tables, shape["span"])
@@ -308,7 +308,7 @@ def bench_depth(client) -> dict:
     for rule, depth, truth in DEPTHS:
         for k in {depth, depth - 1} - {0}:
             adequate = k >= depth
-            table, worst, run_in = machine.window_table(client, rule, k)
+            table, worst, run_in = machine.window_table(client, rule, k, ["x"], ["out"])
             # At an adequate depth the whole table is checkable against truth.
             wrong = None
             if adequate:
