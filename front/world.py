@@ -154,6 +154,22 @@ def parted(rule: str, held: list) -> bool:
     return len(seen) > 1
 
 
+def would_pick(held: list, want: int) -> list[str]:
+    """Which rules, if any, would have chosen this scene.
+
+    Three times a description was marked wrong and the rule was what was wrong:
+    stepping over a heap marked against slenderness when it is about height,
+    the widest spread marked against the widest row when it is about width
+    against height. Each time the working out was the same - go through the
+    measurables and see which one the pick is the extreme of - so it is done
+    here instead of by hand.
+    """
+    return [f"{way} {name}"
+            for name, measure in sorted(MEASURED.items())
+            for way, chosen in (("min", min), ("max", max))
+            if chosen(range(len(held)), key=lambda n: measure(held[n])) == want]
+
+
 def picked(rule: str, held: list) -> int:
     """Work out which scene a description means, from what was counted.
 
@@ -331,6 +347,10 @@ def marked(tried: list[Poured], args) -> int:
             if not hit:
                 print(f"         kept   {tried[kept].scene}")
                 print(f"         wanted {tried[wants].scene}")
+                instead = [one for one in would_pick(tried, kept) if one != chooser]
+                if instead:
+                    print(f"         the scene it kept is the {', or the '.join(instead)}"
+                          " - if the sentence means one of those, the rule is what is wrong")
     print()
     asked = len(checks) - unanswerable
     print(f"{right}/{asked} descriptions matched the scene its rule picks"

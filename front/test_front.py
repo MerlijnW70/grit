@@ -470,6 +470,24 @@ class Asking(unittest.TestCase):
         self.assertEqual(one.clumps, 3, "three runs, whatever they hold")
         self.assertEqual(self.scene([0], [0, 0, 0]).clumps, 0)
 
+    def test_a_miss_says_which_rule_would_have_agreed(self):
+        # The pick is tall and narrow; a rule about width would not have chosen
+        # it and a rule about height would. Saying so is the difference between
+        # a miss that means the judging was wrong and one that means the rule
+        # was, which took three rounds of working out by hand to notice.
+        tall = self.scene([2, 2, 2, 2], [4, 4, 0, 0, 0], sand=8)
+        wide = self.scene([5], [1, 1, 1, 1, 1], sand=5)
+        held = [tall, wide]
+        self.assertIn("max rows", world.would_pick(held, 0))
+        self.assertIn("max widest", world.would_pick(held, 1))
+        self.assertNotIn("max widest", world.would_pick(held, 0))
+
+    def test_a_scene_nothing_singles_out_gets_no_suggestion(self):
+        same = [self.scene([1, 1], [1, 1, 0], sand=2) for _ in range(3)]
+        # Every rule ties, and min and max both land on the first, so the
+        # middle one is the extreme of nothing.
+        self.assertEqual(world.would_pick(same, 1), [])
+
     def test_an_unknown_measure_is_left_to_the_rule_to_refuse(self):
         # parted says nothing about a rule it does not know; picked is the one
         # that names it, so the message comes from one place.
