@@ -91,6 +91,10 @@ SCENES: list[tuple[str, dict]] = [
 # higher and it starts dropping right answers. --check prints the whole sweep.
 TELLING = 0.20
 
+# What the spread stands in for, asked directly. Both are reported because
+# neither is much good here and they miss different ones.
+SINGLES = 0.50
+
 
 def say_spread(held: list[tuple[float, bool]]) -> None:
     """Does a thin spread say the pick is not to be trusted?"""
@@ -398,6 +402,7 @@ def judge(client, wanted: str, poured: list["Poured"],
     options = {f"o{n}": told(one) for n, one in enumerate(poured)}
     answer = client.system_one(
         state={"wanted": wanted,
+               "rooms": [told(one) for one in poured],
                "reading": "the room is 128 cells across; a row holding many "
                           "cells is a wide layer and many rows holding a few is "
                           "a tall column"},
@@ -405,14 +410,32 @@ def judge(client, wanted: str, poured: list["Poured"],
             "kept": Choice(
                 instructions="Which of these settled rooms is the one `wanted` describes?",
                 criteria=options,
-            )
+            ),
+            # The same question the spread stands in for, asked out loud. Three
+            # times elsewhere here that beat the inference badly - a whole-rule
+            # reading over a row-by-row one, a direct depth question over a
+            # table margin. It does not beat it here. Over fifteen descriptions
+            # with three wrong picks between them the spread caught none and
+            # this caught one, which is better and is not much.
+            #
+            # The difference is worth keeping in mind. Those were questions
+            # about a rule, which is a thing with a meaning to be read. This one
+            # cannot be answered without weighing eight rooms against each other,
+            # which is the comparing the whole detour was meant to avoid. Asking
+            # plainly helps where the answer is a meaning, not where it is still
+            # a comparison wearing a sentence.
+            "singles": Noul(instructions=(
+                "`wanted` picks out one of the rooms in `rooms` from the rest of "
+                "them. It is not a description that several of them answer equally "
+                "well, and not one that none of them answers."
+            )),
         },
         model=model,
     )
     kept = answer.choices["kept"]
     spread = kept.probabilities
     return ({n: spread.get(f"o{n}", 0.0) for n in range(len(poured))},
-            kept.confidence)
+            kept.confidence, answer.nouls["singles"].noul)
 
 
 def marked(tried: list[Poured], args) -> int:
@@ -439,6 +462,7 @@ def marked(tried: list[Poured], args) -> int:
     right = 0
     unanswerable = 0
     both: list[tuple[bool, bool, bool]] = []
+    singled: list[tuple[float, float, bool]] = []
     spreads: list[tuple[float, bool]] = []
     with TypeSafeClient() as client:
         for wanted, chooser in checks:
@@ -451,7 +475,7 @@ def marked(tried: list[Poured], args) -> int:
                 continue
             wants = picked(chooser, tried)
             if args.how == "both":
-                says, sure = judge(client, wanted, tried, args.model)
+                says, sure, singles = judge(client, wanted, tried, args.model)
                 by_scene = max(range(len(tried)), key=lambda n: says[n])
                 told_rule, rule_sure = read_rule(client, wanted, args.model)
                 try:
@@ -482,9 +506,10 @@ def marked(tried: list[Poured], args) -> int:
                 says = {kept: sure}
                 asked_as = told_rule
             else:
-                says, sure = judge(client, wanted, tried, args.model)
+                says, sure, singles = judge(client, wanted, tried, args.model)
                 kept = max(range(len(tried)), key=lambda n: says[n])
                 asked_as = chooser
+                singled.append((sure, singles, hit_later := None))
             hit = kept == wants
             right += hit
             rest = [says[n] for n in range(len(tried)) if n != kept and n in says]
@@ -495,6 +520,8 @@ def marked(tried: list[Poured], args) -> int:
                   f"(next {margin:+.2f}, sure {sure:.2f})  {wanted}   "
                   f"{shown}{told_sure}")
             spreads.append((sure, hit))
+            if singled and singled[-1][2] is None:
+                singled[-1] = (singled[-1][0], singled[-1][1], hit)
             if not hit:
                 print(f"         kept   "
                       f"{tried[kept].scene if kept >= 0 else 'nothing it could apply'}")
@@ -509,6 +536,16 @@ def marked(tried: list[Poured], args) -> int:
           + (f", and {unanswerable} could not be asked of this set." if unanswerable
              else "."))
     say_spread(spreads)
+    if singled:
+        print()
+        print("  the spread against the same thing asked out loud:")
+        for sure, singles, hit in singled:
+            print(f"    spread {sure:.2f}  asked {singles:.2f}  "
+                  f"{'right' if hit else 'WRONG'}")
+        missed = [one for one in singled if not one[2]]
+        print(f"    of {len(missed)} wrong, the spread was under {TELLING} for "
+              f"{sum(1 for one in missed if one[0] < TELLING)} and the asking said "
+              f"no for {sum(1 for one in missed if one[1] < 0.5)}")
     if both:
         agreed = [one for one in both if one[0]]
         parted_ways = [one for one in both if not one[0]]
@@ -562,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with TypeSafeClient() as client:
-            says, sure = judge(client, args.wanted, tried, args.model)
+            says, sure, _ = judge(client, args.wanted, tried, args.model)
             # The two routes fail at different things, and over the descriptions
             # this has been measured on every wrong answer sat where they parted.
             # So the second one is asked too, and a disagreement is handed over
