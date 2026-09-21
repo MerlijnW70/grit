@@ -242,6 +242,9 @@ class FakeClient:
             if qid == "span":
                 choices[qid] = FakeAnswer(choice=self.script["span"],
                                           confidence=self.script.get("span_confidence", 1.0))
+            elif "by_text" in self.script:
+                nouls[qid] = FakeAnswer(
+                    noul=self.script["by_text"](qid, questions[qid].instructions))
             else:
                 nouls[qid] = FakeAnswer(noul=self.script["noul"](qid))
         return FakeResponse(nouls, choices)
@@ -326,6 +329,33 @@ class Pruning(Driving_machine, unittest.TestCase):
         # The last request of each run is the window enumeration.
         self.assertLess(len(narrow.asked[-1]), len(wide.asked[-1]),
                         "dropping two of four slots must ask about fewer windows")
+
+    def test_the_check_catches_a_value_that_was_dropped_but_matters(self):
+        # A scripted rule that genuinely reads b at the previous step: the
+        # probe question spells every value out, so the answer can be read
+        # straight off the text the checker built.
+        def noul(qid, text):
+            return 0.95 if "the step immediately before this one, a=0, b=1" in text else 0.05
+
+        client = FakeClient({"span": "2", "noul": lambda q: 0.5, "by_text": noul})
+        honest = {(0, "a"): 0.9, (1, "b"): 0.9, (0, "b"): 0.01, (1, "a"): 0.01}
+        lied = dict(honest)
+        lied[(1, "b")] = 0.0
+        self.assertIn((1, "b"),
+                      machine.check_pruning(client, "r", 2, ["a", "b"], ["out"], lied),
+                      "dropping a value the rule reads has to come back flagged")
+        self.assertNotIn((1, "b"),
+                         machine.check_pruning(client, "r", 2, ["a", "b"], ["out"], honest),
+                         "a value that was kept is not under test")
+
+    def test_the_check_pays_for_every_probe_it_reads(self):
+        # It once asked every background and compared only the first few, so
+        # exhaustive coverage was bought and thrown away.
+        client = FakeClient({"span": "2", "noul": lambda q: 0.05})
+        machine.check_pruning(client, "r", 2, ["a", "b"], ["out"],
+                              {(0, "a"): 0.9, (0, "b"): 0.01, (1, "a"): 0.01, (1, "b"): 0.01})
+        asked = len(client.asked[-1])
+        self.assertEqual(asked % 2, 0, "probes come in pairs")
 
     def test_a_dropped_slot_never_empties_the_window(self):
         # Relevance can come back saying nothing matters. The lookup still

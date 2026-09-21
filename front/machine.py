@@ -153,6 +153,12 @@ def read_relevance(client: TypeSafeClient, rule: str, k: int, names: list[str],
 # clear of this and a false keep landed between - which is the harmless side.
 PRUNE_FLOOR = 0.25
 
+# How many other values a dropped one may be checked against exhaustively.
+# Beyond this the check samples, and a value that matters only under one rare
+# setting of the others can slip through - so the check is a filter on bad
+# prunes rather than a proof of good ones.
+EXHAUSTIVE_BITS = 4
+
 
 def relevant_slots(relevance: dict[tuple[int, str], float], length: int,
                    names: list[str], floor: float = PRUNE_FLOOR) -> list[tuple[int, str]]:
@@ -161,6 +167,89 @@ def relevant_slots(relevance: dict[tuple[int, str], float], length: int,
                   if p > floor and slot[0] < length)
     # A rule that reads nothing still has to read the current step.
     return kept or [(0, names[0])]
+
+
+def check_pruning(client: TypeSafeClient, rule: str, k: int, names: list[str],
+                  outputs: list[str], relevance: dict[tuple[int, str], float],
+                  probes: int = 4, seed: int = 0,
+                  model: str | None = None) -> list[tuple[int, str]]:
+    """Test the claim behind each dropped value instead of trusting it.
+
+    Dropping a value says: no two windows differing only here want different
+    outputs. The pruned enumeration never asks such a pair, by construction, so
+    the claim goes unchecked and a wrong drop flattens the rule silently.
+
+    So ask the pair directly. For every dropped value, a few windows are filled
+    in at random and put twice, once with that value 0 and once with it 1. A
+    pair that disagrees is a value that mattered, and it comes back to be put
+    back. One request, two questions per probe.
+    """
+    kept = set(relevant_slots(relevance, k, names))
+    dropped = [slot for slot in ((lag, name) for lag in range(k) for name in names)
+               if slot not in kept]
+    if not dropped:
+        return []
+    rng = random.Random(seed)
+    every = [(lag, name) for lag in range(k) for name in names]
+    questions, pairs = {}, {}
+    for slot in dropped:
+        rest = [other for other in every if other != slot]
+        # Every background, when there are few enough of them. A value that only
+        # matters under one particular setting of the others - the current input
+        # of a 101 detector matters only when the two before it were 1 then 0 -
+        # is found by chance or not at all, and sampling found it about half the
+        # time. Exhaustive here costs 2^(k*n) questions, which is what the
+        # pruning was avoiding, so it applies only while that is small.
+        backgrounds = ([{slot_: (r >> i) & 1 for i, slot_ in enumerate(rest)}
+                        for r in range(2 ** len(rest))]
+                       if len(rest) <= EXHAUSTIVE_BITS else [])
+        for probe in range(max(probes, len(backgrounds))):
+            # The whole background is fixed before the pair is built, so the two
+            # windows differ in the one value under test and nothing else. Filling
+            # only the kept slots left the rest to be drawn again on each side,
+            # which is two different windows and answers nothing.
+            #
+            # All-ones and all-zeros come first. A value that only matters
+            # alongside another - "a now and b before" needs a to be 1 before b
+            # can change anything - is invisible to a background that happens to
+            # switch it off, and random draws miss that half the time.
+            if probe < len(backgrounds):
+                background = backgrounds[probe]
+            elif probe == len(backgrounds):
+                background = {other: 1 for other in every}
+            elif probe == len(backgrounds) + 1:
+                background = {other: 0 for other in every}
+            else:
+                background = {other: rng.randint(0, 1) for other in every}
+            for value in (0, 1):
+                words = []
+                for step in range(k):
+                    word = 0
+                    for bit, name in enumerate(names):
+                        here = (value if (step, name) == slot
+                                else background[(step, name)])
+                        word |= here << bit
+                    words.append(word)
+                key = f"chk{slot[0]}_{slot[1]}_{probe}_{value}"
+                pairs[key] = (slot, probe, value)
+                said = "; ".join(
+                    ("at this step" if ago == 0 else
+                     "at the step immediately before this one" if ago == 1 else
+                     f"{ago} steps before this one") + ", "
+                    + ", ".join(f"{name}={(words[ago] >> bit) & 1}"
+                                for bit, name in enumerate(names))
+                    for ago in reversed(range(k)))
+                questions[key] = Noul(instructions=(
+                    f"Applying the rule in `rule`: the inputs were: {said}. "
+                    f"The output bit `{outputs[0]}` at this step is 1."
+                ))
+    answers = client.system_one(state={"rule": rule}, questions=questions, model=model)
+    said = {key: answers.nouls[key].noul > 0.5 for key in questions}
+    mattered = {slot for (slot, probe, value), key in
+                ((pairs[key], key) for key in questions)
+                if value == 0
+                and said[key] != said[f"chk{slot[0]}_{slot[1]}_{probe}_1"]}
+    return sorted(mattered)
 
 
 def window_table(client: TypeSafeClient, rule: str, k: int, names: list[str],
@@ -348,6 +437,15 @@ def main(argv: list[str] | None = None) -> int:
             k = shape["span"] or 4
             relevance = (read_relevance(client, args.rule, k, names, args.model)
                          if args.prune else None)
+            if relevance is not None:
+                # Put back anything the check says actually mattered.
+                mattered = check_pruning(client, args.rule, k, names, outputs,
+                                         relevance, seed=args.seed, model=args.model)
+                for slot in mattered:
+                    relevance[slot] = 1.0
+                if mattered and not args.json:
+                    print("put back: " + ", ".join(f"{n}@-{l}" for l, n in mattered)
+                          + " - dropping it changed the answer")
             if relevance is not None and not args.json:
                 kept = relevant_slots(relevance, k, names)
                 print("reads: " + ", ".join(f"{name}@-{lag}" for lag, name in kept)

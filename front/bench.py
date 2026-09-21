@@ -426,12 +426,24 @@ def bench_prune(client) -> dict:
         full = sum(2 ** (n * len(names)) for n in range(1, k + 1))
         pruned = sum(2 ** len(machine.relevant_slots(relevance, n, names))
                      for n in range(1, k + 1))
+        # Does the check pass an honest prune, and catch a sabotaged one? Each
+        # rule is asked again with one value it really needs marked irrelevant.
+        clean = machine.check_pruning(client, rule, k, names, ["out"], relevance)
+        sabotage = sorted(want)[0]
+        lied = dict(relevance)
+        lied[sabotage] = 0.0
+        caught = machine.check_pruning(client, rule, k, names, ["out"], lied)
         cases.append({"rule": rule[:54], "kept": sorted(kept), "want": sorted(want),
                       "dropped": dropped, "spare": spare,
                       "full_windows": full, "pruned_windows": pruned,
                       "saved": round(1 - pruned / full, 2),
-                      "safe": not dropped})
+                      "safe": not dropped,
+                      "check_false_alarm": bool(clean),
+                      "sabotage": list(sabotage),
+                      "sabotage_caught": sabotage in caught})
     return {"rules": len(cases), "cases": cases,
+            "checked_clean": sum(1 for case in cases if not case["check_false_alarm"]),
+            "sabotage_caught": sum(1 for case in cases if case["sabotage_caught"]),
             "safe": sum(1 for case in cases if case["safe"]),
             "exact": sum(1 for case in cases if case["safe"] and not case["spare"]),
             "windows_full": sum(case["full_windows"] for case in cases),
@@ -444,9 +456,15 @@ def say_prune(found: dict) -> None:
           f"{found['exact']}/{found['rules']} exactly right, "
           f"{found['windows_full']} windows down to {found['windows_pruned']} "
           f"({saved:.0%} fewer)")
+    print(f"  the check: passes {found['checked_clean']}/{found['rules']} honest "
+          f"prunes, catches {found['sabotage_caught']}/{found['rules']} sabotaged ones")
     for case in found["cases"]:
         mark = "ok  " if case["safe"] else "LOST"
         note = ""
+        if case["check_false_alarm"]:
+            note += "  check flagged an honest prune"
+        if not case["sabotage_caught"]:
+            note += "  check MISSED a sabotaged " + f"{case['sabotage'][1]}@-{case['sabotage'][0]}"
         if case["dropped"]:
             note += "  dropped " + ", ".join(f"{n}@-{l}" for l, n in case["dropped"])
         if case["spare"]:
