@@ -61,25 +61,36 @@ def stub(answer: dict, *, isError: bool = False, silent: bool = False) -> list[s
 
 
 class Window(unittest.TestCase):
-    """A machine starts from zeros, so the run-in has to pad rather than wrap."""
+    """The run-in is asked about, not assumed."""
 
-    table = {(0, 0): 0, (0, 1): 0, (1, 0): 0, (1, 1): 1}  # newest input first
+    # "this input and the one before it were both 1", newest input first.
+    tables = {1: {(0,): 0, (1,): 0},                      # nothing before it yet
+              2: {(0, 0): 0, (0, 1): 0, (1, 0): 0, (1, 1): 1}}
 
-    def test_pads_the_run_in_with_zeros(self):
-        # Step 0 has nothing before it: window is (feed[0], 0), never (feed[0], feed[-1]).
-        self.assertEqual(machine.label([1, 1, 0], self.table, 2), [0, 1, 0])
+    def test_a_short_prefix_reads_its_own_table(self):
+        # Step 0 has one input, so it reads the one-long table, never the
+        # two-long one with a zero invented to fill the gap.
+        self.assertEqual(machine.label([1, 1, 0], self.tables, 2), [0, 1, 0])
+
+    def test_the_run_in_does_not_invent_history(self):
+        # The bug this replaces: "the last N inputs were all the same" came out
+        # true at step 0, because N imaginary zeros are indeed all the same.
+        same = {1: {(0,): 0, (1,): 0},
+                2: {(0, 0): 1, (0, 1): 0, (1, 0): 0, (1, 1): 1}}
+        self.assertEqual(machine.label([0, 0, 1], same, 2)[0], 0,
+                         "step 0 cannot have two inputs that match")
 
     def test_a_lone_one_never_fires(self):
-        self.assertEqual(machine.label([1, 0, 1, 0], self.table, 2), [0, 0, 0, 0])
+        self.assertEqual(machine.label([1, 0, 1, 0], self.tables, 2), [0, 0, 0, 0])
 
     def test_every_step_is_a_lookup_so_equal_windows_agree(self):
-        got = machine.label([1, 1, 0, 1, 1], self.table, 2)
+        got = machine.label([1, 1, 0, 1, 1], self.tables, 2)
         self.assertEqual(got[1], got[4], "the same window twice must label the same")
 
     def test_runs_are_reproducible_from_a_seed(self):
         import random
-        one = machine.make_runs(random.Random(3), 2, 6, self.table, 2)
-        two = machine.make_runs(random.Random(3), 2, 6, self.table, 2)
+        one = machine.make_runs(random.Random(3), 2, 6, self.tables, 2)
+        two = machine.make_runs(random.Random(3), 2, 6, self.tables, 2)
         self.assertEqual(one, two)
         self.assertTrue(all(len(run["feed"]) == len(run["want"]) == 6 for run in one))
 

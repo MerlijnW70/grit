@@ -251,16 +251,17 @@ def bench_trace(client) -> dict:
                 "as_intended": ok}
         if kind == "window" and ok and shape["span"]:
             windows += 1
-            table, worst = machine.window_table(client, rule, shape["span"])
+            tables, worst, _ = machine.window_table(client, rule, shape["span"])
             steps = wrong = 0
             for feed in feeds:
-                got = machine.label(feed, table, shape["span"])
+                got = machine.label(feed, tables, shape["span"])
                 want = [truth(feed[:t + 1]) for t in range(len(feed))]
                 steps += len(feed)
                 wrong += sum(a != b for a, b in zip(got, want))
             labelled_right += steps - wrong
             case.update({"steps": steps, "steps_right": steps - wrong,
-                         "questions": 2 ** shape["span"], "worst_margin": round(worst, 2)})
+                         "questions": 2 ** (shape["span"] + 1) - 2,
+                         "worst_margin": round(worst, 2)})
         cases.append(case)
     return {"rules": len(TRACES), "routed": routed, "windows": windows,
             "steps_right": labelled_right, "cases": cases}
@@ -278,14 +279,18 @@ def bench_depth(client) -> dict:
     for rule, depth, truth in DEPTHS:
         for k in {depth, depth - 1} - {0}:
             adequate = k >= depth
-            table, worst = machine.window_table(client, rule, k)
+            table, worst, run_in = machine.window_table(client, rule, k)
             # At an adequate depth the whole table is checkable against truth.
             wrong = None
             if adequate:
-                wrong = sum(1 for pattern, bit in table.items()
+                # Every window the run can present, run-in included: the short
+                # ones are where zero-padding used to quietly invent history.
+                wrong = sum(1 for length in table
+                            for pattern, bit in table[length].items()
                             if truth(list(reversed(pattern))) != bit)
             cases.append({"rule": rule[:52], "true_depth": depth, "asked_at": k,
                           "adequate": adequate, "worst_margin": round(worst, 2),
+                          "run_in_margin": round(run_in, 2),
                           "wrong_patterns": wrong,
                           "accepted": worst >= machine.TABLE_FLOOR})
     scored = [(case["worst_margin"], not case["adequate"]) for case in cases]

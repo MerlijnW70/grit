@@ -100,32 +100,64 @@ def read_shape(client: TypeSafeClient, rule: str, model: str | None = None) -> d
 
 
 def window_table(client: TypeSafeClient, rule: str, k: int,
-                 model: str | None = None) -> tuple[dict[tuple[int, ...], int], float]:
-    """The 2^k recent-input patterns, judged once. Returns the table and its worst margin."""
-    patterns = [tuple((r >> i) & 1 for i in range(k)) for r in range(2 ** k)]
-    questions = {}
-    for n, pattern in enumerate(patterns):
-        oldest_first = ", ".join(str(b) for b in reversed(pattern))
-        questions[f"p{n}"] = Noul(instructions=(
-            f"Applying the rule in `rule`: the last {k} inputs, oldest first, were "
-            f"{oldest_first}, so the input at this step is {pattern[0]}. "
-            "The output at this step is 1."
-        ))
+                 model: str | None = None) -> tuple[dict[int, dict], float, float]:
+    """Every window the run can present, judged once, keyed by how long it is.
+
+    Not just the 2^k full windows. The first k-1 steps of a run have less
+    history than the window wants, and what the rule says there is a question,
+    not an assumption. Padding those with zeros - the obvious shortcut - labels
+    "the last three inputs were all the same" as true at step 0, because three
+    imaginary zeros are indeed all the same. The rule means no such thing.
+
+    So a short prefix is asked about as a short prefix: this is the start, only
+    this many inputs have happened. Costs 2^(k+1)-2 questions in one request,
+    still flat in how many runs get labelled afterwards.
+    """
+    questions, shapes = {}, {}
+    for length in range(1, k + 1):
+        for r in range(2 ** length):
+            pattern = tuple((r >> i) & 1 for i in range(length))
+            key = f"w{length}_{r}"
+            shapes[key] = (length, pattern)
+            oldest_first = ", ".join(str(b) for b in reversed(pattern))
+            if length == k:
+                where = f"the last {k} inputs, oldest first, were {oldest_first}"
+            else:
+                many = "input has" if length == 1 else f"{length} inputs have"
+                where = (f"this is the very start of the run - only {many} arrived so "
+                         f"far, and in order they were {oldest_first}")
+            questions[key] = Noul(instructions=(
+                f"Applying the rule in `rule`: {where}, so the input at this step is "
+                f"{pattern[0]}. The output at this step is 1."
+            ))
     answers = client.system_one(state={"rule": rule}, questions=questions, model=model)
-    probabilities = {pattern: answers.nouls[f"p{n}"].noul
-                     for n, pattern in enumerate(patterns)}
-    table = {pattern: (1 if p > 0.5 else 0) for pattern, p in probabilities.items()}
-    return table, min(abs(p - 0.5) for p in probabilities.values())
+    tables: dict[int, dict] = {length: {} for length in range(1, k + 1)}
+    # Kept apart on purpose. The full windows answer "is this depth enough",
+    # which is what TABLE_FLOOR guards. The run-in answers "does the rule say
+    # what happens before it has its history", a harder and different question
+    # whose uncertainty says nothing about the depth.
+    full, run_in = 1.0, 1.0
+    for key, (length, pattern) in shapes.items():
+        p = answers.nouls[key].noul
+        tables[length][pattern] = 1 if p > 0.5 else 0
+        if length == k:
+            full = min(full, abs(p - 0.5))
+        else:
+            run_in = min(run_in, abs(p - 0.5))
+    return tables, full, run_in
 
 
-def label(feed: list[int], table: dict[tuple[int, ...], int], k: int) -> list[int]:
-    """A machine starts from a state of all zeros, so the run-in pads with zeros."""
-    return [table[tuple(feed[t - i] if t - i >= 0 else 0 for i in range(k))]
-            for t in range(len(feed))]
+def label(feed: list[int], tables: dict[int, dict], k: int) -> list[int]:
+    """Each step reads the window it actually has, short ones included."""
+    out = []
+    for t in range(len(feed)):
+        length = min(t + 1, k)
+        out.append(tables[length][tuple(feed[t - i] for i in range(length))])
+    return out
 
 
 def make_runs(rng: random.Random, many: int, steps: int,
-              table: dict[tuple[int, ...], int], k: int) -> list[dict]:
+              table: dict[int, dict], k: int) -> list[dict]:
     runs = []
     for _ in range(many):
         feed = [rng.randint(0, 1) for _ in range(steps)]
@@ -187,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
                           "of a shallower window if you can, or hand grit the runs yourself.")
                 return 3
             k = shape["span"] or 4
-            table, worst = window_table(client, args.rule, k, args.model)
+            table, worst, run_in = window_table(client, args.rule, k, args.model)
             if worst < TABLE_FLOOR and not args.force:
                 if args.json:
                     print(json.dumps({"rule": args.rule, "shape": shape,
@@ -205,10 +237,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if not args.json:
-        print(f"\nwindow table over {2 ** k} patterns (worst margin {worst:.2f}), "
+        print(f"\nwindow tables, {2 ** (k + 1) - 2} patterns "
+              f"(full windows close to {worst:.2f}, run-in to {run_in:.2f}), "
               f"newest input first:")
-        for pattern, bit in sorted(table.items()):
-            print(f"  {''.join(str(b) for b in pattern)} -> {bit}")
+        for length in sorted(table):
+            head = "full window" if length == k else f"run-in, {length} so far"
+            print(f"  {head}:")
+            for pattern, bit in sorted(table[length].items()):
+                print(f"    {''.join(str(b) for b in pattern)} -> {bit}")
 
     rng = random.Random(args.seed)
     taught = make_runs(rng, args.runs, args.steps, table, k)
