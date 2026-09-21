@@ -841,13 +841,33 @@ fn the_list_carries_the_weights_the_whole_grid_would_have() {
     assert_eq!(whole.home, start);
 }
 
+/// The largest side the walk starts from where the bookkeeping can hold it.
+const TOP: u32 = 4096;
+
 #[test]
 fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
     let Some(host) = device("the_list_starts_paying_when_the_grid_outgrows") else {
         return;
     };
+    // The sides are taken from what the bookkeeping can address rather than
+    // written down, because that is what they are being measured against. A
+    // two-level scan over blocks of `sweep::cells(width)` reaches
+    // `cells(width)` squared blocks and no further, so the largest grid a plan
+    // can hold is `cells(width)` cubed quads -- 16 777 216 at a subgroup of 32,
+    // and 32 768 at a subgroup of 4. Four sides, halving down from the largest
+    // that fits, ask the same question of every device instead of asking a
+    // narrow one for a grid it could never plan.
+    let per_block = sweep::cells(host.width());
+    let reach = u64::from(per_block).pow(3);
+    let mut top = TOP;
+    while u64::from(Grid::of(top, top).quads()) > reach && top > 2 {
+        top /= 2;
+    }
+    let sides = [top, top / 2, top / 4, top / 8];
+    eprintln!("{} {per_block} {top}", host.width());
+
     let mut won = false;
-    for side in [512_u32, 1024, 2048, 4096] {
+    for side in sides {
         let grid = Grid::of(side, side);
         let cells = patched(grid, 0x1234_5678, 12);
         let held = [cells.as_slice(), cells.as_slice(), cells.as_slice()];
@@ -863,12 +883,20 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
             listed.ahead,
             listed.back
         );
-        assert!(listed.awake < grid.quads() || side == 512);
+        assert!(listed.awake < grid.quads() || side == sides[3]);
         if listed.ahead < whole.ahead && listed.back < whole.back {
             won = true;
         }
     }
-    assert!(won);
+    // Which side wins is a property of the device, not of this test: the list
+    // carries nine passes against the whole grid's two, so it only pays once
+    // the grid it skips is large enough to cover that. The sides are printed
+    // above, so a device where none of them is large enough says so with the
+    // measurements rather than with a bare false.
+    assert!(
+        won,
+        "no side of {sides:?} had the list beat the whole grid both ways"
+    );
 }
 
 const WIDEST: u32 = 1024;
