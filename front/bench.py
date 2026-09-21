@@ -184,6 +184,38 @@ WIDE = [
 ]
 
 
+# Specs of the kind someone would actually write, rather than three-input toys.
+# Bit 0 of the row index is the first named input. Ground truth is computed
+# from the row index so the table can be marked rather than eyeballed.
+def _bits(r, n):
+    return [(r >> i) & 1 for i in range(n)]
+
+
+HARD = [
+    ("output 1 when the two-bit number a (a1 is its high bit, a0 its low bit) is "
+     "strictly greater than the two-bit number b (b1 high, b0 low)",
+     ["a0", "a1", "b0", "b1"], ["out"],
+     lambda r: [int((((r >> 1) & 1) * 2 + (r & 1)) >
+                    (((r >> 3) & 1) * 2 + ((r >> 2) & 1)))]),
+    ("the four inputs are the bits of a number from 0 to 15, where n0 is the "
+     "lowest bit and n3 the highest; output 1 when that number is 9 or less",
+     ["n0", "n1", "n2", "n3"], ["out"],
+     lambda r: [int(r <= 9)]),
+    ("the three inputs are the bits of a number from 0 to 7, where n0 is the "
+     "lowest bit and n2 the highest; output 1 when that number is prime",
+     ["n0", "n1", "n2"], ["out"],
+     lambda r: [int(r in (2, 3, 5, 7))]),
+    ("output 1 when at least three of the five inputs are 1",
+     ["a", "b", "c", "d", "e"], ["out"],
+     lambda r: [int(sum(_bits(r, 5)) >= 3)]),
+    ("add the two-bit number a (a1 high, a0 low) to the two-bit number b (b1 "
+     "high, b0 low); s0 is the low bit of the sum, s1 the next bit, s2 the carry out",
+     ["a0", "a1", "b0", "b1"], ["s0", "s1", "s2"],
+     lambda r: [(((((r >> 1) & 1) * 2 + (r & 1)) + ((((r >> 3) & 1) * 2 + ((r >> 2) & 1)))) >> i) & 1
+                for i in range(3)]),
+]
+
+
 class Metered:
     """Duck-types the client so the suites can be billed as well as scored."""
 
@@ -539,6 +571,44 @@ def say_wide(found: dict) -> None:
         print(f"        {case['rule']}")
 
 
+def bench_hard(client) -> dict:
+    """Specs past the toy range, marked against ground truth."""
+    cases = []
+    for rule, inputs, outputs, truth in HARD:
+        rows = spec.read_intent(client, rule, inputs, outputs)
+        wrong, stopped = [], []
+        for row in rows:
+            want = truth(row.index)
+            for j, out in enumerate(outputs):
+                if row.outs[out] != want[j]:
+                    wrong.append((row.index, out))
+            stopped += [(row.index, name) for name in row.unclear(spec.UNDECIDED_FLOOR)]
+        cases.append({"rule": rule[:56], "inputs": len(inputs),
+                      "outputs": len(outputs),
+                      "bits": 2 ** len(inputs) * len(outputs),
+                      "wrong": len(wrong), "first_wrong": wrong[:4],
+                      "stopped": len(stopped), "exact": not wrong})
+    return {"specs": len(cases), "cases": cases,
+            "exact": sum(1 for case in cases if case["exact"]),
+            "bits": sum(case["bits"] for case in cases),
+            "wrong": sum(case["wrong"] for case in cases)}
+
+
+def say_hard(found: dict) -> None:
+    print(f"\nspecs past the toy range - {found['exact']}/{found['specs']} exact, "
+          f"{found['bits'] - found['wrong']}/{found['bits']} bits right")
+    for case in found["cases"]:
+        mark = "ok   " if case["exact"] else "WRONG"
+        note = f"  {case['wrong']}/{case['bits']} bits wrong" if case["wrong"] else ""
+        if case["stopped"]:
+            note += f"  ({case['stopped']} rows called undecided)"
+        print(f"  {mark} {case['inputs']}in {case['outputs']}out{note}")
+        print(f"        {case['rule']}")
+        if case["first_wrong"]:
+            print("        first wrong: " + ", ".join(f"row {r} `{o}`"
+                                                      for r, o in case["first_wrong"]))
+
+
 def say_spec(found: dict) -> None:
     print("\nundecided detector "
           f"(floor {spec.UNDECIDED_FLOOR}) - {found['as_intended']}/{found['specs']} as intended")
@@ -598,7 +668,7 @@ def say_trace(found: dict) -> None:
 SUITES = {"spec": (bench_spec, say_spec), "table": (bench_table, say_table),
           "trace": (bench_trace, say_trace), "depth": (bench_depth, say_depth),
           "route": (bench_route, say_route), "prune": (bench_prune, say_prune),
-          "wide": (bench_wide, say_wide)}
+          "wide": (bench_wide, say_wide), "hard": (bench_hard, say_hard)}
 
 
 def main(argv: list[str] | None = None) -> int:
