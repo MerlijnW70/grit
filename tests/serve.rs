@@ -1033,3 +1033,274 @@ fn a_thing_that_is_not_in_the_room_is_named_rather_than_poured() {
         "it has four things in it and treacle is not one: {said}"
     );
 }
+
+fn counts(held: &Json, name: &str) -> Vec<u32> {
+    held.get(name)
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .map(|one| one.int().unwrap() as u32)
+        .collect()
+}
+
+#[test]
+fn a_walled_room_is_a_floor_and_two_sides_and_nothing_overhead() {
+    let Some(host) = device("a_walled_room_is_a_floor_and_two_sides_and_nothing_overhead") else {
+        return;
+    };
+    let held = poured(
+        Some(&host),
+        "{\"wide\":16,\"deep\":16,\"frames\":4,\"walls\":true,\"most\":4}",
+    );
+    let tally = held.get("tally").unwrap();
+    assert_eq!(
+        tally.get("wall").and_then(Json::int),
+        Some(46),
+        "a sixteen by sixteen room is one floor and two sides sharing two corners, and no ceiling: 16 + 16 + 16 - 2"
+    );
+    assert_eq!(tally.get("air").and_then(Json::int), Some(210));
+    assert_eq!(held.get("checked_on_the_host"), Some(&Json::Bool(true)));
+}
+
+#[test]
+fn without_walls_there_is_nothing_for_a_falling_thing_to_land_on() {
+    let Some(host) = device("without_walls_there_is_nothing_for_a_falling_thing_to_land_on") else {
+        return;
+    };
+    let held = poured(
+        Some(&host),
+        "{\"wide\":16,\"deep\":16,\"frames\":4,\"walls\":false,\"most\":4}",
+    );
+    let tally = held.get("tally").unwrap();
+    assert_eq!(
+        tally.get("wall").and_then(Json::int),
+        Some(0),
+        "walls false builds none: {}",
+        written(&held)
+    );
+    assert_eq!(
+        tally.get("air").and_then(Json::int),
+        Some(256),
+        "every cell of the grid is air"
+    );
+}
+
+#[test]
+fn sand_is_counted_in_the_row_and_the_column_it_came_to_rest_in() {
+    let Some(host) = device("sand_is_counted_in_the_row_and_the_column_it_came_to_rest_in") else {
+        return;
+    };
+    let held = poured(
+        Some(&host),
+        "{\"wide\":16,\"deep\":16,\"frames\":30,\"walls\":true,\"most\":8,\"cells\":[{\"at\":34,\"is\":\"sand\"},{\"at\":35,\"is\":\"sand\"}]}",
+    );
+    let tally = held.get("tally").unwrap();
+    assert_eq!(tally.get("sand").and_then(Json::int), Some(2));
+
+    let rows = counts(&held, "rows");
+    let mut wanted = vec![0_u32; 16];
+    wanted[14] = 2;
+    assert_eq!(
+        rows, wanted,
+        "both grains rest on the row above the floor and nowhere else"
+    );
+
+    let columns = counts(&held, "columns");
+    let mut wanted = vec![0_u32; 16];
+    wanted[2] = 1;
+    wanted[3] = 1;
+    assert_eq!(
+        columns, wanted,
+        "they fell straight down, so the columns they started in are the columns they hold"
+    );
+
+    let standing = held.get("standing").and_then(Json::list).unwrap();
+    assert_eq!(
+        standing.len(),
+        2,
+        "the walls are not standing stuff and neither is air: {}",
+        written(&held)
+    );
+    for one in standing {
+        assert_eq!(one.get("is").and_then(Json::text), Some("sand"));
+    }
+    assert_eq!(
+        standing[0].counted("at"),
+        Some(226),
+        "row fourteen, column two"
+    );
+    assert_eq!(standing[1].counted("at"), Some(227));
+}
+
+#[test]
+fn a_spout_pours_for_as_many_frames_as_it_is_given_and_then_shuts_off() {
+    let Some(host) = device("a_spout_pours_for_as_many_frames_as_it_is_given_and_then_shuts_off")
+    else {
+        return;
+    };
+    let sand = |frames: u32| {
+        let held = poured(
+            Some(&host),
+            &format!(
+                "{{\"wide\":16,\"deep\":16,\"frames\":40,\"batch\":1,\"walls\":true,\"most\":2,\"brush\":{{\"at\":18,\"is\":\"sand\",\"span\":1,\"frames\":{frames}}}}}"
+            ),
+        );
+        held.get("tally").unwrap().get("sand").and_then(Json::int)
+    };
+    assert_eq!(
+        sand(0),
+        Some(0),
+        "a spout told to pour for no frames pours nothing at all"
+    );
+    assert_eq!(sand(1), Some(1), "one frame of pouring is one grain");
+    assert_eq!(sand(2), Some(2));
+}
+
+#[test]
+fn a_spout_that_names_no_frames_pours_for_half_the_run() {
+    let Some(host) = device("a_spout_that_names_no_frames_pours_for_half_the_run") else {
+        return;
+    };
+    let sand = |brush: &str| {
+        let held = poured(
+            Some(&host),
+            &format!(
+                "{{\"wide\":16,\"deep\":16,\"frames\":40,\"batch\":1,\"walls\":true,\"most\":2,\"brush\":{brush}}}"
+            ),
+        );
+        held.get("tally").unwrap().get("sand").and_then(Json::int)
+    };
+    let half = sand("{\"at\":18,\"is\":\"sand\",\"span\":1}");
+    let whole = sand("{\"at\":18,\"is\":\"sand\",\"span\":1,\"frames\":40}");
+    assert_eq!(half, Some(11), "forty frames of run, twenty of pouring");
+    assert_eq!(
+        whole,
+        Some(21),
+        "pouring the whole run is nearly twice that"
+    );
+}
+
+#[test]
+fn a_walked_grid_says_the_host_marked_it() {
+    let Some(host) = device("a_walked_grid_says_the_host_marked_it") else {
+        return;
+    };
+    let held = structured(&call(
+        Some(&host),
+        "grit_slope",
+        "{\"wide\":16,\"deep\":16,\"depth\":4,\"most\":3}",
+    ));
+    assert_eq!(
+        held.get("checked_on_the_host"),
+        Some(&Json::Bool(true)),
+        "the word this whole surface rests on is the one nothing was asserting: {}",
+        written(&held)
+    );
+}
+
+const DOWNHILL: &str = "{\"wide\":16,\"deep\":16,\"kind\":\"bound\",\"depth\":4,\"turning\":40,\"swing\":9,\"step\":4,\"fill\":3,\"want\":[{\"at\":51,\"is\":9},{\"at\":67,\"is\":5}]";
+
+fn settled(host: &Host, rounds: u32) -> Json {
+    structured(&call(
+        Some(host),
+        "grit_settle",
+        &format!("{DOWNHILL},\"rounds\":{rounds}}}"),
+    ))
+}
+
+#[test]
+fn a_walk_that_still_has_rounds_left_has_not_stalled() {
+    let Some(host) = device("a_walk_that_still_has_rounds_left_has_not_stalled") else {
+        return;
+    };
+    let held = settled(&host, 6);
+    assert_eq!(
+        held.get("stalled"),
+        Some(&Json::Bool(false)),
+        "six rounds of this walk end because the rounds ran out, not because it was stuck: {}",
+        written(&held)
+    );
+    assert_eq!(
+        held.get("trail").and_then(Json::list).unwrap().len(),
+        6,
+        "one entry a round"
+    );
+    assert_eq!(
+        held.counted("turned_around"),
+        Some(3),
+        "a round that went the wrong way tries the other way before giving up any step"
+    );
+    assert_eq!(held.get("checked_on_the_host"), Some(&Json::Bool(true)));
+}
+
+#[test]
+fn a_walk_with_nowhere_left_to_step_says_it_stalled() {
+    let Some(host) = device("a_walk_with_nowhere_left_to_step_says_it_stalled") else {
+        return;
+    };
+    let held = settled(&host, 7);
+    assert_eq!(
+        held.get("stalled"),
+        Some(&Json::Bool(true)),
+        "the seventh round has no step left to take: {}",
+        written(&held)
+    );
+    assert_eq!(held.get("trail").and_then(Json::list).unwrap().len(), 7);
+}
+
+#[test]
+fn a_walk_that_never_got_nearer_is_not_called_closed() {
+    let Some(host) = device("a_walk_that_never_got_nearer_is_not_called_closed") else {
+        return;
+    };
+    let held = settled(&host, 6);
+    let apart = held.get("apart").and_then(Json::int);
+    assert_eq!(
+        apart,
+        held.get("started_apart").and_then(Json::int),
+        "this walk ends exactly as far off as it started"
+    );
+    assert_eq!(
+        held.get("closed"),
+        Some(&Json::Bool(false)),
+        "closed means nearer than it started, and equal is not nearer: {}",
+        written(&held)
+    );
+}
+
+#[test]
+fn the_last_cell_of_the_grid_is_inside_it_and_the_one_after_is_not() {
+    let Some(host) = device("the_last_cell_of_the_grid_is_inside_it_and_the_one_after_is_not")
+    else {
+        return;
+    };
+    let walked = |at: u32| {
+        call(
+            Some(&host),
+            "grit_slope",
+            &format!("{{\"wide\":16,\"deep\":16,\"depth\":2,\"most\":1,\"at\":{at}}}"),
+        )
+    };
+    let last = walked(255);
+    assert_eq!(
+        last.get("result").and_then(|one| one.get("isError")),
+        Some(&Json::Bool(false)),
+        "a sixteen by sixteen grid holds 256 cells, so 255 is the last one and is inside it"
+    );
+    let past = walked(256);
+    let result = past.get("result").unwrap();
+    assert_eq!(
+        result.get("isError"),
+        Some(&Json::Bool(true)),
+        "256 is one past the end and is refused rather than wrapped"
+    );
+    let said = result
+        .get("content")
+        .and_then(Json::list)
+        .unwrap()
+        .first()
+        .and_then(|one| one.get("text"))
+        .and_then(Json::text)
+        .unwrap();
+    assert!(said.contains("256"), "{said}");
+}
