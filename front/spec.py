@@ -416,6 +416,12 @@ def staged(client: TypeSafeClient, rule: str, inputs: list[str], outputs: list[s
     the middle sum bit given the carry is exact, and the carry out given the
     carry is exact. Every stage passes both guards with room to spare.
 
+    The staging is what does that, not the asking-one-output-at-a-time this does
+    alongside it. The adder asked whole, one request an output, is five of forty
+    eight bits wrong with its closest call a tenth from the middle - the same as
+    asking all three together. Narrowing what is in view makes an answerable
+    question easier; it does not make "s1 is the next bit of the sum" into one.
+
     Each stage is a spec in its own right, asked over the original inputs and
     any in-between values named before it. The last stage is asked once per row
     of the real table, with the in-between values spelled out as facts about
