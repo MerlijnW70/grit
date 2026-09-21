@@ -88,6 +88,18 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The most quads one plan for this subgroup can hold.
+    ///
+    /// `over` refuses once the blocks outrun `sweep::cells` squared, because
+    /// the scan over them is two levels deep and reaches no further, and a
+    /// block holds `sweep::cells` quads. So the grid a plan can address is
+    /// that number cubed: 16 777 216 quads at a subgroup of 32, and 32 768 at
+    /// a subgroup of 4. It is not a limit of the device.
+    #[must_use]
+    pub fn reach(subgroup: u32) -> u64 {
+        u64::from(sweep::cells(subgroup)).pow(3)
+    }
+
     pub fn over(subgroup: u32, blocks: u32) -> Result<Self, TooBig> {
         let per_block = sweep::cells(subgroup);
         let limit = per_block.saturating_mul(per_block);

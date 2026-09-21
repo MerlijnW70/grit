@@ -142,3 +142,31 @@ fn the_work_list_is_every_awake_cell_once_and_in_block_order() {
     println!("{grand} {} {density:.1} {spent:.3?}", plan.quads);
     assert!(grand > 0 && (grand as usize) < plan.quads);
 }
+
+#[test]
+fn the_reach_of_a_plan_is_the_last_grid_it_will_take() {
+    // `reach` says in one place what `over` refuses in another, so the two are
+    // asked the same question here rather than trusted to agree. No device:
+    // both are arithmetic about the shape of the scan.
+    for subgroup in [4_u32, 8, 16, 32, 64] {
+        let per_block = u64::from(sweep::cells(subgroup));
+        assert_eq!(
+            Plan::reach(subgroup),
+            per_block * per_block * per_block,
+            "a block of {per_block} quads, and {per_block} squared of them"
+        );
+
+        let blocks = u32::try_from(Plan::reach(subgroup) / per_block).unwrap();
+        assert!(
+            Plan::over(subgroup, blocks).is_ok(),
+            "the last grid that fits is one a plan takes"
+        );
+        assert!(
+            Plan::over(subgroup, blocks + 1).is_err(),
+            "and one block more is refused"
+        );
+    }
+
+    assert_eq!(Plan::reach(32), 16_777_216, "a subgroup of 32");
+    assert_eq!(Plan::reach(4), 32_768, "a subgroup of 4");
+}
