@@ -596,3 +596,41 @@ fn the_budget_that_fooled_a_reader_is_reached_by_raising_the_crowd() {
         0
     );
 }
+
+#[test]
+fn a_marked_machine_says_how_much_evidence_it_was_marked_on() {
+    let counter = "[{\"kind\":8,\"left\":0,\"right\":2},{\"kind\":6,\"left\":0,\"right\":2},{\"kind\":6,\"left\":1,\"right\":3},{\"kind\":8,\"left\":0,\"right\":0},{\"kind\":8,\"left\":1,\"right\":1}]";
+    let arguments = format!(
+        "{{\"state\":2,\"inputs\":1,\"outputs\":2,\"gates\":5,\"traces\":[{}],\"chip\":{counter}}}",
+        counting(16)
+    );
+    let held = structured(&call(None, "grit_machine", &arguments));
+    assert_eq!(held.counted("traces"), Some(4));
+    assert_eq!(
+        held.counted("steps"),
+        Some(16),
+        "runs and their length are the two numbers that decide whether solved means anything: {}",
+        written(&held)
+    );
+    let said = held.get("solved_means").and_then(Json::text).unwrap();
+    assert!(said.contains("never seen"), "{said}");
+    assert!(said.contains("chip"), "{said}");
+}
+
+#[test]
+fn the_machine_tool_says_what_solved_does_not_cover() {
+    let held = tool("grit_machine");
+    let said = held.get("description").and_then(Json::text).unwrap();
+    assert!(
+        said.contains("never seen"),
+        "a caller reading only the schema must learn that solved is scoped to the runs given: {said}"
+    );
+    let steps = held
+        .get("inputSchema")
+        .and_then(|one| one.get("properties"))
+        .and_then(|one| one.get("steps"))
+        .and_then(|one| one.get("description"))
+        .and_then(Json::text)
+        .unwrap();
+    assert!(steps.contains("longer runs"), "{steps}");
+}

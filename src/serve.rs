@@ -558,7 +558,12 @@ fn tools() -> Json {
         ("inputs", counting("how many inputs it reads each step")),
         ("outputs", counting("how many outputs it writes each step")),
         ("gates", counting("how many two-input gates it may use")),
-        ("steps", counting("how many steps a run lasts")),
+        (
+            "steps",
+            counting(
+                "how many steps a run lasts; taken from the longest run given when it is left out. Steps are worth more than runs: the same count of marks spread over longer runs holds on unseen runs where short ones do not",
+            ),
+        ),
         ("traces", trace),
         (
             "crowd",
@@ -586,7 +591,7 @@ fn tools() -> Json {
             (
                 "description",
                 text(
-                    "Search for a synchronous machine, a circuit with state, that answers every run it is given. A run is a feed of input words and the output words wanted at each step; the machine starts from a state of all zeros. Returns the gates, what the best machine says on each run, and which step of which run it gets wrong, all marked on the host. Pass chip to mark a machine you already hold instead of searching for one.",
+                    "Search for a synchronous machine, a circuit with state, that answers every run it is given. A run is a feed of input words and the output words wanted at each step; the machine starts from a state of all zeros. Returns the gates, what the best machine says on each run, and which step of which run it gets wrong, all marked on the host. Pass chip to mark a machine you already hold instead of searching for one. Solved means every run in the request is answered, which is not the same as holding the rule behind them: take the gates it returns, pass them back as chip with runs it has never seen, and read the marks. Runs that last longer pin a machine down on far fewer marks than short runs do.",
                 ),
             ),
             (
@@ -709,6 +714,7 @@ fn asked_machine(held: &Json) -> Result<(Machine, Runs), Box<dyn std::error::Err
 fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
     if name == "grit_machine" {
         let (machine, traces) = asked_machine(held)?;
+        let steps = machine.steps;
         let told = if held.get("chip").is_some() {
             let shape = machine.shape()?;
             marked_machine(machine, &traces, &given(held, shape)?)?
@@ -725,6 +731,13 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
             ("marks", counted(told.marks)),
             ("of", counted(told.full)),
             ("traces", counted(told.traces)),
+            ("steps", counted(steps)),
+            (
+                "solved_means",
+                text(
+                    "every run in this request is answered. A machine can answer every run it was handed and still miss runs it has never seen; pass it back as chip with fresh runs to find out. Longer runs pin a machine down on far fewer marks than short ones do.",
+                ),
+            ),
             ("rounds", counted(told.rounds)),
             ("crowd", counted(told.crowd)),
             (
