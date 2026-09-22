@@ -140,6 +140,11 @@ fn the_bound_does_not_get_in_the_way_of_ordinary_work() {
     let every: Vec<&[u32]> = vec![&module];
     let mut held = host.resident(&[WORDS, 1], &every).unwrap();
     held.write(0, &vec![1; WORDS]).unwrap();
+    // The kernel adds into binding 1, so nought is where the sum has to start.
+    // A fresh buffer is not promised to hold anything: it reads as nought on
+    // this card and on lavapipe under Linux, and as whatever was there on
+    // lavapipe under Windows, where this read 2180047112.
+    held.write(1, &[0]).unwrap();
 
     let groups = [Groups::Fixed(over(host.width()))];
     held.frame(&groups).unwrap();
