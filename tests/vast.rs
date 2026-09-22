@@ -80,10 +80,14 @@ fn a_window_of_a_buffer_larger_than_the_card() {
     assert!(held.page(0).is_none());
     assert_eq!(held.bound(1), 0);
 
-    held.write(0, &[0xDEAD_BEEF; OUT]).unwrap();
-    held.frame(&[Groups::Fixed(1), Groups::Fixed(0)]).unwrap();
-    let empty = held.read(0, OUT).unwrap();
-    eprintln!("{:#010x}", empty[0]);
+    if host.strict() {
+        held.write(0, &[0xDEAD_BEEF; OUT]).unwrap();
+        held.frame(&[Groups::Fixed(1), Groups::Fixed(0)]).unwrap();
+        let empty = held.read(0, OUT).unwrap();
+        for &one in empty.iter().take(width as usize) {
+            assert_eq!(one, 0);
+        }
+    }
 
     held.bind(1, WHERE_AT, page).unwrap();
     assert_eq!(held.bound(1), page);
