@@ -138,7 +138,14 @@ impl Plan {
             self.quads + spare,
             1,
             3,
-            self.quads + self.quads,
+            // AWAKE is the marks and then a scratch slot for every lane that
+            // did not wake anything, which `live::wake` writes at
+            // `dump_base + group * subgroup + lane`. The scratch has to hold
+            // the widest pass that writes into it, and the brush is that one:
+            // it covers a fixed box of `sand::BOX` squared seats however small
+            // the grid is, so a grid with fewer quads than seats would be
+            // written past its end.
+            self.quads + self.quads.max(crate::sand::SEATS),
             1,
             crate::layout::TALLY_WORDS,
             self.padded() as usize + 1,

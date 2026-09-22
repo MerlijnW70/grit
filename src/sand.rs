@@ -574,6 +574,9 @@ pub fn settle_reference(grid: Grid, frame: u32, cells: &[u32]) -> Vec<u32> {
 
 pub const BOX: u32 = 32;
 
+/// How many seats the brush dispatches, whatever the grid measures.
+pub const SEATS: usize = (BOX * BOX) as usize;
+
 pub fn brush(subgroup: u32, grid: Grid, waking: bool) -> Result<Vec<u32>, LaneError> {
     match subgroup {
         4 => brushed::<4>(subgroup, grid, waking),
