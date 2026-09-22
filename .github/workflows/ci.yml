@@ -154,7 +154,7 @@ jobs:
         working-directory: grit
         run: |
           exe=$(cargo test --release --no-default-features --features deep --test vast --no-run \
-            --message-format=json | jq -r 'select(.executable != null) | .executable')
+            --message-format=json | jq -r 'select(.target.name == "vast" and .executable != null) | .executable')
           echo "VAST=$exe" >> "$GITHUB_ENV"
 
       - name: count
