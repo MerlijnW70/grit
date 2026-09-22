@@ -291,7 +291,9 @@ impl Host {
                 slots,
                 tickets: 0,
                 cached,
-                patience: Resident::PATIENCE,
+                patience: Resident::patience_of(
+                    std::env::var("GRIT_PATIENCE_SECS").ok().as_deref(),
+                ),
                 reused: 0,
                 device: None,
             })
@@ -479,6 +481,22 @@ impl Host {
 
 impl Resident<'_> {
     pub const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// The bound a new resident starts with, given what the environment named.
+    ///
+    /// Ten seconds is a thousand times the longest honest frame on a card, and
+    /// it is not that on a software implementation under load, where a search
+    /// that is working can take minutes. A bound crossed by a dispatch that
+    /// was going to finish reports a device lost that was never lost, so the
+    /// number is settable from outside. Anything that is not a count of
+    /// seconds above nought is ignored rather than argued with.
+    #[must_use]
+    pub fn patience_of(named: Option<&str>) -> Duration {
+        named
+            .and_then(|held| held.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map_or(Self::PATIENCE, Duration::from_secs)
+    }
 
     pub const fn patience(&self) -> Duration {
         self.patience
