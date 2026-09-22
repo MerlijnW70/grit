@@ -187,7 +187,12 @@ const FIRST: u32 = 0x0A11_0000;
 const SECOND: u32 = 0x0B22_0000;
 
 fn both(subgroup: u32) -> Result<Vec<u32>, LaneError> {
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 2))?;
+    // One invocation, not a subgroup of them. Every lane here would read
+    // this word, add one and write it back, and the answer would be +1 only
+    // where the lanes run in lockstep and none of them reads what another
+    // just wrote. That holds on a card and not on a software implementation,
+    // where it came back one too many about a quarter of the time.
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, 1, 2))?;
     let uint = kernel.index_type();
     let head = kernel.module().constant_u32(0)?;
     let one = kernel.module().constant_u32(1)?;
