@@ -111,6 +111,14 @@ pub struct Host {
     instance: ash::Instance,
     device: ash::Device,
     queue: vk::Queue,
+    /// Held across every submission, because a queue is one.
+    ///
+    /// Vulkan asks that host access to a queue be externally synchronised,
+    /// and nothing in Rust says so: the handle is Sync, so two residents made
+    /// from one host will submit from two threads and be allowed to. What that
+    /// costs is measurable -- two of six parallel runs of `tests/dispatch.rs`
+    /// at a subgroup of 16 came back with a pass having run once too often.
+    ordered: std::sync::Mutex<()>,
     family: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
     name: String,
@@ -264,6 +272,7 @@ impl Host {
             instance,
             device,
             queue,
+            ordered: std::sync::Mutex::new(()),
             family,
             memory,
             name,
@@ -301,6 +310,16 @@ impl Host {
 
     pub(crate) const fn device(&self) -> &ash::Device {
         &self.device
+    }
+
+    /// The turn to submit, held until the guard is dropped.
+    ///
+    /// A poisoned lock is taken anyway: it guards an order, not a value, and a
+    /// panic in one thread is no reason for every later submission to refuse.
+    pub(crate) fn ordered(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.ordered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(crate) const fn queue(&self) -> vk::Queue {
