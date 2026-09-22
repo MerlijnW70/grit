@@ -1276,10 +1276,12 @@ impl Resident<'_> {
             times,
         };
         if self.slots.get(at).and_then(|slot| slot.held.as_ref()) == Some(&wanted) {
+            let ordered = self.host.ordered();
             unsafe {
                 device.reset_fences(&[facing.fence])?;
                 device.queue_submit(self.host.queue(), &submit, facing.fence)?;
             }
+            drop(ordered);
             self.reused += 1;
             return Ok(());
         }
@@ -1473,8 +1475,10 @@ impl Resident<'_> {
             device.end_command_buffer(facing.command)?;
             took = began.elapsed();
 
+            let ordered = self.host.ordered();
             device.reset_fences(&[facing.fence])?;
             device.queue_submit(self.host.queue(), &submit, facing.fence)?;
+            drop(ordered);
         }
 
         if let Some(slot) = self.slots.get_mut(at) {
@@ -1505,8 +1509,10 @@ impl Resident<'_> {
 
             let commands = [self.transfer];
             let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+            let ordered = self.host.ordered();
             device.reset_fences(&[self.fence])?;
             device.queue_submit(self.host.queue(), &submit, self.fence)?;
+            drop(ordered);
         }
         self.await_fence(self.fence)
     }
