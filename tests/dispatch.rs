@@ -8,6 +8,12 @@ use simdr::lanes::{LaneError, U32};
 
 const MARK: u32 = 0x5EED_BEEF;
 
+/// What a buffer is filled with when a test means to say nothing touched it.
+///
+/// Kept apart from `MARK`, which is what a kernel writes: a slot holding one
+/// is not the same claim as a slot holding the other.
+const LAID: u32 = 0xA5A5_A5A5;
+
 fn mark(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 1))?;
     let head = kernel.module().constant_u32(0)?;
@@ -408,6 +414,12 @@ fn many_runs_go_in_together_and_a_refused_call_puts_nothing_in() {
     let width = host.width();
     let module = bump(width).unwrap();
     let mut held = host.resident(&[4, 4], &[&module]).unwrap();
+    // What `write_many` leaves alone has to be a value this test laid down,
+    // not one a fresh buffer happened to hold. Vulkan promises nothing about
+    // what is in a buffer before it is written, and the one place this was
+    // read as anything but nought is the one place it was not nought.
+    held.write(0, &[LAID; 4]).unwrap();
+    held.write(1, &[LAID; 4]).unwrap();
 
     held.write_many(&[
         Run {
@@ -423,7 +435,7 @@ fn many_runs_go_in_together_and_a_refused_call_puts_nothing_in() {
     ])
     .unwrap();
     assert_eq!(held.read(0, 1).unwrap(), vec![11]);
-    assert_eq!(held.read(1, 2).unwrap(), vec![0, 22]);
+    assert_eq!(held.read(1, 2).unwrap(), vec![LAID, 22]);
 
     let refused = held.write_many(&[
         Run {
