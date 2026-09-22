@@ -80,7 +80,16 @@ fn a_fence_that_does_not_come_back_in_time_presumes_the_device_lost() {
     let mut held = host.resident(&[WORDS, 1], &every).unwrap();
     held.write(0, &vec![1; WORDS]).unwrap();
 
-    assert_eq!(held.patience(), Duration::from_secs(10));
+    // What a caller gets who sets nothing. The environment may name it, and CI
+    // does -- 300 seconds, because ten is not a bound a software implementation
+    // under load can meet, and a bound crossed by work that was going to finish
+    // reports a device lost that was never lost. So what is asserted here is the
+    // wiring: a new resident takes the named bound rather than one of its own.
+    // That ten seconds is the bound when nothing names one, and that nought and
+    // nonsense do not become bounds, is pinned by the test below, which needs no
+    // device to ask it.
+    let named = std::env::var("GRIT_PATIENCE_SECS").ok();
+    assert_eq!(held.patience(), Resident::patience_of(named.as_deref()));
 
     held.set_patience(IMPATIENT);
     let groups = [Groups::Fixed(over(host.width()))];
