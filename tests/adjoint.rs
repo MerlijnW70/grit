@@ -844,6 +844,18 @@ fn the_list_carries_the_weights_the_whole_grid_would_have() {
 /// The largest side the walk starts from where the bookkeeping can hold it.
 const TOP: u32 = 4096;
 
+/// How much more a walk over the whole grid must cost at the top of the ladder
+/// than at the bottom before the comparison means anything.
+///
+/// The sides span sixty-four to one. Measured over exactly that span, twice,
+/// because these are clocks and they move a little: 9.10 and 9.06 on an RTX
+/// 4080 at a subgroup of 32, 37.4 and 37.9 on an AMD iGPU at 64, against 1.49
+/// and 1.45 under lavapipe at 16 and 1.14 and 1.20 at 8. Three sits between
+/// them with room to spare on both sides, and what it separates is not a fast
+/// device from a slow one but a machine spending its time on cells from one
+/// spending it on dispatches.
+const SPENT: f64 = 3.0;
+
 /// The smallest side on which a list has been seen to leave anything out.
 ///
 /// Measured: at a subgroup of 8 the ladder tops at 1024 and the walk holds; at
@@ -879,6 +891,8 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
     eprintln!("{} {per_block} {top}", host.width());
 
     let mut won = false;
+    let mut widest = None;
+    let mut narrowest = None;
     for side in sides {
         let grid = Grid::of(side, side);
         let cells = patched(grid, 0x1234_5678, 12);
@@ -896,18 +910,38 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
             listed.back
         );
         assert!(listed.awake < grid.quads() || side == sides[3]);
+        if widest.is_none() {
+            widest = Some(whole.ahead);
+        }
+        narrowest = Some(whole.ahead);
         if listed.ahead < whole.ahead && listed.back < whole.back {
             won = true;
         }
     }
-    // Which side wins is a property of the device, not of this test: the list
-    // carries nine passes against the whole grid's two, so it only pays once
-    // the grid it skips is large enough to cover that. The sides are printed
-    // above, so a device where none of them is large enough says so with the
-    // measurements rather than with a bare false.
+
+    // **The question needs a machine that spends its time on the grid.** The
+    // sides span sixty-four to one, so a walk over the whole grid should cost
+    // about that much more at the top than at the bottom. Measured: 9.10 times
+    // at a subgroup of 32 on an RTX 4080 and 37.4 at 64 on an AMD iGPU, against
+    // 1.49 and 1.14 under lavapipe at 16 and 8, where both walks are paying for
+    // dispatch on a CPU rather than for the cells. Below `SPENT` the two sides
+    // of the comparison are not measuring the grid, so the list cannot be shown
+    // to pay and is not shown to fail either.
+    let (top_cost, bottom_cost) = (widest.unwrap(), narrowest.unwrap());
+    let spent = top_cost.as_secs_f64() / bottom_cost.as_secs_f64().max(f64::MIN_POSITIVE);
+    if spent < SPENT {
+        eprintln!(
+            "SKIPPED the_list_starts_paying_when_the_grid_outgrows {spent:.2} under {SPENT:.2}"
+        );
+        return;
+    }
+
+    // Which side first pays is a property of the device -- the list carries
+    // nine passes against the whole grid's two -- so the sides are printed
+    // above and named here rather than failing bare.
     assert!(
         won,
-        "no side of {sides:?} had the list beat the whole grid both ways"
+        "no side of {sides:?} had the list beat the whole grid both ways,          on a machine whose whole-grid walk grew {spent:.2} times over them"
     );
 }
 
