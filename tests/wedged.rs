@@ -147,3 +147,36 @@ fn the_bound_does_not_get_in_the_way_of_ordinary_work() {
     let summed = held.read(1, 1).unwrap();
     assert_eq!(summed.first().copied(), Some(u32::try_from(WORDS).unwrap()));
 }
+
+#[test]
+fn the_bound_is_settable_from_outside_and_ignores_what_is_not_a_bound() {
+    // No device: this is what a new resident is given before it is asked
+    // anything. The bound stops a hung dispatch parking a process in the
+    // driver, so it cannot be turned off -- nought and nonsense both leave the
+    // default standing rather than becoming a bound no work could meet.
+    assert_eq!(
+        Resident::patience_of(None),
+        Resident::PATIENCE,
+        "nothing named leaves the default"
+    );
+    assert_eq!(
+        Resident::patience_of(Some("300")),
+        Duration::from_secs(300),
+        "a count of seconds is the bound"
+    );
+    assert_eq!(
+        Resident::patience_of(Some("0")),
+        Resident::PATIENCE,
+        "a bound of nothing is not a bound"
+    );
+    assert_eq!(
+        Resident::patience_of(Some("later")),
+        Resident::PATIENCE,
+        "and neither is a word"
+    );
+    assert_eq!(
+        Resident::PATIENCE,
+        Duration::from_secs(10),
+        "the default a caller gets when the environment says nothing"
+    );
+}

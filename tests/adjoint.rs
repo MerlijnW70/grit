@@ -844,6 +844,14 @@ fn the_list_carries_the_weights_the_whole_grid_would_have() {
 /// The largest side the walk starts from where the bookkeeping can hold it.
 const TOP: u32 = 4096;
 
+/// The smallest side on which a list has been seen to leave anything out.
+///
+/// Measured: at a subgroup of 8 the ladder tops at 1024 and the walk holds; at
+/// 4 it tops at 256, where every quad this grid is patched with is awake and a
+/// list has nothing to skip. So the question is not a harder one there, it is
+/// not a question.
+const LEAST: u32 = 512;
+
 #[test]
 fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
     let Some(host) = device("the_list_starts_paying_when_the_grid_outgrows") else {
@@ -862,6 +870,10 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
     let mut top = TOP;
     while u64::from(Grid::of(top, top).quads()) > reach && top > 2 {
         top /= 2;
+    }
+    if top < LEAST {
+        eprintln!("SKIPPED the_list_starts_paying_when_the_grid_outgrows {top} under {LEAST}");
+        return;
     }
     let sides = [top, top / 2, top / 4, top / 8];
     eprintln!("{} {per_block} {top}", host.width());

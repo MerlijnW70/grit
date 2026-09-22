@@ -104,6 +104,11 @@ jobs:
         working-directory: grit
         env:
           LP_NATIVE_VECTOR_WIDTH: ${{ matrix.vector }}
+          # A software implementation under load is not a card. The default
+          # bound of ten seconds is there to catch a hung dispatch, and here a
+          # search that is working crosses it: the last run took 2h12m where the
+          # one before took 37m, and three suites reported Wedged { after: 10s }.
+          GRIT_PATIENCE_SECS: 300
         run: |
           set -o pipefail
           cargo test --release --no-default-features --features deep --no-fail-fast -- --nocapture \
