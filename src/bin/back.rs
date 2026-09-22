@@ -99,8 +99,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let grid = Grid::of(SIDE, SIDE);
-    let still = std::env::args().any(|one| one == "--still");
-    let mut depth = DEPTH;
+    let asking: Vec<String> = std::env::args().collect();
+    let still = asking.iter().any(|one| one == "--still");
+    // The window takes the depth from the arrow keys, which is no use to
+    // anything driving it from outside. Named here it is the same run twice.
+    let mut depth = asking
+        .iter()
+        .position(|one| one == "--depth")
+        .and_then(|at| asking.get(at + 1))
+        .and_then(|one| one.parse::<u32>().ok())
+        .filter(|one| (1..=256).contains(one))
+        .unwrap_or(DEPTH);
     let mut board = seated(&host, grid, Kind::Living, (KNOB, 0), depth)?;
     let mut state = blotted(grid, 0x1234_5678);
     let middle = (grid.deep / 2 * grid.wide + grid.wide / 2) as usize;
