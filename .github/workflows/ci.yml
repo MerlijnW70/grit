@@ -123,6 +123,61 @@ jobs:
             exit 1
           fi
 
+  # Diagnostic, to be removed: `vast` dies of SIGSEGV on some lavapipe runs
+  # and not others. Counted here with the tests in parallel, one at a time,
+  # and each test alone, so the three counts say whether it is the overlap.
+  vast:
+    name: vast
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        vector: [128, 256, 512]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: grit
+      - uses: actions/checkout@v5
+        with:
+          repository: MerlijnW70/simdr
+          path: simdr
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+
+      - name: build
+        working-directory: grit
+        run: |
+          exe=$(cargo test --release --no-default-features --features deep --test vast --no-run \
+            --message-format=json | jq -r 'select(.executable != null) | .executable')
+          echo "VAST=$exe" >> "$GITHUB_ENV"
+
+      - name: count
+        env:
+          LP_NATIVE_VECTOR_WIDTH: ${{ matrix.vector }}
+        run: |
+          count() {
+            local label=$1; shift
+            local codes=""
+            for _ in $(seq 1 100); do
+              "$VAST" "$@" > /dev/null 2>&1 && rc=0 || rc=$?
+              codes="$codes $rc"
+            done
+            line="$label $(echo $codes | tr ' ' '\n' | sort | uniq -c | tr '\n' ' ')"
+            echo "$line"
+            printf '%s\n\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+          }
+          count parallel
+          count threads=1 --test-threads=1
+          for name in $("$VAST" --list 2>/dev/null | sed -n 's/: test$//p'); do
+            count "$name" --exact "$name"
+          done
+
   msrv:
     name: msrv
     runs-on: ubuntu-latest
