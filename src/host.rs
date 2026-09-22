@@ -128,6 +128,7 @@ pub struct Host {
     timing: bool,
     wedged: AtomicBool,
     sparse: bool,
+    strict: bool,
     int64: bool,
 }
 
@@ -250,6 +251,10 @@ impl Host {
             .shader_int64(has.shader_int64 == 1);
         let sparse = wanted.sparse_binding == 1 && wanted.sparse_residency_buffer == 1;
         let int64 = wanted.shader_int64 == 1;
+        let strict = sparse && {
+            let properties = unsafe { instance.get_physical_device_properties(physical) };
+            properties.sparse_properties.residency_non_resident_strict == 1
+        };
 
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
@@ -281,6 +286,7 @@ impl Host {
             tick,
             timing,
             sparse,
+            strict,
             int64,
             wedged: AtomicBool::new(false),
         })
@@ -301,6 +307,11 @@ impl Host {
     #[must_use]
     pub const fn sparse(&self) -> bool {
         self.sparse
+    }
+
+    #[must_use]
+    pub const fn strict(&self) -> bool {
+        self.strict
     }
 
     #[must_use]

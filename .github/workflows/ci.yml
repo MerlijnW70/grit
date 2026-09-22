@@ -123,69 +123,6 @@ jobs:
             exit 1
           fi
 
-  # Diagnostic, to be removed: `vast` dies of SIGSEGV on nearly every run
-  # when its binary is started by hand, and only now and then under
-  # `cargo test`. The runs here keep their output and the last one is run
-  # under gdb, so the crash comes back with a place rather than a count.
-  vast:
-    name: vast
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        vector: [128, 256]
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          path: grit
-      - uses: actions/checkout@v5
-        with:
-          repository: MerlijnW70/simdr
-          path: simdr
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: lavapipe
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 gdb
-          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)
-          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
-          dpkg -l mesa-vulkan-drivers | tail -1
-
-      - name: build
-        working-directory: grit
-        env:
-          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
-        run: |
-          exe=$(cargo test --release --no-default-features --features deep --test vast --no-run             --message-format=json | jq -r 'select(.target.name == "vast" and .executable != null) | .executable')
-          echo "VAST=$exe" >> "$GITHUB_ENV"
-
-      - name: look
-        working-directory: grit
-        env:
-          LP_NATIVE_VECTOR_WIDTH: ${{ matrix.vector }}
-        run: |
-          ulimit -c 0
-          once() {
-            echo "::group::$*"
-            timeout 120 "$VAST" "$@" 2>&1 && rc=0 || rc=$?
-            echo "::endgroup::"
-            echo "exit $rc :: $*" | tee -a "$GITHUB_STEP_SUMMARY"
-            echo >> "$GITHUB_STEP_SUMMARY"
-          }
-          for _ in 1 2 3; do once; done
-          for _ in 1 2 3; do once --nocapture; done
-          for _ in 1 2 3; do once --test-threads=1 --nocapture; done
-          for _ in 1 2 3 4 5; do
-            out=$(timeout 300 gdb -q -batch -ex "set pagination off" -ex run               -ex "thread apply all bt 30" --args "$VAST" --nocapture 2>&1 || true)
-            if echo "$out" | grep -q SIGSEGV; then
-              echo "$out"
-              break
-            fi
-            echo "no crash under gdb"
-          done
-
   msrv:
     name: msrv
     runs-on: ubuntu-latest
