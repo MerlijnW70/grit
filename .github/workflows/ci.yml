@@ -62,7 +62,7 @@ jobs:
         include:
           - vector: 128
             width: 4
-            skips: 1
+            skips: 9
           - vector: 256
             width: 8
             skips: 1
