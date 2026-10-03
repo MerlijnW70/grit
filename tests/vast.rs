@@ -224,3 +224,34 @@ fn a_window_ending_on_the_last_word_fits_and_a_window_of_nothing_binds_nothing()
     held.unbind(1, last, page).unwrap();
     assert_eq!(held.bound(1), 0);
 }
+
+#[test]
+fn a_window_is_not_moved_under_a_frame_still_running() {
+    let Some(host) = device("a_window_is_not_moved_under_a_frame_still_running") else {
+        return;
+    };
+    if !host.sparse() {
+        eprintln!("SKIPPED {}", host.name());
+        return;
+    }
+    let width = host.width();
+    let module = reaching(width, WHERE_AT).unwrap();
+    let mut held = host.resident_vast(&[OUT, VAST], &[&module], 1).unwrap();
+    let page = held.page(1).unwrap();
+    held.bind(1, WHERE_AT, page).unwrap();
+    held.write(0, &[0; OUT]).unwrap();
+
+    let running = held.submit(&[&[Groups::Fixed(1)]]).unwrap();
+    assert!(matches!(
+        held.bind(1, WHERE_AT + page, page),
+        Err(Error::StillInFlight)
+    ));
+    assert!(matches!(
+        held.unbind(1, WHERE_AT, page),
+        Err(Error::StillInFlight)
+    ));
+    held.wait(running).unwrap();
+
+    held.unbind(1, WHERE_AT, page).unwrap();
+    assert_eq!(held.bound(1), 0);
+}

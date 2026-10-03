@@ -515,6 +515,14 @@ impl Resident<'_> {
         Ok(())
     }
 
+    fn idle(&self) -> Result<(), Error> {
+        self.live()?;
+        if self.slots.iter().any(|slot| slot.flight.is_some()) {
+            return Err(Error::StillInFlight);
+        }
+        Ok(())
+    }
+
     fn await_fence(&self, fence: vk::Fence) -> Result<(), Error> {
         let patience = u64::try_from(self.patience.as_nanos()).unwrap_or(u64::MAX);
         let waited = unsafe { self.host.device().wait_for_fences(&[fence], true, patience) };
@@ -787,6 +795,7 @@ impl Resident<'_> {
         if bytes == 0 {
             return Ok(());
         }
+        self.idle()?;
 
         self.unbind(index, at, words)?;
 
@@ -816,16 +825,30 @@ impl Resident<'_> {
                 .binds(&binds)];
             let info = [vk::BindSparseInfo::default().buffer_binds(&one)];
 
-            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let fence = match device.create_fence(&vk::FenceCreateInfo::default(), None) {
+                Ok(fence) => fence,
+                Err(code) => {
+                    device.free_memory(memory, None);
+                    return Err(code.into());
+                }
+            };
+            let ordered = self.host.ordered();
             let held = device.queue_bind_sparse(self.host.queue(), &info, fence);
+            drop(ordered);
             if held.is_err() {
                 device.destroy_fence(fence, None);
                 device.free_memory(memory, None);
                 held?;
             }
-            let waited = device.wait_for_fences(&[fence], true, u64::MAX);
+            let waited = self.await_fence(fence);
+            if self.host.wedged() {
+                return waited;
+            }
             device.destroy_fence(fence, None);
-            waited?;
+            if waited.is_err() {
+                device.free_memory(memory, None);
+                return waited;
+            }
 
             if let Some(slot) = self.buffers.get_mut(index) {
                 slot.pages.push((from, memory, bytes));
@@ -855,6 +878,7 @@ impl Resident<'_> {
         if going.is_empty() {
             return Ok(());
         }
+        self.idle()?;
 
         unsafe {
             let device = self.host.device();
@@ -874,12 +898,17 @@ impl Resident<'_> {
                 .binds(&binds)];
             let info = [vk::BindSparseInfo::default().buffer_binds(&one)];
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let ordered = self.host.ordered();
             let sent = device.queue_bind_sparse(self.host.queue(), &info, fence);
+            drop(ordered);
             if sent.is_err() {
                 device.destroy_fence(fence, None);
                 sent?;
             }
-            let waited = device.wait_for_fences(&[fence], true, u64::MAX);
+            let waited = self.await_fence(fence);
+            if self.host.wedged() {
+                return waited;
+            }
             device.destroy_fence(fence, None);
             waited?;
 
@@ -1294,6 +1323,7 @@ impl Resident<'_> {
             device.reset_command_buffer(facing.command, vk::CommandBufferResetFlags::empty())?;
             let begin = vk::CommandBufferBeginInfo::default();
             device.begin_command_buffer(facing.command, &begin)?;
+            after_earlier(device, facing.command);
 
             if let Some(pool) = facing.queries {
                 let held = u32::try_from(STAGES + 3).unwrap_or(3);
@@ -1494,16 +1524,14 @@ impl Resident<'_> {
     where
         F: FnOnce(&ash::Device, vk::CommandBuffer),
     {
-        self.live()?;
-        if self.slots.iter().any(|slot| slot.flight.is_some()) {
-            return Err(Error::StillInFlight);
-        }
+        self.idle()?;
         let device = self.host.device();
         unsafe {
             device.reset_command_buffer(self.transfer, vk::CommandBufferResetFlags::empty())?;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             device.begin_command_buffer(self.transfer, &begin)?;
+            after_earlier(device, self.transfer);
             record(device, self.transfer);
             device.end_command_buffer(self.transfer)?;
 
@@ -1535,6 +1563,31 @@ impl Resident<'_> {
             self.host.device().unmap_memory(memory);
             Ok(out)
         }
+    }
+}
+
+fn after_earlier(device: &ash::Device, command: vk::CommandBuffer) {
+    let barrier = [vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(
+            vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::INDIRECT_COMMAND_READ
+                | vk::AccessFlags::TRANSFER_READ
+                | vk::AccessFlags::TRANSFER_WRITE,
+        )];
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::DRAW_INDIRECT
+                | vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &barrier,
+            &[],
+            &[],
+        );
     }
 }
 
