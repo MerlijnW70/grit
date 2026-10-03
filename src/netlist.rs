@@ -8,6 +8,10 @@ pub const SOURCES: u32 = 1 << SOURCE_BITS;
 
 pub const KINDS: u32 = 1 << KIND_BITS;
 
+pub const INPUTS: u32 = 31;
+
+pub const OUTPUTS: u32 = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gate {
     pub kind: u32,
@@ -62,6 +66,9 @@ impl std::error::Error for Fault {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TooWide {
+    Inputs { inputs: u32, limit: u32 },
+    Answers { outputs: u32, limit: u32 },
+    Steps { steps: u32, limit: u32 },
     Sources { sources: u32, limit: u32 },
     Kinds { kinds: u32, limit: u32 },
     Outputs { outputs: u32, gates: u32 },
@@ -70,6 +77,18 @@ pub enum TooWide {
 impl fmt::Display for TooWide {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Inputs { inputs, limit } => write!(
+                out,
+                "{inputs} inputs asked for; a circuit reads at least one input and at most {limit}, the bits of one row word"
+            ),
+            Self::Answers { outputs, limit } => write!(
+                out,
+                "{outputs} outputs asked for, over the {limit} bits one answer word holds"
+            ),
+            Self::Steps { steps, limit } => write!(
+                out,
+                "{steps} steps asked for, over the {limit} one run may hold"
+            ),
             Self::Sources { sources, limit } => write!(
                 out,
                 "inputs plus gates is {sources}, over the {limit} a {SOURCE_BITS} bit source field can name"
@@ -100,7 +119,19 @@ pub struct Netlist {
 
 impl Netlist {
     pub const fn over(inputs: u32, outputs: u32, gates: u32, kinds: u32) -> Result<Self, TooWide> {
-        let sources = inputs + gates;
+        if inputs == 0 || inputs > INPUTS {
+            return Err(TooWide::Inputs {
+                inputs,
+                limit: INPUTS,
+            });
+        }
+        if outputs > OUTPUTS {
+            return Err(TooWide::Answers {
+                outputs,
+                limit: OUTPUTS,
+            });
+        }
+        let sources = inputs.saturating_add(gates);
         if sources > SOURCES {
             return Err(TooWide::Sources {
                 sources,

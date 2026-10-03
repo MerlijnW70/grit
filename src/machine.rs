@@ -1,5 +1,7 @@
 use crate::netlist::{Chip, Netlist, TooWide};
 
+pub const STEPS: u32 = 1 << 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Machine {
     pub state: u32,
@@ -19,6 +21,12 @@ impl Machine {
         kinds: u32,
         steps: u32,
     ) -> Result<Self, TooWide> {
+        if steps > STEPS {
+            return Err(TooWide::Steps {
+                steps,
+                limit: STEPS,
+            });
+        }
         let held = Self {
             state,
             inputs,
@@ -35,8 +43,8 @@ impl Machine {
 
     pub const fn shape(&self) -> Result<Netlist, TooWide> {
         Netlist::over(
-            self.state + self.inputs,
-            self.state + self.outputs,
+            self.state.saturating_add(self.inputs),
+            self.state.saturating_add(self.outputs),
             self.gates,
             self.kinds,
         )

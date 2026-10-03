@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::netlist::{
-    Chip, Exam, Gate, KIND_BITS, KINDS, Netlist, NotAChip, NotAnExam, SOURCE_BITS, SOURCES,
+    Chip, Exam, Gate, INPUTS, KIND_BITS, KINDS, Netlist, NotAChip, NotAnExam, SOURCE_BITS, SOURCES,
     answered, drawn, turned,
 };
 use grit::sand::{
@@ -281,10 +281,10 @@ fn the_netlists_derived_constants_are_the_numbers_they_derive_to() {
 
 #[test]
 fn a_netlist_takes_every_source_up_to_the_limit_and_refuses_the_one_past_it() {
-    assert!(Netlist::over(SOURCES - 1, 1, 1, 4).is_ok());
-    assert!(Netlist::over(SOURCES, 1, 1, 4).is_err());
-    assert!(Netlist::over(SOURCES / 2, 1, SOURCES / 2, 4).is_ok());
-    assert!(Netlist::over(SOURCES / 2, 1, SOURCES / 2 + 1, 4).is_err());
+    assert!(Netlist::over(1, 1, SOURCES - 1, 4).is_ok());
+    assert!(Netlist::over(1, 1, SOURCES, 4).is_err());
+    assert!(Netlist::over(INPUTS, 1, SOURCES - INPUTS, 4).is_ok());
+    assert!(Netlist::over(INPUTS, 1, SOURCES - INPUTS + 1, 4).is_err());
 }
 
 #[test]

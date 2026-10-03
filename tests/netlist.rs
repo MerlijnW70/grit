@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::netlist::{
-    Chip, Exam, Fault, Gate, KIND_BITS, KINDS, Netlist, NotAChip, NotAnExam, SOURCE_BITS, SOURCES,
-    TooWide, answered, drawn, turned,
+    Chip, Exam, Fault, Gate, INPUTS, KIND_BITS, KINDS, Netlist, NotAChip, NotAnExam, OUTPUTS,
+    SOURCE_BITS, SOURCES, TooWide, answered, drawn, turned,
 };
 
 #[test]
@@ -83,7 +83,30 @@ fn a_shape_past_the_packing_is_refused() {
         })
     );
 
-    assert!(Netlist::over(0, 1, SOURCES, KINDS).is_ok());
+    assert!(Netlist::over(1, 1, SOURCES - 1, KINDS).is_ok());
+
+    assert_eq!(
+        Netlist::over(0, 1, 8, 4),
+        Err(TooWide::Inputs {
+            inputs: 0,
+            limit: INPUTS
+        })
+    );
+    assert!(Netlist::over(INPUTS, 1, 8, 4).is_ok());
+    assert_eq!(
+        Netlist::over(INPUTS + 1, 1, 8, 4),
+        Err(TooWide::Inputs {
+            inputs: INPUTS + 1,
+            limit: INPUTS
+        })
+    );
+    assert_eq!(
+        Netlist::over(4, OUTPUTS + 1, 64, 4),
+        Err(TooWide::Answers {
+            outputs: OUTPUTS + 1,
+            limit: OUTPUTS
+        })
+    );
 }
 
 #[test]

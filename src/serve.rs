@@ -20,6 +20,10 @@ pub const SIDE: u32 = 256;
 
 pub const ROUNDS: u32 = 4000;
 
+pub const WORK: u64 = 1 << 20;
+
+pub const RUNGS: usize = 64;
+
 pub struct Found {
     pub marks: u32,
     pub full: u32,
@@ -72,18 +76,53 @@ pub fn seeded(many: u32) -> Vec<u32> {
         .collect()
 }
 
-fn room(shape: Netlist, many: u32) -> [usize; BINDINGS as usize] {
+fn times(parts: &[u32]) -> Result<usize, Box<dyn std::error::Error>> {
+    parts
+        .iter()
+        .try_fold(1_usize, |held, one| held.checked_mul(*one as usize))
+        .ok_or_else(|| {
+            format!(
+                "a buffer of {parts:?} words multiplied out is past what this machine can address"
+            )
+            .into()
+        })
+}
+
+fn room(
+    shape: Netlist,
+    many: u32,
+) -> Result<[usize; BINDINGS as usize], Box<dyn std::error::Error>> {
     let wide = words_of(shape);
-    [
-        (many * shape.gates) as usize,
-        (many * shape.gates) as usize,
-        (many * shape.sources() * wide) as usize,
-        (shape.outputs * wide) as usize,
+    Ok([
+        times(&[many, shape.gates])?,
+        times(&[many, shape.gates])?,
+        times(&[many, shape.sources(), wide])?,
+        times(&[shape.outputs, wide])?,
         many as usize,
         many as usize,
         many as usize,
         1,
-    ]
+    ])
+}
+
+fn whole(many: u32, width: u32) -> u32 {
+    many.div_ceil(width).saturating_mul(width)
+}
+
+fn unrolled(held: Machine, wide: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let each = u64::from(held.gates)
+        + u64::from(held.state)
+        + u64::from(held.inputs)
+        + u64::from(held.outputs);
+    let work = u64::from(held.steps) * each * u64::from(wide);
+    if work > WORK {
+        return Err(format!(
+            "{} steps of {each} gates and wires over {wide} words of runs would unroll into {work} operations, over the {WORK} one kernel is allowed; ask for fewer steps, fewer gates or fewer runs",
+            held.steps
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn named(shape: Netlist) -> Vec<u32> {
@@ -123,11 +162,12 @@ pub fn sought(
     rounds: u32,
 ) -> Result<Found, Box<dyn std::error::Error>> {
     let width = host.width();
+    let many = whole(many, width);
     let turn = turned_on(width, shape)?;
     let mark = marked(width, shape)?;
     let pick = chosen(width, shape, SIDE, many)?;
     let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
-    let sizes = room(shape, many);
+    let sizes = room(shape, many)?;
     let mut resident = host.resident(&sizes, &modules)?;
 
     resident.write(HELD as usize, &crowd_of(shape, 0x1234_5678, many))?;
@@ -207,7 +247,7 @@ pub fn least(
     let mut rungs = Vec::new();
     let mut gates = shape.gates;
     let mut missed = 0;
-    while gates >= shape.outputs.max(1) && missed < PATIENCE {
+    while gates >= shape.outputs.max(1) && missed < PATIENCE && rungs.len() < RUNGS {
         let narrowed = Netlist::over(shape.inputs, shape.outputs, gates, shape.kinds)?;
         let exam = Exam::of(narrowed, table.to_vec())?;
         let found = pressed(host, narrowed, &exam, many, rounds)?;
@@ -238,8 +278,8 @@ pub struct Ran {
 
 fn laid(held: Machine, traces: &[(Vec<u32>, Vec<u32>)], wide: u32) -> (Vec<u32>, Vec<u32>) {
     let many = wide * 32;
-    let mut feed = vec![0_u32; (held.steps * held.inputs * wide) as usize];
-    let mut want = vec![0_u32; (held.steps * held.outputs * wide) as usize];
+    let mut feed = vec![0_u32; held.steps as usize * held.inputs as usize * wide as usize];
+    let mut want = vec![0_u32; held.steps as usize * held.outputs as usize * wide as usize];
     for slot in 0..many {
         let Some((given, wanted)) = traces.get(slot as usize % traces.len().max(1)) else {
             continue;
@@ -318,7 +358,9 @@ pub fn machined(
 ) -> Result<Ran, Box<dyn std::error::Error>> {
     let shape = held.shape()?;
     let width = host.width();
+    let many = whole(many, width);
     let wide = u32::try_from(traces.len())?.div_ceil(32).max(1);
+    unrolled(held, wide)?;
     let (feed, want) = laid(held, traces, wide);
 
     let turn = turned_on(width, shape)?;
@@ -326,9 +368,9 @@ pub fn machined(
     let pick = chosen(width, shape, SIDE, many)?;
     let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
     let sizes = [
-        (many * shape.gates) as usize,
-        (many * shape.gates) as usize,
-        (many * shape.sources() * wide) as usize,
+        times(&[many, shape.gates])?,
+        times(&[many, shape.gates])?,
+        times(&[many, shape.sources(), wide])?,
         want.len().max(1),
         many as usize,
         many as usize,
@@ -434,30 +476,85 @@ fn told(found: &Found, sought: bool) -> Json {
     map(held)
 }
 
+fn number(held: &Json, key: &str, or: u32) -> Result<u32, Box<dyn std::error::Error>> {
+    let Some(one) = held.get(key) else {
+        return Ok(or);
+    };
+    one.int()
+        .and_then(|one| u32::try_from(one).ok())
+        .ok_or_else(|| {
+            format!(
+                "{key} is {}, which is not a whole number from 0 to {}",
+                crate::wire::written(one),
+                u32::MAX
+            )
+            .into()
+        })
+}
+
+fn needed(held: &Json, key: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    if held.get(key).is_none() {
+        return Err(format!("{key} is missing from {}", crate::wire::written(held)).into());
+    }
+    number(held, key, 0)
+}
+
+fn numbers(held: &Json, key: &str) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let Some(one) = held.get(key) else {
+        return Ok(Vec::new());
+    };
+    let list = one.list().ok_or_else(|| {
+        format!(
+            "{key} is {}, which is not a list",
+            crate::wire::written(one)
+        )
+    })?;
+    list.iter()
+        .enumerate()
+        .map(|(at, one)| {
+            one.int()
+                .and_then(|one| u32::try_from(one).ok())
+                .ok_or_else(|| {
+                    format!(
+                        "{key} entry {at} is {}, which is not a whole number from 0 to {}",
+                        crate::wire::written(one),
+                        u32::MAX
+                    )
+                    .into()
+                })
+        })
+        .collect()
+}
+
 fn asked(held: &Json) -> Result<(Netlist, Exam), Box<dyn std::error::Error>> {
-    let inputs = held.counted("inputs").unwrap_or(4);
-    let outputs = held.counted("outputs").unwrap_or(1);
-    let gates = held.counted("gates").unwrap_or(8);
+    let inputs = number(held, "inputs", 4)?;
+    let outputs = number(held, "outputs", 1)?;
+    let gates = number(held, "gates", 8)?;
     let shape = Netlist::over(inputs, outputs, gates, 16)?;
-    let table: Vec<u32> = held
-        .get("table")
-        .and_then(Json::list)
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|one| one.int())
-        .filter_map(|one| u32::try_from(one).ok())
-        .collect();
+    let table = numbers(held, "table")?;
     Ok((shape, Exam::of(shape, table)?))
 }
 
 fn given(held: &Json, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     let mut gates = Vec::new();
-    for one in held.get("chip").and_then(Json::list).unwrap_or(&[]) {
+    let chip = match held.get("chip") {
+        None => &[][..],
+        Some(one) => one.list().ok_or_else(|| {
+            format!(
+                "chip is {}, which is not a list of gates",
+                crate::wire::written(one)
+            )
+        })?,
+    };
+    for (at, one) in chip.iter().enumerate() {
         let gate = Gate {
-            kind: one.counted("kind").unwrap_or(0),
-            left: one.counted("left").unwrap_or(0),
-            right: one.counted("right").unwrap_or(0),
+            kind: needed(one, "kind")?,
+            left: needed(one, "left")?,
+            right: needed(one, "right")?,
         };
+        shape
+            .checked(u32::try_from(at)?, gate)
+            .map_err(|fault| format!("gate {at}: {fault}"))?;
         gates.push(gate.pack());
     }
     if gates.len() != shape.gates as usize {
@@ -505,18 +602,15 @@ fn tools() -> Json {
         ]),
     ));
     let held = |what: Vec<(&str, Json)>| {
+        let required = ["inputs", "outputs", "gates", "table", "chip"]
+            .into_iter()
+            .filter(|name| what.iter().any(|(held, _)| held == name))
+            .map(text)
+            .collect();
         map(vec![
             ("type", text("object")),
             ("properties", map(what)),
-            (
-                "required",
-                Json::List(vec![
-                    text("inputs"),
-                    text("outputs"),
-                    text("gates"),
-                    text("table"),
-                ]),
-            ),
+            ("required", Json::List(required)),
         ])
     };
     let mut laddering = checking.clone();
@@ -1071,36 +1165,47 @@ fn refused(id: Json, code: i64, what: &str) -> Json {
 }
 
 fn asked_machine(held: &Json) -> Result<(Machine, Runs), Box<dyn std::error::Error>> {
-    let counted = |name: &str, or: u32| held.counted(name).unwrap_or(or);
-    let taken = |one: &Json, name: &str| -> Vec<u32> {
-        one.get(name)
-            .and_then(Json::list)
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(Json::int)
-            .filter_map(|one| u32::try_from(one).ok())
-            .collect()
+    let given = match held.get("traces") {
+        None => &[][..],
+        Some(one) => one.list().ok_or_else(|| {
+            format!(
+                "traces is {}, which is not a list of runs",
+                crate::wire::written(one)
+            )
+        })?,
     };
-    let traces: Runs = held
-        .get("traces")
-        .and_then(Json::list)
-        .unwrap_or(&[])
+    let traces: Runs = given
         .iter()
-        .map(|one| (taken(one, "feed"), taken(one, "want")))
-        .collect();
-    let steps = traces
+        .map(|one| Ok((numbers(one, "feed")?, numbers(one, "want")?)))
+        .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+    let longest = traces
         .iter()
-        .map(|(_, want)| u32::try_from(want.len()).unwrap_or(0))
+        .map(|(_, want)| u32::try_from(want.len()).unwrap_or(u32::MAX))
         .max()
         .unwrap_or(0);
     let machine = Machine::over(
-        counted("state", 2),
-        counted("inputs", 1),
-        counted("outputs", 1),
-        counted("gates", 12),
+        number(held, "state", 2)?,
+        number(held, "inputs", 1)?,
+        number(held, "outputs", 1)?,
+        number(held, "gates", 12)?,
         16,
-        counted("steps", steps),
+        number(held, "steps", longest)?,
     )?;
+    if traces.is_empty() || machine.steps == 0 {
+        return Err(
+            "a machine is marked on its runs, and no run with a step in it was given".into(),
+        );
+    }
+    for (at, (_, want)) in traces.iter().enumerate() {
+        if want.len() != machine.steps as usize {
+            return Err(format!(
+                "run {at} wants {} steps where the machine runs {}; every run must want the same number of steps",
+                want.len(),
+                machine.steps
+            )
+            .into());
+        }
+    }
     Ok((machine, traces))
 }
 
@@ -1704,8 +1809,8 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
             let Some(host) = host else {
                 return Err(Box::new(crate::host::Error::NoComputeDevice));
             };
-            let many = held.counted("crowd").unwrap_or(CROWD).clamp(64, 1 << 20);
-            let rounds = held.counted("rounds").unwrap_or(ROUNDS).clamp(1, 1 << 20);
+            let many = number(held, "crowd", CROWD)?.clamp(64, CROWD);
+            let rounds = number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20);
             pressed_machine(host, machine, &traces, many, rounds)?
         };
         return Ok(map(vec![
@@ -1770,16 +1875,16 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
             let Some(host) = host else {
                 return Err(Box::new(crate::host::Error::NoComputeDevice));
             };
-            let many = held.counted("crowd").unwrap_or(CROWD).clamp(64, 1 << 20);
-            let rounds = held.counted("rounds").unwrap_or(ROUNDS).clamp(1, 1 << 20);
+            let many = number(held, "crowd", CROWD)?.clamp(64, CROWD);
+            let rounds = number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20);
             Ok(told(&pressed(host, shape, &exam, many, rounds)?, true))
         }
         "grit_least" => {
             let Some(host) = host else {
                 return Err(Box::new(crate::host::Error::NoComputeDevice));
             };
-            let many = held.counted("crowd").unwrap_or(CROWD).clamp(64, 1 << 20);
-            let rounds = held.counted("rounds").unwrap_or(ROUNDS).clamp(1, 1 << 20);
+            let many = number(held, "crowd", CROWD)?.clamp(64, CROWD);
+            let rounds = number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20);
             let table: Vec<u32> = (0..shape.words()).map(|row| exam.asked(row)).collect();
             let rungs = least(host, shape, &table, many, rounds)?;
             let smallest = rungs
@@ -1819,6 +1924,22 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
                     ),
                 ),
             ];
+            let failed_twice = rungs
+                .iter()
+                .rev()
+                .take(PATIENCE as usize)
+                .all(|rung| rung.found.marks < rung.found.full);
+            let at_bottom = rungs
+                .last()
+                .is_none_or(|rung| rung.gates <= shape.outputs.max(1));
+            if !failed_twice && !at_bottom {
+                held.push((
+                    "cut_short",
+                    text(&format!(
+                        "the ladder stopped at its limit of {RUNGS} rungs while rungs were still solving, so a smaller budget may still hold it; ask again starting from smallest_that_solved"
+                    )),
+                ));
+            }
             if smallest.is_none() {
                 if let Some(rung) = rungs.iter().max_by_key(|rung| rung.found.marks) {
                     held.push(("best_attempt", told(&rung.found, true)));
@@ -1886,4 +2007,29 @@ pub fn handle(host: Option<&Host>, request: &Json) -> Option<Json> {
         }
         other => Some(refused(id, -32601, other)),
     }
+}
+
+#[must_use]
+pub fn heard(host: Option<&Host>, line: &str) -> Option<Json> {
+    let request = match crate::wire::read(line) {
+        Ok(request) => request,
+        Err(why) => {
+            return Some(refused(
+                Json::Null,
+                -32700,
+                &format!("the line is not JSON this server reads: {why}"),
+            ));
+        }
+    };
+    let answered =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(host, &request)));
+    answered.unwrap_or_else(|_| {
+        request.get("id").cloned().map(|id| {
+            refused(
+                id,
+                -32603,
+                "the server hit a fault while answering this request and has no answer for it",
+            )
+        })
+    })
 }

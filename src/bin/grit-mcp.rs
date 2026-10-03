@@ -1,25 +1,26 @@
 use std::io::{BufRead, Write};
 
 use grit::Host;
-use grit::serve::handle;
-use grit::wire::{read, written};
+use grit::serve::heard;
+use grit::wire::written;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::open()?;
-    let stdin = std::io::stdin();
+    let mut stdin = std::io::stdin().lock();
     let mut out = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        if stdin.read_until(b'\n', &mut bytes)? == 0 {
+            return Ok(());
+        }
+        let line = String::from_utf8_lossy(&bytes);
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(request) = read(&line) else {
-            continue;
-        };
-        if let Some(answer) = handle(host.as_ref(), &request) {
+        if let Some(answer) = heard(host.as_ref(), &line) {
             writeln!(out, "{}", written(&answer))?;
             out.flush()?;
         }
     }
-    Ok(())
 }

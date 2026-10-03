@@ -1455,3 +1455,223 @@ fn a_round_counts_as_unmoved_only_when_the_distance_stayed_where_it_was() {
         "five rounds hold four steps between them, and two of those four left the distance where it was; a counter that says five is counting rounds rather than stillness"
     );
 }
+
+fn refusal(answer: &Json) -> String {
+    let result = answer.get("result").unwrap();
+    assert_eq!(
+        result.get("isError"),
+        Some(&Json::Bool(true)),
+        "{}",
+        written(answer)
+    );
+    result
+        .get("content")
+        .and_then(Json::list)
+        .unwrap()
+        .first()
+        .and_then(|one| one.get("text"))
+        .and_then(Json::text)
+        .unwrap()
+        .to_string()
+}
+
+fn parity() -> String {
+    let rows: Vec<String> = (0..16_u32)
+        .map(|row| (row.count_ones() & 1).to_string())
+        .collect();
+    rows.join(",")
+}
+
+#[test]
+fn a_circuit_that_reads_nothing_is_refused_rather_than_divided_by() {
+    let Some(host) = device("a_circuit_that_reads_nothing_is_refused_rather_than_divided_by")
+    else {
+        return;
+    };
+    let said = refusal(&call(
+        Some(&host),
+        "grit_synthesise",
+        "{\"inputs\":0,\"outputs\":1,\"gates\":1,\"table\":[1]}",
+    ));
+    assert!(said.contains("inputs"), "{said}");
+}
+
+#[test]
+fn a_row_wider_than_a_word_is_refused_rather_than_wrapped_to_one_row() {
+    let said = refusal(&call(
+        None,
+        "grit_check",
+        "{\"inputs\":32,\"outputs\":1,\"gates\":1,\"table\":[0],\"chip\":[{\"kind\":0,\"left\":0,\"right\":0}]}",
+    ));
+    assert!(said.contains("inputs"), "{said}");
+}
+
+#[test]
+fn an_answer_wider_than_a_word_is_refused() {
+    let said = refusal(&call(
+        None,
+        "grit_check",
+        "{\"inputs\":1,\"outputs\":33,\"gates\":33,\"table\":[0,0],\"chip\":[]}",
+    ));
+    assert!(said.contains("outputs"), "{said}");
+}
+
+#[test]
+fn a_machine_whose_state_and_input_overflow_a_word_is_refused() {
+    let said = refusal(&call(
+        None,
+        "grit_machine",
+        "{\"state\":31,\"inputs\":1,\"outputs\":1,\"gates\":32,\"traces\":[{\"feed\":[1],\"want\":[1]}],\"chip\":[]}",
+    ));
+    assert!(said.contains("inputs"), "{said}");
+}
+
+#[test]
+fn a_crowd_is_rounded_up_to_whole_subgroups() {
+    let Some(host) = device("a_crowd_is_rounded_up_to_whole_subgroups") else {
+        return;
+    };
+    let held = structured(&call(
+        Some(&host),
+        "grit_synthesise",
+        &format!(
+            "{{\"inputs\":4,\"outputs\":1,\"gates\":3,\"table\":[{}],\"crowd\":100,\"rounds\":2000}}",
+            parity()
+        ),
+    ));
+    let crowd = held.counted("crowd").unwrap();
+    assert_eq!(
+        crowd % host.width(),
+        0,
+        "a crowd that ends part way through a subgroup sends the rest of it past the end of every buffer: {}",
+        written(&held)
+    );
+}
+
+#[test]
+fn a_crowd_over_the_ceiling_is_held_to_it() {
+    let Some(host) = device("a_crowd_over_the_ceiling_is_held_to_it") else {
+        return;
+    };
+    let held = structured(&call(
+        Some(&host),
+        "grit_synthesise",
+        &format!(
+            "{{\"inputs\":4,\"outputs\":1,\"gates\":3,\"table\":[{}],\"crowd\":1048576,\"rounds\":10}}",
+            parity()
+        ),
+    ));
+    assert!(
+        held.counted("crowd").unwrap() <= 65536,
+        "{}",
+        written(&held)
+    );
+}
+
+#[test]
+fn a_run_too_long_to_mark_is_refused_rather_than_walked() {
+    let said = refusal(&call(
+        None,
+        "grit_machine",
+        "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":2,\"steps\":4000000000,\"traces\":[{\"feed\":[1],\"want\":[1]}],\"chip\":[{\"kind\":0,\"left\":0,\"right\":0},{\"kind\":0,\"left\":0,\"right\":0}]}",
+    ));
+    assert!(said.contains("steps"), "{said}");
+}
+
+#[test]
+fn a_number_sent_as_text_is_refused_rather_than_replaced() {
+    let said = refusal(&call(
+        None,
+        "grit_check",
+        "{\"inputs\":2,\"outputs\":1,\"gates\":\"1\",\"table\":[0,1,1,0],\"chip\":[{\"kind\":6,\"left\":0,\"right\":1}]}",
+    ));
+    assert!(said.contains("gates"), "{said}");
+}
+
+#[test]
+fn a_row_that_is_not_a_number_is_refused_rather_than_dropped() {
+    let said = refusal(&call(
+        None,
+        "grit_check",
+        "{\"inputs\":1,\"outputs\":1,\"gates\":1,\"table\":[0,\"1\",1],\"chip\":[{\"kind\":6,\"left\":0,\"right\":0}]}",
+    ));
+    assert!(said.contains("table"), "{said}");
+}
+
+#[test]
+fn a_gate_naming_a_source_past_the_field_is_refused_rather_than_masked() {
+    let said = refusal(&call(
+        None,
+        "grit_check",
+        "{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,1,1,0],\"chip\":[{\"kind\":6,\"left\":4096,\"right\":1}]}",
+    ));
+    assert!(said.contains("4096"), "{said}");
+}
+
+#[test]
+fn a_gate_missing_a_field_is_refused_rather_than_read_as_zero() {
+    let said = refusal(&call(
+        None,
+        "grit_check",
+        "{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,1,1,0],\"chip\":[{\"left\":0,\"right\":1}]}",
+    ));
+    assert!(said.contains("kind"), "{said}");
+}
+
+#[test]
+fn runs_of_different_lengths_are_refused_rather_than_padded() {
+    let counter = "[{\"kind\":8,\"left\":0,\"right\":2},{\"kind\":6,\"left\":0,\"right\":2},{\"kind\":6,\"left\":1,\"right\":3},{\"kind\":8,\"left\":0,\"right\":0},{\"kind\":8,\"left\":1,\"right\":1}]";
+    let said = refusal(&call(
+        None,
+        "grit_machine",
+        &format!(
+            "{{\"state\":2,\"inputs\":1,\"outputs\":2,\"gates\":5,\"traces\":[{},{{\"feed\":[0],\"want\":[0]}}],\"chip\":{counter}}}",
+            counting(16)
+        ),
+    ));
+    assert!(said.contains("steps"), "{said}");
+}
+
+#[test]
+fn a_machine_marked_on_no_runs_is_refused_rather_than_solved() {
+    let said = refusal(&call(
+        None,
+        "grit_machine",
+        "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":2,\"traces\":[],\"chip\":[{\"kind\":0,\"left\":0,\"right\":0},{\"kind\":0,\"left\":0,\"right\":0}]}",
+    ));
+    assert!(said.contains("run"), "{said}");
+}
+
+#[test]
+fn a_line_that_does_not_parse_is_answered_rather_than_ignored() {
+    let answer = grit::serve::heard(
+        None,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"x\":1.5}",
+    )
+    .unwrap();
+    assert_eq!(
+        answer
+            .get("error")
+            .and_then(|one| one.get("code"))
+            .and_then(Json::int),
+        Some(-32700),
+        "{}",
+        written(&answer)
+    );
+}
+
+#[test]
+fn a_machine_too_large_to_compile_is_refused_before_it_is_built() {
+    let Some(host) = device("a_machine_too_large_to_compile_is_refused_before_it_is_built") else {
+        return;
+    };
+    let said = refusal(&call(
+        Some(&host),
+        "grit_machine",
+        &format!(
+            "{{\"state\":2,\"inputs\":1,\"outputs\":2,\"gates\":4000,\"traces\":[{}],\"crowd\":64,\"rounds\":1}}",
+            counting(1000)
+        ),
+    ));
+    assert!(said.contains("steps"), "{said}");
+}
