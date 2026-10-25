@@ -526,12 +526,13 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
         kernel.load_at(STATE, places[3].id())?,
     ];
 
-    let (settled, counted) = {
+    let (settled, counted, touched) = {
         let mut lanes = kernel.lanes()?;
         let a = lanes.splat_id::<U32, LANES>(held[0])?;
         let b = lanes.splat_id::<U32, LANES>(held[1])?;
         let c = lanes.splat_id::<U32, LANES>(held[2])?;
         let d = lanes.splat_id::<U32, LANES>(held[3])?;
+        let loaded = [a, b, c, d];
 
         let a = sand::hold::<LANES>(&mut lanes, a, c)?;
         let b = sand::hold::<LANES>(&mut lanes, b, d)?;
@@ -553,6 +554,15 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
             count = lanes.add(count, differs)?;
         }
 
+        let mut touched = lanes.splat_bits::<U32, LANES>(0)?;
+        for (before, after) in loaded.into_iter().zip([na, nb, nc, nd]) {
+            let one = lanes.splat_bits::<U32, LANES>(1)?;
+            let none = lanes.splat_bits::<U32, LANES>(0)?;
+            let same = lanes.equal(before, after)?;
+            let differs = lanes.select(same, none, one)?;
+            touched = lanes.add(touched, differs)?;
+        }
+
         let mut wet = lanes.splat_bits::<U32, LANES>(0)?;
         let mut dry = lanes.splat_bits::<U32, LANES>(0)?;
         for cell in [na, nb, nc, nd] {
@@ -568,7 +578,7 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
             wet = lanes.add(wet, add_wet)?;
             dry = lanes.add(dry, add_dry)?;
         }
-        ([na, nb, nc, nd], [count, wet, dry])
+        ([na, nb, nc, nd], [count, wet, dry], touched)
     };
 
     let spare = {
@@ -599,11 +609,7 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
         column,
         row,
     };
-    let holding = *counted.first().ok_or(LaneError::NoMapping {
-        lanes: LANES,
-        width: subgroup,
-    })?;
-    wake::<LANES>(&mut kernel, where_at, holding, inside, dump_base)?;
+    wake::<LANES>(&mut kernel, where_at, touched, inside, dump_base)?;
 
     let what = Tallying {
         counted,
