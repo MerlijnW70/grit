@@ -38,13 +38,13 @@ cargo clippy --all-targets
 cargo clippy --no-default-features --all-targets
 Remove-Item Env:RUSTFLAGS
 $env:RUSTDOCFLAGS = "-D warnings"; cargo doc --no-deps; Remove-Item Env:RUSTDOCFLAGS
-$env:GRIT_DEVICE = "4080"; cargo test --release --no-fail-fast 2>&1 | Tee-Object gate-4080.log
+$env:GRIT_DEVICE = "4080"; cmd /c "cargo test --release --no-fail-fast -- --nocapture > gate-4080.log 2>&1"
 ```
 
-- `gate-4080.log` contains no `SKIPPED` line and no failed test.
+- `gate-4080.log` contains no `SKIPPED` line and no failed test. `--nocapture` is required: `SKIPPED` goes to stderr, which libtest swallows for a passing test. Count with `Select-String -CaseSensitive -Pattern 'SKIPPED' gate-4080.log`; without `-CaseSensitive` it also matches test names that contain "skipped".
 
-Measured at 86f6dc5 on a fresh clone on this machine (rustc 1.98.1): cold `cargo build --release` 77.8 s; `cargo fmt --all --check` 0.9 s; `cargo clippy --release --all-targets` with `-D warnings` 18 s; `cargo test --release --no-run` 474 s; 329 tests listed by default, 346 with `--features deep`. The suite's run time on the GPU has not been measured yet.
-- <If the job touches device code: the same test command with `GRIT_DEVICE = "Radeon"`, for the tests: <list>.>
+Measured at 86f6dc5 on a fresh clone on this machine (rustc 1.98.1): cold `cargo build --release` 77.8 s; `cargo fmt --all --check` 0.9 s; `cargo clippy --release --all-targets` with `-D warnings` 18 s; `cargo test --release --no-run` 474 s; 329 tests listed by default, 346 with `--features deep`. At c945b06, `cargo test --release --no-fail-fast -- --nocapture` with `GRIT_DEVICE=4080` took 378.3 s wall with the test binaries already built: 327 passed, 0 failed, 2 ignored across 46 binaries, no `SKIPPED` line. The AMD iGPU has not been timed here.
+- <If the job touches device code: the same test command with `GRIT_DEVICE = "Radeon"` into `gate-radeon.log`, for the tests: <list>.>
 - <If the job touches the descent research: `cargo test --release --features deep --test descending`.>
 
 ## Deliberate break
