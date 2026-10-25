@@ -228,10 +228,11 @@ pub fn arranged(
             (decay(subgroup, listed)?, hot),
             (wipe(subgroup)?, one),
             (wipe_counts(subgroup, COUNTS)?, tiles),
+            (unclaimed(subgroup)?, one),
         ],
         vec![(
             sand::brush(subgroup, grid, true)?,
-            Groups::Fixed(sand::BOX * sand::BOX / subgroup),
+            Groups::Counting(sand::BOX * sand::BOX / subgroup),
         )],
         vec![(settle(subgroup, grid)?, crate::compact::Plan::listed())],
         looking,
@@ -425,6 +426,17 @@ fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, Lane
     kernel.finish()
 }
 
+/// Zeroes the count of quads the brush adds to the list, which is kept in
+/// `DENSE` at the dump base, past the end of any list.
+pub fn unclaimed(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, 1, BINDINGS))?;
+    let second = kernel.module().constant_u32(1)?;
+    let nothing = kernel.module().constant_u32(0)?;
+    let at = kernel.load_at(PARAMS, second)?;
+    kernel.store_at(DENSE, at, nothing)?;
+    kernel.finish()
+}
+
 pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     use crate::layout::{HOT_TOTALS, TALLY, TALLY_WORDS, TOTALS};
     use crate::sweep::PER_LANE;
@@ -504,15 +516,22 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
     let grand = kernel.load_at(GRAND, head)?;
     let second = kernel.module().constant_u32(1)?;
     let dump_base = kernel.load_at(PARAMS, second)?;
+    let claimed = kernel.load_at(DENSE, dump_base)?;
 
-    let inside = {
+    let (inside, counted_in) = {
         let mut lanes = kernel.lanes()?;
         let here = lanes.splat_id::<U32, LANES>(slot)?;
-        let total = lanes.splat_id::<U32, LANES>(grand)?;
+        let listed = lanes.splat_id::<U32, LANES>(grand)?;
+        let added = lanes.splat_id::<U32, LANES>(claimed)?;
+        let total = lanes.add(listed, added)?;
         let one = lanes.splat_bits::<U32, LANES>(1)?;
         let none = lanes.splat_bits::<U32, LANES>(0)?;
-        let listed = lanes.greater_than(total, here)?;
-        lanes.select(listed, one, none)?
+        let settled = lanes.greater_than(total, here)?;
+        let counted = lanes.greater_than(listed, here)?;
+        (
+            lanes.select(settled, one, none)?,
+            lanes.select(counted, one, none)?,
+        )
     };
 
     let quad = kernel.load_at(DENSE, slot)?;
@@ -615,7 +634,7 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
         counted,
         column,
         row,
-        inside,
+        inside: counted_in,
     };
     tally::<LANES>(&mut kernel, what)?;
     kernel.finish()

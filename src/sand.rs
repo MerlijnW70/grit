@@ -709,9 +709,246 @@ fn brushed<const LANES: u32>(
             row: quad_y,
         };
         crate::live::wake::<LANES>(&mut kernel, where_at, changed, always, dump_base)?;
+
+        let reaching = Reaching {
+            grid,
+            seat,
+            column,
+            row,
+            brush: [where_x, where_y, how_wide, what_of],
+        };
+        claim::<LANES>(&mut kernel, subgroup, reaching)?;
     }
 
     kernel.finish()
+}
+
+struct Reaching<const LANES: u32> {
+    grid: Grid,
+    seat: Id,
+    column: Vector<U32, LANES>,
+    row: Vector<U32, LANES>,
+    brush: [Id; 4],
+}
+
+/// Whether the brush can paint the cell at `column`, `row`: inside its box,
+/// inside its disc, and pouring something. The emptiness of the cell is left
+/// out, so a quad is claimed whenever the brush reaches it.
+fn reaches<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    grid: Grid,
+    column: Vector<U32, LANES>,
+    row: Vector<U32, LANES>,
+    brush: [Id; 4],
+) -> Result<Vector<U32, LANES>, LaneError> {
+    let [where_x, where_y, how_wide, what_of] = brush;
+    let column = low_bits::<LANES>(lanes, column, grid.wide.trailing_zeros())?;
+    let row = low_bits::<LANES>(lanes, row, grid.deep.trailing_zeros())?;
+
+    let bx = lanes.splat_id::<U32, LANES>(where_x)?;
+    let by_row = lanes.splat_id::<U32, LANES>(where_y)?;
+    let reach = lanes.splat_id::<U32, LANES>(how_wide)?;
+    let material = lanes.splat_id::<U32, LANES>(what_of)?;
+    let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
+    let half = lanes.splat_bits::<U32, LANES>(BOX / 2)?;
+    let side = lanes.splat_bits::<U32, LANES>(BOX)?;
+    let one = lanes.splat_bits::<U32, LANES>(1)?;
+    let none = lanes.splat_bits::<U32, LANES>(0)?;
+
+    let away_x = lanes.mul(bx, minus)?;
+    let away_y = lanes.mul(by_row, minus)?;
+    let dx = lanes.add(column, away_x)?;
+    let dy = lanes.add(row, away_y)?;
+
+    let from_x = lanes.add(dx, half)?;
+    let from_x = low_bits::<LANES>(lanes, from_x, grid.wide.trailing_zeros())?;
+    let from_y = lanes.add(dy, half)?;
+    let from_y = low_bits::<LANES>(lanes, from_y, grid.deep.trailing_zeros())?;
+    let in_x = lanes.greater_than(side, from_x)?;
+    let in_y = lanes.greater_than(side, from_y)?;
+
+    let across_sq = lanes.mul(dx, dx)?;
+    let down_sq = lanes.mul(dy, dy)?;
+    let far = lanes.add(across_sq, down_sq)?;
+    let inside = lanes.greater_than(reach, far)?;
+    let pouring = lanes.greater_than(material, none)?;
+
+    let mut all = one;
+    for test in [in_x, in_y, inside, pouring] {
+        let held = lanes.select(test, one, none)?;
+        all = lanes.mul(all, held)?;
+    }
+    Ok(all)
+}
+
+/// Puts on this frame's list every quad of this frame's phase that the brush
+/// reaches and that the list does not hold, so that the settle after the
+/// brush steps it in the frame it is painted. One seat claims each such
+/// quad: the seat of the first corner, in the order the settle reads them,
+/// that the brush reaches.
+///
+/// The list, `DENSE` below `GRAND`, is in ascending order and is searched by
+/// halving. The quads claimed go after it, their count in `DENSE` at the
+/// dump base, and the settle's dispatch grows by a group for every
+/// `subgroup` of them.
+fn claim<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    subgroup: u32,
+    reaching: Reaching<LANES>,
+) -> Result<(), LaneError> {
+    use crate::layout::{DENSE, GRAND, INDIRECT};
+
+    let Reaching {
+        grid,
+        seat,
+        column,
+        row,
+        brush,
+    } = reaching;
+    let head = kernel.module().constant_u32(0)?;
+    let second = kernel.module().constant_u32(1)?;
+    let frame = kernel.load_at(PARAMS, head)?;
+    let dump = kernel.load_at(PARAMS, second)?;
+    let grand = kernel.load_at(GRAND, head)?;
+
+    let (quad, mine) = {
+        let mut lanes = kernel.lanes()?;
+        let now = lanes.splat_id::<U32, LANES>(frame)?;
+        let phase = low_bits::<LANES>(&mut lanes, now, 1)?;
+        let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
+        let back = lanes.mul(phase, minus)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+
+        let shifted_x = lanes.add(column, back)?;
+        let shifted_x = low_bits::<LANES>(&mut lanes, shifted_x, grid.wide.trailing_zeros())?;
+        let shifted_y = lanes.add(row, back)?;
+        let shifted_y = low_bits::<LANES>(&mut lanes, shifted_y, grid.deep.trailing_zeros())?;
+        let corner_x = low_bits::<LANES>(&mut lanes, shifted_x, 1)?;
+        let corner_y = low_bits::<LANES>(&mut lanes, shifted_y, 1)?;
+        let quad_x = lanes.shift_right_logical(shifted_x, one)?;
+        let quad_y = lanes.shift_right_logical(shifted_y, one)?;
+        let by = lanes.splat_bits::<U32, LANES>(grid.across().trailing_zeros())?;
+        let stride = lanes.shift_left(quad_y, by)?;
+        let quad = lanes.add(stride, quad_x)?;
+        let twice = lanes.shift_left(corner_y, one)?;
+        let corner = lanes.add(twice, corner_x)?;
+
+        let doubled_x = lanes.shift_left(quad_x, one)?;
+        let doubled_y = lanes.shift_left(quad_y, one)?;
+        let left = lanes.add(doubled_x, phase)?;
+        let top = lanes.add(doubled_y, phase)?;
+        let right = lanes.add(left, one)?;
+        let under = lanes.add(top, one)?;
+
+        let mut earlier = none;
+        let mut own = none;
+        let corners = [(left, top), (right, top), (left, under), (right, under)];
+        for (index, (x, y)) in (0_u32..).zip(corners) {
+            let reached = reaches::<LANES>(&mut lanes, grid, x, y, brush)?;
+            let at = lanes.splat_bits::<U32, LANES>(index)?;
+            let before = lanes.greater_than(corner, at)?;
+            let before = lanes.select(before, one, none)?;
+            let here = lanes.equal(corner, at)?;
+            let here = lanes.select(here, one, none)?;
+            let counted = lanes.mul(reached, before)?;
+            earlier = lanes.add(earlier, counted)?;
+            let counted = lanes.mul(reached, here)?;
+            own = lanes.add(own, counted)?;
+        }
+
+        let within = lanes.splat_id::<U32, LANES>(seat)?;
+        let shift = lanes.splat_bits::<U32, LANES>(BOX.trailing_zeros())?;
+        let across_box = low_bits::<LANES>(&mut lanes, within, BOX.trailing_zeros())?;
+        let down_box = lanes.shift_right_logical(within, shift)?;
+        let wide = lanes.splat_bits::<U32, LANES>(grid.wide)?;
+        let deep = lanes.splat_bits::<U32, LANES>(grid.deep)?;
+        let fits_x = lanes.greater_than(wide, across_box)?;
+        let fits_x = lanes.select(fits_x, one, none)?;
+        let fits_y = lanes.greater_than(deep, down_box)?;
+        let fits_y = lanes.select(fits_y, one, none)?;
+
+        let first = lanes.equal(earlier, none)?;
+        let first = lanes.select(first, one, none)?;
+        let mine = lanes.mul(own, first)?;
+        let mine = lanes.mul(mine, fits_x)?;
+        let mine = lanes.mul(mine, fits_y)?;
+        (quad, mine)
+    };
+
+    let steps = 33 - grid.quads().leading_zeros();
+    let (mut base, mut left) = {
+        let mut lanes = kernel.lanes()?;
+        (
+            lanes.splat_bits::<U32, LANES>(0)?,
+            lanes.splat_id::<U32, LANES>(grand)?,
+        )
+    };
+    for _ in 0..steps {
+        let (middle, half) = {
+            let mut lanes = kernel.lanes()?;
+            let one = lanes.splat_bits::<U32, LANES>(1)?;
+            let half = lanes.shift_right_logical(left, one)?;
+            (lanes.add(base, half)?, half)
+        };
+        let seen = kernel.load_at(DENSE, middle.id())?;
+        let mut lanes = kernel.lanes()?;
+        let seen = lanes.splat_id::<U32, LANES>(seen)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
+        let active = lanes.greater_than(left, none)?;
+        let active = lanes.select(active, one, none)?;
+        let below = lanes.greater_than(quad, seen)?;
+        let below = lanes.select(below, one, none)?;
+        let go = lanes.mul(active, below)?;
+        let go = lanes.greater_than(go, none)?;
+
+        let past = lanes.add(middle, one)?;
+        let taken = lanes.add(half, one)?;
+        let taken = lanes.mul(taken, minus)?;
+        let rest = lanes.add(left, taken)?;
+        base = lanes.select(go, past, base)?;
+        left = lanes.select(go, rest, half)?;
+    }
+    let seen = kernel.load_at(DENSE, base.id())?;
+
+    let (claimed, junk) = {
+        let mut lanes = kernel.lanes()?;
+        let seen = lanes.splat_id::<U32, LANES>(seen)?;
+        let total = lanes.splat_id::<U32, LANES>(grand)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let within = lanes.greater_than(total, base)?;
+        let within = lanes.select(within, one, none)?;
+        let same = lanes.equal(seen, quad)?;
+        let same = lanes.select(same, one, none)?;
+        let listed = lanes.mul(within, same)?;
+        let missing = lanes.equal(listed, none)?;
+        let missing = lanes.select(missing, one, none)?;
+        let claimed = lanes.mul(mine, missing)?;
+        let start = lanes.splat_id::<U32, LANES>(dump)?;
+        (claimed, lanes.add(start, one)?)
+    };
+
+    let before = kernel.atomic_add_at(DENSE, dump, claimed.id())?;
+    let (into, grows) = {
+        let mut lanes = kernel.lanes()?;
+        let before = lanes.splat_id::<U32, LANES>(before)?;
+        let total = lanes.splat_id::<U32, LANES>(grand)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let at = lanes.add(total, before)?;
+        let taking = lanes.greater_than(claimed, none)?;
+        let into = lanes.select(taking, at, junk)?;
+        let start = low_bits::<LANES>(&mut lanes, at, subgroup.trailing_zeros())?;
+        let start = lanes.equal(start, none)?;
+        let start = lanes.select(start, one, none)?;
+        (into, lanes.mul(start, claimed)?)
+    };
+    kernel.store_at(DENSE, into.id(), quad.id())?;
+    let _ = kernel.atomic_add_at(INDIRECT, head, grows.id())?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
