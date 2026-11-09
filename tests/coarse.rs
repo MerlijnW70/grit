@@ -387,8 +387,8 @@ fn the_halves_a_rule_sits_between_carry_the_tier_they_were_asked_for() {
 
     assert_eq!(fine.before.len(), 1);
     assert_eq!(coarse.before.len(), 1);
-    assert_eq!(fine.before[0].len(), 3);
-    assert_eq!(coarse.before[0].len(), 3);
+    assert_eq!(fine.before[0].len(), 4);
+    assert_eq!(coarse.before[0].len(), 4);
 
     eprintln!("{} {}", fine.after.len(), coarse.after.len());
     assert_eq!(coarse.after.len(), fine.after.len() + 3);

@@ -64,6 +64,7 @@ pub fn keeping(
         (decay(subgroup, listed)?, hot),
         (wipe(subgroup)?, one),
         (wipe_counts(subgroup, COUNTS)?, tiles),
+        (unclaimed(subgroup)?, one),
     ]];
 
     let mut after: Stages = Vec::new();
