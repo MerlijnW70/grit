@@ -127,7 +127,66 @@ pub struct Grid {
     pub deep: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unfit {
+    Side { asked: u32 },
+    TooMany { wide: u32, deep: u32 },
+    Empty { wide: u32, deep: u32 },
+}
+
+impl std::fmt::Display for Unfit {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Side { asked } => write!(
+                out,
+                "a side of {asked} cells rounds up past the largest power of two a u32 holds"
+            ),
+            Self::TooMany { wide, deep } => write!(
+                out,
+                "a grid of {wide} by {deep} cells has more quads than a u32 counts"
+            ),
+            Self::Empty { wide, deep } => write!(
+                out,
+                "a grid of {wide} by {deep} cells holds no whole quad of two by two"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Unfit {}
+
 impl Grid {
+    /// The grid `of` gives, refused where `of` would wrap: a side that
+    /// rounds past `2^31`, quads that pass a `u32`, cells that pass a `usize`,
+    /// or a side under two that leaves no quad at all.
+    pub const fn new(wide: u32, deep: u32) -> Result<Self, Unfit> {
+        let Some(rounded_wide) = wide.checked_next_power_of_two() else {
+            return Err(Unfit::Side { asked: wide });
+        };
+        let Some(rounded_deep) = deep.checked_next_power_of_two() else {
+            return Err(Unfit::Side { asked: deep });
+        };
+        let grid = Self {
+            wide: rounded_wide,
+            deep: rounded_deep,
+        };
+        if grid.across() == 0 || grid.down() == 0 {
+            return Err(Unfit::Empty {
+                wide: rounded_wide,
+                deep: rounded_deep,
+            });
+        }
+        let quads = grid.across().checked_mul(grid.down());
+        let cells = (rounded_wide as usize).checked_mul(rounded_deep as usize);
+        if quads.is_none() || cells.is_none() {
+            return Err(Unfit::TooMany {
+                wide: rounded_wide,
+                deep: rounded_deep,
+            });
+        }
+        Ok(grid)
+    }
+
     #[must_use]
     pub const fn of(wide: u32, deep: u32) -> Self {
         Self {
