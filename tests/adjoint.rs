@@ -939,6 +939,17 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
 
 const WIDEST: u32 = 1024;
 
+const ONE_TILE: [&str; 8] = [
+    "decay wipe counts",
+    "the rule",
+    "mark coarse",
+    "scan coarse",
+    "gather coarse",
+    "mark fine",
+    "scan fine",
+    "gather fine",
+];
+
 const NAMED: [&str; 9] = [
     "decay wipe counts",
     "the rule",
@@ -969,9 +980,11 @@ fn what_a_listed_frame_spends_and_where() {
             return;
         }
     };
+    let named: &[&str] = if plan.tiles == 1 { &ONE_TILE } else { &NAMED };
     let cells = patched(grid, 0x1234_5678, 12);
 
     let (passes, ahead, _) = wiring(width, grid, &plan);
+    assert_eq!(ahead.len(), named.len());
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let plan_sizes = plan.sizes();
     let mut sizes = [1_usize; HOLDING as usize];
@@ -999,7 +1012,7 @@ fn what_a_listed_frame_spends_and_where() {
         resident.staged(&forward).unwrap();
     }
 
-    let mut best = vec![Duration::MAX; NAMED.len()];
+    let mut best = vec![Duration::MAX; named.len()];
     let mut whole = Duration::MAX;
     for _ in 0..ROUNDS {
         for frame in 0..STEPS {
@@ -1007,10 +1020,14 @@ fn what_a_listed_frame_spends_and_where() {
             resident.staged(&forward).unwrap();
         }
         let spans = resident.stage_times().to_vec();
-        if spans.len() != NAMED.len() {
-            common::skip(format_args!("{} {}", spans.len(), NAMED.len()));
+        if spans.is_empty() {
+            common::skip(format_args!(
+                "what_a_listed_frame_spends_and_where: {} keeps no stage times",
+                host.name()
+            ));
             return;
         }
+        assert_eq!(spans.len(), named.len());
         for (slot, span) in best.iter_mut().zip(&spans) {
             *slot = (*slot).min(*span);
         }
@@ -1018,7 +1035,7 @@ fn what_a_listed_frame_spends_and_where() {
     }
 
     let counted: Duration = best.iter().sum();
-    for (name, span) in NAMED.iter().zip(&best) {
+    for (name, span) in named.iter().zip(&best) {
         let share = span.as_secs_f64() / counted.as_secs_f64() * 100.0;
         eprintln!("{name:<20} {span:>10.3?} {share:>5.1}%");
     }

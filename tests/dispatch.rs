@@ -329,15 +329,16 @@ fn a_frame_is_recorded_once_and_a_write_between_two_does_not_undo_it() {
 
 #[test]
 fn a_pattern_matching_nothing_names_the_devices_that_are_here() {
+    let Some(here) = device("a_pattern_matching_nothing_names_the_devices_that_are_here") else {
+        return;
+    };
+    drop(here);
     let present = match Host::matching(Some("zzz-no-device-is-called-this")) {
         Err(Error::NoSuchDevice { wanted, present }) => {
             assert_eq!(wanted, "zzz-no-device-is-called-this");
             present
         }
-        Ok(None) => {
-            common::skip("");
-            return;
-        }
+        Ok(None) => panic!("Vulkan opened a device a moment ago and now says there is none"),
         Ok(Some(taken)) => panic!("{:?}", taken.name()),
         Err(other) => panic!("{other:?}"),
     };

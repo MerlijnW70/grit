@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
 use grit::Host;
 use grit::serve::handle;
 use grit::wire::{Json, read, written};
@@ -89,8 +91,7 @@ fn tried(host: Option<&Host>, many: u32, steps: u32) -> (bool, u32, u32) {
 
 #[test]
 fn a_machine_that_answers_every_run_it_was_taught_can_still_miss_runs_it_never_saw() {
-    let Some(host) = Host::open().unwrap() else {
-        eprintln!("SKIPPED no device");
+    let Some(host) = common::device("heldout") else {
         return;
     };
     let (fit, marks, of) = tried(Some(&host), 3, 8);
@@ -104,8 +105,7 @@ fn a_machine_that_answers_every_run_it_was_taught_can_still_miss_runs_it_never_s
 
 #[test]
 fn longer_runs_pin_the_same_machine_down_on_runs_it_never_saw() {
-    let Some(host) = Host::open().unwrap() else {
-        eprintln!("SKIPPED no device");
+    let Some(host) = common::device("heldout") else {
         return;
     };
     let (fit, marks, of) = tried(Some(&host), 3, 32);

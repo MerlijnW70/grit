@@ -124,6 +124,7 @@ fn the_threshold_is_where_the_two_arrangements_cross() {
     }
 
     if std::env::var_os("CI").is_some() {
+        common::skip("the_threshold_is_where_the_two_arrangements_cross under CI");
         return;
     }
 

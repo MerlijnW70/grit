@@ -9,11 +9,11 @@ use ash::vk;
 use grit::compact::Plan;
 use grit::sweep;
 
-fn limits_of(pattern: Option<&str>) -> Option<(String, vk::PhysicalDeviceLimits)> {
-    let entry = unsafe { ash::Entry::load() }.ok()?;
+fn limits_of(named: &str) -> Option<vk::PhysicalDeviceLimits> {
+    let entry = unsafe { ash::Entry::load() }.unwrap();
     let info = vk::InstanceCreateInfo::default();
-    let instance = unsafe { entry.create_instance(&info, None) }.ok()?;
-    let found = unsafe { instance.enumerate_physical_devices() }.ok()?;
+    let instance = unsafe { entry.create_instance(&info, None) }.unwrap();
+    let found = unsafe { instance.enumerate_physical_devices() }.unwrap();
     let mut held = None;
     for physical in found {
         let properties = unsafe { instance.get_physical_device_properties(physical) };
@@ -24,9 +24,8 @@ fn limits_of(pattern: Option<&str>) -> Option<(String, vk::PhysicalDeviceLimits)
             .map(|byte| u8::try_from(*byte).unwrap_or(b'?'))
             .collect();
         let name = String::from_utf8_lossy(&bytes).into_owned();
-        let wanted = pattern.is_none_or(|want| name.contains(want));
-        if wanted && held.is_none() {
-            held = Some((name, properties.limits));
+        if name == named && held.is_none() {
+            held = Some(properties.limits);
         }
     }
     unsafe { instance.destroy_instance(None) };
@@ -39,10 +38,9 @@ fn the_widest_plan_asks_for_more_workgroups_than_a_device_promises() {
         return;
     };
     let width = host.width();
-    let pattern = std::env::var("GRIT_DEVICE").ok();
-    let Some((name, limits)) = limits_of(pattern.as_deref()) else {
-        common::skip("");
-        return;
+    let name = host.name().to_owned();
+    let Some(limits) = limits_of(&name) else {
+        panic!("Vulkan opened {name:?} and does not list it again");
     };
 
     let per_block = sweep::cells(width);

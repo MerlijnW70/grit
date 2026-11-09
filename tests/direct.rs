@@ -4,6 +4,22 @@ mod common;
 
 use common::device;
 
+use grit::{Error, Host, Resident};
+
+fn direct<'host>(host: &'host Host, sizes: &[usize]) -> Option<Resident<'host>> {
+    match host.resident_direct(sizes, &[]) {
+        Ok(held) => Some(held),
+        Err(Error::NoMemory { bytes }) => {
+            common::skip(format_args!(
+                "{} has no memory that is both on the device and mapped for {bytes} bytes",
+                host.name()
+            ));
+            None
+        }
+        Err(why) => panic!("{why}"),
+    }
+}
+
 #[test]
 fn a_direct_write_lands_the_same_bytes_a_staged_one_does() {
     let Some(host) = device("a_direct_write_lands_the_same_bytes") else {
@@ -13,8 +29,7 @@ fn a_direct_write_lands_the_same_bytes_a_staged_one_does() {
         .map(|one| one.wrapping_mul(2_654_435_761))
         .collect();
 
-    let Ok(mut straight) = host.resident_direct(&[payload.len()], &[]) else {
-        common::skip("");
+    let Some(mut straight) = direct(&host, &[payload.len()]) else {
         return;
     };
     assert!(straight.direct());
@@ -32,8 +47,7 @@ fn a_direct_write_at_an_offset_leaves_what_is_around_it_alone() {
     let Some(host) = device("a_direct_write_at_an_offset_leaves_its_neighbours") else {
         return;
     };
-    let Ok(mut straight) = host.resident_direct(&[16], &[]) else {
-        common::skip("");
+    let Some(mut straight) = direct(&host, &[16]) else {
         return;
     };
 
@@ -51,8 +65,7 @@ fn a_direct_buffer_is_still_a_buffer_a_kernel_can_read() {
     let Some(host) = device("a_direct_buffer_is_still_one_a_kernel_can_read") else {
         return;
     };
-    let Ok(mut straight) = host.resident_direct(&[4], &[]) else {
-        common::skip("");
+    let Some(mut straight) = direct(&host, &[4]) else {
         return;
     };
     straight.write(0, &[7, 8, 9, 10]).unwrap();
@@ -78,10 +91,7 @@ fn a_window_takes_the_buffers_that_fit_and_leaves_the_rest_device_local() {
     let Some(host) = device("near") else {
         return;
     };
-    let Ok(mut near) = host.resident_near(&[4, 1024], &[], 16) else {
-        common::skip("");
-        return;
-    };
+    let mut near = host.resident_near(&[4, 1024], &[], 16).unwrap();
 
     near.write(0, &[1, 2, 3, 4]).unwrap();
     near.write(1, &vec![9_u32; 1024]).unwrap();
