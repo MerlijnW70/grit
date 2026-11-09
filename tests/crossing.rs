@@ -180,12 +180,14 @@ fn how_few_frames_name_the_winner() {
     let width = host.width();
     eprintln!("{} {width}", host.name());
 
+    let mut ran = 0_u32;
     for blocks in SIZES {
         let grid = sized(width, blocks);
         if let Err(why) = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
             eprintln!("{blocks:>7} {width} {why}");
             continue;
         }
+        ran += 1;
         for frames in BUDGETS {
             let mut called = Vec::with_capacity(ROUNDS);
             let mut gaps = Vec::with_capacity(ROUNDS);
@@ -204,6 +206,11 @@ fn how_few_frames_name_the_winner() {
             );
         }
     }
+    if ran == 0 {
+        common::skip(format_args!(
+            "how_few_frames_name_the_winner: no size fits a plan at {width}"
+        ));
+    }
 }
 
 #[test]
@@ -214,17 +221,24 @@ fn what_asking_the_device_costs_before_it_answers() {
     let width = host.width();
     eprintln!("{} {width}", host.name());
 
+    let mut ran = 0_u32;
     for blocks in SIZES {
         let grid = sized(width, blocks);
         if Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).is_err() {
             continue;
         }
+        ran += 1;
         let with = priced(&host, width, grid, true, 1);
         let without = priced(&host, width, grid, false, 1);
         eprintln!(
             "{blocks:>7} {:>10.3?} {:>10.3?} {:>10.3?} {:>10.3?}",
             with.built, with.made, without.built, without.made
         );
+    }
+    if ran == 0 {
+        common::skip(format_args!(
+            "what_asking_the_device_costs_before_it_answers: no size fits a plan at {width}"
+        ));
     }
 }
 
@@ -283,11 +297,13 @@ fn what_calibrating_costs_end_to_end() {
     let width = host.width();
     eprintln!("{} {width} {CALIBRATION}", host.name());
 
+    let mut ran = 0_u32;
     for blocks in SIZES {
         let grid = sized(width, blocks);
         if Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).is_err() {
             continue;
         }
+        ran += 1;
         for frames in [BATCH, 100, 500, 2000] {
             let one = by_constant(&host, width, grid, frames);
             let two = by_measurement(&host, width, grid, frames, CALIBRATION);
@@ -296,5 +312,10 @@ fn what_calibrating_costs_end_to_end() {
                 one.wall, one.chose, two.wall, two.chose
             );
         }
+    }
+    if ran == 0 {
+        common::skip(format_args!(
+            "what_calibrating_costs_end_to_end: no size fits a plan at {width}"
+        ));
     }
 }

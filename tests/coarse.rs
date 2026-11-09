@@ -123,6 +123,13 @@ fn the_threshold_is_where_the_two_arrangements_cross() {
         seen.push((blocks, with, without));
     }
 
+    if seen.is_empty() {
+        common::skip(format_args!(
+            "the_threshold_is_where_the_two_arrangements_cross: no size fits a plan at {width}"
+        ));
+        return;
+    }
+
     if std::env::var_os("CI").is_some() {
         common::skip("the_threshold_is_where_the_two_arrangements_cross under CI");
         return;
