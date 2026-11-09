@@ -1400,11 +1400,11 @@ impl Resident<'_> {
                     } else {
                         None
                     };
-                    if next.is_some() {
-                        let counted = stage
+                    if let Some(next) = next {
+                        let indirect = next
                             .iter()
-                            .any(|&(_, count)| matches!(count, Groups::Counting(_)));
-                        let (reach, stage) = if counted {
+                            .any(|&(_, count)| matches!(count, Groups::From { .. }));
+                        let (reach, stage) = if indirect {
                             (
                                 vk::AccessFlags::INDIRECT_COMMAND_READ,
                                 vk::PipelineStageFlags::DRAW_INDIRECT,
