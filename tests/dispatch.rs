@@ -562,9 +562,14 @@ fn a_write_into_a_near_buffer_does_not_wait_for_the_frame_in_flight() {
     let groups = [Groups::Fixed(1)];
     let stages: Vec<&[Groups]> = vec![&groups];
     let ticket = held.submit(&stages).unwrap();
-    held.write_at(1, 2, &[MARK]).unwrap();
+    assert!(matches!(
+        held.write_at(1, 2, &[MARK]),
+        Err(Error::StillInFlight)
+    ));
     held.wait(ticket).unwrap();
 
+    assert_eq!(held.read(1, 4).unwrap(), vec![0, 0, 0, 0]);
+    held.write_at(1, 2, &[MARK]).unwrap();
     assert_eq!(held.read(1, 4).unwrap(), vec![0, 0, MARK, 0]);
     assert_eq!(held.read(0, 1).unwrap(), vec![1]);
 }

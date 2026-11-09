@@ -622,6 +622,7 @@ impl Resident<'_> {
             return Ok(false);
         }
         let (handle, memory, visible) = (held.handle, held.memory, held.visible);
+        self.idle()?;
         if visible {
             return unsafe { self.poke(memory, into, words) }.map(|()| true);
         }
