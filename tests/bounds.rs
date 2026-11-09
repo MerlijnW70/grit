@@ -386,3 +386,27 @@ fn an_indirect_count_past_its_binding_is_refused() {
     held.frame(&[Groups::From { binding: 1, at: 3 }]).unwrap();
     assert_eq!(held.read(0, 1).unwrap(), vec![1]);
 }
+
+#[test]
+fn a_write_to_a_direct_binding_is_refused_while_a_frame_is_in_flight() {
+    let Some(host) = device("a_write_to_a_direct_binding_is_refused_in_flight") else {
+        return;
+    };
+    let mut held = host.resident_direct(&[LEN], &[]).unwrap();
+    held.write(0, &[LAID; LEN]).unwrap();
+    assert_eq!(held.pushing().2, 1, "{} wrote through staging", host.name());
+
+    let stages: Vec<&[Groups]> = Vec::new();
+    let ticket = held.submit(&stages).unwrap();
+    assert!(matches!(
+        held.write_at(0, LEN - 1, &[1]),
+        Err(Error::StillInFlight)
+    ));
+    held.write_at(0, LEN - 1, &[]).unwrap();
+    held.wait(ticket).unwrap();
+
+    held.write_at(0, LEN - 1, &[1]).unwrap();
+    let mut wanted = vec![LAID; LEN];
+    wanted[LEN - 1] = 1;
+    assert_eq!(held.read(0, LEN).unwrap(), wanted);
+}
