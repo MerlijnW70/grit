@@ -391,3 +391,89 @@ fn a_failure_to_open_says_which_step_failed_and_with_what_code() {
     };
     said_in_words(&Error::NoLoader(why), &["loader"]);
 }
+
+fn asked(named: Option<&str>, required: Option<&str>) -> common::Asked {
+    common::Asked::from(named.map(OsString::from), required.map(OsString::from))
+}
+
+fn said<T>(verdict: common::Verdict<T>) -> (&'static str, String) {
+    match verdict {
+        common::Verdict::Run(_) => ("run", String::new()),
+        common::Verdict::Skip(why) => ("skip", why),
+        common::Verdict::Fail(why) => ("fail", why),
+    }
+}
+
+#[test]
+fn the_helper_runs_skips_and_fails_on_what_it_was_asked_for() {
+    let none = || Ok::<Option<u8>, Error>(None);
+    let some = || Ok::<Option<u8>, Error>(Some(1));
+    let missing = || {
+        Err::<Option<u8>, Error>(Error::NoSuchDevice {
+            wanted: "Radon".to_owned(),
+            present: vec!["AMD Radeon(TM) Graphics".to_owned()],
+        })
+    };
+    let broken =
+        || Err::<Option<u8>, Error>(Error::NoInstance(vk::Result::ERROR_LAYER_NOT_PRESENT));
+
+    for required in [None, Some("0"), Some(""), Some("1")] {
+        for named in [None, Some(""), Some("4080")] {
+            let asking = asked(named, required);
+            assert_eq!(said(common::verdict(some(), &asking, "it")).0, "run");
+            let (missing_is, missing_why) = said(common::verdict(missing(), &asking, "it"));
+            assert_eq!(missing_is, "fail");
+            assert!(
+                missing_why.contains("Radon") && missing_why.contains("AMD Radeon(TM) Graphics")
+            );
+            assert_eq!(said(common::verdict(broken(), &asking, "it")).0, "fail");
+            let wants_one = required == Some("1") || named == Some("4080");
+            let (nothing_is, nothing_why) = said(common::verdict(none(), &asking, "it"));
+            assert_eq!(
+                nothing_is,
+                if wants_one { "fail" } else { "skip" },
+                "{named:?} {required:?} {nothing_why}"
+            );
+        }
+    }
+
+    for wrong in ["yes", "true", "2", " 1", "1 "] {
+        let asking = asked(None, Some(wrong));
+        assert!(asking.required.is_err(), "{wrong:?}");
+        assert_eq!(said(common::verdict(some(), &asking, "it")).0, "fail");
+        assert_eq!(said(common::verdict(none(), &asking, "it")).0, "fail");
+    }
+    assert_eq!(asked(Some(""), None).named, None);
+    assert_eq!(asked(Some("4080"), None).named.as_deref(), Some("4080"));
+}
+
+#[test]
+#[ignore]
+fn probe_a_skip_inside_a_test() {
+    common::skip("probe_a_skip_inside_a_test after the device was found");
+}
+
+#[test]
+fn a_skip_inside_a_test_fails_when_a_device_is_required() {
+    if !here("a_skip_inside_a_test_fails_when_a_device_is_required") {
+        return;
+    }
+    let quiet = child("probe_a_skip_inside_a_test", &[]);
+    assert!(quiet.passed, "{}", quiet.said);
+    assert!(
+        quiet.said.contains("SKIPPED probe_a_skip_inside_a_test"),
+        "{}",
+        quiet.said
+    );
+
+    let required = child(
+        "probe_a_skip_inside_a_test",
+        &[("GRIT_REQUIRE_DEVICE", Set::To(OsStr::new("1")))],
+    );
+    assert!(!required.passed, "{}", required.said);
+    assert!(
+        required.said.contains("would have skipped"),
+        "{}",
+        required.said
+    );
+}
