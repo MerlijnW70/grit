@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use std::time::Duration;
 
 use grit::compact::Plan;
@@ -25,20 +29,6 @@ const ASKING: u32 = 20;
 const COARSE_PASSES: usize = 4;
 
 const MARGIN: f64 = 0.10;
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
-
 fn room(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
     for row in 0..grid.deep {
@@ -218,7 +208,9 @@ fn the_two_arrangements_a_choice_is_made_between_are_not_the_same_one() {
             // A plan reaches `sweep::cells` cubed quads and no further, so a
             // narrow subgroup cannot address this grid at all. Shrinking it
             // would not save the question being asked here.
-            eprintln!("SKIPPED the_two_arrangements_a_choice_is_made_between {why}");
+            common::skip(format_args!(
+                "the_two_arrangements_a_choice_is_made_between {why}"
+            ));
             return;
         }
     };
@@ -289,7 +281,9 @@ fn the_cheaper_arrangement_is_the_one_the_clock_named() {
             // A plan reaches `sweep::cells` cubed quads and no further, so a
             // narrow subgroup cannot address this grid at all. Shrinking it
             // would not save the question being asked here.
-            eprintln!("SKIPPED the_cheaper_arrangement_is_the_one_the_clock_named {why}");
+            common::skip(format_args!(
+                "the_cheaper_arrangement_is_the_one_the_clock_named {why}"
+            ));
             return;
         }
     };

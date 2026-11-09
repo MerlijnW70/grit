@@ -1,8 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
+use grit::Groups;
 use grit::layout::{BINDINGS, PARAMS, STATE};
 use grit::sand::{self, Grid};
-use grit::{Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -12,20 +16,6 @@ const DEEP: u32 = 1024;
 const STEPS: u32 = 1024;
 
 const TWIST: [u32; 4] = [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn turned(subgroup: u32, grid: Grid, back: bool) -> Result<Vec<u32>, LaneError> {
     match subgroup {

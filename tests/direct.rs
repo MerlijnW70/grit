@@ -1,20 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::Host;
+mod common;
 
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
+use common::device;
 
 #[test]
 fn a_direct_write_lands_the_same_bytes_a_staged_one_does() {
@@ -26,7 +14,7 @@ fn a_direct_write_lands_the_same_bytes_a_staged_one_does() {
         .collect();
 
     let Ok(mut straight) = host.resident_direct(&[payload.len()], &[]) else {
-        eprintln!("SKIPPED");
+        common::skip("");
         return;
     };
     assert!(straight.direct());
@@ -45,7 +33,7 @@ fn a_direct_write_at_an_offset_leaves_what_is_around_it_alone() {
         return;
     };
     let Ok(mut straight) = host.resident_direct(&[16], &[]) else {
-        eprintln!("SKIPPED");
+        common::skip("");
         return;
     };
 
@@ -64,7 +52,7 @@ fn a_direct_buffer_is_still_a_buffer_a_kernel_can_read() {
         return;
     };
     let Ok(mut straight) = host.resident_direct(&[4], &[]) else {
-        eprintln!("SKIPPED");
+        common::skip("");
         return;
     };
     straight.write(0, &[7, 8, 9, 10]).unwrap();
@@ -91,7 +79,7 @@ fn a_window_takes_the_buffers_that_fit_and_leaves_the_rest_device_local() {
         return;
     };
     let Ok(mut near) = host.resident_near(&[4, 1024], &[], 16) else {
-        eprintln!("SKIPPED");
+        common::skip("");
         return;
     };
 

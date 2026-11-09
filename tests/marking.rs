@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::marking::{
     BEST, BINDINGS, HELD, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked, turned_on, words_of,
 };
@@ -7,20 +11,6 @@ use grit::netlist::{Chip, Exam, Gate, Netlist, drawn, turned};
 use grit::{Groups, Host};
 
 const CROWD: u32 = 256;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn shape() -> Netlist {
     Netlist::over(4, 2, 8, 16).unwrap()

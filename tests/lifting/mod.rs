@@ -9,7 +9,7 @@ use grit::live::{self, Waking, corners, wake};
 
 use grit::sand::Grid;
 
-use grit::{Groups, Host};
+use grit::Groups;
 
 use simdr::kernel::{Kernel, Shape};
 
@@ -33,19 +33,7 @@ pub const STEP: u32 = 1 << 9;
 
 pub const GRAIN: u32 = 2;
 
-pub fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
+pub use crate::common::device;
 
 pub fn spread(grid: Grid, seed: u32) -> Vec<u32> {
     let mut state = seed;

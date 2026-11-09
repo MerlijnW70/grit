@@ -1,9 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::compact::Plan;
 use grit::layout::PARAMS;
 use grit::sand::Grid;
-use grit::{Groups, Host, sweep};
+use grit::{Groups, sweep};
 
 const BLOCKS: u32 = 16;
 
@@ -16,20 +20,6 @@ const POURED_BLOCKS: u32 = 256;
 const POURED: u32 = 2000;
 
 const POURED_ROUNDS: usize = 4;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn sized(width: u32, blocks: u32) -> Grid {
     let cells = u64::from(blocks) * u64::from(sweep::cells(width)) * 4;
@@ -49,7 +39,7 @@ fn the_frame_counter_counts_frames() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };
@@ -104,7 +94,7 @@ fn the_counter_after_a_pour_is_the_frames_poured() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };
@@ -174,7 +164,7 @@ fn what_a_tick_costs() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };

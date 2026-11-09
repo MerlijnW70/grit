@@ -1,23 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::Host;
+mod common;
+
+use common::device;
+
 use grit::sweep::{self, PER_LANE};
 
 const BLOCKS: u32 = 64;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn seeded(count: usize) -> Vec<u32> {
     (0..count)
@@ -38,7 +27,7 @@ fn the_work_list_is_the_work_list_the_host_computes() {
     let spirv = match sweep::sweep(width) {
         Ok(spirv) => spirv,
         Err(refused) => {
-            eprintln!("SKIPPED {width} {refused}");
+            common::skip(format_args!("{width} {refused}"));
             return;
         }
     };

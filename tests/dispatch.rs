@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use std::time::Duration;
 
 use grit::{Error, Groups, Host, Run};
@@ -36,20 +40,6 @@ fn bump(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let next = kernel.module().i_add(uint, held, one)?;
     kernel.store_at(0, head, next)?;
     kernel.finish()
-}
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
 }
 
 #[test]
@@ -345,7 +335,7 @@ fn a_pattern_matching_nothing_names_the_devices_that_are_here() {
             present
         }
         Ok(None) => {
-            eprintln!("SKIPPED");
+            common::skip("");
             return;
         }
         Ok(Some(taken)) => panic!("{:?}", taken.name()),
@@ -555,7 +545,7 @@ fn a_write_into_a_near_buffer_does_not_wait_for_the_frame_in_flight() {
     held.write(1, &[0, 0, 0, 0]).unwrap();
     let (_, _, straight) = held.pushing();
     if straight == 0 {
-        eprintln!("SKIPPED {}", host.name());
+        common::skip(host.name());
         return;
     }
 

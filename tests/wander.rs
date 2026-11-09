@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::compact::Plan;
 use grit::layout::{AWAKE, BRUSH, GRAND, HOT, HOT_DENSE, HOT_GRAND, PARAMS, STATE};
 use grit::sand::{AIR, Grid, SAND, WALL};
@@ -26,20 +30,6 @@ const ROUNDS: usize = 400;
 const BATCH_RUNS: usize = 400;
 
 const EARLY_RUNS: usize = 128;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn room(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
@@ -179,7 +169,7 @@ fn which_block_goes_out_of_step() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };
@@ -291,7 +281,7 @@ fn what_a_flag_and_its_counters_say_about_each_other() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };
@@ -356,7 +346,7 @@ fn how_few_frames_it_takes_to_part() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };
@@ -434,7 +424,7 @@ fn a_block_named_twice_in_one_list() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };
@@ -532,7 +522,7 @@ fn what_the_batch_size_does_to_it() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };
@@ -584,7 +574,7 @@ fn the_flag_against_its_counters_without_a_list() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };
@@ -651,7 +641,7 @@ fn how_far_a_reduction_in_decay_reaches() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };
@@ -708,7 +698,7 @@ fn what_the_flag_costs() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };

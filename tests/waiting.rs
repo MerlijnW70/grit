@@ -1,8 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use std::time::{Duration, Instant};
 
-use grit::{Groups, Host};
+use grit::Groups;
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -38,20 +42,6 @@ fn walk(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let zero = kernel.module().constant_u32(0)?;
     let _ = kernel.atomic_add_at(1, zero, running)?;
     kernel.finish()
-}
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
 }
 
 fn over(width: u32) -> u32 {

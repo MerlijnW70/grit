@@ -1,24 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::Host;
+mod common;
+
+use common::device;
+
 use grit::compact::{self, Over, Plan, Tier};
 use grit::sweep;
 
 const BLOCKS: u32 = 1024;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 #[test]
 fn the_work_list_is_every_awake_cell_once_and_in_block_order() {
@@ -29,7 +18,7 @@ fn the_work_list_is_every_awake_cell_once_and_in_block_order() {
     let plan = match Plan::over(width, BLOCKS) {
         Ok(plan) => plan,
         Err(too_big) => {
-            eprintln!("SKIPPED {width} {too_big}");
+            common::skip(format_args!("{width} {too_big}"));
             return;
         }
     };

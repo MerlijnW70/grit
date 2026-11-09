@@ -1,6 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::{Error, Groups, Host};
+mod common;
+
+use common::device;
+
+use grit::{Error, Groups};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -9,20 +13,6 @@ const VAST: usize = 1024 * 1024 * 1023 / 4 * 4;
 const WHERE_AT: usize = 512 * 1024 * 1024;
 
 const OUT: usize = 64;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn reaching(subgroup: u32, at: usize) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 2))?;
@@ -59,7 +49,7 @@ fn a_window_of_a_buffer_larger_than_the_card() {
         return;
     };
     if !host.sparse() {
-        eprintln!("SKIPPED {}", host.name());
+        common::skip(host.name());
         return;
     }
     let width = host.width();
@@ -111,7 +101,7 @@ fn a_bind_that_does_not_fit_says_so() {
         return;
     };
     if !host.sparse() {
-        eprintln!("SKIPPED {}", host.name());
+        common::skip(host.name());
         return;
     }
     let width = host.width();
@@ -147,7 +137,7 @@ fn binding_the_same_window_twice_does_not_leak() {
         return;
     };
     if !host.sparse() {
-        eprintln!("SKIPPED {}", host.name());
+        common::skip(host.name());
         return;
     }
     let width = host.width();
@@ -171,7 +161,7 @@ fn unbinding_one_window_leaves_its_neighbour_where_it_was() {
         return;
     };
     if !host.sparse() {
-        eprintln!("SKIPPED {}", host.name());
+        common::skip(host.name());
         return;
     }
     let width = host.width();
@@ -202,7 +192,7 @@ fn a_window_ending_on_the_last_word_fits_and_a_window_of_nothing_binds_nothing()
         return;
     };
     if !host.sparse() {
-        eprintln!("SKIPPED {}", host.name());
+        common::skip(host.name());
         return;
     }
     let width = host.width();
@@ -231,7 +221,7 @@ fn a_window_is_not_moved_under_a_frame_still_running() {
         return;
     };
     if !host.sparse() {
-        eprintln!("SKIPPED {}", host.name());
+        common::skip(host.name());
         return;
     }
     let width = host.width();

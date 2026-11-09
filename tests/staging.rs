@@ -1,21 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-use grit::layout::BINDINGS;
-use grit::{Error, Host, Run};
+mod common;
 
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
+use common::device;
+
+use grit::layout::BINDINGS;
+use grit::{Error, Run};
 
 #[test]
 fn a_write_to_the_sparse_binding_is_bounded_by_the_staging_buffer() {
@@ -23,7 +13,7 @@ fn a_write_to_the_sparse_binding_is_bounded_by_the_staging_buffer() {
         return;
     };
     if !host.sparse() {
-        eprintln!("SKIPPED");
+        common::skip("");
         return;
     }
 
@@ -40,7 +30,7 @@ fn a_write_to_the_sparse_binding_is_bounded_by_the_staging_buffer() {
     let mut held = match held {
         Ok(held) => held,
         Err(why) => {
-            eprintln!("SKIPPED {why}");
+            common::skip(why);
             return;
         }
     };
@@ -192,7 +182,7 @@ fn a_write_at_filling_the_staging_buffer_to_the_word_is_taken() {
         return;
     };
     if !host.sparse() {
-        eprintln!("SKIPPED {}", host.name());
+        common::skip(host.name());
         return;
     }
 
@@ -208,7 +198,7 @@ fn a_write_at_filling_the_staging_buffer_to_the_word_is_taken() {
     let mut held = match host.resident_vast(&sizes, &modules, 1) {
         Ok(held) => held,
         Err(why) => {
-            eprintln!("SKIPPED {why}");
+            common::skip(why);
             return;
         }
     };

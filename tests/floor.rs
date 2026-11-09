@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
 use std::time::{Duration, Instant};
 
 use grit::{Groups, Host};
@@ -21,20 +23,10 @@ fn nothing(subgroup: u32) -> Result<Vec<u32>, LaneError> {
 
 fn device(label: &str) -> Option<Host> {
     if std::env::var_os("CI").is_some() {
-        eprintln!("SKIPPED {label}");
+        common::skip(label);
         return None;
     }
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
+    common::device(label)
 }
 
 fn whole(held: &mut grit::Resident<'_>, stages: &[&[Groups]], times: u32) -> f64 {

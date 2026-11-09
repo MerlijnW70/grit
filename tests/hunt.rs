@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::compact::Plan;
 use grit::layout::{AWAKE, BRUSH, GRAND, HOT, HOT_DENSE, HOT_GRAND, PARAMS, STATE};
 use grit::sand::{AIR, Grid, SAND, WALL};
@@ -12,20 +16,6 @@ const POURING: u32 = 200;
 const BLOCKS: u32 = 1024;
 
 const RUNS: usize = 5;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn room(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
@@ -139,7 +129,7 @@ fn whether_a_barrier_is_what_is_missing() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };

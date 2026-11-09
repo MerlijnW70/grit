@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::layout::{LOOKING, PARAMS, PIXELS, STATE};
 use grit::sand::{
     self, AIR, Grid, RUNNING_RIGHT, SAND, View, WALL, WATER, material_of, running_of,
@@ -11,20 +15,6 @@ const WIDE: u32 = 512;
 const DEEP: u32 = 256;
 
 const STEPS: u32 = 100;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn poured(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];

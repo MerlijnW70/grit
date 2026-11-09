@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use std::time::Duration;
 
 use grit::compact::Plan;
@@ -18,20 +22,6 @@ const STEPS: u32 = 64;
 const TANGENT: u32 = BINDINGS;
 const CARRIED: u32 = BINDINGS + 1;
 const HOLDING: u32 = BINDINGS + 2;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn spread(grid: Grid, seed: u32, fill: u32) -> Vec<u32> {
     let mut state = seed;
@@ -884,7 +874,9 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
         top /= 2;
     }
     if top < LEAST {
-        eprintln!("SKIPPED the_list_starts_paying_when_the_grid_outgrows {top} under {LEAST}");
+        common::skip(format_args!(
+            "the_list_starts_paying_when_the_grid_outgrows {top} under {LEAST}"
+        ));
         return;
     }
     let sides = [top, top / 2, top / 4, top / 8];
@@ -930,9 +922,9 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
     let (top_cost, bottom_cost) = (widest.unwrap(), narrowest.unwrap());
     let spent = top_cost.as_secs_f64() / bottom_cost.as_secs_f64().max(f64::MIN_POSITIVE);
     if spent < SPENT {
-        eprintln!(
-            "SKIPPED the_list_starts_paying_when_the_grid_outgrows {spent:.2} under {SPENT:.2}"
-        );
+        common::skip(format_args!(
+            "the_list_starts_paying_when_the_grid_outgrows {spent:.2} under {SPENT:.2}"
+        ));
         return;
     }
 
@@ -973,7 +965,7 @@ fn what_a_listed_frame_spends_and_where() {
             // A plan reaches `sweep::cells` cubed quads and no further, so a
             // narrow subgroup cannot address this grid at all. Shrinking it
             // would not save the question being asked here.
-            eprintln!("SKIPPED what_a_listed_frame_spends_and_where {why}");
+            common::skip(format_args!("what_a_listed_frame_spends_and_where {why}"));
             return;
         }
     };
@@ -1016,7 +1008,7 @@ fn what_a_listed_frame_spends_and_where() {
         }
         let spans = resident.stage_times().to_vec();
         if spans.len() != NAMED.len() {
-            eprintln!("SKIPPED {} {}", spans.len(), NAMED.len());
+            common::skip(format_args!("{} {}", spans.len(), NAMED.len()));
             return;
         }
         for (slot, span) in best.iter_mut().zip(&spans) {

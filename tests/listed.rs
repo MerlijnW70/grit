@@ -1,24 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::compact::Plan;
 use grit::layout::{BINDINGS, BRUSH, GRAND, PARAMS, PIXELS, STATE};
 use grit::sand::{self, AIR, Grid, SAND, WALL, WATER};
 use grit::sweep;
-use grit::{Groups, Host, Resident};
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
+use grit::{Groups, Resident};
 
 type Brushing = fn(u32, Grid) -> [u32; 4];
 type Starting = fn(Grid) -> Vec<u32>;
@@ -142,7 +132,7 @@ fn against_the_whole_grid(setup: Setup) -> Option<u64> {
     let plan = match Plan::over(width, quads.div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(too_big) => {
-            eprintln!("SKIPPED {} {width} {too_big}", setup.label);
+            common::skip(format_args!("{} {width} {too_big}", setup.label));
             return None;
         }
     };

@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::compact::Plan;
 use grit::layout::{BINDINGS, DENSE, GRAND, PARAMS, STATE};
 use grit::live::{Waking, corners, wake};
@@ -14,20 +18,6 @@ const DEEP: u32 = 1024;
 const STEPS: u32 = 100;
 
 const PATCH: u32 = 24;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn scattered(grid: Grid, seed: u32) -> Vec<u32> {
     let mut state = seed;
@@ -329,11 +319,11 @@ fn some_of<const LANES: u32>(
 fn walked(label: &str, width: u32) -> Option<Grid> {
     let grid = Grid::of(WIDE, DEEP);
     if u64::from(grid.quads()) > Plan::reach(width) {
-        eprintln!(
-            "SKIPPED {label} {} quads over a reach of {}",
+        common::skip(format_args!(
+            "{label} {} quads over a reach of {}",
             grid.quads(),
             Plan::reach(width)
-        );
+        ));
         return None;
     }
     Some(grid)

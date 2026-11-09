@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use std::time::{Duration, Instant};
 
 use grit::compact::Plan;
@@ -18,20 +22,6 @@ const CALIBRATION: u32 = 20;
 const BATCH: u32 = 20;
 
 const AGREEING: u32 = 60;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn room(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
@@ -144,7 +134,7 @@ fn a_silenced_arrangement_computes_the_same_world() {
     let plan = match Plan::over(width, grid.quads().div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(why) => {
-            eprintln!("SKIPPED {width} {why}");
+            common::skip(format_args!("{width} {why}"));
             return;
         }
     };

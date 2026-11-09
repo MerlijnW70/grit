@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::machine::Machine;
 use grit::netlist::{Chip, Gate};
 
@@ -84,27 +88,13 @@ fn a_machine_that_ignores_its_input_says_the_same_whatever_it_is_fed() {
     assert_eq!(one, other, "this counter has no inputs to read");
 }
 
+use grit::Groups;
 use grit::marking::{BINDINGS, FEED, SCORE, TRIAL, VALUES, WANTED, stepped, words_of};
 use grit::netlist::{Netlist, drawn};
-use grit::{Groups, Host};
 
 const CROWD: u32 = 256;
 
 const TRACES: u32 = 32;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn drew(shape: Netlist, seed: u32, many: u32) -> Vec<u32> {
     let mut state = seed | 1;

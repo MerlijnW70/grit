@@ -1,23 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use ash::vk;
 
 use grit::compact::Plan;
-use grit::{Host, sweep};
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
+use grit::sweep;
 
 fn limits_of(pattern: Option<&str>) -> Option<(String, vk::PhysicalDeviceLimits)> {
     let entry = unsafe { ash::Entry::load() }.ok()?;
@@ -51,7 +41,7 @@ fn the_widest_plan_asks_for_more_workgroups_than_a_device_promises() {
     let width = host.width();
     let pattern = std::env::var("GRIT_DEVICE").ok();
     let Some((name, limits)) = limits_of(pattern.as_deref()) else {
-        eprintln!("SKIPPED");
+        common::skip("");
         return;
     };
 

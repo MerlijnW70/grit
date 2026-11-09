@@ -1,25 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::Groups;
-use grit::Host;
 use grit::compact::{self, Over, Plan, Tier};
 use grit::layout::{HOT, HOT_BASES, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, HOT_TOTALS};
 
 const BLOCKS: u32 = 1000;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn hot_blocks() -> Vec<u32> {
     (0..BLOCKS)
@@ -42,7 +31,7 @@ fn the_hot_list_is_every_hot_block_once_and_in_order() {
     let plan = match Plan::over(width, BLOCKS) {
         Ok(plan) => plan,
         Err(too_big) => {
-            eprintln!("SKIPPED {width} {too_big}");
+            common::skip(format_args!("{width} {too_big}"));
             return;
         }
     };

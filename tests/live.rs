@@ -1,10 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::compact::Plan;
 use grit::layout::{AWAKE, BINDINGS, BRUSH, DENSE, GRAND, PARAMS, PIXELS, STATE};
 use grit::sand::{self, AIR, Grid, SAND, WALL, WATER};
 use grit::sweep;
-use grit::{Groups, Host, Resident};
+use grit::{Groups, Resident};
 
 const WIDE: u32 = 512;
 const DEEP: u32 = 256;
@@ -16,20 +20,6 @@ const POURING: u32 = 90;
 const SETTLING: u32 = 400;
 
 const WETTING: u32 = 180;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn room(grid: Grid) -> Vec<u32> {
     let mut cells = vec![AIR; grid.cells()];
@@ -63,7 +53,7 @@ fn against_the_whole_grid(coarse: bool, grid: Grid, frames: u32, until_quiet: bo
     let plan = match Plan::over(width, quads.div_ceil(sweep::cells(width))) {
         Ok(plan) => plan,
         Err(too_big) => {
-            eprintln!("SKIPPED {width} {too_big}");
+            common::skip(format_args!("{width} {too_big}"));
             return;
         }
     };
