@@ -73,6 +73,44 @@ struct Facing {
     fence: vk::Fence,
     queries: Option<vk::QueryPool>,
     staging: vk::Buffer,
+    room: u64,
+}
+
+const WORD: u64 = size_of::<u32>() as u64;
+
+const INDIRECT: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Span {
+    from: u64,
+    bytes: u64,
+    end: u64,
+}
+
+fn span(
+    at: usize,
+    count: usize,
+    limit: u64,
+    refused: impl FnOnce(usize) -> Error,
+) -> Result<Span, Error> {
+    let bytes_of = |words: usize| u64::try_from(words).ok()?.checked_mul(WORD);
+    let found = bytes_of(at).and_then(|from| {
+        let bytes = bytes_of(count)?;
+        let end = from.checked_add(bytes)?;
+        (from < limit && end <= limit).then_some(Span { from, bytes, end })
+    });
+    found.ok_or_else(|| refused(at.saturating_add(count)))
+}
+
+fn words_in(bytes: u64) -> usize {
+    usize::try_from(bytes / WORD).unwrap_or(usize::MAX)
+}
+
+fn staged(at: usize, count: usize, room: u64) -> Result<Span, Error> {
+    span(at, count, room, |needed| Error::Staged {
+        needed,
+        staging: words_in(room),
+    })
 }
 
 pub struct Resident<'host> {
@@ -161,14 +199,20 @@ impl Host {
         window: u64,
         vast: Option<usize>,
     ) -> Result<Resident<'host>, Error> {
-        let words = |count: usize| (count.max(1) * size_of::<u32>()) as u64;
-        let largest = sizes
+        let mut lengths = Vec::with_capacity(sizes.len());
+        for &count in sizes {
+            let counted = span(0, count.max(1), u64::MAX, |_| Error::NoMemory {
+                bytes: u64::MAX,
+            })?;
+            lengths.push(counted.bytes);
+        }
+        let largest = lengths
             .iter()
             .enumerate()
             .filter(|&(at, _)| Some(at) != vast)
-            .map(|(_, &count)| words(count))
+            .map(|(_, &bytes)| bytes)
             .max()
-            .unwrap_or(4);
+            .unwrap_or(WORD);
 
         unsafe {
             let living = if direct {
@@ -187,8 +231,7 @@ impl Host {
                 | vk::MemoryPropertyFlags::HOST_COHERENT;
 
             let mut buffers = Vec::with_capacity(sizes.len());
-            for (at, &size) in sizes.iter().enumerate() {
-                let bytes = words(size);
+            for (at, &bytes) in lengths.iter().enumerate() {
                 if Some(at) == vast {
                     buffers.push(self.allocate_vast(bytes, usage_of)?);
                     continue;
@@ -556,49 +599,53 @@ impl Resident<'_> {
     pub fn write(&mut self, index: usize, words: &[u32]) -> Result<(), Error> {
         self.live()?;
         let began = std::time::Instant::now();
-        let out = self.written(index, words);
+        let out = self.written(index, 0, words);
         self.pushing += began.elapsed();
         self.pushes += 1;
         self.poked += u64::from(*out.as_ref().unwrap_or(&false));
         out.map(|_| ())
     }
 
-    fn written(&mut self, index: usize, words: &[u32]) -> Result<bool, Error> {
+    fn within(&self, index: usize, at: usize, count: usize) -> Result<(&Held, Span), Error> {
         let held = self.at(index)?;
-        let bytes = size_of_val(words) as u64;
-        if bytes > held.bytes {
-            return Err(Error::Overrun {
-                index,
-                needed: words.len(),
-                held: (held.bytes as usize) / size_of::<u32>(),
-            });
+        let found = span(at, count, held.bytes, |needed| Error::Overrun {
+            index,
+            needed,
+            held: words_in(held.bytes),
+        })?;
+        Ok((held, found))
+    }
+
+    fn written(&mut self, index: usize, at: usize, words: &[u32]) -> Result<bool, Error> {
+        let (held, into) = self.within(index, at, words.len())?;
+        if into.bytes == 0 {
+            return Ok(false);
         }
-        if held.visible {
-            return unsafe { self.poke(held.memory, 0, words) }.map(|()| true);
+        let (handle, memory, visible) = (held.handle, held.memory, held.visible);
+        if visible {
+            return unsafe { self.poke(memory, into, words) }.map(|()| true);
         }
-        if bytes > self.staging.bytes {
-            return Err(Error::Staged {
-                needed: words.len(),
-                staging: (self.staging.bytes as usize) / size_of::<u32>(),
-            });
-        }
-        let (handle, staging) = (held.handle, self.staging.memory);
+        let from = staged(0, words.len(), self.staging.bytes)?;
+        let staging = self.staging.memory;
 
         unsafe {
             let mapped = self.host.device().map_memory(
                 staging,
-                0,
-                bytes.max(4),
+                from.from,
+                from.bytes,
                 vk::MemoryMapFlags::empty(),
             )?;
             std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
             self.host.device().unmap_memory(staging);
         }
 
-        let region = [vk::BufferCopy::default().size(bytes.max(4))];
-        let from = self.staging.handle;
+        let region = [vk::BufferCopy::default()
+            .src_offset(from.from)
+            .dst_offset(into.from)
+            .size(into.bytes)];
+        let source = self.staging.handle;
         unsafe {
-            self.once(|device, command| device.cmd_copy_buffer(command, from, handle, &region))
+            self.once(|device, command| device.cmd_copy_buffer(command, source, handle, &region))
                 .map(|()| false)
         }
     }
@@ -606,15 +653,14 @@ impl Resident<'_> {
     unsafe fn poke(
         &self,
         memory: vk::DeviceMemory,
-        offset: u64,
+        into: Span,
         words: &[u32],
     ) -> Result<(), Error> {
-        let bytes = (size_of_val(words) as u64).max(4);
         unsafe {
             let mapped = self.host.device().map_memory(
                 memory,
-                offset,
-                bytes,
+                into.from,
+                into.bytes,
                 vk::MemoryMapFlags::empty(),
             )?;
             std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
@@ -634,104 +680,57 @@ impl Resident<'_> {
 
     pub fn write_at(&mut self, index: usize, at: usize, words: &[u32]) -> Result<(), Error> {
         self.live()?;
-        let held = self.at(index)?;
-        let bytes = size_of_val(words) as u64;
-        let offset = (at * size_of::<u32>()) as u64;
-        if offset + bytes > held.bytes {
-            return Err(Error::Overrun {
-                index,
-                needed: at + words.len(),
-                held: (held.bytes as usize) / size_of::<u32>(),
-            });
-        }
-        if held.visible {
-            return unsafe { self.poke(held.memory, offset, words) };
-        }
-        if bytes > self.staging.bytes {
-            return Err(Error::Staged {
-                needed: words.len(),
-                staging: (self.staging.bytes as usize) / size_of::<u32>(),
-            });
-        }
-        let (handle, staging) = (held.handle, self.staging.memory);
-
-        unsafe {
-            let mapped = self.host.device().map_memory(
-                staging,
-                0,
-                bytes.max(4),
-                vk::MemoryMapFlags::empty(),
-            )?;
-            std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
-            self.host.device().unmap_memory(staging);
-        }
-
-        let region = [vk::BufferCopy::default()
-            .dst_offset(offset)
-            .size(bytes.max(4))];
-        let from = self.staging.handle;
-        unsafe {
-            self.once(|device, command| {
-                device.cmd_copy_buffer(command, from, handle, &region);
-            })
-        }
+        self.written(index, at, words).map(|_| ())
     }
 
     pub fn write_many(&mut self, runs: &[Run<'_>]) -> Result<(), Error> {
         self.live()?;
-        if runs.is_empty() {
+
+        let mut taken = Vec::with_capacity(runs.len());
+        let mut total = 0_usize;
+        for run in runs {
+            let (held, into) = self.within(run.index, run.at, run.words.len())?;
+            if into.bytes == 0 {
+                continue;
+            }
+            total = total.checked_add(run.words.len()).ok_or(Error::Staged {
+                needed: usize::MAX,
+                staging: words_in(self.staging.bytes),
+            })?;
+            taken.push((held.handle, into, run.words));
+        }
+        if taken.is_empty() {
             return Ok(());
         }
-
-        let mut total = 0_u64;
-        for run in runs {
-            let held = self.at(run.index)?;
-            let bytes = size_of_val(run.words) as u64;
-            let offset = (run.at * size_of::<u32>()) as u64;
-            if offset + bytes > held.bytes {
-                return Err(Error::Overrun {
-                    index: run.index,
-                    needed: run.at + run.words.len(),
-                    held: (held.bytes as usize) / size_of::<u32>(),
-                });
-            }
-            total += bytes;
-        }
-        if total > self.staging.bytes {
-            return Err(Error::Staged {
-                needed: (total as usize) / size_of::<u32>(),
-                staging: (self.staging.bytes as usize) / size_of::<u32>(),
-            });
-        }
+        let whole = staged(0, total, self.staging.bytes)?;
+        self.idle()?;
 
         let staging = self.staging.memory;
         unsafe {
             let mapped = self.host.device().map_memory(
                 staging,
-                0,
-                total.max(4),
+                whole.from,
+                whole.bytes,
                 vk::MemoryMapFlags::empty(),
             )?;
             let mut along = 0_usize;
-            for run in runs {
+            for &(_, _, words) in &taken {
                 let into = mapped.cast::<u32>().add(along);
-                std::ptr::copy_nonoverlapping(run.words.as_ptr(), into, run.words.len());
-                along += run.words.len();
+                std::ptr::copy_nonoverlapping(words.as_ptr(), into, words.len());
+                along += words.len();
             }
             self.host.device().unmap_memory(staging);
         }
 
         let source = self.staging.handle;
         let mut grouped: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
-        let mut along = 0_u64;
-        for run in runs {
-            let handle = self.at(run.index)?.handle;
-            let bytes = size_of_val(run.words) as u64;
+        let mut along = whole.from;
+        for &(handle, into, _) in &taken {
             let region = vk::BufferCopy::default()
                 .src_offset(along)
-                .dst_offset((run.at * size_of::<u32>()) as u64)
-                .size(bytes.max(4));
-            along += bytes;
+                .dst_offset(into.from)
+                .size(into.bytes);
+            along += into.bytes;
             match grouped.iter_mut().find(|held| held.0 == handle) {
                 Some(held) => held.1.push(region),
                 None => grouped.push((handle, vec![region])),
@@ -776,20 +775,13 @@ impl Resident<'_> {
                 }),
             };
         }
-        let (from, bytes) = (
-            (at * size_of::<u32>()) as u64,
-            (words * size_of::<u32>()) as u64,
-        );
-        let end = from.saturating_add(bytes);
-        let held = self.buffers.get(index).ok_or(Error::NoSuchBinding {
-            index,
-            held: self.buffers.len(),
-        })?;
-        if from % page != 0 || bytes % page != 0 || end > held.bytes {
+        let (held, window) = self.within(index, at, words)?;
+        let Span { from, bytes, .. } = window;
+        if from % page != 0 || bytes % page != 0 {
             return Err(Error::Overrun {
                 index,
-                needed: (end / size_of::<u32>() as u64) as usize,
-                held: (held.bytes / size_of::<u32>() as u64) as usize,
+                needed: at.saturating_add(words),
+                held: words_in(held.bytes),
             });
         }
         if bytes == 0 {
@@ -858,22 +850,14 @@ impl Resident<'_> {
     }
 
     pub fn unbind(&mut self, index: usize, at: usize, words: usize) -> Result<(), Error> {
-        let (from, bytes) = (
-            (at * size_of::<u32>()) as u64,
-            (words * size_of::<u32>()) as u64,
-        );
-        let end = from.saturating_add(bytes);
-        let Some(held) = self.buffers.get(index) else {
-            return Err(Error::NoSuchBinding {
-                index,
-                held: self.buffers.len(),
-            });
-        };
+        let (held, window) = self.within(index, at, words)?;
         let going: Vec<(u64, vk::DeviceMemory, u64)> = held
             .pages
             .iter()
             .copied()
-            .filter(|&(off, _, size)| off >= from && off + size <= end)
+            .filter(|&(off, _, size)| {
+                off >= window.from && off.checked_add(size).is_some_and(|end| end <= window.end)
+            })
             .collect();
         if going.is_empty() {
             return Ok(());
@@ -924,29 +908,28 @@ impl Resident<'_> {
 
     pub fn read(&mut self, index: usize, count: usize) -> Result<Vec<u32>, Error> {
         self.live()?;
-        let held = self.at(index)?;
-        let bytes = (count * size_of::<u32>()) as u64;
-        if bytes > held.bytes {
-            return Err(Error::Overrun {
-                index,
-                needed: count,
-                held: (held.bytes as usize) / size_of::<u32>(),
-            });
-        }
+        let (held, from) = self.within(index, 0, count)?;
         let handle = held.handle;
+        let into = staged(0, count, self.staging.bytes)?;
+        if from.bytes == 0 {
+            return Ok(Vec::new());
+        }
 
-        let region = [vk::BufferCopy::default().size(bytes.max(4))];
+        let region = [vk::BufferCopy::default()
+            .src_offset(from.from)
+            .dst_offset(into.from)
+            .size(from.bytes)];
         let began = std::time::Instant::now();
-        let into = self.staging.handle;
+        let staging = self.staging.handle;
         unsafe {
             self.once(|device, command| {
-                device.cmd_copy_buffer(command, handle, into, &region);
+                device.cmd_copy_buffer(command, handle, staging, &region);
             })
         }?;
         self.copying += began.elapsed();
         self.copies += 1;
-        let memory = self.staging.memory;
-        unsafe { self.mapped_at(memory, 0, count) }
+        let (memory, room) = (self.staging.memory, self.staging.bytes);
+        unsafe { self.mapped_at(memory, room, 0, count) }
     }
 
     pub fn frame(&mut self, groups: &[Groups]) -> Result<Duration, Error> {
@@ -1027,7 +1010,11 @@ impl Resident<'_> {
 
     fn landed(&mut self, ticket: Ticket) -> Result<(Duration, Vec<Vec<u32>>), Error> {
         let (spent, counts, slot) = self.land(ticket)?;
-        let Some(memory) = self.slots.get(slot).map(|slot| slot.staging.memory) else {
+        let Some((memory, room)) = self
+            .slots
+            .get(slot)
+            .map(|slot| (slot.staging.memory, slot.staging.bytes))
+        else {
             return Err(Error::NoSuchTicket {
                 ticket: ticket.get(),
                 held: None,
@@ -1036,8 +1023,8 @@ impl Resident<'_> {
         let mut every = Vec::with_capacity(counts.len());
         let mut at = 0_usize;
         for count in counts {
-            every.push(unsafe { self.mapped_at(memory, at, count) }?);
-            at += count.max(1);
+            every.push(unsafe { self.mapped_at(memory, room, at, count) }?);
+            at = at.saturating_add(count);
         }
         Ok((spent, every))
     }
@@ -1063,13 +1050,14 @@ impl Resident<'_> {
     }
 
     fn bounded(&self, index: usize, count: usize) -> Result<(), Error> {
-        let held = self.at(index)?;
-        if (count * size_of::<u32>()) as u64 > held.bytes {
-            return Err(Error::Overrun {
-                index,
-                needed: count,
-                held: (held.bytes as usize) / size_of::<u32>(),
-            });
+        self.within(index, 0, count).map(|_| ())
+    }
+
+    fn indirect(&self, stages: &[&[Groups]]) -> Result<(), Error> {
+        for &count in stages.iter().flat_map(|stage| stage.iter()) {
+            if let Groups::From { binding, at } = count {
+                self.within(binding, at, INDIRECT)?;
+            }
         }
         Ok(())
     }
@@ -1088,24 +1076,18 @@ impl Resident<'_> {
         times: u32,
     ) -> Result<Ticket, Error> {
         self.live()?;
+        self.indirect(stages)?;
         let Some((at, facing)) = self.free() else {
             return Err(Error::StillInFlight);
         };
         let mut copy = Vec::with_capacity(out.len());
-        let mut wanted = 0_u64;
+        let mut wanted = 0_usize;
         for &(index, count) in out {
-            let held = self.at(index)?;
-            let bytes = (count * size_of::<u32>()) as u64;
-            copy.push((held.handle, bytes));
-            wanted += bytes.max(4);
+            let (held, from) = self.within(index, 0, count)?;
+            copy.push((held.handle, from.bytes));
+            wanted = wanted.saturating_add(count);
         }
-        if wanted > self.staging.bytes {
-            return Err(Error::Overrun {
-                index: out.len(),
-                needed: (wanted as usize) / size_of::<u32>(),
-                held: (self.staging.bytes as usize) / size_of::<u32>(),
-            });
-        }
+        staged(0, wanted, facing.room)?;
 
         let began = Instant::now();
         self.run_times(at, facing, stages, &copy, times)?;
@@ -1134,6 +1116,7 @@ impl Resident<'_> {
                         fence: slot.fence,
                         queries: slot.queries,
                         staging: slot.staging.handle,
+                        room: slot.staging.bytes,
                     },
                 )
             })
@@ -1291,6 +1274,7 @@ impl Resident<'_> {
                 held: self.pipelines.len(),
             });
         }
+        self.indirect(stages)?;
 
         let device = self.host.device();
         let began = std::time::Instant::now();
@@ -1398,13 +1382,12 @@ impl Resident<'_> {
                                 device.cmd_dispatch(facing.command, count, 1, 1);
                             }
                             Groups::From { binding, at } => {
-                                let held =
-                                    self.buffers.get(binding).ok_or(Error::NoSuchBinding {
-                                        index: binding,
-                                        held: self.buffers.len(),
-                                    })?;
-                                let offset = (at * size_of::<u32>()) as u64;
-                                device.cmd_dispatch_indirect(facing.command, held.handle, offset);
+                                let (held, from) = self.within(binding, at, INDIRECT)?;
+                                device.cmd_dispatch_indirect(
+                                    facing.command,
+                                    held.handle,
+                                    from.from,
+                                );
                             }
                         }
                     }
@@ -1460,6 +1443,9 @@ impl Resident<'_> {
 
             let mut into = 0_u64;
             for &(handle, bytes) in out {
+                if bytes == 0 {
+                    continue;
+                }
                 let barrier = [vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
@@ -1473,24 +1459,11 @@ impl Resident<'_> {
                     &[],
                 );
 
-                let region = [vk::BufferCopy::default()
-                    .dst_offset(into)
-                    .size(bytes.max(4))];
+                let region = [vk::BufferCopy::default().dst_offset(into).size(bytes)];
                 device.cmd_copy_buffer(facing.command, handle, facing.staging, &region);
-                into += bytes.max(4);
+                into = into.saturating_add(bytes);
 
-                let barrier = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
-                device.cmd_pipeline_barrier(
-                    facing.command,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &barrier,
-                    &[],
-                    &[],
-                );
+                to_host(device, facing.command);
             }
 
             if let Some(pool) = facing.queries {
@@ -1548,21 +1521,43 @@ impl Resident<'_> {
     unsafe fn mapped_at(
         &self,
         memory: vk::DeviceMemory,
+        room: u64,
         at: usize,
         count: usize,
     ) -> Result<Vec<u32>, Error> {
-        let from = (at * size_of::<u32>()) as u64;
-        let bytes = ((count * size_of::<u32>()) as u64).max(4);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let from = staged(at, count, room)?;
         unsafe {
-            let mapped =
-                self.host
-                    .device()
-                    .map_memory(memory, from, bytes, vk::MemoryMapFlags::empty())?;
+            let mapped = self.host.device().map_memory(
+                memory,
+                from.from,
+                from.bytes,
+                vk::MemoryMapFlags::empty(),
+            )?;
             let mut out = vec![0_u32; count];
             std::ptr::copy_nonoverlapping(mapped.cast::<u32>(), out.as_mut_ptr(), count);
             self.host.device().unmap_memory(memory);
             Ok(out)
         }
+    }
+}
+
+fn to_host(device: &ash::Device, command: vk::CommandBuffer) {
+    let barrier = [vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::HOST_READ)];
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &barrier,
+            &[],
+            &[],
+        );
     }
 }
 
