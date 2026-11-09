@@ -925,6 +925,7 @@ impl Resident<'_> {
         unsafe {
             self.once(|device, command| {
                 device.cmd_copy_buffer(command, handle, staging, &region);
+                to_host(device, command);
             })
         }?;
         self.copying += began.elapsed();
