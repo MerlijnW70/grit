@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::{Error, Groups, Host, Run};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
@@ -11,20 +15,6 @@ const LAID: u32 = 0xA5A5_A5A5;
 const STALE: u32 = 0x0000_BEEF;
 
 const FAR: usize = 1 << 62;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 fn bump(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, 1, 1))?;

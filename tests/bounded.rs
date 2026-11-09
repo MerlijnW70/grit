@@ -1,23 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::compact::{Over, Plan, Tier};
 use grit::layout::{AWAKE, HOT};
 use grit::sweep;
 use grit::{Groups, Host};
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 /// Runs one mark over `groups` blocks of `tier` with `flags` in its flag
 /// binding and every other binding zero, and returns what it listed, block

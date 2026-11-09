@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
 use grit::compact::Plan;
 use grit::layout::{
     AWAKE, BRUSH, DENSE, GRAND, HOT, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT,
@@ -7,24 +11,10 @@ use grit::layout::{
 };
 use grit::sand::{self, AIR, Grid, SAND, WALL, WATER};
 use grit::sweep;
-use grit::{Groups, Host, Resident};
+use grit::{Groups, Resident};
 
 /// What a fresh allocation may hold: Vulkan does not zero memory.
 const JUNK: u32 = 0xA5A5_A5A5;
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 /// How the listed engine's buffers are left before `seed`.
 #[derive(Clone, Copy, Debug)]

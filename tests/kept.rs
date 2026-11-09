@@ -1,24 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
+use common::device;
+
+use grit::Groups;
 use grit::compact::Plan;
 use grit::layout::{BRUSH, GRAND, PARAMS, STATE};
 use grit::sand::{self, AIR, Grid, SAND, WALL, WATER};
 use grit::sweep;
-use grit::{Groups, Host};
-
-fn device(label: &str) -> Option<Host> {
-    match Host::open() {
-        Ok(Some(host)) => Some(host),
-        Ok(None) => {
-            eprintln!("SKIPPED {label}");
-            None
-        }
-        Err(why) => {
-            eprintln!("SKIPPED {label} {why}");
-            None
-        }
-    }
-}
 
 type Brushing = fn(u32, Grid) -> [u32; 4];
 
