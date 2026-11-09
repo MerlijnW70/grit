@@ -24,7 +24,7 @@ Grit (https://github.com/MerlijnW70/grit, local F:\grit at commit <grit commit>)
 ## How to work
 
 - Clone both repositories next to each other into your job directory, so Grit's `simdr = { path = "../simdr" }` resolves: `git clone F:\grit grit` and `git clone F:\simdr simdr`, then check out the commits above. Never change F:\grit or F:\simdr themselves.
-- Build and test on Windows with the machine's GPUs (an NVIDIA RTX 4080 and an AMD Radeon iGPU, both with Vulkan 1.4). `GRIT_DEVICE=<substring>` picks a device by name, case-insensitive. A test that finds no device prints `SKIPPED` and passes, so a green run with `SKIPPED` lines has not tested anything on that device.
+- Build and test on Windows with the machine's GPUs (an NVIDIA RTX 4080 and an AMD Radeon iGPU, both with Vulkan 1.4). `GRIT_DEVICE=<substring>` picks a device by name, case-insensitive, and a test fails when no device matches it. `GRIT_REQUIRE_DEVICE=1` makes every skip fail. With neither set, a test on a machine without Vulkan prints `SKIPPED` and passes, so a green run with `SKIPPED` lines has not tested anything on that device.
 - Run the gate below before delivering, and keep its output.
 
 ## Gate
