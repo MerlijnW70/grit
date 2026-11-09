@@ -10,7 +10,7 @@ use crate::marking::{
 use crate::netlist::{Chip, Exam, Gate, Netlist, drawn};
 use crate::resident::Groups;
 use crate::rule::{KNOB, Kind, POINT};
-use crate::sand::{AIR, Grid, SAND, WALL, WATER};
+use crate::sand::{AIR, Grid, SAND, WALL, WATER, material_of};
 use crate::sweep;
 use crate::wire::{Json, counted, map, text};
 
@@ -1640,7 +1640,6 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
     resident.write(STATE as usize, &cells)?;
     resident.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
     crate::live::seed(&mut resident, grid, &plan)?;
-    resident.staged(&groups)?;
 
     // The brush is what pours. Left out, whatever the caller placed is all
     // there is, and the answer is about how that settles.
@@ -1660,14 +1659,21 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
     let stuff = stuff_named(named)
         .ok_or_else(|| format!("{named} is not one of {}", STUFF_NAMED.join(", ")))?;
 
+    // A step never crosses the frame the spout shuts at, so the pour stops on
+    // that frame and not at the end of the batch it falls in.
     let mut listed = 0_u64;
     let mut looked = 0_u64;
-    for frame in (0..frames).step_by(batch as usize) {
+    let mut frame = 0_u32;
+    while frame < frames {
+        let pouring_now = frame < pouring;
+        let until = if pouring_now { pouring } else { frames };
+        let step = batch.min(until - frame);
         if let Some((x, y)) = spout {
-            let material = if frame < pouring { stuff } else { AIR };
+            let material = if pouring_now { stuff } else { AIR };
             resident.write_at(PARAMS as usize, BRUSH, &[x, y, span, material])?;
         }
-        resident.staged_frames(&groups, batch)?;
+        resident.staged_frames(&groups, step)?;
+        frame += step;
         listed += u64::from(
             resident
                 .read(GRAND as usize, 1)?
@@ -1681,7 +1687,7 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
     let ended = resident.read(STATE as usize, grid.cells())?;
     let mut tally = [0_u64; 4];
     for one in &ended {
-        if let Some(slot) = tally.get_mut(*one as usize) {
+        if let Some(slot) = tally.get_mut(material_of(*one) as usize) {
             *slot += 1;
         }
     }
@@ -1693,7 +1699,7 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
                 .filter(|column| {
                     ended
                         .get((row * grid.wide + column) as usize)
-                        .is_some_and(|one| *one == SAND || *one == WATER)
+                        .is_some_and(|one| matches!(material_of(*one), SAND | WATER))
                 })
                 .count();
             counted(held as u32)
@@ -1707,7 +1713,7 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
                 .filter(|row| {
                     ended
                         .get((row * grid.wide + column) as usize)
-                        .is_some_and(|one| *one == SAND || *one == WATER)
+                        .is_some_and(|one| matches!(material_of(*one), SAND | WATER))
                 })
                 .count();
             counted(held as u32)
@@ -1716,8 +1722,8 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
     let standing: Vec<(usize, u32)> = ended
         .iter()
         .enumerate()
-        .filter(|(_, one)| **one != AIR && **one != WALL)
-        .map(|(at, one)| (at, *one))
+        .map(|(at, one)| (at, material_of(*one)))
+        .filter(|(_, one)| *one != AIR && *one != WALL)
         .take(most)
         .collect();
 

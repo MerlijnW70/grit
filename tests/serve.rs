@@ -1268,7 +1268,12 @@ fn a_spout_pours_for_as_many_frames_as_it_is_given_and_then_shuts_off() {
         "a spout told to pour for no frames pours nothing at all"
     );
     assert_eq!(sand(1), Some(1), "one frame of pouring is one grain");
-    assert_eq!(sand(2), Some(2));
+    assert_eq!(
+        sand(2),
+        Some(1),
+        "the first grain sits in the spout's cell for the second frame, so it cannot pour again"
+    );
+    assert_eq!(sand(3), Some(2));
 }
 
 #[test]
@@ -1287,12 +1292,8 @@ fn a_spout_that_names_no_frames_pours_for_half_the_run() {
     };
     let half = sand("{\"at\":18,\"is\":\"sand\",\"span\":1}");
     let whole = sand("{\"at\":18,\"is\":\"sand\",\"span\":1,\"frames\":40}");
-    assert_eq!(half, Some(11), "forty frames of run, twenty of pouring");
-    assert_eq!(
-        whole,
-        Some(21),
-        "pouring the whole run is nearly twice that"
-    );
+    assert_eq!(half, Some(10), "forty frames of run, twenty of pouring");
+    assert_eq!(whole, Some(20), "pouring the whole run is twice that");
 }
 
 #[test]
@@ -1674,4 +1675,195 @@ fn a_machine_too_large_to_compile_is_refused_before_it_is_built() {
         ),
     ));
     assert!(said.contains("steps"), "{said}");
+}
+
+fn lowest_held(answer: &Json) -> usize {
+    answer
+        .get("rows")
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| one.int().unwrap_or(0) > 0)
+        .map(|(row, _)| row)
+        .next_back()
+        .unwrap()
+}
+
+fn tally_of(answer: &Json, name: &str) -> i64 {
+    answer
+        .get("tally")
+        .and_then(|one| one.get(name))
+        .and_then(Json::int)
+        .unwrap()
+}
+
+#[test]
+fn a_pour_runs_exactly_the_frames_it_was_asked_for() {
+    let Some(host) = device("a_pour_runs_exactly_the_frames_it_was_asked_for") else {
+        return;
+    };
+    for (frames, batch) in [
+        (1, 1),
+        (1, 20),
+        (2, 20),
+        (21, 20),
+        (37, 8),
+        (20, 20),
+        (1, 256),
+        (40, 256),
+    ] {
+        let answer = poured(
+            Some(&host),
+            &format!(
+                "{{\"wide\":16,\"deep\":64,\"frames\":{frames},\"batch\":{batch},\"walls\":true,\"cells\":[{{\"at\":34,\"is\":\"sand\"}}]}}"
+            ),
+        );
+        assert_eq!(
+            answer.counted("frames"),
+            Some(frames),
+            "the answer reports the frames that ran: frames {frames}, batch {batch}"
+        );
+        assert_eq!(
+            lowest_held(&answer),
+            2 + frames as usize,
+            "a grain falls one row a frame, so frames {frames} with batch {batch} leave it {frames} rows below row 2"
+        );
+    }
+}
+
+#[test]
+fn water_that_carries_state_bits_is_counted_as_water() {
+    let Some(host) = device("water_that_carries_state_bits_is_counted_as_water") else {
+        return;
+    };
+    let answer = poured(
+        Some(&host),
+        "{\"wide\":64,\"deep\":64,\"frames\":120,\"brush\":{\"at\":544,\"is\":\"water\",\"span\":25,\"frames\":80}}",
+    );
+    let cells = i64::from(
+        answer
+            .get("grid")
+            .and_then(|one| one.counted("cells"))
+            .unwrap(),
+    );
+    let (air, water, sand, wall) = (
+        tally_of(&answer, "air"),
+        tally_of(&answer, "water"),
+        tally_of(&answer, "sand"),
+        tally_of(&answer, "wall"),
+    );
+    assert_eq!(air + water + sand + wall, cells, "every cell is counted");
+    assert!(water > 0, "the brush poured water");
+    let sum = |name: &str| -> i64 {
+        answer
+            .get(name)
+            .and_then(Json::list)
+            .unwrap()
+            .iter()
+            .map(|one| one.int().unwrap())
+            .sum()
+    };
+    assert_eq!(sum("rows"), water + sand, "the rows hold all of it");
+    assert_eq!(sum("columns"), water + sand, "the columns hold all of it");
+    let standing = answer.get("standing").and_then(Json::list).unwrap();
+    assert!(!standing.is_empty());
+    for one in standing {
+        assert_eq!(
+            one.get("is").and_then(Json::text),
+            Some("water"),
+            "nothing that stands is air: {}",
+            written(one)
+        );
+    }
+}
+
+#[test]
+fn standing_names_sand_and_water_together_whatever_state_the_water_is_in() {
+    let Some(host) = device("standing_names_sand_and_water_together") else {
+        return;
+    };
+    let answer = poured(
+        Some(&host),
+        "{\"wide\":64,\"deep\":64,\"frames\":150,\"most\":4096,\"brush\":{\"at\":544,\"is\":\"water\",\"span\":9,\"frames\":60},\"cells\":[{\"at\":2100,\"is\":\"sand\"},{\"at\":2101,\"is\":\"sand\"}]}",
+    );
+    let standing = answer.get("standing").and_then(Json::list).unwrap();
+    let named = |name: &str| {
+        standing
+            .iter()
+            .filter(|one| one.get("is").and_then(Json::text) == Some(name))
+            .count() as i64
+    };
+    assert_eq!(named("air"), 0);
+    assert_eq!(named("water"), tally_of(&answer, "water"));
+    assert_eq!(named("sand"), tally_of(&answer, "sand"));
+}
+
+#[test]
+fn a_spout_stops_at_its_frame_whatever_the_batch() {
+    let Some(host) = device("a_spout_stops_at_its_frame_whatever_the_batch") else {
+        return;
+    };
+    let run = |batch: u32, spout: u32, frames: u32| {
+        poured(
+            Some(&host),
+            &format!(
+                "{{\"wide\":32,\"deep\":32,\"frames\":{frames},\"batch\":{batch},\"walls\":true,\"most\":2,\"brush\":{{\"at\":50,\"is\":\"sand\",\"span\":1,\"frames\":{spout}}}}}"
+            ),
+        )
+    };
+    for (spout, frames) in [
+        (7, 45),
+        (1, 45),
+        (30, 45),
+        (0, 45),
+        (45, 45),
+        (60, 45),
+        (19, 20),
+    ] {
+        let alone = run(1, spout, frames);
+        for batch in [3, 7, 8, 20, 256] {
+            let batched = run(batch, spout, frames);
+            for name in ["air", "water", "sand", "wall"] {
+                assert_eq!(
+                    tally_of(&batched, name),
+                    tally_of(&alone, name),
+                    "{name}: spout {spout} of {frames} frames with batch {batch} against batch 1"
+                );
+            }
+            assert_eq!(
+                batched.get("rows"),
+                alone.get("rows"),
+                "rows: spout {spout}, batch {batch}"
+            );
+            assert_eq!(
+                batched.get("columns"),
+                alone.get("columns"),
+                "columns: spout {spout}, batch {batch}"
+            );
+            assert_eq!(batched.counted("frames"), Some(frames));
+        }
+        assert_eq!(
+            tally_of(&alone, "sand"),
+            i64::from(spout.min(frames).div_ceil(2)),
+            "a one cell spout puts in a grain every second frame, the grain before it still in the way: spout {spout}"
+        );
+    }
+}
+
+#[test]
+fn a_room_without_walls_counts_every_cell_of_a_water_pour_too() {
+    let Some(host) = device("a_room_without_walls_counts_every_cell_of_a_water_pour_too") else {
+        return;
+    };
+    let answer = poured(
+        Some(&host),
+        "{\"wide\":32,\"deep\":32,\"frames\":60,\"walls\":false,\"brush\":{\"at\":144,\"is\":\"water\",\"span\":9,\"frames\":25}}",
+    );
+    let counted_cells: i64 = ["air", "water", "sand", "wall"]
+        .iter()
+        .map(|name| tally_of(&answer, name))
+        .sum();
+    assert_eq!(counted_cells, 32 * 32);
+    assert_eq!(tally_of(&answer, "wall"), 0);
 }
