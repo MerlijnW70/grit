@@ -68,7 +68,10 @@ pub fn keeping(
 
     let mut after: Stages = Vec::new();
     if coarse {
-        after.push(vec![(mark(subgroup, Tier::COARSE, Over::Every)?, tiles)]);
+        after.push(vec![(
+            mark_below(subgroup, Tier::COARSE, Over::Every, plan.blocks)?,
+            tiles,
+        )]);
         after.push(vec![(
             crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
             one,
@@ -84,7 +87,10 @@ pub fn keeping(
             ),
         ]);
     }
-    after.push(vec![(mark(subgroup, Tier::FINE, listed)?, hot)]);
+    after.push(vec![(
+        mark_below(subgroup, Tier::FINE, listed, plan.dump())?,
+        hot,
+    )]);
     if plan.tiles == 1 {
         after.push(vec![(
             crate::compact::whole(subgroup, COUNTS, BASES, Tier::FINE)?,
@@ -158,7 +164,10 @@ pub fn arranged(
     let looking = {
         let mut stage = Vec::new();
         if coarse {
-            stage.push((mark(subgroup, Tier::COARSE, Over::Every)?, tiles));
+            stage.push((
+                mark_below(subgroup, Tier::COARSE, Over::Every, plan.blocks)?,
+                tiles,
+            ));
         }
         if let Some(view) = picture {
             let over = u32::try_from(view.pixels())
@@ -238,7 +247,7 @@ pub fn arranged(
         looking,
         hot_scan_counts,
         hot_gather,
-        vec![(mark(subgroup, Tier::FINE, listed)?, hot)],
+        vec![(mark_below(subgroup, Tier::FINE, listed, grid.quads())?, hot)],
         fine_scan_counts,
         fine_scan_totals,
         vec![
@@ -866,13 +875,33 @@ pub fn wake<const LANES: u32>(
     Ok(())
 }
 
+/// Lists every flagged entry of `tier` in the blocks `over` names, wherever
+/// it lies. The engine's frames use [`mark_below`].
 pub fn mark(subgroup: u32, tier: Tier, over: Over) -> Result<Vec<u32>, LaneError> {
+    mark_below(subgroup, tier, over, u32::MAX)
+}
+
+/// Lists the flagged entries of `tier` in the blocks `over` names, and never
+/// one at or past `below`, whatever its flag holds.
+///
+/// The coarse tier marks blocks, and its flags run on past the plan's blocks
+/// to a whole tile. A block listed there would own quads in the scratch
+/// `wake` writes, and `corners` wraps those onto real quads, which are then
+/// stepped twice in one frame. The fine tier marks quads; `arranged` bounds
+/// it by the quads of the grid, and `keeping`, which has no grid, by the
+/// quads of the plan.
+pub fn mark_below(
+    subgroup: u32,
+    tier: Tier,
+    over: Over,
+    below: u32,
+) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => marked::<4>(subgroup, tier, over),
-        8 => marked::<8>(subgroup, tier, over),
-        16 => marked::<16>(subgroup, tier, over),
-        32 => marked::<32>(subgroup, tier, over),
-        64 => marked::<64>(subgroup, tier, over),
+        4 => marked::<4>(subgroup, tier, over, below),
+        8 => marked::<8>(subgroup, tier, over, below),
+        16 => marked::<16>(subgroup, tier, over, below),
+        32 => marked::<32>(subgroup, tier, over, below),
+        64 => marked::<64>(subgroup, tier, over, below),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -880,7 +909,12 @@ pub fn mark(subgroup: u32, tier: Tier, over: Over) -> Result<Vec<u32>, LaneError
     }
 }
 
-fn marked<const LANES: u32>(subgroup: u32, tier: Tier, over: Over) -> Result<Vec<u32>, LaneError> {
+fn marked<const LANES: u32>(
+    subgroup: u32,
+    tier: Tier,
+    over: Over,
+    below: u32,
+) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
@@ -908,6 +942,7 @@ fn marked<const LANES: u32>(subgroup: u32, tier: Tier, over: Over) -> Result<Vec
             dump_mine,
             block,
             tier,
+            below,
         },
     )?;
     kernel.finish()
@@ -919,6 +954,7 @@ struct Sweeping {
     dump_mine: simdr::module::Id,
     block: simdr::module::Id,
     tier: Tier,
+    below: u32,
 }
 
 fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Result<(), LaneError> {
@@ -930,6 +966,7 @@ fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Resu
         dump_mine,
         block,
         tier,
+        below,
     } = where_at;
     let uint = kernel.index_type();
 
@@ -938,7 +975,17 @@ fn swept<const LANES: u32>(kernel: &mut Kernel<U32>, where_at: Sweeping) -> Resu
     for step in 0..PER_LANE {
         let along = kernel.module().constant_u32(step)?;
         let at = kernel.module().i_add(uint, mine, along)?;
-        flags.push(kernel.load_at(tier.flags, at)?);
+        let held = kernel.load_at(tier.flags, at)?;
+        let owned = {
+            let mut lanes = kernel.lanes()?;
+            let here = lanes.splat_id::<U32, LANES>(at)?;
+            let bound = lanes.splat_bits::<U32, LANES>(below)?;
+            let flag = lanes.splat_id::<U32, LANES>(held)?;
+            let none = lanes.splat_bits::<U32, LANES>(0)?;
+            let inside = lanes.greater_than(bound, here)?;
+            lanes.select(inside, flag, none)?.id()
+        };
+        flags.push(owned);
         quads.push(at);
     }
 
