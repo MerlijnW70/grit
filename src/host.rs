@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use ash::vk;
 
+use crate::resident::Groups;
+
 /// The subgroup operations the kernels Grit builds use. The engine's kernels
 /// declare `GroupNonUniform`, `GroupNonUniformVote` for the `any` in
 /// `gate::if_any`, and `GroupNonUniformArithmetic` for the sums, the exclusive
@@ -19,6 +21,23 @@ pub const OPERATIONS: vk::SubgroupFeatureFlags = vk::SubgroupFeatureFlags::from_
 /// The Vulkan a device has to offer: the modules are SPIR-V 1.3, and the
 /// subgroup properties are only there to read from 1.1.
 pub const API: u32 = vk::API_VERSION_1_1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    StorageBufferRange,
+    MemoryAllocationSize,
+    WorkGroupCount,
+}
+
+impl std::fmt::Display for Limit {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::StorageBufferRange => "maxStorageBufferRange",
+            Self::MemoryAllocationSize => "maxMemoryAllocationSize",
+            Self::WorkGroupCount => "maxComputeWorkGroupCount[0]",
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -73,6 +92,55 @@ impl Limits {
     pub fn ceiling(&self) -> u64 {
         self.allocation.min(self.storage_range)
     }
+
+    /// Refuses the first binding the device cannot hold, before anything is
+    /// made. A binding is described whole, so it may not pass the storage
+    /// range; one that is not `vast` is also one allocation, so it may not
+    /// pass the allocation size either. An empty binding is made one word,
+    /// and one whose bytes do not fit a `u64` is refused as no memory can
+    /// hold it, as resident creation always refused it.
+    pub fn admits(&self, sizes: &[usize], vast: Option<usize>) -> Result<(), Error> {
+        for (binding, &words) in sizes.iter().enumerate() {
+            let refused = |limit, allowed| Error::TooLarge {
+                binding,
+                words,
+                limit,
+                allowed,
+            };
+            let Some(bytes) = u64::try_from(words.max(1))
+                .ok()
+                .and_then(|counted| counted.checked_mul(size_of::<u32>() as u64))
+            else {
+                return Err(Error::NoMemory { bytes: u64::MAX });
+            };
+            if bytes > self.storage_range {
+                return Err(refused(Limit::StorageBufferRange, self.storage_range));
+            }
+            if Some(binding) != vast && bytes > self.allocation {
+                return Err(refused(Limit::MemoryAllocationSize, self.allocation));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses the first pass whose workgroup count the device does not
+    /// promise to dispatch. A `From` count is written on the device and is
+    /// not known here.
+    pub fn dispatchable(&self, stages: &[&[Groups]]) -> Result<(), Error> {
+        let passes = stages.iter().flat_map(|stage| stage.iter());
+        for (pass, &count) in passes.enumerate() {
+            if let Groups::Fixed(groups) | Groups::Counting(groups) = count
+                && groups > self.groups
+            {
+                return Err(Error::TooManyGroups {
+                    pass,
+                    groups,
+                    allowed: self.groups,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -95,6 +163,17 @@ pub enum Error {
         api: u32,
         stages: vk::ShaderStageFlags,
         operations: vk::SubgroupFeatureFlags,
+    },
+    TooLarge {
+        binding: usize,
+        words: usize,
+        limit: Limit,
+        allowed: u64,
+    },
+    TooManyGroups {
+        pass: usize,
+        groups: u32,
+        allowed: u32,
     },
     NoMemory {
         bytes: u64,
@@ -186,6 +265,24 @@ impl std::fmt::Display for Error {
                 vk::api_version_minor(API),
                 vk::api_version_major(*api),
                 vk::api_version_minor(*api),
+            ),
+            Self::TooLarge {
+                binding,
+                words,
+                limit,
+                allowed,
+            } => write!(
+                out,
+                "binding {binding} asks for {words} words, more than the device's {limit} of {allowed} bytes lets one binding hold"
+            ),
+            Self::TooManyGroups {
+                pass,
+                groups,
+                allowed,
+            } => write!(
+                out,
+                "pass {pass} asks for {groups} workgroups, more than the device's {} of {allowed} lets one dispatch hold",
+                Limit::WorkGroupCount
             ),
             Self::NoMemory { bytes } => write!(
                 out,

@@ -199,6 +199,7 @@ impl Host {
         window: u64,
         vast: Option<usize>,
     ) -> Result<Resident<'host>, Error> {
+        self.limits().admits(sizes, vast)?;
         let mut lengths = Vec::with_capacity(sizes.len());
         for &count in sizes {
             let counted = span(0, count.max(1), u64::MAX, |_| Error::NoMemory {
@@ -1276,6 +1277,7 @@ impl Resident<'_> {
             });
         }
         self.indirect(stages)?;
+        self.host.limits().dispatchable(stages)?;
 
         let device = self.host.device();
         let began = std::time::Instant::now();
