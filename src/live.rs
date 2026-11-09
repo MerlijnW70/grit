@@ -345,23 +345,59 @@ pub fn cheaper(
     })
 }
 
+/// Sets up every word the listed engine reads before a frame writes it, so
+/// the first frame after `seed` is right whatever the buffers held before.
+///
+/// The caller writes the world into `STATE` and the brush words of `PARAMS`;
+/// the buffers hold at least `plan.sizes()`. After `seed`:
+///
+/// - `PARAMS` holds `u32::MAX` as the frame, so the first `tick` makes it
+///   frame 0, and `plan.dump()` as the dump base. The other words of
+///   `PARAMS` are the caller's and keep what they held.
+/// - Every quad of the grid is awake and listed: `AWAKE`, `DENSE`, `GRAND`
+///   and `INDIRECT`. The rest of `AWAKE` is zero: the plan's quads past the
+///   grid, and the scratch `wake` writes for lanes that wake nothing.
+/// - Every block of the plan is hot and listed: `HOT`, `HOT_DENSE`,
+///   `HOT_GRAND` and `HOT_INDIRECT`. The rest of `HOT` is zero: the padding
+///   up to a whole tile, which the coarse mark reads, and the cold slot.
+/// - `HOT_COUNTS`, which the coarse scan reads past the tiles the coarse
+///   mark writes, `TALLY`, and the brush's claim count at `DENSE[dump]` are
+///   zero.
 pub fn seed(
     held: &mut crate::Resident<'_>,
     grid: Grid,
     plan: &crate::compact::Plan,
 ) -> Result<(), crate::Error> {
-    use crate::layout::{HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT};
+    use crate::layout::{
+        HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT, TALLY, TALLY_WORDS,
+    };
+
+    let sizes = plan.sizes();
+    let words = |binding: u32| sizes.get(binding as usize).copied().unwrap_or(0);
+    let leading = |marked: usize, held: usize| {
+        let mut words = vec![0_u32; held.max(marked)];
+        for word in words.iter_mut().take(marked) {
+            *word = 2;
+        }
+        words
+    };
+
+    held.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
 
     let quads = grid.quads();
-    held.write(AWAKE as usize, &vec![2_u32; quads as usize])?;
+    held.write(AWAKE as usize, &leading(quads as usize, words(AWAKE)))?;
     held.write(DENSE as usize, &(0..quads).collect::<Vec<u32>>())?;
+    held.write_at(DENSE as usize, plan.dump() as usize, &[0])?;
     held.write(GRAND as usize, &[quads])?;
     held.write(INDIRECT as usize, &[quads.div_ceil(plan.subgroup), 1, 1])?;
 
-    held.write(HOT as usize, &vec![2_u32; plan.blocks as usize])?;
+    held.write(HOT as usize, &leading(plan.blocks as usize, words(HOT)))?;
     held.write(HOT_DENSE as usize, &(0..plan.blocks).collect::<Vec<u32>>())?;
     held.write(HOT_GRAND as usize, &[plan.blocks])?;
-    held.write(HOT_INDIRECT as usize, &[plan.blocks, 1, 1])
+    held.write(HOT_INDIRECT as usize, &[plan.blocks, 1, 1])?;
+    held.write(HOT_COUNTS as usize, &vec![0; words(HOT_COUNTS).max(1)])?;
+
+    held.write(TALLY as usize, &[0; TALLY_WORDS])
 }
 
 pub fn decay(subgroup: u32, over: Over) -> Result<Vec<u32>, LaneError> {
