@@ -1078,7 +1078,6 @@ impl Resident<'_> {
         times: u32,
     ) -> Result<Ticket, Error> {
         self.live()?;
-        self.indirect(stages)?;
         let Some((at, facing)) = self.free() else {
             return Err(Error::StillInFlight);
         };
