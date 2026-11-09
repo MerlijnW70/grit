@@ -4,6 +4,77 @@ use std::time::Duration;
 
 use ash::vk;
 
+/// The subgroup operations the kernels Grit builds use. The engine's kernels
+/// declare `GroupNonUniform`, `GroupNonUniformVote` for the `any` in
+/// `gate::if_any`, and `GroupNonUniformArithmetic` for the sums, the exclusive
+/// prefix sums and the maximum in `compact`, `live` and `sweep`; the rule and
+/// circuit kernels declare none. `tests/operations.rs` holds the list to what
+/// the built modules declare.
+pub const OPERATIONS: vk::SubgroupFeatureFlags = vk::SubgroupFeatureFlags::from_raw(
+    vk::SubgroupFeatureFlags::BASIC.as_raw()
+        | vk::SubgroupFeatureFlags::VOTE.as_raw()
+        | vk::SubgroupFeatureFlags::ARITHMETIC.as_raw(),
+);
+
+/// The Vulkan a device has to offer: the modules are SPIR-V 1.3, and the
+/// subgroup properties are only there to read from 1.1.
+pub const API: u32 = vk::API_VERSION_1_1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub storage_range: u64,
+    pub allocation: u64,
+    pub groups: u32,
+    pub width: u32,
+    pub stages: vk::ShaderStageFlags,
+    pub operations: vk::SubgroupFeatureFlags,
+    pub api: u32,
+}
+
+impl Limits {
+    #[must_use]
+    pub fn of(
+        core: &vk::PhysicalDeviceProperties,
+        subgroup: &vk::PhysicalDeviceSubgroupProperties<'_>,
+        third: &vk::PhysicalDeviceMaintenance3Properties<'_>,
+    ) -> Self {
+        let [groups, _, _] = core.limits.max_compute_work_group_count;
+        Self {
+            storage_range: u64::from(core.limits.max_storage_buffer_range),
+            allocation: third.max_memory_allocation_size,
+            groups,
+            width: subgroup.subgroup_size,
+            stages: subgroup.supported_stages,
+            operations: subgroup.supported_operations,
+            api: core.api_version,
+        }
+    }
+
+    /// Whether the kernels can run here at all: Vulkan 1.1 or later, and every
+    /// subgroup operation they use offered in compute shaders.
+    #[must_use]
+    pub fn serves(&self) -> bool {
+        let version = |api: u32| {
+            (
+                vk::api_version_variant(api),
+                vk::api_version_major(api),
+                vk::api_version_minor(api),
+            )
+        };
+        let (variant, major, minor) = version(self.api);
+        let (_, least_major, least_minor) = version(API);
+        variant == 0
+            && (major, minor) >= (least_major, least_minor)
+            && self.stages.contains(vk::ShaderStageFlags::COMPUTE)
+            && self.operations.contains(OPERATIONS)
+    }
+
+    #[must_use]
+    pub fn ceiling(&self) -> u64 {
+        self.allocation.min(self.storage_range)
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     NoLoader(ash::LoadingError),
@@ -18,6 +89,12 @@ pub enum Error {
     NoSuchDevice {
         wanted: String,
         present: Vec<String>,
+    },
+    Unsuited {
+        name: String,
+        api: u32,
+        stages: vk::ShaderStageFlags,
+        operations: vk::SubgroupFeatureFlags,
     },
     NoMemory {
         bytes: u64,
@@ -97,6 +174,19 @@ impl std::fmt::Display for Error {
                     write!(out, "the compute devices here are {present:?}")
                 }
             }
+            Self::Unsuited {
+                name,
+                api,
+                stages,
+                operations,
+            } => write!(
+                out,
+                "the device {name:?} cannot run the kernels: they need Vulkan {}.{} and the subgroup operations {OPERATIONS:?} in compute shaders, and it offers Vulkan {}.{} with {operations:?} in {stages:?}",
+                vk::api_version_major(API),
+                vk::api_version_minor(API),
+                vk::api_version_major(*api),
+                vk::api_version_minor(*api),
+            ),
             Self::NoMemory { bytes } => write!(
                 out,
                 "no memory type on the device can hold a buffer of {bytes} bytes"
@@ -179,8 +269,7 @@ pub struct Host {
     family: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
     name: String,
-    width: u32,
-    ceiling: u64,
+    limits: Limits,
     tick: f32,
     timing: bool,
     wedged: AtomicBool,
@@ -223,7 +312,12 @@ impl Host {
 
     #[must_use]
     pub const fn width(&self) -> u32 {
-        self.width
+        self.limits.width
+    }
+
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
+        self.limits
     }
 
     #[must_use]
@@ -239,8 +333,8 @@ impl Host {
     }
 
     #[must_use]
-    pub const fn ceiling(&self) -> u64 {
-        self.ceiling
+    pub fn ceiling(&self) -> u64 {
+        self.limits.ceiling()
     }
 
     unsafe fn on(
@@ -276,7 +370,7 @@ impl Host {
         let named = |physical| unsafe { name_of(&instance, physical) };
         let wanted = pattern.map(str::to_lowercase);
 
-        let chosen = compute
+        let matching: Vec<(vk::PhysicalDevice, u32)> = compute
             .iter()
             .copied()
             .filter(|&(physical, _)| {
@@ -284,10 +378,29 @@ impl Host {
                     .as_deref()
                     .is_none_or(|wanted| named(physical).to_lowercase().contains(wanted))
             })
+            .collect();
+        let chosen = matching
+            .iter()
+            .copied()
+            .filter(|&(physical, _)| unsafe { limits_of(&instance, physical) }.serves())
             .max_by_key(|&(physical, _)| {
                 let properties = unsafe { instance.get_physical_device_properties(physical) };
                 u8::from(properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU)
             });
+
+        if chosen.is_none()
+            && let Some(&(physical, _)) = matching.first()
+        {
+            let name = named(physical);
+            let limits = unsafe { limits_of(&instance, physical) };
+            unsafe { instance.destroy_instance(None) };
+            return Err(Error::Unsuited {
+                name,
+                api: limits.api,
+                stages: limits.stages,
+                operations: limits.operations,
+            });
+        }
 
         let Some((physical, family)) = chosen else {
             let present = compute
@@ -303,8 +416,7 @@ impl Host {
 
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let name = unsafe { name_of(&instance, physical) };
-        let width = unsafe { subgroup_width(&instance, physical) };
-        let ceiling = unsafe { allocation_ceiling(&instance, physical) };
+        let limits = unsafe { limits_of(&instance, physical) };
         let (tick, timing) = unsafe { timestamps(&instance, physical, family) };
 
         let priorities = [1.0_f32];
@@ -345,8 +457,7 @@ impl Host {
             family,
             memory,
             name,
-            width,
-            ceiling,
+            limits,
             tick,
             timing,
             sparse,
@@ -443,19 +554,21 @@ unsafe fn name_of(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Str
     name.to_string_lossy().into_owned()
 }
 
-unsafe fn allocation_ceiling(instance: &ash::Instance, physical: vk::PhysicalDevice) -> u64 {
-    let mut third = vk::PhysicalDeviceMaintenance3Properties::default();
-    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut third);
-    unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
-    let addressable = u64::from(properties.properties.limits.max_storage_buffer_range);
-    third.max_memory_allocation_size.min(addressable)
-}
-
-unsafe fn subgroup_width(instance: &ash::Instance, physical: vk::PhysicalDevice) -> u32 {
+/// What the device promises. The 1.1 query is made only where the device is
+/// 1.1 or later; an older one keeps empty subgroup properties, so it is not
+/// chosen.
+unsafe fn limits_of(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Limits {
+    let core = unsafe { instance.get_physical_device_properties(physical) };
     let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
-    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
-    unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
-    subgroup.subgroup_size
+    let mut third = vk::PhysicalDeviceMaintenance3Properties::default();
+    let version = |api: u32| (vk::api_version_major(api), vk::api_version_minor(api));
+    if version(core.api_version) >= version(API) {
+        let mut properties = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut subgroup)
+            .push_next(&mut third);
+        unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+    }
+    Limits::of(&core, &subgroup, &third)
 }
 
 unsafe fn timestamps(
