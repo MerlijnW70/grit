@@ -348,11 +348,46 @@ fn every_error_is_a_sentence_that_names_what_failed() {
         ),
     ];
     for (error, parts) in &every {
-        let said = error.to_string();
-        assert!(sentence(&said), "{error:?} says {said:?}");
-        assert!(!said.contains("None"), "{error:?} says {said:?}");
-        for part in parts {
-            assert!(said.contains(part), "{error:?} says {said:?}, not {part:?}");
-        }
+        said_in_words(error, parts);
     }
+}
+
+#[track_caller]
+fn said_in_words(error: &Error, parts: &[&str]) {
+    let said = error.to_string();
+    assert!(sentence(&said), "{error:?} says {said:?}");
+    assert!(!said.contains("None"), "{error:?} says {said:?}");
+    for part in parts {
+        assert!(said.contains(part), "{error:?} says {said:?}, not {part:?}");
+    }
+}
+
+#[test]
+fn a_failure_to_open_says_which_step_failed_and_with_what_code() {
+    said_in_words(
+        &Error::NoInstance(vk::Result::ERROR_LAYER_NOT_PRESENT),
+        &["instance", "ERROR_LAYER_NOT_PRESENT"],
+    );
+    said_in_words(
+        &Error::NoDeviceList(vk::Result::ERROR_INITIALIZATION_FAILED),
+        &["devices", "ERROR_INITIALIZATION_FAILED"],
+    );
+    said_in_words(
+        &Error::NoDevice {
+            name: "NVIDIA GeForce RTX 4080".to_owned(),
+            code: vk::Result::ERROR_DEVICE_LOST,
+        },
+        &["NVIDIA GeForce RTX 4080", "ERROR_DEVICE_LOST", "device"],
+    );
+    said_in_words(
+        &Error::NoSuchDevice {
+            wanted: "4080".to_owned(),
+            present: Vec::new(),
+        },
+        &["4080", "no compute device"],
+    );
+    let Err(why) = (unsafe { ash::Entry::load_from("grit-no-such-vulkan-loader") }) else {
+        panic!("a library that does not exist was loaded");
+    };
+    said_in_words(&Error::NoLoader(why), &["loader"]);
 }

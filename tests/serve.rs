@@ -789,7 +789,7 @@ fn a_kind_that_is_not_in_the_kit_is_named_rather_than_guessed_at() {
     let answer = call(None, "grit_slope", "{\"kind\":\"treacle\"}");
     let said = written(&answer);
     assert!(
-        said.contains("treacle") || said.contains("NoComputeDevice"),
+        said.contains("treacle") || said.contains("compute queue"),
         "either it names the kind it does not know, or it says it has no device: {said}"
     );
 }

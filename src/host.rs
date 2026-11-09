@@ -7,6 +7,12 @@ use ash::vk;
 #[derive(Debug)]
 pub enum Error {
     NoLoader(ash::LoadingError),
+    NoInstance(vk::Result),
+    NoDeviceList(vk::Result),
+    NoDevice {
+        name: String,
+        code: vk::Result,
+    },
     Vulkan(vk::Result),
     NoComputeDevice,
     NoSuchDevice {
@@ -57,37 +63,88 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoLoader(why) => write!(out, "{why}"),
-            Self::Vulkan(code) => write!(out, "{code:?}"),
-            Self::NoSparse => write!(out, "{self:?}"),
-            Self::NoComputeDevice => write!(out, "{self:?}"),
+            Self::NoLoader(why) => {
+                write!(out, "the Vulkan loader could not be used: {why}")
+            }
+            Self::NoInstance(code) => {
+                write!(out, "Vulkan refused to create an instance: {code:?}")
+            }
+            Self::NoDeviceList(code) => {
+                write!(
+                    out,
+                    "Vulkan could not list the devices on this machine: {code:?}"
+                )
+            }
+            Self::NoDevice { name, code } => {
+                write!(out, "Vulkan refused to open the device {name:?}: {code:?}")
+            }
+            Self::Vulkan(code) => write!(out, "a Vulkan call failed with {code:?}"),
+            Self::NoSparse => write!(
+                out,
+                "the device does not offer sparse residency for buffers"
+            ),
+            Self::NoComputeDevice => {
+                write!(
+                    out,
+                    "no Vulkan device on this machine offers a compute queue"
+                )
+            }
             Self::NoSuchDevice { wanted, present } => {
-                write!(out, "{wanted:?} {present:?}")
+                write!(out, "no Vulkan device name contains {wanted:?}; ")?;
+                if present.is_empty() {
+                    write!(out, "this machine has no compute device")
+                } else {
+                    write!(out, "the compute devices here are {present:?}")
+                }
             }
-            Self::NoMemory { bytes } => write!(out, "{bytes}"),
-            Self::NoSuchBinding { index, held } => {
-                write!(out, "{index} {held}")
-            }
+            Self::NoMemory { bytes } => write!(
+                out,
+                "no memory type on the device can hold a buffer of {bytes} bytes"
+            ),
+            Self::NoSuchBinding { index, held } => write!(
+                out,
+                "binding {index} does not exist; the resident holds {held} bindings"
+            ),
             Self::Overrun {
                 index,
                 needed,
                 held,
-            } => write!(out, "{index} {needed} {held}"),
-            Self::Staged { needed, staging } => write!(out, "{needed} {staging}"),
-            Self::WrongPasses { given, held } => {
-                write!(out, "{given} {held}")
-            }
-            Self::StillInFlight => write!(out, "{self:?}"),
-            Self::Wedged { after } => write!(out, "{after:?}"),
-            Self::WrongOutputs { asked, wanted } => {
-                write!(out, "{asked} {wanted}")
-            }
+            } => write!(
+                out,
+                "index {index} asks for {needed} words where only {held} are held"
+            ),
+            Self::Staged { needed, staging } => write!(
+                out,
+                "a transfer of {needed} words does not fit the staging buffer of {staging} words"
+            ),
+            Self::WrongPasses { given, held } => write!(
+                out,
+                "the stages name {given} passes, which does not fit the {held} passes the resident holds"
+            ),
+            Self::StillInFlight => write!(
+                out,
+                "a submission is still in flight, so the resident cannot take this one yet"
+            ),
+            Self::Wedged { after } => write!(
+                out,
+                "the device did not finish a submission within {after:?} and is treated as wedged"
+            ),
+            Self::WrongOutputs { asked, wanted } => write!(
+                out,
+                "the submission carried {asked} outputs where {wanted} were wanted"
+            ),
             Self::NoSuchTicket { ticket, held } => match held {
-                Some(one) => write!(out, "{ticket} {one}"),
-                None => write!(out, "{ticket}"),
+                Some(one) => write!(
+                    out,
+                    "ticket {ticket} is not in flight; ticket {one} is the one in flight"
+                ),
+                None => write!(out, "ticket {ticket} is not in flight, and no ticket is"),
             },
-            Self::Strayed { at, was, now } => write!(out, "{at} {was} {now}"),
-            Self::Lane(why) => write!(out, "{why:?}"),
+            Self::Strayed { at, was, now } => write!(
+                out,
+                "cell {at} did not come back to where it started: it was {was} and is now {now}"
+            ),
+            Self::Lane(why) => write!(out, "a kernel could not be built: {why}"),
         }
     }
 }
@@ -134,13 +191,16 @@ pub struct Host {
 
 impl Host {
     pub fn open() -> Result<Option<Self>, Error> {
-        Self::matching(std::env::var("GRIT_DEVICE").ok().as_deref())
+        let pattern =
+            std::env::var_os("GRIT_DEVICE").map(|held| held.to_string_lossy().into_owned());
+        Self::matching(pattern.as_deref())
     }
 
     pub fn matching(pattern: Option<&str>) -> Result<Option<Self>, Error> {
         let entry = match unsafe { ash::Entry::load() } {
             Ok(entry) => entry,
-            Err(_) => return Ok(None),
+            Err(ash::LoadingError::LibraryLoadFailure(_)) => return Ok(None),
+            Err(why) => return Err(Error::NoLoader(why)),
         };
 
         let application =
@@ -149,13 +209,11 @@ impl Host {
 
         let instance = match unsafe { entry.create_instance(&create, None) } {
             Ok(instance) => instance,
-            Err(_) => return Ok(None),
+            Err(vk::Result::ERROR_INCOMPATIBLE_DRIVER) => return Ok(None),
+            Err(code) => return Err(Error::NoInstance(code)),
         };
 
-        match unsafe { Self::on(entry, instance, pattern) } {
-            Ok(host) => Ok(Some(host)),
-            Err(why) => Err(why),
-        }
+        unsafe { Self::on(entry, instance, pattern) }.map(Some)
     }
 
     #[must_use]
@@ -190,7 +248,13 @@ impl Host {
         instance: ash::Instance,
         pattern: Option<&str>,
     ) -> Result<Self, Error> {
-        let candidates = unsafe { instance.enumerate_physical_devices() }?;
+        let candidates = match unsafe { instance.enumerate_physical_devices() } {
+            Ok(candidates) => candidates,
+            Err(code) => {
+                unsafe { instance.destroy_instance(None) };
+                return Err(Error::NoDeviceList(code));
+            }
+        };
 
         let compute: Vec<(vk::PhysicalDevice, u32)> = candidates
             .into_iter()
@@ -267,7 +331,7 @@ impl Host {
             Ok(device) => device,
             Err(code) => {
                 unsafe { instance.destroy_instance(None) };
-                return Err(code.into());
+                return Err(Error::NoDevice { name, code });
             }
         };
         let queue = unsafe { device.get_device_queue(family, 0) };
