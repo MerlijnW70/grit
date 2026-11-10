@@ -1,23 +1,30 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Write as _};
 use std::path::PathBuf;
 
+use common::device;
+
 use grit::compact::{self, Over, Plan, Tier};
-use grit::layout::{COUNTS, DENSE, GRAND, HOT_BASES, HOT_COUNTS, HOT_DENSE, TOTALS};
+use grit::layout::{
+    BRUSH, COUNTS, DENSE, GRAND, HOT_BASES, HOT_COUNTS, HOT_DENSE, PARAMS, STATE, TOTALS,
+};
 use grit::machine::Machine;
 use grit::marking;
 use grit::netlist::{KINDS, Netlist};
 use grit::rule::{self, Kind, Pass};
-use grit::sand::{self, Grid, View};
-use grit::{live, sweep};
+use grit::sand::{self, AIR, Grid, SAND, View, WALL, WATER};
+use grit::{Groups, live, sweep};
 
 const WIDTHS: [u32; 5] = [4, 8, 16, 32, 64];
 
 const GRIDS: [(u32, u32); 3] = [(256, 128), (512, 256), (4096, 2048)];
 
 const SPIRV_FILE: &str = "tests/golden/spirv.txt";
+const STATE_FILE: &str = "tests/golden/state.txt";
 
 fn writing() -> bool {
     match std::env::var("GRIT_GOLDEN") {
@@ -525,5 +532,239 @@ fn every_kernel_the_engine_builds_is_the_one_on_record() {
         "{} kernels differ from {SPIRV_FILE} (refresh with GRIT_GOLDEN=write only when the change is meant):\n{}",
         wrong.len(),
         wrong.join("\n")
+    );
+}
+
+type Brushing = fn(u32, Grid) -> [u32; 4];
+type Starting = fn(Grid) -> Vec<u32>;
+
+struct Scene {
+    name: &'static str,
+    frames: u32,
+    start: Starting,
+    brushing: Brushing,
+}
+
+fn walled(grid: Grid, fill: impl Fn(u32, u32) -> bool) -> Vec<u32> {
+    let mut cells = vec![AIR; grid.cells()];
+    for row in 0..grid.deep {
+        for column in 0..grid.wide {
+            let edge = row + 1 >= grid.deep || column == 0 || column + 1 >= grid.wide;
+            let at = (row * grid.wide + column) as usize;
+            cells[at] = if edge {
+                WALL
+            } else if fill(column, row) {
+                SAND
+            } else {
+                AIR
+            };
+        }
+    }
+    cells
+}
+
+fn idle_room(grid: Grid) -> Vec<u32> {
+    walled(grid, |_, _| false)
+}
+
+fn row_of_sand(grid: Grid) -> Vec<u32> {
+    walled(grid, |column, row| {
+        row == grid.deep / 8
+            && column >= grid.wide / 2 - 128
+            && column < grid.wide / 2 + 128
+            && column % 4 == 0
+    })
+}
+
+fn column_of_sand(grid: Grid) -> Vec<u32> {
+    walled(grid, |column, row| {
+        column == grid.wide / 2 && row >= grid.deep / 8 && row < grid.deep / 8 + 128 && row % 4 == 0
+    })
+}
+
+fn busy_room(grid: Grid) -> Vec<u32> {
+    walled(grid, |_, row| row % 4 == 2 && row + 8 < grid.deep)
+}
+
+fn floor_only(grid: Grid) -> Vec<u32> {
+    let mut cells = vec![AIR; grid.cells()];
+    for column in 0..grid.wide {
+        cells[((grid.deep - 1) * grid.wide + column) as usize] = WALL;
+    }
+    cells
+}
+
+fn blob_on_side_seam(grid: Grid) -> Vec<u32> {
+    let mut cells = floor_only(grid);
+    for row in 180..250 {
+        for column in (grid.wide - 30)..(grid.wide + 30) {
+            let column = column % grid.wide;
+            cells[(row * grid.wide + column) as usize] = if row < 200 { SAND } else { WATER };
+        }
+    }
+    cells
+}
+
+fn blob_on_floor_seam(grid: Grid) -> Vec<u32> {
+    let mut cells = vec![AIR; grid.cells()];
+    for row in (grid.deep - 20)..(grid.deep + 20) {
+        let row = row % grid.deep;
+        for column in 100..160 {
+            cells[(row * grid.wide + column) as usize] = if column < 130 { SAND } else { WATER };
+        }
+    }
+    cells
+}
+
+fn no_brush(_frame: u32, _grid: Grid) -> [u32; 4] {
+    [0, 0, 0, AIR]
+}
+
+fn pour_at_the_side_seam(frame: u32, _grid: Grid) -> [u32; 4] {
+    let material = match frame {
+        5..60 => WATER,
+        60..90 => SAND,
+        _ => AIR,
+    };
+    [3, 200, 36, material]
+}
+
+fn a_stroke(frame: u32, grid: Grid) -> [u32; 4] {
+    if frame >= 100 {
+        return [0, 0, 0, AIR];
+    }
+    let x = (frame * 5) % grid.wide;
+    let y = 40 + (frame * 3) % 100;
+    let reach = 1 + frame % 6;
+    let material = match (frame / 10) % 4 {
+        0 => SAND,
+        1 => WATER,
+        2 => WALL,
+        _ => AIR,
+    };
+    [x, y, reach, material]
+}
+
+const SCENES: [Scene; 7] = [
+    Scene {
+        name: "idle",
+        frames: 64,
+        start: idle_room,
+        brushing: no_brush,
+    },
+    Scene {
+        name: "row",
+        frames: 120,
+        start: row_of_sand,
+        brushing: no_brush,
+    },
+    Scene {
+        name: "column",
+        frames: 120,
+        start: column_of_sand,
+        brushing: no_brush,
+    },
+    Scene {
+        name: "busy",
+        frames: 120,
+        start: busy_room,
+        brushing: no_brush,
+    },
+    Scene {
+        name: "side-seam",
+        frames: 120,
+        start: blob_on_side_seam,
+        brushing: pour_at_the_side_seam,
+    },
+    Scene {
+        name: "floor-seam",
+        frames: 120,
+        start: blob_on_floor_seam,
+        brushing: no_brush,
+    },
+    Scene {
+        name: "brush",
+        frames: 140,
+        start: idle_room,
+        brushing: a_stroke,
+    },
+];
+
+const OPEN: Grid = Grid::of(512, 256);
+
+fn run(host: &grit::Host, scene: &Scene, coarse: bool) -> String {
+    let width = host.width();
+    let grid = OPEN;
+    let plan = Plan::over(width, grid.quads().div_ceil(sweep::cells(width))).unwrap();
+    let (passes, stages) = live::arranged(width, grid, &plan, None, coarse).unwrap();
+    let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let sizes = plan.sizes();
+    let mut held = host.resident(&sizes, &modules).unwrap();
+    for (binding, &words) in sizes.iter().enumerate() {
+        if binding == grit::layout::PIXELS as usize {
+            continue;
+        }
+        held.write(binding, &vec![0_u32; words]).unwrap();
+    }
+    held.write(STATE as usize, &(scene.start)(grid)).unwrap();
+    held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
+        .unwrap();
+    live::seed(&mut held, grid, &plan).unwrap();
+    for frame in 0..scene.frames {
+        let brush = (scene.brushing)(frame, grid);
+        held.write_at(PARAMS as usize, BRUSH, &brush).unwrap();
+        held.staged(&groups).unwrap();
+    }
+    let state = held.read(STATE as usize, grid.cells()).unwrap();
+    words_hash(&state)
+}
+
+#[test]
+fn the_fixed_scenes_end_in_the_state_on_record() {
+    let Some(host) = device("the_fixed_scenes_end_in_the_state_on_record") else {
+        return;
+    };
+    let mut now: Vec<(String, String)> = Vec::new();
+    for scene in &SCENES {
+        for (tier, coarse) in [("fine", false), ("coarse", true)] {
+            let hash = run(&host, scene, coarse);
+            now.push((format!("{} {tier} {}", scene.name, scene.frames), hash));
+        }
+    }
+
+    if writing() {
+        write_lines(STATE_FILE, &now);
+        println!("wrote {} lines to {STATE_FILE}", now.len());
+        return;
+    }
+
+    let mut on_record = read_lines(STATE_FILE, 4);
+    let mut wrong = Vec::new();
+    for (key, hash) in &now {
+        match on_record.remove(key) {
+            None => wrong.push(format!("scene {key} is not on record; now {hash}")),
+            Some(golden) if golden != *hash => wrong.push(format!(
+                "scene {key} frames ended in a different state on {} at subgroup {}: record {golden}, now {hash}",
+                host.name(),
+                host.width()
+            )),
+            Some(_) => {}
+        }
+    }
+    for key in on_record.keys() {
+        wrong.push(format!("scene {key} is on record and no longer run"));
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} scenes differ from {STATE_FILE} (refresh with GRIT_GOLDEN=write only when the change is meant):\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+    println!(
+        "{} scenes end in the recorded state on {} at subgroup {}",
+        now.len(),
+        host.name(),
+        host.width()
     );
 }
