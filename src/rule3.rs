@@ -18,6 +18,7 @@ use simdr::lanes::{LaneError, Lanes, U32, Vector};
 
 use crate::layout::Dimension;
 
+pub mod heat;
 pub mod sand;
 
 /// The cells of an oct.
