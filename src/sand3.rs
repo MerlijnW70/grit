@@ -1,61 +1,18 @@
 use simdr::kernel::{Kernel, Shape};
-use simdr::lanes::{LaneError, Lanes, Predicate, U32, Vector};
+use simdr::lanes::{LaneError, Lanes, U32, Vector};
 use simdr::module::Id;
 
 use crate::geometry::{Emit, Solid};
 use crate::layout::{BINDINGS, PARAMS, STATE};
-use crate::sand::{AIR, Grid, PATIENCE, WALL, WATER};
+use crate::rule3::{FIRST_PARAM, Oct, Rule};
+use crate::sand::{Grid, WALL};
 
-const MATERIAL_BITS: u32 = 2;
-const RUNNING_BITS: u32 = 3;
-const CARRIED_BITS: u32 = MATERIAL_BITS + RUNNING_BITS;
-const TIRED_BITS: u32 = 3;
-
-pub const HELD: u32 = 1 << CARRIED_BITS;
-pub const TIRED: u32 = HELD << 1;
-
-pub const MINUS_X: u32 = 1;
-pub const PLUS_X: u32 = 2;
-pub const MINUS_Z: u32 = 5;
-pub const PLUS_Z: u32 = 6;
-
-pub const RUNNING_MINUS_X: u32 = WATER + (MINUS_X << MATERIAL_BITS);
-pub const RUNNING_PLUS_X: u32 = WATER + (PLUS_X << MATERIAL_BITS);
-pub const RUNNING_MINUS_Z: u32 = WATER + (MINUS_Z << MATERIAL_BITS);
-pub const RUNNING_PLUS_Z: u32 = WATER + (PLUS_Z << MATERIAL_BITS);
-
-pub const CORNERS: usize = 8;
-
-#[must_use]
-pub const fn material_of(word: u32) -> u32 {
-    word % (1 << MATERIAL_BITS)
-}
-
-#[must_use]
-pub const fn running_of(word: u32) -> u32 {
-    (word >> MATERIAL_BITS) % (1 << RUNNING_BITS)
-}
-
-#[must_use]
-pub const fn held_of(word: u32) -> u32 {
-    (word >> CARRIED_BITS) % 2
-}
-
-#[must_use]
-pub const fn tired_of(word: u32) -> u32 {
-    (word >> (CARRIED_BITS + 1)) % (1 << TIRED_BITS)
-}
-
-#[must_use]
-pub const fn hold_of(word: u32, under: u32) -> u32 {
-    let carried = word % HELD;
-    let worn = tired_of(word) * TIRED;
-    if material_of(word) == WATER && material_of(under) == WATER {
-        carried + HELD + worn
-    } else {
-        carried + worn
-    }
-}
+pub use crate::rule3::CORNERS;
+pub use crate::rule3::sand::{
+    HELD, MINUS_X, MINUS_Z, PLUS_X, PLUS_Z, RUNNING_MINUS_X, RUNNING_MINUS_Z, RUNNING_PLUS_X,
+    RUNNING_PLUS_Z, Sand, TIRED, held_of, hold_of, material_of, running_of, settle_oct, tired_of,
+    x_first,
+};
 
 /// A torus of `wide` columns (x), `deep` rows (y) and `tall` layers (z),
 /// each a power of two. Rows are the 2D grid's rows: a grain falls from row
@@ -139,172 +96,50 @@ impl Grid3 {
     }
 }
 
-/// Whether frame `frame` takes the x axis before the z axis. The order holds
-/// for two frames, one of each phase, and then flips, so each phase sees both
-/// orders and every oct of a frame runs the same rule.
+/// The lattice point of oct `oct` of `grid`, x, y and z, as
+/// [`Grid3::corners`] numbers the octs.
 #[must_use]
-pub const fn x_first(frame: u32) -> bool {
-    (frame >> 1) & 1 == 0
+pub const fn lattice(grid: Grid3, oct: u32) -> [u32; 3] {
+    let across = grid.wide / 2;
+    let down = grid.deep / 2;
+    [oct % across, (oct / across) % down, oct / across / down]
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Axis {
-    X,
-    Z,
-}
-
-impl Axis {
-    const fn bit(self) -> usize {
-        match self {
-            Self::X => 1,
-            Self::Z => 2,
-        }
-    }
-
-    const fn minus(self) -> u32 {
-        match self {
-            Self::X => MINUS_X,
-            Self::Z => MINUS_Z,
-        }
-    }
-
-    const fn plus(self) -> u32 {
-        match self {
-            Self::X => PLUS_X,
-            Self::Z => PLUS_Z,
-        }
-    }
-}
-
-fn read(cells: &[u32; CORNERS], at: usize) -> u32 {
-    cells.get(at).copied().unwrap_or(WALL)
-}
-
-fn put(cells: &mut [u32; CORNERS], at: usize, value: u32) {
-    if let Some(slot) = cells.get_mut(at) {
-        *slot = value;
-    }
-}
-
-const fn halted(word: u32) -> u32 {
-    material_of(word) + held_of(word) * HELD + tired_of(word) * TIRED
-}
-
-const fn ready(word: u32) -> bool {
-    material_of(word) == WATER
-        && running_of(word) == 0
-        && held_of(word) != 0
-        && tired_of(word) < PATIENCE
-}
-
-const fn started(word: u32, way: u32) -> u32 {
-    WATER + (way << MATERIAL_BITS) + HELD + (tired_of(word) + 1) * TIRED
-}
-
-fn along(cells: &mut [u32; CORNERS], axis: Axis, low: usize, high: usize) {
-    let (here, there) = (read(cells, low), read(cells, high));
-    let goes_up = running_of(here) == axis.plus();
-    let goes_down = running_of(there) == axis.minus();
-    let up_free = material_of(there) == AIR;
-    let down_free = material_of(here) == AIR;
-
-    let kept_here = if goes_up && !up_free {
-        halted(here)
-    } else {
-        here
-    };
-    let kept_there = if goes_down && !down_free {
-        halted(there)
-    } else {
-        there
-    };
-    if (goes_up && up_free) || (goes_down && down_free) {
-        put(cells, low, kept_there);
-        put(cells, high, kept_here);
-    } else {
-        put(cells, low, kept_here);
-        put(cells, high, kept_there);
-    }
-}
-
-fn fall(cells: &mut [u32; CORNERS], upper: usize, lower: usize) {
-    let (up, low) = (read(cells, upper), read(cells, lower));
-    let (above, below) = (material_of(up), material_of(low));
-    if above > below && above != WALL {
-        put(cells, upper, low);
-        put(cells, lower, above);
-    }
-}
-
-const UPPER: [usize; 4] = [0, 1, 2, 3];
-const LOWER: usize = 4;
-const CORNER: usize = 3;
-
-/// One step of one oct, its corners laid out as [`Grid3::corners`] gives them.
-///
-/// In order: the four upper cells take their held bit from the cell under
-/// them; held idle water starts to run toward an empty neighbour in its layer
-/// along the first axis, else the second; runners swap with an empty
-/// neighbour along the first axis and then the second; the four vertical
-/// pairs fall; then the four upper cells fall along an edge diagonal of the
-/// first axis, then of the second axis, then along the corner diagonal. Each
-/// of these stages works on four disjoint pairs, so only the axis order can
-/// change an outcome, and `x_first` sets it.
+/// One frame of the whole torus on the CPU under `rule`: every oct of the
+/// frame's phase steps once with [`Rule::step`], given `params` as its
+/// parameters (a missing word reads as 0). A cell index past `cells` reads
+/// as [`crate::sand::WALL`] and is never written.
 #[must_use]
-pub fn settle_oct(oct: [u32; CORNERS], x_first: bool) -> [u32; CORNERS] {
-    let axes = if x_first {
-        [Axis::X, Axis::Z]
-    } else {
-        [Axis::Z, Axis::X]
-    };
-    let mut cells = oct;
-
-    for top in UPPER {
-        let (word, under) = (read(&cells, top), read(&cells, top + LOWER));
-        put(&mut cells, top, hold_of(word, under));
-    }
-
-    let before = cells;
-    for at in 0..CORNERS {
-        let word = read(&before, at);
-        if !ready(word) {
-            continue;
+pub fn reference<R: Rule>(
+    rule: &R,
+    grid: Grid3,
+    frame: u32,
+    cells: &[u32],
+    params: &[u32],
+) -> Vec<u32> {
+    let held: Vec<u32> = (0..rule.params())
+        .map(|which| crate::rule3::param(params, which))
+        .collect();
+    let mut out = cells.to_vec();
+    for oct in 0..grid.octs() {
+        let places = grid.corners(frame, oct);
+        let mut words = [WALL; CORNERS];
+        for (slot, place) in words.iter_mut().zip(places) {
+            *slot = out.get(place).copied().unwrap_or(WALL);
         }
-        for axis in axes {
-            let other = at ^ axis.bit();
-            if material_of(read(&before, other)) == AIR {
-                let way = if at & axis.bit() == 0 {
-                    axis.plus()
-                } else {
-                    axis.minus()
-                };
-                put(&mut cells, at, started(word, way));
-                break;
+        let ruled = rule.step(Oct {
+            words,
+            frame,
+            at: lattice(grid, oct),
+            params: &held,
+        });
+        for (place, value) in places.into_iter().zip(ruled.out) {
+            if let Some(slot) = out.get_mut(place) {
+                *slot = value;
             }
         }
     }
-
-    for axis in axes {
-        for low in 0..CORNERS {
-            if low & axis.bit() == 0 {
-                along(&mut cells, axis, low, low | axis.bit());
-            }
-        }
-    }
-
-    for top in UPPER {
-        fall(&mut cells, top, top + LOWER);
-    }
-    for axis in axes {
-        for top in UPPER {
-            fall(&mut cells, top, LOWER + (top ^ axis.bit()));
-        }
-    }
-    for top in UPPER {
-        fall(&mut cells, top, LOWER + (top ^ CORNER));
-    }
-
-    cells
+    out
 }
 
 /// One frame of the whole torus on the CPU: every oct of the frame's phase
@@ -312,22 +147,7 @@ pub fn settle_oct(oct: [u32; CORNERS], x_first: bool) -> [u32; CORNERS] {
 /// and is never written.
 #[must_use]
 pub fn settle_reference3(grid: Grid3, frame: u32, cells: &[u32]) -> Vec<u32> {
-    let mut out = cells.to_vec();
-    let first = x_first(frame);
-    for oct in 0..grid.octs() {
-        let places = grid.corners(frame, oct);
-        let mut block = [WALL; CORNERS];
-        for (slot, place) in block.iter_mut().zip(places) {
-            *slot = out.get(place).copied().unwrap_or(WALL);
-        }
-        let settled = settle_oct(block, first);
-        for (place, value) in places.into_iter().zip(settled) {
-            if let Some(slot) = out.get_mut(place) {
-                *slot = value;
-            }
-        }
-    }
-    out
+    reference(&Sand, grid, frame, cells, &[])
 }
 
 /// Why [`settle`] or [`Spread::of`] refuses a grid that is not solid.
@@ -425,13 +245,25 @@ pub struct Whole {
 /// `most` is the most groups the device dispatches; the kernel is built so
 /// that its [`Spread::dispatch`] stays at or under it.
 pub fn settle(subgroup: u32, grid: Grid, most: u32) -> Result<Whole, LaneError> {
+    settle_by(&Sand, subgroup, grid, most)
+}
+
+/// The kernel that steps every oct of a solid grid by one frame of `rule`,
+/// the frame read from `PARAMS[0]` and the rule's parameters from
+/// `PARAMS[FIRST_PARAM..]`. Bit for bit it is [`reference()`].
+pub fn settle_by<R: Rule>(
+    rule: &R,
+    subgroup: u32,
+    grid: Grid,
+    most: u32,
+) -> Result<Whole, LaneError> {
     let spread = Spread::of(grid, subgroup, most)?;
     let words = match subgroup {
-        4 => whole::<4>(subgroup, grid, spread),
-        8 => whole::<8>(subgroup, grid, spread),
-        16 => whole::<16>(subgroup, grid, spread),
-        32 => whole::<32>(subgroup, grid, spread),
-        64 => whole::<64>(subgroup, grid, spread),
+        4 => whole::<4, R>(rule, subgroup, grid, spread),
+        8 => whole::<8, R>(rule, subgroup, grid, spread),
+        16 => whole::<16, R>(rule, subgroup, grid, spread),
+        32 => whole::<32, R>(rule, subgroup, grid, spread),
+        64 => whole::<64, R>(rule, subgroup, grid, spread),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -440,7 +272,24 @@ pub fn settle(subgroup: u32, grid: Grid, most: u32) -> Result<Whole, LaneError> 
     Ok(Whole { words, spread })
 }
 
-fn whole<const LANES: u32>(
+/// Loads the frame, `PARAMS[0]`, and the rule's parameters.
+pub(crate) fn frame_and_params<R: Rule>(
+    kernel: &mut Kernel<U32>,
+    rule: &R,
+) -> Result<(Id, Vec<Id>), LaneError> {
+    let head = kernel.module().constant_u32(0)?;
+    let frame = kernel.load_at(PARAMS, head)?;
+    let mut params = Vec::with_capacity(rule.params());
+    for which in 0..rule.params() {
+        let at = u32::try_from(FIRST_PARAM + which).unwrap_or(u32::MAX);
+        let at = kernel.module().constant_u32(at)?;
+        params.push(kernel.load_at(PARAMS, at)?);
+    }
+    Ok((frame, params))
+}
+
+fn whole<const LANES: u32, R: Rule>(
+    rule: &R,
     subgroup: u32,
     grid: Grid,
     spread: Spread,
@@ -454,19 +303,29 @@ fn whole<const LANES: u32>(
     let base = kernel.module().i_mul(uint, group, width)?;
     let first = kernel.module().i_add(uint, base, lane)?;
 
-    let head = kernel.module().constant_u32(0)?;
-    let frame = kernel.load_at(PARAMS, head)?;
+    let (frame, params) = frame_and_params(&mut kernel, rule)?;
+    let given = Given {
+        frame,
+        params: &params,
+    };
 
     if spread.per == 1 {
-        step::<LANES>(&mut kernel, grid, first, frame)?;
+        step::<LANES, R>(&mut kernel, rule, grid, first, given)?;
     } else {
         let stride = kernel.module().constant_u32(spread.stride())?;
         let _ = kernel.repeat_rolled(spread.per, uint, first, |kernel, oct, _| {
-            step::<LANES>(kernel, grid, oct, frame)?;
+            step::<LANES, R>(kernel, rule, grid, oct, given)?;
             Ok(kernel.module().i_add(uint, oct, stride)?)
         })?;
     }
     kernel.finish()
+}
+
+/// The frame and the rule's parameters, as loaded once by a kernel.
+#[derive(Clone, Copy)]
+pub(crate) struct Given<'held> {
+    pub frame: Id,
+    pub params: &'held [Id],
 }
 
 /// Where each corner of [`Grid3::corners`] lies among the corners of
@@ -474,55 +333,46 @@ fn whole<const LANES: u32>(
 /// x, z, y.
 const REFERENCE: [usize; CORNERS] = [0, 1, 4, 5, 2, 3, 6, 7];
 
-/// The corners the two axis orders trade: those whose x and z bits differ.
-const TRADED: [(usize, usize); 2] = [(1, 2), (5, 6)];
-
 type Word<const LANES: u32> = Vector<U32, LANES>;
-type Truth<const LANES: u32> = Predicate<LANES>;
 
-/// Steps oct `oct` of `grid` at frame `frame`.
-fn step<const LANES: u32>(
+/// Steps oct `oct` of `grid` under `rule`.
+fn step<const LANES: u32, R: Rule>(
     kernel: &mut Kernel<U32>,
+    rule: &R,
     grid: Grid,
     oct: Id,
-    frame: Id,
+    given: Given<'_>,
 ) -> Result<(), LaneError> {
-    let places = {
+    let placing = {
         let mut lanes = kernel.lanes()?;
-        placed::<LANES>(&mut lanes, grid, oct, frame)?.places
+        placed::<LANES>(&mut lanes, grid, oct, given.frame)?
     };
 
-    let mut held = [frame; CORNERS];
-    for (word, place) in held.iter_mut().zip(&places) {
+    let mut loaded = [given.frame; CORNERS];
+    for (word, place) in loaded.iter_mut().zip(&placing.places) {
         *word = kernel.load_at(STATE, place.id())?;
     }
 
-    let settled = {
+    let out = {
         let mut lanes = kernel.lanes()?;
-        stepped::<LANES>(&mut lanes, frame, held)?.out
+        ruled::<LANES, R>(&mut lanes, rule, &placing, loaded, given)?.out
     };
 
-    for (place, value) in places.iter().zip(&settled) {
+    for (place, value) in placing.places.iter().zip(&out) {
         kernel.store_at(STATE, place.id(), value.id())?;
     }
     Ok(())
 }
 
-/// Where the cells of an oct lie, in the order the rule takes them, and the
-/// oct's point in the lattice of octs.
+/// Where the cells of an oct lie, in the order of [`Grid3::corners`], and
+/// the oct's point in the lattice of octs.
 pub(crate) struct Placing<const LANES: u32> {
     pub places: [Word<LANES>; CORNERS],
     pub block: [Word<LANES>; 3],
 }
 
 /// The cells of oct `oct` of `grid` at frame `frame`, as [`Grid3::corners`]
-/// orders them, or in the mirrored order when the frame takes z first.
-///
-/// A frame that takes z first is stepped as its mirror across the plane
-/// x = z: the corners whose x and z differ trade places, a running word
-/// trades its x and z ways, the x-first rule runs, and the ways trade back.
-/// The rule treats x and z alike but for their order, so the mirror of an
-/// x-first step is the z-first step.
+/// orders them.
 pub(crate) fn placed<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     grid: Grid,
@@ -538,315 +388,37 @@ pub(crate) fn placed<const LANES: u32>(
             *place = *found;
         }
     }
-    let mirrored = z_first::<LANES>(lanes, now)?;
-    for (one, other) in TRADED {
-        let (Some(here), Some(there)) = (word_at(&places, one), word_at(&places, other)) else {
-            continue;
-        };
-        put_word(&mut places, one, lanes.select(mirrored, there, here)?);
-        put_word(&mut places, other, lanes.select(mirrored, here, there)?);
-    }
     Ok(Placing {
         places,
         block: solid.block,
     })
 }
 
-/// One oct stepped by the rule: the words as loaded, the words after the
-/// held step and after the whole rule (both with the frame's ways), and the
-/// words to store.
-pub(crate) struct Stepped<const LANES: u32> {
-    pub loaded: [Word<LANES>; CORNERS],
-    pub held: [Word<LANES>; CORNERS],
-    pub ruled: [Word<LANES>; CORNERS],
-    pub out: [Word<LANES>; CORNERS],
-}
-
-/// Steps the eight words `held`, loaded from the places [`placed`] gives
-/// for frame `frame`.
-pub(crate) fn stepped<const LANES: u32>(
+/// The eight words `loaded`, from the places of `placing`, stepped by
+/// `rule`.
+pub(crate) fn ruled<const LANES: u32, R: Rule>(
     lanes: &mut Lanes<'_>,
-    frame: Id,
-    held: [Id; CORNERS],
-) -> Result<Stepped<LANES>, LaneError> {
-    let now = lanes.splat_id::<U32, LANES>(frame)?;
-    let mirrored = z_first::<LANES>(lanes, now)?;
-    let mut cells = [now; CORNERS];
-    let mut loaded = [now; CORNERS];
-    for ((cell, raw), word) in cells.iter_mut().zip(loaded.iter_mut()).zip(held) {
-        *raw = lanes.splat_id::<U32, LANES>(word)?;
-        *cell = traded::<LANES>(lanes, *raw, mirrored)?;
+    rule: &R,
+    placing: &Placing<LANES>,
+    loaded: [Id; CORNERS],
+    given: Given<'_>,
+) -> Result<crate::rule3::Ruled<Word<LANES>>, LaneError> {
+    let frame = lanes.splat_id::<U32, LANES>(given.frame)?;
+    let mut words = [frame; CORNERS];
+    for (word, id) in words.iter_mut().zip(loaded) {
+        *word = lanes.splat_id::<U32, LANES>(id)?;
     }
-    let (after_hold, ruled) = rule::<LANES>(lanes, cells)?;
-    let mut out = ruled;
-    for (cell, from) in out.iter_mut().zip(ruled) {
-        *cell = traded::<LANES>(lanes, from, mirrored)?;
+    let mut params = Vec::with_capacity(given.params.len());
+    for &id in given.params {
+        params.push(lanes.splat_id::<U32, LANES>(id)?);
     }
-    Ok(Stepped {
-        loaded,
-        held: after_hold,
-        ruled,
-        out,
-    })
-}
-
-fn word_at<const LANES: u32>(cells: &[Word<LANES>; CORNERS], at: usize) -> Option<Word<LANES>> {
-    cells.get(at).copied()
-}
-
-fn put_word<const LANES: u32>(cells: &mut [Word<LANES>; CORNERS], at: usize, value: Word<LANES>) {
-    if let Some(slot) = cells.get_mut(at) {
-        *slot = value;
-    }
-}
-
-/// Whether the frame `now` takes z before x: bit 1 of the frame, as
-/// [`x_first`] reads it.
-fn z_first<const LANES: u32>(
-    lanes: &mut Lanes<'_>,
-    now: Word<LANES>,
-) -> Result<Truth<LANES>, LaneError> {
-    let two = lanes.splat_bits::<U32, LANES>(2)?;
-    let none = lanes.splat_bits::<U32, LANES>(0)?;
-    let order = lanes.and(now, two)?;
-    lanes.not_equal(order, none)
-}
-
-/// `word` with its x and z ways traded where `mirrored` holds. A running
-/// field whose two low bits differ names a way, and its high bit picks z
-/// over x; the other running fields name no way and stay.
-fn traded<const LANES: u32>(
-    lanes: &mut Lanes<'_>,
-    word: Word<LANES>,
-    mirrored: Truth<LANES>,
-) -> Result<Word<LANES>, LaneError> {
-    let low = lanes.splat_bits::<U32, LANES>(MATERIAL_BITS)?;
-    let high = lanes.splat_bits::<U32, LANES>(MATERIAL_BITS + 1)?;
-    let one = lanes.splat_bits::<U32, LANES>(1)?;
-    let across = lanes.splat_bits::<U32, LANES>(MATERIAL_BITS + 2)?;
-    let first = lanes.shift_right_logical(word, low)?;
-    let second = lanes.shift_right_logical(word, high)?;
-    let differ = lanes.xor(first, second)?;
-    let differ = lanes.and(differ, one)?;
-    let flip = lanes.shift_left(differ, across)?;
-    let flipped = lanes.xor(word, flip)?;
-    lanes.select(mirrored, flipped, word)
-}
-
-const WORN: u32 = ((1 << TIRED_BITS) - 1) * TIRED;
-
-struct Fields<const LANES: u32> {
-    one: Word<LANES>,
-    none: Word<LANES>,
-}
-
-impl<const LANES: u32> Fields<LANES> {
-    fn new(lanes: &mut Lanes<'_>) -> Result<Self, LaneError> {
-        Ok(Self {
-            one: lanes.splat_bits::<U32, LANES>(1)?,
-            none: lanes.splat_bits::<U32, LANES>(0)?,
-        })
-    }
-
-    fn masked(
-        lanes: &mut Lanes<'_>,
-        word: Word<LANES>,
-        mask: u32,
-    ) -> Result<Word<LANES>, LaneError> {
-        let mask = lanes.splat_bits::<U32, LANES>(mask)?;
-        lanes.and(word, mask)
-    }
-
-    fn field(
-        lanes: &mut Lanes<'_>,
-        word: Word<LANES>,
-        from: u32,
-        bits: u32,
-    ) -> Result<Word<LANES>, LaneError> {
-        let by = lanes.splat_bits::<U32, LANES>(from)?;
-        let above = lanes.shift_right_logical(word, by)?;
-        Self::masked(lanes, above, (1 << bits) - 1)
-    }
-
-    fn is(
-        &self,
-        lanes: &mut Lanes<'_>,
-        value: Word<LANES>,
-        want: u32,
-    ) -> Result<Word<LANES>, LaneError> {
-        let want = lanes.splat_bits::<U32, LANES>(want)?;
-        let same = lanes.equal(value, want)?;
-        lanes.select(same, self.one, self.none)
-    }
-
-    fn is_material(
-        &self,
-        lanes: &mut Lanes<'_>,
-        word: Word<LANES>,
-        want: u32,
-    ) -> Result<Word<LANES>, LaneError> {
-        let kind = Self::masked(lanes, word, (1 << MATERIAL_BITS) - 1)?;
-        self.is(lanes, kind, want)
-    }
-
-    fn truth(&self, lanes: &mut Lanes<'_>, flag: Word<LANES>) -> Result<Truth<LANES>, LaneError> {
-        lanes.not_equal(flag, self.none)
-    }
-
-    /// [`hold_of`].
-    fn hold(
-        &self,
-        lanes: &mut Lanes<'_>,
-        word: Word<LANES>,
-        under: Word<LANES>,
-    ) -> Result<Word<LANES>, LaneError> {
-        let kept = Self::masked(lanes, word, (HELD - 1) | WORN)?;
-        let wet = self.is_material(lanes, word, WATER)?;
-        let standing = self.is_material(lanes, under, WATER)?;
-        let both = lanes.and(wet, standing)?;
-        let both = self.truth(lanes, both)?;
-        let bit = lanes.splat_bits::<U32, LANES>(HELD)?;
-        let set = lanes.add(kept, bit)?;
-        lanes.select(both, set, kept)
-    }
-
-    /// Whether `word` is ready to start running, as 1 or 0.
-    fn ready(&self, lanes: &mut Lanes<'_>, word: Word<LANES>) -> Result<Word<LANES>, LaneError> {
-        let wet = self.is_material(lanes, word, WATER)?;
-        let way = Self::field(lanes, word, MATERIAL_BITS, RUNNING_BITS)?;
-        let still = self.is(lanes, way, 0)?;
-        let held = Self::field(lanes, word, CARRIED_BITS, 1)?;
-        let worn = Self::field(lanes, word, CARRIED_BITS + 1, TIRED_BITS)?;
-        let patience = lanes.splat_bits::<U32, LANES>(PATIENCE)?;
-        let spare = lanes.greater_than(patience, worn)?;
-        let spare = lanes.select(spare, self.one, self.none)?;
-        let all = lanes.and(wet, still)?;
-        let all = lanes.and(all, held)?;
-        lanes.and(all, spare)
-    }
-
-    /// `word` started running along `way`: one more tired step, held.
-    fn started(
-        lanes: &mut Lanes<'_>,
-        word: Word<LANES>,
-        way: u32,
-    ) -> Result<Word<LANES>, LaneError> {
-        let worn = Self::masked(lanes, word, WORN)?;
-        let fixed =
-            lanes.splat_bits::<U32, LANES>(WATER + (way << MATERIAL_BITS) + HELD + TIRED)?;
-        lanes.add(worn, fixed)
-    }
-
-    /// `word` stopped: its material, held bit and tired steps.
-    fn halted(lanes: &mut Lanes<'_>, word: Word<LANES>) -> Result<Word<LANES>, LaneError> {
-        Self::masked(lanes, word, ((1 << MATERIAL_BITS) - 1) | HELD | WORN)
-    }
-
-    /// One pair of cells along `axis`, the lower first.
-    fn along(
-        &self,
-        lanes: &mut Lanes<'_>,
-        axis: Axis,
-        [here, there]: [Word<LANES>; 2],
-    ) -> Result<[Word<LANES>; 2], LaneError> {
-        let going_here = Self::field(lanes, here, MATERIAL_BITS, RUNNING_BITS)?;
-        let going_there = Self::field(lanes, there, MATERIAL_BITS, RUNNING_BITS)?;
-        let goes_up = self.is(lanes, going_here, axis.plus())?;
-        let goes_down = self.is(lanes, going_there, axis.minus())?;
-        let up_free = self.is_material(lanes, there, AIR)?;
-        let down_free = self.is_material(lanes, here, AIR)?;
-        let up_shut = lanes.xor(up_free, self.one)?;
-        let down_shut = lanes.xor(down_free, self.one)?;
-
-        let stops_here = lanes.and(goes_up, up_shut)?;
-        let stops_here = self.truth(lanes, stops_here)?;
-        let stops_there = lanes.and(goes_down, down_shut)?;
-        let stops_there = self.truth(lanes, stops_there)?;
-        let stilled_here = Self::halted(lanes, here)?;
-        let stilled_there = Self::halted(lanes, there)?;
-        let kept_here = lanes.select(stops_here, stilled_here, here)?;
-        let kept_there = lanes.select(stops_there, stilled_there, there)?;
-
-        let rises = lanes.and(goes_up, up_free)?;
-        let sinks = lanes.and(goes_down, down_free)?;
-        let swapping = lanes.or(rises, sinks)?;
-        let swapping = self.truth(lanes, swapping)?;
-        Ok([
-            lanes.select(swapping, kept_there, kept_here)?,
-            lanes.select(swapping, kept_here, kept_there)?,
-        ])
-    }
-}
-
-/// [`settle_oct`] with x first, on words in the order of [`Grid3::corners`]:
-/// the words after the held step, and after the whole rule.
-fn rule<const LANES: u32>(
-    lanes: &mut Lanes<'_>,
-    oct: [Word<LANES>; CORNERS],
-) -> Result<([Word<LANES>; CORNERS], [Word<LANES>; CORNERS]), LaneError> {
-    let fields = Fields::<LANES>::new(lanes)?;
-    let axes = [Axis::X, Axis::Z];
-    let mut cells = oct;
-
-    for top in UPPER {
-        let (Some(word), Some(under)) = (word_at(&cells, top), word_at(&cells, top + LOWER)) else {
-            continue;
-        };
-        put_word(&mut cells, top, fields.hold(lanes, word, under)?);
-    }
-
-    let before = cells;
-    for (at, word) in before.iter().enumerate() {
-        let ready = fields.ready(lanes, *word)?;
-        let mut open = Vec::with_capacity(axes.len());
-        for axis in axes {
-            let Some(other) = word_at(&before, at ^ axis.bit()) else {
-                continue;
-            };
-            let free = fields.is_material(lanes, other, AIR)?;
-            let way = if at & axis.bit() == 0 {
-                axis.plus()
-            } else {
-                axis.minus()
-            };
-            open.push((free, Fields::<LANES>::started(lanes, *word, way)?));
-        }
-        let mut next = *word;
-        for (free, started) in open.into_iter().rev() {
-            let goes = lanes.and(ready, free)?;
-            let goes = fields.truth(lanes, goes)?;
-            next = lanes.select(goes, started, next)?;
-        }
-        put_word(&mut cells, at, next);
-    }
-
-    for axis in axes {
-        for low in (0..CORNERS).filter(|low| low & axis.bit() == 0) {
-            let high = low | axis.bit();
-            let (Some(here), Some(there)) = (word_at(&cells, low), word_at(&cells, high)) else {
-                continue;
-            };
-            let [here, there] = fields.along(lanes, axis, [here, there])?;
-            put_word(&mut cells, low, here);
-            put_word(&mut cells, high, there);
-        }
-    }
-
-    let straight = UPPER.map(|top| (top, top + LOWER));
-    let edges = axes.map(|axis| UPPER.map(|top| (top, LOWER + (top ^ axis.bit()))));
-    let corner = UPPER.map(|top| (top, LOWER + (top ^ CORNER)));
-    let falls = straight
-        .into_iter()
-        .chain(edges.into_iter().flatten())
-        .chain(corner);
-    for (upper, lower) in falls {
-        let (Some(up), Some(low)) = (word_at(&cells, upper), word_at(&cells, lower)) else {
-            continue;
-        };
-        let (up, low) = crate::sand::fall::<LANES>(lanes, up, low)?;
-        put_word(&mut cells, upper, up);
-        put_word(&mut cells, lower, low);
-    }
-
-    Ok((before, cells))
+    rule.emit::<LANES>(
+        lanes,
+        Oct {
+            words,
+            frame,
+            at: placing.block,
+            params: &params,
+        },
+    )
 }

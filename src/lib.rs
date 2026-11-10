@@ -10,6 +10,7 @@ pub mod marking;
 pub mod netlist;
 pub mod resident;
 pub mod rule;
+pub mod rule3;
 pub mod sand;
 pub mod sand3;
 pub mod serve;

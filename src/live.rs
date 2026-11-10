@@ -4,6 +4,7 @@ use simdr::lanes::{LaneError, Lanes, U32, Vector};
 use crate::compact::{Over, Tier, owned};
 use crate::geometry::{Emit, Placed, Plane, Space};
 use crate::layout::{AWAKE, BINDINGS, DENSE, Dimension, GRAND, HOT, PARAMS, STATE};
+use crate::rule3::Rule;
 use crate::sand::{self, Grid};
 
 pub type Loop = (Vec<Vec<u32>>, Vec<Vec<crate::Groups>>);
@@ -320,16 +321,50 @@ fn fits(operation: &'static str, grid: Grid, plan: &crate::compact::Plan) -> Res
 
 /// [`arranged3`] on the tier the plan's size pays for, as [`wired`] picks it.
 pub fn wired3(subgroup: u32, grid: Grid, plan: &crate::compact::Plan) -> Result<Loop, LaneError> {
+    wired3_by(&crate::rule3::sand::Sand, subgroup, grid, plan)
+}
+
+/// [`arranged3_by`] on the tier the plan's size pays for, as [`wired`] picks
+/// it.
+pub fn wired3_by<R: Rule>(
+    rule: &R,
+    subgroup: u32,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+) -> Result<Loop, LaneError> {
     fits("live::wired3", grid, plan)?;
-    arranged3(subgroup, grid, plan, coarse_pays(plan.blocks))
+    arranged3_by(rule, subgroup, grid, plan, coarse_pays(plan.blocks))
+}
+
+/// The sizes of the bindings of a listed engine on `plan` that steps
+/// `rule`: [`crate::compact::Plan::sizes`] with `PARAMS` grown by the
+/// rule's parameters, which start at [`crate::rule3::FIRST_PARAM`].
+#[must_use]
+pub fn sizes3<R: Rule>(rule: &R, plan: &crate::compact::Plan) -> [usize; BINDINGS as usize] {
+    let mut sizes = plan.sizes();
+    if let Some(params) = sizes.get_mut(PARAMS as usize) {
+        *params = (*params).max(crate::rule3::FIRST_PARAM) + rule.params();
+    }
+    sizes
+}
+
+/// [`arranged3_by`] under the sand and water rule.
+pub fn arranged3(
+    subgroup: u32,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+    coarse: bool,
+) -> Result<Loop, LaneError> {
+    arranged3_by(&crate::rule3::sand::Sand, subgroup, grid, plan, coarse)
 }
 
 /// The frame of the listed engine on a solid grid, the 3D counterpart of
 /// [`arranged`] without the brush and the picture: tick, decay and wipe,
-/// [`settle3`] over the listed octs, then the marks, scans and gathers that
-/// list the octs of the next frame. `plan` is laid out for
+/// [`settle3_by`] under `rule` over the listed octs, then the marks, scans
+/// and gathers that list the octs of the next frame. `plan` is laid out for
 /// [`Dimension::Three`] and holds every oct of `grid`.
-pub fn arranged3(
+pub fn arranged3_by<R: Rule>(
+    rule: &R,
     subgroup: u32,
     grid: Grid,
     plan: &crate::compact::Plan,
@@ -357,7 +392,10 @@ pub fn arranged3(
             (wipe_counts(subgroup, COUNTS)?, tiles),
             (unclaimed(subgroup, plan)?, one),
         ],
-        vec![(settle3(subgroup, grid)?, crate::compact::Plan::listed())],
+        vec![(
+            settle3_by(rule, subgroup, grid)?,
+            crate::compact::Plan::listed(),
+        )],
     ];
     if coarse {
         stages.push(vec![(
@@ -899,20 +937,26 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
     kernel.finish()
 }
 
-/// The listed settle of a solid grid: each listed entry is one oct, stepped
-/// by [`crate::sand3::settle_oct`] with 8 loads and 8 stores of `STATE`
-/// through [`crate::geometry::Solid`]. An oct that changes wakes itself and
-/// the 26 octs around it ([`crate::geometry::Space::near`]), and the frame's
-/// counts go to the [`Dimension::Three`] tally. Lanes past the list store
-/// into the spare region of `STATE`, 8 words a slot from the grid's end.
+/// The listed settle of a solid grid under the sand and water rule:
+/// [`settle3_by`] with [`crate::rule3::sand::Sand`].
 pub fn settle3(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
+    settle3_by(&crate::rule3::sand::Sand, subgroup, grid)
+}
+
+/// The listed settle of a solid grid: each listed entry is one oct, stepped
+/// by `rule` with 8 loads and 8 stores of `STATE` through
+/// [`crate::geometry::Solid`]. An oct that changes wakes itself and the 26
+/// octs around it ([`crate::geometry::Space::near`]), and the rule's counts
+/// go to the [`Dimension::Three`] tally. Lanes past the list store into the
+/// spare region of `STATE`, 8 words a slot from the grid's end.
+pub fn settle3_by<R: Rule>(rule: &R, subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
     solid("live::settle3", grid)?;
     match subgroup {
-        4 => listed3::<4>(subgroup, grid),
-        8 => listed3::<8>(subgroup, grid),
-        16 => listed3::<16>(subgroup, grid),
-        32 => listed3::<32>(subgroup, grid),
-        64 => listed3::<64>(subgroup, grid),
+        4 => listed3::<4, R>(rule, subgroup, grid),
+        8 => listed3::<8, R>(rule, subgroup, grid),
+        16 => listed3::<16, R>(rule, subgroup, grid),
+        32 => listed3::<32, R>(rule, subgroup, grid),
+        64 => listed3::<64, R>(rule, subgroup, grid),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -920,8 +964,12 @@ pub fn settle3(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
     }
 }
 
-fn listed3<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
-    use crate::sand3::{CORNERS, placed, stepped};
+fn listed3<const LANES: u32, R: Rule>(
+    rule: &R,
+    subgroup: u32,
+    grid: Grid,
+) -> Result<Vec<u32>, LaneError> {
+    use crate::sand3::{CORNERS, Given, frame_and_params, placed, ruled};
 
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -932,8 +980,8 @@ fn listed3<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, Lane
     let base = kernel.module().i_mul(uint, group, width)?;
     let slot = kernel.module().i_add(uint, base, lane)?;
 
+    let (frame, params) = frame_and_params(&mut kernel, rule)?;
     let head = kernel.module().constant_u32(0)?;
-    let frame = kernel.load_at(PARAMS, head)?;
     let grand = kernel.load_at(GRAND, head)?;
     let second = kernel.module().constant_u32(1)?;
     let dump_base = kernel.load_at(PARAMS, second)?;
@@ -961,45 +1009,29 @@ fn listed3<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, Lane
         placed::<LANES>(&mut lanes, grid, oct, frame)?
     };
 
-    let mut held = [frame; CORNERS];
-    for (word, place) in held.iter_mut().zip(&placing.places) {
+    let mut loaded = [frame; CORNERS];
+    for (word, place) in loaded.iter_mut().zip(&placing.places) {
         *word = kernel.load_at(STATE, place.id())?;
     }
 
     let (settled, counted, touched) = {
         let mut lanes = kernel.lanes()?;
-        let step = stepped::<LANES>(&mut lanes, frame, held)?;
+        let given = Given {
+            frame,
+            params: &params,
+        };
+        let step = ruled::<LANES, R>(&mut lanes, rule, &placing, loaded, given)?;
         let one = lanes.splat_bits::<U32, LANES>(1)?;
         let none = lanes.splat_bits::<U32, LANES>(0)?;
 
-        let mut count = none;
-        for (before, after) in step.held.into_iter().zip(step.ruled) {
-            let same = lanes.equal(before, after)?;
-            let differs = lanes.select(same, none, one)?;
-            count = lanes.add(count, differs)?;
-        }
-
         let mut touched = none;
-        for (before, after) in step.loaded.into_iter().zip(step.out) {
+        for (before, after) in loaded.into_iter().zip(step.out) {
+            let before = lanes.splat_id::<U32, LANES>(before)?;
             let same = lanes.equal(before, after)?;
             let differs = lanes.select(same, none, one)?;
             touched = lanes.add(touched, differs)?;
         }
-
-        let water = lanes.splat_bits::<U32, LANES>(sand::WATER)?;
-        let grain = lanes.splat_bits::<U32, LANES>(sand::SAND)?;
-        let mut wet = none;
-        let mut dry = none;
-        for cell in step.out {
-            let kind = sand::material::<LANES>(&mut lanes, cell)?;
-            let is_wet = lanes.equal(kind, water)?;
-            let is_dry = lanes.equal(kind, grain)?;
-            let add_wet = lanes.select(is_wet, one, none)?;
-            let add_dry = lanes.select(is_dry, one, none)?;
-            wet = lanes.add(wet, add_wet)?;
-            dry = lanes.add(dry, add_dry)?;
-        }
-        (step.out, [count, wet, dry], touched)
+        (step.out, step.counts, touched)
     };
 
     let spare = {
@@ -1046,10 +1078,12 @@ struct Tallying<const LANES: u32, const AXES: usize> {
     inside: Vector<U32, LANES>,
 }
 
-/// Adds a frame's counts to `TALLY`: the cells that moved, the wet and the
-/// dry cells, the moved cells weighted by each axis of their block shifted
-/// down by [`COARSE`](crate::layout::COARSE), and the blocks that moved at
-/// all. That is `3 + AXES + 1` words, the dimension's tally.
+/// Adds a frame's counts to `TALLY`: three counts (in 2D the cells that
+/// moved, the wet and the dry cells; in 3D the rule's three tally words,
+/// [`crate::rule3::Ruled::counts`]), the first count weighted by each axis
+/// of its block shifted down by [`COARSE`](crate::layout::COARSE), and the
+/// blocks whose first count is not zero. That is `3 + AXES + 1` words, the
+/// dimension's tally.
 fn tally<const LANES: u32, const AXES: usize>(
     kernel: &mut Kernel<U32>,
     what: Tallying<LANES, AXES>,
