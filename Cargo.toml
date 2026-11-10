@@ -41,6 +41,10 @@ name = "pour"
 required-features = ["window"]
 
 [[bin]]
+name = "pour3"
+required-features = ["window"]
+
+[[bin]]
 name = "spike"
 required-features = ["window"]
 
