@@ -977,3 +977,75 @@ fn params_read(words: &[u32]) -> usize {
         .filter(|(code, operands)| *code == 61 && chains.contains(&operands[2]))
         .count()
 }
+
+/// Worlds with fewer octs than a subgroup, or one oct along an axis, where
+/// the 27 octs a change wakes are partly or wholly the same oct.
+const SMALL: [(u32, u32, u32); 6] = [
+    (2, 2, 2),
+    (4, 4, 4),
+    (2, 8, 4),
+    (8, 8, 2),
+    (32, 2, 8),
+    (2, 2, 64),
+];
+
+#[test]
+fn heat_listed_and_whole_equal_the_reference_on_small_and_thin_worlds() {
+    let subject = heated();
+    let Some(host) = device("heat small") else {
+        return;
+    };
+    for shape in SMALL {
+        for coarse in TIERS {
+            let Some(mut engine) = Engine::new(&host, &subject, shape, coarse) else {
+                continue;
+            };
+            for seed in SEEDS {
+                let first = random(&subject, engine.reference, seed);
+                engine.restart(&first, label("heat small", shape, coarse, seed));
+                engine.run(FRAMES, 1);
+                let room = heat_room(engine.reference, seed);
+                engine.restart(&room, label("heat small room", shape, coarse, seed));
+                engine.run(FRAMES, 1);
+            }
+        }
+    }
+}
+
+/// Words with every bit at random, so temperatures reach the top and kinds
+/// past the known ones turn up, under parameters at their edges: fuel that
+/// is always past ignition and always or never lucky, a flare past the top,
+/// and the frame counter wrapping.
+#[test]
+fn heat_listed_and_whole_equal_the_reference_on_wild_words_and_edge_parameters() {
+    let Some(host) = device("heat wild") else {
+        return;
+    };
+    for params in [
+        [0, 16, u32::MAX],
+        [0, 0, 0],
+        [u32::MAX, 0, 0],
+        [heat::TOP, 8, 1],
+        [1, 1, heat::TOP],
+    ] {
+        let subject = Subject {
+            name: "heat wild",
+            params: params.to_vec(),
+            cell: |state| next(state) as u32,
+            ..heated()
+        };
+        for shape in [(16, 16, 16), (64, 32, 16)] {
+            for coarse in TIERS {
+                let Some(mut engine) = Engine::new(&host, &subject, shape, coarse) else {
+                    continue;
+                };
+                for (seed, first) in [(SEEDS[0], 0), (SEEDS[1], u32::MAX - 31)] {
+                    let start = random(&subject, engine.reference, seed);
+                    let named = format!("heat wild {params:?}");
+                    engine.restart_at(&start, label(&named, shape, coarse, seed), first);
+                    engine.run(FRAMES, 1);
+                }
+            }
+        }
+    }
+}
