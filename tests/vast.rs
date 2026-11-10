@@ -4,15 +4,22 @@ mod common;
 
 use common::device;
 
-use grit::{Error, Groups};
+use grit::{Error, Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
 const VAST: usize = 1024 * 1024 * 1023 / 4 * 4;
 
-const WHERE_AT: usize = 512 * 1024 * 1024;
-
 const OUT: usize = 64;
+
+fn vast(host: &Host) -> usize {
+    let words = host.limits().storage_range / size_of::<u32>() as u64;
+    VAST.min(usize::try_from(words).unwrap_or(usize::MAX))
+}
+
+fn where_at(vast: usize) -> usize {
+    (vast - 1).next_power_of_two() / 2
+}
 
 fn reaching(subgroup: u32, at: usize) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 2))?;
@@ -53,22 +60,32 @@ fn a_window_of_a_buffer_larger_than_the_card() {
         return;
     }
     let width = host.width();
-    let looking = peeking(width, WHERE_AT).unwrap();
-    let module = reaching(width, WHERE_AT).unwrap();
+    let vast = vast(&host);
+    let where_at = where_at(vast);
+    let looking = peeking(width, where_at).unwrap();
+    let module = reaching(width, where_at).unwrap();
     let mut held = host
-        .resident_vast(&[OUT, VAST], &[&looking, &module], 1)
+        .resident_vast(&[OUT, vast], &[&looking, &module], 1)
         .unwrap();
 
     let page = held.page(1).unwrap();
     eprintln!(
         "{} {width} {} {} {}",
         host.name(),
-        VAST / (1024 * 1024 / 4),
+        vast / (1024 * 1024 / 4),
         host.heap() / (1 << 20),
         page / 256
     );
     assert!(held.page(0).is_none());
     assert_eq!(held.bound(1), 0);
+
+    let limits = host.limits();
+    let bytes = vast as u64 * size_of::<u32>() as u64;
+    assert!(bytes <= limits.storage_range);
+    if limits.storage_range > limits.allocation {
+        assert!(bytes > limits.allocation, "{bytes} {}", limits.allocation);
+    }
+    assert!(where_at + page <= vast);
 
     if host.strict() {
         held.write(0, &[0xDEAD_BEEF; OUT]).unwrap();
@@ -79,9 +96,9 @@ fn a_window_of_a_buffer_larger_than_the_card() {
         }
     }
 
-    held.bind(1, WHERE_AT, page).unwrap();
+    held.bind(1, where_at, page).unwrap();
     assert_eq!(held.bound(1), page);
-    eprintln!("{} {WHERE_AT} {}", page / 256, WHERE_AT / (1024 * 1024 / 4));
+    eprintln!("{} {where_at} {}", page / 256, where_at / (1024 * 1024 / 4));
 
     held.write(0, &[0xDEAD_BEEF; OUT]).unwrap();
     held.frame(&[Groups::Fixed(0), Groups::Fixed(1)]).unwrap();
@@ -91,7 +108,7 @@ fn a_window_of_a_buffer_larger_than_the_card() {
     }
     eprintln!("{width}");
 
-    held.unbind(1, WHERE_AT, page).unwrap();
+    held.unbind(1, where_at, page).unwrap();
     assert_eq!(held.bound(1), 0);
 }
 
@@ -105,8 +122,9 @@ fn a_bind_that_does_not_fit_says_so() {
         return;
     }
     let width = host.width();
+    let vast = vast(&host);
     let module = reaching(width, 0).unwrap();
-    let mut held = host.resident_vast(&[OUT, VAST], &[&module], 1).unwrap();
+    let mut held = host.resident_vast(&[OUT, vast], &[&module], 1).unwrap();
     let page = held.page(1).unwrap();
 
     assert!(matches!(held.bind(1, 1, page), Err(Error::Overrun { .. })));
@@ -115,12 +133,12 @@ fn a_bind_that_does_not_fit_says_so() {
         Err(Error::Overrun { .. })
     ));
     assert!(matches!(
-        held.bind(1, VAST, page),
+        held.bind(1, vast, page),
         Err(Error::Overrun { index: 1, needed, held: has })
-            if needed == VAST + page && has == VAST
+            if needed == vast + page && has == vast
     ));
     assert!(matches!(
-        held.bind(1, VAST, page),
+        held.bind(1, vast, page),
         Err(Error::Overrun { .. })
     ));
     assert!(matches!(held.bind(0, 0, page), Err(Error::NoSparse)));
@@ -141,12 +159,14 @@ fn binding_the_same_window_twice_does_not_leak() {
         return;
     }
     let width = host.width();
-    let module = reaching(width, WHERE_AT).unwrap();
-    let mut held = host.resident_vast(&[OUT, VAST], &[&module], 1).unwrap();
+    let vast = vast(&host);
+    let where_at = where_at(vast);
+    let module = reaching(width, where_at).unwrap();
+    let mut held = host.resident_vast(&[OUT, vast], &[&module], 1).unwrap();
     let page = held.page(1).unwrap();
 
     for _ in 0..8 {
-        held.bind(1, WHERE_AT, page).unwrap();
+        held.bind(1, where_at, page).unwrap();
         assert_eq!(held.bound(1), page);
     }
     held.write(0, &[0; OUT]).unwrap();
@@ -165,24 +185,26 @@ fn unbinding_one_window_leaves_its_neighbour_where_it_was() {
         return;
     }
     let width = host.width();
-    let looking = peeking(width, WHERE_AT).unwrap();
-    let module = reaching(width, WHERE_AT).unwrap();
+    let vast = vast(&host);
+    let where_at = where_at(vast);
+    let looking = peeking(width, where_at).unwrap();
+    let module = reaching(width, where_at).unwrap();
     let mut held = host
-        .resident_vast(&[OUT, VAST], &[&looking, &module], 1)
+        .resident_vast(&[OUT, vast], &[&looking, &module], 1)
         .unwrap();
 
     let page = held.page(1).unwrap();
-    held.bind(1, WHERE_AT, page).unwrap();
-    held.bind(1, WHERE_AT + page, page).unwrap();
+    held.bind(1, where_at, page).unwrap();
+    held.bind(1, where_at + page, page).unwrap();
     assert_eq!(held.bound(1), page * 2);
 
-    held.unbind(1, WHERE_AT, page).unwrap();
+    held.unbind(1, where_at, page).unwrap();
     assert_eq!(held.bound(1), page);
 
-    held.bind(1, WHERE_AT, page).unwrap();
+    held.bind(1, where_at, page).unwrap();
     assert_eq!(held.bound(1), page * 2);
 
-    held.unbind(1, WHERE_AT, page * 2).unwrap();
+    held.unbind(1, where_at, page * 2).unwrap();
     assert_eq!(held.bound(1), 0);
 }
 
@@ -196,10 +218,12 @@ fn a_window_ending_on_the_last_word_fits_and_a_window_of_nothing_binds_nothing()
         return;
     }
     let width = host.width();
-    let looking = peeking(width, WHERE_AT).unwrap();
-    let module = reaching(width, WHERE_AT).unwrap();
+    let vast = vast(&host);
+    let where_at = where_at(vast);
+    let looking = peeking(width, where_at).unwrap();
+    let module = reaching(width, where_at).unwrap();
     let mut held = host
-        .resident_vast(&[OUT, VAST], &[&looking, &module], 1)
+        .resident_vast(&[OUT, vast], &[&looking, &module], 1)
         .unwrap();
 
     let page = held.page(1).unwrap();
@@ -208,7 +232,7 @@ fn a_window_ending_on_the_last_word_fits_and_a_window_of_nothing_binds_nothing()
     held.bind(1, 0, 0).unwrap();
     assert_eq!(held.bound(1), 0);
 
-    let last = (VAST / page) * page - page;
+    let last = (vast / page) * page - page;
     held.bind(1, last, page).unwrap();
     assert_eq!(held.bound(1), page);
     held.unbind(1, last, page).unwrap();
@@ -225,23 +249,25 @@ fn a_window_is_not_moved_under_a_frame_still_running() {
         return;
     }
     let width = host.width();
-    let module = reaching(width, WHERE_AT).unwrap();
-    let mut held = host.resident_vast(&[OUT, VAST], &[&module], 1).unwrap();
+    let vast = vast(&host);
+    let where_at = where_at(vast);
+    let module = reaching(width, where_at).unwrap();
+    let mut held = host.resident_vast(&[OUT, vast], &[&module], 1).unwrap();
     let page = held.page(1).unwrap();
-    held.bind(1, WHERE_AT, page).unwrap();
+    held.bind(1, where_at, page).unwrap();
     held.write(0, &[0; OUT]).unwrap();
 
     let running = held.submit(&[&[Groups::Fixed(1)]]).unwrap();
     assert!(matches!(
-        held.bind(1, WHERE_AT + page, page),
+        held.bind(1, where_at + page, page),
         Err(Error::StillInFlight)
     ));
     assert!(matches!(
-        held.unbind(1, WHERE_AT, page),
+        held.unbind(1, where_at, page),
         Err(Error::StillInFlight)
     ));
     held.wait(running).unwrap();
 
-    held.unbind(1, WHERE_AT, page).unwrap();
+    held.unbind(1, where_at, page).unwrap();
     assert_eq!(held.bound(1), 0);
 }
