@@ -107,8 +107,8 @@ pub const fn lattice(grid: Grid3, oct: u32) -> [u32; 3] {
 
 /// One frame of the whole torus on the CPU under `rule`: every oct of the
 /// frame's phase steps once with [`Rule::step`], given `params` as its
-/// parameters (a missing word reads as 0). A cell index past `cells` reads
-/// as [`crate::sand::WALL`] and is never written.
+/// parameters (a missing word reads as 0). An oct with a cell past `cells`
+/// is not stepped, so the engine makes up no word for a rule.
 #[must_use]
 pub fn reference<R: Rule>(
     rule: &R,
@@ -121,11 +121,14 @@ pub fn reference<R: Rule>(
         .map(|which| crate::rule3::param(params, which))
         .collect();
     let mut out = cells.to_vec();
-    for oct in 0..grid.octs() {
+    'octs: for oct in 0..grid.octs() {
         let places = grid.corners(frame, oct);
-        let mut words = [WALL; CORNERS];
+        let mut words = [0; CORNERS];
         for (slot, place) in words.iter_mut().zip(places) {
-            *slot = out.get(place).copied().unwrap_or(WALL);
+            let Some(&word) = out.get(place) else {
+                continue 'octs;
+            };
+            *slot = word;
         }
         let ruled = rule.step(Oct {
             words,
@@ -147,7 +150,11 @@ pub fn reference<R: Rule>(
 /// and is never written.
 #[must_use]
 pub fn settle_reference3(grid: Grid3, frame: u32, cells: &[u32]) -> Vec<u32> {
-    reference(&Sand, grid, frame, cells, &[])
+    let mut walled = cells.to_vec();
+    walled.resize(walled.len().max(grid.cells()), WALL);
+    let mut out = reference(&Sand, grid, frame, &walled, &[]);
+    out.truncate(cells.len());
+    out
 }
 
 /// Why [`settle`] or [`Spread::of`] refuses a grid that is not solid.

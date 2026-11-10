@@ -1049,3 +1049,33 @@ fn heat_listed_and_whole_equal_the_reference_on_wild_words_and_edge_parameters()
         }
     }
 }
+
+/// The generic reference makes up no word: an oct with a cell past a short
+/// world is left as it is. The sand reference keeps reading such a cell as
+/// a wall, as it always has.
+#[test]
+fn the_reference_steps_no_oct_that_reaches_past_a_short_world() {
+    let grid = Grid3::new(4, 4, 4).unwrap();
+    let full: Vec<u32> = (0..grid.cells())
+        .map(|at| heat::cell(heat::AIR, u32::try_from(at).unwrap() * 37))
+        .collect();
+    let short = &full[..40];
+    let stepped = reference(&Heat, grid, 0, short, &heat::TUNED);
+    assert_eq!(stepped.len(), short.len());
+    let whole = reference(&Heat, grid, 0, &full, &heat::TUNED);
+    for oct in 0..grid.octs() {
+        let places = grid.corners(0, oct);
+        let inside = places.iter().all(|&at| at < short.len());
+        for at in places.into_iter().filter(|&at| at < short.len()) {
+            let want = if inside { whole[at] } else { short[at] };
+            assert_eq!(stepped[at], want, "oct {oct} cell {at}");
+        }
+    }
+    let mut sand_world = vec![sand2::SAND; 40];
+    sand_world[0] = sand2::AIR;
+    let mut padded = sand_world.clone();
+    padded.resize(grid.cells(), sand2::WALL);
+    let mut wanted = sand3::settle_reference3(grid, 0, &padded);
+    wanted.truncate(40);
+    assert_eq!(sand3::settle_reference3(grid, 0, &sand_world), wanted);
+}
