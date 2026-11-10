@@ -208,10 +208,39 @@ fn differ(listed: &[u32], whole: &[u32], grid: Grid) {
     }
 }
 
+/// The frame a caller who brings its own middle builds from `keeping`, with
+/// the brush dispatched the way `keeping` hands it over.
+fn kept(width: u32, grid: Grid, plan: &Plan, coarse: bool) -> grit::live::Loop {
+    let keeping = grit::live::keeping(width, plan, coarse).unwrap();
+    let mut stages: grit::live::Stages =
+        vec![vec![(grit::live::tick(width).unwrap(), Groups::Fixed(1))]];
+    stages.extend(keeping.before);
+    stages.push(vec![(
+        sand::brush(width, grid, true).unwrap(),
+        keeping.brush,
+    )]);
+    stages.push(vec![(
+        grit::live::settle(width, grid).unwrap(),
+        keeping.over,
+    )]);
+    stages.extend(keeping.after);
+    grit::live::staged(stages)
+}
+
+fn arranged(width: u32, grid: Grid, plan: &Plan, coarse: bool) -> grit::live::Loop {
+    grit::live::arranged(width, grid, plan, None, coarse).unwrap()
+}
+
+type Building = fn(u32, Grid, &Plan, bool) -> grit::live::Loop;
+
 fn engine(host: &grit::Host, grid: Grid, coarse: bool) -> Engine<'_> {
+    engine_of(host, grid, coarse, arranged)
+}
+
+fn engine_of(host: &grit::Host, grid: Grid, coarse: bool, build: Building) -> Engine<'_> {
     let width = host.width();
     let plan = plan_for(width, grid);
-    let (passes, stages) = grit::live::arranged(width, grid, &plan, None, coarse).unwrap();
+    let (passes, stages) = build(width, grid, &plan, coarse);
     let whole = [
         grit::live::tick(width).unwrap(),
         sand::brush(width, grid, false).unwrap(),
@@ -264,13 +293,13 @@ const IDLE: [(&str, [u32; 4]); 4] = [
 /// After a quiet frame with an idle brush, nothing a brush seat writes was
 /// written: the brush's count reads zero groups, and none of the scratch
 /// slots in `AWAKE` that every seat which wakes nothing marks holds a mark.
-fn an_idle_brush_runs_no_seat(label: &str, coarse: bool) {
+fn an_idle_brush_runs_no_seat(label: &str, coarse: bool, build: Building) {
     let Some(host) = device(label) else {
         return;
     };
     let width = host.width();
     for (name, idle) in IDLE {
-        let mut engine = engine(&host, ROOM, coarse);
+        let mut engine = engine_of(&host, ROOM, coarse, build);
         quiet(&mut engine, idle);
 
         let plan = engine.plan;
@@ -301,7 +330,11 @@ fn an_idle_brush_runs_no_seat(label: &str, coarse: bool) {
         engine.brush([128, 30, 36, SAND]);
         engine.frame();
         let args = read(&mut engine.live, DENSE, args_at(&plan), 3);
-        assert_eq!(args[1..], [1, 1], "{label} {name}: painting brush count");
+        assert_eq!(
+            args,
+            [sand::BOX * sand::BOX / width, 1, 1],
+            "{label} {name}: painting brush count"
+        );
         println!(
             "{label} {name} {} sg={width}: idle brush ran no seat",
             host.name()
@@ -311,12 +344,12 @@ fn an_idle_brush_runs_no_seat(label: &str, coarse: bool) {
 
 #[test]
 fn an_idle_brush_runs_no_seat_on_the_fine_tier() {
-    an_idle_brush_runs_no_seat("idle fine", false);
+    an_idle_brush_runs_no_seat("idle fine", false, arranged);
 }
 
 #[test]
 fn an_idle_brush_runs_no_seat_on_the_coarse_tier() {
-    an_idle_brush_runs_no_seat("idle coarse", true);
+    an_idle_brush_runs_no_seat("idle coarse", true, arranged);
 }
 
 /// The full count of seats once the brush paints, read back after the frame
@@ -470,10 +503,14 @@ fn seam(frame: u32) -> [u32; 4] {
 /// A brush that switches between painting and idle every frame, in every
 /// way it can be idle, agrees with the whole grid frame by frame.
 fn switching(label: &str, coarse: bool, brushing: Brushing, in_flight: bool) {
+    switching_in(label, coarse, brushing, in_flight, arranged);
+}
+
+fn switching_in(label: &str, coarse: bool, brushing: Brushing, in_flight: bool, build: Building) {
     let Some(host) = device(label) else {
         return;
     };
-    let mut engine = engine(&host, ROOM, coarse);
+    let mut engine = engine_of(&host, ROOM, coarse, build);
     let mut frame = 0;
     while frame < 120 {
         engine.brush(brushing(frame));
@@ -507,4 +544,48 @@ fn a_flickering_brush_agrees_with_two_frames_in_flight() {
 fn a_flickering_brush_at_the_seam_agrees_on_both_tiers() {
     switching("seam fine", false, seam, false);
     switching("seam coarse", true, seam, true);
+}
+
+#[test]
+fn keeping_hands_over_the_brush_count_and_the_pass_that_writes_it() {
+    for (width, grid, plan, coarse) in arrangements() {
+        let keeping = grit::live::keeping(width, &plan, coarse).unwrap();
+        let label = format!(
+            "width {width} grid {}x{} coarse {coarse}",
+            grid.wide, grid.deep
+        );
+        assert_eq!(
+            keeping.brush,
+            Groups::From {
+                binding: DENSE as usize,
+                at: args_at(&plan),
+            },
+            "{label}"
+        );
+        let writer = grit::live::unclaimed(width, &plan).unwrap();
+        let held = keeping
+            .before
+            .iter()
+            .flatten()
+            .filter(|(module, _)| *module == writer)
+            .count();
+        assert_eq!(held, 1, "{label}");
+        let after_reads = keeping.after.iter().flatten().any(|(_, groups)| {
+            matches!(groups, Groups::From { binding, at }
+                if *binding == DENSE as usize && *at == args_at(&plan))
+        });
+        assert!(!after_reads, "{label}");
+    }
+}
+
+#[test]
+fn an_idle_brush_in_a_kept_frame_runs_no_seat() {
+    an_idle_brush_runs_no_seat("kept idle fine", false, kept);
+    an_idle_brush_runs_no_seat("kept idle coarse", true, kept);
+}
+
+#[test]
+fn a_flickering_brush_in_a_kept_frame_agrees_with_the_whole_grid() {
+    switching_in("kept flicker fine", false, flicker, false, kept);
+    switching_in("kept flicker coarse", true, flicker, true, kept);
 }

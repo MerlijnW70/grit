@@ -636,6 +636,60 @@ pub const BOX: u32 = 32;
 /// How many seats the brush dispatches, whatever the grid measures.
 pub const SEATS: usize = (BOX * BOX) as usize;
 
+/// Where in `DENSE` the brush's dispatch count lies: the three words right
+/// after the claim count at the dump base, which no list reaches and which
+/// `Plan::sizes` always holds.
+#[must_use]
+pub fn counted_at(plan: &crate::compact::Plan) -> u32 {
+    plan.dump().saturating_add(1)
+}
+
+/// The brush's dispatch in the engine's frame. The count is the one
+/// [`reckon`] writes earlier in the same frame, so a brush that paints
+/// nothing is dispatched with no group at all.
+#[must_use]
+pub fn seats(plan: &crate::compact::Plan) -> crate::Groups {
+    crate::Groups::From {
+        binding: crate::layout::DENSE as usize,
+        at: counted_at(plan) as usize,
+    }
+}
+
+/// Writes the brush's dispatch count at `at` in `DENSE`: `SEATS / subgroup`
+/// groups while the brush has reach and pours something, and none while its
+/// reach is 0 or it pours `AIR`. Those are the two words every seat of the
+/// brush tests before it paints or claims a cell, so a brush they stop runs
+/// no seat and leaves the world as it was.
+pub fn reckon(kernel: &mut Kernel<U32>, subgroup: u32, at: u32) -> Result<(), LaneError> {
+    let word = |kernel: &mut Kernel<U32>, part: usize| -> Result<Id, LaneError> {
+        let slot = kernel
+            .module()
+            .constant_u32(u32::try_from(BRUSH + part).unwrap_or(0))?;
+        kernel.load_at(PARAMS, slot)
+    };
+    let how_wide = word(kernel, 2)?;
+    let what_of = word(kernel, 3)?;
+
+    let groups = {
+        let mut lanes = kernel.lanes()?;
+        let reach = lanes.splat_id::<U32, 1>(how_wide)?;
+        let material = lanes.splat_id::<U32, 1>(what_of)?;
+        let none = lanes.splat_bits::<U32, 1>(0)?;
+        let every = lanes.splat_bits::<U32, 1>(BOX * BOX / subgroup)?;
+        let wide = lanes.greater_than(reach, none)?;
+        let pouring = lanes.greater_than(material, none)?;
+        let some = lanes.select(wide, every, none)?;
+        lanes.select(pouring, some, none)?
+    };
+
+    let one = kernel.module().constant_u32(1)?;
+    for (step, value) in [(0, groups.id()), (1, one), (2, one)] {
+        let slot = kernel.module().constant_u32(at.saturating_add(step))?;
+        kernel.store_at(crate::layout::DENSE, slot, value)?;
+    }
+    Ok(())
+}
+
 pub fn brush(subgroup: u32, grid: Grid, waking: bool) -> Result<Vec<u32>, LaneError> {
     match subgroup {
         4 => brushed::<4>(subgroup, grid, waking),
@@ -849,7 +903,9 @@ fn reaches<const LANES: u32>(
 /// The list, `DENSE` below `GRAND`, is in ascending order and is searched by
 /// halving. The quads claimed go after it, their count in `DENSE` at the
 /// dump base, and the settle's dispatch grows by a group for every
-/// `subgroup` of them.
+/// `subgroup` of them. A seat that claims nothing writes 1 over the last
+/// word of the brush's own dispatch count, which already holds 1, so the
+/// count this dispatch was read from keeps its value.
 fn claim<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     subgroup: u32,
@@ -987,11 +1043,12 @@ fn claim<const LANES: u32>(
         let missing = lanes.select(missing, one, none)?;
         let claimed = lanes.mul(mine, missing)?;
         let start = lanes.splat_id::<U32, LANES>(dump)?;
-        (claimed, lanes.add(start, one)?)
+        let last = lanes.splat_bits::<U32, LANES>(3)?;
+        (claimed, lanes.add(start, last)?)
     };
 
     let before = kernel.atomic_add_at(DENSE, dump, claimed.id())?;
-    let (into, grows) = {
+    let (into, what, grows) = {
         let mut lanes = kernel.lanes()?;
         let before = lanes.splat_id::<U32, LANES>(before)?;
         let total = lanes.splat_id::<U32, LANES>(grand)?;
@@ -1000,12 +1057,13 @@ fn claim<const LANES: u32>(
         let at = lanes.add(total, before)?;
         let taking = lanes.greater_than(claimed, none)?;
         let into = lanes.select(taking, at, junk)?;
+        let what = lanes.select(taking, quad, one)?;
         let start = low_bits::<LANES>(&mut lanes, at, subgroup.trailing_zeros())?;
         let start = lanes.equal(start, none)?;
         let start = lanes.select(start, one, none)?;
-        (into, lanes.mul(start, claimed)?)
+        (into, what, lanes.mul(start, claimed)?)
     };
-    kernel.store_at(DENSE, into.id(), quad.id())?;
+    kernel.store_at(DENSE, into.id(), what.id())?;
     let _ = kernel.atomic_add_at(INDIRECT, head, grows.id())?;
     Ok(())
 }

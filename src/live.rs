@@ -41,6 +41,7 @@ pub struct Keeping {
     pub before: Stages,
     pub after: Stages,
     pub over: crate::Groups,
+    pub brush: crate::Groups,
 }
 
 pub fn keeping(
@@ -64,7 +65,7 @@ pub fn keeping(
         (decay(subgroup, listed)?, hot),
         (wipe(subgroup)?, one),
         (wipe_counts(subgroup, COUNTS)?, tiles),
-        (unclaimed(subgroup)?, one),
+        (unclaimed(subgroup, plan)?, one),
     ]];
 
     let mut after: Stages = Vec::new();
@@ -122,6 +123,7 @@ pub fn keeping(
         before,
         after,
         over: crate::compact::Plan::listed(),
+        brush: sand::seats(plan),
     })
 }
 
@@ -238,12 +240,9 @@ pub fn arranged(
             (decay(subgroup, listed)?, hot),
             (wipe(subgroup)?, one),
             (wipe_counts(subgroup, COUNTS)?, tiles),
-            (unclaimed(subgroup)?, one),
+            (unclaimed(subgroup, plan)?, one),
         ],
-        vec![(
-            sand::brush(subgroup, grid, true)?,
-            Groups::Counting(sand::BOX * sand::BOX / subgroup),
-        )],
+        vec![(sand::brush(subgroup, grid, true)?, sand::seats(plan))],
         vec![(settle(subgroup, grid)?, crate::compact::Plan::listed())],
         looking,
         hot_scan_counts,
@@ -481,13 +480,16 @@ fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, Lane
 }
 
 /// Zeroes the count of quads the brush adds to the list, which is kept in
-/// `DENSE` at the dump base, past the end of any list.
-pub fn unclaimed(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+/// `DENSE` at the dump base, past the end of any list, and writes the
+/// brush's dispatch count for this frame right after it, at
+/// [`sand::counted_at`]: no group while the brush paints nothing.
+pub fn unclaimed(subgroup: u32, plan: &crate::compact::Plan) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, 1, BINDINGS))?;
     let second = kernel.module().constant_u32(1)?;
     let nothing = kernel.module().constant_u32(0)?;
     let at = kernel.load_at(PARAMS, second)?;
     kernel.store_at(DENSE, at, nothing)?;
+    sand::reckon(&mut kernel, subgroup, sand::counted_at(plan))?;
     kernel.finish()
 }
 
