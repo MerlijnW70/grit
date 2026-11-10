@@ -7,6 +7,7 @@ use common::device;
 use grit::compact::Plan;
 use grit::layout::{BINDINGS, Dimension, GRAND, PARAMS, PIXELS, STATE, TALLY};
 use grit::live;
+use grit::rule3::code::{self, Code};
 use grit::rule3::heat::{self, Heat};
 use grit::rule3::sand::Sand;
 use grit::rule3::{CORNERS, FIRST_PARAM, Oct, Rule, Ruled, Word, noise, noise_emitted};
@@ -198,6 +199,85 @@ fn heated() -> Subject<Heat> {
         calm: heat::cell(heat::AIR, ROOM_HEAT),
         room: heat_room,
         poured: heat_poured,
+    }
+}
+
+/// Every instruction, the inert ones too, with every way, the six and the
+/// two that are no way, any payload and the spare bit: mostly empty cells,
+/// packets and data, so cells meet and claims conflict.
+fn code_cell(state: &mut u64) -> u32 {
+    let roll = next(state);
+    let instruction = match roll % 50 {
+        0..20 => code::NOP,
+        20..27 => code::DATA,
+        27..36 => code::MOVE,
+        36 => code::COPY,
+        37..42 => code::ADD,
+        42..45 => code::TURN,
+        45..48 => code::HALT,
+        _ => code::INSTRUCTIONS + ((roll >> 40) % 9) as u32,
+    };
+    let way = ((roll >> 8) % 8) as u32;
+    let payload = (roll >> 16) as u32;
+    let spare = ((roll >> 50) & 1) as u32;
+    code::word(instruction, way, payload) | (spare << 31)
+}
+
+/// The sand room's walls as HALT cells, with DATA, packets and ADD cells in
+/// its upper half. Each packet runs into a wall, a cell it cannot enter or
+/// a packet coming the other way, so the room falls quiet.
+fn code_room(grid: Grid3, seed: u64) -> Vec<u32> {
+    let mut state = seed;
+    let mut cells = vec![code::word(code::NOP, 0, 0); grid.cells()];
+    for z in 0..grid.tall {
+        for y in 0..grid.deep {
+            for x in 0..grid.wide {
+                let wall = y + 1 == grid.deep || x == 0 || z == 0;
+                let roll = next(&mut state);
+                let way = ((roll >> 8) % u64::from(code::WAYS)) as u32;
+                let payload = (roll >> 16) as u32;
+                cells[grid.index(x, y, z)] = if wall {
+                    code::word(code::HALT, 0, 0)
+                } else if y < grid.deep / 2 && roll.is_multiple_of(4) {
+                    let instruction =
+                        [code::DATA, code::DATA, code::MOVE, code::ADD][((roll >> 4) % 4) as usize];
+                    code::word(instruction, way, payload)
+                } else {
+                    code::word(code::NOP, 0, 0)
+                };
+            }
+        }
+    }
+    cells
+}
+
+/// Two packets, a turn, an ADD by a DATA cell and a COPY that floods what
+/// of the room is still empty.
+fn code_poured(grid: Grid3) -> Vec<(u32, u32)> {
+    let mut cells = Vec::new();
+    for (dx, dz, word) in [
+        (0, 0, code::word(code::MOVE, code::PLUS_X, 0x11)),
+        (1, 0, code::word(code::TURN, code::MINUS_Z, 0)),
+        (0, 1, code::word(code::ADD, code::PLUS_X, 5)),
+        (1, 1, code::word(code::DATA, 0, 6)),
+        (2, 1, code::word(code::COPY, 0, 0x77)),
+        (3, 0, code::word(code::MOVE, code::MINUS_X, 0x22)),
+    ] {
+        let at = grid.index(grid.wide / 2 + dx, 1, grid.tall / 2 + dz);
+        cells.push((u32::try_from(at).unwrap(), word));
+    }
+    cells
+}
+
+fn coded() -> Subject<Code> {
+    Subject {
+        name: "code",
+        rule: Code,
+        params: Vec::new(),
+        cell: code_cell,
+        calm: code::word(code::NOP, 0, 0),
+        room: code_room,
+        poured: code_poured,
     }
 }
 
@@ -621,6 +701,132 @@ fn heat_falls_quiet_and_wakes_with_two_frames_in_flight() {
     quiet_then_woken(&heated(), 2);
 }
 
+#[test]
+fn code_listed_and_whole_equal_the_reference_on_random_worlds() {
+    matrix(&coded(), "random", random, 1);
+}
+
+#[test]
+fn code_listed_and_whole_equal_the_reference_across_the_x_seam() {
+    seam(&coded(), Seam::X, "x seam");
+}
+
+#[test]
+fn code_listed_and_whole_equal_the_reference_across_the_y_seam() {
+    seam(&coded(), Seam::Y, "y seam");
+}
+
+#[test]
+fn code_listed_and_whole_equal_the_reference_across_the_z_seam() {
+    seam(&coded(), Seam::Z, "z seam");
+}
+
+#[test]
+fn code_with_two_frames_in_flight_equals_the_reference() {
+    matrix(&coded(), "in flight", random, 2);
+}
+
+#[test]
+fn code_falls_quiet_and_a_host_write_wakes_it() {
+    quiet_then_woken(&coded(), 1);
+}
+
+#[test]
+fn code_falls_quiet_and_wakes_with_two_frames_in_flight() {
+    quiet_then_woken(&coded(), 2);
+}
+
+/// A world of DATA and HALT cells with every other bit at random: nothing
+/// is listed after the seed's two frames, on both tiers.
+#[test]
+fn a_code_world_of_data_and_halt_lists_nothing_after_the_seed() {
+    let subject = coded();
+    let Some(host) = device("code still") else {
+        return;
+    };
+    for coarse in TIERS {
+        let Some(mut engine) = Engine::new(&host, &subject, (32, 32, 32), coarse) else {
+            continue;
+        };
+        let mut state = SEEDS[2];
+        let start: Vec<u32> = (0..engine.reference.cells())
+            .map(|_| {
+                let roll = next(&mut state) as u32;
+                let instruction = if roll.is_multiple_of(3) {
+                    code::HALT
+                } else {
+                    code::DATA
+                };
+                (roll & !(0xF << 24)) | (instruction << 24)
+            })
+            .collect();
+        engine.restart(&start, label("code still", (32, 32, 32), coarse, SEEDS[2]));
+        let listed = engine.run(6, 1);
+        assert_eq!(listed[1..], [0, 0, 0, 0, 0], "{listed:?}");
+        assert_eq!(engine.want, start);
+    }
+}
+
+#[test]
+fn code_listed_and_whole_equal_the_reference_on_small_and_thin_worlds() {
+    let subject = coded();
+    let Some(host) = device("code small") else {
+        return;
+    };
+    for shape in SMALL {
+        for coarse in TIERS {
+            let Some(mut engine) = Engine::new(&host, &subject, shape, coarse) else {
+                continue;
+            };
+            for seed in SEEDS {
+                let first = random(&subject, engine.reference, seed);
+                engine.restart(&first, label("code small", shape, coarse, seed));
+                engine.run(FRAMES, 1);
+                let room = code_room(engine.reference, seed);
+                engine.restart(&room, label("code small room", shape, coarse, seed));
+                engine.run(FRAMES, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_tally_holds_the_counts_of_the_code_rule() {
+    let subject = coded();
+    let Some(host) = device("code tally") else {
+        return;
+    };
+    for coarse in TIERS {
+        let Some(mut engine) = Engine::new(&host, &subject, (16, 16, 16), coarse) else {
+            continue;
+        };
+        let start = random(&subject, engine.reference, SEEDS[1]);
+        engine.restart(&start, label("code tally", (16, 16, 16), coarse, SEEDS[1]));
+        let before = engine.want.clone();
+        engine.frame();
+        let got = engine.live.read(TALLY as usize, 7).unwrap();
+        let mut wanted = [0_u32; 7];
+        for oct in 0..engine.reference.octs() {
+            let places = engine.reference.corners(0, oct);
+            let ruled = Code.step(Oct {
+                words: places.map(|at| before[at]),
+                frame: 0,
+                at: lattice(engine.reference, oct),
+                params: &[],
+            });
+            for (word, count) in wanted.iter_mut().zip(ruled.counts) {
+                *word += count;
+            }
+            for (word, value) in wanted[3..6].iter_mut().zip(lattice(engine.reference, oct)) {
+                *word += (value >> grit::layout::COARSE) * ruled.counts[0];
+            }
+            wanted[6] += u32::from(ruled.counts[0] > 0);
+        }
+        assert_eq!(got, wanted, "{}", engine.label);
+        assert!(wanted[0] > 0 && wanted[1] > 0 && wanted[2] > 0);
+    }
+}
+
 /// A world at one temperature with no fire: the list drains to empty, and
 /// every word is the CPU's.
 #[test]
@@ -832,7 +1038,7 @@ fn quiet_stays_quiet<R: Rule>(subject: &Subject<R>, octs: &mut dyn FnMut(&mut u6
 }
 
 #[test]
-fn a_quiet_oct_stays_quiet_at_every_later_frame_under_both_rules() {
+fn a_quiet_oct_stays_quiet_at_every_later_frame_under_every_rule() {
     let sand = sand();
     quiet_stays_quiet(&sand, &mut |state| {
         let mut words: [u32; 8] = std::array::from_fn(|_| sand_cell(state));
@@ -848,6 +1054,21 @@ fn a_quiet_oct_stays_quiet_at_every_later_frame_under_both_rules() {
         for word in &mut words {
             if heat::conducts(heat::kind_of(*word)) {
                 *word = (*word & 0xFFFF) | (temperature << 16);
+            }
+        }
+        words
+    });
+    let coded = coded();
+    quiet_stays_quiet(&coded, &mut |state| {
+        let mut words: [u32; 8] = std::array::from_fn(|_| code_cell(state));
+        if next(state).is_multiple_of(2) {
+            for word in &mut words {
+                if matches!(
+                    code::instruction_of(*word),
+                    code::MOVE | code::COPY | code::ADD
+                ) {
+                    *word = code::word(code::DATA, 0, *word);
+                }
             }
         }
         words
@@ -925,6 +1146,12 @@ fn the_kernels_read_the_rules_parameters_and_nothing_more() {
                         .words,
                 ),
                 (2, sand3::settle_by(&Noisy, width, grid, 1).unwrap().words),
+                (
+                    0,
+                    sand3::settle_by(&Code, width, grid, u32::MAX)
+                        .unwrap()
+                        .words,
+                ),
             ] {
                 assert_eq!(params_read(&words), 1 + rule_params);
             }
@@ -940,10 +1167,15 @@ fn the_kernels_read_the_rules_parameters_and_nothing_more() {
                 params_read(&live::settle3_by(&Heat, width, grid).unwrap()),
                 5
             );
+            assert_eq!(
+                params_read(&live::settle3_by(&Code, width, grid).unwrap()),
+                2
+            );
         }
     }
     let plan = Plan::over_in(16, 2, Dimension::Three).unwrap();
     assert_eq!(live::sizes3(&Sand, &plan), plan.sizes());
+    assert_eq!(live::sizes3(&Code, &plan), plan.sizes());
     let mut grown = plan.sizes();
     grown[PARAMS as usize] = FIRST_PARAM + 3;
     assert_eq!(live::sizes3(&Heat, &plan), grown);
