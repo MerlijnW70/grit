@@ -19,7 +19,7 @@ use grit::rule::{self, Kind, Pass};
 use grit::rule3::code::Code;
 use grit::rule3::heat::Heat;
 use grit::sand::{self, AIR, Grid, SAND, View, WALL, WATER};
-use grit::{Groups, live, sand3, sweep, view3};
+use grit::{Groups, live, render3, sand3, sweep, view3};
 
 const WIDTHS: [u32; 5] = [4, 8, 16, 32, 64];
 
@@ -499,6 +499,30 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                         view3::picture(w, grid, view, axis, look, kinds),
                     );
                 }
+            }
+        }
+    }
+
+    for (wide, deep, tall) in SOLIDS {
+        let grid = Grid::solid(wide, deep, tall).unwrap();
+        for rule in ["sand", "heat", "code"] {
+            let kinds = view3::Kinds::named(rule).unwrap();
+            for (screen_wide, screen_high) in [(1280, 720), (8, 8)] {
+                let build = render3::Build {
+                    grid,
+                    kinds,
+                    screen: render3::Screen {
+                        wide: screen_wide,
+                        high: screen_high,
+                    },
+                    subgroup: w,
+                    suns: 2,
+                };
+                let at = format!("{rule}@{wide}x{deep}x{tall}/screen-{screen_wide}x{screen_high}");
+                all.add(format!("render3::occupied/{at}"), render3::occupied(&build));
+                all.add(format!("render3::filled/{at}"), render3::filled(&build));
+                all.add(format!("render3::primary/{at}"), render3::primary(&build));
+                all.add(format!("render3::shade/{at}"), render3::shade(&build));
             }
         }
     }
