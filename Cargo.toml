@@ -45,6 +45,10 @@ name = "pour3"
 required-features = ["window"]
 
 [[bin]]
+name = "grit3d"
+required-features = ["window"]
+
+[[bin]]
 name = "spike"
 required-features = ["window"]
 
