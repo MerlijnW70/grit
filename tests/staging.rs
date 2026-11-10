@@ -5,7 +5,14 @@ mod common;
 use common::device;
 
 use grit::layout::BINDINGS;
-use grit::{Error, Run};
+use grit::{Error, Host, Run};
+
+const VAST: usize = 256 * 1024 * 1024;
+
+fn vast(host: &Host) -> usize {
+    let words = host.limits().storage_range / size_of::<u32>() as u64;
+    VAST.min(usize::try_from(words).unwrap_or(usize::MAX))
+}
 
 #[test]
 fn a_write_to_the_sparse_binding_is_bounded_by_the_staging_buffer() {
@@ -18,11 +25,11 @@ fn a_write_to_the_sparse_binding_is_bounded_by_the_staging_buffer() {
     }
 
     const ORDINARY: usize = 1024;
-    const VAST: usize = 256 * 1024 * 1024;
+    let vast = vast(&host);
 
     let mut sizes = [1_usize; BINDINGS as usize];
     sizes[0] = ORDINARY;
-    sizes[1] = VAST;
+    sizes[1] = vast;
 
     let tick = grit::live::tick(host.width()).unwrap();
     let modules: Vec<&[u32]> = vec![&tick];
@@ -36,7 +43,7 @@ fn a_write_to_the_sparse_binding_is_bounded_by_the_staging_buffer() {
     };
 
     eprintln!("{ORDINARY}");
-    eprintln!("{VAST}");
+    eprintln!("{vast}");
 
     held.write(0, &vec![7_u32; ORDINARY]).unwrap();
 
@@ -187,11 +194,11 @@ fn a_write_at_filling_the_staging_buffer_to_the_word_is_taken() {
     }
 
     const ORDINARY: usize = 1024;
-    const VAST: usize = 256 * 1024 * 1024;
+    let vast = vast(&host);
 
     let mut sizes = [1_usize; BINDINGS as usize];
     sizes[0] = ORDINARY;
-    sizes[1] = VAST;
+    sizes[1] = vast;
 
     let tick = grit::live::tick(host.width()).unwrap();
     let modules: Vec<&[u32]> = vec![&tick];
