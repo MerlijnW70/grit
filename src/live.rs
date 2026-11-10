@@ -448,19 +448,27 @@ fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, Lane
         Ok::<_, LaneError>(lanes.add(floored, back)?.id())
     };
 
-    let mut highest = kernel.module().constant_u32(0)?;
+    let mut quads = Vec::with_capacity(PER_LANE as usize);
+    let mut held = Vec::with_capacity(PER_LANE as usize);
     for offset in 0..PER_LANE {
         let along = kernel.module().constant_u32(offset)?;
         let quad = kernel.module().i_add(uint, mine, along)?;
-        let held = kernel.load_at(AWAKE, quad)?;
-        let lower = step(&mut kernel, held)?;
+        held.push(kernel.load_at(AWAKE, quad)?);
+        quads.push(quad);
+    }
+    let mut lowered = Vec::with_capacity(PER_LANE as usize);
+    for &was in &held {
+        lowered.push(step(&mut kernel, was)?);
+    }
+    for (&quad, &lower) in quads.iter().zip(&lowered) {
         kernel.store_at(AWAKE, quad, lower)?;
-        highest = {
-            let mut lanes = kernel.lanes()?;
-            let so_far = lanes.splat_id::<U32, 1>(highest)?;
-            let now = lanes.splat_id::<U32, 1>(lower)?;
-            lanes.max(so_far, now)?.id()
-        };
+    }
+    let mut highest = kernel.module().constant_u32(0)?;
+    for &lower in &lowered {
+        let mut lanes = kernel.lanes()?;
+        let so_far = lanes.splat_id::<U32, 1>(highest)?;
+        let now = lanes.splat_id::<U32, 1>(lower)?;
+        highest = lanes.max(so_far, now)?.id();
     }
 
     let flag = {
