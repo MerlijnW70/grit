@@ -267,33 +267,120 @@ fn junk_in_every_binding_before_seed_agrees_on_the_coarse_tier_too() {
     against_the_whole_grid(room("junk coarse", Before::Junk(JUNK), true));
 }
 
+fn has_padding(width: u32, grid: Grid) -> bool {
+    let plan = plan_for(width, grid);
+    plan.blocks < plan.padded()
+}
+
+/// The room the padding tests use at `width`: `ROOM` where its plan leaves
+/// coarse flags past its blocks, else a room of half a tile of blocks. At
+/// widths 4, 8 and 16 the 512x256 room fills its tiles exactly, and a
+/// power-of-two room does until it holds fewer blocks than a tile.
+fn padded_room_for(width: u32) -> Grid {
+    if has_padding(width, ROOM) {
+        return ROOM;
+    }
+    let per_block = sweep::cells(width);
+    Grid::of(2 * per_block, per_block)
+}
+
+/// `moving` where the room holds its path, else `pulse`.
+fn brush_for(grid: Grid) -> Brushing {
+    if grid.wide > 80 && grid.deep > 30 + 25 {
+        moving
+    } else {
+        pulse
+    }
+}
+
+/// A room with coarse padding on the device under test, whose flags past
+/// the blocks hold `flag` before `seed`.
+fn padded(label: &'static str, flag: u32, coarse: bool) -> Option<Setup> {
+    let host = device(label)?;
+    let width = host.width();
+    drop(host);
+    let grid = padded_room_for(width);
+    Some(Setup {
+        grid,
+        brushing: brush_for(grid),
+        ..room(label, Before::Padded(flag), coarse)
+    })
+}
+
+#[test]
+fn every_width_has_a_room_with_padding() {
+    for width in [4, 8, 16, 32, 64] {
+        let grid = padded_room_for(width);
+        assert!(has_padding(width, grid), "width {width}");
+        let plan = plan_for(width, grid);
+        assert!(plan.padded() - plan.blocks >= plan.blocks, "width {width}");
+    }
+    for (width, grid) in [
+        (4, Grid::of(64, 32)),
+        (8, Grid::of(128, 64)),
+        (16, Grid::of(256, 128)),
+        (32, ROOM),
+        (64, ROOM),
+    ] {
+        assert_eq!(padded_room_for(width), grid, "width {width}");
+    }
+    for width in [4, 8, 16] {
+        assert!(!has_padding(width, ROOM), "width {width}");
+    }
+}
+
+#[test]
+fn the_brush_of_each_padded_room_stays_inside_it() {
+    for width in [4, 8, 16, 32, 64] {
+        let grid = padded_room_for(width);
+        for frame in 0..200 {
+            let [x, y, radius, _] = brush_for(grid)(frame, grid);
+            assert!(
+                x > radius && x + radius < grid.wide,
+                "width {width} frame {frame}"
+            );
+            assert!(
+                y > radius && y + radius < grid.deep,
+                "width {width} frame {frame}"
+            );
+        }
+    }
+}
+
 #[test]
 fn flags_in_the_coarse_padding_before_seed_list_no_phantom_block() {
-    against_the_whole_grid(room("padding coarse", Before::Padded(2), true));
+    if let Some(setup) = padded("padding coarse", 2, true) {
+        against_the_whole_grid(setup);
+    }
 }
 
 #[test]
 fn flags_in_the_coarse_padding_leave_the_fine_tier_alone() {
-    against_the_whole_grid(room("padding fine", Before::Padded(2), false));
+    if let Some(setup) = padded("padding fine", 2, false) {
+        against_the_whole_grid(setup);
+    }
 }
 
 #[test]
 fn the_smallest_flag_in_the_padding_lists_no_phantom_block() {
-    against_the_whole_grid(room("padding one", Before::Padded(1), true));
+    if let Some(setup) = padded("padding one", 1, true) {
+        against_the_whole_grid(setup);
+    }
 }
 
 #[test]
 fn the_largest_flag_in_the_padding_lists_no_phantom_block() {
-    against_the_whole_grid(room("padding max", Before::Padded(u32::MAX), true));
+    if let Some(setup) = padded("padding max", u32::MAX, true) {
+        against_the_whole_grid(setup);
+    }
 }
 
 #[test]
 fn seeding_a_used_engine_again_gives_the_whole_grid_world() {
     for coarse in [false, true] {
-        against_the_whole_grid(Setup {
-            again: 51,
-            ..room("again", Before::Padded(2), coarse)
-        });
+        if let Some(setup) = padded("again", 2, coarse) {
+            against_the_whole_grid(Setup { again: 51, ..setup });
+        }
     }
 }
 
