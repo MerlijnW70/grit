@@ -19,7 +19,7 @@ use grit::rule::{self, Kind, Pass};
 use grit::rule3::code::Code;
 use grit::rule3::heat::Heat;
 use grit::sand::{self, AIR, Grid, SAND, View, WALL, WATER};
-use grit::{Groups, live, sand3, sweep};
+use grit::{Groups, live, sand3, sweep, view3};
 
 const WIDTHS: [u32; 5] = [4, 8, 16, 32, 64];
 
@@ -482,6 +482,24 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                 &format!("live::arranged3/{tier}{at}"),
                 live::arranged3(w, grid, &plan, coarse),
             );
+        }
+    }
+
+    for (wide, deep, tall) in SOLIDS {
+        let grid = Grid::solid(wide, deep, tall).unwrap();
+        for rule in ["sand", "heat", "code"] {
+            let kinds = view3::Kinds::named(rule).unwrap();
+            for (view_wide, view_deep) in [(1024, 512), (8, 8)] {
+                let view = View::of(view_wide, view_deep);
+                for (axis, look) in view3::SHOWN {
+                    all.add(
+                        format!(
+                            "view3::picture/{rule}/{axis:?}/{look:?}@{wide}x{deep}x{tall}/view-{view_wide}x{view_deep}"
+                        ),
+                        view3::picture(w, grid, view, axis, look, kinds),
+                    );
+                }
+            }
         }
     }
 
