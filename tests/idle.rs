@@ -168,6 +168,42 @@ impl Engine<'_> {
         (there, listed[0])
     }
 
+    /// Runs only the stages of the listed frame before the brush, which
+    /// write the brush's count, and reads the count back before any later
+    /// stage can reuse those words. The listed engine is then part of a frame
+    /// ahead of the whole grid, so no frame is compared after this.
+    fn counted(&mut self) -> Vec<u32> {
+        let at = args_at(&self.plan);
+        let brush = self
+            .live_groups
+            .iter()
+            .position(|stage| {
+                stage.iter().any(|groups| {
+                    *groups
+                        == Groups::From {
+                            binding: DENSE as usize,
+                            at,
+                        }
+                })
+            })
+            .unwrap();
+        let first: Vec<Vec<Groups>> = self
+            .live_groups
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| {
+                if index < brush {
+                    stage.clone()
+                } else {
+                    stage.iter().map(|_| Groups::Fixed(0)).collect()
+                }
+            })
+            .collect();
+        let stages: Vec<&[Groups]> = first.iter().map(Vec::as_slice).collect();
+        self.live.staged(&stages).unwrap();
+        read(&mut self.live, DENSE, args_at(&self.plan), 3)
+    }
+
     fn frames_in_flight(&mut self) -> Vec<(Vec<u32>, u32)> {
         let cells = self.grid.cells();
         let groups = self.live_groups.clone();
@@ -324,12 +360,10 @@ fn an_idle_brush_runs_no_seat(label: &str, coarse: bool, build: Building) {
         let marks = read(&mut engine.live, AWAKE, scratch, spare);
         let marked = marks.iter().filter(|&&mark| mark != 0).count();
         assert_eq!(marked, 0, "{label} {name}: {marked} brush seats ran");
-        let args = read(&mut engine.live, DENSE, args_at(&plan), 3);
-        assert_eq!(args, [0, 1, 1], "{label} {name}: brush count");
+        assert_eq!(engine.counted(), [0, 1, 1], "{label} {name}: brush count");
 
         engine.brush([128, 30, 36, SAND]);
-        engine.frame();
-        let args = read(&mut engine.live, DENSE, args_at(&plan), 3);
+        let args = engine.counted();
         assert_eq!(
             args,
             [sand::BOX * sand::BOX / width, 1, 1],
@@ -352,8 +386,9 @@ fn an_idle_brush_runs_no_seat_on_the_coarse_tier() {
     an_idle_brush_runs_no_seat("idle coarse", true, arranged);
 }
 
-/// The full count of seats once the brush paints, read back after the frame
-/// in which it starts: the count is made in the frame it is used in.
+/// The full count of seats once the brush paints and none while it is idle,
+/// read back right after the stage that writes it, whatever the brush held
+/// in the frame before.
 fn a_painting_brush_gets_every_seat(label: &str, coarse: bool) {
     let Some(host) = device(label) else {
         return;
@@ -361,7 +396,6 @@ fn a_painting_brush_gets_every_seat(label: &str, coarse: bool) {
     let width = host.width();
     let mut engine = engine(&host, ROOM, coarse);
     quiet(&mut engine, [0, 0, 0, AIR]);
-    let at = args_at(&engine.plan);
     for (frame, words) in [
         [128, 30, 36, SAND],
         [128, 30, 0, SAND],
@@ -373,8 +407,7 @@ fn a_painting_brush_gets_every_seat(label: &str, coarse: bool) {
     .enumerate()
     {
         engine.brush(words);
-        engine.frame();
-        let args = read(&mut engine.live, DENSE, at, 3);
+        let args = engine.counted();
         let wanted = if words[2] == 0 || words[3] == AIR {
             0
         } else {
