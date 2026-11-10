@@ -5,9 +5,10 @@ use ash::vk;
 use crate::host::{Error, Host};
 use crate::written::{Written, written};
 
-/// Counts every object resident construction makes and frees, both as this
-/// crate calls create and destroy and as the driver allocates and frees host
-/// memory through the callbacks passed with them, and fails a chosen
+/// Counts every object resident construction makes and frees, and the
+/// host's device, both as this crate calls create and destroy and as the
+/// driver allocates and frees host memory through the callbacks passed with
+/// them, and fails a chosen
 /// construction step on demand, so the failure paths can be tested without
 /// exhausting a device. It exists only with the `faults` feature; without it
 /// the same calls are empty, the callbacks are none, and nothing of it is
@@ -38,9 +39,15 @@ pub mod faults {
         CommandBuffers,
         Fence,
         Queries,
+        Device,
     }
 
+    /// Every kind counted: the construction steps and the host's device.
+    const KINDS: usize = 14;
+
     impl Step {
+        /// The steps of resident construction. The device is made by the host
+        /// and lives longer than any resident, so it is counted apart.
         pub const ALL: [Self; 13] = [
             Self::Buffer,
             Self::Memory,
@@ -82,21 +89,21 @@ pub mod faults {
     }
 
     struct Hooks {
-        tallies: [Tally; 13],
-        callbacks: [vk::AllocationCallbacks<'static>; 13],
+        tallies: [Tally; KINDS],
+        callbacks: [vk::AllocationCallbacks<'static>; KINDS],
     }
 
     thread_local! {
         static ARMED: Cell<Option<(Step, u32)>> = const { Cell::new(None) };
         static FIRED: Cell<bool> = const { Cell::new(false) };
-        static COUNTS: RefCell<[(u64, u64); 13]> = const { RefCell::new([(0, 0); 13]) };
+        static COUNTS: RefCell<[(u64, u64); KINDS]> = const { RefCell::new([(0, 0); KINDS]) };
         static HOOKS: &'static Hooks = hooks();
     }
 
     fn hooks() -> &'static Hooks {
         let held: &'static mut Hooks = Box::leak(Box::new(Hooks {
             tallies: Default::default(),
-            callbacks: [vk::AllocationCallbacks::default(); 13],
+            callbacks: [vk::AllocationCallbacks::default(); KINDS],
         }));
         for (callbacks, tally) in held.callbacks.iter_mut().zip(held.tallies.iter()) {
             *callbacks = vk::AllocationCallbacks::default()
@@ -216,7 +223,7 @@ pub mod faults {
     pub fn reset() {
         disarm();
         FIRED.set(false);
-        COUNTS.with_borrow_mut(|counts| *counts = [(0, 0); 13]);
+        COUNTS.with_borrow_mut(|counts| *counts = [(0, 0); KINDS]);
         HOOKS.with(|hooks| {
             for tally in &hooks.tallies {
                 tally.allocations.store(0, Ordering::Relaxed);
@@ -286,7 +293,7 @@ pub mod faults {
 }
 
 #[cfg(not(feature = "faults"))]
-mod faults {
+pub(crate) mod faults {
     use ash::vk;
 
     #[derive(Clone, Copy)]
@@ -304,6 +311,7 @@ mod faults {
         CommandBuffers,
         Fence,
         Queries,
+        Device,
     }
 
     #[inline(always)]

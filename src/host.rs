@@ -5,6 +5,7 @@ use std::time::Duration;
 use ash::vk;
 
 use crate::resident::Groups;
+use crate::resident::faults::{self, Step};
 
 /// The subgroup operations the kernels Grit builds use. The engine's kernels
 /// declare `GroupNonUniform`, `GroupNonUniformVote` for the `any` in
@@ -536,8 +537,13 @@ impl Host {
             .queue_create_infos(&queues)
             .enabled_features(&wanted);
 
-        let device = match unsafe { instance.create_device(physical, &create, None) } {
-            Ok(device) => device,
+        let made =
+            unsafe { instance.create_device(physical, &create, faults::callbacks(Step::Device)) };
+        let device = match made {
+            Ok(device) => {
+                faults::made(Step::Device, device.handle());
+                device
+            }
             Err(code) => {
                 unsafe { instance.destroy_instance(None) };
                 return Err(Error::NoDevice { name, code });
@@ -637,7 +643,8 @@ impl Drop for Host {
         }
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.device.destroy_device(None);
+            self.device.destroy_device(faults::callbacks(Step::Device));
+            faults::gone(Step::Device, self.device.handle());
             self.instance.destroy_instance(None);
         }
         let _ = &self.entry;
