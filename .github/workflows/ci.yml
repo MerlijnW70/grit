@@ -68,13 +68,13 @@ jobs:
         include:
           - vector: 128
             width: 4
-            skips: 15
+            skips: 16
           - vector: 256
             width: 8
-            skips: 8
+            skips: 9
           - vector: 512
             width: 16
-            skips: 5
+            skips: 6
     steps:
       - uses: actions/checkout@v5
         with:
