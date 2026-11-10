@@ -678,6 +678,9 @@ impl Host {
         }
     }
 
+    /// A buffer bound to fresh memory of the kind `wanted`, or an error with
+    /// nothing left made: a buffer whose memory cannot be had or bound is
+    /// destroyed, and memory that cannot be bound is freed.
     unsafe fn allocate(
         &self,
         bytes: u64,
@@ -694,28 +697,40 @@ impl Host {
                 .create_buffer(&create, faults::callbacks(Step::Buffer))
         }?;
         faults::made(Step::Buffer, handle);
-
-        let requirements = unsafe { self.device().get_buffer_memory_requirements(handle) };
-        let Some(kind) = self.suits(requirements, wanted) else {
+        let unmade = |why: Error| {
             unsafe {
                 self.device()
                     .destroy_buffer(handle, faults::callbacks(Step::Buffer))
             };
             faults::gone(Step::Buffer, handle);
-            return Err(Error::NoMemory { bytes });
+            why
+        };
+
+        let requirements = unsafe { self.device().get_buffer_memory_requirements(handle) };
+        let Some(kind) = self.suits(requirements, wanted) else {
+            return Err(unmade(Error::NoMemory { bytes }));
         };
 
         let allocate = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(kind);
-        faults::enter(Step::Memory)?;
-        let memory = unsafe {
-            self.device()
-                .allocate_memory(&allocate, faults::callbacks(Step::Memory))
-        }?;
+        let memory = faults::enter(Step::Memory)
+            .and_then(|()| unsafe {
+                self.device()
+                    .allocate_memory(&allocate, faults::callbacks(Step::Memory))
+            })
+            .map_err(|code| unmade(code.into()))?;
         faults::made(Step::Memory, memory);
-        faults::enter(Step::Bind)?;
-        unsafe { self.device().bind_buffer_memory(handle, memory, 0) }?;
+        faults::enter(Step::Bind)
+            .and_then(|()| unsafe { self.device().bind_buffer_memory(handle, memory, 0) })
+            .map_err(|code| {
+                unsafe {
+                    self.device()
+                        .free_memory(memory, faults::callbacks(Step::Memory))
+                };
+                faults::gone(Step::Memory, memory);
+                unmade(code.into())
+            })?;
 
         Ok(Held {
             handle,
