@@ -10,7 +10,7 @@ use common::device;
 
 use grit::compact::{self, Over, Plan, Tier};
 use grit::layout::{
-    BRUSH, COUNTS, DENSE, GRAND, HOT_BASES, HOT_COUNTS, HOT_DENSE, PARAMS, STATE, TOTALS,
+    BRUSH, COUNTS, DENSE, Dimension, GRAND, HOT_BASES, HOT_COUNTS, HOT_DENSE, PARAMS, STATE, TOTALS,
 };
 use grit::machine::Machine;
 use grit::marking;
@@ -433,6 +433,27 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                 }
                 Err(why) => panic!("sand3::settle{at} at width {w}: refused: {why:?}"),
             }
+        }
+    }
+
+    for (wide, deep, tall) in SOLIDS {
+        let grid = Grid::solid(wide, deep, tall).unwrap();
+        let at = format!("@{wide}x{deep}x{tall}");
+        all.add(format!("live::settle3{at}"), live::settle3(w, grid));
+        let Ok(plan) = Plan::over_in(w, grid.blocks().div_ceil(sweep::cells(w)), Dimension::Three)
+        else {
+            continue;
+        };
+        all.text(
+            format!("plan3{at}"),
+            &format!("{:?} dump {}", plan.sizes(), plan.dump()),
+        );
+        for coarse in [false, true] {
+            let tier = if coarse { "coarse" } else { "fine" };
+            all.loop_of(
+                &format!("live::arranged3/{tier}{at}"),
+                live::arranged3(w, grid, &plan, coarse),
+            );
         }
     }
 
