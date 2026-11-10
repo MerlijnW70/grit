@@ -4,8 +4,8 @@ use simdr::module::Id;
 
 use crate::Groups;
 use crate::layout::{
-    AWAKE, BUCKETS, COUNTS, HOT, HOT_BASES, HOT_BUCKETS, HOT_COUNTS, HOT_DENSE, HOT_GRAND,
-    HOT_INDIRECT, HOT_TOTALS, PIXELS,
+    AWAKE, BUCKETS, COUNTS, Dimension, HOT, HOT_BASES, HOT_BUCKETS, HOT_COUNTS, HOT_DENSE,
+    HOT_GRAND, HOT_INDIRECT, HOT_TOTALS, PIXELS,
 };
 pub use crate::layout::{BASES, BINDINGS, DENSE, GRAND, INDIRECT, TOTALS};
 use crate::sand::View;
@@ -85,6 +85,7 @@ pub struct Plan {
     pub hot_tiles: u32,
     pub grid: usize,
     pub quads: usize,
+    pub dimension: Dimension,
 }
 
 impl Plan {
@@ -101,6 +102,10 @@ impl Plan {
     }
 
     pub fn over(subgroup: u32, blocks: u32) -> Result<Self, TooBig> {
+        Self::over_in(subgroup, blocks, Dimension::Two)
+    }
+
+    pub fn over_in(subgroup: u32, blocks: u32, dimension: Dimension) -> Result<Self, TooBig> {
         let per_block = sweep::cells(subgroup);
         let limit = per_block.saturating_mul(per_block);
         if blocks > limit {
@@ -114,7 +119,8 @@ impl Plan {
             tiles,
             hot_tiles: tiles.div_ceil(per_block),
             quads: per_block as usize * blocks as usize,
-            grid: per_block as usize * blocks as usize * 4,
+            grid: per_block as usize * blocks as usize * dimension.corners(),
+            dimension,
         })
     }
 
@@ -129,8 +135,8 @@ impl Plan {
         let hot_padded = self.hot_tiles as usize * self.per_block as usize;
         let spare = self.blocks as usize * self.subgroup as usize;
         [
-            8,
-            self.grid + self.quads * 4,
+            self.dimension.params_words(),
+            self.grid + self.quads * self.dimension.corners(),
             self.blocks as usize * sweep::stride(self.subgroup) as usize,
             padded,
             padded,
@@ -142,12 +148,12 @@ impl Plan {
             // did not wake anything, which `live::wake` writes at
             // `dump_base + group * subgroup + lane`. The scratch has to hold
             // the widest pass that writes into it, and the brush is that one:
-            // it covers a fixed box of `sand::BOX` squared seats however small
-            // the grid is, so a grid with fewer quads than seats would be
+            // it covers a fixed box of `sand::BOX` seats along each axis however
+            // small the grid is, so a grid with fewer quads than seats would be
             // written past its end.
-            self.quads + self.quads.max(crate::sand::SEATS),
+            self.quads + self.quads.max(self.dimension.seats()),
             1,
-            crate::layout::TALLY_WORDS,
+            self.dimension.tally_words(),
             self.padded() as usize + 1,
             self.tiles as usize * sweep::stride(self.subgroup) as usize,
             hot_padded,

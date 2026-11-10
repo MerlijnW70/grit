@@ -3,7 +3,7 @@ use simdr::lanes::{LaneError, Lanes, U32, Vector};
 
 use crate::compact::{Over, Tier, owned};
 use crate::geometry::{Emit, Placed, Plane, Space};
-use crate::layout::{AWAKE, BINDINGS, DENSE, GRAND, HOT, PARAMS, STATE};
+use crate::layout::{AWAKE, BINDINGS, DENSE, Dimension, GRAND, HOT, PARAMS, STATE};
 use crate::sand::{self, Grid};
 
 pub type Loop = (Vec<Vec<u32>>, Vec<Vec<crate::Groups>>);
@@ -378,9 +378,7 @@ pub fn seed(
     grid: Grid,
     plan: &crate::compact::Plan,
 ) -> Result<(), crate::Error> {
-    use crate::layout::{
-        HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT, TALLY, TALLY_WORDS,
-    };
+    use crate::layout::{HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT, TALLY};
 
     let sizes = plan.sizes();
     let words = |binding: u32| sizes.get(binding as usize).copied().unwrap_or(0);
@@ -407,7 +405,7 @@ pub fn seed(
     held.write(HOT_INDIRECT as usize, &[plan.blocks, 1, 1])?;
     held.write(HOT_COUNTS as usize, &vec![0; words(HOT_COUNTS).max(1)])?;
 
-    held.write(TALLY as usize, &[0; TALLY_WORDS])
+    held.write(TALLY as usize, &vec![0; plan.dimension.tally_words()])
 }
 
 pub fn decay(subgroup: u32, over: Over) -> Result<Vec<u32>, LaneError> {
@@ -495,7 +493,11 @@ pub fn unclaimed(subgroup: u32, plan: &crate::compact::Plan) -> Result<Vec<u32>,
 }
 
 pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
-    use crate::layout::{HOT_TOTALS, TALLY, TALLY_WORDS, TOTALS};
+    wipe_in(subgroup, Dimension::Two)
+}
+
+pub fn wipe_in(subgroup: u32, dimension: Dimension) -> Result<Vec<u32>, LaneError> {
+    use crate::layout::{HOT_TOTALS, TALLY, TOTALS};
     use crate::sweep::PER_LANE;
 
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
@@ -512,7 +514,7 @@ pub fn wipe(subgroup: u32) -> Result<Vec<u32>, LaneError> {
         kernel.store_at(HOT_TOTALS, at, nothing)?;
     }
 
-    for word in 0..TALLY_WORDS {
+    for word in 0..dimension.tally_words() {
         let at = kernel
             .module()
             .constant_u32(u32::try_from(word).unwrap_or(0))?;
@@ -662,8 +664,8 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
         let past =
             lanes.splat_bits::<U32, LANES>(u32::try_from(grid.cells()).unwrap_or(u32::MAX))?;
         let mine = lanes.splat_id::<U32, LANES>(slot)?;
-        let four = lanes.splat_bits::<U32, LANES>(2)?;
-        let along = lanes.shift_left(mine, four)?;
+        let shift = lanes.splat_bits::<U32, LANES>(Dimension::Two.corner_bits())?;
+        let along = lanes.shift_left(mine, shift)?;
         lanes.add(past, along)?
     };
 

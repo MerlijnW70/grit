@@ -24,7 +24,7 @@ pub const HOT_INDIRECT: u32 = 19;
 
 pub const BINDINGS: u32 = 20;
 
-pub const TALLY_WORDS: usize = 6;
+pub const TALLY_WORDS: usize = Dimension::Two.tally_words();
 
 pub const COARSE: u32 = 3;
 
@@ -32,3 +32,56 @@ pub const BRUSH: usize = 2;
 pub const BRUSH_WORDS: usize = 4;
 
 pub const LOOKING: usize = 6;
+
+pub const BRUSH_Z: usize = 8;
+pub const LOOKING_Z: usize = 9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dimension {
+    Two,
+    Three,
+}
+
+impl Dimension {
+    #[must_use]
+    pub const fn corner_bits(self) -> u32 {
+        match self {
+            Self::Two => 2,
+            Self::Three => 3,
+        }
+    }
+
+    #[must_use]
+    pub const fn corners(self) -> usize {
+        1 << self.corner_bits()
+    }
+
+    #[must_use]
+    pub const fn tally_words(self) -> usize {
+        match self {
+            Self::Two => 6,
+            Self::Three => 7,
+        }
+    }
+
+    #[must_use]
+    pub const fn params_words(self) -> usize {
+        match self {
+            Self::Two => 8,
+            Self::Three => 10,
+        }
+    }
+
+    #[must_use]
+    pub const fn seats(self) -> usize {
+        (crate::sand::BOX as usize).pow(self.axes())
+    }
+
+    #[must_use]
+    pub const fn axes(self) -> u32 {
+        match self {
+            Self::Two => 2,
+            Self::Three => 3,
+        }
+    }
+}
