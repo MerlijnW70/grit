@@ -39,7 +39,7 @@ jobs:
         working-directory: grit
         env:
           RUSTFLAGS: -D warnings
-        run: cargo clippy --no-default-features --all-targets
+        run: cargo clippy --locked --no-default-features --all-targets
 
       - name: headers
         run: |
@@ -51,13 +51,13 @@ jobs:
         working-directory: grit
         env:
           RUSTFLAGS: -D warnings
-        run: cargo clippy --all-targets
+        run: cargo clippy --locked --all-targets
 
       - name: doc
         working-directory: grit
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
 
   device:
     name: lavapipe
@@ -93,7 +93,7 @@ jobs:
 
       - name: icd
         run: |
-          ls -la /usr/share/vulkan/icd.d/ || true
+          ls -la /usr/share/vulkan/icd.d/
           icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -n1)
           if [ -z "$icd" ]; then
             echo "::error::no ICD"
@@ -105,7 +105,7 @@ jobs:
       - name: vulkaninfo
         env:
           LP_NATIVE_VECTOR_WIDTH: ${{ matrix.vector }}
-        run: vulkaninfo --summary || true
+        run: vulkaninfo --summary
 
       - name: test ${{ matrix.width }}
         working-directory: grit
@@ -118,13 +118,13 @@ jobs:
           GRIT_PATIENCE_SECS: 300
         run: |
           set -o pipefail
-          cargo test --release --no-default-features --features deep --no-fail-fast -- --nocapture \
+          cargo test --release --locked --no-default-features --features deep --no-fail-fast -- --nocapture \
             2>&1 | tee "$RUNNER_TEMP/suite.log"
-          # Counted so that none is a count. `grep` reports no match by
-          # failing, `pipefail` hands that on, and `-e` would take the whole
-          # step down before the comparison below is ever reached.
-          skipped=$({ grep -o 'SKIPPED ' "$RUNNER_TEMP/suite.log" || true; } | wc -l)
-          echo "$skipped ${{ matrix.skips }}"
+          # Every SKIPPED counts, a bare one with no reason after it too. awk
+          # exits 0 when there is none, so the count needs no guard.
+          awk '/SKIPPED/ { print "skip: " $0 }' "$RUNNER_TEMP/suite.log"
+          skipped=$(awk '{ n += gsub(/SKIPPED/, "") } END { print n + 0 }' "$RUNNER_TEMP/suite.log")
+          echo "skipped $skipped, expected ${{ matrix.skips }}"
           if [ "$skipped" -ne "${{ matrix.skips }}" ]; then
             echo "::error::$skipped != ${{ matrix.skips }}"
             exit 1
@@ -147,4 +147,4 @@ jobs:
           toolchain: "1.88"
       - name: check
         working-directory: grit
-        run: cargo check --no-default-features --all-targets
+        run: cargo check --locked --no-default-features --all-targets
