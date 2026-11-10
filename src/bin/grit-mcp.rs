@@ -1,11 +1,12 @@
 use std::io::{BufRead, Write};
 
 use grit::Host;
-use grit::serve::heard;
+use grit::serve3::Server;
 use grit::wire::written;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::open()?;
+    let mut server = Server::new(host.as_ref());
     let mut stdin = std::io::stdin().lock();
     let mut out = std::io::stdout();
     let mut bytes = Vec::new();
@@ -18,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(answer) = heard(host.as_ref(), &line) {
+        if let Some(answer) = server.heard(&line) {
             writeln!(out, "{}", written(&answer))?;
             out.flush()?;
         }
