@@ -359,6 +359,10 @@ pub fn cheaper(
     })
 }
 
+/// Why [`seed`] refuses a plan laid out for another number of axes than the
+/// grid has.
+pub const UNLIKE: &str = "the plan is laid out for another number of axes than the grid has";
+
 /// Sets up every word the listed engine reads before a frame writes it, so
 /// the first frame after `seed` is right whatever the buffers held before.
 ///
@@ -368,8 +372,9 @@ pub fn cheaper(
 /// - `PARAMS` holds `u32::MAX` as the frame, so the first `tick` makes it
 ///   frame 0, and `plan.dump()` as the dump base. The other words of
 ///   `PARAMS` are the caller's and keep what they held.
-/// - Every quad of the grid is awake and listed: `AWAKE`, `DENSE`, `GRAND`
-///   and `INDIRECT`. The rest of `AWAKE` is zero: the plan's quads past the
+/// - Every block of the grid, each quad of a flat grid and each oct of a
+///   solid one, is awake and listed: `AWAKE`, `DENSE`, `GRAND` and
+///   `INDIRECT`. The rest of `AWAKE` is zero: the plan's blocks past the
 ///   grid, and the scratch `wake` writes for lanes that wake nothing.
 /// - Every block of the plan is hot and listed: `HOT`, `HOT_DENSE`,
 ///   `HOT_GRAND` and `HOT_INDIRECT`. The rest of `HOT` is zero: the padding
@@ -377,6 +382,9 @@ pub fn cheaper(
 /// - `HOT_COUNTS`, which the coarse scan reads past the tiles the coarse
 ///   mark writes, `TALLY`, and the brush's claim count at `DENSE[dump]` are
 ///   zero.
+///
+/// A plan laid out for another number of axes than the grid has is refused
+/// with [`UNLIKE`], before anything is written.
 pub fn seed(
     held: &mut crate::Resident<'_>,
     grid: Grid,
@@ -394,9 +402,16 @@ pub fn seed(
         words
     };
 
+    if grid.axes() != plan.dimension.axes() {
+        return Err(crate::Error::Lane(LaneError::NoSuchForm {
+            operation: "live::seed",
+            because: UNLIKE,
+        }));
+    }
+
     held.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
 
-    let quads = grid.quads();
+    let quads = grid.blocks();
     held.write(AWAKE as usize, &leading(quads as usize, words(AWAKE)))?;
     held.write(DENSE as usize, &(0..quads).collect::<Vec<u32>>())?;
     held.write_at(DENSE as usize, plan.dump() as usize, &[0])?;
