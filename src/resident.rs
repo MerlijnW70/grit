@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use ash::vk;
 
 use crate::host::{Error, Host};
+use crate::written::{Written, written};
 
 /// Counts every object resident construction makes and frees, both as this
 /// crate calls create and destroy and as the driver allocates and frees host
@@ -445,6 +446,7 @@ pub struct Resident<'host> {
     pipeline_layout: vk::PipelineLayout,
     shaders: Vec<vk::ShaderModule>,
     pipelines: Vec<vk::Pipeline>,
+    writes: Vec<Written>,
     commands: vk::CommandPool,
     transfer: vk::CommandBuffer,
     fence: vk::Fence,
@@ -606,6 +608,7 @@ impl Host {
 
             made.describe()?;
             made.compile(modules)?;
+            made.writes = modules.iter().map(|words| written(words)).collect();
             made.record()?;
             made.fence = self.fence()?;
             for slot in &mut made.slots {
@@ -787,6 +790,7 @@ impl<'host> Resident<'host> {
             pipeline_layout: vk::PipelineLayout::null(),
             shaders: Vec::new(),
             pipelines: Vec::new(),
+            writes: Vec::new(),
             commands: vk::CommandPool::null(),
             transfer: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -1023,6 +1027,12 @@ impl Resident<'_> {
     #[must_use]
     pub fn passes(&self) -> usize {
         self.pipelines.len()
+    }
+
+    /// What each pass may write, in pass order, as read from its module.
+    #[must_use]
+    pub fn writes(&self) -> &[Written] {
+        &self.writes
     }
 
     #[must_use]
@@ -1765,21 +1775,8 @@ impl Resident<'_> {
                 &[],
             );
 
-            let mut pass = 0;
-            let mut running: Vec<Vec<(usize, Groups)>> = Vec::with_capacity(stages.len());
-            for stage in stages {
-                let mut held = Vec::new();
-                for &count in *stage {
-                    if !matches!(count, Groups::Fixed(0) | Groups::Counting(0)) {
-                        held.push((pass, count));
-                    }
-                    pass += 1;
-                }
-                if !held.is_empty() {
-                    running.push(held);
-                }
-            }
-
+            let running = running(stages);
+            let mut carrying = carried(&running, &self.writes, times).into_iter();
             let profiling = facing
                 .queries
                 .filter(|_| running.len() <= STAGES)
@@ -1789,7 +1786,7 @@ impl Resident<'_> {
             }
 
             for repeat in 0..times {
-                for (nth, stage) in running.iter().enumerate() {
+                for (nth, (_, stage)) in running.iter().enumerate() {
                     if let Some((pool, last)) = profiling
                         && repeat == last
                     {
@@ -1835,11 +1832,8 @@ impl Resident<'_> {
                     } else {
                         None
                     };
-                    if let Some(next) = next {
-                        let indirect = next
-                            .iter()
-                            .any(|&(_, count)| matches!(count, Groups::From { .. }));
-                        let (reach, stage) = if indirect {
+                    if next.is_some() {
+                        let (reach, stage) = if carrying.next().unwrap_or(true) {
                             (
                                 vk::AccessFlags::INDIRECT_COMMAND_READ,
                                 vk::PipelineStageFlags::DRAW_INDIRECT,
@@ -1978,6 +1972,111 @@ impl Resident<'_> {
             Ok(out)
         }
     }
+}
+
+type Running = Vec<(usize, Vec<(usize, Groups)>)>;
+
+fn running(stages: &[&[Groups]]) -> Running {
+    let mut pass = 0;
+    let mut out = Vec::with_capacity(stages.len());
+    for (at, stage) in stages.iter().enumerate() {
+        let mut held = Vec::new();
+        for &count in *stage {
+            if !matches!(count, Groups::Fixed(0) | Groups::Counting(0)) {
+                held.push((pass, count));
+            }
+            pass += 1;
+        }
+        if !held.is_empty() {
+            out.push((at, held));
+        }
+    }
+    out
+}
+
+struct Since {
+    every: bool,
+    bindings: Vec<usize>,
+}
+
+impl Since {
+    fn ran(&mut self, writes: Option<&Written>) {
+        match writes {
+            Some(Written::Only(bindings)) => {
+                for &binding in bindings {
+                    if !self.bindings.contains(&binding) {
+                        self.bindings.push(binding);
+                    }
+                }
+            }
+            Some(Written::Every) | None => self.every = true,
+        }
+    }
+
+    fn holds(&self, binding: usize) -> bool {
+        self.every || self.bindings.contains(&binding)
+    }
+
+    fn clear(&mut self) {
+        self.every = false;
+        self.bindings.clear();
+    }
+}
+
+/// For each barrier between two running stages, in recording order, whether
+/// it carries the indirect stage and access: only when a `From` pass of the
+/// stage it opens reads a binding some pass may have written since the last
+/// barrier that carried them. The frame starts behind one that does.
+fn carried(running: &Running, writes: &[Written], times: u32) -> Vec<bool> {
+    let mut since = Since {
+        every: false,
+        bindings: Vec::new(),
+    };
+    let mut out = Vec::new();
+    for repeat in 0..times {
+        for (nth, (_, stage)) in running.iter().enumerate() {
+            for &(pass, _) in stage {
+                since.ran(writes.get(pass));
+            }
+            let next = if nth + 1 < running.len() {
+                running.get(nth + 1)
+            } else if repeat + 1 < times {
+                running.first()
+            } else {
+                None
+            };
+            if let Some((_, next)) = next {
+                let needed = next.iter().any(|&(_, count)| match count {
+                    Groups::From { binding, .. } => since.holds(binding),
+                    Groups::Fixed(_) | Groups::Counting(_) => false,
+                });
+                if needed {
+                    since.clear();
+                }
+                out.push(needed);
+            }
+        }
+    }
+    out
+}
+
+/// The barriers of a recording of `stages` repeated `times` that carry the
+/// indirect stage and access, each named by the repeat and the index in
+/// `stages` of the stage it opens, given what each pass may write.
+#[must_use]
+pub fn indirect_barriers(
+    stages: &[&[Groups]],
+    writes: &[Written],
+    times: u32,
+) -> Vec<(u32, usize)> {
+    let running = running(stages);
+    let carrying = carried(&running, writes, times);
+    let opened = (0..times).flat_map(|repeat| running.iter().map(move |&(at, _)| (repeat, at)));
+    opened
+        .skip(1)
+        .zip(carrying)
+        .filter_map(|(opens, carries)| carries.then_some(opens))
+        .collect()
 }
 
 fn to_host(device: &ash::Device, command: vk::CommandBuffer) {
