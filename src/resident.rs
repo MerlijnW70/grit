@@ -436,6 +436,7 @@ fn staged(at: usize, count: usize, room: u64) -> Result<Span, Error> {
 pub struct Resident<'host> {
     host: &'host Host,
     direct: bool,
+    built: bool,
     buffers: Vec<Held>,
     staging: Held,
     layout: vk::DescriptorSetLayout,
@@ -535,26 +536,26 @@ impl Host {
             .max()
             .unwrap_or(WORD);
 
-        unsafe {
-            let living = if direct {
-                vk::MemoryPropertyFlags::DEVICE_LOCAL
-                    | vk::MemoryPropertyFlags::HOST_VISIBLE
-                    | vk::MemoryPropertyFlags::HOST_COHERENT
-            } else {
-                vk::MemoryPropertyFlags::DEVICE_LOCAL
-            };
-            let usage_of = vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::INDIRECT_BUFFER;
-            let near = vk::MemoryPropertyFlags::DEVICE_LOCAL
+        let living = if direct {
+            vk::MemoryPropertyFlags::DEVICE_LOCAL
                 | vk::MemoryPropertyFlags::HOST_VISIBLE
-                | vk::MemoryPropertyFlags::HOST_COHERENT;
+                | vk::MemoryPropertyFlags::HOST_COHERENT
+        } else {
+            vk::MemoryPropertyFlags::DEVICE_LOCAL
+        };
+        let usage_of = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::INDIRECT_BUFFER;
+        let near = vk::MemoryPropertyFlags::DEVICE_LOCAL
+            | vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-            let mut buffers = Vec::with_capacity(sizes.len());
+        let mut made = Resident::building(self, direct, sizes.len());
+        unsafe {
             for (at, &bytes) in lengths.iter().enumerate() {
                 if Some(at) == vast {
-                    buffers.push(self.allocate_vast(bytes, usage_of)?);
+                    made.buffers.push(self.allocate_vast(bytes, usage_of)?);
                     continue;
                 }
 
@@ -569,7 +570,7 @@ impl Host {
                 } else {
                     None
                 };
-                buffers.push(match held {
+                made.buffers.push(match held {
                     Some(held) => held,
                     None => Held {
                         visible: direct,
@@ -581,8 +582,7 @@ impl Host {
             let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
             let plain =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let mut staged = Vec::new();
-            for _ in 0..=SLOTS {
+            for at in 0..=SLOTS {
                 let held = match self.allocate(
                     largest,
                     usage,
@@ -591,91 +591,30 @@ impl Host {
                     Ok(held) => held,
                     Err(_) => self.allocate(largest, usage, plain)?,
                 };
-                staged.push(held);
-            }
-            let cached = staged
-                .iter()
-                .all(|held| held.kind.contains(vk::MemoryPropertyFlags::HOST_CACHED));
-            let staging = staged.pop().ok_or(Error::NoMemory { bytes: largest })?;
-
-            let (layout, pool, set) = self.describe(&buffers)?;
-            let (pipeline_layout, shaders, pipelines) = self.compile(layout, modules)?;
-            let (commands, mut spare, transfer) = self.record_into()?;
-            faults::enter(Step::Fence)?;
-            let fence = self.device().create_fence(
-                &vk::FenceCreateInfo::default(),
-                faults::callbacks(Step::Fence),
-            )?;
-            faults::made(Step::Fence, fence);
-
-            let mut slots = Vec::with_capacity(SLOTS);
-            for staging in staged {
-                let command = spare.pop().unwrap_or_default();
-                faults::enter(Step::Fence)?;
-                let fence = self.device().create_fence(
-                    &vk::FenceCreateInfo::default(),
-                    faults::callbacks(Step::Fence),
-                )?;
-                faults::made(Step::Fence, fence);
-                let queries = if self.ticking().1 {
-                    let create = vk::QueryPoolCreateInfo::default()
-                        .query_type(vk::QueryType::TIMESTAMP)
-                        .query_count(u32::try_from(STAGES + 3).unwrap_or(3));
-                    let made = faults::enter(Step::Queries).ok().and_then(|()| {
-                        self.device()
-                            .create_query_pool(&create, faults::callbacks(Step::Queries))
-                            .ok()
-                    });
-                    if let Some(pool) = made {
-                        faults::made(Step::Queries, pool);
-                    }
-                    made
+                if at < SLOTS {
+                    made.slots.push(Slot::staged(held));
                 } else {
-                    None
-                };
-                slots.push(Slot {
-                    command,
-                    fence,
-                    staging,
-                    queries,
-                    held: None,
-                    flight: None,
-                    stamped: 0,
-                });
+                    made.staging = held;
+                }
             }
+            made.cached = made
+                .slots
+                .iter()
+                .map(|slot| &slot.staging)
+                .chain(std::iter::once(&made.staging))
+                .all(|held| held.kind.contains(vk::MemoryPropertyFlags::HOST_CACHED));
 
-            Ok(Resident {
-                spans: Vec::new(),
-                recording: Duration::ZERO,
-                recorded: 0,
-                copying: Duration::ZERO,
-                copies: 0,
-                pushing: Duration::ZERO,
-                pushes: 0,
-                poked: 0,
-                host: self,
-                direct,
-                buffers,
-                staging,
-                layout,
-                pool,
-                set,
-                pipeline_layout,
-                shaders,
-                pipelines,
-                commands,
-                transfer,
-                fence,
-                slots,
-                tickets: 0,
-                cached,
-                patience: Resident::patience_of(
-                    std::env::var("GRIT_PATIENCE_SECS").ok().as_deref(),
-                ),
-                reused: 0,
-                device: None,
-            })
+            made.describe()?;
+            made.compile(modules)?;
+            made.record()?;
+            made.fence = self.fence()?;
+            for slot in &mut made.slots {
+                slot.fence = self.fence()?;
+                slot.queries = self.queries();
+            }
         }
+        made.built = true;
+        Ok(made)
     }
 
     /// A buffer bound to fresh memory of the kind `wanted`, or an error with
@@ -743,6 +682,40 @@ impl Host {
         })
     }
 
+    unsafe fn fence(&self) -> Result<vk::Fence, Error> {
+        faults::enter(Step::Fence)?;
+        let fence = unsafe {
+            self.device().create_fence(
+                &vk::FenceCreateInfo::default(),
+                faults::callbacks(Step::Fence),
+            )
+        }?;
+        faults::made(Step::Fence, fence);
+        Ok(fence)
+    }
+
+    /// A timestamp pool, or none when the device has no timestamps or the
+    /// pool cannot be made: timing is optional and never fails construction.
+    unsafe fn queries(&self) -> Option<vk::QueryPool> {
+        if !self.ticking().1 {
+            return None;
+        }
+        let create = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(u32::try_from(STAGES + 3).unwrap_or(3));
+        let made = faults::enter(Step::Queries).ok().and_then(|()| {
+            unsafe {
+                self.device()
+                    .create_query_pool(&create, faults::callbacks(Step::Queries))
+            }
+            .ok()
+        });
+        if let Some(pool) = made {
+            faults::made(Step::Queries, pool);
+        }
+        made
+    }
+
     unsafe fn allocate_vast(&self, bytes: u64, usage: vk::BufferUsageFlags) -> Result<Held, Error> {
         let create = vk::BufferCreateInfo::default()
             .size(bytes.max(4))
@@ -766,19 +739,77 @@ impl Host {
             kind: vk::MemoryPropertyFlags::empty(),
         })
     }
+}
 
-    unsafe fn describe(
-        &self,
-        buffers: &[Held],
-    ) -> Result<
-        (
-            vk::DescriptorSetLayout,
-            vk::DescriptorPool,
-            vk::DescriptorSet,
-        ),
-        Error,
-    > {
-        let count = u32::try_from(buffers.len()).unwrap_or(u32::MAX).max(1);
+impl Held {
+    const fn none() -> Self {
+        Self {
+            handle: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            bytes: 0,
+            page: 0,
+            pages: Vec::new(),
+            visible: false,
+            kind: vk::MemoryPropertyFlags::empty(),
+        }
+    }
+}
+
+impl Slot {
+    fn staged(staging: Held) -> Self {
+        Self {
+            command: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            staging,
+            queries: None,
+            held: None,
+            flight: None,
+            stamped: 0,
+        }
+    }
+}
+
+/// Construction fills a resident that starts with every handle null and owns
+/// each object from the moment it is made, so a step that fails drops what
+/// came before it through the one drop path. Destroying a null handle is a
+/// no-op in Vulkan.
+impl<'host> Resident<'host> {
+    fn building(host: &'host Host, direct: bool, bindings: usize) -> Self {
+        Self {
+            host,
+            direct,
+            built: false,
+            buffers: Vec::with_capacity(bindings),
+            staging: Held::none(),
+            layout: vk::DescriptorSetLayout::null(),
+            pool: vk::DescriptorPool::null(),
+            set: vk::DescriptorSet::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            shaders: Vec::new(),
+            pipelines: Vec::new(),
+            commands: vk::CommandPool::null(),
+            transfer: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            slots: Vec::with_capacity(SLOTS),
+            tickets: 0,
+            cached: false,
+            recording: Duration::ZERO,
+            recorded: 0,
+            copying: Duration::ZERO,
+            copies: 0,
+            pushing: Duration::ZERO,
+            pushes: 0,
+            poked: 0,
+            patience: Resident::patience_of(std::env::var("GRIT_PATIENCE_SECS").ok().as_deref()),
+            device: None,
+            spans: Vec::new(),
+            reused: 0,
+        }
+    }
+
+    unsafe fn describe(&mut self) -> Result<(), Error> {
+        let device = self.host.device();
+        let count = u32::try_from(self.buffers.len()).unwrap_or(u32::MAX).max(1);
 
         let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = (0..count)
             .map(|index| {
@@ -791,11 +822,10 @@ impl Host {
             .collect();
         let create = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         faults::enter(Step::SetLayout)?;
-        let layout = unsafe {
-            self.device()
-                .create_descriptor_set_layout(&create, faults::callbacks(Step::SetLayout))
+        self.layout = unsafe {
+            device.create_descriptor_set_layout(&create, faults::callbacks(Step::SetLayout))
         }?;
-        faults::made(Step::SetLayout, layout);
+        faults::made(Step::SetLayout, self.layout);
 
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
@@ -804,22 +834,21 @@ impl Host {
             .max_sets(1)
             .pool_sizes(&sizes);
         faults::enter(Step::Pool)?;
-        let pool = unsafe {
-            self.device()
-                .create_descriptor_pool(&create, faults::callbacks(Step::Pool))
-        }?;
-        faults::made(Step::Pool, pool);
+        self.pool =
+            unsafe { device.create_descriptor_pool(&create, faults::callbacks(Step::Pool)) }?;
+        faults::made(Step::Pool, self.pool);
 
-        let layouts = [layout];
+        let layouts = [self.layout];
         let allocate = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(pool)
+            .descriptor_pool(self.pool)
             .set_layouts(&layouts);
         faults::enter(Step::Set)?;
-        let sets = unsafe { self.device().allocate_descriptor_sets(&allocate) }?;
-        let set = sets.first().copied().unwrap_or_default();
-        faults::made(Step::Set, set);
+        let sets = unsafe { device.allocate_descriptor_sets(&allocate) }?;
+        self.set = sets.first().copied().unwrap_or_default();
+        faults::made(Step::Set, self.set);
 
-        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = self
+            .buffers
             .iter()
             .map(|held| {
                 [vk::DescriptorBufferInfo::default()
@@ -833,44 +862,40 @@ impl Host {
             .enumerate()
             .map(|(index, info)| {
                 vk::WriteDescriptorSet::default()
-                    .dst_set(set)
+                    .dst_set(self.set)
                     .dst_binding(u32::try_from(index).unwrap_or(0))
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(info)
             })
             .collect();
-        unsafe { self.device().update_descriptor_sets(&writes, &[]) };
-
-        Ok((layout, pool, set))
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        Ok(())
     }
 
-    unsafe fn compile(
-        &self,
-        layout: vk::DescriptorSetLayout,
-        modules: &[&[u32]],
-    ) -> Result<(vk::PipelineLayout, Vec<vk::ShaderModule>, Vec<vk::Pipeline>), Error> {
-        let layouts = [layout];
+    /// The pipeline layout and every module and pipeline are kept the moment
+    /// they are made, so a pipeline that fails leaves its module, the layout
+    /// and the pipelines before it to be freed with the rest.
+    unsafe fn compile(&mut self, modules: &[&[u32]]) -> Result<(), Error> {
+        let device = self.host.device();
+        let layouts = [self.layout];
         let create = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
         faults::enter(Step::PipelineLayout)?;
-        let pipeline_layout = unsafe {
-            self.device()
-                .create_pipeline_layout(&create, faults::callbacks(Step::PipelineLayout))
+        self.pipeline_layout = unsafe {
+            device.create_pipeline_layout(&create, faults::callbacks(Step::PipelineLayout))
         }?;
-        faults::made(Step::PipelineLayout, pipeline_layout);
+        faults::made(Step::PipelineLayout, self.pipeline_layout);
 
-        let mut shaders = Vec::with_capacity(modules.len());
-        let mut pipelines = Vec::with_capacity(modules.len());
+        self.shaders.reserve(modules.len());
+        self.pipelines.reserve(modules.len());
         let entry = c"main";
 
         for words in modules {
             let create = vk::ShaderModuleCreateInfo::default().code(words);
             faults::enter(Step::Shader)?;
-            let shader = unsafe {
-                self.device()
-                    .create_shader_module(&create, faults::callbacks(Step::Shader))
-            }?;
+            let shader =
+                unsafe { device.create_shader_module(&create, faults::callbacks(Step::Shader)) }?;
             faults::made(Step::Shader, shader);
-            shaders.push(shader);
+            self.shaders.push(shader);
 
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
@@ -878,10 +903,10 @@ impl Host {
                 .name(entry);
             let create = [vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
-                .layout(pipeline_layout)];
+                .layout(self.pipeline_layout)];
             let built = match faults::enter(Step::Pipeline) {
                 Ok(()) => unsafe {
-                    self.device().create_compute_pipelines(
+                    device.create_compute_pipelines(
                         vk::PipelineCache::null(),
                         &create,
                         faults::callbacks(Step::Pipeline),
@@ -889,49 +914,45 @@ impl Host {
                 },
                 Err(code) => Err((Vec::new(), code)),
             };
-            match built {
-                Ok(made) => {
-                    made.iter()
-                        .for_each(|&pipeline| faults::made(Step::Pipeline, pipeline));
-                    pipelines.extend(made);
-                }
-                Err((made, code)) => {
-                    made.iter()
-                        .for_each(|&pipeline| faults::made(Step::Pipeline, pipeline));
-                    pipelines.extend(made);
-                    return Err(code.into());
-                }
+            let (made, failed) = match built {
+                Ok(made) => (made, None),
+                Err((made, code)) => (made, Some(code)),
+            };
+            for pipeline in made {
+                faults::made(Step::Pipeline, pipeline);
+                self.pipelines.push(pipeline);
+            }
+            if let Some(code) = failed {
+                return Err(code.into());
             }
         }
-
-        Ok((pipeline_layout, shaders, pipelines))
+        Ok(())
     }
 
-    unsafe fn record_into(
-        &self,
-    ) -> Result<(vk::CommandPool, Vec<vk::CommandBuffer>, vk::CommandBuffer), Error> {
+    unsafe fn record(&mut self) -> Result<(), Error> {
+        let device = self.host.device();
         let create = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(self.family())
+            .queue_family_index(self.host.family())
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         faults::enter(Step::Commands)?;
-        let pool = unsafe {
-            self.device()
-                .create_command_pool(&create, faults::callbacks(Step::Commands))
-        }?;
-        faults::made(Step::Commands, pool);
+        self.commands =
+            unsafe { device.create_command_pool(&create, faults::callbacks(Step::Commands)) }?;
+        faults::made(Step::Commands, self.commands);
 
         let allocate = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
+            .command_pool(self.commands)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(u32::try_from(SLOTS + 1).unwrap_or(2));
         faults::enter(Step::CommandBuffers)?;
-        let mut buffers = unsafe { self.device().allocate_command_buffers(&allocate) }?;
-        buffers
+        let mut spare = unsafe { device.allocate_command_buffers(&allocate) }?;
+        spare
             .iter()
             .for_each(|&buffer| faults::made(Step::CommandBuffers, buffer));
-        let transfer = buffers.pop().unwrap_or_default();
-
-        Ok((pool, buffers, transfer))
+        self.transfer = spare.pop().unwrap_or_default();
+        for slot in &mut self.slots {
+            slot.command = spare.pop().unwrap_or_default();
+        }
+        Ok(())
     }
 }
 
@@ -2002,13 +2023,19 @@ fn after_earlier(device: &ash::Device, command: vk::CommandBuffer) {
 }
 
 impl Drop for Resident<'_> {
+    /// A finished resident may have work on the device: it waits for the
+    /// device first, and leaks everything on a wedged host, where waiting
+    /// would not end. One still being built has never submitted anything, so
+    /// it frees what it made at once, wedged or not.
     fn drop(&mut self) {
-        if self.host.wedged() {
+        if self.built && self.host.wedged() {
             return;
         }
         let device = self.host.device();
         unsafe {
-            let _ = device.device_wait_idle();
+            if self.built {
+                let _ = device.device_wait_idle();
+            }
             device.destroy_fence(self.fence, faults::callbacks(Step::Fence));
             faults::gone(Step::Fence, self.fence);
             for slot in &self.slots {
