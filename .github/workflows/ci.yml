@@ -51,7 +51,7 @@ jobs:
         working-directory: grit
         env:
           RUSTFLAGS: -D warnings
-        run: cargo clippy --locked --all-targets
+        run: cargo clippy --locked --all-targets --features faults
 
       - name: doc
         working-directory: grit
@@ -68,13 +68,13 @@ jobs:
         include:
           - vector: 128
             width: 4
-            skips: 12
+            skips: 15
           - vector: 256
             width: 8
-            skips: 5
+            skips: 8
           - vector: 512
             width: 16
-            skips: 2
+            skips: 5
     steps:
       - uses: actions/checkout@v5
         with:
@@ -118,7 +118,7 @@ jobs:
           GRIT_PATIENCE_SECS: 300
         run: |
           set -o pipefail
-          cargo test --release --locked --no-default-features --features deep --no-fail-fast -- --nocapture \
+          cargo test --release --locked --no-default-features --features deep,faults --no-fail-fast -- --nocapture \
             2>&1 | tee "$RUNNER_TEMP/suite.log"
           # Every SKIPPED counts, a bare one with no reason after it too. awk
           # exits 0 when there is none, so the count needs no guard.
