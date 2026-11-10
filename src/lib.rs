@@ -1,6 +1,7 @@
 pub mod board;
 pub mod compact;
 pub mod gate;
+pub mod geometry;
 pub mod host;
 pub mod layout;
 pub mod live;

@@ -125,6 +125,8 @@ pub const fn hold_of(word: u32, under: u32) -> u32 {
 pub struct Grid {
     pub wide: u32,
     pub deep: u32,
+    /// The cells along the third axis: 1 for a 2D grid.
+    pub tall: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +134,7 @@ pub enum Unfit {
     Side { asked: u32 },
     TooMany { wide: u32, deep: u32 },
     Empty { wide: u32, deep: u32 },
+    TooTall { wide: u32, deep: u32, tall: u32 },
 }
 
 impl std::fmt::Display for Unfit {
@@ -148,6 +151,10 @@ impl std::fmt::Display for Unfit {
             Self::Empty { wide, deep } => write!(
                 out,
                 "a grid of {wide} by {deep} cells holds no whole quad of two by two"
+            ),
+            Self::TooTall { wide, deep, tall } => write!(
+                out,
+                "a grid of {wide} by {deep} by {tall} cells has more octs than a u32 counts"
             ),
         }
     }
@@ -169,6 +176,7 @@ impl Grid {
         let grid = Self {
             wide: rounded_wide,
             deep: rounded_deep,
+            tall: 1,
         };
         if grid.across() == 0 || grid.down() == 0 {
             return Err(Unfit::Empty {
@@ -187,17 +195,52 @@ impl Grid {
         Ok(grid)
     }
 
+    /// The 3D grid `wide` by `deep` by `tall`, each side rounded up to a
+    /// power of two, refused where [`Grid::new`] refuses the first two sides,
+    /// where `tall` rounds past `2^31`, or where its octs pass a `u32` or its
+    /// cells a `usize`. A `tall` of 0 or 1 gives the 2D grid.
+    pub const fn solid(wide: u32, deep: u32, tall: u32) -> Result<Self, Unfit> {
+        let Some(rounded_tall) = tall.checked_next_power_of_two() else {
+            return Err(Unfit::Side { asked: tall });
+        };
+        let flat = match Self::new(wide, deep) {
+            Ok(flat) => flat,
+            Err(why) => return Err(why),
+        };
+        let grid = Self {
+            tall: rounded_tall,
+            ..flat
+        };
+        let octs = flat.quads().checked_mul(rounded_tall / 2);
+        let cells = flat.cells().checked_mul(rounded_tall as usize);
+        if octs.is_none() || cells.is_none() {
+            return Err(Unfit::TooTall {
+                wide: grid.wide,
+                deep: grid.deep,
+                tall: rounded_tall,
+            });
+        }
+        Ok(grid)
+    }
+
     #[must_use]
     pub const fn of(wide: u32, deep: u32) -> Self {
         Self {
             wide: wide.next_power_of_two(),
             deep: deep.next_power_of_two(),
+            tall: 1,
         }
+    }
+
+    /// 2 for a flat grid, 3 for a solid one.
+    #[must_use]
+    pub const fn axes(self) -> u32 {
+        if self.tall > 1 { 3 } else { 2 }
     }
 
     #[must_use]
     pub const fn cells(self) -> usize {
-        self.wide as usize * self.deep as usize
+        self.wide as usize * self.deep as usize * self.tall as usize
     }
 
     #[must_use]
@@ -213,6 +256,16 @@ impl Grid {
     #[must_use]
     pub const fn quads(self) -> u32 {
         self.across() * self.down()
+    }
+
+    /// The blocks of two cells along every axis: quads in 2D, octs in 3D.
+    #[must_use]
+    pub const fn blocks(self) -> u32 {
+        if self.tall > 1 {
+            self.quads() * (self.tall / 2)
+        } else {
+            self.quads()
+        }
     }
 }
 
