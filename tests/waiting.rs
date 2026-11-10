@@ -55,6 +55,10 @@ fn the_wait_is_time_the_host_gets_back() {
     let Some(host) = device("the_wait_is_time_the_host_gets_back") else {
         return;
     };
+    if std::env::var_os("CI").is_some() {
+        common::skip("the_wait_is_time_the_host_gets_back is a timing claim, skipped under CI");
+        return;
+    }
     let module = walk(host.width()).unwrap();
     let every: Vec<&[u32]> = vec![&module; PASSES];
     let over = over(host.width(), host.limits().groups);

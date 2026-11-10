@@ -873,6 +873,12 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
     let Some(host) = device("the_list_starts_paying_when_the_grid_outgrows") else {
         return;
     };
+    if std::env::var_os("CI").is_some() {
+        common::skip(
+            "the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping is a timing claim, skipped under CI",
+        );
+        return;
+    }
     // The sides are taken from what the bookkeeping can address rather than
     // written down, because that is what they are being measured against. A
     // two-level scan over blocks of `sweep::cells(width)` reaches
