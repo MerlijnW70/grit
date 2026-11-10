@@ -16,6 +16,7 @@ pub mod sand3;
 pub mod serve;
 pub mod serve3;
 pub mod sweep;
+pub mod view3;
 pub mod wire;
 pub mod written;
 
