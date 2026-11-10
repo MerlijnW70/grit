@@ -17,11 +17,13 @@ use grit::marking;
 use grit::netlist::{KINDS, Netlist};
 use grit::rule::{self, Kind, Pass};
 use grit::sand::{self, AIR, Grid, SAND, View, WALL, WATER};
-use grit::{Groups, live, sweep};
+use grit::{Groups, live, sand3, sweep};
 
 const WIDTHS: [u32; 5] = [4, 8, 16, 32, 64];
 
 const GRIDS: [(u32, u32); 3] = [(256, 128), (512, 256), (4096, 2048)];
+
+const SOLIDS: [(u32, u32, u32); 3] = [(16, 16, 16), (64, 32, 16), (256, 256, 256)];
 
 const SPIRV_FILE: &str = "tests/golden/spirv.txt";
 const STATE_FILE: &str = "tests/golden/state.txt";
@@ -412,6 +414,24 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                     );
                 }
                 Err(why) => panic!("live::keeping/{tier}{at} at width {w}: refused: {why:?}"),
+            }
+        }
+    }
+
+    for (wide, deep, tall) in SOLIDS {
+        let grid = Grid::solid(wide, deep, tall).unwrap();
+        for most in [u32::MAX, 65_535] {
+            let at = format!("@{wide}x{deep}x{tall}/most-{most}");
+            match sand3::settle(w, grid, most) {
+                Ok(built) => {
+                    all.found
+                        .push((format!("sand3::settle{at}"), words_hash(&built.words)));
+                    all.text(
+                        format!("sand3::settle{at}/spread"),
+                        &format!("{:?}", built.spread),
+                    );
+                }
+                Err(why) => panic!("sand3::settle{at} at width {w}: refused: {why:?}"),
             }
         }
     }
