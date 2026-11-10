@@ -160,6 +160,11 @@ pub fn settle_reference3(grid: Grid3, frame: u32, cells: &[u32]) -> Vec<u32> {
 /// Why [`settle`] or [`Spread::of`] refuses a grid that is not solid.
 pub const FLAT: &str = "the grid is flat (tall 1), and the 3D kernel steps a solid grid";
 
+/// Why a kernel under a rule is refused when the rule declares no tally
+/// count or more than [`crate::rule3::MOST_COUNTS`], or its step gives
+/// another number of counts than it declares.
+pub const MISCOUNTED: &str = "the rule declares no tally count, more than rule3::MOST_COUNTS, or another number than its step gives";
+
 /// Why [`settle`] or [`Spread::of`] refuses a device that dispatches no group.
 pub const NO_GROUPS: &str = "the device dispatches no workgroup at all";
 
@@ -419,7 +424,7 @@ pub(crate) fn ruled<const LANES: u32, R: Rule>(
     for &id in given.params {
         params.push(lanes.splat_id::<U32, LANES>(id)?);
     }
-    rule.emit::<LANES>(
+    let stepped = rule.emit::<LANES>(
         lanes,
         Oct {
             words,
@@ -427,5 +432,13 @@ pub(crate) fn ruled<const LANES: u32, R: Rule>(
             at: placing.block,
             params: &params,
         },
-    )
+    )?;
+    let tally = rule.tally();
+    if !tally.fits() || stepped.counts.len() != tally.counts {
+        return Err(LaneError::NoSuchForm {
+            operation: "sand3::ruled",
+            because: MISCOUNTED,
+        });
+    }
+    Ok(stepped)
 }

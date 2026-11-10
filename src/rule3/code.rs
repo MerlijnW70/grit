@@ -52,12 +52,12 @@
 //! the quiet contract of [`crate::rule3`]. A world of only [`DATA`] and
 //! [`HALT`] cells has no cell that claims and is quiet from its first frame.
 //!
-//! Its tally words are the cells that changed, the [`MOVE`] cells and the
-//! [`DATA`] cells after the step.
+//! The rule is one [`OneStep`] over [`Ops`]: the CPU functions below run
+//! that step on `u32`. Its tally words are the cells that changed, the
+//! [`MOVE`] cells and the [`DATA`] cells after the step, the first weighted.
 
-use simdr::lanes::{LaneError, Lanes, Predicate, U32};
-
-use super::{CORNERS, Oct, Rule, Ruled, Word};
+use super::{Axis, CORNERS, Corner, Declared, Oct, Octet, OneStep, Ruled, Tally};
+use crate::ops::{Cpu, Flag, Helpers, Ops};
 
 pub const NOP: u32 = 0;
 pub const DATA: u32 = 1;
@@ -82,16 +82,15 @@ pub const WAYS: u32 = 6;
 
 pub const PAYLOAD: u32 = (1 << 24) - 1;
 const INSTRUCTION_SHIFT: u32 = 24;
+const INSTRUCTION_BITS: u32 = 4;
 const INSTRUCTION_MASK: u32 = 0xF << INSTRUCTION_SHIFT;
 const WAY_SHIFT: u32 = 28;
+const WAY_BITS: u32 = 3;
 const WAY_MASK: u32 = 0x7 << WAY_SHIFT;
 
 /// The axes, x, y and z, in the order a conflict is resolved: the claim of
 /// the neighbour along the first of them wins.
-pub const PRIORITY: [usize; 3] = [0, 1, 2];
-
-/// The bit of a corner index that is its place along each axis, x, y and z.
-const AXIS_BIT: [usize; 3] = [1, 4, 2];
+pub const PRIORITY: [Axis; 3] = Axis::ALL;
 
 /// A cell of `instruction` facing `way`, holding `payload` cut to 24 bits.
 #[must_use]
@@ -116,60 +115,179 @@ pub const fn payload_of(word: u32) -> u32 {
     word & PAYLOAD
 }
 
-const fn with_instruction(word: u32, instruction: u32) -> u32 {
-    (word & !INSTRUCTION_MASK) | (instruction << INSTRUCTION_SHIFT)
+/// The way along `axis` that a cell at `corner` faces a neighbour in the
+/// oct.
+const fn facing(corner: Corner, axis: Axis) -> u32 {
+    2 * axis.index() as u32 + corner.side(axis)
 }
 
-fn bit_of(axis: usize) -> usize {
-    AXIS_BIT.get(axis).copied().unwrap_or(0)
+fn instruction<O: Ops>(ops: &mut O, word: O::Word) -> O::Word {
+    ops.field(word, INSTRUCTION_SHIFT, INSTRUCTION_BITS)
 }
 
-/// The way along `axis` that a cell at `corner` faces a neighbour in the oct.
-fn facing(corner: usize, axis: usize) -> u32 {
-    let high = u32::from(corner & bit_of(axis) != 0);
-    u32::try_from(2 * axis).unwrap_or(0) + high
+fn way<O: Ops>(ops: &mut O, word: O::Word) -> O::Word {
+    ops.field(word, WAY_SHIFT, WAY_BITS)
 }
 
-fn at<T: Copy, const N: usize>(cells: &[T; N], which: usize, or: T) -> T {
-    cells.get(which).copied().unwrap_or(or)
-}
-
-fn put<T>(cells: &mut [T; CORNERS], corner: usize, value: T) {
-    if let Some(slot) = cells.get_mut(corner) {
-        *slot = value;
+/// The turn stage over [`Ops`]; `instructions` are those of `words`. The
+/// turns are taken last axis first, so the first in [`PRIORITY`] stands.
+fn turned_by<O: Ops>(
+    ops: &mut O,
+    words: Octet<O::Word>,
+    instructions: Octet<O::Word>,
+) -> Octet<O::Word> {
+    let mut out = words;
+    for corner in Corner::ALL {
+        let cell = words[corner];
+        let moving = ops.is(instructions[corner], MOVE);
+        let kept = ops.masked(cell, !WAY_MASK);
+        let mut held = cell;
+        for axis in PRIORITY.into_iter().rev() {
+            let near = corner.neighbour(axis);
+            let turn = ops.is(instructions[near], TURN);
+            let turns = ops.both(moving, turn);
+            let way = ops.masked(words[near], WAY_MASK);
+            let taken = ops.or(kept, way);
+            held = ops.select(turns, taken, held);
+        }
+        out[corner] = held;
     }
+    out
 }
 
 /// The turn stage: each [`MOVE`] cell takes the way of the first [`TURN`]
 /// cell next to it in [`PRIORITY`].
 #[must_use]
 pub fn turned(words: [u32; CORNERS]) -> [u32; CORNERS] {
-    let mut out = words;
-    for (corner, &cell) in words.iter().enumerate() {
-        if instruction_of(cell) != MOVE {
-            continue;
-        }
-        for axis in PRIORITY {
-            let next = at(&words, corner ^ bit_of(axis), 0);
-            if instruction_of(next) == TURN {
-                put(&mut out, corner, (cell & !WAY_MASK) | (next & WAY_MASK));
-                break;
-            }
-        }
+    let words = Octet(words);
+    turned_by(&mut Cpu, words, words.map(instruction_of)).0
+}
+
+/// A cell of an oct after the turn stage, with what it is: flags of its
+/// instruction, and whether it faces its neighbour along each axis.
+#[derive(Clone, Copy)]
+struct Cell<W> {
+    word: W,
+    moving: Flag<W>,
+    copying: Flag<W>,
+    adding: Flag<W>,
+    empty: Flag<W>,
+    data: Flag<W>,
+    halting: Flag<W>,
+    faces: [Flag<W>; 3],
+}
+
+/// `word`, of instruction `does`, at `corner`, as a [`Cell`].
+fn cell_by<O: Ops>(ops: &mut O, word: O::Word, does: O::Word, corner: Corner) -> Cell<O::Word> {
+    let pointed = way(ops, word);
+    Cell {
+        word,
+        moving: ops.is(does, MOVE),
+        copying: ops.is(does, COPY),
+        adding: ops.is(does, ADD),
+        empty: ops.is(does, NOP),
+        data: ops.is(does, DATA),
+        halting: ops.is(does, HALT),
+        faces: PRIORITY.map(|axis| ops.is(pointed, facing(corner, axis))),
     }
-    out
+}
+
+/// The flag of `flags` along `axis`.
+const fn along<T: Copy>(flags: [T; 3], axis: Axis) -> T {
+    let [x, y, z] = flags;
+    match axis {
+        Axis::X => x,
+        Axis::Y => y,
+        Axis::Z => z,
+    }
+}
+
+/// One claim over [`Ops`]: whether `source` claims its neighbour `target`
+/// along `axis`, and the word it claims it for.
+fn claimed_by<O: Ops>(
+    ops: &mut O,
+    source: &Cell<O::Word>,
+    target: &Cell<O::Word>,
+    axis: Axis,
+) -> (Flag<O::Word>, O::Word) {
+    let faces = along(source.faces, axis);
+    let walks = ops.both(source.moving, faces);
+    let spreads = ops.either(walks, source.copying);
+    let into_empty = ops.both(spreads, target.empty);
+    let sums = ops.both(source.adding, faces);
+    let into_data = ops.both(sums, target.data);
+    let claims = ops.either(into_empty, into_data);
+    let total = ops.add(source.word, target.word);
+    let total = ops.masked(total, PAYLOAD);
+    let kept = ops.masked(source.word, !PAYLOAD);
+    let added = ops.or(kept, total);
+    let word = ops.select(sums, added, source.word);
+    (claims, word)
 }
 
 /// The word the cell `source`, at corner `from`, claims its neighbour
 /// `target` along `axis` for, if it claims it.
 #[must_use]
 pub fn claim(source: u32, from: usize, target: u32, axis: usize) -> Option<u32> {
-    let faces = way_of(source) == facing(from, axis);
-    match (instruction_of(source), instruction_of(target)) {
-        (MOVE, NOP) if faces => Some(source),
-        (COPY, NOP) => Some(source),
-        (ADD, DATA) if faces => Some((source & !PAYLOAD) | (source.wrapping_add(target) & PAYLOAD)),
-        _ => None,
+    let from = Corner::new(from)?;
+    let axis = Axis::of(axis)?;
+    let ops = &mut Cpu;
+    let source = cell_by(ops, source, instruction_of(source), from);
+    let target = cell_by(ops, target, instruction_of(target), from.neighbour(axis));
+    let (claims, word) = claimed_by(ops, &source, &target, axis);
+    (claims.word() != 0).then_some(word)
+}
+
+/// One step of one oct over [`Ops`], without the tally.
+fn stepped_by<O: Ops>(ops: &mut O, words: Octet<O::Word>) -> Octet<O::Word> {
+    let instructions = words.map(|word| instruction(ops, word));
+    let turned = turned_by(ops, words, instructions);
+    let cells = Octet::from_fn(|corner| cell_by(ops, turned[corner], instructions[corner], corner));
+    let none = ops.truth(false);
+
+    let mut out = turned;
+    let mut won = Octet([[none; 3]; CORNERS]);
+    for target in Corner::ALL {
+        let mut taken = none;
+        for axis in PRIORITY {
+            let from = target.neighbour(axis);
+            let (claims, claimed) = claimed_by(ops, &cells[from], &cells[target], axis);
+            let free = ops.denied(taken);
+            let wins = ops.both(claims, free);
+            taken = ops.either(taken, claims);
+            out[target] = ops.select(wins, claimed, out[target]);
+            won[target] = winning(won[target], axis, wins);
+        }
+    }
+
+    let gone = ops.constant(word(NOP, 0, 0));
+    let stopped = ops.constant(DATA << INSTRUCTION_SHIFT);
+    for corner in Corner::ALL {
+        let cell = cells[corner];
+        let walker = ops.either(cell.moving, cell.adding);
+        let kept = ops.masked(cell.word, !INSTRUCTION_MASK);
+        let halted = ops.or(kept, stopped);
+        let mut now = out[corner];
+        for axis in PRIORITY {
+            let near = corner.neighbour(axis);
+            let left = ops.both(along(won[near], axis), walker);
+            now = ops.select(left, gone, now);
+            let blocked = ops.both(cell.moving, along(cell.faces, axis));
+            let blocked = ops.both(blocked, cells[near].halting);
+            now = ops.select(blocked, halted, now);
+        }
+        out[corner] = now;
+    }
+    out
+}
+
+/// `won` with the claim along `axis` set to `wins`.
+const fn winning<T: Copy>(won: [T; 3], axis: Axis, wins: T) -> [T; 3] {
+    let [x, y, z] = won;
+    match axis {
+        Axis::X => [wins, y, z],
+        Axis::Y => [x, wins, z],
+        Axis::Z => [x, y, wins],
     }
 }
 
@@ -177,259 +295,35 @@ pub fn claim(source: u32, from: usize, target: u32, axis: usize) -> Option<u32> 
 /// resolution.
 #[must_use]
 pub fn stepped(words: [u32; CORNERS]) -> [u32; CORNERS] {
-    let cells = turned(words);
-    let mut out = cells;
-    for (target, &held) in cells.iter().enumerate() {
-        for axis in PRIORITY {
-            let from = target ^ bit_of(axis);
-            let source = at(&cells, from, 0);
-            if let Some(claimed) = claim(source, from, held, axis) {
-                put(&mut out, target, claimed);
-                if matches!(instruction_of(source), MOVE | ADD) {
-                    put(&mut out, from, word(NOP, 0, 0));
-                }
-                break;
-            }
-        }
-    }
-    for (corner, &cell) in cells.iter().enumerate() {
-        if instruction_of(cell) != MOVE {
-            continue;
-        }
-        for axis in PRIORITY {
-            let next = at(&cells, corner ^ bit_of(axis), 0);
-            if way_of(cell) == facing(corner, axis) && instruction_of(next) == HALT {
-                put(&mut out, corner, with_instruction(cell, DATA));
-            }
-        }
-    }
-    out
+    stepped_by(&mut Cpu, Octet(words)).0
 }
 
 /// Cellular code, as the module describes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Code;
 
-impl Rule for Code {
+impl Declared for Code {
     fn params(&self) -> usize {
         0
     }
 
-    fn step(&self, oct: Oct<'_, u32>) -> Ruled<u32> {
-        let out = stepped(oct.words);
-        let mut counts = [0; 3];
-        for (before, after) in oct.words.iter().zip(&out) {
-            let found = [
-                before != after,
-                instruction_of(*after) == MOVE,
-                instruction_of(*after) == DATA,
-            ];
-            for (count, add) in counts.iter_mut().zip(found) {
-                *count += u32::from(add);
-            }
+    fn tally(&self) -> Tally {
+        Tally {
+            counts: 3,
+            weighted: true,
         }
-        Ruled { out, counts }
-    }
-
-    fn emit<const LANES: u32>(
-        &self,
-        lanes: &mut Lanes<'_>,
-        oct: Oct<'_, Word<LANES>>,
-    ) -> Result<Ruled<Word<LANES>>, LaneError> {
-        let mut emit = Emitting::<LANES>::new(lanes)?;
-        let out = emit.stepped(oct.words)?;
-        let none = emit.none;
-        let mut counts = [none; 3];
-        for (before, after) in oct.words.into_iter().zip(out) {
-            let same = emit.lanes.equal(before, after)?;
-            let changed = emit.lanes.select(same, emit.none, emit.one)?;
-            let instruction = emit.instruction(after)?;
-            let moving = emit.is(instruction, MOVE)?;
-            let data = emit.is(instruction, DATA)?;
-            for (count, add) in counts.iter_mut().zip([changed, moving, data]) {
-                *count = emit.lanes.add(*count, add)?;
-            }
-        }
-        Ok(Ruled { out, counts })
     }
 }
 
-/// The code rule's stages, emitted. Flags are words of 0 or 1.
-struct Emitting<'held, 'module, const LANES: u32> {
-    lanes: &'held mut Lanes<'module>,
-    one: Word<LANES>,
-    none: Word<LANES>,
-}
-
-impl<'held, 'module, const LANES: u32> Emitting<'held, 'module, LANES> {
-    fn new(lanes: &'held mut Lanes<'module>) -> Result<Self, LaneError> {
-        let one = lanes.splat_bits::<U32, LANES>(1)?;
-        let none = lanes.splat_bits::<U32, LANES>(0)?;
-        Ok(Self { lanes, one, none })
-    }
-
-    fn bits(&mut self, value: u32) -> Result<Word<LANES>, LaneError> {
-        self.lanes.splat_bits::<U32, LANES>(value)
-    }
-
-    fn masked(&mut self, word: Word<LANES>, mask: u32) -> Result<Word<LANES>, LaneError> {
-        let mask = self.bits(mask)?;
-        self.lanes.and(word, mask)
-    }
-
-    fn flag(&mut self, truth: Predicate<LANES>) -> Result<Word<LANES>, LaneError> {
-        self.lanes.select(truth, self.one, self.none)
-    }
-
-    fn is(&mut self, value: Word<LANES>, want: u32) -> Result<Word<LANES>, LaneError> {
-        let want = self.bits(want)?;
-        let same = self.lanes.equal(value, want)?;
-        self.flag(same)
-    }
-
-    fn pick(
-        &mut self,
-        flag: Word<LANES>,
-        then: Word<LANES>,
-        otherwise: Word<LANES>,
-    ) -> Result<Word<LANES>, LaneError> {
-        let truth = self.lanes.not_equal(flag, self.none)?;
-        self.lanes.select(truth, then, otherwise)
-    }
-
-    fn instruction(&mut self, word: Word<LANES>) -> Result<Word<LANES>, LaneError> {
-        let by = self.bits(INSTRUCTION_SHIFT)?;
-        let shifted = self.lanes.shift_right_logical(word, by)?;
-        self.masked(shifted, 0xF)
-    }
-
-    fn way(&mut self, word: Word<LANES>) -> Result<Word<LANES>, LaneError> {
-        let by = self.bits(WAY_SHIFT)?;
-        let shifted = self.lanes.shift_right_logical(word, by)?;
-        self.masked(shifted, 0x7)
-    }
-
-    /// [`turned`].
-    fn turned(
-        &mut self,
-        words: [Word<LANES>; CORNERS],
-        instructions: [Word<LANES>; CORNERS],
-    ) -> Result<[Word<LANES>; CORNERS], LaneError> {
-        let none = self.none;
-        let mut out = words;
-        for corner in 0..CORNERS {
-            let cell = at(&words, corner, none);
-            let moving = self.is(at(&instructions, corner, none), MOVE)?;
-            let kept = self.masked(cell, !WAY_MASK)?;
-            let mut held = cell;
-            for axis in PRIORITY.into_iter().rev() {
-                let near = corner ^ bit_of(axis);
-                let turn = self.is(at(&instructions, near, none), TURN)?;
-                let turns = self.lanes.and(moving, turn)?;
-                let way = self.masked(at(&words, near, none), WAY_MASK)?;
-                let taken = self.lanes.or(kept, way)?;
-                held = self.pick(turns, taken, held)?;
-            }
-            put(&mut out, corner, held);
-        }
-        Ok(out)
-    }
-
-    /// [`stepped`].
-    fn stepped(
-        &mut self,
-        words: [Word<LANES>; CORNERS],
-    ) -> Result<[Word<LANES>; CORNERS], LaneError> {
-        let none = self.none;
-        let mut instructions = [none; CORNERS];
-        for (instruction, &word) in instructions.iter_mut().zip(&words) {
-            *instruction = self.instruction(word)?;
-        }
-        let cells = self.turned(words, instructions)?;
-        let mut ways = [none; CORNERS];
-        for (way, &cell) in ways.iter_mut().zip(&cells) {
-            *way = self.way(cell)?;
-        }
-        let mut faces = [[none; 3]; CORNERS];
-        for (corner, facing_axes) in faces.iter_mut().enumerate() {
-            for (axis, flag) in facing_axes.iter_mut().enumerate() {
-                *flag = self.is(at(&ways, corner, none), facing(corner, axis))?;
-            }
-        }
-        let mut moving = [none; CORNERS];
-        let mut copying = [none; CORNERS];
-        let mut adding = [none; CORNERS];
-        let mut empty = [none; CORNERS];
-        let mut data = [none; CORNERS];
-        let mut halting = [none; CORNERS];
-        for corner in 0..CORNERS {
-            let instruction = at(&instructions, corner, none);
-            put(&mut moving, corner, self.is(instruction, MOVE)?);
-            put(&mut copying, corner, self.is(instruction, COPY)?);
-            put(&mut adding, corner, self.is(instruction, ADD)?);
-            put(&mut empty, corner, self.is(instruction, NOP)?);
-            put(&mut data, corner, self.is(instruction, DATA)?);
-            put(&mut halting, corner, self.is(instruction, HALT)?);
-        }
-
-        let mut out = cells;
-        let mut won = [[none; 3]; CORNERS];
-        for target in 0..CORNERS {
-            let held = at(&cells, target, none);
-            let mut taken = none;
-            for axis in PRIORITY {
-                let from = target ^ bit_of(axis);
-                let source = at(&cells, from, none);
-                let faced = at(&faces, from, [none; 3]);
-                let faced = at(&faced, axis, none);
-                let walks = self.lanes.and(at(&moving, from, none), faced)?;
-                let spreads = self.lanes.or(walks, at(&copying, from, none))?;
-                let into_empty = self.lanes.and(spreads, at(&empty, target, none))?;
-                let sums = self.lanes.and(at(&adding, from, none), faced)?;
-                let into_data = self.lanes.and(sums, at(&data, target, none))?;
-                let claims = self.lanes.or(into_empty, into_data)?;
-                let free = self.lanes.xor(taken, self.one)?;
-                let wins = self.lanes.and(claims, free)?;
-                taken = self.lanes.or(taken, claims)?;
-                let total = self.lanes.add(source, held)?;
-                let total = self.masked(total, PAYLOAD)?;
-                let kept = self.masked(source, !PAYLOAD)?;
-                let added = self.lanes.or(kept, total)?;
-                let claimed = self.pick(sums, added, source)?;
-                let now = self.pick(wins, claimed, at(&out, target, none))?;
-                put(&mut out, target, now);
-                if let Some(row) = won.get_mut(target)
-                    && let Some(slot) = row.get_mut(axis)
-                {
-                    *slot = wins;
-                }
-            }
-        }
-
-        let gone_word = self.bits(word(NOP, 0, 0))?;
-        let stopped = self.bits(DATA << INSTRUCTION_SHIFT)?;
-        for corner in 0..CORNERS {
-            let cell = at(&cells, corner, none);
-            let walker = self
-                .lanes
-                .or(at(&moving, corner, none), at(&adding, corner, none))?;
-            let faced = at(&faces, corner, [none; 3]);
-            let mut now = at(&out, corner, none);
-            for axis in PRIORITY {
-                let near = corner ^ bit_of(axis);
-                let wins = at(&at(&won, near, [none; 3]), axis, none);
-                let gone = self.lanes.and(wins, walker)?;
-                now = self.pick(gone, gone_word, now)?;
-                let blocked = self
-                    .lanes
-                    .and(at(&moving, corner, none), at(&faced, axis, none))?;
-                let blocked = self.lanes.and(blocked, at(&halting, near, none))?;
-                let kept = self.masked(cell, !INSTRUCTION_MASK)?;
-                let halted = self.lanes.or(kept, stopped)?;
-                now = self.pick(blocked, halted, now)?;
-            }
-            put(&mut out, corner, now);
-        }
-        Ok(out)
+impl OneStep for Code {
+    fn one_step<O: Ops>(&self, ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word> {
+        let before = Octet(oct.words);
+        let out = stepped_by(ops, before);
+        let changed = Octet::from_fn(|corner| ops.not_equal(before[corner], out[corner]));
+        let does = out.map(|after| instruction(ops, after));
+        let moving = does.map(|does| ops.is(does, MOVE));
+        let data = does.map(|does| ops.is(does, DATA));
+        let counts = vec![ops.count(changed.0), ops.count(moving.0), ops.count(data.0)];
+        Ruled { out: out.0, counts }
     }
 }

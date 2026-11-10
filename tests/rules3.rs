@@ -7,10 +7,14 @@ use common::device;
 use grit::compact::Plan;
 use grit::layout::{BINDINGS, Dimension, GRAND, PARAMS, PIXELS, STATE, TALLY};
 use grit::live;
+use grit::ops::{Helpers, Ops};
 use grit::rule3::code::{self, Code};
 use grit::rule3::heat::{self, Heat};
 use grit::rule3::sand::Sand;
-use grit::rule3::{CORNERS, FIRST_PARAM, Oct, Rule, Ruled, Word, noise, noise_emitted};
+use grit::rule3::{
+    CORNERS, Declared, FIRST_PARAM, MOST_COUNTS, Oct, OneStep, Rule, Ruled, Tally, Word, noise,
+    noise_emitted,
+};
 use grit::sand::{self as sand2, Grid};
 use grit::sand3::{self, Grid3, lattice, reference};
 use grit::sweep;
@@ -814,7 +818,7 @@ fn the_tally_holds_the_counts_of_the_code_rule() {
                 at: lattice(engine.reference, oct),
                 params: &[],
             });
-            for (word, count) in wanted.iter_mut().zip(ruled.counts) {
+            for (word, count) in wanted.iter_mut().zip(ruled.counts.clone()) {
                 *word += count;
             }
             for (word, value) in wanted[3..6].iter_mut().zip(lattice(engine.reference, oct)) {
@@ -899,7 +903,7 @@ fn the_tally_holds_the_counts_of_the_heat_rule() {
                 at: lattice(engine.reference, oct),
                 params: &heat::TUNED,
             });
-            for (word, count) in wanted.iter_mut().zip(ruled.counts) {
+            for (word, count) in wanted.iter_mut().zip(ruled.counts.clone()) {
                 *word += count;
             }
             for (word, value) in wanted[3..6].iter_mut().zip(lattice(engine.reference, oct)) {
@@ -917,11 +921,20 @@ fn the_tally_holds_the_counts_of_the_heat_rule() {
 /// oct every frame.
 struct Noisy;
 
-impl Rule for Noisy {
+impl Declared for Noisy {
     fn params(&self) -> usize {
         2
     }
 
+    fn tally(&self) -> Tally {
+        Tally {
+            counts: 3,
+            weighted: true,
+        }
+    }
+}
+
+impl Rule for Noisy {
     fn step(&self, oct: Oct<'_, u32>) -> Ruled<u32> {
         let made = noise(oct.at, oct.frame);
         let out = std::array::from_fn(|corner| {
@@ -930,7 +943,7 @@ impl Rule for Noisy {
         });
         Ruled {
             out,
-            counts: [8, 0, 0],
+            counts: vec![8, 0, 0],
         }
     }
 
@@ -951,7 +964,7 @@ impl Rule for Noisy {
         let none = lanes.splat_bits::<U32, LANES>(0)?;
         Ok(Ruled {
             out,
-            counts: [eight, none, none],
+            counts: vec![eight, none, none],
         })
     }
 }
@@ -1310,4 +1323,236 @@ fn the_reference_steps_no_oct_that_reaches_past_a_short_world() {
     let mut wanted = sand3::settle_reference3(grid, 0, &padded);
     wanted.truncate(40);
     assert_eq!(sand3::settle_reference3(grid, 0, &sand_world), wanted);
+}
+
+/// A probe rule that declares `counts` tally counts, weighted or not. Each
+/// even cell steps to one more; count `k` is the cells of the stepped oct
+/// whose bit `k` is set.
+struct Counted {
+    counts: usize,
+    weighted: bool,
+}
+
+impl Declared for Counted {
+    fn params(&self) -> usize {
+        0
+    }
+
+    fn tally(&self) -> Tally {
+        Tally {
+            counts: self.counts,
+            weighted: self.weighted,
+        }
+    }
+}
+
+impl OneStep for Counted {
+    fn one_step<O: Ops>(&self, ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word> {
+        let one = ops.constant(1);
+        let out = oct.words.map(|word| {
+            let low = ops.masked(word, 1);
+            let even = ops.is(low, 0);
+            let up = ops.add(word, one);
+            ops.select(even, up, word)
+        });
+        let counts = (0..self.counts)
+            .map(|bit| {
+                let set = out.map(|word| {
+                    let held = ops.field(word, u32::try_from(bit).unwrap(), 1);
+                    ops.is(held, 1)
+                });
+                ops.count(set)
+            })
+            .collect();
+        Ruled { out, counts }
+    }
+}
+
+fn counted(counts: usize, weighted: bool) -> Subject<Counted> {
+    Subject {
+        name: "counted",
+        rule: Counted { counts, weighted },
+        params: Vec::new(),
+        cell: |state| next(state) as u32,
+        calm: 1,
+        room: |grid, _| vec![1; grid.cells()],
+        poured: |_| Vec::new(),
+    }
+}
+
+/// The tally a frame from `before` leaves on the CPU, every oct stepped, as
+/// [`Tally`] lays it out.
+fn tally_on_cpu<R: Rule>(
+    subject: &Subject<R>,
+    grid: Grid3,
+    frame: u32,
+    before: &[u32],
+) -> Vec<u32> {
+    let tally = subject.rule.tally();
+    let mut wanted = vec![0_u32; tally.words()];
+    for oct in 0..grid.octs() {
+        let places = grid.corners(frame, oct);
+        let at = lattice(grid, oct);
+        let ruled = subject.rule.step(Oct {
+            words: places.map(|place| before[place]),
+            frame,
+            at,
+            params: &subject.params,
+        });
+        assert_eq!(ruled.counts.len(), tally.counts);
+        for (word, count) in wanted.iter_mut().zip(&ruled.counts) {
+            *word += count;
+        }
+        if tally.weighted {
+            let moved = ruled.counts[0];
+            for (word, value) in wanted[tally.counts..].iter_mut().zip(at) {
+                *word += (value >> grit::layout::COARSE) * moved;
+            }
+            wanted[tally.counts + 3] += u32::from(moved > 0);
+        }
+    }
+    wanted
+}
+
+/// One listed frame from a random world under `subject`, the tally binding
+/// filled with a marker first: the frame wipes exactly the rule's tally
+/// words and leaves its counts there, equal to the CPU's, and the words
+/// past them keep the marker.
+fn tally_holds_the_cpu_counts<R: Rule>(subject: &Subject<R>, host: &Host, seed: u64) -> Vec<u32> {
+    const MARK: u32 = 0xDEAD_BEEF;
+    const SHAPE: (u32, u32, u32) = (64, 32, 32);
+    let tally = subject.rule.tally();
+    let mut last = Vec::new();
+    for coarse in TIERS {
+        let Some(mut engine) = Engine::new(host, subject, SHAPE, coarse) else {
+            continue;
+        };
+        let sizes = live::sizes3(&subject.rule, &engine.plan);
+        let room = sizes[TALLY as usize];
+        assert_eq!(room, tally.words().max(Dimension::Three.tally_words()));
+        let start = random(subject, engine.reference, seed);
+        let name = format!("{} tally {} {}", subject.name, tally.counts, tally.weighted);
+        engine.restart(&start, label(&name, SHAPE, coarse, seed));
+        engine
+            .live
+            .write(TALLY as usize, &vec![MARK; room])
+            .unwrap();
+        let before = engine.want.clone();
+        engine.frame();
+        let got = engine.live.read(TALLY as usize, room).unwrap();
+        let wanted = tally_on_cpu(subject, engine.reference, 0, &before);
+        assert_eq!(got[..tally.words()], wanted[..], "{}", engine.label);
+        assert!(
+            got[tally.words()..].iter().all(|&word| word == MARK),
+            "{got:x?}"
+        );
+        last = wanted;
+    }
+    last
+}
+
+#[test]
+fn the_tally_holds_the_counts_of_the_sand_rule() {
+    let Some(host) = device("sand tally") else {
+        return;
+    };
+    let wanted = tally_holds_the_cpu_counts(&sand(), &host, SEEDS[2]);
+    assert_eq!(wanted.len(), 7);
+    assert!(wanted.iter().all(|&word| word > 0), "{wanted:?}");
+}
+
+/// A rule's tally is as long as it declares, from one count to the most,
+/// with the weighted words after the counts only when it asks for them.
+#[test]
+fn the_tally_is_as_long_as_the_rule_declares() {
+    let Some(host) = device("tally lengths") else {
+        return;
+    };
+    for (counts, weighted) in [
+        (1, false),
+        (1, true),
+        (3, false),
+        (4, true),
+        (MOST_COUNTS, false),
+        (MOST_COUNTS, true),
+    ] {
+        let wanted = tally_holds_the_cpu_counts(&counted(counts, weighted), &host, SEEDS[3]);
+        let words = counts + if weighted { 4 } else { 0 };
+        assert_eq!(wanted.len(), words);
+        assert!(wanted.iter().all(|&word| word > 0), "{wanted:?}");
+    }
+    for tally in [
+        sand().rule.tally(),
+        heated().rule.tally(),
+        coded().rule.tally(),
+    ] {
+        assert_eq!(tally.words(), Dimension::Three.tally_words());
+    }
+}
+
+/// A probe rule that gives more counts than it declares.
+struct Overcounted;
+
+impl Declared for Overcounted {
+    fn params(&self) -> usize {
+        0
+    }
+
+    fn tally(&self) -> Tally {
+        Tally {
+            counts: 2,
+            weighted: false,
+        }
+    }
+}
+
+impl OneStep for Overcounted {
+    fn one_step<O: Ops>(&self, ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word> {
+        let none = ops.constant(0);
+        Ruled {
+            out: oct.words,
+            counts: vec![none; 3],
+        }
+    }
+}
+
+fn refused_everywhere<R: Rule>(rule: &R, plan: &Plan) {
+    let (grid, _) = grids(16, 16, 16);
+    let miscounted = LaneError::NoSuchForm {
+        operation: "sand3::ruled",
+        because: sand3::MISCOUNTED,
+    };
+    for width in [4, 8, 16, 32, 64] {
+        assert_eq!(
+            sand3::settle_by(rule, width, grid, u32::MAX).map(|built| built.words),
+            Err(miscounted.clone())
+        );
+        assert_eq!(live::settle3_by(rule, width, grid), Err(miscounted.clone()));
+    }
+    assert!(live::arranged3_by(rule, plan.subgroup, grid, plan, false).is_err());
+}
+
+/// A tally of no counts or more than the most, or a step that gives
+/// another number of counts than it declares, builds no kernel.
+#[test]
+fn a_rule_whose_tally_does_not_fit_builds_no_kernel() {
+    let (grid, _) = grids(16, 16, 16);
+    let plan = Plan::over_in(
+        16,
+        grid.blocks().div_ceil(sweep::cells(16)),
+        Dimension::Three,
+    )
+    .unwrap();
+    for (counts, weighted) in [(0, false), (0, true), (MOST_COUNTS + 1, false)] {
+        let rule = Counted { counts, weighted };
+        assert!(!rule.tally().fits());
+        refused_everywhere(&rule, &plan);
+    }
+    refused_everywhere(&Overcounted, &plan);
+    for (counts, weighted) in [(1, false), (MOST_COUNTS, true)] {
+        let rule = Counted { counts, weighted };
+        assert!(rule.tally().fits());
+        assert!(sand3::settle_by(&rule, 16, grid, u32::MAX).is_ok());
+        assert!(live::arranged3_by(&rule, 16, grid, &plan, true).is_ok());
+    }
 }

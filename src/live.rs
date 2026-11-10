@@ -338,12 +338,18 @@ pub fn wired3_by<R: Rule>(
 
 /// The sizes of the bindings of a listed engine on `plan` that steps
 /// `rule`: [`crate::compact::Plan::sizes`] with `PARAMS` grown by the
-/// rule's parameters, which start at [`crate::rule3::FIRST_PARAM`].
+/// rule's parameters, which start at [`crate::rule3::FIRST_PARAM`], and
+/// `TALLY` grown to the rule's [`crate::rule3::Tally::words`].
 #[must_use]
 pub fn sizes3<R: Rule>(rule: &R, plan: &crate::compact::Plan) -> [usize; BINDINGS as usize] {
+    use crate::layout::TALLY;
+
     let mut sizes = plan.sizes();
     if let Some(params) = sizes.get_mut(PARAMS as usize) {
         *params = (*params).max(crate::rule3::FIRST_PARAM) + rule.params();
+    }
+    if let Some(tally) = sizes.get_mut(TALLY as usize) {
+        *tally = (*tally).max(rule.tally().words());
     }
     sizes
 }
@@ -388,7 +394,7 @@ pub fn arranged3_by<R: Rule>(
         vec![
             (tick(subgroup)?, one),
             (decay(subgroup, listed)?, hot),
-            (wipe_in(subgroup, Dimension::Three)?, one),
+            (wipe3(subgroup, rule.tally().words())?, one),
             (wipe_counts(subgroup, COUNTS)?, tiles),
             (unclaimed(subgroup, plan)?, one),
         ],
@@ -761,6 +767,36 @@ pub fn wipe_in(subgroup: u32, dimension: Dimension) -> Result<Vec<u32>, LaneErro
     kernel.finish()
 }
 
+/// [`wipe_in`] for a solid grid whose rule's tally takes `words` words:
+/// `TOTALS` and `HOT_TOTALS` as [`wipe_in`] zeroes them, and the first
+/// `words` words of `TALLY`.
+pub fn wipe3(subgroup: u32, words: usize) -> Result<Vec<u32>, LaneError> {
+    use crate::layout::{HOT_TOTALS, TALLY, TOTALS};
+    use crate::sweep::PER_LANE;
+
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let uint = kernel.index_type();
+    let lane = kernel.local_index();
+    let run = kernel.module().constant_u32(PER_LANE)?;
+    let mine = kernel.module().i_mul(uint, lane, run)?;
+    let nothing = kernel.module().constant_u32(0)?;
+
+    for step in 0..PER_LANE {
+        let along = kernel.module().constant_u32(step)?;
+        let at = kernel.module().i_add(uint, mine, along)?;
+        kernel.store_at(TOTALS, at, nothing)?;
+        kernel.store_at(HOT_TOTALS, at, nothing)?;
+    }
+
+    for word in 0..words {
+        let at = kernel
+            .module()
+            .constant_u32(u32::try_from(word).unwrap_or(0))?;
+        kernel.store_at(TALLY, at, nothing)?;
+    }
+    kernel.finish()
+}
+
 pub fn wipe_counts(subgroup: u32, counts: u32) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
@@ -1063,13 +1099,89 @@ fn listed3<const LANES: u32, R: Rule>(
     };
     woken::<LANES, 3, 8, 27>(&mut kernel, block, [touched, inside], dump_base)?;
 
-    let what = Tallying {
-        counted,
+    let what = Tallied3 {
+        counted: &counted,
         at: placing.block,
         inside: counted_in,
+        weighted: rule.tally().weighted,
     };
-    tally::<LANES, 3>(&mut kernel, what)?;
+    tally3::<LANES>(&mut kernel, what)?;
     kernel.finish()
+}
+
+/// What a 3D frame adds to `TALLY`, as [`tally3`] takes it.
+struct Tallied3<'held, const LANES: u32> {
+    counted: &'held [Vector<U32, LANES>],
+    at: [Vector<U32, LANES>; 3],
+    inside: Vector<U32, LANES>,
+    weighted: bool,
+}
+
+/// Adds a 3D frame's counts to `TALLY`, as [`crate::rule3::Tally`] lays
+/// them out: each of the rule's counts from the lanes inside the list, and
+/// when weighted, the first count weighted by each axis of its oct shifted
+/// down by [`COARSE`](crate::layout::COARSE), and the octs whose first
+/// count is not zero.
+fn tally3<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    what: Tallied3<'_, LANES>,
+) -> Result<(), LaneError> {
+    use crate::layout::{COARSE, TALLY};
+
+    let Tallied3 {
+        counted,
+        at,
+        inside,
+        weighted,
+    } = what;
+    let first = kernel.local_index();
+
+    let shares = {
+        let mut lanes = kernel.lanes()?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let listed = lanes.greater_than(inside, none)?;
+
+        let mut shares = Vec::with_capacity(counted.len() + 4);
+        for &count in counted {
+            shares.push(lanes.select(listed, count, none)?);
+        }
+        if weighted && let Some(&moved) = shares.first() {
+            let by = lanes.splat_bits::<U32, LANES>(COARSE)?;
+            let mut weighted = at;
+            for value in &mut weighted {
+                *value = lanes.shift_right_logical(*value, by)?;
+            }
+            for value in &mut weighted {
+                *value = lanes.mul(*value, moved)?;
+            }
+            let stirred = lanes.greater_than(moved, none)?;
+            let stirred = lanes.select(stirred, one, none)?;
+            shares.extend(weighted);
+            shares.push(stirred);
+        }
+        shares
+    };
+
+    for (word, share) in shares.into_iter().enumerate() {
+        let total = {
+            let mut lanes = kernel.lanes()?;
+            lanes.reduce_sum::<U32, LANES>(share)?
+        };
+        let mine = {
+            let mut lanes = kernel.lanes()?;
+            let none = lanes.splat_bits::<U32, LANES>(0)?;
+            let seat = lanes.splat_id::<U32, LANES>(first)?;
+            let sum = lanes.splat_id::<U32, LANES>(total)?;
+            let leading = lanes.equal(seat, none)?;
+            lanes.select(leading, sum, none)?
+        };
+        let at = kernel
+            .module()
+            .constant_u32(u32::try_from(word).unwrap_or(0))?;
+        let _ = kernel.atomic_add_at(TALLY, at, mine.id())?;
+    }
+    Ok(())
 }
 
 struct Tallying<const LANES: u32, const AXES: usize> {
@@ -1078,9 +1190,8 @@ struct Tallying<const LANES: u32, const AXES: usize> {
     inside: Vector<U32, LANES>,
 }
 
-/// Adds a frame's counts to `TALLY`: three counts (in 2D the cells that
-/// moved, the wet and the dry cells; in 3D the rule's three tally words,
-/// [`crate::rule3::Ruled::counts`]), the first count weighted by each axis
+/// Adds a 2D frame's counts to `TALLY`: three counts (the cells that
+/// moved, the wet and the dry cells), the first count weighted by each axis
 /// of its block shifted down by [`COARSE`](crate::layout::COARSE), and the
 /// blocks whose first count is not zero. That is `3 + AXES + 1` words, the
 /// dimension's tally.

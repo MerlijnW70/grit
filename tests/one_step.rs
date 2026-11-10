@@ -6,7 +6,10 @@ use common::device;
 
 use grit::Groups;
 use grit::ops::{Cpu, Device, Flag, Helpers, Ops};
-use grit::rule3::{Axis, CORNERS, Corner, Octet};
+use grit::rule3::sand::Sand;
+use grit::rule3::{Axis, CORNERS, Corner, Oct, Octet, Rule};
+use grit::sand::{AIR, PATIENCE, SAND, WALL, WATER};
+use grit::sand3::{settle_oct, x_first};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -327,4 +330,246 @@ fn the_corner_helpers_follow_the_corner_order() {
         Corner::ALL
     );
     assert_eq!(octet.map(|value| value / 10).0, [0, 1, 2, 3, 4, 5, 6, 7]);
+}
+
+/// The sand step as it was written before it was one step over the ops,
+/// branch by branch on the CPU: the oracle the generic step is held to.
+mod before {
+    use super::{AIR, CORNERS, PATIENCE, SAND, WALL, WATER};
+
+    const MATERIAL_BITS: u32 = 2;
+    const RUNNING_BITS: u32 = 3;
+    const CARRIED_BITS: u32 = MATERIAL_BITS + RUNNING_BITS;
+    const TIRED_BITS: u32 = 3;
+    const HELD: u32 = 1 << CARRIED_BITS;
+    const TIRED: u32 = HELD << 1;
+    const MINUS_X: u32 = 1;
+    const PLUS_X: u32 = 2;
+    const MINUS_Z: u32 = 5;
+    const PLUS_Z: u32 = 6;
+
+    const fn material_of(word: u32) -> u32 {
+        word % (1 << MATERIAL_BITS)
+    }
+
+    const fn running_of(word: u32) -> u32 {
+        (word >> MATERIAL_BITS) % (1 << RUNNING_BITS)
+    }
+
+    const fn held_of(word: u32) -> u32 {
+        (word >> CARRIED_BITS) % 2
+    }
+
+    const fn tired_of(word: u32) -> u32 {
+        (word >> (CARRIED_BITS + 1)) % (1 << TIRED_BITS)
+    }
+
+    pub const fn hold_of(word: u32, under: u32) -> u32 {
+        let carried = word % HELD;
+        let worn = tired_of(word) * TIRED;
+        if material_of(word) == WATER && material_of(under) == WATER {
+            carried + HELD + worn
+        } else {
+            carried + worn
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Axis {
+        X,
+        Z,
+    }
+
+    impl Axis {
+        const fn bit(self) -> usize {
+            match self {
+                Self::X => 1,
+                Self::Z => 2,
+            }
+        }
+
+        const fn minus(self) -> u32 {
+            match self {
+                Self::X => MINUS_X,
+                Self::Z => MINUS_Z,
+            }
+        }
+
+        const fn plus(self) -> u32 {
+            match self {
+                Self::X => PLUS_X,
+                Self::Z => PLUS_Z,
+            }
+        }
+    }
+
+    const fn halted(word: u32) -> u32 {
+        material_of(word) + held_of(word) * HELD + tired_of(word) * TIRED
+    }
+
+    const fn ready(word: u32) -> bool {
+        material_of(word) == WATER
+            && running_of(word) == 0
+            && held_of(word) != 0
+            && tired_of(word) < PATIENCE
+    }
+
+    const fn started(word: u32, way: u32) -> u32 {
+        WATER + (way << MATERIAL_BITS) + HELD + (tired_of(word) + 1) * TIRED
+    }
+
+    fn along(cells: &mut [u32; CORNERS], axis: Axis, low: usize, high: usize) {
+        let (here, there) = (cells[low], cells[high]);
+        let goes_up = running_of(here) == axis.plus();
+        let goes_down = running_of(there) == axis.minus();
+        let up_free = material_of(there) == AIR;
+        let down_free = material_of(here) == AIR;
+        let kept_here = if goes_up && !up_free {
+            halted(here)
+        } else {
+            here
+        };
+        let kept_there = if goes_down && !down_free {
+            halted(there)
+        } else {
+            there
+        };
+        if (goes_up && up_free) || (goes_down && down_free) {
+            cells[low] = kept_there;
+            cells[high] = kept_here;
+        } else {
+            cells[low] = kept_here;
+            cells[high] = kept_there;
+        }
+    }
+
+    fn fall(cells: &mut [u32; CORNERS], upper: usize, lower: usize) {
+        let (up, low) = (cells[upper], cells[lower]);
+        let (above, below) = (material_of(up), material_of(low));
+        if above > below && above != WALL {
+            cells[upper] = low;
+            cells[lower] = above;
+        }
+    }
+
+    const UPPER: [usize; 4] = [0, 1, 2, 3];
+    const LOWER: usize = 4;
+    const CORNER: usize = 3;
+
+    pub fn settle_oct(oct: [u32; CORNERS], x_first: bool) -> [u32; CORNERS] {
+        let axes = if x_first {
+            [Axis::X, Axis::Z]
+        } else {
+            [Axis::Z, Axis::X]
+        };
+        let mut cells = oct;
+        for top in UPPER {
+            cells[top] = hold_of(cells[top], cells[top + LOWER]);
+        }
+        let before = cells;
+        for at in 0..CORNERS {
+            let word = before[at];
+            if !ready(word) {
+                continue;
+            }
+            for axis in axes {
+                let other = at ^ axis.bit();
+                if material_of(before[other]) == AIR {
+                    let way = if at & axis.bit() == 0 {
+                        axis.plus()
+                    } else {
+                        axis.minus()
+                    };
+                    cells[at] = started(word, way);
+                    break;
+                }
+            }
+        }
+        for axis in axes {
+            for low in 0..CORNERS {
+                if low & axis.bit() == 0 {
+                    along(&mut cells, axis, low, low | axis.bit());
+                }
+            }
+        }
+        for top in UPPER {
+            fall(&mut cells, top, top + LOWER);
+        }
+        for axis in axes {
+            for top in UPPER {
+                fall(&mut cells, top, LOWER + (top ^ axis.bit()));
+            }
+        }
+        for top in UPPER {
+            fall(&mut cells, top, LOWER + (top ^ CORNER));
+        }
+        cells
+    }
+
+    pub fn counts(oct: [u32; CORNERS], frame: u32) -> [u32; 3] {
+        let mut held = oct;
+        for top in UPPER {
+            held[top] = hold_of(held[top], held[top + LOWER]);
+        }
+        let out = settle_oct(oct, super::x_first(frame));
+        let moved = held.iter().zip(&out).filter(|(a, b)| a != b).count();
+        let of = |want| {
+            out.iter()
+                .filter(|&&word| material_of(word) == want)
+                .count()
+        };
+        [moved, of(WATER), of(SAND)].map(|count| u32::try_from(count).unwrap())
+    }
+}
+
+/// A sand word: any material, any running way, held bit and tired steps,
+/// and random bits above them now and then.
+fn sand_word(state: &mut u64) -> u32 {
+    let roll = next(state);
+    let low = (roll & 0x1FF) as u32;
+    if (roll >> 12).is_multiple_of(5) {
+        low | (((roll >> 16) as u32) << 9)
+    } else {
+        low
+    }
+}
+
+/// The sand step over the ops equals the step as it was written before,
+/// branch by branch, on random octs in both axis orders, with its counts;
+/// and the hold equals the old hold on every pair of low words.
+#[test]
+fn the_sand_step_over_the_ops_equals_the_sand_step_it_replaced() {
+    let mut state = 0x5A4D_u64;
+    let mut moved = 0_u64;
+    for round in 0..400_000_u32 {
+        let words: [u32; CORNERS] = std::array::from_fn(|_| sand_word(&mut state));
+        let frame = next(&mut state) as u32;
+        for order in [true, false] {
+            let got = settle_oct(words, order);
+            assert_eq!(
+                got,
+                before::settle_oct(words, order),
+                "{words:#x?} x first {order}"
+            );
+            moved += u64::from(got != words);
+        }
+        let ruled = Sand.step(Oct {
+            words,
+            frame,
+            at: [round, 0, 0],
+            params: &[],
+        });
+        assert_eq!(ruled.out, before::settle_oct(words, x_first(frame)));
+        assert_eq!(ruled.counts, before::counts(words, frame), "{words:#x?}");
+    }
+    assert!(moved > 100_000, "only {moved} steps changed an oct");
+    for word in 0..0x200 {
+        for under in 0..0x200 {
+            assert_eq!(
+                grit::sand3::hold_of(word, under),
+                before::hold_of(word, under)
+            );
+        }
+    }
+    println!("{moved} of 800000 sand steps changed their oct");
 }

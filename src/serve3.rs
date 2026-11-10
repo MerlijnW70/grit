@@ -34,9 +34,6 @@ pub const STEP_MOST: u32 = 65536;
 /// How many frames go to the device at a time.
 const BATCH: u32 = 64;
 
-/// The words of the tally a 3D frame leaves.
-const TALLY_WORDS: usize = Dimension::Three.tally_words();
-
 /// The digits a slice of kinds is drawn with, one a kind.
 const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
@@ -47,6 +44,10 @@ pub trait Listed {
 
     /// How many words of parameters the rule reads.
     fn params(&self) -> usize;
+
+    /// The words of the tally a frame under the rule leaves, as
+    /// [`crate::rule3::Tally::words`] gives them.
+    fn tally_words(&self) -> usize;
 
     /// The listed frame under the rule, as [`live::wired3_by`] builds it.
     fn wired(&self, subgroup: u32, grid: Grid, plan: &Plan) -> Result<Loop, LaneError>;
@@ -76,6 +77,10 @@ impl<R: Rule> Listed for Named<R> {
 
     fn params(&self) -> usize {
         self.rule.params()
+    }
+
+    fn tally_words(&self) -> usize {
+        self.rule.tally().words()
     }
 
     fn wired(&self, subgroup: u32, grid: Grid, plan: &Plan) -> Result<Loop, LaneError> {
@@ -547,7 +552,7 @@ impl<'host> Server<'host> {
             done += step;
         }
         world.frame = world.frame.wrapping_add(frames);
-        let tally = world.live.read(TALLY as usize, TALLY_WORDS)?;
+        let tally = world.live.read(TALLY as usize, world.rule.tally_words())?;
         let listed = world.listed()?;
         Ok(map(vec![
             ("world", counted(needed(held, "world")?)),
@@ -913,7 +918,7 @@ fn world_tools() -> Vec<Json> {
         tool(
             "grit_world_step",
             &format!(
-                "Run frames, 1 to {STEP_MOST}. Returns the frame count so far, the 7 tally words of the last frame and how many octs it lists for the next."
+                "Run frames, 1 to {STEP_MOST}. Returns the frame count so far, the rule's tally words of the last frame and how many octs it lists for the next."
             ),
             vec![
                 ("world", world()),

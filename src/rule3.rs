@@ -13,12 +13,19 @@
 //! unchanged at one frame leaves them unchanged two frames later, at the same
 //! oct. Noise may decide a step only where the step changes the oct whatever
 //! the noise says.
+//!
+//! A rule is best written once, as a [`OneStep`] over the word operations of
+//! [`crate::ops`]: the same function is then its CPU reference and its
+//! kernel. [`Corner`], [`Axis`] and [`Octet`] give it the oct's geometry.
 
 use core::ops::{Index, IndexMut};
 
-use simdr::lanes::{LaneError, Lanes, U32, Vector};
+use simdr::lanes::{LaneError, Lanes};
 
 use crate::layout::Dimension;
+use crate::ops::{Cpu, Device, Ops};
+
+pub use crate::ops::Word;
 
 pub mod code;
 pub mod heat;
@@ -189,9 +196,6 @@ impl<T> IndexMut<Corner> for Octet<T> {
     }
 }
 
-/// One lane's word on the device.
-pub type Word<const LANES: u32> = Vector<U32, LANES>;
-
 /// One oct as a rule sees it, on the CPU (`W` is `u32`) or on the device
 /// (`W` is a [`Word`]).
 ///
@@ -202,7 +206,7 @@ pub type Word<const LANES: u32> = Vector<U32, LANES>;
 /// - `at`: the oct's point in the lattice of octs, x, y and z. With the
 ///   phase it names the eight cells.
 /// - `params`: the rule's words of `PARAMS` from [`FIRST_PARAM`] on, as many
-///   as [`Rule::params`] says.
+///   as [`Declared::params`] says.
 #[derive(Debug, Clone, Copy)]
 pub struct Oct<'held, W> {
     pub words: [W; CORNERS],
@@ -211,25 +215,65 @@ pub struct Oct<'held, W> {
     pub params: &'held [W],
 }
 
-/// What one step of a rule gives: the eight words to store, in the order
-/// they came, and the rule's three tally words. The first counts the cells
-/// the rule moved, and the engine weights it by the oct's point; the other
-/// two are the rule's own.
+/// The most tally counts a rule may declare.
+pub const MOST_COUNTS: usize = 8;
+
+/// The tally a rule leaves each frame, as [`Declared::tally`] declares it.
+///
+/// The frame's tally holds the sum over the stepped octs of each of the
+/// rule's `counts`, in order. A `weighted` tally goes on with the first
+/// count weighted by each axis of the oct's point shifted down by
+/// [`crate::layout::COARSE`], x, y and z, and then the octs whose first
+/// count is not zero; its first count is the cells the rule moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tally {
+    pub counts: usize,
+    pub weighted: bool,
+}
+
+impl Tally {
+    /// The words the tally takes: the counts, and four more when weighted.
+    #[must_use]
+    pub const fn words(self) -> usize {
+        if self.weighted {
+            self.counts + 4
+        } else {
+            self.counts
+        }
+    }
+
+    /// Whether the engine keeps such a tally: 1 to [`MOST_COUNTS`] counts.
+    #[must_use]
+    pub const fn fits(self) -> bool {
+        self.counts >= 1 && self.counts <= MOST_COUNTS
+    }
+}
+
+/// What one step of a rule gives: the eight words to store, in the order
+/// they came, and the rule's tally counts, as many as [`Declared::tally`]
+/// declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ruled<W> {
     pub out: [W; CORNERS],
-    pub counts: [W; 3],
+    pub counts: Vec<W>,
+}
+
+/// What a rule declares to the engine, however its step is written.
+pub trait Declared {
+    /// How many words of `PARAMS` the rule reads, from [`FIRST_PARAM`] on.
+    fn params(&self) -> usize;
+
+    /// The tally counts the rule gives, and whether the first is weighted.
+    fn tally(&self) -> Tally;
 }
 
 /// A rule of the 3D engine.
 ///
 /// [`Rule::emit`] must equal [`Rule::step`] bit for bit on every input, at
 /// every subgroup width. Both are pure: the step of an oct depends only on
-/// its [`Oct`].
-pub trait Rule {
-    /// How many words of `PARAMS` the rule reads, from [`FIRST_PARAM`] on.
-    fn params(&self) -> usize;
-
+/// its [`Oct`]. A [`OneStep`] rule has both from its one step; a rule may
+/// also write the two by hand.
+pub trait Rule: Declared {
     /// One step of one oct on the CPU.
     fn step(&self, oct: Oct<'_, u32>) -> Ruled<u32>;
 
@@ -239,6 +283,29 @@ pub trait Rule {
         lanes: &mut Lanes<'_>,
         oct: Oct<'_, Word<LANES>>,
     ) -> Result<Ruled<Word<LANES>>, LaneError>;
+}
+
+/// A rule written once, over [`Ops`]: [`OneStep::one_step`] with [`Cpu`]
+/// is its [`Rule::step`], and with [`Device`] its [`Rule::emit`].
+pub trait OneStep: Declared {
+    /// One step of one oct.
+    fn one_step<O: Ops>(&self, ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word>;
+}
+
+impl<S: OneStep> Rule for S {
+    fn step(&self, oct: Oct<'_, u32>) -> Ruled<u32> {
+        self.one_step(&mut Cpu, oct)
+    }
+
+    fn emit<const LANES: u32>(
+        &self,
+        lanes: &mut Lanes<'_>,
+        oct: Oct<'_, Word<LANES>>,
+    ) -> Result<Ruled<Word<LANES>>, LaneError> {
+        let mut device = Device::<LANES>::new(lanes)?;
+        let ruled = self.one_step(&mut device, oct);
+        device.finish(ruled)
+    }
 }
 
 const STIR: u32 = 0x9E37_79B9;
@@ -263,22 +330,29 @@ pub const fn noise(at: [u32; 3], frame: u32) -> u32 {
     mixed(out ^ at[2])
 }
 
-fn mixed_emitted<const LANES: u32>(
-    lanes: &mut Lanes<'_>,
-    value: Word<LANES>,
-) -> Result<Word<LANES>, LaneError> {
-    let sixteen = lanes.splat_bits::<U32, LANES>(16)?;
-    let fifteen = lanes.splat_bits::<U32, LANES>(15)?;
-    let first = lanes.splat_bits::<U32, LANES>(0x7FEB_352D)?;
-    let second = lanes.splat_bits::<U32, LANES>(0x846C_A68B)?;
-    let shifted = lanes.shift_right_logical(value, sixteen)?;
-    let out = lanes.xor(value, shifted)?;
-    let out = lanes.mul(out, first)?;
-    let shifted = lanes.shift_right_logical(out, fifteen)?;
-    let out = lanes.xor(out, shifted)?;
-    let out = lanes.mul(out, second)?;
-    let shifted = lanes.shift_right_logical(out, sixteen)?;
-    lanes.xor(out, shifted)
+fn mixed_by<O: Ops>(ops: &mut O, value: O::Word) -> O::Word {
+    let first = ops.constant(0x7FEB_352D);
+    let second = ops.constant(0x846C_A68B);
+    let shifted = ops.shift_right(value, 16);
+    let out = ops.xor(value, shifted);
+    let out = ops.mul(out, first);
+    let shifted = ops.shift_right(out, 15);
+    let out = ops.xor(out, shifted);
+    let out = ops.mul(out, second);
+    let shifted = ops.shift_right(out, 16);
+    ops.xor(out, shifted)
+}
+
+/// [`noise`] over [`Ops`].
+pub fn noise_by<O: Ops>(ops: &mut O, at: [O::Word; 3], frame: O::Word) -> O::Word {
+    let stir = ops.constant(STIR);
+    let start = ops.xor(frame, stir);
+    let mut out = mixed_by(ops, start);
+    for value in at {
+        let folded = ops.xor(out, value);
+        out = mixed_by(ops, folded);
+    }
+    out
 }
 
 /// [`noise`], emitted into `lanes`.
@@ -287,18 +361,21 @@ pub fn noise_emitted<const LANES: u32>(
     at: [Word<LANES>; 3],
     frame: Word<LANES>,
 ) -> Result<Word<LANES>, LaneError> {
-    let stir = lanes.splat_bits::<U32, LANES>(STIR)?;
-    let start = lanes.xor(frame, stir)?;
-    let mut out = mixed_emitted::<LANES>(lanes, start)?;
-    for value in at {
-        let folded = lanes.xor(out, value)?;
-        out = mixed_emitted::<LANES>(lanes, folded)?;
-    }
-    Ok(out)
+    let mut device = Device::<LANES>::new(lanes)?;
+    let made = noise_by(&mut device, at, frame);
+    device.finish(made)
 }
 
 /// The rule's parameter `which`, or 0 where `params` holds fewer words.
 #[must_use]
 pub fn param(params: &[u32], which: usize) -> u32 {
     params.get(which).copied().unwrap_or(0)
+}
+
+/// [`param`] over [`Ops`]: the constant 0 where `params` holds fewer words.
+pub fn param_by<O: Ops>(ops: &mut O, params: &[O::Word], which: usize) -> O::Word {
+    match params.get(which) {
+        Some(&value) => value,
+        None => ops.constant(0),
+    }
 }
