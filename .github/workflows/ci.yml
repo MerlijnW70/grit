@@ -7,6 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The simdr commit every job builds against, and the only place it is
+  # recorded. To move it: set the new full SHA here, run the lavapipe test
+  # step locally at each width with the environment it sets, and update
+  # `skips` in the matrix to the counts those runs print.
+  SIMDR_REV: 9dec3b766b0ac14c8507a338502cf8b0a37b6136
 
 jobs:
   library:
@@ -19,6 +24,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: MerlijnW70/simdr
+          ref: ${{ env.SIMDR_REV }}
           path: simdr
 
       - uses: dtolnay/rust-toolchain@stable
@@ -76,6 +82,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: MerlijnW70/simdr
+          ref: ${{ env.SIMDR_REV }}
           path: simdr
       - uses: dtolnay/rust-toolchain@stable
 
@@ -133,6 +140,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: MerlijnW70/simdr
+          ref: ${{ env.SIMDR_REV }}
           path: simdr
       - uses: dtolnay/rust-toolchain@master
         with:
