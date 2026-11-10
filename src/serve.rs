@@ -566,7 +566,7 @@ fn given(held: &Json, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Er
     Ok(gates)
 }
 
-fn tools() -> Json {
+pub(crate) fn tools() -> Json {
     let table = map(vec![
         ("type", text("array")),
         ("items", map(vec![("type", text("integer"))])),
@@ -1132,7 +1132,7 @@ fn tools() -> Json {
     ])
 }
 
-fn said(what: &str, wrong: bool) -> Json {
+pub(crate) fn said(what: &str, wrong: bool) -> Json {
     map(vec![
         (
             "content",
@@ -1145,7 +1145,7 @@ fn said(what: &str, wrong: bool) -> Json {
     ])
 }
 
-fn answered(id: Json, result: Json) -> Json {
+pub(crate) fn answered(id: Json, result: Json) -> Json {
     map(vec![
         ("jsonrpc", text("2.0")),
         ("id", id),
@@ -1153,7 +1153,7 @@ fn answered(id: Json, result: Json) -> Json {
     ])
 }
 
-fn refused(id: Json, code: i64, what: &str) -> Json {
+pub(crate) fn refused(id: Json, code: i64, what: &str) -> Json {
     map(vec![
         ("jsonrpc", text("2.0")),
         ("id", id),
@@ -1966,6 +1966,23 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
     }
 }
 
+pub(crate) fn delivered(id: Json, result: Json) -> Json {
+    answered(
+        id,
+        map(vec![
+            (
+                "content",
+                Json::List(vec![map(vec![
+                    ("type", text("text")),
+                    ("text", text(&crate::wire::written(&result))),
+                ])]),
+            ),
+            ("isError", Json::Bool(false)),
+            ("structuredContent", result),
+        ]),
+    )
+}
+
 #[must_use]
 pub fn handle(host: Option<&Host>, request: &Json) -> Option<Json> {
     let way = request.get("method").and_then(Json::text).unwrap_or("");
@@ -1994,20 +2011,7 @@ pub fn handle(host: Option<&Host>, request: &Json) -> Option<Json> {
                 .cloned()
                 .unwrap_or(Json::Map(Vec::new()));
             match ran(host, name, &arguments) {
-                Ok(result) => Some(answered(
-                    id,
-                    map(vec![
-                        (
-                            "content",
-                            Json::List(vec![map(vec![
-                                ("type", text("text")),
-                                ("text", text(&crate::wire::written(&result))),
-                            ])]),
-                        ),
-                        ("isError", Json::Bool(false)),
-                        ("structuredContent", result),
-                    ]),
-                )),
+                Ok(result) => Some(delivered(id, result)),
                 Err(why) => Some(answered(id, said(&why.to_string(), true))),
             }
         }
