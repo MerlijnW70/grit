@@ -13,6 +13,7 @@ pub mod sand;
 pub mod serve;
 pub mod sweep;
 pub mod wire;
+pub mod written;
 
 pub use host::{Error, Host};
 pub use resident::{Groups, Resident, Run, Ticket};
