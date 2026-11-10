@@ -443,6 +443,7 @@ pub fn backward<const LANES: u32>(
 }
 
 pub fn built(subgroup: u32, grid: Grid, pass: Pass, kind: Kind) -> Result<Vec<u32>, LaneError> {
+    crate::sand::flat("rule::built", grid)?;
     match subgroup {
         4 => building::<4>(subgroup, grid, pass, kind),
         8 => building::<8>(subgroup, grid, pass, kind),
@@ -462,6 +463,7 @@ pub fn building<const LANES: u32>(
     pass: Pass,
     kind: Kind,
 ) -> Result<Vec<u32>, LaneError> {
+    crate::sand::flat("rule::building", grid)?;
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let group = kernel.workgroup_index();
