@@ -422,15 +422,29 @@ fn the_slope_and_the_weight_agree_however_deep_the_walk() {
     }
 }
 
+fn dispatched(host: &Host, grid: Grid) -> Grid {
+    let allowed = host.limits().groups;
+    let mut grid = grid;
+    while grid.quads().div_ceil(host.width()) > allowed && grid.deep > 2 {
+        grid = if grid.deep >= grid.wide {
+            Grid::of(grid.wide, grid.deep / 2)
+        } else {
+            Grid::of(grid.wide / 2, grid.deep)
+        };
+    }
+    grid
+}
+
 #[test]
 fn a_tape_that_would_not_fit_on_the_card_is_never_written() {
     let Some(host) = device("a_tape_that_would_not_fit_on_the_card_is_never_written") else {
         return;
     };
     let width = host.width();
-    let grid = Grid::of(2048, 2048);
+    let full = Grid::of(2048, 2048);
+    let grid = dispatched(&host, full);
     let quads = grid.quads();
-    let depth = 4096_u32;
+    let depth = 4096_u32 * u32::try_from(full.cells() / grid.cells()).unwrap();
 
     let passes = [
         built(width, grid, Pass::Tangent).unwrap(),
@@ -866,11 +880,16 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
     // can hold is `cells(width)` cubed quads -- 16 777 216 at a subgroup of 32,
     // and 32 768 at a subgroup of 4. Four sides, halving down from the largest
     // that fits, ask the same question of every device instead of asking a
-    // narrow one for a grid it could never plan.
+    // narrow one for a grid it could never plan. The walk over the whole grid
+    // is one dispatch of a group per subgroup of quads, so the largest side is
+    // also held to the workgroup count the device promises.
     let per_block = sweep::cells(host.width());
     let reach = u64::from(per_block).pow(3);
     let mut top = TOP;
-    while u64::from(Grid::of(top, top).quads()) > reach && top > 2 {
+    while (u64::from(Grid::of(top, top).quads()) > reach
+        || dispatched(&host, Grid::of(top, top)) != Grid::of(top, top))
+        && top > 2
+    {
         top /= 2;
     }
     if top < LEAST {

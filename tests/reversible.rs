@@ -4,9 +4,9 @@ mod common;
 
 use common::device;
 
-use grit::Groups;
 use grit::layout::{BINDINGS, PARAMS, STATE};
 use grit::sand::{self, Grid};
+use grit::{Groups, Host};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -176,13 +176,26 @@ fn a_block_turned_back_is_the_block_it_was() {
     assert_eq!(held, cells);
 }
 
+fn dispatched(host: &Host, grid: Grid) -> Grid {
+    let allowed = host.limits().groups;
+    let mut grid = grid;
+    while grid.quads().div_ceil(host.width()) > allowed && grid.deep > 2 {
+        grid = if grid.deep >= grid.wide {
+            Grid::of(grid.wide, grid.deep / 2)
+        } else {
+            Grid::of(grid.wide / 2, grid.deep)
+        };
+    }
+    grid
+}
+
 #[test]
 fn a_thousand_steps_forward_and_back_is_the_grid_it_started_as() {
     let Some(host) = device("a_thousand_steps_forward_and_back") else {
         return;
     };
     let width = host.width();
-    let grid = Grid::of(WIDE, DEEP);
+    let grid = dispatched(&host, Grid::of(WIDE, DEEP));
     let quads = grid.quads();
 
     let ahead = turned(width, grid, false).unwrap();

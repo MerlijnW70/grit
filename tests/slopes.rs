@@ -3,8 +3,8 @@
 mod common;
 mod lifting;
 
-use grit::Groups;
 use grit::sand::Grid;
+use grit::{Groups, Host};
 use lifting::*;
 
 #[test]
@@ -284,6 +284,19 @@ fn the_smallest_difference_the_slope_can_point_at() {
     }
 }
 
+fn dispatched(host: &Host, grid: Grid) -> Grid {
+    let allowed = host.limits().groups;
+    let mut grid = grid;
+    while grid.quads().div_ceil(host.width()) > allowed && grid.deep > 2 {
+        grid = if grid.deep >= grid.wide {
+            Grid::of(grid.wide, grid.deep / 2)
+        } else {
+            Grid::of(grid.wide / 2, grid.deep)
+        };
+    }
+    grid
+}
+
 #[test]
 fn the_angle_is_found_where_the_tape_would_not_fit() {
     let Some(host) = device("the_angle_is_found_where_the_tape_would_not_fit") else {
@@ -299,9 +312,17 @@ fn the_angle_is_found_where_the_tape_would_not_fit() {
         "cells", "held", "a tape", "found", "times", "took"
     );
 
-    let mut told = Vec::new();
+    let mut grids: Vec<Grid> = Vec::new();
     for side in [64_u32, 512, 2048, 4096] {
-        let grid = Grid::of(side, side);
+        let grid = dispatched(&host, Grid::of(side, side));
+        if grids.last() != Some(&grid) {
+            grids.push(grid);
+        }
+    }
+    let top = grids.last().copied();
+
+    let mut told = Vec::new();
+    for grid in grids {
         let passes = [
             built(width, grid, Pass::Ahead, Kind::Smooth).unwrap(),
             built(width, grid, Pass::Back, Kind::Smooth).unwrap(),
@@ -343,7 +364,7 @@ fn the_angle_is_found_where_the_tape_would_not_fit() {
         );
         told.push((grid.cells(), found));
 
-        if side == 4096 {
+        if Some(grid) == top {
             let away = 192_u32;
             let here = truth + away;
             let slope = asking(&mut board, &start, &target, here);

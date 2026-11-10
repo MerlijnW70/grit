@@ -44,8 +44,10 @@ fn walk(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     kernel.finish()
 }
 
-fn over(width: u32) -> u32 {
-    u32::try_from(WORDS / (width as usize * PER_LANE as usize)).unwrap_or(1)
+fn over(width: u32, allowed: u32) -> u32 {
+    u32::try_from(WORDS / (width as usize * PER_LANE as usize))
+        .unwrap_or(1)
+        .min(allowed)
 }
 
 #[test]
@@ -55,10 +57,12 @@ fn the_wait_is_time_the_host_gets_back() {
     };
     let module = walk(host.width()).unwrap();
     let every: Vec<&[u32]> = vec![&module; PASSES];
-    let mut held = host.resident(&[WORDS, 1], &every).unwrap();
-    held.write(0, &vec![1; WORDS]).unwrap();
+    let over = over(host.width(), host.limits().groups);
+    let words = over as usize * host.width() as usize * PER_LANE as usize;
+    let mut held = host.resident(&[words, 1], &every).unwrap();
+    held.write(0, &vec![1; words]).unwrap();
 
-    let groups = vec![Groups::Fixed(over(host.width())); PASSES];
+    let groups = vec![Groups::Fixed(over); PASSES];
     let stages: Vec<&[Groups]> = groups.iter().map(core::slice::from_ref).collect();
 
     let elsewhere = || std::thread::sleep(std::time::Duration::from_millis(4));
