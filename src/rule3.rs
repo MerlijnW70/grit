@@ -14,6 +14,8 @@
 //! oct. Noise may decide a step only where the step changes the oct whatever
 //! the noise says.
 
+use core::ops::{Index, IndexMut};
+
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 
 use crate::layout::Dimension;
@@ -28,6 +30,164 @@ pub const CORNERS: usize = 8;
 /// The first word of `PARAMS` a rule's parameters take. The words before it
 /// are the engine's.
 pub const FIRST_PARAM: usize = Dimension::Three.params_words();
+
+/// An axis of the lattice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl Axis {
+    /// The axes, x, y and z.
+    pub const ALL: [Self; 3] = [Self::X, Self::Y, Self::Z];
+
+    /// The bit of a corner's index that is its place along the axis: x is
+    /// 1, z is 2 and y is 4, as [`crate::sand3::Grid3::corners`] numbers
+    /// the corners.
+    #[must_use]
+    pub const fn bit(self) -> usize {
+        match self {
+            Self::X => 1,
+            Self::Y => 4,
+            Self::Z => 2,
+        }
+    }
+
+    /// 0, 1 and 2 for x, y and z.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
+    }
+
+    /// The axis of index 0, 1 or 2.
+    #[must_use]
+    pub const fn of(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::X),
+            1 => Some(Self::Y),
+            2 => Some(Self::Z),
+            _ => None,
+        }
+    }
+}
+
+/// A cell of an oct, 0 to 7, in the order of
+/// [`crate::sand3::Grid3::corners`]: its bit [`Axis::bit`] is its place
+/// along each axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Corner(u8);
+
+impl Corner {
+    /// The corners in order, 0 to 7.
+    pub const ALL: [Self; CORNERS] = [
+        Self(0),
+        Self(1),
+        Self(2),
+        Self(3),
+        Self(4),
+        Self(5),
+        Self(6),
+        Self(7),
+    ];
+
+    /// The corner of index `index`, if it is below [`CORNERS`].
+    #[must_use]
+    pub const fn new(index: usize) -> Option<Self> {
+        match index {
+            0..CORNERS => Some(Self((index & 7) as u8)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// The corner next to this one along `axis`, in the same oct.
+    #[must_use]
+    pub const fn neighbour(self, axis: Axis) -> Self {
+        Self(self.0 ^ (axis.bit() as u8))
+    }
+
+    /// The side of the oct the corner is on along `axis`: 0 low, 1 high.
+    #[must_use]
+    pub const fn side(self, axis: Axis) -> u32 {
+        if self.0 as usize & axis.bit() == 0 {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+/// One value for each corner of an oct, indexed by [`Corner`]; indexing
+/// cannot fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Octet<T>(pub [T; CORNERS]);
+
+impl<T> Octet<T> {
+    #[must_use]
+    pub fn from_fn(made: impl FnMut(Corner) -> T) -> Self {
+        Self(Corner::ALL.map(made))
+    }
+
+    #[must_use]
+    pub fn map<U>(self, made: impl FnMut(T) -> U) -> Octet<U> {
+        Octet(self.0.map(made))
+    }
+
+    /// Each corner with its value, in corner order.
+    pub fn iter(&self) -> impl Iterator<Item = (Corner, &T)> {
+        Corner::ALL.into_iter().zip(&self.0)
+    }
+}
+
+impl<T> From<[T; CORNERS]> for Octet<T> {
+    fn from(values: [T; CORNERS]) -> Self {
+        Self(values)
+    }
+}
+
+impl<T> Index<Corner> for Octet<T> {
+    type Output = T;
+
+    fn index(&self, corner: Corner) -> &T {
+        let [v0, v1, v2, v3, v4, v5, v6, v7] = &self.0;
+        match corner.0 & 7 {
+            0 => v0,
+            1 => v1,
+            2 => v2,
+            3 => v3,
+            4 => v4,
+            5 => v5,
+            6 => v6,
+            _ => v7,
+        }
+    }
+}
+
+impl<T> IndexMut<Corner> for Octet<T> {
+    fn index_mut(&mut self, corner: Corner) -> &mut T {
+        let [v0, v1, v2, v3, v4, v5, v6, v7] = &mut self.0;
+        match corner.0 & 7 {
+            0 => v0,
+            1 => v1,
+            2 => v2,
+            3 => v3,
+            4 => v4,
+            5 => v5,
+            6 => v6,
+            _ => v7,
+        }
+    }
+}
 
 /// One lane's word on the device.
 pub type Word<const LANES: u32> = Vector<U32, LANES>;

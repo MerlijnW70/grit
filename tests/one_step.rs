@@ -6,6 +6,7 @@ use common::device;
 
 use grit::Groups;
 use grit::ops::{Cpu, Device, Flag, Helpers, Ops};
+use grit::rule3::{Axis, CORNERS, Corner, Octet};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -279,4 +280,51 @@ fn the_cpu_ops_mean_what_the_module_says() {
     assert_eq!(ops.count([yes, no, yes]), 2);
     assert_eq!(ops.field(0xABCD_1234, 28, 4), 0xA);
     assert_eq!(ops.field(u32::MAX, 0, 31), 0x7FFF_FFFF);
+}
+
+#[test]
+fn the_corner_helpers_follow_the_corner_order() {
+    assert_eq!(Axis::ALL.map(Axis::bit), [1, 4, 2]);
+    assert_eq!(Axis::ALL.map(Axis::index), [0, 1, 2]);
+    assert_eq!(Axis::of(3), None);
+    for (index, axis) in Axis::ALL.into_iter().enumerate() {
+        assert_eq!(Axis::of(index), Some(axis));
+    }
+    assert_eq!(Corner::new(CORNERS), None);
+    for (index, corner) in Corner::ALL.into_iter().enumerate() {
+        assert_eq!(Corner::new(index), Some(corner));
+        assert_eq!(corner.index(), index);
+        for axis in Axis::ALL {
+            let near = corner.neighbour(axis);
+            assert_eq!(near.index(), index ^ axis.bit());
+            assert_eq!(near.neighbour(axis), corner);
+            assert_eq!(corner.side(axis), u32::from(index & axis.bit() != 0));
+            assert_ne!(near.side(axis), corner.side(axis));
+            for other in Axis::ALL.into_iter().filter(|other| *other != axis) {
+                assert_eq!(near.side(other), corner.side(other));
+            }
+        }
+    }
+    let x = [0, 1, 0, 1, 0, 1, 0, 1];
+    let y = [0, 0, 0, 0, 1, 1, 1, 1];
+    let z = [0, 0, 1, 1, 0, 0, 1, 1];
+    for corner in Corner::ALL {
+        let side = |axis| corner.side(axis);
+        assert_eq!(
+            [side(Axis::X), side(Axis::Y), side(Axis::Z)],
+            [x[corner.index()], y[corner.index()], z[corner.index()]]
+        );
+    }
+    let values: [u32; CORNERS] = std::array::from_fn(|at| 10 * u32::try_from(at).unwrap());
+    let mut octet = Octet::from(values);
+    for corner in Corner::ALL {
+        assert_eq!(octet[corner], values[corner.index()]);
+        octet[corner] += 1;
+    }
+    assert_eq!(octet, Octet::from_fn(|corner| values[corner.index()] + 1));
+    assert_eq!(
+        octet.iter().map(|(corner, _)| corner).collect::<Vec<_>>(),
+        Corner::ALL
+    );
+    assert_eq!(octet.map(|value| value / 10).0, [0, 1, 2, 3, 4, 5, 6, 7]);
 }
