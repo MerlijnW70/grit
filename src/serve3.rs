@@ -12,6 +12,7 @@ use crate::host::Host;
 use crate::layout::{BINDINGS, Dimension, GRAND, PARAMS, STATE, TALLY};
 use crate::live::{self, Loop};
 use crate::resident::{Groups, Resident};
+use crate::rule3::code::{self, Code};
 use crate::rule3::heat::{self, Heat};
 use crate::rule3::sand::{self, Sand};
 use crate::rule3::{FIRST_PARAM, Rule};
@@ -117,6 +118,7 @@ pub fn rules() -> Vec<Box<dyn Listed>> {
     vec![
         named("sand", Sand, sand::material_of),
         named("heat", Heat, heat::kind_of),
+        named("code", Code, code::instruction_of),
     ]
 }
 

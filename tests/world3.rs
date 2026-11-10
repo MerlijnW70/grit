@@ -5,6 +5,7 @@ mod common;
 use common::device;
 
 use grit::Host;
+use grit::rule3::code::{self, ADD, DATA, HALT, MOVE, PLUS_X, PLUS_Z};
 use grit::rule3::heat;
 use grit::sand3::Grid3;
 use grit::serve::handle;
@@ -243,7 +244,7 @@ fn the_rules_are_listed_with_their_parameter_counts() {
     let got = answer(&call(&mut Server::new(None), "grit_world_rules", "{}"));
     assert_eq!(
         written(got.get("rules").unwrap()),
-        "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3}]"
+        "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0}]"
     );
 }
 
@@ -263,7 +264,7 @@ fn an_unknown_rule_is_refused_and_the_refusal_lists_the_rules() {
             .unwrap();
         assert_eq!(
             written(told.get("rules").unwrap()),
-            "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3}]"
+            "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0}]"
         );
         let message = told.get("message").and_then(Json::text).unwrap();
         assert!(
@@ -688,13 +689,105 @@ fn a_heat_world_run_through_the_tools_equals_the_cpu_reference() {
     }
 }
 
-/// Words a rule is written into a quiet world with: any word, a box of them.
+/// Words a rule is written into a quiet world with: any word, a box of
+/// them; for the code rule, an instruction that acts or is acted on, with
+/// any way, payload and spare bit.
 fn wild(state: &mut u64, rule: &str) -> u32 {
-    if rule == "heat" {
-        heat_cell(state)
-    } else {
-        (next(state) & 0xFFFF_FFFF) as u32
+    match rule {
+        "heat" => heat_cell(state),
+        "code" => {
+            let roll = next(state);
+            let does = [code::COPY, MOVE, ADD, DATA, code::TURN][(roll % 5) as usize];
+            let way = ((roll >> 8) % 8) as u32;
+            code::word(does, way, (roll >> 16) as u32) | (((roll >> 63) as u32) << 31)
+        }
+        _ => (next(state) & 0xFFFF_FFFF) as u32,
     }
+}
+
+/// A small code program run through the tools, create, write, step and
+/// read, ends in the world worked out by hand:
+///
+/// - an ADD at (2, 2, 3) facing +x walks along the DATA cells 5, 7, 11 and
+///   13, one a frame, and stops before the HALT at (7, 2, 3) holding 36;
+/// - a MOVE at (12, 4, 1) facing +z waits one frame for an oct in which it
+///   faces +z, moves three cells, and stops as DATA before the HALT at
+///   (12, 4, 5).
+#[test]
+fn a_code_program_run_through_the_tools_ends_in_the_world_worked_out_by_hand() {
+    let Some(host) = device("world code program") else {
+        return;
+    };
+    let size = [16, 8, 8];
+    let grid = Grid3::new(16, 8, 8).unwrap();
+    let packet = 0x00AB_CDEF;
+    let program = [
+        (2, 2, 3, code::word(ADD, PLUS_X, 0)),
+        (3, 2, 3, code::word(DATA, 0, 5)),
+        (4, 2, 3, code::word(DATA, 0, 7)),
+        (5, 2, 3, code::word(DATA, 0, 11)),
+        (6, 2, 3, code::word(DATA, 0, 13)),
+        (7, 2, 3, code::word(HALT, 0, 0)),
+        (12, 4, 1, code::word(MOVE, PLUS_Z, packet)),
+        (12, 4, 5, code::word(HALT, 0, 0)),
+    ];
+    let world_after = |cells: &[(u32, u32, u32, u32)]| {
+        let mut world = vec![0_u32; grid.cells()];
+        for &(x, y, z, word) in cells {
+            world[grid.index(x, y, z)] = word;
+        }
+        world
+    };
+
+    let mut server = Server::new(Some(&host));
+    let world = created(&mut server, "code", size, &[]);
+    answer(&call(
+        &mut server,
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&program)),
+    ));
+
+    let first = step(&mut server, world, 1);
+    assert_eq!(numbers(&first, "tally"), [2, 1, 3, 0, 0, 0, 1]);
+    assert_eq!(
+        read_all(&mut server, world, size),
+        world_after(&[
+            (3, 2, 3, code::word(ADD, PLUS_X, 5)),
+            (4, 2, 3, code::word(DATA, 0, 7)),
+            (5, 2, 3, code::word(DATA, 0, 11)),
+            (6, 2, 3, code::word(DATA, 0, 13)),
+            (7, 2, 3, code::word(HALT, 0, 0)),
+            (12, 4, 1, code::word(MOVE, PLUS_Z, packet)),
+            (12, 4, 5, code::word(HALT, 0, 0)),
+        ])
+    );
+
+    step(&mut server, world, 1);
+    assert_eq!(
+        read_all(&mut server, world, size),
+        world_after(&[
+            (4, 2, 3, code::word(ADD, PLUS_X, 12)),
+            (5, 2, 3, code::word(DATA, 0, 11)),
+            (6, 2, 3, code::word(DATA, 0, 13)),
+            (7, 2, 3, code::word(HALT, 0, 0)),
+            (12, 4, 2, code::word(MOVE, PLUS_Z, packet)),
+            (12, 4, 5, code::word(HALT, 0, 0)),
+        ])
+    );
+
+    let done = world_after(&[
+        (6, 2, 3, code::word(ADD, PLUS_X, 36)),
+        (7, 2, 3, code::word(HALT, 0, 0)),
+        (12, 4, 4, code::word(DATA, PLUS_Z, packet)),
+        (12, 4, 5, code::word(HALT, 0, 0)),
+    ]);
+    let got = step(&mut server, world, 3);
+    assert_eq!(got.counted("frame"), Some(5));
+    assert_eq!(read_all(&mut server, world, size), done);
+    let later = step(&mut server, world, 30);
+    assert_eq!(later.counted("frame"), Some(35));
+    assert_eq!(later.counted("listed"), Some(0));
+    assert_eq!(read_all(&mut server, world, size), done);
 }
 
 /// Every registered rule: a world that has fallen quiet, a write into it
