@@ -270,7 +270,25 @@ impl Grid {
     }
 }
 
+/// Why a kernel built for a flat grid refuses a solid one: it would read
+/// only x and y, and step every layer as if it were layer zero.
+pub const SOLID: &str = "the grid is solid (tall > 1), and this kernel steps a flat grid";
+
+/// Refuses a solid grid at the entry of `operation`, a kernel built for a
+/// flat grid.
+pub const fn flat(operation: &'static str, grid: Grid) -> Result<(), LaneError> {
+    if grid.tall > 1 {
+        Err(LaneError::NoSuchForm {
+            operation,
+            because: SOLID,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 pub fn settle(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
+    flat("sand::settle", grid)?;
     match subgroup {
         4 => settled::<4>(subgroup, grid),
         8 => settled::<8>(subgroup, grid),
@@ -534,6 +552,7 @@ pub fn at<const LANES: u32>(
     column: Vector<U32, LANES>,
     row: Vector<U32, LANES>,
 ) -> Result<Vector<U32, LANES>, LaneError> {
+    flat("sand::at", grid)?;
     Plane::at(
         &mut Emit::<LANES>(lanes),
         Plane::extents(grid),
@@ -714,6 +733,7 @@ pub fn reckon(kernel: &mut Kernel<U32>, subgroup: u32, at: u32) -> Result<(), La
 }
 
 pub fn brush(subgroup: u32, grid: Grid, waking: bool) -> Result<Vec<u32>, LaneError> {
+    flat("sand::brush", grid)?;
     match subgroup {
         4 => brushed::<4>(subgroup, grid, waking),
         8 => brushed::<8>(subgroup, grid, waking),
@@ -1067,6 +1087,7 @@ impl View {
 }
 
 pub fn paint(subgroup: u32, grid: Grid, view: View) -> Result<Vec<u32>, LaneError> {
+    flat("sand::paint", grid)?;
     match subgroup {
         4 => painted::<4>(subgroup, grid, view),
         8 => painted::<8>(subgroup, grid, view),

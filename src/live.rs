@@ -33,6 +33,7 @@ pub fn wired(
     plan: &crate::compact::Plan,
     picture: Option<sand::View>,
 ) -> Result<Loop, LaneError> {
+    sand::flat("live::wired", grid)?;
     arranged(subgroup, grid, plan, picture, coarse_pays(plan.blocks))
 }
 
@@ -156,6 +157,8 @@ pub fn arranged(
     use crate::Groups;
     use crate::layout::{HOT_BASES, HOT_COUNTS, HOT_DENSE};
     use crate::sweep::COUNTS;
+
+    sand::flat("live::arranged", grid)?;
 
     let (listed, hot) = if coarse {
         (Over::Listed(HOT_DENSE), crate::compact::Plan::hot_listed())
@@ -299,6 +302,7 @@ pub fn both(
     plan: &crate::compact::Plan,
     picture: Option<sand::View>,
 ) -> Result<Both, LaneError> {
+    sand::flat("live::both", grid)?;
     let (with_passes, with_stages) = arranged(subgroup, grid, plan, picture, true)?;
     let (without_passes, without_stages) = arranged(subgroup, grid, plan, picture, false)?;
 
@@ -547,6 +551,7 @@ pub fn wipe_counts(subgroup: u32, counts: u32) -> Result<Vec<u32>, LaneError> {
 }
 
 pub fn settle(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
+    sand::flat("live::settle", grid)?;
     match subgroup {
         4 => listed::<4>(subgroup, grid),
         8 => listed::<8>(subgroup, grid),
@@ -778,6 +783,7 @@ pub fn corners<const LANES: u32>(
     quad: simdr::module::Id,
     frame: simdr::module::Id,
 ) -> Result<Corners<LANES>, LaneError> {
+    sand::flat("live::corners", grid)?;
     let mut lanes = kernel.lanes()?;
     let which = lanes.splat_id::<U32, LANES>(quad)?;
     let now = lanes.splat_id::<U32, LANES>(frame)?;
@@ -812,6 +818,7 @@ pub fn wake<const LANES: u32>(
         column,
         row,
     } = where_at;
+    sand::flat("live::wake", grid)?;
     let block = Block::<LANES, 2> {
         subgroup,
         grid,
