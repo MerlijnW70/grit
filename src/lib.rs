@@ -8,6 +8,7 @@ pub mod live;
 pub mod machine;
 pub mod marking;
 pub mod netlist;
+pub mod ops;
 pub mod resident;
 pub mod rule;
 pub mod rule3;
