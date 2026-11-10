@@ -242,6 +242,16 @@ impl<'host> Engine<'host> {
         self.label = label;
     }
 
+    /// [`Self::restart`], with the next frame `frame` in both worlds.
+    fn restart_at(&mut self, start: &[u32], label: String, frame: u32) {
+        self.restart(start, label);
+        for held in [&mut self.live, &mut self.full] {
+            held.write(PARAMS as usize, &[frame.wrapping_sub(1)])
+                .unwrap();
+        }
+        self.frame = frame;
+    }
+
     fn parted(&self, what: &str, got: &[u32]) -> Option<String> {
         let cells = self.reference.cells();
         let at = (0..cells).find(|&at| got[at] != self.want[at])?;
@@ -422,6 +432,99 @@ fn two_frames_in_flight_equal_the_whole_grid_on_dense_worlds() {
 #[test]
 fn two_frames_in_flight_equal_the_whole_grid_on_sparse_worlds() {
     matrix("in flight sparse", &WORLDS, sparse, 2);
+}
+
+/// Worlds with fewer octs than a subgroup, or one oct along an axis, where
+/// the 27 octs a change wakes are partly or wholly the same oct.
+const SMALL: [(u32, u32, u32); 6] = [
+    (2, 2, 2),
+    (4, 4, 4),
+    (2, 8, 4),
+    (8, 8, 2),
+    (32, 2, 8),
+    (2, 2, 64),
+];
+
+#[test]
+fn the_listed_frame_equals_the_whole_grid_on_small_and_thin_worlds() {
+    let Some(host) = device("small") else {
+        return;
+    };
+    for shape in SMALL {
+        for coarse in TIERS {
+            let Some(mut engine) = Engine::new(&host, shape, coarse) else {
+                continue;
+            };
+            for seed in SEEDS {
+                for (name, start) in [("dense", dense as Starting), ("sparse", sparse)] {
+                    let first = start(engine.reference, seed);
+                    engine.restart(&first, label(name, shape, coarse, seed));
+                    engine.run(FRAMES, 1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_listed_frame_equals_the_whole_grid_on_words_with_every_bit_at_random() {
+    let wild = |grid: Grid3, seed: u64| -> Vec<u32> {
+        let mut state = seed;
+        (0..grid.cells()).map(|_| next(&mut state) as u32).collect()
+    };
+    matrix("wild", &[(16, 16, 16), (64, 32, 16)], wild, 1);
+}
+
+#[test]
+fn the_listed_frame_equals_the_whole_grid_where_the_frame_counter_wraps() {
+    let Some(host) = device("wrap") else {
+        return;
+    };
+    for coarse in TIERS {
+        let shape = (16, 16, 16);
+        let Some(mut engine) = Engine::new(&host, shape, coarse) else {
+            continue;
+        };
+        for (seed, start) in [(SEEDS[1], dense as Starting), (SEEDS[2], sparse)] {
+            let first = start(engine.reference, seed);
+            let late = u32::MAX - 31;
+            engine.restart_at(&first, label("wrap", shape, coarse, seed), late);
+            for _ in 0..FRAMES {
+                engine.frame();
+            }
+            assert_eq!(engine.frame, late.wrapping_add(FRAMES));
+            assert_eq!(
+                engine.live.read(PARAMS as usize, 1).unwrap(),
+                [late.wrapping_add(FRAMES - 1)]
+            );
+        }
+    }
+}
+
+#[test]
+fn keeping_wipes_the_tally_words_of_its_plan() {
+    let (grid, _) = grids(16, 16, 16);
+    for width in WIDTHS {
+        let solid = plan_of(width, grid).unwrap();
+        let flat = Plan::over(width, solid.blocks).unwrap();
+        for (plan, dimension) in [(solid, Dimension::Three), (flat, Dimension::Two)] {
+            for coarse in TIERS {
+                let held = live::keeping(width, &plan, coarse).unwrap();
+                assert_eq!(
+                    held.before[0][1].0,
+                    live::wipe_in(width, dimension).unwrap()
+                );
+            }
+        }
+        assert_eq!(
+            live::wipe(width).unwrap(),
+            live::wipe_in(width, Dimension::Two).unwrap()
+        );
+        assert_ne!(
+            live::wipe_in(width, Dimension::Three).unwrap(),
+            live::wipe_in(width, Dimension::Two).unwrap()
+        );
+    }
 }
 
 const QUIET_WORLDS: [(u32, u32, u32); 2] = [(16, 16, 16), (32, 16, 16)];

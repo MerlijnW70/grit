@@ -65,7 +65,7 @@ pub fn keeping(
 
     let before = vec![vec![
         (decay(subgroup, listed)?, hot),
-        (wipe(subgroup)?, one),
+        (wipe_in(subgroup, plan.dimension)?, one),
         (wipe_counts(subgroup, COUNTS)?, tiles),
         (unclaimed(subgroup, plan)?, one),
     ]];
