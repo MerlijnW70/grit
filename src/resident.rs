@@ -4,6 +4,326 @@ use ash::vk;
 
 use crate::host::{Error, Host};
 
+/// Counts every object resident construction makes and frees, both as this
+/// crate calls create and destroy and as the driver allocates and frees host
+/// memory through the callbacks passed with them, and fails a chosen
+/// construction step on demand, so the failure paths can be tested without
+/// exhausting a device. It exists only with the `faults` feature; without it
+/// the same calls are empty, the callbacks are none, and nothing of it is
+/// compiled.
+///
+/// The counts, the callbacks and the armed step belong to the calling thread.
+#[cfg(feature = "faults")]
+pub mod faults {
+    use std::alloc::{Layout, alloc, dealloc};
+    use std::cell::{Cell, RefCell};
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+    use ash::vk;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Step {
+        Buffer,
+        Memory,
+        Bind,
+        SetLayout,
+        Pool,
+        Set,
+        PipelineLayout,
+        Shader,
+        Pipeline,
+        Commands,
+        CommandBuffers,
+        Fence,
+        Queries,
+    }
+
+    impl Step {
+        pub const ALL: [Self; 13] = [
+            Self::Buffer,
+            Self::Memory,
+            Self::Bind,
+            Self::SetLayout,
+            Self::Pool,
+            Self::Set,
+            Self::PipelineLayout,
+            Self::Shader,
+            Self::Pipeline,
+            Self::Commands,
+            Self::CommandBuffers,
+            Self::Fence,
+            Self::Queries,
+        ];
+
+        const fn slot(self) -> usize {
+            self as usize
+        }
+    }
+
+    /// What construction did with one kind of object. `made` and `gone`
+    /// count the creates and destroys this crate called; `allocations` and
+    /// `outstanding` count the host memory the driver itself took and has
+    /// not given back through the allocation callbacks passed with them, so
+    /// they move only when the driver really destroys an object.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Count {
+        pub made: u64,
+        pub gone: u64,
+        pub allocations: u64,
+        pub outstanding: i64,
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        allocations: AtomicU64,
+        outstanding: AtomicI64,
+    }
+
+    struct Hooks {
+        tallies: [Tally; 13],
+        callbacks: [vk::AllocationCallbacks<'static>; 13],
+    }
+
+    thread_local! {
+        static ARMED: Cell<Option<(Step, u32)>> = const { Cell::new(None) };
+        static FIRED: Cell<bool> = const { Cell::new(false) };
+        static COUNTS: RefCell<[(u64, u64); 13]> = const { RefCell::new([(0, 0); 13]) };
+        static HOOKS: &'static Hooks = hooks();
+    }
+
+    fn hooks() -> &'static Hooks {
+        let held: &'static mut Hooks = Box::leak(Box::new(Hooks {
+            tallies: Default::default(),
+            callbacks: [vk::AllocationCallbacks::default(); 13],
+        }));
+        for (callbacks, tally) in held.callbacks.iter_mut().zip(held.tallies.iter()) {
+            *callbacks = vk::AllocationCallbacks::default()
+                .user_data(std::ptr::from_ref(tally).cast_mut().cast())
+                .pfn_allocation(Some(allocation))
+                .pfn_reallocation(Some(reallocation))
+                .pfn_free(Some(free));
+        }
+        held
+    }
+
+    /// The callbacks every create and destroy of `step` passes, so the
+    /// driver's own host allocations for those objects are counted.
+    pub(crate) fn callbacks(step: Step) -> Option<&'static vk::AllocationCallbacks<'static>> {
+        HOOKS.with(|hooks| hooks.callbacks.get(step.slot()))
+    }
+
+    const HEAD: usize = 2 * size_of::<usize>();
+
+    fn shape(size: usize, alignment: usize) -> Option<(Layout, usize)> {
+        let alignment = alignment.max(HEAD).checked_next_power_of_two()?;
+        let whole = size.checked_add(alignment)?;
+        Layout::from_size_align(whole, alignment)
+            .ok()
+            .map(|layout| (layout, alignment))
+    }
+
+    unsafe extern "system" fn allocation(
+        user: *mut c_void,
+        size: usize,
+        alignment: usize,
+        _: vk::SystemAllocationScope,
+    ) -> *mut c_void {
+        let Some((layout, alignment)) = shape(size, alignment) else {
+            return std::ptr::null_mut();
+        };
+        let base = unsafe { alloc(layout) };
+        if base.is_null() {
+            return base.cast();
+        }
+        unsafe {
+            let given = base.add(alignment);
+            given
+                .sub(HEAD)
+                .cast::<[usize; 2]>()
+                .write([size, alignment]);
+            if let Some(tally) = user.cast::<Tally>().cast_const().as_ref() {
+                tally.allocations.fetch_add(1, Ordering::Relaxed);
+                tally.outstanding.fetch_add(1, Ordering::Relaxed);
+            }
+            given.cast()
+        }
+    }
+
+    unsafe extern "system" fn free(user: *mut c_void, memory: *mut c_void) {
+        if memory.is_null() {
+            return;
+        }
+        unsafe {
+            let given = memory.cast::<u8>();
+            let [size, alignment] = given.sub(HEAD).cast::<[usize; 2]>().read();
+            if let Some((layout, _)) = shape(size, alignment) {
+                dealloc(given.sub(alignment), layout);
+            }
+            if let Some(tally) = user.cast::<Tally>().cast_const().as_ref() {
+                tally.outstanding.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    unsafe extern "system" fn reallocation(
+        user: *mut c_void,
+        original: *mut c_void,
+        size: usize,
+        alignment: usize,
+        scope: vk::SystemAllocationScope,
+    ) -> *mut c_void {
+        unsafe {
+            if original.is_null() {
+                return allocation(user, size, alignment, scope);
+            }
+            if size == 0 {
+                free(user, original);
+                return std::ptr::null_mut();
+            }
+            let moved = allocation(user, size, alignment, scope);
+            if moved.is_null() {
+                return moved;
+            }
+            let [held, _] = original.cast::<u8>().sub(HEAD).cast::<[usize; 2]>().read();
+            std::ptr::copy_nonoverlapping(
+                original.cast::<u8>(),
+                moved.cast::<u8>(),
+                held.min(size),
+            );
+            free(user, original);
+            moved
+        }
+    }
+
+    /// Fails the `nth` time, counting from nought, that `step` is reached.
+    pub fn arm(step: Step, nth: u32) {
+        ARMED.set(Some((step, nth)));
+        FIRED.set(false);
+    }
+
+    pub fn disarm() {
+        ARMED.set(None);
+    }
+
+    /// Whether the armed step was reached and failed since it was armed.
+    #[must_use]
+    pub fn fired() -> bool {
+        FIRED.get()
+    }
+
+    pub fn reset() {
+        disarm();
+        FIRED.set(false);
+        COUNTS.with_borrow_mut(|counts| *counts = [(0, 0); 13]);
+        HOOKS.with(|hooks| {
+            for tally in &hooks.tallies {
+                tally.allocations.store(0, Ordering::Relaxed);
+                tally.outstanding.store(0, Ordering::Relaxed);
+            }
+        });
+    }
+
+    #[must_use]
+    pub fn count(step: Step) -> Count {
+        let (made, gone) =
+            COUNTS.with_borrow(|counts| counts.get(step.slot()).copied().unwrap_or_default());
+        let (allocations, outstanding) = HOOKS.with(|hooks| {
+            hooks.tallies.get(step.slot()).map_or((0, 0), |tally| {
+                (
+                    tally.allocations.load(Ordering::Relaxed),
+                    tally.outstanding.load(Ordering::Relaxed),
+                )
+            })
+        });
+        Count {
+            made,
+            gone,
+            allocations,
+            outstanding,
+        }
+    }
+
+    pub(crate) fn enter(step: Step) -> Result<(), vk::Result> {
+        let Some((armed, nth)) = ARMED.get() else {
+            return Ok(());
+        };
+        if armed != step {
+            return Ok(());
+        }
+        if nth > 0 {
+            ARMED.set(Some((armed, nth - 1)));
+            return Ok(());
+        }
+        ARMED.set(None);
+        FIRED.set(true);
+        Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+    }
+
+    fn tally(step: Step, handle: impl vk::Handle, made: bool) {
+        if handle.as_raw() == 0 {
+            return;
+        }
+        COUNTS.with_borrow_mut(|counts| {
+            if let Some((creates, destroys)) = counts.get_mut(step.slot()) {
+                if made {
+                    *creates += 1;
+                } else {
+                    *destroys += 1;
+                }
+            }
+        });
+    }
+
+    pub(crate) fn made(step: Step, handle: impl vk::Handle) {
+        tally(step, handle, true);
+    }
+
+    pub(crate) fn gone(step: Step, handle: impl vk::Handle) {
+        tally(step, handle, false);
+    }
+}
+
+#[cfg(not(feature = "faults"))]
+mod faults {
+    use ash::vk;
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum Step {
+        Buffer,
+        Memory,
+        Bind,
+        SetLayout,
+        Pool,
+        Set,
+        PipelineLayout,
+        Shader,
+        Pipeline,
+        Commands,
+        CommandBuffers,
+        Fence,
+        Queries,
+    }
+
+    #[inline(always)]
+    pub(crate) const fn enter(_: Step) -> Result<(), vk::Result> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) fn made(_: Step, _: impl vk::Handle) {}
+
+    #[inline(always)]
+    pub(crate) fn gone(_: Step, _: impl vk::Handle) {}
+
+    #[inline(always)]
+    pub(crate) const fn callbacks(_: Step) -> Option<&'static vk::AllocationCallbacks<'static>> {
+        None
+    }
+}
+
+use faults::Step;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Groups {
     Fixed(u32),
@@ -281,21 +601,35 @@ impl Host {
             let (layout, pool, set) = self.describe(&buffers)?;
             let (pipeline_layout, shaders, pipelines) = self.compile(layout, modules)?;
             let (commands, mut spare, transfer) = self.record_into()?;
-            let fence = self
-                .device()
-                .create_fence(&vk::FenceCreateInfo::default(), None)?;
+            faults::enter(Step::Fence)?;
+            let fence = self.device().create_fence(
+                &vk::FenceCreateInfo::default(),
+                faults::callbacks(Step::Fence),
+            )?;
+            faults::made(Step::Fence, fence);
 
             let mut slots = Vec::with_capacity(SLOTS);
             for staging in staged {
                 let command = spare.pop().unwrap_or_default();
-                let fence = self
-                    .device()
-                    .create_fence(&vk::FenceCreateInfo::default(), None)?;
+                faults::enter(Step::Fence)?;
+                let fence = self.device().create_fence(
+                    &vk::FenceCreateInfo::default(),
+                    faults::callbacks(Step::Fence),
+                )?;
+                faults::made(Step::Fence, fence);
                 let queries = if self.ticking().1 {
                     let create = vk::QueryPoolCreateInfo::default()
                         .query_type(vk::QueryType::TIMESTAMP)
                         .query_count(u32::try_from(STAGES + 3).unwrap_or(3));
-                    self.device().create_query_pool(&create, None).ok()
+                    let made = faults::enter(Step::Queries).ok().and_then(|()| {
+                        self.device()
+                            .create_query_pool(&create, faults::callbacks(Step::Queries))
+                            .ok()
+                    });
+                    if let Some(pool) = made {
+                        faults::made(Step::Queries, pool);
+                    }
+                    made
                 } else {
                     None
                 };
@@ -354,18 +688,33 @@ impl Host {
             .size(bytes.max(4))
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let handle = unsafe { self.device().create_buffer(&create, None) }?;
+        faults::enter(Step::Buffer)?;
+        let handle = unsafe {
+            self.device()
+                .create_buffer(&create, faults::callbacks(Step::Buffer))
+        }?;
+        faults::made(Step::Buffer, handle);
 
         let requirements = unsafe { self.device().get_buffer_memory_requirements(handle) };
         let Some(kind) = self.suits(requirements, wanted) else {
-            unsafe { self.device().destroy_buffer(handle, None) };
+            unsafe {
+                self.device()
+                    .destroy_buffer(handle, faults::callbacks(Step::Buffer))
+            };
+            faults::gone(Step::Buffer, handle);
             return Err(Error::NoMemory { bytes });
         };
 
         let allocate = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(kind);
-        let memory = unsafe { self.device().allocate_memory(&allocate, None) }?;
+        faults::enter(Step::Memory)?;
+        let memory = unsafe {
+            self.device()
+                .allocate_memory(&allocate, faults::callbacks(Step::Memory))
+        }?;
+        faults::made(Step::Memory, memory);
+        faults::enter(Step::Bind)?;
         unsafe { self.device().bind_buffer_memory(handle, memory, 0) }?;
 
         Ok(Held {
@@ -385,7 +734,12 @@ impl Host {
             .usage(usage)
             .flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let handle = unsafe { self.device().create_buffer(&create, None) }?;
+        faults::enter(Step::Buffer)?;
+        let handle = unsafe {
+            self.device()
+                .create_buffer(&create, faults::callbacks(Step::Buffer))
+        }?;
+        faults::made(Step::Buffer, handle);
         let requirements = unsafe { self.device().get_buffer_memory_requirements(handle) };
         Ok(Held {
             handle,
@@ -421,7 +775,12 @@ impl Host {
             })
             .collect();
         let create = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        let layout = unsafe { self.device().create_descriptor_set_layout(&create, None) }?;
+        faults::enter(Step::SetLayout)?;
+        let layout = unsafe {
+            self.device()
+                .create_descriptor_set_layout(&create, faults::callbacks(Step::SetLayout))
+        }?;
+        faults::made(Step::SetLayout, layout);
 
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
@@ -429,14 +788,21 @@ impl Host {
         let create = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
             .pool_sizes(&sizes);
-        let pool = unsafe { self.device().create_descriptor_pool(&create, None) }?;
+        faults::enter(Step::Pool)?;
+        let pool = unsafe {
+            self.device()
+                .create_descriptor_pool(&create, faults::callbacks(Step::Pool))
+        }?;
+        faults::made(Step::Pool, pool);
 
         let layouts = [layout];
         let allocate = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts);
+        faults::enter(Step::Set)?;
         let sets = unsafe { self.device().allocate_descriptor_sets(&allocate) }?;
         let set = sets.first().copied().unwrap_or_default();
+        faults::made(Step::Set, set);
 
         let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
             .iter()
@@ -470,7 +836,12 @@ impl Host {
     ) -> Result<(vk::PipelineLayout, Vec<vk::ShaderModule>, Vec<vk::Pipeline>), Error> {
         let layouts = [layout];
         let create = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
-        let pipeline_layout = unsafe { self.device().create_pipeline_layout(&create, None) }?;
+        faults::enter(Step::PipelineLayout)?;
+        let pipeline_layout = unsafe {
+            self.device()
+                .create_pipeline_layout(&create, faults::callbacks(Step::PipelineLayout))
+        }?;
+        faults::made(Step::PipelineLayout, pipeline_layout);
 
         let mut shaders = Vec::with_capacity(modules.len());
         let mut pipelines = Vec::with_capacity(modules.len());
@@ -478,7 +849,12 @@ impl Host {
 
         for words in modules {
             let create = vk::ShaderModuleCreateInfo::default().code(words);
-            let shader = unsafe { self.device().create_shader_module(&create, None) }?;
+            faults::enter(Step::Shader)?;
+            let shader = unsafe {
+                self.device()
+                    .create_shader_module(&create, faults::callbacks(Step::Shader))
+            }?;
+            faults::made(Step::Shader, shader);
             shaders.push(shader);
 
             let stage = vk::PipelineShaderStageCreateInfo::default()
@@ -488,13 +864,25 @@ impl Host {
             let create = [vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(pipeline_layout)];
-            let built = unsafe {
-                self.device()
-                    .create_compute_pipelines(vk::PipelineCache::null(), &create, None)
+            let built = match faults::enter(Step::Pipeline) {
+                Ok(()) => unsafe {
+                    self.device().create_compute_pipelines(
+                        vk::PipelineCache::null(),
+                        &create,
+                        faults::callbacks(Step::Pipeline),
+                    )
+                },
+                Err(code) => Err((Vec::new(), code)),
             };
             match built {
-                Ok(made) => pipelines.extend(made),
+                Ok(made) => {
+                    made.iter()
+                        .for_each(|&pipeline| faults::made(Step::Pipeline, pipeline));
+                    pipelines.extend(made);
+                }
                 Err((made, code)) => {
+                    made.iter()
+                        .for_each(|&pipeline| faults::made(Step::Pipeline, pipeline));
                     pipelines.extend(made);
                     return Err(code.into());
                 }
@@ -510,13 +898,22 @@ impl Host {
         let create = vk::CommandPoolCreateInfo::default()
             .queue_family_index(self.family())
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let pool = unsafe { self.device().create_command_pool(&create, None) }?;
+        faults::enter(Step::Commands)?;
+        let pool = unsafe {
+            self.device()
+                .create_command_pool(&create, faults::callbacks(Step::Commands))
+        }?;
+        faults::made(Step::Commands, pool);
 
         let allocate = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(u32::try_from(SLOTS + 1).unwrap_or(2));
+        faults::enter(Step::CommandBuffers)?;
         let mut buffers = unsafe { self.device().allocate_command_buffers(&allocate) }?;
+        buffers
+            .iter()
+            .for_each(|&buffer| faults::made(Step::CommandBuffers, buffer));
         let transfer = buffers.pop().unwrap_or_default();
 
         Ok((pool, buffers, transfer))
@@ -1597,23 +1994,44 @@ impl Drop for Resident<'_> {
         let device = self.host.device();
         unsafe {
             let _ = device.device_wait_idle();
-            device.destroy_fence(self.fence, None);
+            device.destroy_fence(self.fence, faults::callbacks(Step::Fence));
+            faults::gone(Step::Fence, self.fence);
             for slot in &self.slots {
-                device.destroy_fence(slot.fence, None);
+                device.destroy_fence(slot.fence, faults::callbacks(Step::Fence));
+                faults::gone(Step::Fence, slot.fence);
                 if let Some(pool) = slot.queries {
-                    device.destroy_query_pool(pool, None);
+                    device.destroy_query_pool(pool, faults::callbacks(Step::Queries));
+                    faults::gone(Step::Queries, pool);
                 }
             }
-            device.destroy_command_pool(self.commands, None);
+            device.destroy_command_pool(self.commands, faults::callbacks(Step::Commands));
+            if self.commands != vk::CommandPool::null() {
+                faults::gone(Step::CommandBuffers, self.transfer);
+                for slot in &self.slots {
+                    faults::gone(Step::CommandBuffers, slot.command);
+                }
+            }
+            faults::gone(Step::Commands, self.commands);
             for &pipeline in &self.pipelines {
-                device.destroy_pipeline(pipeline, None);
+                device.destroy_pipeline(pipeline, faults::callbacks(Step::Pipeline));
+                faults::gone(Step::Pipeline, pipeline);
             }
             for &shader in &self.shaders {
-                device.destroy_shader_module(shader, None);
+                device.destroy_shader_module(shader, faults::callbacks(Step::Shader));
+                faults::gone(Step::Shader, shader);
             }
-            device.destroy_pipeline_layout(self.pipeline_layout, None);
-            device.destroy_descriptor_pool(self.pool, None);
-            device.destroy_descriptor_set_layout(self.layout, None);
+            device.destroy_pipeline_layout(
+                self.pipeline_layout,
+                faults::callbacks(Step::PipelineLayout),
+            );
+            faults::gone(Step::PipelineLayout, self.pipeline_layout);
+            device.destroy_descriptor_pool(self.pool, faults::callbacks(Step::Pool));
+            if self.pool != vk::DescriptorPool::null() {
+                faults::gone(Step::Set, self.set);
+            }
+            faults::gone(Step::Pool, self.pool);
+            device.destroy_descriptor_set_layout(self.layout, faults::callbacks(Step::SetLayout));
+            faults::gone(Step::SetLayout, self.layout);
             let staged = self.slots.iter().map(|slot| &slot.staging);
             for held in self
                 .buffers
@@ -1621,8 +2039,10 @@ impl Drop for Resident<'_> {
                 .chain(std::iter::once(&self.staging))
                 .chain(staged)
             {
-                device.destroy_buffer(held.handle, None);
-                device.free_memory(held.memory, None);
+                device.destroy_buffer(held.handle, faults::callbacks(Step::Buffer));
+                faults::gone(Step::Buffer, held.handle);
+                device.free_memory(held.memory, faults::callbacks(Step::Memory));
+                faults::gone(Step::Memory, held.memory);
                 for &(_, memory, _) in &held.pages {
                     device.free_memory(memory, None);
                 }
