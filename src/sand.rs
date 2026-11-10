@@ -2,6 +2,7 @@ use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 use simdr::module::Id;
 
+use crate::geometry::{self, Emit, Held, Plane};
 pub use crate::layout::{BINDINGS, BRUSH, BRUSH_WORDS, LOOKING, PIXELS};
 use crate::layout::{PARAMS, STATE};
 
@@ -296,36 +297,12 @@ fn settled<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, Lane
     let head = kernel.module().constant_u32(0)?;
     let frame = kernel.load_at(PARAMS, head)?;
 
-    let (top_left, top_right, bottom_left, bottom_right) = {
+    let places = {
         let mut lanes = kernel.lanes()?;
         let which = lanes.splat_id::<U32, LANES>(block)?;
         let now = lanes.splat_id::<U32, LANES>(frame)?;
-
-        let phase = low_bits::<LANES>(&mut lanes, now, 1)?;
-
-        let by_across = lanes.splat_bits::<U32, LANES>(grid.across().trailing_zeros())?;
-        let down_a_row = lanes.shift_right_logical(which, by_across)?;
-        let along = low_bits::<LANES>(&mut lanes, which, grid.across().trailing_zeros())?;
-
-        let two = lanes.splat_bits::<U32, LANES>(1)?;
-        let column = lanes.shift_left(along, two)?;
-        let row = lanes.shift_left(down_a_row, two)?;
-        let column = lanes.add(column, phase)?;
-        let row = lanes.add(row, phase)?;
-
-        let one = lanes.splat_bits::<U32, LANES>(1)?;
-        let right = lanes.add(column, one)?;
-        let under = lanes.add(row, one)?;
-
-        (
-            at::<LANES>(&mut lanes, grid, column, row)?,
-            at::<LANES>(&mut lanes, grid, right, row)?,
-            at::<LANES>(&mut lanes, grid, column, under)?,
-            at::<LANES>(&mut lanes, grid, right, under)?,
-        )
+        Plane::block(&mut Emit::<LANES>(&mut lanes), grid, which, now)?.places
     };
-
-    let places = [top_left, top_right, bottom_left, bottom_right];
     let held = [
         kernel.load_at(STATE, places[0].id())?,
         kernel.load_at(STATE, places[1].id())?,
@@ -557,12 +534,11 @@ pub fn at<const LANES: u32>(
     column: Vector<U32, LANES>,
     row: Vector<U32, LANES>,
 ) -> Result<Vector<U32, LANES>, LaneError> {
-    let column = low_bits::<LANES>(lanes, column, grid.wide.trailing_zeros())?;
-    let row = low_bits::<LANES>(lanes, row, grid.deep.trailing_zeros())?;
-
-    let by = lanes.splat_bits::<U32, LANES>(grid.wide.trailing_zeros())?;
-    let along = lanes.shift_left(row, by)?;
-    lanes.add(along, column)
+    Plane::at(
+        &mut Emit::<LANES>(lanes),
+        Plane::extents(grid),
+        [column, row],
+    )
 }
 
 pub fn low_bits<const LANES: u32>(
@@ -570,13 +546,7 @@ pub fn low_bits<const LANES: u32>(
     value: Vector<U32, LANES>,
     bits: u32,
 ) -> Result<Vector<U32, LANES>, LaneError> {
-    let by = lanes.splat_bits::<U32, LANES>(bits)?;
-    let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
-
-    let above = lanes.shift_right_logical(value, by)?;
-    let back = lanes.shift_left(above, by)?;
-    let away = lanes.mul(back, minus)?;
-    lanes.add(value, away)
+    geometry::low_bits(&mut Emit::<LANES>(lanes), value, bits)
 }
 
 #[must_use]
@@ -785,24 +755,12 @@ fn brushed<const LANES: u32>(
     let (cell, column, row) = {
         let mut lanes = kernel.lanes()?;
         let within = lanes.splat_id::<U32, LANES>(seat)?;
-        let by = lanes.splat_bits::<U32, LANES>(BOX.trailing_zeros())?;
-        let across_box = low_bits::<LANES>(&mut lanes, within, BOX.trailing_zeros())?;
-        let down_box = lanes.shift_right_logical(within, by)?;
-
-        let half = lanes.splat_bits::<U32, LANES>(BOX / 2)?;
-        let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
-        let back = lanes.mul(half, minus)?;
-
         let bx = lanes.splat_id::<U32, LANES>(where_x)?;
         let by_row = lanes.splat_id::<U32, LANES>(where_y)?;
-        let column = lanes.add(bx, across_box)?;
-        let column = lanes.add(column, back)?;
-        let row = lanes.add(by_row, down_box)?;
-        let row = lanes.add(row, back)?;
-
-        let column = low_bits::<LANES>(&mut lanes, column, grid.wide.trailing_zeros())?;
-        let row = low_bits::<LANES>(&mut lanes, row, grid.deep.trailing_zeros())?;
-        let cell = at::<LANES>(&mut lanes, grid, column, row)?;
+        let mut arith = Emit::<LANES>(&mut lanes);
+        let point = Plane::seated(&mut arith, grid, BOX, within, [bx, by_row])?;
+        let cell = Plane::at(&mut arith, Plane::extents(grid), point)?;
+        let [column, row] = point;
         (cell, column, row)
     };
 
@@ -817,20 +775,15 @@ fn brushed<const LANES: u32>(
         let reach = lanes.splat_id::<U32, LANES>(how_wide)?;
         let material = lanes.splat_id::<U32, LANES>(what_of)?;
 
-        let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
         let air = lanes.splat_bits::<U32, LANES>(AIR)?;
         let one = lanes.splat_bits::<U32, LANES>(1)?;
         let none = lanes.splat_bits::<U32, LANES>(0)?;
 
-        let away_x = lanes.mul(bx, minus)?;
-        let away_y = lanes.mul(by_row, minus)?;
-        let dx = lanes.add(column, away_x)?;
-        let dy = lanes.add(row, away_y)?;
-        let across_sq = lanes.mul(dx, dx)?;
-        let down_sq = lanes.mul(dy, dy)?;
-        let far = lanes.add(across_sq, down_sq)?;
-
-        let inside = lanes.greater_than(reach, far)?;
+        let inside = {
+            let mut arith = Emit::<LANES>(&mut lanes);
+            let apart = Plane::apart(&mut arith, [column, row], [bx, by_row])?;
+            Plane::inside(&mut arith, apart, reach)?
+        };
         let empty = lanes.equal(there, air)?;
         let pouring = lanes.greater_than(material, none)?;
         let near = lanes.select(inside, one, none)?;
@@ -915,32 +868,21 @@ fn reaches<const LANES: u32>(
     let by_row = lanes.splat_id::<U32, LANES>(where_y)?;
     let reach = lanes.splat_id::<U32, LANES>(how_wide)?;
     let material = lanes.splat_id::<U32, LANES>(what_of)?;
-    let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
     let half = lanes.splat_bits::<U32, LANES>(BOX / 2)?;
     let side = lanes.splat_bits::<U32, LANES>(BOX)?;
     let one = lanes.splat_bits::<U32, LANES>(1)?;
     let none = lanes.splat_bits::<U32, LANES>(0)?;
 
-    let away_x = lanes.mul(bx, minus)?;
-    let away_y = lanes.mul(by_row, minus)?;
-    let dx = lanes.add(column, away_x)?;
-    let dy = lanes.add(row, away_y)?;
-
-    let from_x = lanes.add(dx, half)?;
-    let from_x = low_bits::<LANES>(lanes, from_x, grid.wide.trailing_zeros())?;
-    let from_y = lanes.add(dy, half)?;
-    let from_y = low_bits::<LANES>(lanes, from_y, grid.deep.trailing_zeros())?;
-    let in_x = lanes.greater_than(side, from_x)?;
-    let in_y = lanes.greater_than(side, from_y)?;
-
-    let across_sq = lanes.mul(dx, dx)?;
-    let down_sq = lanes.mul(dy, dy)?;
-    let far = lanes.add(across_sq, down_sq)?;
-    let inside = lanes.greater_than(reach, far)?;
+    let (boxed, inside) = {
+        let mut arith = Emit::<LANES>(lanes);
+        let apart = Plane::apart(&mut arith, [column, row], [bx, by_row])?;
+        let boxed = Plane::boxed(&mut arith, grid, apart, [half, side])?;
+        (boxed, Plane::inside(&mut arith, apart, reach)?)
+    };
     let pouring = lanes.greater_than(material, none)?;
 
     let mut all = one;
-    for test in [in_x, in_y, inside, pouring] {
+    for test in boxed.into_iter().chain([inside, pouring]) {
         let held = lanes.select(test, one, none)?;
         all = lanes.mul(all, held)?;
     }
@@ -983,36 +925,20 @@ fn claim<const LANES: u32>(
         let mut lanes = kernel.lanes()?;
         let now = lanes.splat_id::<U32, LANES>(frame)?;
         let phase = low_bits::<LANES>(&mut lanes, now, 1)?;
-        let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
-        let back = lanes.mul(phase, minus)?;
         let one = lanes.splat_bits::<U32, LANES>(1)?;
         let none = lanes.splat_bits::<U32, LANES>(0)?;
 
-        let shifted_x = lanes.add(column, back)?;
-        let shifted_x = low_bits::<LANES>(&mut lanes, shifted_x, grid.wide.trailing_zeros())?;
-        let shifted_y = lanes.add(row, back)?;
-        let shifted_y = low_bits::<LANES>(&mut lanes, shifted_y, grid.deep.trailing_zeros())?;
-        let corner_x = low_bits::<LANES>(&mut lanes, shifted_x, 1)?;
-        let corner_y = low_bits::<LANES>(&mut lanes, shifted_y, 1)?;
-        let quad_x = lanes.shift_right_logical(shifted_x, one)?;
-        let quad_y = lanes.shift_right_logical(shifted_y, one)?;
-        let by = lanes.splat_bits::<U32, LANES>(grid.across().trailing_zeros())?;
-        let stride = lanes.shift_left(quad_y, by)?;
-        let quad = lanes.add(stride, quad_x)?;
-        let twice = lanes.shift_left(corner_y, one)?;
-        let corner = lanes.add(twice, corner_x)?;
-
-        let doubled_x = lanes.shift_left(quad_x, one)?;
-        let doubled_y = lanes.shift_left(quad_y, one)?;
-        let left = lanes.add(doubled_x, phase)?;
-        let top = lanes.add(doubled_y, phase)?;
-        let right = lanes.add(left, one)?;
-        let under = lanes.add(top, one)?;
+        let mut arith = Emit::<LANES>(&mut lanes);
+        let Held {
+            block,
+            index: quad,
+            corner,
+        } = Plane::holder(&mut arith, grid, [column, row], phase)?;
+        let corners = Plane::corners(&mut arith, block, phase)?;
 
         let mut earlier = none;
         let mut own = none;
-        let corners = [(left, top), (right, top), (left, under), (right, under)];
-        for (index, (x, y)) in (0_u32..).zip(corners) {
+        for (index, [x, y]) in (0_u32..).zip(corners) {
             let reached = reaches::<LANES>(&mut lanes, grid, x, y, brush)?;
             let at = lanes.splat_bits::<U32, LANES>(index)?;
             let before = lanes.greater_than(corner, at)?;
@@ -1026,9 +952,7 @@ fn claim<const LANES: u32>(
         }
 
         let within = lanes.splat_id::<U32, LANES>(seat)?;
-        let shift = lanes.splat_bits::<U32, LANES>(BOX.trailing_zeros())?;
-        let across_box = low_bits::<LANES>(&mut lanes, within, BOX.trailing_zeros())?;
-        let down_box = lanes.shift_right_logical(within, shift)?;
+        let [across_box, down_box] = Plane::seat(&mut Emit::<LANES>(&mut lanes), BOX, within)?;
         let wide = lanes.splat_bits::<U32, LANES>(grid.wide)?;
         let deep = lanes.splat_bits::<U32, LANES>(grid.deep)?;
         let fits_x = lanes.greater_than(wide, across_box)?;

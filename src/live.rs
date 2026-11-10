@@ -2,6 +2,7 @@ use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 
 use crate::compact::{Over, Tier, owned};
+use crate::geometry::{Emit, Placed, Plane, Space};
 use crate::layout::{AWAKE, BINDINGS, DENSE, GRAND, HOT, PARAMS, STATE};
 use crate::sand::{self, Grid};
 
@@ -778,26 +779,10 @@ pub fn corners<const LANES: u32>(
     let mut lanes = kernel.lanes()?;
     let which = lanes.splat_id::<U32, LANES>(quad)?;
     let now = lanes.splat_id::<U32, LANES>(frame)?;
-
-    let phase = sand::low_bits::<LANES>(&mut lanes, now, 1)?;
-    let by = lanes.splat_bits::<U32, LANES>(grid.across().trailing_zeros())?;
-    let down = lanes.shift_right_logical(which, by)?;
-    let along = sand::low_bits::<LANES>(&mut lanes, which, grid.across().trailing_zeros())?;
-
-    let one = lanes.splat_bits::<U32, LANES>(1)?;
-    let doubled_x = lanes.shift_left(along, one)?;
-    let doubled_y = lanes.shift_left(down, one)?;
-    let column = lanes.add(doubled_x, phase)?;
-    let row = lanes.add(doubled_y, phase)?;
-    let right = lanes.add(column, one)?;
-    let under = lanes.add(row, one)?;
-
-    let places = [
-        sand::at::<LANES>(&mut lanes, grid, column, row)?,
-        sand::at::<LANES>(&mut lanes, grid, right, row)?,
-        sand::at::<LANES>(&mut lanes, grid, column, under)?,
-        sand::at::<LANES>(&mut lanes, grid, right, under)?,
-    ];
+    let Placed {
+        block: [along, down],
+        places,
+    } = Plane::block(&mut Emit::<LANES>(&mut lanes), grid, which, now)?;
     Ok(Corners {
         places,
         along,
@@ -825,63 +810,72 @@ pub fn wake<const LANES: u32>(
         column,
         row,
     } = where_at;
+    let block = Block::<LANES, 2> {
+        subgroup,
+        grid,
+        at: [column, row],
+    };
+    woken::<LANES, 2, 4, 9>(kernel, block, [holding, inside], dump_base)
+}
+
+struct Block<const LANES: u32, const AXES: usize> {
+    subgroup: u32,
+    grid: Grid,
+    at: [Vector<U32, LANES>; AXES],
+}
+
+/// Wakes every block of [`Space::near`] around `block`, in a world of any
+/// number of axes.
+fn woken<const LANES: u32, const AXES: usize, const CORNERS: usize, const NEAR: usize>(
+    kernel: &mut Kernel<U32>,
+    block: Block<LANES, AXES>,
+    [holding, inside]: [Vector<U32, LANES>; 2],
+    dump_base: simdr::module::Id,
+) -> Result<(), LaneError> {
+    let Block { subgroup, grid, at } = block;
     let lane = kernel.local_index();
     let group = kernel.workgroup_index();
 
-    for down in 0..3_u32 {
-        for across in 0..3_u32 {
-            let slot = {
-                let mut lanes = kernel.lanes()?;
-                let one = lanes.splat_bits::<U32, LANES>(1)?;
-                let none = lanes.splat_bits::<U32, LANES>(0)?;
-                let minus = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
+    for offset in Space::<AXES, CORNERS, NEAR>::near() {
+        let slot = {
+            let mut lanes = kernel.lanes()?;
+            let none = lanes.splat_bits::<U32, LANES>(0)?;
+            let flag = Space::<AXES, CORNERS, NEAR>::neighbour(
+                &mut Emit::<LANES>(&mut lanes),
+                grid,
+                at,
+                offset,
+            )?;
 
-                let along = lanes.splat_bits::<U32, LANES>(across)?;
-                let below = lanes.splat_bits::<U32, LANES>(down)?;
-                let back = lanes.mul(one, minus)?;
-                let near_x = lanes.add(column, along)?;
-                let near_x = lanes.add(near_x, back)?;
-                let near_y = lanes.add(row, below)?;
-                let near_y = lanes.add(near_y, back)?;
+            let base = lanes.splat_id::<U32, LANES>(dump_base)?;
+            let mine = lanes.splat_id::<U32, LANES>(group)?;
+            let seat = lanes.splat_id::<U32, LANES>(lane)?;
+            let width = lanes.splat_bits::<U32, LANES>(subgroup)?;
+            let spread = lanes.mul(mine, width)?;
+            let elsewhere = lanes.add(base, spread)?;
+            let elsewhere = lanes.add(elsewhere, seat)?;
 
-                let x =
-                    sand::low_bits::<LANES>(&mut lanes, near_x, grid.across().trailing_zeros())?;
-                let y = sand::low_bits::<LANES>(&mut lanes, near_y, grid.down().trailing_zeros())?;
-                let by = lanes.splat_bits::<U32, LANES>(grid.across().trailing_zeros())?;
-                let stride = lanes.shift_left(y, by)?;
-                let flag = lanes.add(stride, x)?;
+            let both = lanes.mul(holding, inside)?;
+            let waking = lanes.greater_than(both, none)?;
+            lanes.select(waking, flag, elsewhere)?
+        };
+        let mark = kernel.module().constant_u32(2)?;
+        kernel.store_at(AWAKE, slot.id(), mark)?;
 
-                let base = lanes.splat_id::<U32, LANES>(dump_base)?;
-                let mine = lanes.splat_id::<U32, LANES>(group)?;
-                let seat = lanes.splat_id::<U32, LANES>(lane)?;
-                let width = lanes.splat_bits::<U32, LANES>(subgroup)?;
-                let spread = lanes.mul(mine, width)?;
-                let elsewhere = lanes.add(base, spread)?;
-                let elsewhere = lanes.add(elsewhere, seat)?;
+        let coarse = {
+            let mut lanes = kernel.lanes()?;
+            let none = lanes.splat_bits::<U32, LANES>(0)?;
+            let per_block = crate::sweep::cells(subgroup);
+            let by = lanes.splat_bits::<U32, LANES>(per_block.trailing_zeros())?;
+            let blocks = grid.blocks().div_ceil(per_block);
+            let cold = lanes.splat_bits::<U32, LANES>(blocks.div_ceil(per_block) * per_block)?;
 
-                let both = lanes.mul(holding, inside)?;
-                let waking = lanes.greater_than(both, none)?;
-                lanes.select(waking, flag, elsewhere)?
-            };
-            let mark = kernel.module().constant_u32(2)?;
-            kernel.store_at(AWAKE, slot.id(), mark)?;
-
-            let coarse = {
-                let mut lanes = kernel.lanes()?;
-                let none = lanes.splat_bits::<U32, LANES>(0)?;
-                let per_block = crate::sweep::cells(subgroup);
-                let by = lanes.splat_bits::<U32, LANES>(per_block.trailing_zeros())?;
-                let blocks = grid.quads().div_ceil(per_block);
-                let cold =
-                    lanes.splat_bits::<U32, LANES>(blocks.div_ceil(per_block) * per_block)?;
-
-                let which = lanes.shift_right_logical(slot, by)?;
-                let both = lanes.mul(holding, inside)?;
-                let waking = lanes.greater_than(both, none)?;
-                lanes.select(waking, which, cold)?
-            };
-            kernel.store_at(HOT, coarse.id(), mark)?;
-        }
+            let which = lanes.shift_right_logical(slot, by)?;
+            let both = lanes.mul(holding, inside)?;
+            let waking = lanes.greater_than(both, none)?;
+            lanes.select(waking, which, cold)?
+        };
+        kernel.store_at(HOT, coarse.id(), mark)?;
     }
     Ok(())
 }
