@@ -9,6 +9,7 @@ pub mod machine;
 pub mod marking;
 pub mod netlist;
 pub mod ops;
+pub mod render3;
 pub mod resident;
 pub mod rule;
 pub mod rule3;
