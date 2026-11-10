@@ -481,12 +481,6 @@ type Word<const LANES: u32> = Vector<U32, LANES>;
 type Truth<const LANES: u32> = Predicate<LANES>;
 
 /// Steps oct `oct` of `grid` at frame `frame`.
-///
-/// A frame that takes z first is stepped as its mirror across the plane
-/// x = z: the corners whose x and z differ trade places, a running word
-/// trades its x and z ways, the x-first rule runs, and the ways trade back.
-/// The rule treats x and z alike but for their order, so the mirror of an
-/// x-first step is the z-first step.
 fn step<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     grid: Grid,
@@ -495,24 +489,7 @@ fn step<const LANES: u32>(
 ) -> Result<(), LaneError> {
     let places = {
         let mut lanes = kernel.lanes()?;
-        let which = lanes.splat_id::<U32, LANES>(oct)?;
-        let now = lanes.splat_id::<U32, LANES>(frame)?;
-        let solid = Solid::block(&mut Emit::<LANES>(&mut lanes), grid, which, now)?.places;
-        let mut places = [which; CORNERS];
-        for (place, from) in places.iter_mut().zip(REFERENCE) {
-            if let Some(found) = solid.get(from) {
-                *place = *found;
-            }
-        }
-        let mirrored = z_first::<LANES>(&mut lanes, now)?;
-        for (one, other) in TRADED {
-            let (Some(here), Some(there)) = (word_at(&places, one), word_at(&places, other)) else {
-                continue;
-            };
-            put_word(&mut places, one, lanes.select(mirrored, there, here)?);
-            put_word(&mut places, other, lanes.select(mirrored, here, there)?);
-        }
-        places
+        placed::<LANES>(&mut lanes, grid, oct, frame)?.places
     };
 
     let mut held = [frame; CORNERS];
@@ -522,25 +499,95 @@ fn step<const LANES: u32>(
 
     let settled = {
         let mut lanes = kernel.lanes()?;
-        let now = lanes.splat_id::<U32, LANES>(frame)?;
-        let mirrored = z_first::<LANES>(&mut lanes, now)?;
-        let mut cells = [now; CORNERS];
-        for (cell, word) in cells.iter_mut().zip(held) {
-            let loaded = lanes.splat_id::<U32, LANES>(word)?;
-            *cell = traded::<LANES>(&mut lanes, loaded, mirrored)?;
-        }
-        let stepped = rule::<LANES>(&mut lanes, cells)?;
-        let mut out = stepped;
-        for (cell, from) in out.iter_mut().zip(stepped) {
-            *cell = traded::<LANES>(&mut lanes, from, mirrored)?;
-        }
-        out
+        stepped::<LANES>(&mut lanes, frame, held)?.out
     };
 
     for (place, value) in places.iter().zip(&settled) {
         kernel.store_at(STATE, place.id(), value.id())?;
     }
     Ok(())
+}
+
+/// Where the cells of an oct lie, in the order the rule takes them, and the
+/// oct's point in the lattice of octs.
+pub(crate) struct Placing<const LANES: u32> {
+    pub places: [Word<LANES>; CORNERS],
+    pub block: [Word<LANES>; 3],
+}
+
+/// The cells of oct `oct` of `grid` at frame `frame`, as [`Grid3::corners`]
+/// orders them, or in the mirrored order when the frame takes z first.
+///
+/// A frame that takes z first is stepped as its mirror across the plane
+/// x = z: the corners whose x and z differ trade places, a running word
+/// trades its x and z ways, the x-first rule runs, and the ways trade back.
+/// The rule treats x and z alike but for their order, so the mirror of an
+/// x-first step is the z-first step.
+pub(crate) fn placed<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    grid: Grid,
+    oct: Id,
+    frame: Id,
+) -> Result<Placing<LANES>, LaneError> {
+    let which = lanes.splat_id::<U32, LANES>(oct)?;
+    let now = lanes.splat_id::<U32, LANES>(frame)?;
+    let solid = Solid::block(&mut Emit::<LANES>(lanes), grid, which, now)?;
+    let mut places = [which; CORNERS];
+    for (place, from) in places.iter_mut().zip(REFERENCE) {
+        if let Some(found) = solid.places.get(from) {
+            *place = *found;
+        }
+    }
+    let mirrored = z_first::<LANES>(lanes, now)?;
+    for (one, other) in TRADED {
+        let (Some(here), Some(there)) = (word_at(&places, one), word_at(&places, other)) else {
+            continue;
+        };
+        put_word(&mut places, one, lanes.select(mirrored, there, here)?);
+        put_word(&mut places, other, lanes.select(mirrored, here, there)?);
+    }
+    Ok(Placing {
+        places,
+        block: solid.block,
+    })
+}
+
+/// One oct stepped by the rule: the words as loaded, the words after the
+/// held step and after the whole rule (both with the frame's ways), and the
+/// words to store.
+pub(crate) struct Stepped<const LANES: u32> {
+    pub loaded: [Word<LANES>; CORNERS],
+    pub held: [Word<LANES>; CORNERS],
+    pub ruled: [Word<LANES>; CORNERS],
+    pub out: [Word<LANES>; CORNERS],
+}
+
+/// Steps the eight words `held`, loaded from the places [`placed`] gives
+/// for frame `frame`.
+pub(crate) fn stepped<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    frame: Id,
+    held: [Id; CORNERS],
+) -> Result<Stepped<LANES>, LaneError> {
+    let now = lanes.splat_id::<U32, LANES>(frame)?;
+    let mirrored = z_first::<LANES>(lanes, now)?;
+    let mut cells = [now; CORNERS];
+    let mut loaded = [now; CORNERS];
+    for ((cell, raw), word) in cells.iter_mut().zip(loaded.iter_mut()).zip(held) {
+        *raw = lanes.splat_id::<U32, LANES>(word)?;
+        *cell = traded::<LANES>(lanes, *raw, mirrored)?;
+    }
+    let (after_hold, ruled) = rule::<LANES>(lanes, cells)?;
+    let mut out = ruled;
+    for (cell, from) in out.iter_mut().zip(ruled) {
+        *cell = traded::<LANES>(lanes, from, mirrored)?;
+    }
+    Ok(Stepped {
+        loaded,
+        held: after_hold,
+        ruled,
+        out,
+    })
 }
 
 fn word_at<const LANES: u32>(cells: &[Word<LANES>; CORNERS], at: usize) -> Option<Word<LANES>> {
@@ -731,11 +778,12 @@ impl<const LANES: u32> Fields<LANES> {
     }
 }
 
-/// [`settle_oct`] with x first, on words in the order of [`Grid3::corners`].
+/// [`settle_oct`] with x first, on words in the order of [`Grid3::corners`]:
+/// the words after the held step, and after the whole rule.
 fn rule<const LANES: u32>(
     lanes: &mut Lanes<'_>,
     oct: [Word<LANES>; CORNERS],
-) -> Result<[Word<LANES>; CORNERS], LaneError> {
+) -> Result<([Word<LANES>; CORNERS], [Word<LANES>; CORNERS]), LaneError> {
     let fields = Fields::<LANES>::new(lanes)?;
     let axes = [Axis::X, Axis::Z];
     let mut cells = oct;
@@ -800,5 +848,5 @@ fn rule<const LANES: u32>(
         put_word(&mut cells, lower, low);
     }
 
-    Ok(cells)
+    Ok((before, cells))
 }

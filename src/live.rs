@@ -283,6 +283,187 @@ pub fn arranged(
     Ok((passes, groups))
 }
 
+/// Why a 3D builder refuses a plan laid out for a flat grid.
+pub const FLAT_PLAN: &str =
+    "the plan is laid out for a flat grid, and a solid grid has eight cells to a block";
+
+/// Why a 3D builder refuses a plan that holds fewer blocks than the grid.
+pub const SHORT_PLAN: &str = "the plan holds fewer blocks than the grid has octs";
+
+const fn solid(operation: &'static str, grid: Grid) -> Result<(), LaneError> {
+    if grid.tall > 1 {
+        Ok(())
+    } else {
+        Err(LaneError::NoSuchForm {
+            operation,
+            because: crate::sand3::FLAT,
+        })
+    }
+}
+
+fn fits(operation: &'static str, grid: Grid, plan: &crate::compact::Plan) -> Result<(), LaneError> {
+    solid(operation, grid)?;
+    if plan.dimension != Dimension::Three {
+        return Err(LaneError::NoSuchForm {
+            operation,
+            because: FLAT_PLAN,
+        });
+    }
+    if plan.quads < grid.blocks() as usize {
+        return Err(LaneError::NoSuchForm {
+            operation,
+            because: SHORT_PLAN,
+        });
+    }
+    Ok(())
+}
+
+/// [`arranged3`] on the tier the plan's size pays for, as [`wired`] picks it.
+pub fn wired3(subgroup: u32, grid: Grid, plan: &crate::compact::Plan) -> Result<Loop, LaneError> {
+    fits("live::wired3", grid, plan)?;
+    arranged3(subgroup, grid, plan, coarse_pays(plan.blocks))
+}
+
+/// The frame of the listed engine on a solid grid, the 3D counterpart of
+/// [`arranged`] without the brush and the picture: tick, decay and wipe,
+/// [`settle3`] over the listed octs, then the marks, scans and gathers that
+/// list the octs of the next frame. `plan` is laid out for
+/// [`Dimension::Three`] and holds every oct of `grid`.
+pub fn arranged3(
+    subgroup: u32,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+    coarse: bool,
+) -> Result<Loop, LaneError> {
+    use crate::Groups;
+    use crate::layout::{BASES, HOT_BASES, HOT_COUNTS, HOT_DENSE, TOTALS};
+    use crate::sweep::COUNTS;
+
+    fits("live::arranged3", grid, plan)?;
+
+    let (listed, hot) = if coarse {
+        (Over::Listed(HOT_DENSE), crate::compact::Plan::hot_listed())
+    } else {
+        (Over::Every, Groups::Fixed(plan.blocks))
+    };
+    let tiles = Groups::Fixed(plan.tiles);
+    let one = Groups::Fixed(1);
+
+    let mut stages: Stages = vec![
+        vec![
+            (tick(subgroup)?, one),
+            (decay(subgroup, listed)?, hot),
+            (wipe_in(subgroup, Dimension::Three)?, one),
+            (wipe_counts(subgroup, COUNTS)?, tiles),
+            (unclaimed(subgroup, plan)?, one),
+        ],
+        vec![(settle3(subgroup, grid)?, crate::compact::Plan::listed())],
+    ];
+    if coarse {
+        stages.push(vec![(
+            mark_below(subgroup, Tier::COARSE, Over::Every, plan.blocks)?,
+            tiles,
+        )]);
+        stages.push(vec![(
+            crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
+            one,
+        )]);
+        stages.push(vec![
+            (
+                crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
+                tiles,
+            ),
+            (
+                crate::compact::prepare(subgroup, 1, Tier::COARSE)?,
+                Groups::Counting(1),
+            ),
+        ]);
+    }
+    stages.push(vec![(
+        mark_below(subgroup, Tier::FINE, listed, grid.blocks())?,
+        hot,
+    )]);
+    if plan.tiles == 1 {
+        stages.push(vec![(
+            crate::compact::whole(subgroup, COUNTS, BASES, Tier::FINE)?,
+            one,
+        )]);
+    } else {
+        stages.push(vec![(
+            crate::compact::scan(subgroup, COUNTS, BASES, TOTALS)?,
+            tiles,
+        )]);
+        stages.push(vec![(
+            crate::compact::scan(subgroup, TOTALS, TOTALS, GRAND)?,
+            one,
+        )]);
+    }
+    stages.push(vec![
+        (
+            crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
+            hot,
+        ),
+        (
+            crate::compact::prepare(subgroup, subgroup, Tier::FINE)?,
+            Groups::Counting(1),
+        ),
+    ]);
+    Ok(staged(stages))
+}
+
+/// Writes `cells` (each a cell index and its new word) into the world of a
+/// listed engine on a solid grid between frames, and wakes what they touch:
+/// the oct of either phase that holds each cell is marked awake and hot, as
+/// [`seed`] marks every oct, and is put on the list the next frame steps,
+/// once however many cells it holds. The list keeps the octs it held.
+///
+/// No frame may be in flight. A cell past the grid is refused with
+/// [`Error::Overrun`](crate::Error::Overrun) before anything is written.
+pub fn put3(
+    held: &mut crate::Resident<'_>,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+    cells: &[(u32, u32)],
+) -> Result<(), crate::Error> {
+    use crate::geometry::Solid;
+    use crate::layout::INDIRECT;
+
+    fits("live::put3", grid, plan).map_err(crate::Error::Lane)?;
+    let past = grid.cells();
+    if let Some(&(cell, _)) = cells.iter().find(|(cell, _)| *cell as usize >= past) {
+        return Err(crate::Error::Overrun {
+            index: STATE as usize,
+            needed: cell as usize + 1,
+            held: past,
+        });
+    }
+
+    let grand = held.read(GRAND as usize, 1)?.first().copied().unwrap_or(0);
+    let mut octs: std::collections::BTreeSet<u32> = held
+        .read(DENSE as usize, grand as usize)?
+        .into_iter()
+        .collect();
+    let mut woken = std::collections::BTreeSet::new();
+    for &(cell, word) in cells {
+        held.write_at(STATE as usize, cell as usize, &[word])?;
+        for phase in 0..2 {
+            woken.insert(Solid::held(grid, cell, phase).index);
+        }
+    }
+
+    let by = plan.per_block.trailing_zeros();
+    for &oct in &woken {
+        held.write_at(AWAKE as usize, oct as usize, &[2])?;
+        held.write_at(HOT as usize, (oct >> by) as usize, &[2])?;
+    }
+    octs.extend(woken);
+    let list: Vec<u32> = octs.into_iter().collect();
+    let count = u32::try_from(list.len()).unwrap_or(u32::MAX);
+    held.write(DENSE as usize, &list)?;
+    held.write(GRAND as usize, &[count])?;
+    held.write(INDIRECT as usize, &[count.div_ceil(plan.subgroup), 1, 1])
+}
+
 pub struct Both {
     pub passes: Vec<Vec<u32>>,
     pub listed: Vec<Vec<crate::Groups>>,
@@ -711,31 +892,173 @@ fn listed<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneE
 
     let what = Tallying {
         counted,
-        column,
-        row,
+        at: [column, row],
         inside: counted_in,
     };
-    tally::<LANES>(&mut kernel, what)?;
+    tally::<LANES, 2>(&mut kernel, what)?;
     kernel.finish()
 }
 
-struct Tallying<const LANES: u32> {
+/// The listed settle of a solid grid: each listed entry is one oct, stepped
+/// by [`crate::sand3::settle_oct`] with 8 loads and 8 stores of `STATE`
+/// through [`crate::geometry::Solid`]. An oct that changes wakes itself and
+/// the 26 octs around it ([`crate::geometry::Space::near`]), and the frame's
+/// counts go to the [`Dimension::Three`] tally. Lanes past the list store
+/// into the spare region of `STATE`, 8 words a slot from the grid's end.
+pub fn settle3(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
+    solid("live::settle3", grid)?;
+    match subgroup {
+        4 => listed3::<4>(subgroup, grid),
+        8 => listed3::<8>(subgroup, grid),
+        16 => listed3::<16>(subgroup, grid),
+        32 => listed3::<32>(subgroup, grid),
+        64 => listed3::<64>(subgroup, grid),
+        other => Err(LaneError::NoMapping {
+            lanes: other,
+            width: subgroup,
+        }),
+    }
+}
+
+fn listed3<const LANES: u32>(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
+    use crate::sand3::{CORNERS, placed, stepped};
+
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let uint = kernel.index_type();
+
+    let group = kernel.workgroup_index();
+    let lane = kernel.local_index();
+    let width = kernel.module().constant_u32(subgroup)?;
+    let base = kernel.module().i_mul(uint, group, width)?;
+    let slot = kernel.module().i_add(uint, base, lane)?;
+
+    let head = kernel.module().constant_u32(0)?;
+    let frame = kernel.load_at(PARAMS, head)?;
+    let grand = kernel.load_at(GRAND, head)?;
+    let second = kernel.module().constant_u32(1)?;
+    let dump_base = kernel.load_at(PARAMS, second)?;
+    let claimed = kernel.load_at(DENSE, dump_base)?;
+
+    let (inside, counted_in) = {
+        let mut lanes = kernel.lanes()?;
+        let here = lanes.splat_id::<U32, LANES>(slot)?;
+        let listed = lanes.splat_id::<U32, LANES>(grand)?;
+        let added = lanes.splat_id::<U32, LANES>(claimed)?;
+        let total = lanes.add(listed, added)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let settled = lanes.greater_than(total, here)?;
+        let counted = lanes.greater_than(listed, here)?;
+        (
+            lanes.select(settled, one, none)?,
+            lanes.select(counted, one, none)?,
+        )
+    };
+
+    let oct = kernel.load_at(DENSE, slot)?;
+    let placing = {
+        let mut lanes = kernel.lanes()?;
+        placed::<LANES>(&mut lanes, grid, oct, frame)?
+    };
+
+    let mut held = [frame; CORNERS];
+    for (word, place) in held.iter_mut().zip(&placing.places) {
+        *word = kernel.load_at(STATE, place.id())?;
+    }
+
+    let (settled, counted, touched) = {
+        let mut lanes = kernel.lanes()?;
+        let step = stepped::<LANES>(&mut lanes, frame, held)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+
+        let mut count = none;
+        for (before, after) in step.held.into_iter().zip(step.ruled) {
+            let same = lanes.equal(before, after)?;
+            let differs = lanes.select(same, none, one)?;
+            count = lanes.add(count, differs)?;
+        }
+
+        let mut touched = none;
+        for (before, after) in step.loaded.into_iter().zip(step.out) {
+            let same = lanes.equal(before, after)?;
+            let differs = lanes.select(same, none, one)?;
+            touched = lanes.add(touched, differs)?;
+        }
+
+        let water = lanes.splat_bits::<U32, LANES>(sand::WATER)?;
+        let grain = lanes.splat_bits::<U32, LANES>(sand::SAND)?;
+        let mut wet = none;
+        let mut dry = none;
+        for cell in step.out {
+            let kind = sand::material::<LANES>(&mut lanes, cell)?;
+            let is_wet = lanes.equal(kind, water)?;
+            let is_dry = lanes.equal(kind, grain)?;
+            let add_wet = lanes.select(is_wet, one, none)?;
+            let add_dry = lanes.select(is_dry, one, none)?;
+            wet = lanes.add(wet, add_wet)?;
+            dry = lanes.add(dry, add_dry)?;
+        }
+        (step.out, [count, wet, dry], touched)
+    };
+
+    let spare = {
+        let mut lanes = kernel.lanes()?;
+        let past =
+            lanes.splat_bits::<U32, LANES>(u32::try_from(grid.cells()).unwrap_or(u32::MAX))?;
+        let mine = lanes.splat_id::<U32, LANES>(slot)?;
+        let shift = lanes.splat_bits::<U32, LANES>(Dimension::Three.corner_bits())?;
+        let along = lanes.shift_left(mine, shift)?;
+        lanes.add(past, along)?
+    };
+
+    for (corner, (place, value)) in placing.places.iter().zip(&settled).enumerate() {
+        let where_at = {
+            let mut lanes = kernel.lanes()?;
+            let none = lanes.splat_bits::<U32, LANES>(0)?;
+            let step = lanes.splat_bits::<U32, LANES>(u32::try_from(corner).unwrap_or(0))?;
+            let elsewhere = lanes.add(spare, step)?;
+            let listed = lanes.greater_than(inside, none)?;
+            lanes.select(listed, *place, elsewhere)?
+        };
+        kernel.store_at(STATE, where_at.id(), value.id())?;
+    }
+
+    let block = Block::<LANES, 3> {
+        subgroup,
+        grid,
+        at: placing.block,
+    };
+    woken::<LANES, 3, 8, 27>(&mut kernel, block, [touched, inside], dump_base)?;
+
+    let what = Tallying {
+        counted,
+        at: placing.block,
+        inside: counted_in,
+    };
+    tally::<LANES, 3>(&mut kernel, what)?;
+    kernel.finish()
+}
+
+struct Tallying<const LANES: u32, const AXES: usize> {
     counted: [Vector<U32, LANES>; 3],
-    column: Vector<U32, LANES>,
-    row: Vector<U32, LANES>,
+    at: [Vector<U32, LANES>; AXES],
     inside: Vector<U32, LANES>,
 }
 
-fn tally<const LANES: u32>(
+/// Adds a frame's counts to `TALLY`: the cells that moved, the wet and the
+/// dry cells, the moved cells weighted by each axis of their block shifted
+/// down by [`COARSE`](crate::layout::COARSE), and the blocks that moved at
+/// all. That is `3 + AXES + 1` words, the dimension's tally.
+fn tally<const LANES: u32, const AXES: usize>(
     kernel: &mut Kernel<U32>,
-    what: Tallying<LANES>,
+    what: Tallying<LANES, AXES>,
 ) -> Result<(), LaneError> {
     use crate::layout::{COARSE, TALLY};
 
     let Tallying {
         counted,
-        column,
-        row,
+        at,
         inside,
     } = what;
     let [moved, wet, dry] = counted;
@@ -754,15 +1077,22 @@ fn tally<const LANES: u32>(
         let dry = keep(&mut lanes, dry)?;
 
         let by = lanes.splat_bits::<U32, LANES>(COARSE)?;
-        let across = lanes.shift_right_logical(column, by)?;
-        let down = lanes.shift_right_logical(row, by)?;
-        let across = lanes.mul(across, moved)?;
-        let down = lanes.mul(down, moved)?;
+        let mut weighted = at;
+        for value in &mut weighted {
+            *value = lanes.shift_right_logical(*value, by)?;
+        }
+        for value in &mut weighted {
+            *value = lanes.mul(*value, moved)?;
+        }
 
         let stirred = lanes.greater_than(moved, none)?;
         let stirred = lanes.select(stirred, one, none)?;
 
-        [moved, wet, dry, across, down, stirred]
+        let mut shares = Vec::with_capacity(AXES + 4);
+        shares.extend([moved, wet, dry]);
+        shares.extend(weighted);
+        shares.push(stirred);
+        shares
     };
 
     for (word, share) in shares.into_iter().enumerate() {
