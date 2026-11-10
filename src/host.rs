@@ -1,5 +1,5 @@
 use std::ffi::{CStr, c_char};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ash::vk;
@@ -371,6 +371,7 @@ pub struct Host {
     tick: f32,
     timing: bool,
     wedged: AtomicBool,
+    owing: AtomicUsize,
     sparse: bool,
     strict: bool,
     int64: bool,
@@ -567,6 +568,7 @@ impl Host {
             strict,
             int64,
             wedged: AtomicBool::new(false),
+            owing: AtomicUsize::new(0),
         })
     }
 
@@ -576,6 +578,18 @@ impl Host {
 
     pub(crate) fn wedged(&self) -> bool {
         self.wedged.load(Ordering::SeqCst)
+    }
+
+    /// A finished resident now exists and may submit work. It owes the host
+    /// until its drop has seen all of that work finish.
+    pub(crate) fn owe(&self) {
+        self.owing.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A finished resident was freed after it saw all its work finish. Each
+    /// finished resident owes once and settles at most once, in its drop.
+    pub(crate) fn settle(&self) {
+        self.owing.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub(crate) const fn ticking(&self) -> (f32, bool) {
@@ -637,8 +651,13 @@ impl Host {
 }
 
 impl Drop for Host {
+    /// A wedged host is left alive while any resident still owes it: one
+    /// that left work on the device unfinished, or one that was never
+    /// dropped. Once every resident has seen its own work finish, nothing is
+    /// pending, and the device and instance are destroyed as on a healthy
+    /// host, so no driver thread is left running while the process exits.
     fn drop(&mut self) {
-        if self.wedged() {
+        if self.wedged() && self.owing.load(Ordering::SeqCst) > 0 {
             return;
         }
         unsafe {

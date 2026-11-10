@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ash::vk;
@@ -458,6 +459,8 @@ pub struct Resident<'host> {
     commands: vk::CommandPool,
     transfer: vk::CommandBuffer,
     fence: vk::Fence,
+    sending: AtomicBool,
+    stranded: Vec<(vk::Fence, vk::DeviceMemory)>,
     slots: Vec<Slot>,
     tickets: u64,
     cached: bool,
@@ -625,6 +628,7 @@ impl Host {
             }
         }
         made.built = true;
+        self.owe();
         Ok(made)
     }
 
@@ -802,6 +806,8 @@ impl<'host> Resident<'host> {
             commands: vk::CommandPool::null(),
             transfer: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            sending: AtomicBool::new(false),
+            stranded: Vec::new(),
             slots: Vec::with_capacity(SLOTS),
             tickets: 0,
             cached: false,
@@ -1025,6 +1031,31 @@ impl Resident<'_> {
             }
             Err(code) => Err(code.into()),
         }
+    }
+
+    /// Whether every submission this resident made and has not seen finish
+    /// finishes within its patience, and never less than the default bound:
+    /// a frame in flight, a transfer whose wait ran out, and a sparse bind
+    /// left behind on a wedged host. A bound that declared the host wedged
+    /// may have been far shorter than the work, which can still be running.
+    fn drained(&self) -> bool {
+        let mut pending: Vec<vk::Fence> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.flight.is_some())
+            .map(|slot| slot.fence)
+            .collect();
+        if self.sending.load(Ordering::SeqCst) {
+            pending.push(self.fence);
+        }
+        pending.extend(self.stranded.iter().map(|&(fence, _)| fence));
+        if pending.is_empty() {
+            return true;
+        }
+        let bound = self.patience.max(Self::PATIENCE);
+        let patience = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX);
+        let waited = unsafe { self.host.device().wait_for_fences(&pending, true, patience) };
+        waited.is_ok()
     }
 
     #[must_use]
@@ -1287,6 +1318,7 @@ impl Resident<'_> {
             }
             let waited = self.await_fence(fence);
             if self.host.wedged() {
+                self.stranded.push((fence, memory));
                 return waited;
             }
             device.destroy_fence(fence, None);
@@ -1344,6 +1376,7 @@ impl Resident<'_> {
             }
             let waited = self.await_fence(fence);
             if self.host.wedged() {
+                self.stranded.push((fence, vk::DeviceMemory::null()));
                 return waited;
             }
             device.destroy_fence(fence, None);
@@ -1951,9 +1984,12 @@ impl Resident<'_> {
             let ordered = self.host.ordered();
             device.reset_fences(&[self.fence])?;
             device.queue_submit(self.host.queue(), &submit, self.fence)?;
+            self.sending.store(true, Ordering::SeqCst);
             drop(ordered);
         }
-        self.await_fence(self.fence)
+        self.await_fence(self.fence)?;
+        self.sending.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     unsafe fn mapped_at(
@@ -2130,17 +2166,21 @@ fn after_earlier(device: &ash::Device, command: vk::CommandBuffer) {
 }
 
 impl Drop for Resident<'_> {
-    /// A finished resident may have work on the device: it waits for the
-    /// device first, and leaks everything on a wedged host, where waiting
-    /// would not end. One still being built has never submitted anything, so
-    /// it frees what it made at once, wedged or not.
+    /// A finished resident may have work on the device. On a healthy host it
+    /// waits for the device first. On a wedged host it waits, within a bound,
+    /// for its own unfinished work only, since the device may never be idle:
+    /// work that finishes in time is freed as usual, and work that does not
+    /// is left alive with everything it uses, and the host with it. One still
+    /// being built has never submitted anything, so it frees what it made at
+    /// once, wedged or not.
     fn drop(&mut self) {
-        if self.built && self.host.wedged() {
+        let wedged = self.built && self.host.wedged();
+        if wedged && !self.drained() {
             return;
         }
         let device = self.host.device();
         unsafe {
-            if self.built {
+            if self.built && !wedged {
                 let _ = device.device_wait_idle();
             }
             device.destroy_fence(self.fence, faults::callbacks(Step::Fence));
@@ -2196,6 +2236,13 @@ impl Drop for Resident<'_> {
                     device.free_memory(memory, None);
                 }
             }
+            for &(fence, memory) in &self.stranded {
+                device.destroy_fence(fence, None);
+                device.free_memory(memory, None);
+            }
+        }
+        if self.built {
+            self.host.settle();
         }
     }
 }
