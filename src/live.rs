@@ -372,7 +372,24 @@ const fn solid(operation: &'static str, grid: Grid) -> Result<(), LaneError> {
     }
 }
 
+pub const BRICKED_PLAN: &str =
+    "the plan is laid out for a brick pool, whose STATE does not hold the grid";
+
 pub(crate) fn fits(
+    operation: &'static str,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+) -> Result<(), LaneError> {
+    if plan.is_bricked() {
+        return Err(LaneError::NoSuchForm {
+            operation,
+            because: BRICKED_PLAN,
+        });
+    }
+    fits_pool(operation, grid, plan)
+}
+
+pub(crate) fn fits_pool(
     operation: &'static str,
     grid: Grid,
     plan: &crate::compact::Plan,

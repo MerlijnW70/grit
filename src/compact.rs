@@ -124,6 +124,7 @@ pub struct Plan {
     pub quads: usize,
     pub dimension: Dimension,
     window: u32,
+    bricked: bool,
 }
 
 impl Plan {
@@ -163,6 +164,29 @@ impl Plan {
     }
 
     pub fn over_in(subgroup: u32, blocks: u32, dimension: Dimension) -> Result<Self, TooBig> {
+        let held = Self::laid(subgroup, blocks, dimension)?;
+        let words = held.state_words() as u64;
+        if words > Self::MOST_WORDS {
+            return Err(TooBig::Cells {
+                cells: words,
+                limit: Self::MOST_WORDS,
+            });
+        }
+        Ok(held)
+    }
+
+    pub fn bricked(subgroup: u32, blocks: u32) -> Result<Self, TooBig> {
+        let mut held = Self::laid(subgroup, blocks, Dimension::Three)?;
+        held.bricked = true;
+        Ok(held)
+    }
+
+    #[must_use]
+    pub const fn is_bricked(&self) -> bool {
+        self.bricked
+    }
+
+    fn laid(subgroup: u32, blocks: u32, dimension: Dimension) -> Result<Self, TooBig> {
         let per_block = sweep::cells(subgroup);
         let most = Self::most_blocks(subgroup, dimension);
         if u64::from(blocks) > most {
@@ -180,14 +204,8 @@ impl Plan {
             grid: per_block as usize * blocks as usize * dimension.corners(),
             dimension,
             window: crate::layout::WINDOW_BITS,
+            bricked: false,
         };
-        let words = held.state_words() as u64;
-        if words > Self::MOST_WORDS {
-            return Err(TooBig::Cells {
-                cells: words,
-                limit: Self::MOST_WORDS,
-            });
-        }
         Ok(held)
     }
 
@@ -591,6 +609,103 @@ fn gathered<const LANES: u32>(
     let dump_mine = kernel.module().i_add(uint, dump_start, lane)?;
 
     crate::gate::if_any::<LANES, _>(&mut kernel, live, |kernel| {
+        let where_at = Gathering {
+            source,
+            along_lane,
+            dump_mine,
+            live,
+            tile_base,
+            block_base,
+            tier,
+        };
+        taking::<LANES>(kernel, where_at)
+    })?;
+    kernel.finish()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Held {
+    pub table: u32,
+    pub entry: u32,
+    pub reach: u32,
+    pub dump: u32,
+    pub upper: Option<u32>,
+}
+
+pub fn gather_held(
+    subgroup: u32,
+    tier: Tier,
+    over: Over,
+    held: Held,
+) -> Result<Vec<u32>, LaneError> {
+    match subgroup {
+        4 => gathered_held::<4>(subgroup, tier, over, held),
+        8 => gathered_held::<8>(subgroup, tier, over, held),
+        16 => gathered_held::<16>(subgroup, tier, over, held),
+        32 => gathered_held::<32>(subgroup, tier, over, held),
+        64 => gathered_held::<64>(subgroup, tier, over, held),
+        other => Err(LaneError::NoMapping {
+            lanes: other,
+            width: subgroup,
+        }),
+    }
+}
+
+fn gathered_held<const LANES: u32>(
+    subgroup: u32,
+    tier: Tier,
+    over: Over,
+    held: Held,
+) -> Result<Vec<u32>, LaneError> {
+    let reach = over_reach(tier, over).max(held.reach);
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, reach))?;
+    let uint = kernel.index_type();
+
+    let block = owned(&mut kernel, over)?;
+    let lane = kernel.local_index();
+    let per_block = sweep::cells(subgroup);
+
+    let tile = {
+        let mut lanes = kernel.lanes()?;
+        let which = lanes.splat_id::<U32, LANES>(block)?;
+        let by = lanes.splat_bits::<U32, LANES>(per_block.trailing_zeros())?;
+        lanes.shift_right_logical(which, by)?
+    };
+
+    let tile_base = kernel.load_at(tier.totals, tile.id())?;
+    let tile_base = match held.upper {
+        None => tile_base,
+        Some(upper) => {
+            let group = {
+                let mut lanes = kernel.lanes()?;
+                let by = lanes.splat_bits::<U32, LANES>(per_block.trailing_zeros())?;
+                let past = lanes.splat_bits::<U32, LANES>(upper)?;
+                let group = lanes.shift_right_logical(tile, by)?;
+                lanes.add(group, past)?
+            };
+            let group_base = kernel.load_at(tier.totals, group.id())?;
+            kernel.module().i_add(uint, tile_base, group_base)?
+        }
+    };
+    let block_base = kernel.load_at(tier.bases, block)?;
+    let live = kernel.load_at(tier.counts, block)?;
+
+    crate::gate::if_any::<LANES, _>(&mut kernel, live, |kernel| {
+        let uint = kernel.index_type();
+        let width = kernel.module().constant_u32(held.entry)?;
+        let at = kernel.module().i_mul(uint, block, width)?;
+        let slot = kernel.load_at(held.table, at)?;
+        let wide = kernel.module().constant_u32(sweep::stride(subgroup))?;
+        let region = kernel.module().i_mul(uint, slot, wide)?;
+        let run = kernel.module().constant_u32(PER_LANE)?;
+        let along_lane = kernel.module().i_mul(uint, lane, run)?;
+        let source = kernel.module().i_add(uint, region, along_lane)?;
+
+        let dump_base = kernel.module().constant_u32(held.dump)?;
+        let dump_span = kernel.module().constant_u32(subgroup)?;
+        let dump_block = kernel.module().i_mul(uint, slot, dump_span)?;
+        let dump_start = kernel.module().i_add(uint, dump_base, dump_block)?;
+        let dump_mine = kernel.module().i_add(uint, dump_start, lane)?;
         let where_at = Gathering {
             source,
             along_lane,
