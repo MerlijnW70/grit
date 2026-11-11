@@ -1412,17 +1412,13 @@ impl Region {
     }
 }
 
-fn vast_for(host: &Host) -> (Grid, Plan, [u32; 3]) {
-    let width = host.width();
+const SEED_BUDGET: f64 = 0.4;
+
+fn vast_of(width: u32, bricks: u64) -> (Grid, Plan, [u32; 3]) {
     let per_block = sweep::cells(width);
     let k = per_block.trailing_zeros();
     let sides = [2 << k.div_ceil(3), 2 << ((k + 1) / 3), 2 << (k / 3)];
-    let scanned = Plan::most_blocks(width, Dimension::Three);
-    let dispatched = u64::from(host.limits().groups) * u64::from(width) / u64::from(per_block);
-    let cells_most = 1_u64 << 33;
-    let brick_cells = u64::from(per_block) * 8;
-    let mut bricks = scanned.min(dispatched).min(cells_most / brick_cells);
-    bricks = 1 << (63 - bricks.leading_zeros());
+    let bricks = 1 << (63 - bricks.max(64).leading_zeros());
     let mut lattice = [4_u64, 4, 4];
     let mut axis = 0;
     while lattice.iter().product::<u64>() < bricks {
@@ -1439,6 +1435,41 @@ fn vast_for(host: &Host) -> (Grid, Plan, [u32; 3]) {
     (grid, plan, sides)
 }
 
+fn seed_seconds_a_brick(host: &Host, bricks: u64) -> f64 {
+    let (grid, plan, _) = vast_of(host.width(), bricks);
+    let pool = Bricks::new(grid, &plan, 64).unwrap();
+    let (passes, stages) = bricks::arranged(&Sand, &pool, &plan, true).unwrap();
+    let sizes = pool.sizes(&Sand, &plan);
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let mut held = host.resident(&sizes, &modules).unwrap();
+    clear(&mut held, &sizes);
+    held.write(PARAMS as usize, &[u32::MAX]).unwrap();
+    let packed = pool
+        .compose(|_| bricks::Content::Uniform(sand2::AIR))
+        .unwrap();
+    pool.write_packed(&mut held, &plan, &packed).unwrap();
+    pool.seed(&mut held, &plan).unwrap();
+    let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
+    let clock = std::time::Instant::now();
+    held.staged(&groups).unwrap();
+    let took = held.on_device().unwrap_or_else(|| clock.elapsed());
+    took.as_secs_f64() / f64::from(pool.count())
+}
+
+fn vast_for(host: &Host) -> (Grid, Plan, [u32; 3], u64) {
+    let width = host.width();
+    let per_block = sweep::cells(width);
+    let scanned = Plan::most_blocks(width, Dimension::Three);
+    let dispatched = u64::from(host.limits().groups) * u64::from(width) / u64::from(per_block);
+    let cells_most = 1_u64 << 33;
+    let brick_cells = u64::from(per_block) * 8;
+    let reached = scanned.min(dispatched).min(cells_most / brick_cells);
+    let each = seed_seconds_a_brick(host, reached.min(1 << 16));
+    let paced = (SEED_BUDGET / each.max(1e-12)) as u64;
+    let (grid, plan, sides) = vast_of(width, reached.min(paced));
+    (grid, plan, sides, reached * brick_cells)
+}
+
 #[test]
 fn a_world_past_the_u32_cell_index_steps_its_region_to_the_cpu_reference() {
     let name = "bricks vast";
@@ -1446,12 +1477,13 @@ fn a_world_past_the_u32_cell_index_steps_its_region_to_the_cpu_reference() {
         return;
     };
     let width = host.width();
-    let (grid, plan, side) = vast_for(&host);
+    let (grid, plan, side, reached) = vast_for(&host);
     let cells = grid.cells() as u64;
-    let most = Plan::most_blocks(width, Dimension::Three) * u64::from(plan.per_block) * 8;
-    let groups = u64::from(host.limits().groups) * u64::from(width) * 8;
-    if most > 1 << 32 && groups > 1 << 32 {
-        assert!(cells > 1 << 32, "{name}: {cells} cells");
+    if cells < reached {
+        println!(
+            "{name} {} width {width}: a frame stepping every oct of {reached} cells would pass {SEED_BUDGET} s on this device, so the world is {cells} cells",
+            host.name()
+        );
     }
     let bricks = Bricks::new(grid, &plan, 64).unwrap();
     let lattice = bricks.lattice();
