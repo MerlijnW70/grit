@@ -220,9 +220,31 @@ fn ball(
 fn sanded() -> Example {
     use grit::sand::{AIR, SAND, WALL, WATER};
     let table = Table::empty()
-        .with(SAND, Material::solid(0x00E2_BC72, 0.14).strata(0.05))
-        .with(WATER, Material::solid(0x002C_7486, 0.02).clear(0.82))
-        .with(WALL, Material::solid(0x0084_7C73, 0.16).strata(0.32));
+        .with(
+            SAND,
+            Material::solid(0x00E2_BC72, 0.14)
+                .strata(0.05)
+                .surface(0.95, 0.03)
+                .detail(0.45, 0.35, 0.0, 0.0)
+                .wets(1.0),
+        )
+        .with(
+            WATER,
+            Material::solid(0x003F_B5B0, 0.02)
+                .clear(0.82)
+                .surface(0.06, 0.02)
+                .detail(0.0, 0.55, 0.0, 0.0)
+                .liquid(0x002F_7FA8),
+        )
+        .with(
+            WALL,
+            Material::solid(0x0084_7C73, 0.16)
+                .strata(0.32)
+                .surface(0.82, 0.04)
+                .detail(0.35, 0.5, 0.6, 0.15)
+                .mossy(0.55, 0x006B_7350)
+                .wets(0.8),
+        );
     Example {
         name: "sand",
         rule: "sand",
@@ -335,18 +357,74 @@ const SNOW: u32 = 12;
 fn fired() -> Example {
     use heat::{AIR, ASH, FIRE, FUEL, ICE, STEAM, WALL, WATER, cell};
     let table = Table::empty()
-        .with(WALL, Material::solid(0x007E_7872, 0.12).strata(0.26))
-        .with(ICE, Material::solid(0x002C_5528, 0.3))
-        .with(WATER, Material::solid(0x0030_7E8C, 0.02).clear(0.84))
+        .with(
+            WALL,
+            Material::solid(0x007E_7872, 0.12)
+                .strata(0.26)
+                .surface(0.82, 0.04)
+                .detail(0.35, 0.5, 0.6, 0.15)
+                .mossy(0.55, 0x006B_7350)
+                .wets(0.8),
+        )
+        .with(
+            ICE,
+            Material::solid(0x002C_5528, 0.3)
+                .surface(0.75, 0.03)
+                .detail(0.6, 0.5, 0.0, 0.1),
+        )
+        .with(
+            WATER,
+            Material::solid(0x003F_B5B0, 0.02)
+                .clear(0.84)
+                .surface(0.06, 0.02)
+                .detail(0.0, 0.55, 0.0, 0.0)
+                .liquid(0x002F_7FA8),
+        )
         .with(STEAM, Material::solid(0x0060_5A55, 0.0).gas(0.5))
-        .with(FUEL, Material::solid(0x0034_5C2C, 0.32))
+        .with(
+            FUEL,
+            Material::solid(0x0034_5C2C, 0.32)
+                .surface(0.75, 0.03)
+                .detail(0.6, 0.5, 0.0, 0.1),
+        )
         .with(FIRE, Material::solid(0x00FF_5A14, 0.5).glowing(1.7))
-        .with(ASH, Material::solid(0x0040_3D3A, 0.25))
-        .with(EARTH, Material::solid(0x0078_5A3C, 0.14).strata(0.22))
-        .with(GRASS, Material::solid(0x005E_7E38, 0.26))
-        .with(SHORE, Material::solid(0x00D8_BE86, 0.12))
-        .with(TRUNK, Material::solid(0x005C_3F28, 0.2))
-        .with(SNOW, Material::solid(0x00F2_F3F5, 0.04));
+        .with(
+            ASH,
+            Material::solid(0x0040_3D3A, 0.25).detail(0.5, 0.3, 0.0, 0.0),
+        )
+        .with(
+            EARTH,
+            Material::solid(0x0078_5A3C, 0.14)
+                .strata(0.22)
+                .detail(0.5, 0.45, 0.15, 0.0)
+                .wets(0.7),
+        )
+        .with(
+            GRASS,
+            Material::solid(0x005E_7E38, 0.26)
+                .detail(0.55, 0.4, 0.0, 0.3)
+                .wets(0.5),
+        )
+        .with(
+            SHORE,
+            Material::solid(0x00D8_BE86, 0.12)
+                .surface(0.95, 0.03)
+                .detail(0.45, 0.35, 0.0, 0.0)
+                .wets(1.0),
+        )
+        .with(
+            TRUNK,
+            Material::solid(0x005C_3F28, 0.2)
+                .detail(0.6, 0.5, 0.2, 0.9)
+                .mossy(0.35, 0x004F_5E32),
+        )
+        .with(
+            SNOW,
+            Material::solid(0x00F2_F3F5, 0.04)
+                .surface(0.55, 0.03)
+                .detail(0.15, 0.35, 0.0, 0.0)
+                .sparkle(1.0),
+        );
     Example {
         name: "fire",
         rule: "heat",
