@@ -29,6 +29,7 @@ pub use crate::ops::Word;
 
 pub mod code;
 pub mod heat;
+pub mod nature;
 pub mod sand;
 
 /// The cells of an oct.
