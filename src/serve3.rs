@@ -36,7 +36,7 @@ pub const SLICE_MOST: u64 = 65536;
 /// The most frames one `grit_world_step` runs.
 pub const STEP_MOST: u32 = 65536;
 
-pub const SLOTS_LEAST: u32 = 64;
+pub const POOL_LEAST_CELLS: u64 = 1 << 21;
 
 /// How many frames go to the device at a time.
 const BATCH: u32 = 64;
@@ -557,9 +557,9 @@ impl<'host> Server<'host> {
             let most = u32::try_from(((1_u64 << 32) - 1) / (u64::from(plan.per_block) * 8))
                 .unwrap_or(u32::MAX)
                 .min(plan.blocks);
-            let capacity = slots
-                .unwrap_or((plan.blocks / 4).max(SLOTS_LEAST))
-                .clamp(1, most);
+            let brick_cells = u64::from(plan.per_block) * 8;
+            let least = u32::try_from(POOL_LEAST_CELLS.div_ceil(brick_cells)).unwrap_or(u32::MAX);
+            let capacity = slots.unwrap_or((plan.blocks / 4).max(least)).clamp(1, most);
             Some(Bricks::new(grid, &plan, capacity)?)
         } else {
             None
@@ -1037,7 +1037,7 @@ fn world_tools() -> Vec<Json> {
                     "slots",
                     property(
                         "integer",
-                        "for a sparse world, how many bricks it may hold; a quarter of them if left out",
+                        "for a sparse world, how many bricks it may hold; if left out, a quarter of them, but never fewer than hold 2097152 cells",
                     ),
                 ),
                 (

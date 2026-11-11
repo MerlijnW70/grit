@@ -1193,14 +1193,7 @@ fn a_sparse_world_through_the_tools_steps_as_the_dense_one_and_reports_its_pool(
         };
         let mut server = Server::new(Some(&host));
         let dense = created(&mut server, rule.name(), size, &params);
-        let (bricks, _) = bricked(host.width(), size);
-        let made = created_with(
-            &mut server,
-            rule.name(),
-            size,
-            &params,
-            &format!(",\"sparse\":true,\"slots\":{bricks}"),
-        );
+        let made = created_with(&mut server, rule.name(), size, &params, ",\"sparse\":true");
         let sparse = made.counted("world").unwrap();
         assert_eq!(made.get("sparse"), Some(&Json::Bool(true)));
         let (_, free, capacity, overflow, lost) = pool_of(&made);
@@ -1210,7 +1203,14 @@ fn a_sparse_world_through_the_tools_steps_as_the_dense_one_and_reports_its_pool(
             "{}",
             rule.name()
         );
-        assert!(capacity >= 8, "{}: {capacity} slots", rule.name());
+        let (bricks, sides) = bricked(host.width(), size);
+        assert_eq!(
+            capacity,
+            bricks,
+            "{}: a world of {} cells in bricks of {sides:?} is held whole by default",
+            rule.name(),
+            size.iter().product::<u32>()
+        );
         let mut state = 0x5BA_45E ^ u64::from(rule.params() as u32);
         let mut cells = Vec::new();
         for _ in 0..300 {
@@ -1336,6 +1336,13 @@ fn a_sparse_world_without_room_refuses_a_write_and_stops_with_its_pool_full() {
         &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[3,3,3]}}"),
     );
     assert_eq!(refusal(&read), "pool_full");
+    println!(
+        "width {}: bricks of {sides:?}; {} grains written into one brick at [{}, 2, {}], then the fall overflowed the pool of one slot",
+        host.width(),
+        grains.len(),
+        sides[0],
+        sides[2]
+    );
     let wrong = call(
         &mut server,
         "grit_world_create",
