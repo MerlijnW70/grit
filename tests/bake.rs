@@ -517,6 +517,40 @@ fn a_map_is_refused_by_name() {
     assert_eq!(map.default, nature::cell(nature::STEAM, 0));
 }
 
+#[test]
+fn a_material_map_can_name_every_kind_the_nature_rule_has_char_among_them() {
+    assert_eq!(bake::NATURE_KINDS.len() as u32, nature::KINDS);
+    let expected = [
+        ("AIR", nature::AIR),
+        ("ROCK", nature::ROCK),
+        ("EARTH", nature::EARTH),
+        ("SAND", nature::SAND),
+        ("SNOW", nature::SNOW),
+        ("ICE", nature::ICE),
+        ("WATER", nature::WATER),
+        ("WOOD", nature::WOOD),
+        ("LEAVES", nature::LEAVES),
+        ("FIRE", nature::FIRE),
+        ("ASH", nature::ASH),
+        ("SMOKE", nature::SMOKE),
+        ("STEAM", nature::STEAM),
+        ("CHAR", nature::CHAR),
+    ];
+    for (at, (name, kind)) in expected.into_iter().enumerate() {
+        assert_eq!(bake::NATURE_KINDS.get(at).copied(), Some(name));
+        let text = format!(r#"{{"default":"{}","heat":200}}"#, name.to_lowercase());
+        let map = nature_map(&text);
+        assert_eq!(map.default, nature::cell(kind, 200), "{name}");
+        assert_eq!(nature::kind_of(map.default), kind, "{name}");
+    }
+    let burnt = nature_map(r#"{"default":"ROCK","materials":{"trunk":"Char"}}"#);
+    assert_eq!(burnt.word(Some("trunk")), nature::cell(nature::CHAR, 0));
+    assert!(matches!(
+        Map::read(br#"{"default":"CHARCOAL"}"#),
+        Err(Error::UnknownWord { word, .. }) if word == "CHARCOAL"
+    ));
+}
+
 fn l_shape() -> Asset {
     let size = [3, 2, 2];
     let mut cells = vec![None; 12];

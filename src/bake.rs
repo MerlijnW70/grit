@@ -220,9 +220,9 @@ pub struct Options {
 }
 
 /// The names of the nature rule's kinds, in the order of their values.
-pub const NATURE_KINDS: [&str; 13] = [
+pub const NATURE_KINDS: [&str; 14] = [
     "AIR", "ROCK", "EARTH", "SAND", "SNOW", "ICE", "WATER", "WOOD", "LEAVES", "FIRE", "ASH",
-    "SMOKE", "STEAM",
+    "SMOKE", "STEAM", "CHAR",
 ];
 
 /// A material map: the word each glTF material name bakes to, and the
