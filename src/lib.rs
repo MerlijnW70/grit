@@ -1,3 +1,4 @@
+pub mod bake;
 pub mod board;
 pub mod compact;
 pub mod gate;
