@@ -28,6 +28,7 @@ use crate::ops::{Cpu, Device, Ops};
 pub use crate::ops::Word;
 
 pub mod code;
+pub mod embed;
 pub mod heat;
 pub mod nature;
 pub mod sand;

@@ -137,6 +137,7 @@ impl Kinds {
             "heat" => Self::new(0xF, 0),
             "code" => Self::new(0xF, 24),
             "nature" => Self::new(0xF, 0),
+            "embed" => Self::new(0xF, 4),
             _ => None,
         }
     }
