@@ -551,6 +551,16 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                 ]) {
                     all.add(format!("render3::{name}/{at}"), built);
                 }
+                all.add(
+                    format!("render3::window/{at}/window-1920x1080"),
+                    render3::present::window(
+                        &build,
+                        render3::Screen {
+                            wide: 1920,
+                            high: 1080,
+                        },
+                    ),
+                );
             }
         }
     }
