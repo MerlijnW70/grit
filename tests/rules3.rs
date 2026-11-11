@@ -675,7 +675,12 @@ const PATIENCE_FRAMES: u32 = 2048;
 /// Runs until the list is empty, checking every frame, and returns the frame
 /// it emptied in.
 fn fall_quiet<R: Rule>(engine: &mut Engine<'_, '_, R>) -> u32 {
-    let until = engine.frame + PATIENCE_FRAMES;
+    fall_quiet_within(engine, PATIENCE_FRAMES)
+}
+
+/// As [`fall_quiet`], with the list empty within `patience` frames.
+fn fall_quiet_within<R: Rule>(engine: &mut Engine<'_, '_, R>, patience: u32) -> u32 {
+    let until = engine.frame + patience;
     while engine.frame < until {
         if engine.frame() == 0 {
             let quiet = engine.frame;
@@ -686,7 +691,7 @@ fn fall_quiet<R: Rule>(engine: &mut Engine<'_, '_, R>) -> u32 {
         }
     }
     panic!(
-        "{}: the list never emptied in {PATIENCE_FRAMES} frames",
+        "{}: the list never emptied in {patience} frames",
         engine.label
     );
 }
@@ -958,6 +963,34 @@ fn a_heat_world_at_one_temperature_without_fire_drains_the_list() {
                 assert_eq!(engine.live.read(GRAND as usize, 1).unwrap(), [0]);
                 println!("{} quiet at frame {quiet}", engine.label);
             }
+        }
+    }
+}
+
+const REST_FRAMES: u32 = 256;
+
+/// A world of heat air at 260 with one cell at 261, 300 or 9000, on a torus:
+/// the list drains to empty within [`REST_FRAMES`] frames and every word is
+/// the CPU's.
+#[test]
+fn a_heat_world_of_air_with_one_odd_cell_drains_the_list() {
+    let subject = heated();
+    let Some(host) = device("heat odd cell") else {
+        return;
+    };
+    let shape = (16, 16, 16);
+    for coarse in TIERS {
+        let Some(mut engine) = Engine::new(&host, &subject, shape, coarse) else {
+            continue;
+        };
+        for odd in [261, 300, 9000] {
+            let mut start = vec![heat::cell(heat::AIR, 260); engine.reference.cells()];
+            start[engine.reference.index(5, 6, 7)] = heat::cell(heat::AIR, odd);
+            let name = format!("heat odd cell {odd}");
+            engine.restart(&start, label(&name, shape, coarse, 0));
+            let quiet = fall_quiet_within(&mut engine, REST_FRAMES);
+            assert_eq!(engine.live.read(GRAND as usize, 1).unwrap(), [0]);
+            println!("{} quiet at frame {quiet}", engine.label);
         }
     }
 }

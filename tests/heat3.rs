@@ -479,3 +479,42 @@ fn the_step_reads_its_parameters_and_its_noise() {
     assert!(lit(&[600, nibble + 1, 0], 9));
     assert!(!lit(&[600, nibble, 0], 9));
 }
+
+const REST_FRAMES: u32 = 256;
+const REST_SPARE: u32 = 8;
+
+fn last_change(grid: Grid3, start: &[u32], frames: u32) -> Option<(u32, usize)> {
+    let mut cells = start.to_vec();
+    let mut last = None;
+    for frame in 0..frames {
+        let next = reference(&Heat, grid, frame, &cells, &TUNED);
+        if let Some(at) = (0..cells.len()).find(|&at| next[at] != cells[at]) {
+            last = Some((frame, at));
+        }
+        cells = next;
+    }
+    last
+}
+
+#[test]
+fn a_heat_world_of_air_with_one_odd_cell_comes_to_rest() {
+    let grid = Grid3::new(16, 16, 16).unwrap();
+    let mut failures = Vec::new();
+    for odd in [261, 300, 9000] {
+        let mut cells = vec![cell(AIR, 260); grid.cells()];
+        cells[grid.index(5, 6, 7)] = cell(AIR, odd);
+        let total = heat_of(&cells, |_| true);
+        let last = last_change(grid, &cells, REST_FRAMES);
+        println!("odd cell {odd}: last change {last:?}");
+        if let Some((frame, at)) = last
+            && frame + REST_SPARE >= REST_FRAMES
+        {
+            failures.push(format!(
+                "odd cell {odd}: cell {at} still changes at frame {frame} of {REST_FRAMES}"
+            ));
+        }
+        let settled = run(grid, &cells, 0, REST_FRAMES);
+        assert_eq!(heat_of(&settled, |_| true), total, "odd cell {odd}");
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
