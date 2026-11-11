@@ -6,6 +6,8 @@ use simdr::lanes::{LaneError, U32};
 use simdr::module::{Id, op};
 use simdr::spec::{Glsl, LoopControl, SelectionControl};
 
+use crate::layout::Windows;
+
 const LOGICAL_NOT: u16 = 168;
 
 /// A branch [`Em::open`] opened: the block before it and the block it
@@ -23,6 +25,7 @@ pub struct Em<'held> {
     pub float: Id,
     pub truth: Id,
     glsl: Id,
+    state: Windows,
 }
 
 impl<'held> Em<'held> {
@@ -37,7 +40,20 @@ impl<'held> Em<'held> {
             float,
             truth,
             glsl,
+            state: Windows::of(0),
         })
+    }
+
+    /// [`Em::new`] for a kernel that reads `STATE` laid out as `state`.
+    pub fn reading(kernel: &'held mut Kernel<U32>, state: Windows) -> Result<Self, LaneError> {
+        let mut em = Self::new(kernel)?;
+        em.state = state;
+        Ok(em)
+    }
+
+    /// Word `at` of `STATE`, from the window that holds it.
+    pub fn cell(&mut self, at: Id) -> Result<Id, LaneError> {
+        crate::live::state_load(self.kernel, self.state, at)
     }
 
     pub fn u(&mut self, value: u32) -> Result<Id, LaneError> {

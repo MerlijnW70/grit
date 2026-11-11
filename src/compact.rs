@@ -86,6 +86,7 @@ pub struct Plan {
     pub grid: usize,
     pub quads: usize,
     pub dimension: Dimension,
+    window: u32,
 }
 
 impl Plan {
@@ -121,7 +122,19 @@ impl Plan {
             quads: per_block as usize * blocks as usize,
             grid: per_block as usize * blocks as usize * dimension.corners(),
             dimension,
+            window: crate::layout::WINDOW_BITS,
         })
+    }
+
+    /// This plan with `STATE` split into windows of `2^bits` words once it
+    /// holds `2^(bits + 1)` words or more, in place of
+    /// [`crate::layout::WINDOW_BITS`]. Only tests build it, to split a small
+    /// world.
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub const fn split_at(mut self, bits: u32) -> Self {
+        self.window = bits;
+        self
     }
 
     /// The words of `STATE`: the grid, and for a flat world the spare its
@@ -132,6 +145,19 @@ impl Plan {
             Dimension::Two => self.grid + self.quads * self.dimension.corners(),
             Dimension::Three => self.grid,
         }
+    }
+
+    /// How `STATE` lies over bindings.
+    #[must_use]
+    pub const fn windows(&self) -> crate::layout::Windows {
+        crate::layout::Windows::at(self.state_words(), self.window)
+    }
+
+    /// [`Plan::sizes`] laid over the bindings a resident holds: `STATE` as
+    /// its first window and the other windows after the engine's bindings.
+    #[must_use]
+    pub fn bound(&self) -> Vec<usize> {
+        self.windows().laid(&self.sizes())
     }
 
     #[must_use]

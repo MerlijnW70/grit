@@ -52,7 +52,7 @@ pub mod volume;
 use simdr::lanes::LaneError;
 
 use crate::Groups;
-use crate::layout::{BINDINGS, PIXELS};
+use crate::layout::{BINDINGS, PIXELS, Windows};
 use crate::sand::Grid;
 use crate::view3::{Kinds, PALETTE};
 
@@ -1323,6 +1323,9 @@ pub struct Build {
     pub screen: Screen,
     pub subgroup: u32,
     pub suns: u32,
+    /// How `STATE` lies over bindings: [`Windows::of`] the grid's cells,
+    /// or the windows of the plan the engine runs.
+    pub windows: Windows,
 }
 
 /// Which of the optional stages a frame runs: the full rebuild of every

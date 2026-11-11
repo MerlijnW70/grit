@@ -11,7 +11,7 @@ use super::{
     BRICK_BITS, Build, GAS_WORDS, GASSY, MATERIAL_WORDS, Table, WATER_WORDS, material, of, put,
     refuse, scene, word,
 };
-use crate::layout::{BINDINGS, DENSE, GRAND, PARAMS, PIXELS, STATE};
+use crate::layout::{DENSE, GRAND, PARAMS, PIXELS};
 use crate::sand::Grid;
 use crate::view3::Kinds;
 
@@ -47,8 +47,12 @@ pub fn occupancy(grid: Grid, kinds: Kinds, shown: u32, gases: u32, cells: &[u32]
     out
 }
 
-fn kernel(subgroup: u32) -> Result<Kernel<U32>, LaneError> {
-    Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))
+fn kernel(build: &Build) -> Result<Kernel<U32>, LaneError> {
+    Kernel::<U32>::new(Shape::new(
+        build.subgroup,
+        build.subgroup,
+        build.windows.bindings(),
+    ))
 }
 
 /// The kinds a rebuild reads from the scene: those a brick counts as full
@@ -123,7 +127,7 @@ fn rebuilt(
         let height = em.and_u(height, SIDE - 1)?;
         let height = em.add(corner[1], height)?;
         let row = em.add(corner[2], z_in)?;
-        let held = em.load(STATE, cell)?;
+        let held = em.cell(cell)?;
         let kind = em.shr(held, kinds.shift())?;
         let kind = em.and_u(kind, kinds.mask())?;
         let shown = em.bit(masks.shown, kind)?;
@@ -286,7 +290,7 @@ fn open_beside(
     let lower_step = em.u(grid.wide)?;
     let lower = em.add(cell, lower_step)?;
     let lower = em.pick(floored, cell, lower)?;
-    let under = em.load(STATE, lower)?;
+    let under = em.cell(lower)?;
     let under = em.shr(under, kinds.shift())?;
     let under = em.and_u(under, kinds.mask())?;
     let held_up = em.bit(shown, under)?;
@@ -312,7 +316,7 @@ fn open_beside(
                 em.add(cell, stride)?
             };
             let at = em.pick(inside, at, cell)?;
-            let held = em.load(STATE, at)?;
+            let held = em.cell(at)?;
             let kind = em.shr(held, kinds.shift())?;
             let kind = em.and_u(kind, kinds.mask())?;
             let seen = em.bit(shown, kind)?;
@@ -320,7 +324,7 @@ fn open_beside(
             let empty = em.both(empty, inside)?;
             let beneath = em.add(at, lower_step)?;
             let beneath = em.pick(floored, at, beneath)?;
-            let below = em.load(STATE, beneath)?;
+            let below = em.cell(beneath)?;
             let below = em.shr(below, kinds.shift())?;
             let below = em.and_u(below, kinds.mask())?;
             let below = em.bit(shown, below)?;
@@ -338,8 +342,8 @@ pub fn filled(build: &Build) -> Result<Vec<u32>, LaneError> {
     refuse("render3::filled", build.grid, build.screen)?;
     let layout = build.layout();
     let grid = build.grid;
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let brick = em.invocation(build.subgroup)?;
     let count = em.u(layout.bricks)?;
     let inside = em.lt(brick, count)?;
@@ -365,8 +369,8 @@ pub fn occupied(build: &Build) -> Result<Vec<u32>, LaneError> {
     refuse("render3::occupied", build.grid, build.screen)?;
     let layout = build.layout();
     let grid = build.grid;
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let slot = em.invocation(build.subgroup)?;
     let grand = em.load_u(GRAND, 0)?;
     let dump = em.load_u(PARAMS, 1)?;

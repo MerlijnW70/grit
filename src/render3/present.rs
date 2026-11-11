@@ -193,8 +193,8 @@ pub fn window(build: &Build, window: Screen) -> Result<Vec<u32>, LaneError> {
     let layout = build.layout();
     let held = Windowed::of(&layout, window);
     let from = build.screen;
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, window)?;
     let none = em.u(0)?;
     let x = em.pick(shown, x, none)?;

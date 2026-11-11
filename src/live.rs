@@ -160,6 +160,12 @@ pub fn arranged(
     use crate::sweep::COUNTS;
 
     sand::flat("live::arranged", grid)?;
+    if plan.windows().is_split() {
+        return Err(LaneError::NoSuchForm {
+            operation: "live::arranged",
+            because: SPLIT_FLAT,
+        });
+    }
 
     let (listed, hot) = if coarse {
         (Over::Listed(HOT_DENSE), crate::compact::Plan::hot_listed())
@@ -284,6 +290,11 @@ pub fn arranged(
     Ok((passes, groups))
 }
 
+/// Why a flat frame refuses a plan whose `STATE` is split: its brush and
+/// its picture read `STATE` as one binding.
+pub const SPLIT_FLAT: &str =
+    "the plan splits STATE over bindings, and a flat frame's brush and picture read one";
+
 /// Why a 3D builder refuses a plan laid out for a flat grid.
 pub const FLAT_PLAN: &str =
     "the plan is laid out for a flat grid, and a solid grid has eight cells to a block";
@@ -399,7 +410,7 @@ pub fn arranged3_by<R: Rule>(
             (unclaimed(subgroup, plan)?, one),
         ],
         vec![(
-            settle3_by(rule, subgroup, grid)?,
+            settle3_in(rule, subgroup, grid, plan.windows())?,
             crate::compact::Plan::listed(),
         )],
     ];
@@ -488,8 +499,9 @@ pub fn put3(
         .into_iter()
         .collect();
     let mut woken = std::collections::BTreeSet::new();
+    let windows = plan.windows();
     for &(cell, word) in cells {
-        held.write_at(STATE as usize, cell as usize, &[word])?;
+        write_state(held, windows, cell as usize, &[word])?;
         for phase in 0..2 {
             woken.insert(Solid::held(grid, cell, phase).index);
         }
@@ -506,6 +518,59 @@ pub fn put3(
     held.write(DENSE as usize, &list)?;
     held.write(GRAND as usize, &[count])?;
     held.write(INDIRECT as usize, &[count.div_ceil(plan.subgroup), 1, 1])
+}
+
+/// Writes `words` into `STATE` laid out as `windows`, from word `at`: each
+/// run within one window is one write of that window's binding.
+pub fn write_state(
+    held: &mut crate::Resident<'_>,
+    windows: crate::layout::Windows,
+    at: usize,
+    words: &[u32],
+) -> Result<(), crate::Error> {
+    if !windows.is_split() {
+        return held.write_at(STATE as usize, at, words);
+    }
+    let mut done = 0_usize;
+    while done < words.len() {
+        let index = at + done;
+        let (binding, offset) = windows.place(index);
+        let room = windows.span() - offset;
+        let run = room.min(words.len() - done);
+        let part = words.get(done..done + run).unwrap_or_default();
+        held.write_at(binding as usize, offset, part)?;
+        done += run;
+    }
+    Ok(())
+}
+
+/// The first `count` words of `STATE` laid out as `windows`, read window by
+/// window.
+pub fn read_state(
+    held: &mut crate::Resident<'_>,
+    windows: crate::layout::Windows,
+    count: usize,
+) -> Result<Vec<u32>, crate::Error> {
+    if !windows.is_split() {
+        return held.read(STATE as usize, count);
+    }
+    let mut out = Vec::with_capacity(count);
+    for window in 0..windows.count() {
+        if out.len() >= count {
+            break;
+        }
+        let wanted = windows.held(window).min(count - out.len());
+        let binding = crate::layout::Windows::binding(window);
+        out.extend(held.read(binding as usize, wanted)?);
+    }
+    if out.len() < count {
+        return Err(crate::Error::Overrun {
+            index: STATE as usize,
+            needed: count,
+            held: windows.words(),
+        });
+    }
+    Ok(out)
 }
 
 pub struct Both {
@@ -986,18 +1051,53 @@ pub fn settle3(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
 /// go to the [`Dimension::Three`] tally. Only the lanes inside the list
 /// store, so `STATE` holds the grid and nothing past it.
 pub fn settle3_by<R: Rule>(rule: &R, subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
+    settle3_in(
+        rule,
+        subgroup,
+        grid,
+        crate::layout::Windows::of(grid.cells()),
+    )
+}
+
+/// [`settle3_by`] on a `STATE` laid out as `windows`.
+pub fn settle3_in<R: Rule>(
+    rule: &R,
+    subgroup: u32,
+    grid: Grid,
+    windows: crate::layout::Windows,
+) -> Result<Vec<u32>, LaneError> {
     solid("live::settle3", grid)?;
     match subgroup {
-        4 => listed3::<4, R>(rule, subgroup, grid),
-        8 => listed3::<8, R>(rule, subgroup, grid),
-        16 => listed3::<16, R>(rule, subgroup, grid),
-        32 => listed3::<32, R>(rule, subgroup, grid),
-        64 => listed3::<64, R>(rule, subgroup, grid),
+        4 => listed3::<4, R>(rule, subgroup, grid, windows),
+        8 => listed3::<8, R>(rule, subgroup, grid, windows),
+        16 => listed3::<16, R>(rule, subgroup, grid, windows),
+        32 => listed3::<32, R>(rule, subgroup, grid, windows),
+        64 => listed3::<64, R>(rule, subgroup, grid, windows),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
         }),
     }
+}
+
+/// The window word `at` of `STATE` lies in, and where in it.
+fn window_of(
+    kernel: &mut Kernel<U32>,
+    windows: crate::layout::Windows,
+    at: simdr::module::Id,
+) -> Result<(simdr::module::Id, simdr::module::Id), LaneError> {
+    use simdr::module::op;
+
+    let uint = kernel.index_type();
+    let by = kernel.module().constant_u32(windows.bits())?;
+    let mask = kernel
+        .module()
+        .constant_u32(u32::try_from(windows.span() - 1).unwrap_or(u32::MAX))?;
+    let window = kernel
+        .module()
+        .binary(op::SHIFT_RIGHT_LOGICAL, uint, at, by)?;
+    let offset = kernel.module().binary(op::BITWISE_AND, uint, at, mask)?;
+    Ok((window, offset))
 }
 
 /// Runs `body` in the lanes where `when`, a bool, holds, and in no other.
@@ -1024,14 +1124,91 @@ where
     Ok(())
 }
 
+/// Whether `window` is `which`, as a bool.
+fn in_window(
+    kernel: &mut Kernel<U32>,
+    window: simdr::module::Id,
+    which: u32,
+) -> Result<simdr::module::Id, LaneError> {
+    use simdr::module::op;
+
+    let truth = kernel.module().type_bool()?;
+    let named = kernel.module().constant_u32(which)?;
+    Ok(kernel.module().binary(op::I_EQUAL, truth, window, named)?)
+}
+
+/// Word `at` of `STATE` laid out as `windows`: one load of `STATE` when it is
+/// one binding, and otherwise one load of the window that holds it.
+pub fn state_load(
+    kernel: &mut Kernel<U32>,
+    windows: crate::layout::Windows,
+    at: simdr::module::Id,
+) -> Result<simdr::module::Id, LaneError> {
+    use simdr::spec::SelectionControl;
+
+    if !windows.is_split() {
+        return kernel.load_at(STATE, at);
+    }
+    let uint = kernel.index_type();
+    let (window, offset) = window_of(kernel, windows, at)?;
+    let mut held = kernel.module().constant_u32(0)?;
+    for which in 0..windows.count() {
+        let here = in_window(kernel, window, which)?;
+        let before = kernel
+            .module()
+            .current_block()
+            .ok_or(LaneError::NoOpenBlock { arm: "before" })?;
+        let taken = kernel.module().alloc_id()?;
+        let merge = kernel.module().alloc_id()?;
+        kernel
+            .module()
+            .selection_merge(merge, SelectionControl::None)?;
+        kernel.module().branch_conditional(here, taken, merge)?;
+        kernel.module().label_at(taken)?;
+        let loaded = kernel.load_at(crate::layout::Windows::binding(which), offset)?;
+        let finished = kernel
+            .module()
+            .current_block()
+            .ok_or(LaneError::NoOpenBlock { arm: "then" })?;
+        kernel.module().branch(merge)?;
+        kernel.module().label_at(merge)?;
+        held = kernel
+            .module()
+            .phi(uint, &[(loaded, finished), (held, before)])?;
+    }
+    Ok(held)
+}
+
+/// Stores `value` at word `at` of `STATE` laid out as `windows`, in the one
+/// window that holds it.
+pub fn state_store(
+    kernel: &mut Kernel<U32>,
+    windows: crate::layout::Windows,
+    at: simdr::module::Id,
+    value: simdr::module::Id,
+) -> Result<(), LaneError> {
+    if !windows.is_split() {
+        return kernel.store_at(STATE, at, value);
+    }
+    let (window, offset) = window_of(kernel, windows, at)?;
+    for which in 0..windows.count() {
+        let here = in_window(kernel, window, which)?;
+        lane_if(kernel, here, |kernel| {
+            kernel.store_at(crate::layout::Windows::binding(which), offset, value)
+        })?;
+    }
+    Ok(())
+}
+
 fn listed3<const LANES: u32, R: Rule>(
     rule: &R,
     subgroup: u32,
     grid: Grid,
+    windows: crate::layout::Windows,
 ) -> Result<Vec<u32>, LaneError> {
     use crate::sand3::{CORNERS, Given, frame_and_params, placed, ruled};
 
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, windows.bindings()))?;
     let uint = kernel.index_type();
 
     let group = kernel.workgroup_index();
@@ -1071,7 +1248,7 @@ fn listed3<const LANES: u32, R: Rule>(
 
     let mut loaded = [frame; CORNERS];
     for (word, place) in loaded.iter_mut().zip(&placing.places) {
-        *word = kernel.load_at(STATE, place.id())?;
+        *word = state_load(&mut kernel, windows, place.id())?;
     }
 
     let (settled, counted, touched) = {
@@ -1106,7 +1283,7 @@ fn listed3<const LANES: u32, R: Rule>(
     };
     lane_if(&mut kernel, listed, |kernel| {
         for (place, value) in placing.places.iter().zip(&settled) {
-            kernel.store_at(STATE, place.id(), value.id())?;
+            state_store(kernel, windows, place.id(), value.id())?;
         }
         Ok(())
     })?;

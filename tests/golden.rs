@@ -317,6 +317,19 @@ fn catalog(width: u32) -> Vec<(String, String)> {
         "compact::whole/hot-counts",
         compact::whole(w, HOT_COUNTS, HOT_BASES, Tier::COARSE),
     );
+    for (wide, deep, tall) in [(1024, 1024, 1024), (2048, 1024, 1024)] {
+        let grid = Grid::solid(wide, deep, tall).unwrap();
+        let at = format!("@{wide}x{deep}x{tall}");
+        let windows = grit::layout::Windows::of(grid.cells());
+        all.add(
+            format!("live::settle3_in/split-{}{at}", windows.count()),
+            live::settle3_in(&grit::rule3::sand::Sand, w, grid, windows),
+        );
+        all.add(
+            format!("live::settle3_in/nature/split-{}{at}", windows.count()),
+            live::settle3_in(&Nature, w, grid, windows),
+        );
+    }
 
     for (wide, deep) in GRIDS {
         let grid = Grid::of(wide, deep);
@@ -531,6 +544,7 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                     },
                     subgroup: w,
                     suns: 2,
+                    windows: grit::layout::Windows::of(grid.cells()),
                 };
                 let at = format!("{rule}@{wide}x{deep}x{tall}/screen-{screen_wide}x{screen_high}");
                 all.add(format!("render3::occupied/{at}"), render3::occupied(&build));

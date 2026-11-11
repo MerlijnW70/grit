@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use grit::compact::Plan;
 use grit::geometry::Solid;
-use grit::layout::{DENSE, Dimension, GRAND, PARAMS, PIXELS, STATE, TALLY};
+use grit::layout::{DENSE, Dimension, GRAND, PARAMS, PIXELS, STATE, TALLY, Windows};
 use grit::render3::present::Windowed;
 use grit::render3::{
     self, Build, Camera, Frame, HIT_WORDS, INSIDE, Light, MISS, Screen, Steps, framed_words, stage,
@@ -163,18 +163,20 @@ impl<'h> Session<'h> {
             return Err(render3::UNFIT.into());
         }
         let kinds = Kinds::named(example.rule).ok_or("no kinds for the rule")?;
+        let plan = Plan::over_in(
+            width,
+            grid.blocks().div_ceil(sweep::cells(width)),
+            Dimension::Three,
+        )?;
+        let windows = plan.windows();
         let build = Build {
             grid,
             kinds,
             screen: setup.screen,
             subgroup: width,
             suns: setup.suns,
+            windows,
         };
-        let plan = Plan::over_in(
-            width,
-            grid.blocks().div_ceil(sweep::cells(width)),
-            Dimension::Three,
-        )?;
         let engine = live::wired3_by(rule, width, grid, &plan)?;
         let listed = Plan::listed();
         let watcher = engine
@@ -194,18 +196,30 @@ impl<'h> Session<'h> {
         let (passes, stages) =
             render3::watching(engine, all).ok_or("the engine has no listed step")?;
         let layout = build.layout();
-        let mut sizes = layout.sized(live::sizes3(rule, &plan));
-        if let (Some(held), Some(slot)) = (windowed, sizes.get_mut(PIXELS as usize)) {
+        let mut sized = layout.sized(live::sizes3(rule, &plan));
+        if let (Some(held), Some(slot)) = (windowed, sized.get_mut(PIXELS as usize)) {
             *slot = (*slot).max(held.words());
         }
+        let sizes = windows.laid(&sized);
+        host.limits().admits_on(&sizes, None, host.heap())?;
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
         let bytes = sizes.iter().sum::<usize>() * 4;
         let mut held = host.resident(&sizes, &modules)?;
-        for (binding, words) in sizes.iter().enumerate() {
-            held.write(binding, &vec![0_u32; *words])?;
-        }
         let world = (example.scene)(grid);
-        held.write(STATE as usize, &world)?;
+        let zeros = vec![0_u32; ZEROS.min(sizes.iter().copied().max().unwrap_or(0))];
+        for (binding, &words) in sizes.iter().enumerate() {
+            let state = binding == STATE as usize || binding >= grit::layout::BINDINGS as usize;
+            if state && world.len() == windows.words() {
+                continue;
+            }
+            let mut at = 0;
+            while at < words {
+                let run = zeros.len().min(words - at);
+                held.write_at(binding, at, zeros.get(..run).unwrap_or(&[]))?;
+                at += run;
+            }
+        }
+        live::write_state(&mut held, windows, 0, &world)?;
         let top = glass_top(grid, kinds, example.table.visible(), &world);
         let life = example.life.map(|made| made(grid, &world));
         let feed = example
@@ -467,7 +481,7 @@ impl<'h> Session<'h> {
             return Ok(());
         };
         self.ahead = None;
-        self.held.write(STATE as usize, start)?;
+        live::write_state(&mut self.held, self.build.windows, 0, start)?;
         live::seed(&mut self.held, self.build.grid, &self.plan)?;
         let warm = self.example.warm;
         self.held
@@ -563,9 +577,10 @@ impl<'h> Session<'h> {
             .copied()
             .unwrap_or(0);
         self.longest = self.longest.max(grand);
+        let windows = self.build.windows;
         let mut writes: Vec<(usize, usize, Vec<u32>)> = runs(sorted.iter().copied())
             .into_iter()
-            .map(|(start, words)| (STATE as usize, start as usize, words))
+            .flat_map(|(start, words)| placed(windows, start as usize, words))
             .collect();
         let woken: BTreeSet<u32> = sorted
             .iter()
@@ -698,7 +713,11 @@ impl<'h> Session<'h> {
 
     #[allow(dead_code)]
     pub fn state(&mut self) -> Result<Vec<u32>, Failed> {
-        Ok(self.held.read(STATE as usize, self.build.grid.cells())?)
+        Ok(live::read_state(
+            &mut self.held,
+            self.build.windows,
+            self.build.grid.cells(),
+        )?)
     }
 
     /// The stage times of the last frame, by stage, with the engine's summed
@@ -815,4 +834,25 @@ pub fn stroked(grid: Grid, (cell, face): (u32, u32), tool: Tool) -> Vec<(u32, u3
     cells.sort_unstable();
     cells.dedup();
     cells
+}
+
+/// The words to zero at once when a session starts.
+const ZEROS: usize = 1 << 24;
+
+/// A run of `words` from cell `start` of `STATE` laid out as `windows`, as
+/// writes of each window it crosses.
+fn placed(windows: Windows, start: usize, words: Vec<u32>) -> Vec<(usize, usize, Vec<u32>)> {
+    let mut out = Vec::new();
+    let mut done = 0;
+    while done < words.len() {
+        let (binding, offset) = windows.place(start + done);
+        let run = (windows.span() - offset).min(words.len() - done);
+        out.push((
+            binding as usize,
+            offset,
+            words.get(done..done + run).unwrap_or(&[]).to_vec(),
+        ));
+        done += run;
+    }
+    out
 }

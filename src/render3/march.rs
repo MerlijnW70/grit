@@ -18,7 +18,7 @@ use simdr::module::Id;
 
 use super::emit::Em;
 use super::{BRICK_BITS, INSIDE, MISS, UNIT, UNIT_BITS, of, put};
-use crate::layout::{PIXELS, STATE};
+use crate::layout::PIXELS;
 use crate::sand::Grid;
 use crate::view3::Kinds;
 
@@ -817,7 +817,7 @@ impl Reader {
         let held = em.load(PIXELS, slot)?;
         let full = em.ne_u(held, 0)?;
         let none = em.u(0)?;
-        let word = em.when(full, &[none], |em| Ok(vec![em.load(STATE, cell)?]))?;
+        let word = em.when(full, &[none], |em| Ok(vec![em.cell(cell)?]))?;
         let word = word.first().copied().unwrap_or(none);
         let kind = em.shr(word, self.kinds.shift())?;
         let kind = em.and_u(kind, self.kinds.mask())?;

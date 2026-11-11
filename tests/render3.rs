@@ -335,12 +335,13 @@ fn a_grid_or_screen_the_renderer_cannot_draw_is_refused() {
         screen: Screen { wide, high },
         subgroup: 32,
         suns: 2,
+        windows: grit::layout::Windows::of(grid.cells()),
     };
     let solid = Grid::solid(16, 16, 16).unwrap();
     for refused in [
         build(Grid::of(16, 16), 8, 8),
         build(Grid::solid(16, 2, 16).unwrap(), 8, 8),
-        build(Grid::solid(1024, 16, 16).unwrap(), 8, 8),
+        build(Grid::solid(2048, 16, 16).unwrap(), 8, 8),
         build(solid, 0, 8),
         build(solid, 8, 4097),
     ] {
@@ -411,6 +412,7 @@ fn the_brick_watcher_runs_right_after_the_listed_step() {
             screen: Screen { wide: 8, high: 4 },
             subgroup: width,
             suns: 1,
+            windows: grit::layout::Windows::of(grid.cells()),
         };
         let added = build.passes().unwrap();
         let (watched, groups) = render3::watching(engine, added.clone()).unwrap();
@@ -561,6 +563,7 @@ fn the_device_march_finds_the_cpu_hits_bit_for_bit_for_random_cameras_and_worlds
                     screen,
                     subgroup: width,
                     suns: 1,
+                    windows: grit::layout::Windows::of(grid.cells()),
                 };
                 let layout = build.layout();
                 let mut still = Still::new(&host, build, &cells);
@@ -679,6 +682,7 @@ fn the_shaded_picture_is_within_two_of_the_cpu_on_every_channel() {
                 screen,
                 subgroup: width,
                 suns,
+                windows: grit::layout::Windows::of(grid.cells()),
             };
             let layout = build.layout();
             let mut still = Still::new(&host, build, &cells);
@@ -783,6 +787,7 @@ fn the_light_of_glowing_cells_and_the_gas_are_kept_a_brick_at_a_time_as_on_the_c
             screen,
             subgroup: width,
             suns,
+            windows: grit::layout::Windows::of(grid.cells()),
         };
         let layout = build.layout();
         let mut still = Still::new(&host, build, &cells);
@@ -936,6 +941,7 @@ fn drops_seen(named: Option<u32>) -> (Vec<u32>, Vec<u32>) {
         screen,
         subgroup: host.width(),
         suns: 2,
+        windows: grit::layout::Windows::of(grid.cells()),
     };
     let layout = build.layout();
     let mut still = Still::new(&host, build, &cells);
@@ -1150,6 +1156,7 @@ fn running<R: Rule>(host: &Host, rule: &R, ran: &Ran) -> Vec<String> {
         screen,
         subgroup: width,
         suns: 1,
+        windows: grit::layout::Windows::of(grid.cells()),
     };
     let layout = build.layout();
     let engine = live::wired3_by(rule, width, grid, &plan).unwrap();
@@ -1330,6 +1337,7 @@ fn a_quiet_world_rebuilds_no_brick() {
         screen: Screen { wide: 4, high: 4 },
         subgroup: width,
         suns: 1,
+        windows: grit::layout::Windows::of(grid.cells()),
     };
     let layout = build.layout();
     let engine = live::wired3_by(&Code, width, grid, &plan).unwrap();
@@ -1516,6 +1524,7 @@ fn the_device_bounce_finds_the_cpu_cells_bit_for_bit_for_random_cameras_over_wat
                     screen,
                     subgroup: width,
                     suns: 2,
+                    windows: grit::layout::Windows::of(grid.cells()),
                 };
                 let layout = build.layout();
                 let mut still = Still::new(&host, build, &cells);
@@ -1622,6 +1631,7 @@ fn a_liquid_top_sends_its_rays_from_the_point_met_and_mirrors_its_fall() {
         screen,
         subgroup: 4,
         suns: 2,
+        windows: grit::layout::Windows::of(grid.cells()),
     };
     let layout = build.layout();
     let light = Light::evening(1, 1.0);
@@ -1708,6 +1718,7 @@ fn the_window_pass_stretches_the_picture_and_lays_the_overlay_as_the_cpu_does() 
             screen,
             subgroup: width,
             suns: 1,
+            windows: grit::layout::Windows::of(grid.cells()),
         };
         let layout = build.layout();
         let place = Windowed::of(&layout, target);

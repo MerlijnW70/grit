@@ -527,8 +527,8 @@ fn pixel_pass(
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, screen)?;
     let none = em.u(0)?;
     let x = em.pick(shown, x, none)?;
@@ -567,8 +567,8 @@ pub fn resolve(build: &Build) -> Result<Vec<u32>, LaneError> {
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let none = em.u(0)?;
     let x = em.pick(shown, x, none)?;

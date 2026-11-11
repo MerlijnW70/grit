@@ -19,7 +19,7 @@ use super::{
     HIT_WORDS, Layout, MATERIAL_WORDS, MISS, Rays, SPARE_WORDS, Screen, UNIT, brick_sides, flags,
     light, material, of, put, refuse, scene, word,
 };
-use crate::layout::{BINDINGS, PARAMS, PIXELS, STATE};
+use crate::layout::{PARAMS, PIXELS};
 use crate::sand::Grid;
 use crate::view3::Kinds;
 
@@ -2706,7 +2706,7 @@ impl Shader for Emitted<'_, '_> {
         self.em.float_bits(a)
     }
     fn cell(&mut self, at: Id) -> Result<Id, LaneError> {
-        self.em.load(STATE, at)
+        self.em.cell(at)
     }
     fn fixed(&mut self, at: u32) -> Result<Id, LaneError> {
         self.em.load_u(PIXELS, at)
@@ -2738,8 +2738,12 @@ impl Shader for Emitted<'_, '_> {
     }
 }
 
-pub(crate) fn kernel(subgroup: u32) -> Result<simdr::kernel::Kernel<simdr::lanes::U32>, LaneError> {
-    Kernel::new(Shape::new(subgroup, subgroup, BINDINGS))
+pub(crate) fn kernel(build: &Build) -> Result<simdr::kernel::Kernel<simdr::lanes::U32>, LaneError> {
+    Kernel::new(Shape::new(
+        build.subgroup,
+        build.subgroup,
+        build.windows.bindings(),
+    ))
 }
 
 pub(crate) fn look_of(build: &Build) -> Look {
@@ -2808,8 +2812,8 @@ pub fn primary(build: &Build) -> Result<Vec<u32>, LaneError> {
     let grid = build.grid;
     let look = look_of(build);
     let reader = reader_of(build);
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let base = word(layout.scene());
     let mut origin = [pixel; 3];
@@ -2942,8 +2946,8 @@ pub fn shade(build: &Build) -> Result<Vec<u32>, LaneError> {
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let none = em.u(0)?;
     let place = em.pick(shown, pixel, none)?;
@@ -2997,8 +3001,8 @@ pub fn bounce(build: &Build) -> Result<Vec<u32>, LaneError> {
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let none = em.u(0)?;
     let place = em.pick(shown, pixel, none)?;

@@ -85,3 +85,128 @@ impl Dimension {
         }
     }
 }
+
+/// A window of `STATE` holds `2^WINDOW_BITS` words, 2 GiB: two of them pass
+/// the 4 GiB a binding may hold.
+pub const WINDOW_BITS: u32 = 29;
+
+/// How the words of `STATE` lie over bindings. A world of fewer than
+/// `2^(bits + 1)` words keeps them in the one binding `STATE`. A larger one
+/// is split by index: word `i` lies in window `i >> bits`, at `i` less the
+/// window's start, each window `2^bits` words but the last. Window 0 is
+/// `STATE`, and window `w` past it is binding `BINDINGS + w - 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Windows {
+    words: usize,
+    bits: u32,
+}
+
+impl Windows {
+    /// `words` laid out at [`WINDOW_BITS`].
+    #[must_use]
+    pub const fn of(words: usize) -> Self {
+        Self::at(words, WINDOW_BITS)
+    }
+
+    pub(crate) const fn at(words: usize, bits: u32) -> Self {
+        Self { words, bits }
+    }
+
+    /// `words` split into windows of `2^bits` words. Only tests build it,
+    /// to split a small world.
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub const fn split_at(words: usize, bits: u32) -> Self {
+        Self::at(words, bits)
+    }
+
+    #[must_use]
+    pub const fn words(self) -> usize {
+        self.words
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.bits
+    }
+
+    #[must_use]
+    pub const fn span(self) -> usize {
+        1 << self.bits
+    }
+
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        if self.words < 2 * self.span() {
+            1
+        } else {
+            self.words.div_ceil(self.span()) as u32
+        }
+    }
+
+    #[must_use]
+    pub const fn is_split(self) -> bool {
+        self.count() > 1
+    }
+
+    /// The bindings a kernel that reads `STATE` declares.
+    #[must_use]
+    pub const fn bindings(self) -> u32 {
+        BINDINGS + self.count() - 1
+    }
+
+    #[must_use]
+    pub const fn binding(window: u32) -> u32 {
+        if window == 0 {
+            STATE
+        } else {
+            BINDINGS + window - 1
+        }
+    }
+
+    /// The words window `window` holds.
+    #[must_use]
+    pub const fn held(self, window: u32) -> usize {
+        if !self.is_split() {
+            return if window == 0 { self.words } else { 0 };
+        }
+        let start = window as usize * self.span();
+        if start >= self.words {
+            0
+        } else if self.words - start < self.span() {
+            self.words - start
+        } else {
+            self.span()
+        }
+    }
+
+    /// Where word `index` of `STATE` lies: its binding and the word in it.
+    #[must_use]
+    pub const fn place(self, index: usize) -> (u32, usize) {
+        if !self.is_split() {
+            return (STATE, index);
+        }
+        let window = (index >> self.bits) as u32;
+        (Self::binding(window), index & (self.span() - 1))
+    }
+
+    /// `sizes` with `STATE` in its first window and the other windows
+    /// appended after the engine's bindings.
+    #[must_use]
+    pub fn laid(self, sizes: &[usize]) -> Vec<usize> {
+        let mut bound = sizes.to_vec();
+        if !self.is_split() {
+            return bound;
+        }
+        if let Some(state) = bound.get_mut(STATE as usize) {
+            *state = self.held(0);
+        }
+        if bound.len() < BINDINGS as usize {
+            bound.resize(BINDINGS as usize, 1);
+        }
+        for window in 1..self.count() {
+            bound.push(self.held(window));
+        }
+        bound
+    }
+}

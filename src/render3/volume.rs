@@ -199,8 +199,8 @@ fn spread_pass(build: &Build, axis: usize, operation: &'static str) -> Result<Ve
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let (brick, inside, count) = bricked(&mut em, build)?;
     let frame = em.load_u(PARAMS, 0)?;
     let one = em.u(1)?;
@@ -248,8 +248,8 @@ pub fn sunlit(build: &Build) -> Result<Vec<u32>, LaneError> {
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
-    let mut kernel = kernel(build.subgroup)?;
-    let mut em = Em::new(&mut kernel)?;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::reading(&mut kernel, build.windows)?;
     let (brick, inside, count) = bricked(&mut em, build)?;
     let none = em.u(0)?;
     let place = em.pick(inside, brick, none)?;
