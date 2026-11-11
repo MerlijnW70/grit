@@ -429,6 +429,15 @@ impl<'h> Session<'h> {
         Ok(Some(by))
     }
 
+    pub fn surface(&self, [x, z]: [f32; 2]) -> Option<f32> {
+        let pool = self.pool.as_ref()?;
+        let land = pool.land.as_ref()?;
+        let world = pool.bricks.grid();
+        let x = (x.max(0.0) as u32 + pool.corner[0]) % world.wide;
+        let z = (z.max(0.0) as u32 + pool.corner[2]) % world.tall;
+        Some(world.deep.saturating_sub(land.top(x, z)) as f32)
+    }
+
     pub fn world_point(&self, cell: u32) -> [u32; 3] {
         let view = self.build.grid;
         let local = Solid::point(view, cell);

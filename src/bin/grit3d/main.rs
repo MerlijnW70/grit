@@ -286,7 +286,7 @@ fn chosen(host: &Host, asked: &Asked) -> Result<Quality, Failed> {
     let start = usize::from(host.heap() < SMALL_HEAP);
     for quality in QUALITIES.iter().skip(start) {
         let mut session = Session::cold(host, setup(asked, *quality))?;
-        let camera = home(asked, asked.which, session.grid()).camera();
+        let camera = homed(asked, asked.which, &session).camera();
         let mut times = Vec::new();
         for at in 0..8 {
             session.aim(&camera, false, at == 0)?;
@@ -337,6 +337,16 @@ fn steps(session: &Session<'_>, quality: Quality, first: bool) -> Steps {
 
 /// Where the camera of `which` starts, and where R and a switch to it take
 /// it back: the framing `--camera` asks for, or the scene's first.
+fn homed(asked: &Asked, which: Which, session: &Session<'_>) -> View {
+    let grid = session.grid();
+    let mut view = home(asked, which, grid);
+    if let Some(ground) = session.surface([view.target[0], view.target[2]]) {
+        view.target[1] = view.target[1].min(ground - 3.0);
+        view = view.held(Mode::Orbit, grid);
+    }
+    view
+}
+
 fn home(asked: &Asked, which: Which, grid: grit::sand::Grid) -> View {
     View::framed(which, asked.camera.unwrap_or(0), grid).held(Mode::Orbit, grid)
 }
@@ -600,7 +610,7 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
         session.build.suns
     );
     let mut play = Play {
-        rig: Rig::new(home(asked, asked.which, session.grid()), session.grid()),
+        rig: Rig::new(homed(asked, asked.which, &session), session.grid()),
         tool: asked.tool,
         paused: asked.paused,
         active: asked.active,
@@ -805,7 +815,7 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
             }
             play.tool = 0;
             play.rig
-                .reset(home(asked, which, session.grid()), session.grid());
+                .reset(homed(asked, which, &session), session.grid());
             fresh = true;
         }
         play.rig.tick(push, fast, spent);
@@ -1046,7 +1056,7 @@ fn measured(host: &Host, asked: &Asked) -> Result<(), Failed> {
     }
     session.advance(asked.skip)?;
     let grid = session.grid();
-    let camera = home(asked, asked.which, grid).camera();
+    let camera = homed(asked, asked.which, &session).camera();
     let timed = asked.timed.max(1);
     let mut totals = Vec::with_capacity(timed);
     let mut parts: Vec<Vec<Duration>> = (0..2 + stage::COUNT)

@@ -49,13 +49,65 @@ impl Which {
 }
 
 fn opened() -> Example {
+    use grit::rule3::nature::{EARTH, LEAVES, ROCK, SNOW, WOOD};
     let mut example = dressed(super::valley::example());
     example.name = "open world";
     example.scene = |_| Vec::new();
     example.warm = 2;
     example.life = None;
     example.feed = None;
+    example.light = clear_day;
+    let table = example.table;
+    example.table = table
+        .with(
+            EARTH,
+            table
+                .material(EARTH)
+                .topped(0x004C_702A)
+                .hue(0.55)
+                .detail(0.55, 0.45, 0.1, 0.0),
+        )
+        .with(
+            LEAVES,
+            Material::solid(0x0012_2A18, 0.32)
+                .topped(0x0028_4A20)
+                .hue(1.4)
+                .surface(0.8, 0.03)
+                .detail(0.6, 0.5, 0.0, 0.1),
+        )
+        .with(
+            ROCK,
+            table
+                .material(ROCK)
+                .topped(0x007C_7A74)
+                .mossy(0.25, 0x0046_5A30),
+        )
+        .with(
+            SNOW,
+            Material::solid(0x00F4_F8FF, 0.04)
+                .surface(0.5, 0.03)
+                .detail(0.12, 0.3, 0.0, 0.0)
+                .sparkle(1.0),
+        )
+        .with(WOOD, table.material(WOOD).hue(0.2));
     example
+}
+
+fn clear_day(mut light: Light) -> Light {
+    let rise: f32 = 0.33;
+    let across = (1.0 - rise * rise).sqrt();
+    let (x, z) = (0.75, -0.66_f32);
+    let length = (x * x + z * z).sqrt();
+    light.toward_sun = [x / length * across, -rise, z / length * across];
+    light.sun = [3.6, 3.0, 2.2];
+    light.zenith = [0.08, 0.2, 0.5];
+    light.horizon = [0.4, 0.56, 0.8];
+    light.ground = [0.12, 0.13, 0.08];
+    light.haze = 0.00014;
+    light.exposure = 0.8;
+    light.occlusion = 0.28;
+    light.glow = 0.35;
+    light
 }
 
 /// A scene: its name, the rule that runs it and that rule's kind mapping,
