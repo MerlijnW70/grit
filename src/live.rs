@@ -47,13 +47,131 @@ pub struct Keeping {
     pub brush: crate::Groups,
 }
 
+/// The scans of the fine tier, from the counts the mark wrote to the bases
+/// and the totals the gather reads, one stage each: one pass over one tile,
+/// two levels while the tiles fit a block's quads, and past that a third
+/// level, which scans the tiles' totals in groups into `TOTALS` past them and
+/// then scans those.
+pub fn fine_scans(subgroup: u32, plan: &crate::compact::Plan) -> Result<Stages, LaneError> {
+    use crate::Groups;
+    use crate::compact::Along;
+    use crate::layout::{BASES, COUNTS, TOTALS};
+
+    let one = Groups::Fixed(1);
+    let tiles = Groups::Fixed(plan.tiles);
+    Ok(match plan.levels() {
+        1 => vec![vec![(
+            crate::compact::whole(subgroup, COUNTS, BASES, Tier::FINE)?,
+            one,
+        )]],
+        2 => vec![
+            vec![(
+                crate::compact::scan(subgroup, COUNTS, BASES, TOTALS)?,
+                tiles,
+            )],
+            vec![(crate::compact::scan(subgroup, TOTALS, TOTALS, GRAND)?, one)],
+        ],
+        _ => vec![
+            vec![(
+                crate::compact::scan(subgroup, COUNTS, BASES, TOTALS)?,
+                tiles,
+            )],
+            vec![(
+                crate::compact::scan_at(
+                    subgroup,
+                    TOTALS,
+                    TOTALS,
+                    TOTALS,
+                    Along {
+                        from: 0,
+                        aggregate: plan.upper(),
+                    },
+                )?,
+                Groups::Fixed(plan.supers()),
+            )],
+            vec![(
+                crate::compact::scan_at(
+                    subgroup,
+                    TOTALS,
+                    TOTALS,
+                    GRAND,
+                    Along {
+                        from: plan.upper(),
+                        aggregate: 0,
+                    },
+                )?,
+                one,
+            )],
+        ],
+    })
+}
+
+/// The gather of the fine tier over the blocks `listed` names, reading the
+/// third level's totals where the plan's scan has one.
+pub fn fine_gather(
+    subgroup: u32,
+    plan: &crate::compact::Plan,
+    listed: Over,
+) -> Result<Vec<u32>, LaneError> {
+    let upper = (plan.levels() > 2).then(|| plan.upper());
+    crate::compact::gather_over(subgroup, Tier::FINE, listed, plan.dump(), upper)
+}
+
+/// The scans of the coarse tier: one pass while the tiles fit a block's
+/// quads, and two levels past that, as the fine tier scans its tiles.
+pub fn coarse_scans(subgroup: u32, plan: &crate::compact::Plan) -> Result<Stages, LaneError> {
+    use crate::Groups;
+    use crate::layout::{HOT_BASES, HOT_COUNTS, HOT_GRAND, HOT_TOTALS};
+
+    let one = Groups::Fixed(1);
+    Ok(if plan.hot_tiles <= 1 {
+        vec![vec![(
+            crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
+            one,
+        )]]
+    } else {
+        vec![
+            vec![(
+                crate::compact::scan(subgroup, HOT_COUNTS, HOT_BASES, HOT_TOTALS)?,
+                Groups::Fixed(plan.hot_tiles),
+            )],
+            vec![(
+                crate::compact::scan(subgroup, HOT_TOTALS, HOT_TOTALS, HOT_GRAND)?,
+                one,
+            )],
+        ]
+    })
+}
+
+/// Zeroes the whole of `TOTALS`, a block's quads of words a group: a scan
+/// three levels deep reads the padding past the tiles and past the groups
+/// of tiles, and writes its prefixes over it.
+pub fn wipe_totals(subgroup: u32) -> Result<Vec<u32>, LaneError> {
+    wipe_counts(subgroup, crate::layout::TOTALS)
+}
+
+/// The pass that zeroes `TOTALS` for a scan three levels deep, and the
+/// groups it runs over; none for a shallower scan, which [`wipe_in`] serves.
+pub fn totals_wiped(
+    subgroup: u32,
+    plan: &crate::compact::Plan,
+) -> Result<Option<(Vec<u32>, crate::Groups)>, LaneError> {
+    if plan.levels() < 3 {
+        return Ok(None);
+    }
+    Ok(Some((
+        wipe_totals(subgroup)?,
+        crate::Groups::Fixed(plan.supers() + 1),
+    )))
+}
+
 pub fn keeping(
     subgroup: u32,
     plan: &crate::compact::Plan,
     coarse: bool,
 ) -> Result<Keeping, LaneError> {
     use crate::Groups;
-    use crate::layout::{BASES, GRAND, HOT_BASES, HOT_COUNTS, HOT_DENSE, TOTALS};
+    use crate::layout::HOT_DENSE;
     use crate::sweep::COUNTS;
 
     let (listed, hot) = if coarse {
@@ -64,12 +182,14 @@ pub fn keeping(
     let tiles = Groups::Fixed(plan.tiles);
     let one = Groups::Fixed(1);
 
-    let before = vec![vec![
+    let mut first = vec![
         (decay(subgroup, listed)?, hot),
         (wipe_in(subgroup, plan.dimension)?, one),
         (wipe_counts(subgroup, COUNTS)?, tiles),
         (unclaimed(subgroup, plan)?, one),
-    ]];
+    ];
+    first.extend(totals_wiped(subgroup, plan)?);
+    let before = vec![first];
 
     let mut after: Stages = Vec::new();
     if coarse {
@@ -77,10 +197,7 @@ pub fn keeping(
             mark_below(subgroup, Tier::COARSE, Over::Every, plan.blocks)?,
             tiles,
         )]);
-        after.push(vec![(
-            crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
-            one,
-        )]);
+        after.extend(coarse_scans(subgroup, plan)?);
         after.push(vec![
             (
                 crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
@@ -96,26 +213,9 @@ pub fn keeping(
         mark_below(subgroup, Tier::FINE, listed, plan.dump())?,
         hot,
     )]);
-    if plan.tiles == 1 {
-        after.push(vec![(
-            crate::compact::whole(subgroup, COUNTS, BASES, Tier::FINE)?,
-            one,
-        )]);
-    } else {
-        after.push(vec![(
-            crate::compact::scan(subgroup, COUNTS, BASES, TOTALS)?,
-            tiles,
-        )]);
-        after.push(vec![(
-            crate::compact::scan(subgroup, TOTALS, TOTALS, GRAND)?,
-            one,
-        )]);
-    }
+    after.extend(fine_scans(subgroup, plan)?);
     after.push(vec![
-        (
-            crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
-            hot,
-        ),
+        (fine_gather(subgroup, plan, listed)?, hot),
         (
             crate::compact::prepare(subgroup, subgroup, Tier::FINE)?,
             Groups::Counting(1),
@@ -156,7 +256,7 @@ pub fn arranged(
     coarse: bool,
 ) -> Result<Loop, LaneError> {
     use crate::Groups;
-    use crate::layout::{HOT_BASES, HOT_COUNTS, HOT_DENSE};
+    use crate::layout::HOT_DENSE;
     use crate::sweep::COUNTS;
 
     sand::flat("live::arranged", grid)?;
@@ -192,16 +292,23 @@ pub fn arranged(
         stage
     };
 
-    let hot_scan_counts = if coarse {
-        vec![(
-            crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
-            one,
-        )]
-    } else {
-        Vec::new()
-    };
-    let hot_gather = if coarse {
-        vec![
+    let mut first = vec![
+        (tick(subgroup)?, one),
+        (decay(subgroup, listed)?, hot),
+        (wipe(subgroup)?, one),
+        (wipe_counts(subgroup, COUNTS)?, tiles),
+        (unclaimed(subgroup, plan)?, one),
+    ];
+    first.extend(totals_wiped(subgroup, plan)?);
+    let mut stages: Stages = vec![
+        first,
+        vec![(sand::brush(subgroup, grid, true)?, sand::seats(plan))],
+        vec![(settle(subgroup, grid)?, crate::compact::Plan::listed())],
+        looking,
+    ];
+    if coarse {
+        stages.extend(coarse_scans(subgroup, plan)?);
+        stages.push(vec![
             (
                 crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
                 tiles,
@@ -210,68 +317,20 @@ pub fn arranged(
                 crate::compact::prepare(subgroup, 1, Tier::COARSE)?,
                 Groups::Counting(1),
             ),
-        ]
-    } else {
-        Vec::new()
-    };
-
-    let fine_scan_counts = if plan.tiles == 1 {
-        vec![(
-            crate::compact::whole(subgroup, COUNTS, crate::layout::BASES, Tier::FINE)?,
-            one,
-        )]
-    } else {
-        vec![(
-            crate::compact::scan(
-                subgroup,
-                COUNTS,
-                crate::layout::BASES,
-                crate::layout::TOTALS,
-            )?,
-            tiles,
-        )]
-    };
-    let fine_scan_totals = if plan.tiles > 1 {
-        vec![(
-            crate::compact::scan(
-                subgroup,
-                crate::layout::TOTALS,
-                crate::layout::TOTALS,
-                crate::layout::GRAND,
-            )?,
-            one,
-        )]
-    } else {
-        Vec::new()
-    };
-
-    let stages = vec![
-        vec![
-            (tick(subgroup)?, one),
-            (decay(subgroup, listed)?, hot),
-            (wipe(subgroup)?, one),
-            (wipe_counts(subgroup, COUNTS)?, tiles),
-            (unclaimed(subgroup, plan)?, one),
-        ],
-        vec![(sand::brush(subgroup, grid, true)?, sand::seats(plan))],
-        vec![(settle(subgroup, grid)?, crate::compact::Plan::listed())],
-        looking,
-        hot_scan_counts,
-        hot_gather,
-        vec![(mark_below(subgroup, Tier::FINE, listed, grid.quads())?, hot)],
-        fine_scan_counts,
-        fine_scan_totals,
-        vec![
-            (
-                crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
-                hot,
-            ),
-            (
-                crate::compact::prepare(subgroup, subgroup, Tier::FINE)?,
-                Groups::Counting(1),
-            ),
-        ],
-    ];
+        ]);
+    }
+    stages.push(vec![(
+        mark_below(subgroup, Tier::FINE, listed, grid.quads())?,
+        hot,
+    )]);
+    stages.extend(fine_scans(subgroup, plan)?);
+    stages.push(vec![
+        (fine_gather(subgroup, plan, listed)?, hot),
+        (
+            crate::compact::prepare(subgroup, subgroup, Tier::FINE)?,
+            Groups::Counting(1),
+        ),
+    ]);
 
     let mut passes = Vec::new();
     let mut groups = Vec::with_capacity(stages.len());
@@ -388,7 +447,7 @@ pub fn arranged3_by<R: Rule>(
     coarse: bool,
 ) -> Result<Loop, LaneError> {
     use crate::Groups;
-    use crate::layout::{BASES, HOT_BASES, HOT_COUNTS, HOT_DENSE, TOTALS};
+    use crate::layout::HOT_DENSE;
     use crate::sweep::COUNTS;
 
     fits("live::arranged3", grid, plan)?;
@@ -401,14 +460,16 @@ pub fn arranged3_by<R: Rule>(
     let tiles = Groups::Fixed(plan.tiles);
     let one = Groups::Fixed(1);
 
+    let mut first = vec![
+        (tick(subgroup)?, one),
+        (decay(subgroup, listed)?, hot),
+        (wipe3(subgroup, rule.tally().words())?, one),
+        (wipe_counts(subgroup, COUNTS)?, tiles),
+        (unclaimed(subgroup, plan)?, one),
+    ];
+    first.extend(totals_wiped(subgroup, plan)?);
     let mut stages: Stages = vec![
-        vec![
-            (tick(subgroup)?, one),
-            (decay(subgroup, listed)?, hot),
-            (wipe3(subgroup, rule.tally().words())?, one),
-            (wipe_counts(subgroup, COUNTS)?, tiles),
-            (unclaimed(subgroup, plan)?, one),
-        ],
+        first,
         vec![(
             settle3_in(rule, subgroup, grid, plan.windows())?,
             crate::compact::Plan::listed(),
@@ -419,10 +480,7 @@ pub fn arranged3_by<R: Rule>(
             mark_below(subgroup, Tier::COARSE, Over::Every, plan.blocks)?,
             tiles,
         )]);
-        stages.push(vec![(
-            crate::compact::whole(subgroup, HOT_COUNTS, HOT_BASES, Tier::COARSE)?,
-            one,
-        )]);
+        stages.extend(coarse_scans(subgroup, plan)?);
         stages.push(vec![
             (
                 crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
@@ -438,26 +496,9 @@ pub fn arranged3_by<R: Rule>(
         mark_below(subgroup, Tier::FINE, listed, grid.blocks())?,
         hot,
     )]);
-    if plan.tiles == 1 {
-        stages.push(vec![(
-            crate::compact::whole(subgroup, COUNTS, BASES, Tier::FINE)?,
-            one,
-        )]);
-    } else {
-        stages.push(vec![(
-            crate::compact::scan(subgroup, COUNTS, BASES, TOTALS)?,
-            tiles,
-        )]);
-        stages.push(vec![(
-            crate::compact::scan(subgroup, TOTALS, TOTALS, GRAND)?,
-            one,
-        )]);
-    }
+    stages.extend(fine_scans(subgroup, plan)?);
     stages.push(vec![
-        (
-            crate::compact::gather(subgroup, Tier::FINE, listed, plan.dump())?,
-            hot,
-        ),
+        (fine_gather(subgroup, plan, listed)?, hot),
         (
             crate::compact::prepare(subgroup, subgroup, Tier::FINE)?,
             Groups::Counting(1),

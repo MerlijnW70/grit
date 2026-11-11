@@ -64,12 +64,17 @@ pub(crate) fn owned(kernel: &mut Kernel<U32>, over: Over) -> Result<Id, LaneErro
 #[derive(Debug)]
 pub enum TooBig {
     Blocks { blocks: u32, limit: u32 },
+    Cells { cells: u64, limit: u64 },
 }
 
 impl std::fmt::Display for TooBig {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Blocks { blocks, limit } => write!(out, "{blocks} {limit}"),
+            Self::Cells { cells, limit } => write!(
+                out,
+                "{cells} words of STATE pass the {limit} a u32 index reaches"
+            ),
         }
     }
 }
@@ -90,17 +95,36 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The most quads one plan for this subgroup can hold.
+    /// The most quads a scan two levels deep reaches for this subgroup, and
+    /// so the most a flat plan holds.
     ///
-    /// `over` refuses once the blocks outrun `sweep::cells` squared, because
-    /// the scan over them is two levels deep and reaches no further, and a
-    /// block holds `sweep::cells` quads. So the grid a plan can address is
-    /// that number cubed: 16 777 216 quads at a subgroup of 32, and 32 768 at
-    /// a subgroup of 4. It is not a limit of the device.
+    /// `over` refuses a flat plan once its blocks outrun `sweep::cells`
+    /// squared, because its scan is two levels deep and reaches no further,
+    /// and a block holds `sweep::cells` quads. So the grid such a plan can
+    /// address is that number cubed: 16 777 216 quads at a subgroup of 32,
+    /// and 32 768 at a subgroup of 4. A solid plan past it scans three levels
+    /// deep ([`Plan::most_blocks`]). It is not a limit of the device.
     #[must_use]
     pub fn reach(subgroup: u32) -> u64 {
         u64::from(sweep::cells(subgroup)).pow(3)
     }
+
+    /// The most blocks a plan of `dimension` scans: [`Plan::reach`] over a
+    /// block's quads for a flat world, whose scan is two levels deep, and a
+    /// block's quads squared for a solid one, whose scan takes a third level
+    /// once its tiles outnumber a block's quads.
+    #[must_use]
+    pub fn most_blocks(subgroup: u32, dimension: Dimension) -> u64 {
+        let per_block = u64::from(sweep::cells(subgroup));
+        match dimension {
+            Dimension::Two => per_block * per_block,
+            Dimension::Three => per_block * per_block * per_block,
+        }
+    }
+
+    /// The most words of `STATE` a plan holds: every one is addressed by a
+    /// `u32` index.
+    pub const MOST_WORDS: u64 = 1 << 32;
 
     pub fn over(subgroup: u32, blocks: u32) -> Result<Self, TooBig> {
         Self::over_in(subgroup, blocks, Dimension::Two)
@@ -108,12 +132,13 @@ impl Plan {
 
     pub fn over_in(subgroup: u32, blocks: u32, dimension: Dimension) -> Result<Self, TooBig> {
         let per_block = sweep::cells(subgroup);
-        let limit = per_block.saturating_mul(per_block);
-        if blocks > limit {
+        let most = Self::most_blocks(subgroup, dimension);
+        if u64::from(blocks) > most {
+            let limit = u32::try_from(most).unwrap_or(u32::MAX);
             return Err(TooBig::Blocks { blocks, limit });
         }
         let tiles = blocks.div_ceil(per_block);
-        Ok(Self {
+        let held = Self {
             subgroup,
             per_block,
             blocks,
@@ -123,7 +148,15 @@ impl Plan {
             grid: per_block as usize * blocks as usize * dimension.corners(),
             dimension,
             window: crate::layout::WINDOW_BITS,
-        })
+        };
+        let words = held.state_words() as u64;
+        if words > Self::MOST_WORDS {
+            return Err(TooBig::Cells {
+                cells: words,
+                limit: Self::MOST_WORDS,
+            });
+        }
+        Ok(held)
     }
 
     /// This plan with `STATE` split into windows of `2^bits` words once it
@@ -135,6 +168,33 @@ impl Plan {
     pub const fn split_at(mut self, bits: u32) -> Self {
         self.window = bits;
         self
+    }
+
+    /// The scan's depth: 1 for one tile, 2 while the tiles fit one block's
+    /// quads, and 3 past that.
+    #[must_use]
+    pub const fn levels(&self) -> u32 {
+        if self.tiles == 1 {
+            1
+        } else if self.tiles <= self.per_block {
+            2
+        } else {
+            3
+        }
+    }
+
+    /// The groups of tiles the third level scans, each a block's quads of
+    /// tiles.
+    #[must_use]
+    pub const fn supers(&self) -> u32 {
+        self.tiles.div_ceil(self.per_block)
+    }
+
+    /// Where in `TOTALS` the totals of the third level start: past the
+    /// tiles' totals, padded to whole groups of tiles.
+    #[must_use]
+    pub const fn upper(&self) -> u32 {
+        self.supers() * self.per_block
     }
 
     /// The words of `STATE`: the grid, and for a flat world the spare its
@@ -170,13 +230,18 @@ impl Plan {
         let padded = self.tiles as usize * self.per_block as usize;
         let hot_padded = self.hot_tiles as usize * self.per_block as usize;
         let spare = self.blocks as usize * self.subgroup as usize;
+        let totals = if self.levels() > 2 {
+            self.upper() as usize + self.per_block as usize
+        } else {
+            self.per_block as usize
+        };
         [
             self.dimension.params_words(),
             self.state_words(),
             self.blocks as usize * sweep::stride(self.subgroup) as usize,
             padded,
             padded,
-            self.per_block as usize,
+            totals,
             self.quads + spare,
             1,
             3,
@@ -254,12 +319,48 @@ impl Plan {
 }
 
 pub fn scan(subgroup: u32, from: u32, into: u32, aggregate: u32) -> Result<Vec<u32>, LaneError> {
+    scan_at(subgroup, from, into, aggregate, Along::START)
+}
+
+/// Where a scan starts in its source and its target, and where its
+/// aggregates start: the third level scans the tiles' totals into
+/// `TOTALS` past them, and then scans those in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Along {
+    pub from: u32,
+    pub aggregate: u32,
+}
+
+impl Along {
+    pub const START: Self = Self {
+        from: 0,
+        aggregate: 0,
+    };
+}
+
+/// [`scan`] with each group's run starting `along.from` words into `from`
+/// and `into`, and its aggregate stored `along.aggregate` words into
+/// `aggregate`.
+pub fn scan_at(
+    subgroup: u32,
+    from: u32,
+    into: u32,
+    aggregate: u32,
+    along: Along,
+) -> Result<Vec<u32>, LaneError> {
+    let at = Scanning {
+        from,
+        into,
+        aggregate,
+        alone: None,
+        along,
+    };
     match subgroup {
-        4 => scanned::<4>(subgroup, from, into, aggregate, None),
-        8 => scanned::<8>(subgroup, from, into, aggregate, None),
-        16 => scanned::<16>(subgroup, from, into, aggregate, None),
-        32 => scanned::<32>(subgroup, from, into, aggregate, None),
-        64 => scanned::<64>(subgroup, from, into, aggregate, None),
+        4 => scanned::<4>(subgroup, at),
+        8 => scanned::<8>(subgroup, at),
+        16 => scanned::<16>(subgroup, at),
+        32 => scanned::<32>(subgroup, at),
+        64 => scanned::<64>(subgroup, at),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -268,13 +369,19 @@ pub fn scan(subgroup: u32, from: u32, into: u32, aggregate: u32) -> Result<Vec<u
 }
 
 pub fn whole(subgroup: u32, from: u32, into: u32, tier: Tier) -> Result<Vec<u32>, LaneError> {
-    let held = Some((tier.totals, tier.grand));
+    let at = Scanning {
+        from,
+        into,
+        aggregate: tier.totals,
+        alone: Some((tier.totals, tier.grand)),
+        along: Along::START,
+    };
     match subgroup {
-        4 => scanned::<4>(subgroup, from, into, tier.totals, held),
-        8 => scanned::<8>(subgroup, from, into, tier.totals, held),
-        16 => scanned::<16>(subgroup, from, into, tier.totals, held),
-        32 => scanned::<32>(subgroup, from, into, tier.totals, held),
-        64 => scanned::<64>(subgroup, from, into, tier.totals, held),
+        4 => scanned::<4>(subgroup, at),
+        8 => scanned::<8>(subgroup, at),
+        16 => scanned::<16>(subgroup, at),
+        32 => scanned::<32>(subgroup, at),
+        64 => scanned::<64>(subgroup, at),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -282,13 +389,22 @@ pub fn whole(subgroup: u32, from: u32, into: u32, tier: Tier) -> Result<Vec<u32>
     }
 }
 
-fn scanned<const LANES: u32>(
-    subgroup: u32,
+struct Scanning {
     from: u32,
     into: u32,
     aggregate: u32,
     alone: Option<(u32, u32)>,
-) -> Result<Vec<u32>, LaneError> {
+    along: Along,
+}
+
+fn scanned<const LANES: u32>(subgroup: u32, at: Scanning) -> Result<Vec<u32>, LaneError> {
+    let Scanning {
+        from,
+        into,
+        aggregate,
+        alone,
+        along,
+    } = at;
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
 
@@ -296,6 +412,12 @@ fn scanned<const LANES: u32>(
     let lane = kernel.local_index();
     let span = kernel.module().constant_u32(sweep::cells(subgroup))?;
     let start = kernel.module().i_mul(uint, block, span)?;
+    let start = if along.from == 0 {
+        start
+    } else {
+        let offset = kernel.module().constant_u32(along.from)?;
+        kernel.module().i_add(uint, start, offset)?
+    };
     let run = kernel.module().constant_u32(PER_LANE)?;
     let along_lane = kernel.module().i_mul(uint, lane, run)?;
     let mine = kernel.module().i_add(uint, start, along_lane)?;
@@ -328,7 +450,12 @@ fn scanned<const LANES: u32>(
         (before, total)
     };
     match alone {
-        None => kernel.store_at(aggregate, block, total)?,
+        None if along.aggregate == 0 => kernel.store_at(aggregate, block, total)?,
+        None => {
+            let offset = kernel.module().constant_u32(along.aggregate)?;
+            let at = kernel.module().i_add(uint, block, offset)?;
+            kernel.store_at(aggregate, at, total)?;
+        }
         Some((totals, grand)) => {
             let nothing = kernel.module().constant_u32(0)?;
             kernel.store_at(totals, block, nothing)?;
@@ -351,12 +478,25 @@ fn scanned<const LANES: u32>(
 }
 
 pub fn gather(subgroup: u32, tier: Tier, over: Over, dump: u32) -> Result<Vec<u32>, LaneError> {
+    gather_over(subgroup, tier, over, dump, None)
+}
+
+/// [`gather`] behind a scan three levels deep: each block's base also takes
+/// the total of the group of tiles it lies in, which the third level keeps
+/// `upper` words into the tier's totals.
+pub fn gather_over(
+    subgroup: u32,
+    tier: Tier,
+    over: Over,
+    dump: u32,
+    upper: Option<u32>,
+) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => gathered::<4>(subgroup, tier, over, dump),
-        8 => gathered::<8>(subgroup, tier, over, dump),
-        16 => gathered::<16>(subgroup, tier, over, dump),
-        32 => gathered::<32>(subgroup, tier, over, dump),
-        64 => gathered::<64>(subgroup, tier, over, dump),
+        4 => gathered::<4>(subgroup, tier, over, (dump, upper)),
+        8 => gathered::<8>(subgroup, tier, over, (dump, upper)),
+        16 => gathered::<16>(subgroup, tier, over, (dump, upper)),
+        32 => gathered::<32>(subgroup, tier, over, (dump, upper)),
+        64 => gathered::<64>(subgroup, tier, over, (dump, upper)),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -368,7 +508,7 @@ fn gathered<const LANES: u32>(
     subgroup: u32,
     tier: Tier,
     over: Over,
-    dump: u32,
+    (dump, upper): (u32, Option<u32>),
 ) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
@@ -385,6 +525,20 @@ fn gathered<const LANES: u32>(
     };
 
     let tile_base = kernel.load_at(tier.totals, tile.id())?;
+    let tile_base = match upper {
+        None => tile_base,
+        Some(upper) => {
+            let group = {
+                let mut lanes = kernel.lanes()?;
+                let by = lanes.splat_bits::<U32, LANES>(per_block.trailing_zeros())?;
+                let past = lanes.splat_bits::<U32, LANES>(upper)?;
+                let group = lanes.shift_right_logical(tile, by)?;
+                lanes.add(group, past)?
+            };
+            let group_base = kernel.load_at(tier.totals, group.id())?;
+            kernel.module().i_add(uint, tile_base, group_base)?
+        }
+    };
     let block_base = kernel.load_at(tier.bases, block)?;
     let live = kernel.load_at(tier.counts, block)?;
 

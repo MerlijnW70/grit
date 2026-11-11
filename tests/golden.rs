@@ -317,6 +317,39 @@ fn catalog(width: u32) -> Vec<(String, String)> {
         "compact::whole/hot-counts",
         compact::whole(w, HOT_COUNTS, HOT_BASES, Tier::COARSE),
     );
+    all.add(
+        "compact::scan_at/groups-of-tiles/upper-64",
+        compact::scan_at(
+            w,
+            TOTALS,
+            TOTALS,
+            TOTALS,
+            compact::Along {
+                from: 0,
+                aggregate: 64,
+            },
+        ),
+    );
+    all.add(
+        "compact::scan_at/totals/from-64",
+        compact::scan_at(
+            w,
+            TOTALS,
+            TOTALS,
+            GRAND,
+            compact::Along {
+                from: 64,
+                aggregate: 0,
+            },
+        ),
+    );
+    for (label, over) in overs {
+        all.add(
+            format!("compact::gather_over/fine/{label}/dump-7/upper-64"),
+            compact::gather_over(w, Tier::FINE, over, 7, Some(64)),
+        );
+    }
+    all.add("live::wipe_totals", live::wipe_totals(w));
     for (wide, deep, tall) in [(1024, 1024, 1024), (2048, 1024, 1024)] {
         let grid = Grid::solid(wide, deep, tall).unwrap();
         let at = format!("@{wide}x{deep}x{tall}");

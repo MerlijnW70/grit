@@ -158,11 +158,16 @@ fn the_brush_box_sets_the_awake_floor_of_a_small_three_dimensional_world() {
 }
 
 #[test]
-fn a_world_past_512_cubed_is_refused_by_the_scan_at_a_subgroup_of_32() {
+fn a_world_past_512_cubed_takes_a_third_level_of_scan_at_a_subgroup_of_32() {
     let per_block = sweep::cells(SUBGROUP);
     let limit = per_block * per_block;
-    assert!(Plan::over_in(SUBGROUP, limit, Dimension::Three).is_ok());
-    assert!(Plan::over_in(SUBGROUP, limit + 1, Dimension::Three).is_err());
+    let at = |blocks| Plan::over_in(SUBGROUP, blocks, Dimension::Three);
+    assert_eq!(at(limit).unwrap().levels(), 2);
+    assert_eq!(at(limit + 1).unwrap().levels(), 3);
+    let indexed = u32::try_from(Plan::MOST_WORDS / 8 / u64::from(per_block)).unwrap();
+    assert_eq!(at(indexed).unwrap().levels(), 3);
+    assert!(at(indexed + 1).is_err());
+    assert!(at(limit * per_block).is_err());
 }
 
 #[test]

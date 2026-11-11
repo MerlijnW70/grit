@@ -331,10 +331,20 @@ fn sizes_the_device_cannot_hold_are_refused_with_the_engines_errors() {
         return;
     };
     let mut server = Server::new(Some(&host));
+    let wide = grit::sand::Grid::solid(2048, 1024, 1024).unwrap();
+    let blocks = wide.blocks().div_ceil(grit::sweep::cells(host.width()));
+    let planned =
+        grit::compact::Plan::over_in(host.width(), blocks, grit::layout::Dimension::Three);
+    let past_one_binding = if planned.is_ok() {
+        "too_large"
+    } else {
+        "too_big"
+    };
     for (size, named) in [
         ("65536,65536,65536", "unfit"),
         ("4294967295,2,2", "unfit"),
-        ("2048,1024,1024", "too_big"),
+        ("2048,1024,1024", past_one_binding),
+        ("4096,2048,1024", "too_big"),
         ("16,16,1", "lane"),
         ("16,16,0", "lane"),
     ] {
