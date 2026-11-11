@@ -3,6 +3,7 @@ mod font;
 mod life;
 mod scenes;
 mod session;
+mod sparse;
 mod ui;
 mod valley;
 
@@ -90,6 +91,9 @@ struct Asked {
     timed: usize,
     shape: Option<[u32; 3]>,
     engine: bool,
+    sparse: bool,
+    open: bool,
+    slots: Option<u32>,
 }
 
 fn asked() -> Result<Asked, Failed> {
@@ -121,6 +125,9 @@ fn asked() -> Result<Asked, Failed> {
         timed: TIMED,
         shape: None,
         engine: false,
+        sparse: false,
+        open: false,
+        slots: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(one) = args.next() {
@@ -145,6 +152,13 @@ fn asked() -> Result<Asked, Failed> {
                 }
             }
             "--engine" => held.engine = true,
+            "--sparse" => held.sparse = true,
+            "--open" => {
+                held.open = true;
+                held.sparse = true;
+                held.which = Which::Valley;
+            }
+            "--slots" => held.slots = Some(value()?.parse()?),
             "--width" => held.window.wide = value()?.parse()?,
             "--height" => held.window.high = value()?.parse()?,
             "--frames" => held.frames = Some(value()?.parse()?),
@@ -176,7 +190,7 @@ fn asked() -> Result<Asked, Failed> {
             "--measure" => held.measure = true,
             other => {
                 return Err(format!(
-                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle, --readback, --timed N, --engine and --generate SIDE; --size takes SIDE or WIDExDEEPxTALL"
+                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle, --readback, --timed N, --engine, --sparse, --open, --slots N and --generate SIDE; --size takes SIDE or WIDExDEEPxTALL"
                 )
                 .into());
             }
@@ -201,6 +215,9 @@ fn main() -> Result<(), Failed> {
     };
     if asked.engine {
         return engined(&host, &asked);
+    }
+    if asked.sparse {
+        return Err("a sparse world runs only with --engine in this build".into());
     }
     if asked
         .shape
@@ -1100,9 +1117,38 @@ fn engined_by<R: grit::rule3::Rule>(host: &Host, asked: &Asked, rule: &R) -> Res
     use grit::{live, sweep};
 
     let side = asked.side.unwrap_or(QUALITIES[0].side);
-    let [wide, deep, tall] = asked.shape.unwrap_or([side; 3]);
+    let [wide, deep, tall] = if asked.open {
+        asked.shape.unwrap_or(sparse::OPEN)
+    } else {
+        asked.shape.unwrap_or([side; 3])
+    };
     let grid = grit::sand::Grid::solid(wide, deep, tall)?;
     let example = asked.which.example();
+    if asked.sparse {
+        let clock = Instant::now();
+        let world = if asked.open {
+            sparse::World::Open(sparse::Open::new(grid))
+        } else {
+            sparse::World::Dense((example.scene)(grid))
+        };
+        let generated = clock.elapsed();
+        let line = sparse::engined(
+            host,
+            rule,
+            grid,
+            world,
+            &sparse::Asked {
+                slots: asked.slots,
+                skip: asked.skip,
+                warm: WARM,
+                timed: asked.timed.max(1),
+                params: example.params.clone(),
+                name: if asked.open { "open" } else { example.name },
+            },
+        )?;
+        println!("{line} | generated in {:.1} s", generated.as_secs_f64());
+        return Ok(());
+    }
     let width = host.width();
     let plan = Plan::over_in(
         width,
