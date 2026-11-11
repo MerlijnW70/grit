@@ -408,6 +408,11 @@ struct Facing {
 
 const WORD: u64 = size_of::<u32>() as u64;
 
+/// The most bytes a staging buffer is made with: 64 MiB. A transfer longer
+/// than it goes through it in pieces, and a frame that reads back more grows
+/// its slot's buffer to what it reads.
+pub const STAGING: u64 = 64 << 20;
+
 const INDIRECT: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +476,7 @@ pub struct Resident<'host> {
     built: bool,
     buffers: Vec<Held>,
     staging: Held,
+    room: u64,
     layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
@@ -615,18 +621,9 @@ impl Host {
                 });
             }
 
-            let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-            let plain =
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            made.room = largest;
             for at in 0..=SLOTS {
-                let held = match self.allocate(
-                    largest,
-                    usage,
-                    plain | vk::MemoryPropertyFlags::HOST_CACHED,
-                ) {
-                    Ok(held) => held,
-                    Err(_) => self.allocate(largest, usage, plain)?,
-                };
+                let held = self.staging_of(largest.min(STAGING))?;
                 if at < SLOTS {
                     made.slots.push(Slot::staged(held));
                 } else {
@@ -719,6 +716,17 @@ impl Host {
             visible: wanted.contains(vk::MemoryPropertyFlags::HOST_VISIBLE),
             kind: wanted,
         })
+    }
+
+    /// A host-visible buffer of `bytes` to stage transfers through, cached
+    /// where the device offers it.
+    unsafe fn staging_of(&self, bytes: u64) -> Result<Held, Error> {
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        let plain = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        match unsafe { self.allocate(bytes, usage, plain | vk::MemoryPropertyFlags::HOST_CACHED) } {
+            Ok(held) => Ok(held),
+            Err(_) => unsafe { self.allocate(bytes, usage, plain) },
+        }
     }
 
     unsafe fn fence(&self) -> Result<vk::Fence, Error> {
@@ -820,6 +828,7 @@ impl<'host> Resident<'host> {
             built: false,
             buffers: Vec::with_capacity(bindings),
             staging: Held::none(),
+            room: 0,
             layout: vk::DescriptorSetLayout::null(),
             pool: vk::DescriptorPool::null(),
             set: vk::DescriptorSet::null(),
@@ -1183,6 +1192,21 @@ impl Resident<'_> {
         if visible {
             return unsafe { self.poke(memory, into, words) }.map(|()| true);
         }
+        if self.sparse(index) {
+            staged(0, words.len(), self.room)?;
+        }
+        let piece = words_in(self.staging.bytes).max(1);
+        let mut along = into.from;
+        for part in words.chunks(piece) {
+            unsafe { self.sent(handle, along, part) }?;
+            along += part.len() as u64 * WORD;
+        }
+        Ok(false)
+    }
+
+    /// Copies `words` through the staging buffer into `handle` at byte
+    /// `into`; they fit the staging buffer.
+    unsafe fn sent(&self, handle: vk::Buffer, into: u64, words: &[u32]) -> Result<(), Error> {
         let from = staged(0, words.len(), self.staging.bytes)?;
         let staging = self.staging.memory;
 
@@ -1199,12 +1223,11 @@ impl Resident<'_> {
 
         let region = [vk::BufferCopy::default()
             .src_offset(from.from)
-            .dst_offset(into.from)
-            .size(into.bytes)];
+            .dst_offset(into)
+            .size(from.bytes)];
         let source = self.staging.handle;
         unsafe {
             self.once(|device, command| device.cmd_copy_buffer(command, source, handle, &region))
-                .map(|()| false)
         }
     }
 
@@ -1253,11 +1276,20 @@ impl Resident<'_> {
             }
             total = total.checked_add(run.words.len()).ok_or(Error::Staged {
                 needed: usize::MAX,
-                staging: words_in(self.staging.bytes),
+                staging: words_in(self.room),
             })?;
             taken.push((held.handle, into, run.words));
         }
         if taken.is_empty() {
+            return Ok(());
+        }
+        if runs.iter().any(|run| self.sparse(run.index)) {
+            staged(0, total, self.room)?;
+        }
+        if staged(0, total, self.staging.bytes).is_err() {
+            for run in runs {
+                self.written(run.index, run.at, run.words)?;
+            }
             return Ok(());
         }
         let whole = staged(0, total, self.staging.bytes)?;
@@ -1470,15 +1502,38 @@ impl Resident<'_> {
         self.live()?;
         let (held, from) = self.within(index, 0, count)?;
         let handle = held.handle;
-        let into = staged(0, count, self.staging.bytes)?;
+        if self.sparse(index) {
+            staged(0, count, self.room)?;
+        }
         if from.bytes == 0 {
             return Ok(Vec::new());
         }
+        let piece = words_in(self.staging.bytes).max(1);
+        let mut out = Vec::with_capacity(count);
+        let mut along = 0_usize;
+        while along < count {
+            let part = piece.min(count - along);
+            unsafe { self.fetched(handle, from.from + along as u64 * WORD, part, &mut out) }?;
+            along += part;
+        }
+        Ok(out)
+    }
 
+    /// Copies `count` words from `handle` at byte `at` through the staging
+    /// buffer onto the end of `out`, once from the mapped memory; they fit
+    /// the staging buffer.
+    unsafe fn fetched(
+        &mut self,
+        handle: vk::Buffer,
+        at: u64,
+        count: usize,
+        out: &mut Vec<u32>,
+    ) -> Result<(), Error> {
+        let into = staged(0, count, self.staging.bytes)?;
         let region = [vk::BufferCopy::default()
-            .src_offset(from.from)
+            .src_offset(at)
             .dst_offset(into.from)
-            .size(from.bytes)];
+            .size(into.bytes)];
         let began = std::time::Instant::now();
         let staging = self.staging.handle;
         unsafe {
@@ -1490,7 +1545,18 @@ impl Resident<'_> {
         self.copying += began.elapsed();
         self.copies += 1;
         let (memory, room) = (self.staging.memory, self.staging.bytes);
-        unsafe { self.mapped_at(memory, room, 0, count) }
+        let from = staged(0, count, room)?;
+        unsafe {
+            let mapped = self.host.device().map_memory(
+                memory,
+                from.from,
+                from.bytes,
+                vk::MemoryMapFlags::empty(),
+            )?;
+            out.extend_from_slice(std::slice::from_raw_parts(mapped.cast::<u32>(), count));
+            self.host.device().unmap_memory(memory);
+        }
+        Ok(())
     }
 
     pub fn frame(&mut self, groups: &[Groups]) -> Result<Duration, Error> {
@@ -1647,7 +1713,14 @@ impl Resident<'_> {
             copy.push((held.handle, from.bytes));
             wanted = wanted.saturating_add(count);
         }
-        staged(0, wanted, facing.room)?;
+        if out.iter().any(|&(index, _)| self.sparse(index)) {
+            staged(0, wanted, self.room)?;
+        }
+        let facing = if staged(0, wanted, facing.room).is_err() {
+            self.grown(at, wanted)?
+        } else {
+            facing
+        };
 
         let began = Instant::now();
         self.run_times(at, facing, stages, &copy, times)?;
@@ -1661,6 +1734,45 @@ impl Resident<'_> {
             slot.flight = Some(flight);
         }
         Ok(Ticket(self.tickets))
+    }
+
+    /// Whether binding `index` is the sparse one: its transfers are bound by
+    /// the largest other binding, the most any other transfer can move.
+    fn sparse(&self, index: usize) -> bool {
+        self.buffers.get(index).is_some_and(|held| held.page > 0)
+    }
+
+    /// Remakes the staging buffer of slot `at`, which holds no frame, to
+    /// hold `words`, and forgets the frame recorded against the one before.
+    fn grown(&mut self, at: usize, words: usize) -> Result<Facing, Error> {
+        let bytes = staged(0, words, u64::MAX)?.bytes;
+        let made = unsafe { self.host.staging_of(bytes) }?;
+        let device = self.host.device();
+        let Some(slot) = self.slots.get_mut(at) else {
+            return Err(Error::StillInFlight);
+        };
+        let old = std::mem::replace(&mut slot.staging, made);
+        slot.held = None;
+        unsafe {
+            device.destroy_buffer(old.handle, faults::callbacks(Step::Buffer));
+            faults::gone(Step::Buffer, old.handle);
+            device.free_memory(old.memory, faults::callbacks(Step::Memory));
+            faults::gone(Step::Memory, old.memory);
+        }
+        self.free()
+            .filter(|&(found, _)| found == at)
+            .map(|(_, facing)| facing)
+            .ok_or(Error::StillInFlight)
+    }
+
+    /// The words the staging buffers hold now: the transfer buffer and each
+    /// slot's, in that order.
+    #[must_use]
+    pub fn staging(&self) -> Vec<usize> {
+        std::iter::once(&self.staging)
+            .chain(self.slots.iter().map(|slot| &slot.staging))
+            .map(|held| words_in(held.bytes))
+            .collect()
     }
 
     fn free(&self) -> Option<(usize, Facing)> {
