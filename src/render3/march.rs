@@ -375,6 +375,28 @@ impl World<'_> {
         false
     }
 
+    /// The first cell a ray from `origin` along `direction` meets of a kind
+    /// in `mask`, and the face it came in through, before it leaves the
+    /// grid; [`MISS`] and 0 when it meets none.
+    #[must_use]
+    pub fn found(&self, origin: [i32; 3], direction: [i32; 3], mask: u32) -> (u32, u32) {
+        let sides = sides(self.grid);
+        let Some(mut ray) = Ray::from(origin, direction).entered(sides) else {
+            return (MISS, 0);
+        };
+        for _ in 0..limit(self.grid) {
+            let (cell, kind, full) = self.kind_at(&ray);
+            if full && bit(mask, kind) {
+                return (cell, ray.face);
+            }
+            ray = if full { ray.stepped() } else { ray.jumped() };
+            if !ray.inside(sides) {
+                return (MISS, 0);
+            }
+        }
+        (MISS, 0)
+    }
+
     /// The first cell a ray sees, walked one wall at a time from its start
     /// with no brick read at all, and the face it came in through: what
     /// [`World::seen`] finds first, by the plain walk.
@@ -839,5 +861,47 @@ impl Reader {
         })?;
         let blocked = out.get(1).copied().unwrap_or(none);
         em.ne_u(blocked, 0)
+    }
+
+    /// The first cell a ray from `origin` along `direction` meets of a kind
+    /// in `mask`, and the face it came in through, as [`World::found`]
+    /// finds them. No ray is traced where `going` is false.
+    pub fn found(
+        &self,
+        em: &mut Em<'_>,
+        mask: Id,
+        (origin, direction): ([Id; 3], [Id; 3]),
+        going: Id,
+    ) -> Result<(Id, Id), LaneError> {
+        let grid = self.grid;
+        let start = Marching::from(em, origin, direction)?;
+        let (start, alive) = start.entered(em, sides(grid))?;
+        let alive = em.both(alive, going)?;
+        let alive = em.flag(alive)?;
+        let none = em.u(0)?;
+        let miss = em.u(MISS)?;
+        let mut initial = vec![alive, miss, none];
+        initial.extend(start.carried());
+        let out = em.looped(limit(grid), &initial, |em, words, _| {
+            let ray = start.with(words.get(3..).unwrap_or(&[]));
+            let get = |at: usize| words.get(at).copied().unwrap_or(none);
+            let (cell, kind, full) = self.read(em, &ray)?;
+            let wanted = em.bit(mask, kind)?;
+            let stops = em.both(full, wanted)?;
+            let found = em.pick(stops, cell, get(1))?;
+            let face = em.pick(stops, ray.face, get(2))?;
+            let moved = ray.advanced(em, full)?;
+            let inside = moved.inside(em, sides(grid))?;
+            let go = em.not(stops)?;
+            let go = em.both(go, inside)?;
+            let alive = em.flag(go)?;
+            let mut next = vec![alive, found, face];
+            next.extend(moved.carried());
+            Ok(next)
+        })?;
+        Ok((
+            out.get(1).copied().unwrap_or(miss),
+            out.get(2).copied().unwrap_or(none),
+        ))
     }
 }

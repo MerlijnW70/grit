@@ -8,13 +8,13 @@ use grit::compact::Plan;
 use grit::layout::{BINDINGS, Dimension, PARAMS, PIXELS, STATE};
 use grit::live;
 use grit::render3::march::{Ray, World, brick_of, index, sides};
-use grit::render3::occupancy::emission;
+use grit::render3::occupancy::{emission, watered};
 use grit::render3::post::develop;
 use grit::render3::volume::Volumes;
 use grit::render3::{
-    self, Build, Camera, FOG_WORDS, Frame, GAS_WORDS, HIT_WORDS, INSIDE, Layout, Light, MISS,
-    Material, Rays, STEEPEST, Screen, Shading, Table, UNIT, flags, framed_words, occupancy,
-    scene_words, stage,
+    self, BOUNCE_WORDS, BOUNCED, Build, Camera, FOG_WORDS, Frame, GAS_WORDS, HIT_WORDS, INSIDE,
+    Layout, Light, MISS, Material, Rays, STEEPEST, Screen, Shading, Table, UNIT, WATER_WORDS,
+    flags, framed_words, occupancy, scene_words, stage,
 };
 use grit::rule3::code::Code;
 use grit::rule3::heat::{self, Heat};
@@ -49,18 +49,41 @@ fn kinds(rule: &str) -> Kinds {
     Kinds::named(rule).unwrap()
 }
 
+/// A liquid of colour `colour` that deepens to `deep`.
+fn liquid(colour: u32, deep: u32) -> Material {
+    Material::solid(colour, 0.05)
+        .clear(0.8)
+        .surface(0.08, 0.02)
+        .detail(0.0, 0.5, 0.0, 0.0)
+        .liquid(deep)
+}
+
+/// An opaque kind of colour `colour` with every kind of fine detail.
+fn detailed(colour: u32, tint: u32) -> Material {
+    Material::solid(colour, 0.25)
+        .strata(0.2)
+        .surface(0.45, 0.05)
+        .detail(0.6, 0.6, 0.7, 0.5)
+        .mossy(0.6, tint)
+        .wets(0.8)
+        .sparkle(0.8)
+}
+
 /// A table that shows kind 0 as empty, and the other kinds as opaque, seen
-/// through, glowing, gas or empty, chosen by `seed`.
+/// through, glowing, gas, liquid, opaque with fine detail or empty, chosen
+/// by `seed`.
 fn table(kinds: Kinds, seed: u64) -> Table {
     let mut state = seed;
     let mut out = Table::empty();
     for kind in 1..=kinds.mask() {
         let colour = next(&mut state) as u32 & 0xFF_FFFF;
-        let material = match below(&mut state, 6) {
+        let material = match below(&mut state, 8) {
             0 => continue,
             1 => Material::solid(colour, 0.3).clear(0.7),
             2 => Material::solid(colour, 0.2).glowing(2.0),
             3 => Material::solid(colour, 0.0).gas(0.6),
+            4 => liquid(colour, colour ^ 0x40_4040),
+            5 => detailed(colour, colour ^ 0x30_5030),
             _ => Material::solid(colour, 0.25).strata(0.2).gap(0.1),
         };
         out = out.with(kind, material);
@@ -346,6 +369,24 @@ fn a_table_tells_which_kinds_are_seen_and_which_block_light() {
     assert_eq!(made.opaque(), 0b1000_0000_0000_0010);
     assert_eq!(made.words().len(), 16 * render3::MATERIAL_WORDS);
     assert!((made.material(1).albedo[0] - 1.0).abs() < 1e-6);
+    let wet = made
+        .with(4, liquid(0x30_8080, 0x10_3050))
+        .with(5, liquid(0x30_8080, 0x10_3050).clear(1.0))
+        .with(6, Material::solid(0x80_8080, 0.0).liquid(0x10_3050));
+    assert_eq!(
+        wet.liquids(),
+        0b101_0000,
+        "a liquid nobody sees is no liquid"
+    );
+    assert_eq!(made.liquids(), 0);
+    let words = wet.words();
+    let at = 4 * render3::MATERIAL_WORDS;
+    assert_eq!(words[at + render3::material::LIQUID], 1);
+    assert_eq!(
+        f32::from_bits(words[at + render3::material::ROUGH]),
+        0.08,
+        "the roughness is where the passes read it"
+    );
 }
 
 #[test]
@@ -654,7 +695,7 @@ fn the_shaded_picture_is_within_two_of_the_cpu_on_every_channel() {
                 let scene = framed_words(&made, &table, &frame, &light);
                 still.set(&table, &scene);
                 still.run(&VOLUMES);
-                still.run(&[stage::PRIMARY]);
+                still.run(&[stage::PRIMARY, stage::BOUNCE]);
                 let mut image = still.read(0, layout.words());
                 still.run(&AFTER);
                 let got = still.read(0, screen.pixels());
@@ -694,7 +735,7 @@ fn lit_world(grid: Grid, kinds: Kinds, seed: u64) -> (Table, Vec<u32>) {
         .with(1, Material::solid(0x80_8080, 0.2))
         .with(2, Material::solid(0xFF_7020, 0.4).glowing(2.0))
         .with(3, Material::solid(0x50_4840, 0.0).gas(0.6))
-        .with(4, Material::solid(0x30_60A0, 0.1).clear(0.8));
+        .with(4, liquid(0x30_60A0, 0x10_2040));
     let field = kinds.mask() << kinds.shift();
     let cells = clumped(grid, kinds, seed)
         .into_iter()
@@ -776,6 +817,16 @@ fn the_light_of_glowing_cells_and_the_gas_are_kept_a_brick_at_a_time_as_on_the_c
             "gas",
             &image[layout.gas()..layout.gas() + GAS_WORDS * bricks],
             &words(&gas),
+        );
+        let water = words(&watered(grid, held, &table, &cells));
+        check(
+            "water",
+            &image[layout.water()..layout.water() + WATER_WORDS * bricks],
+            &water,
+        );
+        assert!(
+            water.iter().any(|&share| f32::from_bits(share) > 0.0),
+            "no brick holds water"
         );
         let volumes = Volumes {
             grid,
@@ -1018,6 +1069,14 @@ fn running<R: Rule>(host: &Host, rule: &R, ran: &Ran) -> Vec<String> {
                 ran.name
             ));
         }
+        let water = watered(grid, held_kinds, &table, &cells);
+        let water: Vec<u32> = water.iter().map(|value| value.to_bits()).collect();
+        if all[layout.water()..layout.water() + water.len()] != water[..] {
+            wrong.push(format!(
+                "{} frame {frame}: the water of the bricks differs",
+                ran.name
+            ));
+        }
         let (glow, _) = emission(grid, held_kinds, &table, &cells);
         let given: Vec<u32> = glow.iter().map(|value| value.to_bits()).collect();
         let bricks_count = layout.bricks as usize;
@@ -1201,5 +1260,272 @@ fn a_quiet_world_rebuilds_no_brick() {
         got.iter().sum::<u32>(),
         bricks.iter().sum::<u32>(),
         table.visible()
+    );
+}
+
+/// A world of `grid` for the bounced rays: ground of kind 1 or 3, liquid of
+/// kind 2 over it up to `level` cells from the floor, and blocks of kind 1
+/// standing out of it, in words of `kinds`.
+fn lake(grid: Grid, kinds: Kinds, level: u32, seed: u64) -> Vec<u32> {
+    let mut state = seed;
+    let word = |kind: u32| kind << kinds.shift();
+    let mut cells = vec![0; grid.cells()];
+    let heights: Vec<u32> = (0..grid.wide * grid.tall)
+        .map(|_| 1 + below(&mut state, level + 2))
+        .collect();
+    for z in 0..grid.tall {
+        for x in 0..grid.wide {
+            let ground = heights[(z * grid.wide + x) as usize];
+            let stone = below(&mut state, 9) == 0;
+            let tall = if stone {
+                ground + 2 + below(&mut state, grid.deep - ground - 2)
+            } else {
+                ground
+            };
+            for up in 0..grid.deep {
+                let y = grid.deep - 1 - up;
+                let kind = if up < tall {
+                    if up % 3 == 0 { 3 } else { 1 }
+                } else if up < level {
+                    2
+                } else {
+                    0
+                };
+                cells[index(grid, [x, y, z]) as usize] = word(kind);
+            }
+        }
+    }
+    cells
+}
+
+/// Random rays from above a liquid's top at `level` cells from the floor of
+/// `grid`, aimed down at it, some with small whole directions so ties
+/// between axes are common.
+fn over_water(state: &mut u64, grid: Grid, screen: Screen, level: u32) -> Rays {
+    let sides = sides(grid);
+    let unit = UNIT as i32;
+    let surface = (grid.deep - level) as i32 * unit;
+    loop {
+        let tied = below(state, 4) == 0;
+        let origin = [
+            between(state, -(sides[0] as i32) * unit, 2 * sides[0] as i32 * unit),
+            between(state, -3 * sides[1] as i32 * unit, surface - unit),
+            between(state, -(sides[2] as i32) * unit, 2 * sides[2] as i32 * unit),
+        ];
+        let target = [
+            between(state, 0, sides[0] as i32 * unit - 1),
+            surface + between(state, 0, 2 * unit),
+            between(state, 0, sides[2] as i32 * unit - 1),
+        ];
+        let aim: [i32; 3] = std::array::from_fn(|axis| target[axis] - origin[axis]);
+        let longest = aim.iter().map(|v| v.abs()).max().unwrap_or(1).max(1);
+        let reach = (screen.wide + screen.high) as i32;
+        let (forward, small) = if tied {
+            (aim.map(|value| value.signum() * between(state, 1, 6)), 1)
+        } else {
+            let scale = f64::from(STEEPEST / 2) / f64::from(longest);
+            (
+                aim.map(|value| (f64::from(value) * scale) as i32),
+                STEEPEST / 8 / reach,
+            )
+        };
+        let made = Rays {
+            origin,
+            forward,
+            right: std::array::from_fn(|_| between(state, -small, small)),
+            up: std::array::from_fn(|_| between(state, -small, small)),
+        };
+        if made.fit(grid, screen) {
+            return made;
+        }
+    }
+}
+
+#[test]
+fn the_device_bounce_finds_the_cpu_cells_bit_for_bit_for_random_cameras_over_water() {
+    let Some(host) = device("render3 bounce") else {
+        return;
+    };
+    let width = host.width();
+    let screens = [Screen { wide: 37, high: 23 }, Screen { wide: 5, high: 3 }];
+    let mut state = 0xB0_0CE;
+    let mut wrong = Vec::new();
+    let (mut cameras, mut pixels, mut sent, mut mirrored, mut bent) = (0, 0, 0, 0, 0);
+    for (seed, rule) in RULES.into_iter().enumerate() {
+        let held = kinds(rule);
+        let table = Table::empty()
+            .with(1, Material::solid(0x80_7060, 0.2))
+            .with(2, liquid(0x30_A0A0, 0x10_3060))
+            .with(3, detailed(0x90_8070, 0x50_7040));
+        for (wide, deep, tall) in [(16, 16, 16), (32, 16, 8)] {
+            let grid = Grid::solid(wide, deep, tall).unwrap();
+            let level = deep / 2;
+            let cells = lake(grid, held, level, 0x1A4E + seed as u64);
+            let bricks = occupancy(grid, held, table.shown(), table.gases(), &cells);
+            let world = plain_world(grid, held, &table, &cells, &bricks);
+            for screen in screens {
+                let build = Build {
+                    grid,
+                    kinds: held,
+                    screen,
+                    subgroup: width,
+                    suns: 2,
+                };
+                let layout = build.layout();
+                let mut still = Still::new(&host, build, &cells);
+                for _ in 0..10 {
+                    let made = over_water(&mut state, grid, screen, level);
+                    let light = Light::evening(screen.high, 1.0);
+                    let frame = Frame {
+                        suns: light.sun_rays(1, 0.05),
+                        floor: 0.05,
+                        flags: flags::RESET,
+                        drawn: next(&mut state) as u32,
+                        ..Frame::default()
+                    };
+                    still.set(&table, &framed_words(&made, &table, &frame, &light));
+                    still.run(&[stage::FILLED]);
+                    still.run(&[stage::PRIMARY]);
+                    still.run(&[stage::BOUNCE]);
+                    let image = still.read(0, layout.words());
+                    let shading = Shading {
+                        world,
+                        screen,
+                        layout,
+                        pixels: &image,
+                        suns: 2,
+                        frame: 0,
+                    };
+                    let hits = &image[layout.hits()..layout.hits() + HIT_WORDS * screen.pixels()];
+                    if let Some(why) = first_difference(hits, &shading.hits(&made), HIT_WORDS) {
+                        wrong.push(format!("{rule} hits {made:?}: {why}"));
+                    }
+                    let want = shading.bounces().unwrap();
+                    let got =
+                        &image[layout.bounces()..layout.bounces() + BOUNCE_WORDS * screen.pixels()];
+                    if let Some(why) = first_difference(got, &want, BOUNCE_WORDS) {
+                        wrong.push(format!(
+                            "{rule} {wide}x{deep}x{tall} {}x{} drawn {} rays {made:?}: {why}",
+                            screen.wide, screen.high, frame.drawn
+                        ));
+                    }
+                    for words in want.chunks(BOUNCE_WORDS) {
+                        if words[1] & BOUNCED != 0 {
+                            sent += 1;
+                            mirrored += usize::from(words[0] != MISS);
+                            bent += usize::from(words[2] != MISS);
+                        }
+                    }
+                    cameras += 1;
+                    pixels += screen.pixels();
+                }
+            }
+        }
+    }
+    println!(
+        "width {width}: {cameras} cameras, {pixels} pixels, {sent} sent rays from water, {mirrored} mirrored rays met a cell, {bent} bent rays met the floor, {} differ from the CPU",
+        wrong.len()
+    );
+    assert!(sent > pixels / 10, "{sent} of {pixels} pixels sent rays");
+    assert!(
+        mirrored > 0 && mirrored < sent,
+        "{mirrored} of {sent} mirrored rays met a cell"
+    );
+    assert!(bent > sent / 2, "{bent} of {sent} bent rays met the floor");
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_liquid_top_sends_its_rays_from_the_point_met_and_mirrors_its_fall() {
+    let grid = Grid::solid(16, 16, 16).unwrap();
+    let held = kinds("sand");
+    let table = Table::empty()
+        .with(1, Material::solid(0x80_7060, 0.2))
+        .with(2, liquid(0x30_A0A0, 0x10_3060));
+    let mut cells = lake(grid, held, 8, 0x77);
+    let wet_column = (0..grid.wide * grid.tall)
+        .find(|&at| {
+            let (x, z) = (at % grid.wide, at / grid.wide);
+            (2..14).contains(&x)
+                && (2..14).contains(&z)
+                && held.of(cells[index(grid, [x, grid.deep - 8, z]) as usize]) == 2
+                && held.of(cells[index(grid, [x, grid.deep - 9, z]) as usize]) == 0
+        })
+        .unwrap();
+    let (x, z) = (wet_column % grid.wide, wet_column / grid.wide);
+    let roof = index(grid, [x, 1, z]);
+    for y in 0..grid.deep - 8 {
+        cells[index(grid, [x, y, z]) as usize] = 0;
+    }
+    cells[roof as usize] = 1 << held.shift();
+    let bricks = occupancy(grid, held, table.shown(), table.gases(), &cells);
+    let world = plain_world(grid, held, &table, &cells, &bricks);
+    let screen = Screen { wide: 1, high: 1 };
+    let unit = UNIT as i32;
+    let origin = [x as i32 * unit + 8, 3 * unit, z as i32 * unit + 8];
+    let forward = [12, 16000, -8];
+    let made = Rays {
+        origin,
+        forward,
+        right: [0; 3],
+        up: [0; 3],
+    };
+    let build = Build {
+        grid,
+        kinds: held,
+        screen,
+        subgroup: 4,
+        suns: 2,
+    };
+    let layout = build.layout();
+    let light = Light::evening(1, 1.0);
+    let mut pixels = vec![0; layout.words()];
+    pixels[layout.table()..layout.table() + table.words().len()].copy_from_slice(&table.words());
+    let scene = scene_words(&made, &table, &[], &light);
+    pixels[layout.scene()..layout.scene() + scene.len()].copy_from_slice(&scene);
+    let hit = world.seen(origin, forward);
+    pixels[layout.hits()..layout.hits() + HIT_WORDS].copy_from_slice(&hit);
+    let shading = Shading {
+        world,
+        screen,
+        layout,
+        pixels: &pixels,
+        suns: 2,
+        frame: 0,
+    };
+    let words = shading.bounces().unwrap();
+    assert_eq!(hit[1] & 7, 2, "the ray meets the liquid's top");
+    assert_eq!(held.of(cells[hit[0] as usize]), 2);
+    assert_ne!(words[1] & BOUNCED, 0, "the top of a liquid sends its rays");
+    assert_ne!(words[2], MISS, "the bent ray meets the floor");
+    let floor = held.of(cells[words[2] as usize]);
+    assert!(floor == 1 || floor == 3, "the bent ray stops at {floor}");
+    let point = |cell: u32| {
+        [
+            cell % grid.wide,
+            (cell / grid.wide) % grid.deep,
+            cell / (grid.wide * grid.deep),
+        ]
+    };
+    let met = point(hit[0]);
+    let floor_at = point(words[2]);
+    assert!(floor_at[1] > met[1], "the bent ray goes down");
+    assert_eq!(words[0], roof, "the mirrored ray goes back up to the roof");
+    let mut dry = cells.clone();
+    dry[hit[0] as usize] = 1 << held.shift();
+    let dry_bricks = occupancy(grid, held, table.shown(), table.gases(), &dry);
+    let dry_world = plain_world(grid, held, &table, &dry, &dry_bricks);
+    let dry_hit = dry_world.seen(origin, forward);
+    let mut dry_pixels = pixels.clone();
+    dry_pixels[layout.hits()..layout.hits() + HIT_WORDS].copy_from_slice(&dry_hit);
+    let dry_shading = Shading {
+        world: dry_world,
+        pixels: &dry_pixels,
+        ..shading
+    };
+    assert_eq!(
+        dry_shading.bounces().unwrap(),
+        vec![MISS, 0, MISS, 0],
+        "a top that is not liquid sends nothing"
     );
 }

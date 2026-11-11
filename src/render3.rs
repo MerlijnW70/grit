@@ -18,6 +18,9 @@
 //!   walk ([`march`]) that crosses empty bricks in one jump. It keeps the
 //!   first cell it sees and, past cells it can see through, the first it
 //!   cannot, and gathers the light of the gas it crosses on the way.
+//! - [`bounce`] sends two more rays from each pixel whose first cell is the
+//!   top of a liquid: one mirrored off the surface, one bent into it, each
+//!   by the same integer march, so the CPU finds the same cells.
 //! - [`shade()`] lights what each pixel sees: a sun traced through the grid
 //!   from each corner of the face, ambient occlusion from the cells around
 //!   the face, the light of glowing cells nearby, a sky, colour that varies
@@ -35,6 +38,7 @@
 //! material. The camera is [`Rays`], whole numbers, so where a ray lands is
 //! exact and the CPU finds the same cell ([`march::World::seen`]).
 
+mod detail;
 pub mod emit;
 pub mod march;
 pub mod occupancy;
@@ -51,7 +55,7 @@ use crate::view3::{Kinds, PALETTE};
 
 pub use self::occupancy::{filled, occupancy, occupied};
 pub use self::post::{bloom_across, bloom_down, bloom_up, composite, resolve};
-pub use self::shade::{Shading, primary, shade};
+pub use self::shade::{Shading, bounce, primary, shade};
 pub use self::volume::{lit_across, lit_deep, lit_down, sunlit};
 
 /// A ray's start is held in sixteenths of a cell.
@@ -80,7 +84,18 @@ pub const SUNS: usize = 4;
 pub const FLOOR_RAYS: usize = 16;
 
 /// The words of a kind in the material table.
-pub const MATERIAL_WORDS: usize = 10;
+pub const MATERIAL_WORDS: usize = 26;
+
+/// The words a pixel's bounced rays take: the cell the mirrored ray meets
+/// and its face, then the cell the bent ray meets and its face.
+pub const BOUNCE_WORDS: usize = 4;
+
+/// The bit of a bounced face word that tells the pixel sent its rays.
+pub const BOUNCED: u32 = 8;
+
+/// The words of a brick's water: the share of its cells that are liquid,
+/// and the share that are liquid with open air beside them.
+pub const WATER_WORDS: usize = 2;
 
 /// The words a pixel's hits take: the first cell seen and its face and run,
 /// then the first cell that cannot be seen through, and its face and run.
@@ -144,8 +159,10 @@ pub mod scene {
     pub const SHOWN: usize = SUN_RAYS + 3 * super::SUNS;
     pub const GAS: usize = SHOWN + 1;
     pub const GLOWING: usize = GAS + 1;
+    /// The kinds drawn as a liquid.
+    pub const LIQUID: usize = GLOWING + 1;
     /// The bits of [`super::flags`].
-    pub const FLAGS: usize = GLOWING + 1;
+    pub const FLAGS: usize = LIQUID + 1;
     /// A count the host raises every frame it draws.
     pub const DRAWN: usize = FLAGS + 1;
     /// [`super::FLOOR_RAYS`] whole-number directions toward the sun, spread
@@ -244,8 +261,8 @@ pub const fn brick_sides(grid: Grid) -> [u32; 3] {
 /// occupancy, the brick claims, the light each brick gives off, the share
 /// of each brick that is gas, the light of glowing cells spread over the
 /// bricks (two halfway steps, then the result), how much sun reaches each
-/// brick through the gas, a stamp an oct, and the frame the light last
-/// changed.
+/// brick through the gas, a stamp an oct, the frame the light last
+/// changed, the water of each brick, and the bounced rays of each pixel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     pub screen: Screen,
@@ -366,10 +383,22 @@ impl Layout {
         self.active() + self.octs as usize
     }
 
+    /// The water of each brick, [`WATER_WORDS`] a brick.
+    #[must_use]
+    pub const fn water(self) -> usize {
+        self.changed() + 1
+    }
+
+    /// The bounced rays of each pixel, [`BOUNCE_WORDS`] a pixel.
+    #[must_use]
+    pub const fn bounces(self) -> usize {
+        self.water() + WATER_WORDS * self.bricks as usize
+    }
+
     /// The words `PIXELS` holds for the picture.
     #[must_use]
     pub const fn words(self) -> usize {
-        self.changed() + 1
+        self.bounces() + BOUNCE_WORDS * self.pixels()
     }
 
     /// `sizes` with `PIXELS` grown to [`Layout::words`].
@@ -627,7 +656,20 @@ impl Camera {
 /// - `strata`: how much its colour changes from one layer of cells to the
 ///   next, so a cut through it shows bands;
 /// - `gap`: the share of a cell's face, at its rim, that is dark, so cells
-///   of a kind side by side stay apart.
+///   of a kind side by side stay apart;
+/// - `rough`: how rough its surface is, from 0, a mirror, to 1, matte;
+/// - `shine`: the share of light it reflects head on;
+/// - `grain`: how much a fine noise over its surface varies its colour;
+/// - `bump`: how much that noise tilts the light across a face;
+/// - `cracks`: how dark the thin lines of a ridged noise run over it;
+/// - `streak`: how far its noise is drawn out up and down, from 0, even,
+///   toward 1, long streaks;
+/// - `moss`, `tint`: how much of its surface turns `tint` where it faces
+///   away from the sun or lies near water, and in patches;
+/// - `wets`: how much darker and shinier it gets next to water;
+/// - `sparkle`: how often its surface glints in the sun;
+/// - `liquid`: drawn as a liquid: its top mirrors and bends light, its
+///   colour deepens to `deep` with the water a ray crosses, and it foams.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Material {
     pub albedo: [f32; 3],
@@ -637,6 +679,18 @@ pub struct Material {
     pub gas: bool,
     pub strata: f32,
     pub gap: f32,
+    pub rough: f32,
+    pub shine: f32,
+    pub grain: f32,
+    pub bump: f32,
+    pub cracks: f32,
+    pub streak: f32,
+    pub moss: f32,
+    pub tint: [f32; 3],
+    pub wets: f32,
+    pub sparkle: f32,
+    pub liquid: bool,
+    pub deep: [f32; 3],
 }
 
 impl Material {
@@ -649,21 +703,41 @@ impl Material {
         gas: false,
         strata: 0.0,
         gap: 0.0,
+        rough: 1.0,
+        shine: 0.0,
+        grain: 0.0,
+        bump: 0.0,
+        cracks: 0.0,
+        streak: 0.0,
+        moss: 0.0,
+        tint: [0.0; 3],
+        wets: 0.0,
+        sparkle: 0.0,
+        liquid: false,
+        deep: [0.0; 3],
     };
+
+    /// The linear light of `rgb`, an sRGB triple.
+    #[must_use]
+    pub fn linear(rgb: u32) -> [f32; 3] {
+        let channel = |shift: u32| (((rgb >> shift) & 0xFF) as f32 / 255.0).powf(2.2);
+        [channel(16), channel(8), channel(0)]
+    }
 
     /// An opaque kind of colour `rgb`, an sRGB triple, whose cells vary by
     /// `jitter`.
     #[must_use]
     pub fn solid(rgb: u32, jitter: f32) -> Self {
-        let channel = |shift: u32| (((rgb >> shift) & 0xFF) as f32 / 255.0).powf(2.2);
+        let albedo = Self::linear(rgb);
         Self {
-            albedo: [channel(16), channel(8), channel(0)],
+            albedo,
             jitter,
-            glow: 0.0,
             clear: 0.0,
-            gas: false,
-            strata: 0.0,
-            gap: 0.0,
+            rough: 0.9,
+            shine: 0.04,
+            tint: albedo,
+            deep: albedo,
+            ..Self::EMPTY
         }
     }
 
@@ -700,8 +774,57 @@ impl Material {
         self
     }
 
+    /// The surface as rough as `rough`, reflecting `shine` of the light
+    /// head on.
+    #[must_use]
+    pub const fn surface(mut self, rough: f32, shine: f32) -> Self {
+        self.rough = rough;
+        self.shine = shine;
+        self
+    }
+
+    /// Its fine detail: `grain` of colour, `bump` of tilt, `cracks` and
+    /// `streak`.
+    #[must_use]
+    pub const fn detail(mut self, grain: f32, bump: f32, cracks: f32, streak: f32) -> Self {
+        self.grain = grain;
+        self.bump = bump;
+        self.cracks = cracks;
+        self.streak = streak;
+        self
+    }
+
+    /// Moss or lichen of colour `rgb`, an sRGB triple, over `moss` of it.
+    #[must_use]
+    pub fn mossy(mut self, moss: f32, rgb: u32) -> Self {
+        self.moss = moss;
+        self.tint = Self::linear(rgb);
+        self
+    }
+
+    #[must_use]
+    pub const fn wets(mut self, wets: f32) -> Self {
+        self.wets = wets;
+        self
+    }
+
+    #[must_use]
+    pub const fn sparkle(mut self, sparkle: f32) -> Self {
+        self.sparkle = sparkle;
+        self
+    }
+
+    /// The kind as a liquid whose colour deepens to `rgb`, an sRGB triple.
+    #[must_use]
+    pub fn liquid(mut self, rgb: u32) -> Self {
+        self.liquid = true;
+        self.deep = Self::linear(rgb);
+        self
+    }
+
     fn words(self) -> [u32; MATERIAL_WORDS] {
-        [
+        let mut out = [0; MATERIAL_WORDS];
+        let values = [
             self.albedo[0].to_bits(),
             self.albedo[1].to_bits(),
             self.albedo[2].to_bits(),
@@ -711,8 +834,27 @@ impl Material {
             u32::from(self.gas),
             self.strata.to_bits(),
             self.gap.to_bits(),
-            0,
-        ]
+            self.rough.to_bits(),
+            self.shine.to_bits(),
+            self.grain.to_bits(),
+            self.bump.to_bits(),
+            self.cracks.to_bits(),
+            self.streak.to_bits(),
+            self.moss.to_bits(),
+            self.tint[0].to_bits(),
+            self.tint[1].to_bits(),
+            self.tint[2].to_bits(),
+            self.wets.to_bits(),
+            self.sparkle.to_bits(),
+            u32::from(self.liquid),
+            self.deep[0].to_bits(),
+            self.deep[1].to_bits(),
+            self.deep[2].to_bits(),
+        ];
+        for (slot, value) in out.iter_mut().zip(values) {
+            *slot = value;
+        }
+        out
     }
 }
 
@@ -725,6 +867,18 @@ pub mod material {
     pub const GAS: usize = 6;
     pub const STRATA: usize = 7;
     pub const GAP: usize = 8;
+    pub const ROUGH: usize = 9;
+    pub const SHINE: usize = 10;
+    pub const GRAIN: usize = 11;
+    pub const BUMP: usize = 12;
+    pub const CRACKS: usize = 13;
+    pub const STREAK: usize = 14;
+    pub const MOSS: usize = 15;
+    pub const TINT: usize = 16;
+    pub const WETS: usize = 19;
+    pub const SPARKLE: usize = 20;
+    pub const LIQUID: usize = 21;
+    pub const DEEP: usize = 22;
 }
 
 /// A material for every kind a [`Kinds`] mapping gives.
@@ -790,6 +944,12 @@ impl Table {
     #[must_use]
     pub fn glowing(&self) -> u32 {
         self.mask(|material| material.glow > 0.0)
+    }
+
+    /// The kinds drawn as a liquid, a bit each: seen, and liquid.
+    #[must_use]
+    pub fn liquids(&self) -> u32 {
+        self.mask(|material| material.liquid) & self.visible()
     }
 
     /// The table as the words `PIXELS` holds from [`Layout::table`] on.
@@ -1061,6 +1221,7 @@ pub fn framed_words(rays: &Rays, table: &Table, frame: &Frame, light: &Light) ->
     put(scene::SHOWN, table.shown());
     put(scene::GAS, table.gases());
     put(scene::GLOWING, table.glowing());
+    put(scene::LIQUID, table.liquids());
     put(scene::FLAGS, frame.flags);
     put(scene::DRAWN, frame.drawn);
     for (at, sun) in frame.suns.iter().take(SUNS).enumerate() {
@@ -1084,7 +1245,9 @@ pub fn framed_words(rays: &Rays, table: &Table, frame: &Frame, light: &Light) ->
 
 /// What the passes need to know when they are built: the grid, how its
 /// words map to kinds, the screen, the subgroup width, and how many sun
-/// rays a corner traces.
+/// rays a corner traces. With one sun ray, the light is the plain one of a
+/// low quality: it leaves out the fine detail of surfaces, their gloss,
+/// glints and caustics, and the rays and foam of a liquid's top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Build {
     pub grid: Grid,
@@ -1128,13 +1291,14 @@ pub mod stage {
     pub const LIT_DEEP: usize = 3;
     pub const SUNLIT: usize = 4;
     pub const PRIMARY: usize = 5;
-    pub const SHADE: usize = 6;
-    pub const RESOLVE: usize = 7;
-    pub const BLOOM_DOWN: usize = 8;
-    pub const BLOOM_ACROSS: usize = 9;
-    pub const BLOOM_UP: usize = 10;
-    pub const COMPOSITE: usize = 11;
-    pub const COUNT: usize = 12;
+    pub const BOUNCE: usize = 6;
+    pub const SHADE: usize = 7;
+    pub const RESOLVE: usize = 8;
+    pub const BLOOM_DOWN: usize = 9;
+    pub const BLOOM_ACROSS: usize = 10;
+    pub const BLOOM_UP: usize = 11;
+    pub const COMPOSITE: usize = 12;
+    pub const COUNT: usize = 13;
     pub const NAMES: [&str; COUNT] = [
         "filled",
         "lit_across",
@@ -1142,6 +1306,7 @@ pub mod stage {
         "lit_deep",
         "sunlit",
         "primary",
+        "bounce",
         "shade",
         "resolve",
         "bloom_down",
@@ -1167,6 +1332,7 @@ impl Build {
             lit_deep(self)?,
             sunlit(self)?,
             primary(self)?,
+            bounce(self)?,
             shade(self)?,
             resolve(self)?,
             bloom_down(self)?,
@@ -1200,6 +1366,7 @@ impl Build {
             vec![lamp],
             vec![lamp],
             vec![if steps.sunlit { bricks } else { none }],
+            vec![pixels],
             vec![pixels],
             vec![pixels],
             vec![pixels],

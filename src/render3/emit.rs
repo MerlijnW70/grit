@@ -8,6 +8,14 @@ use simdr::spec::{Glsl, LoopControl, SelectionControl};
 
 const LOGICAL_NOT: u16 = 168;
 
+/// A branch [`Em::open`] opened: the block before it and the block it
+/// merges into.
+#[derive(Debug, Clone, Copy)]
+pub struct Opened {
+    before: Id,
+    merge: Id,
+}
+
 /// The kernel being written, with the scalar types it uses.
 pub struct Em<'held> {
     pub kernel: &'held mut Kernel<U32>,
@@ -405,6 +413,79 @@ impl<'held> Em<'held> {
                 self.kernel
                     .module()
                     .phi(uint, &[(yes, finished), (no, before)])?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Opens a branch that runs only on the invocations where `when` holds,
+    /// until [`Em::close`].
+    pub fn open(&mut self, when: Id) -> Result<Opened, LaneError> {
+        let before = self
+            .kernel
+            .module()
+            .current_block()
+            .ok_or(LaneError::NoOpenBlock { arm: "before" })?;
+        let taken = self.kernel.module().alloc_id()?;
+        let merge = self.kernel.module().alloc_id()?;
+        self.kernel
+            .module()
+            .selection_merge(merge, SelectionControl::DontFlatten)?;
+        self.kernel
+            .module()
+            .branch_conditional(when, taken, merge)?;
+        self.kernel.module().label_at(taken)?;
+        Ok(Opened { before, merge })
+    }
+
+    /// Closes the branch `opened`: the floats `given` where it ran, else
+    /// `otherwise`, which must be made before it was opened.
+    pub fn close(
+        &mut self,
+        opened: Opened,
+        given: &[Id],
+        otherwise: &[Id],
+    ) -> Result<Vec<Id>, LaneError> {
+        let float = self.float;
+        self.closed(opened, (given, otherwise), float)
+    }
+
+    /// [`Em::close`] for words.
+    pub fn close_words(
+        &mut self,
+        opened: Opened,
+        given: &[Id],
+        otherwise: &[Id],
+    ) -> Result<Vec<Id>, LaneError> {
+        let uint = self.uint;
+        self.closed(opened, (given, otherwise), uint)
+    }
+
+    fn closed(
+        &mut self,
+        opened: Opened,
+        (given, otherwise): (&[Id], &[Id]),
+        float: Id,
+    ) -> Result<Vec<Id>, LaneError> {
+        if given.len() != otherwise.len() {
+            return Err(LaneError::BadCarry {
+                given: given.len(),
+                wanted: otherwise.len(),
+            });
+        }
+        let finished = self
+            .kernel
+            .module()
+            .current_block()
+            .ok_or(LaneError::NoOpenBlock { arm: "then" })?;
+        self.kernel.module().branch(opened.merge)?;
+        self.kernel.module().label_at(opened.merge)?;
+        let mut out = Vec::with_capacity(given.len());
+        for (&yes, &no) in given.iter().zip(otherwise) {
+            out.push(
+                self.kernel
+                    .module()
+                    .phi(float, &[(yes, finished), (no, opened.before)])?,
             );
         }
         Ok(out)

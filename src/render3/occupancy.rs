@@ -1,6 +1,6 @@
-//! Which bricks hold a cell anyone sees or gas, how much of each is gas and
-//! how much light its glowing cells give off, kept current from the octs
-//! the engine steps.
+//! Which bricks hold a cell anyone sees or gas, how much of each is gas,
+//! how much light its glowing cells give off and how much of it is water,
+//! kept current from the octs the engine steps.
 
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
@@ -8,8 +8,8 @@ use simdr::module::Id;
 
 use super::emit::Em;
 use super::{
-    BRICK_BITS, Build, GAS_WORDS, GASSY, MATERIAL_WORDS, Table, material, of, put, refuse, scene,
-    word,
+    BRICK_BITS, Build, GAS_WORDS, GASSY, MATERIAL_WORDS, Table, WATER_WORDS, material, of, put,
+    refuse, scene, word,
 };
 use crate::layout::{BINDINGS, DENSE, GRAND, PARAMS, PIXELS, STATE};
 use crate::sand::Grid;
@@ -52,12 +52,13 @@ fn kernel(subgroup: u32) -> Result<Kernel<U32>, LaneError> {
 }
 
 /// The kinds a rebuild reads from the scene: those a brick counts as full
-/// for, the gases and the glowing kinds.
+/// for, the gases, the glowing kinds and the liquids.
 #[derive(Debug, Clone, Copy)]
 struct Masks {
     shown: Id,
     gases: Id,
     glowing: Id,
+    liquid: Id,
 }
 
 impl Masks {
@@ -67,14 +68,15 @@ impl Masks {
             shown: em.load_u(PIXELS, base + word(scene::SHOWN))?,
             gases: em.load_u(PIXELS, base + word(scene::GAS))?,
             glowing: em.load_u(PIXELS, base + word(scene::GLOWING))?,
+            liquid: em.load_u(PIXELS, base + word(scene::LIQUID))?,
         })
     }
 }
 
 /// Emits the rebuild of the brick at `at`, given as its coordinates, whose
-/// index is `brick`: its occupancy word, its share of gas and the light it
-/// gives off. When the light changed, the frame plus one goes into
-/// [`super::Layout::changed`].
+/// index is `brick`: its occupancy word, its share of gas, the light it
+/// gives off and its water. When the light changed, the frame plus one goes
+/// into [`super::Layout::changed`].
 fn rebuilt(
     em: &mut Em<'_>,
     build: &Build,
@@ -103,7 +105,7 @@ fn rebuilt(
     let table = em.u(word(layout.table()))?;
     let size = em.u(word(MATERIAL_WORDS))?;
     let initial = [
-        one, none, none, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
+        one, none, none, nothing, nothing, nothing, nothing, nothing, nothing, nothing, none, none,
     ];
     let out = em.looped(CELLS, &initial, |em, words, run| {
         let get = |at: usize| words.get(at).copied().unwrap_or(none);
@@ -111,11 +113,16 @@ fn rebuilt(
         let y = em.shr(run, BRICK_BITS)?;
         let y = em.and_u(y, SIDE - 1)?;
         let y = em.shl(y, wide)?;
-        let z = em.shr(run, 2 * BRICK_BITS)?;
-        let z = em.shl(z, wide + deep)?;
+        let z_in = em.shr(run, 2 * BRICK_BITS)?;
+        let z = em.shl(z_in, wide + deep)?;
         let cell = em.add(first, x)?;
         let cell = em.add(cell, y)?;
         let cell = em.add(cell, z)?;
+        let column = em.add(corner[0], x)?;
+        let height = em.shr(run, BRICK_BITS)?;
+        let height = em.and_u(height, SIDE - 1)?;
+        let height = em.add(corner[1], height)?;
+        let row = em.add(corner[2], z_in)?;
         let held = em.load(STATE, cell)?;
         let kind = em.shr(held, kinds.shift())?;
         let kind = em.and_u(kind, kinds.mask())?;
@@ -175,9 +182,20 @@ fn rebuilt(
             }
             Ok(out)
         })?;
+        let liquid = em.bit(masks.liquid, kind)?;
+        let wet = em.flag(liquid)?;
+        let wet = em.add(get(10), wet)?;
+        let open = em.when(liquid, &[none], |em| {
+            let open = open_beside(em, build, masks, cell, [column, height, row])?;
+            Ok(vec![em.flag(open)?])
+        })?;
+        let open = open.first().copied().unwrap_or(none);
+        let spray = em.add(get(11), open)?;
         let mut next = vec![one, seen, gas];
         next.extend(light);
         next.extend(thick);
+        next.push(wet);
+        next.push(spray);
         Ok(next)
     })?;
     let get = |at: usize| out.get(at).copied().unwrap_or(none);
@@ -222,7 +240,86 @@ fn rebuilt(
         em.store(PIXELS, at, stamp)?;
         Ok(Vec::new())
     })?;
+    let water = em.u(word(layout.water()))?;
+    let size = em.u(word(WATER_WORDS))?;
+    let start = em.mul(brick, size)?;
+    let start = em.add(water, start)?;
+    for field in 0..WATER_WORDS {
+        let count = em.to_float(get(10 + field))?;
+        let value = em.fmul(count, share)?;
+        let value = em.float_bits(value)?;
+        let step = em.u(word(field))?;
+        let into = em.add(start, step)?;
+        em.store(PIXELS, into, value)?;
+    }
     Ok(())
+}
+
+/// Whether a liquid cell at `cell`, at `[column, height, row]` of the grid,
+/// falls free: it is not on the grid's floor, the cell under it is liquid
+/// or of no kind in `shown`, and a cell beside it along x or z inside the
+/// grid is of no kind in `shown` and has none under it either: open air
+/// it can spray into.
+fn open_beside(
+    em: &mut Em<'_>,
+    build: &Build,
+    masks: Masks,
+    cell: Id,
+    [column, height, row]: [Id; 3],
+) -> Result<Id, LaneError> {
+    let grid = build.grid;
+    let kinds = build.kinds;
+    let shown = masks.shown;
+    let none = em.u(0)?;
+    let bottom = em.u(grid.deep - 1)?;
+    let floored = em.eq(height, bottom)?;
+    let lower_step = em.u(grid.wide)?;
+    let lower = em.add(cell, lower_step)?;
+    let lower = em.pick(floored, cell, lower)?;
+    let under = em.load(STATE, lower)?;
+    let under = em.shr(under, kinds.shift())?;
+    let under = em.and_u(under, kinds.mask())?;
+    let held_up = em.bit(shown, under)?;
+    let wet_under = em.bit(masks.liquid, under)?;
+    let dry_under = em.not(wet_under)?;
+    let held_up = em.both(held_up, dry_under)?;
+    let rests = em.either(floored, held_up)?;
+    let free = em.not(rests)?;
+    let mut open = em.ne(none, none)?;
+    let plane = grid.wide.trailing_zeros() + grid.deep.trailing_zeros();
+    for (along, step, side) in [(column, 1_u32, grid.wide), (row, 1 << plane, grid.tall)] {
+        let last = em.u(side - 1)?;
+        let stride = em.u(step)?;
+        for low in [true, false] {
+            let inside = if low {
+                em.ne(along, none)?
+            } else {
+                em.ne(along, last)?
+            };
+            let at = if low {
+                em.sub(cell, stride)?
+            } else {
+                em.add(cell, stride)?
+            };
+            let at = em.pick(inside, at, cell)?;
+            let held = em.load(STATE, at)?;
+            let kind = em.shr(held, kinds.shift())?;
+            let kind = em.and_u(kind, kinds.mask())?;
+            let seen = em.bit(shown, kind)?;
+            let empty = em.not(seen)?;
+            let empty = em.both(empty, inside)?;
+            let beneath = em.add(at, lower_step)?;
+            let beneath = em.pick(floored, at, beneath)?;
+            let below = em.load(STATE, beneath)?;
+            let below = em.shr(below, kinds.shift())?;
+            let below = em.and_u(below, kinds.mask())?;
+            let below = em.bit(shown, below)?;
+            let drop = em.not(below)?;
+            let drop = em.both(drop, empty)?;
+            open = em.either(open, drop)?;
+        }
+    }
+    em.both(open, free)
 }
 
 /// The pass that rebuilds every brick's word, one brick a lane; dispatch
@@ -370,4 +467,66 @@ pub fn emission(grid: Grid, kinds: Kinds, table: &Table, cells: &[u32]) -> (Vec<
         }
     }
     (light, gas)
+}
+
+/// The water of each brick of `grid`, [`WATER_WORDS`] a brick: the share of
+/// its cells of a liquid kind, and the share that fall free: above a cell
+/// of a liquid or of no kind `table` shows, inside the grid, and with a
+/// cell of no kind it shows beside them along x or z inside the grid, and
+/// none it shows under that one: what
+/// the rebuild writes from [`super::Layout::water`] on.
+#[must_use]
+pub fn watered(grid: Grid, kinds: Kinds, table: &Table, cells: &[u32]) -> Vec<f32> {
+    let count = super::bricks(grid) as usize;
+    let liquid = table.liquids();
+    let shown = table.shown();
+    let mut out = vec![0.0_f32; WATER_WORDS * count];
+    let [across, down, _] = super::brick_sides(grid);
+    let kind_at = |x: u32, y: u32, z: u32| {
+        let at = ((z * grid.deep + y) * grid.wide + x) as usize;
+        kinds.of(cells.get(at).copied().unwrap_or(0))
+    };
+    let bit = |mask: u32, kind: u32| (mask >> (kind & 31)) & 1 == 1;
+    for brick in 0..count {
+        let brick_word = super::word(brick);
+        let bx = brick_word % across;
+        let by = (brick_word / across) % down;
+        let bz = brick_word / (across * down);
+        let mut wet = 0_u32;
+        let mut spray = 0_u32;
+        for run in 0..CELLS {
+            let x = (bx << BRICK_BITS) + (run & (SIDE - 1));
+            let y = (by << BRICK_BITS) + ((run >> BRICK_BITS) & (SIDE - 1));
+            let z = (bz << BRICK_BITS) + (run >> (2 * BRICK_BITS));
+            if !bit(liquid, kind_at(x, y, z)) {
+                continue;
+            }
+            wet += 1;
+            let rests = y + 1 >= grid.deep || {
+                let under = kind_at(x, y + 1, z);
+                bit(shown, under) && !bit(liquid, under)
+            };
+            if rests {
+                continue;
+            }
+            let beside = [
+                (x > 0).then(|| (x - 1, z)),
+                (x + 1 < grid.wide).then(|| (x + 1, z)),
+                (z > 0).then(|| (x, z - 1)),
+                (z + 1 < grid.tall).then(|| (x, z + 1)),
+            ];
+            let open = |(at_x, at_z): (u32, u32)| {
+                !bit(shown, kind_at(at_x, y, at_z)) && !bit(shown, kind_at(at_x, y + 1, at_z))
+            };
+            if beside.into_iter().flatten().any(open) {
+                spray += 1;
+            }
+        }
+        for (field, value) in [wet, spray].into_iter().enumerate() {
+            if let Some(slot) = out.get_mut(WATER_WORDS * brick + field) {
+                *slot = value as f32 * (1.0 / CELLS as f32);
+            }
+        }
+    }
+    out
 }
