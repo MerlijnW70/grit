@@ -96,6 +96,7 @@ struct Asked {
     open: bool,
     slots: Option<u32>,
     at: Option<[u32; 2]>,
+    paused: bool,
 }
 
 fn asked() -> Result<Asked, Failed> {
@@ -131,6 +132,7 @@ fn asked() -> Result<Asked, Failed> {
         open: false,
         slots: None,
         at: None,
+        paused: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(one) = args.next() {
@@ -197,11 +199,12 @@ fn asked() -> Result<Asked, Failed> {
             "--generate" => held.generate = Some(value()?.parse()?),
             "--clean" => held.clean = true,
             "--active" => held.active = true,
+            "--paused" => held.paused = true,
             "--help-panel" => held.help = true,
             "--measure" => held.measure = true,
             other => {
                 return Err(format!(
-                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code|open, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle, --readback, --timed N, --engine, --sparse, --open, --at X,Z, --slots N and --generate SIDE; --size takes SIDE or WIDExDEEPxTALL"
+                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code|open, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --paused, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle, --readback, --timed N, --engine, --sparse, --open, --at X,Z, --slots N and --generate SIDE; --size takes SIDE or WIDExDEEPxTALL"
                 )
                 .into());
             }
@@ -599,7 +602,7 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
     let mut play = Play {
         rig: Rig::new(home(asked, asked.which, session.grid()), session.grid()),
         tool: asked.tool,
-        paused: false,
+        paused: asked.paused,
         active: asked.active,
         help: asked.help,
         pressed_at: None,
