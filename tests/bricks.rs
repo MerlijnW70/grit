@@ -603,6 +603,8 @@ struct Run {
     mode: Mode,
     listed_dense: u64,
     listed_sparse: u64,
+    freeing: u32,
+    taking: u32,
     bricks: u32,
     freed: u32,
     lowest: u32,
@@ -659,6 +661,8 @@ fn agree_in<R: Rule>(
                 mode,
                 listed_dense: 0,
                 listed_sparse: 0,
+                freeing: 0,
+                taking: 0,
                 bricks: sparse.bricks.count(),
                 freed: 0,
                 lowest: opened.held,
@@ -716,7 +720,10 @@ fn agree_in<R: Rule>(
                     run.listed_sparse += covered.len() as u64;
                 }
                 let now = sparse.held_bricks();
-                run.freed += u32::try_from(held_before.difference(&now).count()).unwrap();
+                let freed = u32::try_from(held_before.difference(&now).count()).unwrap();
+                run.freed += freed;
+                run.freeing += u32::from(freed > 0);
+                run.taking += u32::from(now.difference(&held_before).next().is_some());
                 held_before = now;
                 let used = sparse.bricks.check(&mut sparse.held).unwrap();
                 run.lowest = run.lowest.min(used.held);
@@ -1248,10 +1255,12 @@ fn packing_keeps_every_word_and_holds_only_mixed_bricks() {
 
 #[test]
 fn a_pool_is_refused_by_name_for_a_flat_plan_a_small_grid_or_no_slot() {
-    let named = |built: Result<Bricks, LaneError>, why: &str| match built {
-        Err(LaneError::NoSuchForm { because, .. }) => assert_eq!(because, why),
-        other => panic!("expected {why:?}, got {other:?}"),
-    };
+    fn named<T: std::fmt::Debug>(built: Result<T, LaneError>, why: &str) {
+        match built {
+            Err(LaneError::NoSuchForm { because, .. }) => assert_eq!(because, why),
+            other => panic!("expected {why:?}, got {other:?}"),
+        }
+    }
     let width = 32;
     let (grid, _) = grids(64, 64, 32);
     let plan = plan_of(width, grid);
@@ -1264,4 +1273,314 @@ fn a_pool_is_refused_by_name_for_a_flat_plan_a_small_grid_or_no_slot() {
     let other = Plan::over_in(width, plan.blocks * 2, Dimension::Three).unwrap();
     named(Bricks::new(grid, &other, 4), bricks::UNPLANNED);
     named(Bricks::new(grid, &plan, u32::MAX), bricks::TOO_MANY_SLOTS);
+    let vast = Plan::bricked(width, plan.blocks).unwrap();
+    assert!(vast.is_bricked());
+    named(
+        live::arranged3(width, grid, &vast, true).map(|_| ()),
+        live::BRICKED_PLAN,
+    );
+    named(
+        live::wired3_by(&Sand, width, grid, &vast).map(|_| ()),
+        live::BRICKED_PLAN,
+    );
+    assert!(Bricks::new(grid, &vast, 4).is_ok());
+}
+
+fn torrent(grid: Grid3, side: [u32; 3], seed: u64) -> Vec<u32> {
+    let mut state = seed;
+    let mut cells = vec![sand2::AIR; grid.cells()];
+    let apart = side[1] + side[1] / 2 + 1;
+    let mut y = 0;
+    while y + apart <= grid.deep {
+        for z in 0..grid.tall {
+            for x in 0..grid.wide {
+                if !next(&mut state).is_multiple_of(6) {
+                    cells[grid.index(x, y, z)] = sand2::SAND;
+                }
+            }
+        }
+        y += apart;
+    }
+    cells
+}
+
+#[test]
+fn sheets_falling_around_the_torus_take_and_free_bricks_every_few_frames() {
+    let name = "bricks torrent";
+    let Some(host) = device(name) else {
+        return;
+    };
+    let shape = world_for(host.width());
+    let frames = 96;
+    let (grid, _) = grids(shape.0, shape.1, shape.2);
+    let every = side_of(host.width(), grid)[1];
+    let start = |grid: Grid3, side: [u32; 3], seed: u64| torrent(grid, side, seed);
+    let runs = agree(&host, &sand(), shape, &start, frames);
+    for run in &runs {
+        if run.mode == Mode::Whole {
+            continue;
+        }
+        assert!(
+            run.freeing * every >= frames && run.taking * every >= frames,
+            "{name} {:?}: bricks were freed in {} and taken in {} of {frames} frames",
+            run.mode,
+            run.freeing,
+            run.taking
+        );
+    }
+}
+
+struct Region {
+    from: [u32; 3],
+    side: [u32; 3],
+    cells: Vec<u32>,
+}
+
+impl Region {
+    fn index(&self, point: [u32; 3]) -> Option<usize> {
+        let mut at = 0_usize;
+        let mut stride = 1_usize;
+        for ((&value, &from), &side) in point.iter().zip(&self.from).zip(&self.side) {
+            let local = value.checked_sub(from).filter(|&local| local < side)?;
+            at += local as usize * stride;
+            stride *= side as usize;
+        }
+        Some(at)
+    }
+
+    fn step<R: Rule>(&mut self, rule: &R, frame: u32) {
+        let phase = frame & 1;
+        let low = self.from.map(|from| from / 2);
+        let high = [0, 1, 2].map(|axis| (self.from[axis] + self.side[axis]) / 2 + 1);
+        for qz in low[2]..high[2] {
+            for qy in low[1]..high[1] {
+                for qx in low[0]..high[0] {
+                    let base = [qx * 2 + phase, qy * 2 + phase, qz * 2 + phase];
+                    let corners = [
+                        [0, 0, 0],
+                        [1, 0, 0],
+                        [0, 0, 1],
+                        [1, 0, 1],
+                        [0, 1, 0],
+                        [1, 1, 0],
+                        [0, 1, 1],
+                        [1, 1, 1],
+                    ]
+                    .map(|[dx, dy, dz]| self.index([base[0] + dx, base[1] + dy, base[2] + dz]));
+                    if corners.iter().any(Option::is_none) {
+                        continue;
+                    }
+                    let places = corners.map(Option::unwrap_or_default);
+                    let words = places.map(|place| self.cells[place]);
+                    let ruled = rule.step(grit::rule3::Oct {
+                        words,
+                        frame,
+                        at: [qx, qy, qz],
+                        params: &[],
+                    });
+                    for (place, word) in places.into_iter().zip(ruled.out) {
+                        self.cells[place] = word;
+                    }
+                }
+            }
+        }
+    }
+
+    fn rim_is(&self, calm: u32, margin: u32) -> bool {
+        (0..self.cells.len()).all(|at| {
+            let fine = {
+                let mut rest = at;
+                let mut inner = true;
+                for &side in &self.side {
+                    let local = (rest % side as usize) as u32;
+                    rest /= side as usize;
+                    inner &= local >= margin && local + margin < side;
+                }
+                inner || self.cells[at] == calm
+            };
+            if !fine {
+                let x = at % self.side[0] as usize;
+                let y = (at / self.side[0] as usize) % self.side[1] as usize;
+                let z = at / (self.side[0] * self.side[1]) as usize;
+                println!("rim cell {x} {y} {z} holds {:#x}", self.cells[at]);
+            }
+            fine
+        })
+    }
+}
+
+fn vast_for(host: &Host) -> (Grid, Plan, [u32; 3]) {
+    let width = host.width();
+    let per_block = sweep::cells(width);
+    let k = per_block.trailing_zeros();
+    let sides = [2 << k.div_ceil(3), 2 << ((k + 1) / 3), 2 << (k / 3)];
+    let scanned = Plan::most_blocks(width, Dimension::Three);
+    let dispatched = u64::from(host.limits().groups) * u64::from(width) / u64::from(per_block);
+    let cells_most = 1_u64 << 33;
+    let brick_cells = u64::from(per_block) * 8;
+    let mut bricks = scanned.min(dispatched).min(cells_most / brick_cells);
+    bricks = 1 << (63 - bricks.leading_zeros());
+    let mut lattice = [4_u64, 4, 4];
+    let mut axis = 0;
+    while lattice.iter().product::<u64>() < bricks {
+        lattice[[0, 2][axis % 2]] *= 2;
+        axis += 1;
+    }
+    let shape = [0, 1, 2].map(|at| u32::try_from(lattice[at]).unwrap() * sides[at]);
+    let grid = Grid::solid(shape[0], shape[1], shape[2]).unwrap();
+    let plan = Plan::bricked(
+        width,
+        u32::try_from(lattice.iter().product::<u64>()).unwrap(),
+    )
+    .unwrap();
+    (grid, plan, sides)
+}
+
+#[test]
+fn a_world_past_the_u32_cell_index_steps_its_region_to_the_cpu_reference() {
+    let name = "bricks vast";
+    let Some(host) = device(name) else {
+        return;
+    };
+    let width = host.width();
+    let (grid, plan, side) = vast_for(&host);
+    let cells = grid.cells() as u64;
+    let most = Plan::most_blocks(width, Dimension::Three) * u64::from(plan.per_block) * 8;
+    let groups = u64::from(host.limits().groups) * u64::from(width) * 8;
+    if most > 1 << 32 && groups > 1 << 32 {
+        assert!(cells > 1 << 32, "{name}: {cells} cells");
+    }
+    let bricks = Bricks::new(grid, &plan, 64).unwrap();
+    let lattice = bricks.lattice();
+    let from = [side[0], side[1], (lattice[2] - 3) * side[2]];
+    let span = [side[0] * 2, side[1] * 2, side[2] * 2];
+    let margin = 2;
+    let mut region = Region {
+        from,
+        side: span,
+        cells: vec![sand2::AIR; span.iter().map(|&at| at as usize).product()],
+    };
+    let floor = span[1] - margin - 1;
+    for z in margin..span[2] - margin {
+        for y in margin..span[1] - margin {
+            for x in margin..span[0] - margin {
+                let wall = y == floor
+                    || x == margin
+                    || x + margin + 1 == span[0]
+                    || z == margin
+                    || z + margin + 1 == span[2];
+                let pile = y > margin
+                    && y < margin + 1 + span[1] / 4
+                    && x >= span[0] / 2 - 2
+                    && x < span[0] / 2 + 2
+                    && z > margin
+                    && z + margin + 1 < span[2];
+                let at = region
+                    .index([from[0] + x, from[1] + y, from[2] + z])
+                    .unwrap();
+                if wall {
+                    region.cells[at] = sand2::WALL;
+                } else if pile {
+                    region.cells[at] = sand2::SAND | ((x * 7 + y * 3 + z) % 128) << 2;
+                }
+            }
+        }
+    }
+    let first_cell = u64::from(from[2]) * u64::from(grid.wide) * u64::from(grid.deep);
+    println!(
+        "{name} {} width {width}: {}x{}x{} = {cells} cells, {} bricks, region from cell index {first_cell}",
+        host.name(),
+        grid.wide,
+        grid.deep,
+        grid.tall,
+        bricks.count()
+    );
+    let per = bricks.cells();
+    for coarse in [false, true] {
+        let (passes, stages) = bricks::arranged(&Sand, &bricks, &plan, coarse).unwrap();
+        let sizes = bricks.sizes(&Sand, &plan);
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let mut held = host.resident(&sizes, &modules).unwrap();
+        clear(&mut held, &sizes);
+        held.write(PARAMS as usize, &[u32::MAX]).unwrap();
+        let start = region.cells.clone();
+        let packed = bricks
+            .compose(|brick| {
+                let point = bricks.point_of(brick, 0);
+                if region.index(point).is_none() {
+                    return bricks::Content::Uniform(sand2::AIR);
+                }
+                bricks::Content::Mixed(
+                    (0..per)
+                        .map(|offset| {
+                            let at = bricks.point_of(brick, u32::try_from(offset).unwrap());
+                            start[region.index(at).unwrap()]
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap();
+        bricks.write_packed(&mut held, &plan, &packed).unwrap();
+        bricks.seed(&mut held, &plan).unwrap();
+        let mut want = region.cells.clone();
+        let mut reference = Region {
+            from,
+            side: span,
+            cells: start,
+        };
+        let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
+        let mut most_held = 0;
+        let poured = [
+            from[0] + span[0] / 2,
+            from[1] + margin + 1,
+            from[2] + span[2] / 2,
+        ];
+        for frame in 0..64 {
+            if frame == 48 {
+                bricks.put_at(&mut held, &[(poured, sand2::SAND)]).unwrap();
+                let place = reference.index(poured).unwrap();
+                reference.cells[place] = sand2::SAND;
+                let listed = bricks.listed(&mut held).unwrap();
+                assert!(listed.0 > 0, "{name}: the write woke nothing");
+            }
+            held.staged(&groups).unwrap();
+            reference.step(&Sand, frame);
+            assert!(
+                reference.rim_is(sand2::AIR, margin),
+                "{name}: frame {frame}: the reference reached the region's rim"
+            );
+            let used = bricks.check(&mut held).unwrap();
+            most_held = most_held.max(used.held);
+            let (table, pool) = bricks.raw(&mut held).unwrap();
+            for brick in 0..bricks.count() {
+                let corner = bricks.point_of(brick, 0);
+                let content = bricks.brick_words(&table, &pool, brick);
+                if region.index(corner).is_none() {
+                    assert_eq!(
+                        content,
+                        bricks::Content::Uniform(sand2::AIR),
+                        "{name} coarse {coarse}: frame {frame}: brick {brick} at {corner:?} left the air"
+                    );
+                    continue;
+                }
+                for offset in 0..per {
+                    let at = bricks.point_of(brick, u32::try_from(offset).unwrap());
+                    let word = match &content {
+                        bricks::Content::Uniform(value) => *value,
+                        bricks::Content::Mixed(words) => words[offset],
+                    };
+                    let place = region.index(at).unwrap();
+                    want[place] = reference.cells[place];
+                    assert_eq!(
+                        word, want[place],
+                        "{name} coarse {coarse}: frame {frame}: cell {at:?}, brick {brick}"
+                    );
+                }
+            }
+        }
+        assert_ne!(reference.cells, region.cells, "{name}: nothing moved");
+        println!(
+            "{name} coarse {coarse}: 64 frames equal on the region and uniform air elsewhere, a grain written at {poured:?} after frame 47; at most {most_held} bricks held"
+        );
+    }
 }

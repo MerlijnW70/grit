@@ -96,6 +96,12 @@ pub struct Packed {
     pub held: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Content {
+    Uniform(u32),
+    Mixed(Vec<u32>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell<W> {
     pub brick: W,
@@ -510,18 +516,44 @@ impl Bricks {
             });
         }
         let per = self.cells();
-        let mut table = vec![0_u32; self.table_words()];
-        let mut pool = Vec::new();
-        let mut held = 0_u32;
-        let mut words = vec![0_u32; per];
-        for brick in 0..self.count() {
+        self.compose(|brick| {
+            let mut words = vec![0_u32; per];
             for (offset, word) in (0_u32..).zip(words.iter_mut()) {
                 let point = self.point_of(brick, offset);
                 let at = Solid::cell(grid, point) as usize;
                 *word = cells.get(at).copied().unwrap_or_default();
             }
-            let first = words.first().copied().unwrap_or_default();
+            Content::Mixed(words)
+        })
+    }
+
+    pub fn compose<F>(&self, mut content: F) -> Result<Packed, Error>
+    where
+        F: FnMut(u32) -> Content,
+    {
+        let per = self.cells();
+        let mut table = vec![0_u32; self.table_words()];
+        let mut pool = Vec::new();
+        let mut held = 0_u32;
+        for brick in 0..self.count() {
             let entry = brick as usize * ENTRY;
+            let words = match content(brick) {
+                Content::Uniform(value) => {
+                    if let Some(slot) = table.get_mut(entry..entry + 2) {
+                        slot.copy_from_slice(&[UNIFORM, value]);
+                    }
+                    continue;
+                }
+                Content::Mixed(words) => words,
+            };
+            if words.len() != per {
+                return Err(Error::Overrun {
+                    index: STATE as usize,
+                    needed: per,
+                    held: words.len(),
+                });
+            }
+            let first = words.first().copied().unwrap_or_default();
             if words.iter().all(|&word| word == first) {
                 if let Some(slot) = table.get_mut(entry..entry + 2) {
                     slot.copy_from_slice(&[UNIFORM, first]);
@@ -550,6 +582,25 @@ impl Bricks {
         })
     }
 
+    pub fn raw(&self, held: &mut Resident<'_>) -> Result<(Vec<u32>, Vec<u32>), Error> {
+        let table = held.read(self.table() as usize, self.table_words())?;
+        let pool = live::read_state(held, self.windows, self.scratch())?;
+        Ok((table, pool))
+    }
+
+    #[must_use]
+    pub fn brick_words(&self, table: &[u32], pool: &[u32], brick: u32) -> Content {
+        let entry = brick as usize * ENTRY;
+        let slot = table.get(entry).copied().unwrap_or(UNIFORM);
+        let value = table.get(entry + VALUE).copied().unwrap_or_default();
+        if slot == UNIFORM {
+            return Content::Uniform(value);
+        }
+        let per = self.cells();
+        let from = slot as usize * per;
+        Content::Mixed(pool.get(from..from + per).unwrap_or_default().to_vec())
+    }
+
     pub fn write(
         &self,
         held: &mut Resident<'_>,
@@ -557,6 +608,15 @@ impl Bricks {
         cells: &[u32],
     ) -> Result<PoolUse, Error> {
         let packed = self.pack(cells)?;
+        self.write_packed(held, plan, &packed)
+    }
+
+    pub fn write_packed(
+        &self,
+        held: &mut Resident<'_>,
+        plan: &Plan,
+        packed: &Packed,
+    ) -> Result<PoolUse, Error> {
         held.write(self.table() as usize, &packed.table)?;
         held.write(self.slots() as usize, &packed.slots)?;
         live::write_state(held, self.windows, 0, &packed.pool)?;
