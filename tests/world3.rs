@@ -1116,6 +1116,15 @@ fn a_fixed_script_of_calls_reads_the_same_twice_and_on_every_card() {
     assert_eq!(first, SCRIPT_HASH, "{first:#018x}");
 }
 
+fn bricked(width: u32, size: [u32; 3]) -> (u32, [u32; 3]) {
+    let grid = grit::sand::Grid::solid(size[0], size[1], size[2]).unwrap();
+    let plan =
+        grit::compact::Plan::bricked(width, grid.blocks().div_ceil(grit::sweep::cells(width)))
+            .unwrap();
+    let bricks = grit::bricks::Bricks::new(grid, &plan, 1).unwrap();
+    (bricks.count(), bricks.sides())
+}
+
 fn created_with(
     server: &mut Server<'_>,
     rule: &str,
@@ -1184,7 +1193,14 @@ fn a_sparse_world_through_the_tools_steps_as_the_dense_one_and_reports_its_pool(
         };
         let mut server = Server::new(Some(&host));
         let dense = created(&mut server, rule.name(), size, &params);
-        let made = created_with(&mut server, rule.name(), size, &params, ",\"sparse\":true");
+        let (bricks, _) = bricked(host.width(), size);
+        let made = created_with(
+            &mut server,
+            rule.name(),
+            size,
+            &params,
+            &format!(",\"sparse\":true,\"slots\":{bricks}"),
+        );
         let sparse = made.counted("world").unwrap();
         assert_eq!(made.get("sparse"), Some(&Json::Bool(true)));
         let (_, free, capacity, overflow, lost) = pool_of(&made);
@@ -1300,8 +1316,10 @@ fn a_sparse_world_without_room_refuses_a_write_and_stops_with_its_pool_full() {
         ));
         assert_eq!(numbers(&got, "cells"), vec![0; 64], "{corner}");
     }
-    let grains: Vec<(u32, u32, u32, u32)> = (0..8)
-        .flat_map(|x| (0..4).map(move |z| (x + 4, 2, z + 2, grit::sand::SAND)))
+    let (_, sides) = bricked(host.width(), size);
+    let (across, along) = (sides[0].min(8), sides[2].min(4));
+    let grains: Vec<(u32, u32, u32, u32)> = (0..across)
+        .flat_map(|x| (0..along).map(move |z| (x + sides[0], 2, z + sides[2], grit::sand::SAND)))
         .collect();
     let wrote = answer(&call(
         &mut server,
