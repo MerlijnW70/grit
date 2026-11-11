@@ -1236,7 +1236,12 @@ fn a_sparse_world_through_the_tools_steps_as_the_dense_one_and_reports_its_pool(
             assert!(!overflow && !lost, "{}", rule.name());
             frame += frames;
             let want = stepped(rule.name(), grid, &start, &params, 0, frame);
-            assert_eq!(read_layers(&mut server, dense, size), want, "{}", rule.name());
+            assert_eq!(
+                read_layers(&mut server, dense, size),
+                want,
+                "{}",
+                rule.name()
+            );
             assert_eq!(
                 read_layers(&mut server, sparse, size),
                 want,
