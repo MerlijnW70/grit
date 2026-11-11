@@ -343,7 +343,7 @@ pub(crate) struct Given<'held> {
 /// Where each corner of [`Grid3::corners`] lies among the corners of
 /// [`Solid::corners`], whose bits run x, y, z where the reference's run
 /// x, z, y.
-const REFERENCE: [usize; CORNERS] = [0, 1, 4, 5, 2, 3, 6, 7];
+pub(crate) const REFERENCE: [usize; CORNERS] = [0, 1, 4, 5, 2, 3, 6, 7];
 
 type Word<const LANES: u32> = Vector<U32, LANES>;
 

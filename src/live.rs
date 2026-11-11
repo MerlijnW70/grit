@@ -372,7 +372,11 @@ const fn solid(operation: &'static str, grid: Grid) -> Result<(), LaneError> {
     }
 }
 
-fn fits(operation: &'static str, grid: Grid, plan: &crate::compact::Plan) -> Result<(), LaneError> {
+pub(crate) fn fits(
+    operation: &'static str,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+) -> Result<(), LaneError> {
     solid(operation, grid)?;
     if plan.dimension != Dimension::Three {
         return Err(LaneError::NoSuchForm {
@@ -446,17 +450,39 @@ pub fn arranged3_by<R: Rule>(
     plan: &crate::compact::Plan,
     coarse: bool,
 ) -> Result<Loop, LaneError> {
-    use crate::Groups;
-    use crate::layout::HOT_DENSE;
-    use crate::sweep::COUNTS;
-
     fits("live::arranged3", grid, plan)?;
 
-    let (listed, hot) = if coarse {
+    let mut stages: Stages = vec![
+        opening3(rule, subgroup, plan, coarse)?,
+        vec![(
+            settle3_in(rule, subgroup, grid, plan.windows())?,
+            crate::compact::Plan::listed(),
+        )],
+    ];
+    stages.extend(closing3(subgroup, grid, plan, coarse)?);
+    Ok(staged(stages))
+}
+
+pub(crate) fn tiers(plan: &crate::compact::Plan, coarse: bool) -> (Over, crate::Groups) {
+    use crate::layout::HOT_DENSE;
+
+    if coarse {
         (Over::Listed(HOT_DENSE), crate::compact::Plan::hot_listed())
     } else {
-        (Over::Every, Groups::Fixed(plan.blocks))
-    };
+        (Over::Every, crate::Groups::Fixed(plan.blocks))
+    }
+}
+
+pub(crate) fn opening3<R: Rule>(
+    rule: &R,
+    subgroup: u32,
+    plan: &crate::compact::Plan,
+    coarse: bool,
+) -> Result<Vec<(Vec<u32>, crate::Groups)>, LaneError> {
+    use crate::Groups;
+    use crate::sweep::COUNTS;
+
+    let (listed, hot) = tiers(plan, coarse);
     let tiles = Groups::Fixed(plan.tiles);
     let one = Groups::Fixed(1);
 
@@ -468,13 +494,20 @@ pub fn arranged3_by<R: Rule>(
         (unclaimed(subgroup, plan)?, one),
     ];
     first.extend(totals_wiped(subgroup, plan)?);
-    let mut stages: Stages = vec![
-        first,
-        vec![(
-            settle3_in(rule, subgroup, grid, plan.windows())?,
-            crate::compact::Plan::listed(),
-        )],
-    ];
+    Ok(first)
+}
+
+pub(crate) fn closing3(
+    subgroup: u32,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+    coarse: bool,
+) -> Result<Stages, LaneError> {
+    use crate::Groups;
+
+    let (listed, hot) = tiers(plan, coarse);
+    let tiles = Groups::Fixed(plan.tiles);
+    let mut stages: Stages = Vec::new();
     if coarse {
         stages.push(vec![(
             mark_below(subgroup, Tier::COARSE, Over::Every, plan.blocks)?,
@@ -504,7 +537,7 @@ pub fn arranged3_by<R: Rule>(
             Groups::Counting(1),
         ),
     ]);
-    Ok(staged(stages))
+    Ok(stages)
 }
 
 /// Writes `cells` (each a cell index and its new word) into the world of a
@@ -906,7 +939,8 @@ pub fn wipe3(subgroup: u32, words: usize) -> Result<Vec<u32>, LaneError> {
 pub fn wipe_counts(subgroup: u32, counts: u32) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let reach = crate::compact::reaching(&[counts]);
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, reach))?;
     let uint = kernel.index_type();
 
     let block = kernel.workgroup_index();
@@ -1347,11 +1381,11 @@ fn listed3<const LANES: u32, R: Rule>(
 }
 
 /// What a 3D frame adds to `TALLY`, as [`tally3`] takes it.
-struct Tallied3<'held, const LANES: u32> {
-    counted: &'held [Vector<U32, LANES>],
-    at: [Vector<U32, LANES>; 3],
-    inside: Vector<U32, LANES>,
-    weighted: bool,
+pub(crate) struct Tallied3<'held, const LANES: u32> {
+    pub counted: &'held [Vector<U32, LANES>],
+    pub at: [Vector<U32, LANES>; 3],
+    pub inside: Vector<U32, LANES>,
+    pub weighted: bool,
 }
 
 /// Adds a 3D frame's counts to `TALLY`, as [`crate::rule3::Tally`] lays
@@ -1359,7 +1393,7 @@ struct Tallied3<'held, const LANES: u32> {
 /// when weighted, the first count weighted by each axis of its oct shifted
 /// down by [`COARSE`](crate::layout::COARSE), and the octs whose first
 /// count is not zero.
-fn tally3<const LANES: u32>(
+pub(crate) fn tally3<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     what: Tallied3<'_, LANES>,
 ) -> Result<(), LaneError> {
@@ -1554,10 +1588,10 @@ pub fn wake<const LANES: u32>(
     woken::<LANES, 2, 4, 9>(kernel, block, [holding, inside], dump_base)
 }
 
-struct Block<const LANES: u32, const AXES: usize> {
-    subgroup: u32,
-    grid: Grid,
-    at: [Vector<U32, LANES>; AXES],
+pub(crate) struct Block<const LANES: u32, const AXES: usize> {
+    pub subgroup: u32,
+    pub grid: Grid,
+    pub at: [Vector<U32, LANES>; AXES],
 }
 
 /// Wakes every block of [`Space::near`] around `block`, in a world of any
@@ -1569,6 +1603,34 @@ fn woken<const LANES: u32, const AXES: usize, const CORNERS: usize, const NEAR: 
     dump_base: simdr::module::Id,
 ) -> Result<(), LaneError> {
     let Block { subgroup, grid, at } = block;
+    woken_by::<LANES, AXES, CORNERS, NEAR, _>(
+        kernel,
+        Block { subgroup, grid, at },
+        [holding, inside],
+        dump_base,
+        |lanes, offset| {
+            Space::<AXES, CORNERS, NEAR>::neighbour(&mut Emit::<LANES>(lanes), grid, at, offset)
+        },
+    )
+}
+
+pub(crate) fn woken_by<
+    const LANES: u32,
+    const AXES: usize,
+    const CORNERS: usize,
+    const NEAR: usize,
+    F,
+>(
+    kernel: &mut Kernel<U32>,
+    block: Block<LANES, AXES>,
+    [holding, inside]: [Vector<U32, LANES>; 2],
+    dump_base: simdr::module::Id,
+    mut numbered: F,
+) -> Result<(), LaneError>
+where
+    F: FnMut(&mut Lanes<'_>, [u32; AXES]) -> Result<Vector<U32, LANES>, LaneError>,
+{
+    let Block { subgroup, grid, .. } = block;
     let lane = kernel.local_index();
     let group = kernel.workgroup_index();
 
@@ -1576,12 +1638,7 @@ fn woken<const LANES: u32, const AXES: usize, const CORNERS: usize, const NEAR: 
         let slot = {
             let mut lanes = kernel.lanes()?;
             let none = lanes.splat_bits::<U32, LANES>(0)?;
-            let flag = Space::<AXES, CORNERS, NEAR>::neighbour(
-                &mut Emit::<LANES>(&mut lanes),
-                grid,
-                at,
-                offset,
-            )?;
+            let flag = numbered(&mut lanes, offset)?;
 
             let base = lanes.splat_id::<U32, LANES>(dump_base)?;
             let mine = lanes.splat_id::<U32, LANES>(group)?;
@@ -1658,7 +1715,8 @@ fn marked<const LANES: u32>(
 ) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let reach = crate::compact::over_reach(tier, over);
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, reach))?;
     let uint = kernel.index_type();
 
     let block = owned(&mut kernel, over)?;

@@ -47,10 +47,42 @@ impl Tier {
     };
 }
 
+#[must_use]
+pub fn reaching(bindings: &[u32]) -> u32 {
+    bindings
+        .iter()
+        .map(|binding| binding.saturating_add(1))
+        .fold(BINDINGS, u32::max)
+}
+
+impl Tier {
+    #[must_use]
+    pub fn reach(&self) -> u32 {
+        reaching(&[
+            self.flags,
+            self.buckets,
+            self.counts,
+            self.bases,
+            self.totals,
+            self.dense,
+            self.grand,
+            self.indirect,
+        ])
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Over {
     Every,
     Listed(u32),
+}
+
+#[must_use]
+pub fn over_reach(tier: Tier, over: Over) -> u32 {
+    match over {
+        Over::Every => tier.reach(),
+        Over::Listed(binding) => tier.reach().max(binding.saturating_add(1)),
+    }
 }
 
 pub(crate) fn owned(kernel: &mut Kernel<U32>, over: Over) -> Result<Id, LaneError> {
@@ -405,7 +437,11 @@ fn scanned<const LANES: u32>(subgroup: u32, at: Scanning) -> Result<Vec<u32>, La
         alone,
         along,
     } = at;
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let mut held = vec![from, into, aggregate];
+    if let Some((totals, grand)) = alone {
+        held.extend([totals, grand]);
+    }
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, reaching(&held)))?;
     let uint = kernel.index_type();
 
     let block = kernel.workgroup_index();
@@ -510,7 +546,7 @@ fn gathered<const LANES: u32>(
     over: Over,
     (dump, upper): (u32, Option<u32>),
 ) -> Result<Vec<u32>, LaneError> {
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, over_reach(tier, over)))?;
     let uint = kernel.index_type();
 
     let block = owned(&mut kernel, over)?;
@@ -662,7 +698,7 @@ fn prepared<const LANES: u32>(
     per_group: u32,
     tier: Tier,
 ) -> Result<Vec<u32>, LaneError> {
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, tier.reach()))?;
     let per_block = per_group.max(1);
 
     let head = kernel.module().constant_u32(0)?;
