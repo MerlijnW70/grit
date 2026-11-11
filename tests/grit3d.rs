@@ -7,6 +7,9 @@ use common::device;
 #[path = "../src/bin/grit3d/font.rs"]
 #[allow(dead_code)]
 mod font;
+#[path = "../src/bin/grit3d/life.rs"]
+#[allow(dead_code)]
+mod life;
 #[path = "../src/bin/grit3d/scenes.rs"]
 #[allow(dead_code)]
 mod scenes;
@@ -16,11 +19,15 @@ mod session;
 #[path = "../src/bin/grit3d/ui.rs"]
 #[allow(dead_code)]
 mod ui;
+#[path = "../src/bin/grit3d/valley.rs"]
+#[allow(dead_code)]
+mod valley;
 
 use grit::render3::{Camera, Screen, Steps};
 use grit::rule3::Rule;
 use grit::rule3::code::Code;
 use grit::rule3::heat::Heat;
+use grit::rule3::nature::Nature;
 use grit::rule3::sand::Sand;
 use grit::sand::Grid;
 use grit::sand3::{self, Grid3};
@@ -44,10 +51,29 @@ fn warmed(which: Which) -> Vec<u32> {
     let example = which.example();
     let grid = Grid::solid(SIDE, SIDE, SIDE).unwrap();
     let mut cells = (example.scene)(grid);
+    let feed = fed(which);
     for frame in 0..example.warm {
+        feeding(&feed, frame, &mut cells);
         cells = stepped(which, frame, &cells, &example.params);
     }
     cells
+}
+
+/// The cells `which` writes before every step its feed is due at.
+fn fed(which: Which) -> Vec<(u32, u32)> {
+    let example = which.example();
+    let grid = Grid::solid(SIDE, SIDE, SIDE).unwrap();
+    example
+        .feed
+        .map_or_else(Vec::new, |made| made(grid, &(example.scene)(grid)))
+}
+
+fn feeding(feed: &[(u32, u32)], frame: u32, cells: &mut [u32]) {
+    if frame.is_multiple_of(valley::FEED_EVERY) {
+        for &(cell, word) in feed {
+            cells[cell as usize] = word;
+        }
+    }
 }
 
 fn stepped(which: Which, frame: u32, cells: &[u32], params: &[u32]) -> Vec<u32> {
@@ -56,6 +82,7 @@ fn stepped(which: Which, frame: u32, cells: &[u32], params: &[u32]) -> Vec<u32> 
         sand3::reference(rule, grid, frame, cells, params)
     }
     match which {
+        Which::Valley => one(&Nature, grid, frame, cells, params),
         Which::Sand => one(&Sand, grid, frame, cells, params),
         Which::Fire => one(&Heat, grid, frame, cells, params),
         Which::Code => one(&Code, grid, frame, cells, params),
@@ -81,6 +108,7 @@ fn switching_or_restarting_a_scene_starts_it_as_the_rule_runs_it_from_its_world(
         (Which::Sand, Which::Fire),
         (Which::Fire, Which::Code),
         (Which::Code, Which::Sand),
+        (Which::Sand, Which::Valley),
         (Which::Fire, Which::Fire),
     ] {
         let mut before = Session::open(&host, setup(from)).unwrap();
@@ -124,6 +152,7 @@ fn a_tool_stroke_goes_through_put3_and_the_listed_engine_stays_equal_to_the_whol
         let mut cells = session.state().unwrap();
         let camera = looking(&session);
         let params = session.example.params.clone();
+        let feed = fed(which);
         let mut strokes = 0;
         for at in 0..12_u32 {
             if at % 3 == 1 {
@@ -152,6 +181,7 @@ fn a_tool_stroke_goes_through_put3_and_the_listed_engine_stays_equal_to_the_whol
             let frame = session.steps;
             session.aim(&camera, false, at == 0).unwrap();
             session.frame(true, Steps::KEPT, false).unwrap();
+            feeding(&feed, frame, &mut cells);
             cells = stepped(which, frame, &cells, &params);
             let got = session.state().unwrap();
             if got != cells {
