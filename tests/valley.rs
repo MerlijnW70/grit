@@ -23,10 +23,12 @@ mod ui;
 #[allow(dead_code)]
 mod valley;
 
+use grit::layout::PARAMS;
 use grit::render3::Screen;
+use grit::rule3::FIRST_PARAM;
 use grit::rule3::nature::{
-    self, AIR, ASH, EARTH, FIRE, GRANULAR, KINDS, LEAVES, Nature, ROCK, SAND, SMOKE, SNOW, STEAM,
-    WATER, WOOD,
+    self, AIR, ASH, CHAR, EARTH, FIRE, GRANULAR, KINDS, LEAVES, Nature, ROCK, SAND, SMOKE, SNOW,
+    STEAM, WATER, WOOD,
 };
 use grit::sand::Grid;
 use grit::sand3::{self, Grid3};
@@ -34,7 +36,7 @@ use grit::sand3::{self, Grid3};
 use life::{Act, Cycle, Phase};
 use scenes::Which;
 use session::{COUNT_EVERY, Session, Setup};
-use valley::{AMBIENT, FEED_EVERY, SEED};
+use valley::{AMBIENT, FEED_EVERY, SEED, SUN};
 
 /// The side of the valley the engine tests run on.
 const SIDE: u32 = 64;
@@ -139,6 +141,13 @@ fn the_valley_is_a_world_the_nature_rule_can_run() {
                             under_air.min(nature::DEEPEST),
                             "{side}^3 ({x},{y},{z}): the air counts the air under it wrong"
                         );
+                        let open =
+                            (0..y).all(|over| nature::kind_of(cells[at(side, x, over, z)]) == AIR);
+                        assert_eq!(
+                            nature::sky_of(word),
+                            open,
+                            "{side}^3 ({x},{y},{z}): the sky bit is not the column's"
+                        );
                         under_air += 1;
                     } else {
                         under_air = 0;
@@ -215,7 +224,7 @@ impl Cpu {
         };
         for _ in 0..example.warm {
             cpu.fed();
-            cpu.cells = sand3::reference(&Nature, cpu.grid3, cpu.steps, &cpu.cells, &[]);
+            cpu.cells = sand3::reference(&Nature, cpu.grid3, cpu.steps, &cpu.cells, &[SUN]);
             cpu.steps += 1;
         }
         cpu.start = cpu.cells.clone();
@@ -232,7 +241,7 @@ impl Cpu {
 
     fn step(&mut self) {
         self.fed();
-        self.cells = sand3::reference(&Nature, self.grid3, self.steps, &self.cells, &[]);
+        self.cells = sand3::reference(&Nature, self.grid3, self.steps, &self.cells, &[SUN]);
         self.steps += 1;
         let counted = (self.life.phase == Phase::Burning && self.steps.is_multiple_of(COUNT_EVERY))
             .then(|| burning(&self.cells));
@@ -361,6 +370,100 @@ fn the_fire_starts_by_itself_burns_out_and_the_valley_starts_again() {
     assert!(restarted, "the valley did not start again");
 }
 
+/// The falling water within a sixteenth of the side of the waterfall's lip
+/// or of its pool, in plan.
+fn falling_at_the_fall(side: u32, cells: &[u32]) -> usize {
+    let place = |at: [f32; 2]| ((at[0] * side as f32) as i64, (at[1] * side as f32) as i64);
+    let reach = i64::from(side / 16);
+    let (lip, pool) = (place(valley::LIP), place(valley::POOL));
+    (0..cells.len())
+        .filter(|&index| nature::falling_of(cells[index]))
+        .filter(|&index| {
+            let index = index as u32;
+            let (x, z) = (i64::from(index % side), i64::from(index / side / side));
+            [lip, pool]
+                .iter()
+                .any(|&(cx, cz)| (x - cx).abs() <= reach && (z - cz).abs() <= reach)
+        })
+        .count()
+}
+
+/// The valley of `side` run 300 steps past its warm-up under the sun
+/// `sun`, with no fire lit, so only the sun melts snow: every 25 steps,
+/// the step, the falling water at the waterfall summed over those 25
+/// steps, and the snow; and the snow after the warm-up.
+fn melting(host: &grit::Host, side: u32, sun: u32) -> (usize, Vec<(u32, usize, usize)>) {
+    let mut session = Session::open(host, setup(side)).unwrap();
+    assert!(
+        session
+            .feed
+            .iter()
+            .all(|&(_, word)| nature::kind_of(word) == AIR),
+        "the feed writes something other than air"
+    );
+    assert_eq!(session.example.params, [SUN]);
+    session
+        .held
+        .write_at(PARAMS as usize, FIRST_PARAM, &[sun])
+        .unwrap();
+    session.life = None;
+    let snow = |cells: &[u32]| {
+        cells
+            .iter()
+            .filter(|&&word| nature::kind_of(word) == SNOW)
+            .count()
+    };
+    let first = snow(&session.state().unwrap());
+    let mut samples = Vec::new();
+    let mut fell = 0;
+    for at in 1..=300 {
+        session.advance(1).unwrap();
+        let cells = session.state().unwrap();
+        fell += falling_at_the_fall(side, &cells);
+        if at % 25 == 0 {
+            samples.push((session.steps, fell, snow(&cells)));
+            fell = 0;
+        }
+    }
+    (first, samples)
+}
+
+/// No spring feeds the valley: its feed writes only the seep's air. The
+/// sun melts the snowfield, and the melt runs down to the river and falls
+/// off the lip: falling water at the waterfall in every span of 25 steps
+/// from 100 steps after the warm-up on, and less snow than at the start. With the
+/// sun put out after the warm-up, the waterfall runs dry within those 100
+/// steps: the water that falls is the melt.
+#[test]
+fn the_sun_melts_the_snow_and_its_water_runs_off_the_lip_with_no_spring() {
+    let side = SIDE;
+    let Some(host) = device("valley melt") else {
+        return;
+    };
+    let (first, lit) = melting(&host, side, SUN);
+    let (_, dark) = melting(&host, side, 0);
+    for (&(step, falling, left), &(_, dry, _)) in lit.iter().zip(&dark) {
+        println!(
+            "{side}^3 25 steps to step {step}: {falling} water cells falling at the waterfall under the sun, {dry} with the sun out; {left} snow cells"
+        );
+    }
+    let (_, _, last) = *lit.last().unwrap();
+    println!(
+        "{} width {}: snow {first} after the warm-up, {last} 300 steps later",
+        host.name(),
+        host.width()
+    );
+    assert!(last < first, "no snow melted");
+    assert!(
+        lit.iter().skip(3).all(|&(_, falling, _)| falling > 0),
+        "the waterfall ran dry under the sun: {lit:?}"
+    );
+    assert!(
+        dark.iter().skip(3).all(|&(_, falling, _)| falling == 0),
+        "water fell with no sun: {dark:?}"
+    );
+}
+
 /// A forest of touching crowns on an even slope that rises along x, lit
 /// in its middle: how far the burned cells reach downhill and uphill after
 /// each of a few spans of steps.
@@ -406,7 +509,7 @@ fn spread_on_a_slope(frames: u32) -> Vec<(u32, u32, u32)> {
             for z in middle - 4..=middle + 4 {
                 for x in 0..side {
                     for y in 0..side - 2 - ground(x) {
-                        if [FIRE, ASH].contains(&nature::kind_of(cells[at(side, x, y, z)])) {
+                        if [FIRE, ASH, CHAR].contains(&nature::kind_of(cells[at(side, x, y, z)])) {
                             low = low.min(x);
                             high = high.max(x);
                         }

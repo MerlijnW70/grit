@@ -1,7 +1,7 @@
 use grit::render3::{Light, Material, Table};
 use grit::rule3::nature::{
-    AIR, ASH, EARTH, FIRE, ICE, LEAVES, ROCK, SAND, SMOKE, SNOW, STEAM, WATER, WOOD, WOOD_LIFE,
-    air, alive, cell,
+    AIR, ASH, CHAR, EARTH, FIRE, ICE, LEAVES, ROCK, SAND, SMOKE, SNOW, STEAM, THAW, WATER, WOOD,
+    WOOD_LIFE, air, alive, cell, open_air,
 };
 use grit::sand::Grid;
 
@@ -15,6 +15,11 @@ pub const SEED: u32 = 0x00C0_FFEE;
 /// [`grit::rule3::nature::MELT`], so snow keeps, and the same in every
 /// cell, so the valley at rest is quiet.
 pub const AMBIENT: u32 = 260;
+
+/// The sun the valley runs under: the thaw a sunlit snow cell takes in
+/// each step it is lit, so it melts after
+/// `grit::rule3::nature::THAW / SUN + 1` lit steps.
+pub const SUN: u32 = 1;
 
 /// A valley as the generator makes it: its words, and what a check needs
 /// to know of it.
@@ -350,8 +355,8 @@ fn nearest(path: &[(Plan, f32)], at: Plan) -> (f32, f32, usize) {
 const PEAK: Plan = [0.25, 0.23];
 const SHOULDER: Plan = [0.12, 0.40];
 const BASIN: Plan = [0.30, 0.39];
-const LIP: Plan = [0.335, 0.47];
-const POOL: Plan = [0.36, 0.525];
+pub const LIP: Plan = [0.335, 0.47];
+pub const POOL: Plan = [0.36, 0.525];
 const LAKE: Plan = [0.87, 0.64];
 const BURN: Plan = [0.68, 0.46];
 const SPRING: Plan = [0.283, 0.372];
@@ -360,6 +365,10 @@ const SPRING: Plan = [0.283, 0.372];
 const FLOOR: f32 = 0.11;
 const LEVEL: f32 = 0.165;
 const SNOWLINE: f32 = 0.43;
+/// The depth of snow every snow column holds over what its hollow and
+/// slope give it, as a share of the world's height, so the sun melts the
+/// snowfield down over many cycles of its surface.
+const PACK: f32 = 0.02;
 const LIP_HEIGHT: f32 = 0.41;
 const POOL_HEIGHT: f32 = 0.265;
 
@@ -528,7 +537,9 @@ impl Columns {
 
 /// The world of `grid` made from `seed`: heights, erosion, carving, the
 /// skin of each column, water, snow, trees and boulders, every cell at
-/// [`AMBIENT`].
+/// [`AMBIENT`], and the air over the highest other cell of each column
+/// open to the sky. Each snow cell starts with a thaw of its own, from a
+/// hash, so the sun melts the snowfield cell by cell, not all at once.
 #[allow(clippy::too_many_lines)]
 pub fn made(grid: Grid, seed: u32) -> Made {
     let side = grid.wide.min(grid.tall).max(4) as usize;
@@ -552,6 +563,7 @@ pub fn made(grid: Grid, seed: u32) -> Made {
     }
     carved(&mut field, seed);
     let level = (LEVEL * tall).round() as u32;
+    let pack = (PACK * tall) as u32;
     let snowline = snow_cells.round() as u32;
     let top = grid.deep.saturating_sub(4);
 
@@ -610,7 +622,7 @@ pub fn made(grid: Grid, seed: u32) -> Made {
             let (skin, deep) = if (h as f32) > line && fall <= 3 {
                 (
                     Skin::Snow,
-                    1 + (hollow * 0.8).min(4.0) as u32 + u32::from(fall <= 1),
+                    1 + (hollow * 0.8).min(4.0) as u32 + u32::from(fall <= 1) + pack,
                 )
             } else if river.is_some() || pool || basin {
                 (Skin::Bed, 2)
@@ -756,6 +768,14 @@ pub fn made(grid: Grid, seed: u32) -> Made {
     let mut cells = vec![0_u32; w * d * t];
     for z in 0..t {
         for x in 0..w {
+            let open = (0..d as u32)
+                .rev()
+                .find(|&h| {
+                    index(x, h, z)
+                        .and_then(|at| kinds.get(at))
+                        .is_some_and(|&kind| u32::from(kind) != AIR)
+                })
+                .map_or(0, |h| h + 1);
             let mut over = 0_u32;
             for h in 0..d as u32 {
                 let Some(at) = index(x, h, z) else {
@@ -763,8 +783,16 @@ pub fn made(grid: Grid, seed: u32) -> Made {
                 };
                 let kind = kinds.get(at).copied().unwrap_or(0);
                 let heat = AMBIENT;
-                let word = if u32::from(kind) == AIR {
+                let word = if u32::from(kind) == AIR && h >= open {
+                    open_air(heat, over)
+                } else if u32::from(kind) == AIR {
                     air(heat, over)
+                } else if u32::from(kind) == SNOW {
+                    alive(
+                        SNOW,
+                        heat,
+                        hashed(x as u32, h, z as u32, seed ^ 0x5A0) & THAW,
+                    )
                 } else {
                     cell(u32::from(kind), heat)
                 };
@@ -1117,11 +1145,10 @@ fn valley_scene(grid: Grid) -> Vec<u32> {
 /// How many engine steps apart the feed is written.
 pub const FEED_EVERY: u32 = 4;
 
-/// The snowmelt springs and the seep, as the cells written before every
-/// [`FEED_EVERY`]th step: water over the river's head under the snowfield
-/// and over the gorge just above the lip, which falls in and keeps the
-/// river and the waterfall running, and air at the lake's floor, which
-/// bubbles up and takes water away, so the lake rises only slowly.
+/// The seep, as the cells written before every [`FEED_EVERY`]th step: air
+/// at the lake's floor, which bubbles up and takes water away, so the lake
+/// the snowmelt fills rises only slowly. The river and the waterfall need
+/// no spring: the sun melts the snowfield, and its water runs down.
 pub fn feed(grid: Grid, cells: &[u32]) -> Vec<(u32, u32)> {
     let s = grid.wide as f32;
     let (w, d) = (grid.wide as usize, grid.deep as usize);
@@ -1137,41 +1164,8 @@ pub fn feed(grid: Grid, cells: &[u32]) -> Vec<(u32, u32)> {
             ((at[1] * s) as u32).min(grid.tall - 1),
         )
     };
-    let surface = |x: u32, z: u32| (0..grid.deep).find(|&y| word(x, y, z) & 0xF != AIR);
     let mut out = Vec::new();
     let scale = (s / 256.0).max(0.25);
-    let toward = [POOL[0] - LIP[0], POOL[1] - LIP[1]];
-    let length = apart(POOL, LIP).max(1e-6);
-    let back = 3.0 / s;
-    let up = [
-        LIP[0] - toward[0] / length * back,
-        LIP[1] - toward[1] / length * back,
-    ];
-    let springs = [
-        (SPRING, (3.0 * scale).ceil() as u32, 2_u32),
-        (up, (9.0 * scale).ceil() as u32, (2.0 * scale).ceil() as u32),
-    ];
-    for (at, across, along) in springs {
-        let (cx, cz) = place(at);
-        let x0 = cx.saturating_sub(across / 2);
-        let Some(top) = surface(cx, cz) else {
-            continue;
-        };
-        for z in cz..(cz + along).min(grid.tall) {
-            for y in top.saturating_sub(FEED_EVERY + 1)..top.saturating_sub(1) {
-                for x in x0..(x0 + across).min(grid.wide) {
-                    let held = word(x, y, z);
-                    if held & 0xF == AIR {
-                        let heat = grit::rule3::nature::temperature_of(held);
-                        out.push((
-                            grit::geometry::Solid::cell(grid, [x, y, z]),
-                            cell(WATER, heat),
-                        ));
-                    }
-                }
-            }
-        }
-    }
     let (lx, lz) = place(LAKE);
     let sink = (3.0 * scale).ceil() as u32;
     for z in lz..(lz + sink).min(grid.tall) {
@@ -1212,7 +1206,7 @@ fn valley_light(mut light: Light) -> Light {
     light
 }
 
-/// The valley: snow on a jagged peak, springs under it that feed a river
+/// The valley: snow on a jagged peak, which the sun melts into a river
 /// down a gorge and off a cliff into a lake, and a pine forest that burns
 /// once in a while.
 pub fn example() -> Example {
@@ -1228,11 +1222,12 @@ pub fn example() -> Example {
         .with(FIRE, Material::solid(0x00FF_6418, 0.5).glowing(2.0))
         .with(ASH, Material::solid(0x003A_3735, 0.28))
         .with(SMOKE, Material::solid(0x0058_524D, 0.0).gas(0.62))
-        .with(STEAM, Material::solid(0x00D8_DADC, 0.0).gas(0.86));
+        .with(STEAM, Material::solid(0x00D8_DADC, 0.0).gas(0.86))
+        .with(CHAR, Material::solid(0x001C_1816, 0.3));
     Example {
         name: "valley",
         rule: "nature",
-        params: Vec::new(),
+        params: vec![SUN],
         table,
         tools: vec![
             Tool {
