@@ -1,3 +1,4 @@
+mod camera;
 mod font;
 mod life;
 mod scenes;
@@ -9,21 +10,16 @@ use std::time::{Duration, Instant};
 
 use grit::Host;
 use grit::render3::present::{Presenter, windowed};
-use grit::render3::{self, Camera, Screen, Steps, stage};
+use grit::render3::{self, Screen, Steps, stage};
 
+use camera::{Mode, Rig, View};
 use font::Canvas;
 use scenes::Which;
-use session::{Failed, Session, Setup, VIEW};
+use session::{Failed, Session, Setup};
 
 /// The frames of a timed run: warm-up, then timed.
 const WARM: usize = 20;
 const TIMED: usize = 60;
-
-/// How long the demo waits without input before it orbits again.
-const IDLE: Duration = Duration::from_secs(20);
-
-/// How fast the orbit turns, in radians a second.
-const TURN: f32 = 0.07;
 
 /// The longest frame, on the device, a quality may take and still be kept.
 const BUDGET: Duration = Duration::from_millis(26);
@@ -232,7 +228,7 @@ fn chosen(host: &Host, asked: &Asked) -> Result<Quality, Failed> {
     let start = usize::from(host.heap() < SMALL_HEAP);
     for quality in QUALITIES.iter().skip(start) {
         let mut session = Session::cold(host, setup(asked, *quality))?;
-        let camera = orbit_camera(&Orbit::start(asked.which, session.grid()), session.grid());
+        let camera = home(asked, asked.which, session.grid()).camera();
         let mut times = Vec::new();
         for at in 0..8 {
             session.aim(&camera, false, at == 0)?;
@@ -278,78 +274,10 @@ fn steps(session: &Session<'_>, quality: Quality, first: bool) -> Steps {
     }
 }
 
-/// A slow orbit around the middle of the world: where it looks, how far it
-/// stands, and its turn and tilt.
-#[derive(Debug, Clone, Copy)]
-struct Orbit {
-    target: [f32; 3],
-    yaw: f32,
-    pitch: f32,
-    far: f32,
-}
-
-impl Orbit {
-    fn start(which: Which, grid: grit::sand::Grid) -> Self {
-        if which == Which::Valley {
-            return framed(which, 0, grid);
-        }
-        let side = grid.wide as f32;
-        Self {
-            target: [side * 0.5, side * 0.72, side * 0.5],
-            yaw: -2.35,
-            pitch: 0.6,
-            far: side * 2.25,
-        }
-    }
-}
-
-fn orbit_camera(orbit: &Orbit, grid: grit::sand::Grid) -> Camera {
-    let (sin_yaw, cos_yaw) = orbit.yaw.sin_cos();
-    let (sin_pitch, cos_pitch) = orbit.pitch.sin_cos();
-    let at = [
-        orbit.target[0] - cos_pitch * cos_yaw * orbit.far,
-        orbit.target[1] - sin_pitch * orbit.far,
-        orbit.target[2] - cos_pitch * sin_yaw * orbit.far,
-    ];
-    Camera {
-        at,
-        yaw: orbit.yaw,
-        pitch: orbit.pitch,
-        view: VIEW,
-    }
-    .kept(grid)
-}
-
-/// The fixed framings of each scene, for pictures: an orbit's turn, tilt
-/// and distance in sides of the world, and its target's height.
-fn framed(which: Which, camera: usize, grid: grit::sand::Grid) -> Orbit {
-    let side = grid.wide as f32;
-    let (yaw, pitch, far, height, across) = match (which, camera) {
-        (Which::Valley, 0) => (-2.35, 0.56, 1.6, 0.7, [0.5, 0.5]),
-        (Which::Valley, 1) => (-2.75, 0.3, 0.6, 0.66, [0.5, 0.56]),
-        (Which::Valley, 3) => (-2.0, 0.42, 0.42, 0.66, [0.6, 0.36]),
-        (Which::Valley, 5) => (-2.35, 0.5, 2.3, 0.56, [0.5, 0.5]),
-        (Which::Valley, 6) => (-2.0, 0.95, 0.35, 0.6, [0.33, 0.47]),
-        (Which::Valley, 7) => (-2.3, 0.36, 0.42, 0.78, [0.74, 0.62]),
-        (_, 2) => (-2.35, 0.62, 3.0, 0.72, [0.5, 0.5]),
-        (_, 4) => (-0.95, 0.16, 1.9, 0.62, [0.5, 0.5]),
-        (Which::Sand, 0) => (-2.3, 0.6, 2.2, 0.74, [0.5, 0.5]),
-        (Which::Sand, 1) => (-0.9, 0.42, 1.2, 0.8, [0.45, 0.45]),
-        (Which::Fire, 0) => (-2.35, 0.58, 2.25, 0.7, [0.5, 0.5]),
-        (Which::Fire, 1) => (-1.75, 0.36, 1.0, 0.72, [0.62, 0.45]),
-        (Which::Code, 0) => (-2.4, 0.5, 2.0, 0.72, [0.5, 0.5]),
-        (Which::Code, 1) => (-1.2, 0.3, 0.8, 0.78, [0.45, 0.5]),
-        (Which::Valley, _) => (-2.0, 0.3, 0.6, 0.7, [0.5, 0.6]),
-        (Which::Sand, _) => (2.45, 0.3, 0.75, 0.82, [1.0, 0.45]),
-        (Which::Fire, _) => (-2.0, 0.3, 0.5, 0.72, [0.64, 0.44]),
-        (Which::Code, _) => (-1.6, 0.15, 0.45, 0.8, [0.5, 0.6]),
-    };
-    Orbit {
-        target: [across[0] * side, height * side, across[1] * side],
-        yaw,
-        pitch,
-        far: far * side,
-    }
+/// Where the camera of `which` starts, and where R and a switch to it take
+/// it back: the framing `--camera` asks for, or the scene's first.
+fn home(asked: &Asked, which: Which, grid: grit::sand::Grid) -> View {
+    View::framed(which, asked.camera.unwrap_or(0), grid).held(Mode::Orbit, grid)
 }
 
 /// `picture`, drawn on `from`, stretched over `to` and blended between the
@@ -494,9 +422,7 @@ impl Timing {
 
 /// What the demo is doing between frames.
 struct Play {
-    orbit: Orbit,
-    manual: bool,
-    last_input: Instant,
+    rig: Rig,
     tool: usize,
     paused: bool,
     active: bool,
@@ -504,6 +430,86 @@ struct Play {
     pressed_at: Option<(f32, f32)>,
     dragging: bool,
     last_mouse: Option<(f32, f32)>,
+    middle_at: Option<(f32, f32)>,
+}
+
+/// The key of a keyboard input; none for the mouse's.
+fn key_of(input: ui::Input) -> Option<minifb::Key> {
+    use minifb::Key;
+    use ui::Input;
+    match input {
+        Input::Digit(digit) => [
+            Key::Key0,
+            Key::Key1,
+            Key::Key2,
+            Key::Key3,
+            Key::Key4,
+            Key::Key5,
+            Key::Key6,
+            Key::Key7,
+            Key::Key8,
+            Key::Key9,
+        ]
+        .get(digit as usize)
+        .copied(),
+        Input::W => Some(Key::W),
+        Input::A => Some(Key::A),
+        Input::S => Some(Key::S),
+        Input::D => Some(Key::D),
+        Input::Q => Some(Key::Q),
+        Input::E => Some(Key::E),
+        Input::F => Some(Key::F),
+        Input::O => Some(Key::O),
+        Input::R => Some(Key::R),
+        Input::N => Some(Key::N),
+        Input::H => Some(Key::H),
+        Input::Space => Some(Key::Space),
+        Input::Shift => Some(Key::LeftShift),
+        Input::Escape => Some(Key::Escape),
+        Input::Drag
+        | Input::ShiftDrag
+        | Input::MiddleDrag
+        | Input::RightDrag
+        | Input::Wheel
+        | Input::Click
+        | Input::ClickBar => None,
+    }
+}
+
+/// Whether the key of `input` is down; Shift either side.
+fn down(window: &minifb::Window, input: ui::Input) -> bool {
+    match input {
+        ui::Input::Shift => {
+            window.is_key_down(minifb::Key::LeftShift)
+                || window.is_key_down(minifb::Key::RightShift)
+        }
+        other => key_of(other).is_some_and(|key| window.is_key_down(key)),
+    }
+}
+
+/// How much one notch of the wheel turns minifb's scroll value.
+#[cfg(windows)]
+const NOTCH: f32 = 12.0;
+#[cfg(not(windows))]
+const NOTCH: f32 = 1.0;
+
+/// The point of the cell a window pixel sees in the last frame, at the
+/// middle of the cell, when it sees one.
+fn picked(
+    session: &mut Session<'_>,
+    (x, y): (f32, f32),
+    quality: Quality,
+) -> Result<Option<[f32; 3]>, Failed> {
+    let scale = quality.scale.max(1) as f32;
+    let (x, y) = (x / scale, y / scale);
+    let screen = session.build.screen;
+    if x < 0.0 || y < 0.0 || x as u32 >= screen.wide || y as u32 >= screen.high {
+        return Ok(None);
+    }
+    let grid = session.grid();
+    Ok(session
+        .under((x as u32, y as u32))?
+        .map(|(cell, _)| grit::geometry::Solid::point(grid, cell).map(|at| at as f32 + 0.5)))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -532,13 +538,8 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
         quality.name,
         session.build.suns
     );
-    let fixed = asked
-        .camera
-        .map(|at| framed(asked.which, at, session.grid()));
     let mut play = Play {
-        orbit: fixed.unwrap_or_else(|| Orbit::start(asked.which, session.grid())),
-        manual: fixed.is_some(),
-        last_input: Instant::now(),
+        rig: Rig::new(home(asked, asked.which, session.grid()), session.grid()),
         tool: asked.tool,
         paused: false,
         active: asked.active,
@@ -546,6 +547,7 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
         pressed_at: None,
         dragging: false,
         last_mouse: None,
+        middle_at: None,
     };
     let mut window = minifb::Window::new(
         "grit3d",
@@ -579,7 +581,7 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
     let mut steady: Option<(Instant, u32)> = None;
     let mut owed = 0.0_f32;
     let mut timing = Timing::default();
-    while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
+    while window.is_open() {
         let now = Instant::now();
         let elapsed = now.duration_since(last_frame);
         let spent = elapsed.as_secs_f32().min(0.1);
@@ -587,67 +589,94 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
         let mut step = false;
         let mut switch_to = None;
         let mut restart = false;
+        let mut quit = false;
+        let mut push = [0.0_f32; 3];
+        let mut fast = false;
         {
-            use minifb::{Key, KeyRepeat, MouseButton, MouseMode};
-            let mut touched = false;
-            let pressed = |key| window.is_key_pressed(key, KeyRepeat::No);
-            for (at, key) in [Key::Key0, Key::Key1, Key::Key2, Key::Key3]
-                .into_iter()
-                .enumerate()
-            {
-                if pressed(key) {
-                    switch_to = Which::ALL.get(at).copied();
-                    touched = true;
+            use minifb::{KeyRepeat, MouseButton, MouseMode};
+            use ui::{Action, Input};
+            let mut fly = false;
+            for (input, action) in ui::BINDINGS {
+                let Some(key) = key_of(input) else {
+                    continue;
+                };
+                let now = if action.held() {
+                    down(&window, input)
+                } else {
+                    window.is_key_pressed(key, KeyRepeat::No)
+                };
+                if !now {
+                    continue;
+                }
+                match action {
+                    Action::Scene(at) => switch_to = Which::ALL.get(at).copied(),
+                    Action::Tool(at) => {
+                        if at < session.example.tools.len() {
+                            play.tool = at;
+                        }
+                    }
+                    Action::Forward
+                    | Action::Back
+                    | Action::Right
+                    | Action::Left
+                    | Action::Up
+                    | Action::Down => {
+                        for (slot, by) in push.iter_mut().zip(action.push()) {
+                            *slot += by;
+                        }
+                    }
+                    Action::Faster => fast = true,
+                    Action::Fly => fly = true,
+                    Action::Overlay => play.active = !play.active,
+                    Action::Restart => restart = true,
+                    Action::Pause => play.paused = !play.paused,
+                    Action::Step => step = true,
+                    Action::Help => play.help = !play.help,
+                    Action::Quit => quit = true,
+                    Action::Turn
+                    | Action::Pan
+                    | Action::Zoom
+                    | Action::UseTool
+                    | Action::KeepUsingTool
+                    | Action::PickTool => {}
                 }
             }
-            for (at, key) in [Key::Key4, Key::Key5, Key::Key6, Key::Key7, Key::Key8]
-                .into_iter()
-                .enumerate()
-                .take(session.example.tools.len())
-            {
-                if pressed(key) {
-                    play.tool = at;
-                    touched = true;
-                }
-            }
-            if pressed(Key::R) {
-                restart = true;
-                touched = true;
-            }
-            if pressed(Key::Space) {
-                play.paused = !play.paused;
-                touched = true;
-            }
-            if pressed(Key::N) {
-                step = true;
-                touched = true;
-            }
-            if pressed(Key::A) {
-                play.active = !play.active;
-                touched = true;
-            }
-            if pressed(Key::H) {
-                play.help = !play.help;
-                touched = true;
+            let window_size = (window_screen.wide, window_screen.high);
+            let mouse = window.get_mouse_pos(MouseMode::Discard);
+            if fly {
+                let middle = (
+                    window_screen.wide as f32 / 2.0,
+                    window_screen.high as f32 / 2.0,
+                );
+                let ahead = picked(&mut session, middle, quality)?;
+                play.rig.switch(ahead);
             }
             if let Some((_, wheel)) = window.get_scroll_wheel()
                 && wheel != 0.0
+                && ui::meaning(Input::Wheel) == Some(Action::Zoom)
             {
-                play.orbit.far = (play.orbit.far * (1.0 - wheel * 0.08))
-                    .clamp(8.0, session.grid().wide as f32 * 3.6);
-                touched = true;
+                let anchor = match mouse {
+                    Some(at) => picked(&mut session, at, quality)?
+                        .map(|point| play.rig.shown.anchor(window_screen, at, point)),
+                    None => None,
+                };
+                play.rig.zoom(wheel / NOTCH, anchor);
             }
-            let mouse = window.get_mouse_pos(MouseMode::Discard);
+            let shift = down(&window, Input::Shift);
             let left = window.get_mouse_down(MouseButton::Left);
+            let middle = window.get_mouse_down(MouseButton::Middle);
             let right = window.get_mouse_down(MouseButton::Right);
-            let window_size = (window_screen.wide, window_screen.high);
             let tools = session.example.tools.clone();
+            let dragged = |play: &mut Play, input: Input, by: (f32, f32)| match ui::meaning(input) {
+                Some(Action::Turn) => play.rig.turn(by),
+                Some(Action::Pan) => play.rig.pan(window_screen, by),
+                _ => {}
+            };
             match (left, play.pressed_at, mouse) {
                 (true, None, Some(at)) => {
                     play.pressed_at = Some(at);
                     play.dragging = false;
                     play.last_mouse = Some(at);
-                    touched = true;
                 }
                 (true, Some(start), Some(at)) => {
                     if (at.0 - start.0).abs() + (at.1 - start.1).abs() > 5.0 {
@@ -656,38 +685,49 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
                     if play.dragging
                         && let Some(before) = play.last_mouse
                     {
-                        play.orbit.yaw += (at.0 - before.0) * 0.006;
-                        play.orbit.pitch =
-                            (play.orbit.pitch + (at.1 - before.1) * 0.006).clamp(0.05, 1.45);
+                        let input = if shift { Input::ShiftDrag } else { Input::Drag };
+                        dragged(&mut play, input, (at.0 - before.0, at.1 - before.1));
                     }
                     play.last_mouse = Some(at);
-                    touched = true;
                 }
                 (false, Some(start), _) => {
                     if !play.dragging {
                         if let Some(tool) = ui::pressed(&tools, window_size, start) {
-                            play.tool = tool;
-                        } else {
+                            if ui::meaning(Input::ClickBar) == Some(Action::PickTool) {
+                                play.tool = tool;
+                            }
+                        } else if ui::meaning(Input::Click) == Some(Action::UseTool) {
                             use_tool(&mut session, start, quality, play.tool)?;
                         }
                     }
                     play.pressed_at = None;
                     play.dragging = false;
-                    touched = true;
                 }
                 _ => {}
+            }
+            match (middle, mouse) {
+                (true, Some(at)) => {
+                    if let Some(before) = play.middle_at {
+                        dragged(
+                            &mut play,
+                            Input::MiddleDrag,
+                            (at.0 - before.0, at.1 - before.1),
+                        );
+                    }
+                    play.middle_at = Some(at);
+                }
+                _ => play.middle_at = None,
             }
             if right
                 && let Some(at) = mouse
                 && ui::pressed(&tools, window_size, at).is_none()
+                && ui::meaning(Input::RightDrag) == Some(Action::KeepUsingTool)
             {
                 use_tool(&mut session, at, quality, play.tool)?;
-                touched = true;
             }
-            if touched {
-                play.manual = true;
-                play.last_input = Instant::now();
-            }
+        }
+        if quit {
+            break;
         }
         if let Some(which) = switch_to.or(restart.then_some(session.setup.which)) {
             let mut wanted = setup(asked, quality);
@@ -703,18 +743,12 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
                 session.dusk = dusk;
             }
             play.tool = 0;
-            if let Some(which) = switch_to {
-                play.orbit = Orbit::start(which, session.grid());
-            }
+            play.rig
+                .reset(home(asked, which, session.grid()), session.grid());
             fresh = true;
         }
-        if fixed.is_none() && play.manual && play.last_input.elapsed() >= IDLE {
-            play.manual = false;
-        }
-        if !play.manual {
-            play.orbit.yaw += TURN * spent;
-        }
-        let camera = orbit_camera(&play.orbit, session.grid());
+        play.rig.tick(push, fast, spent);
+        let camera = play.rig.camera();
         let mut light_steps = steps(&session, quality, fresh);
         light_steps.refill = fresh;
         if !asked.smooth {
@@ -846,7 +880,10 @@ fn corner_line(session: &Session<'_>, rate: f64, play: &Play, active_count: u32)
     if play.paused {
         line.push_str("PAUSED  \u{b7}  ");
     }
-    line.push_str("DRAG TO ORBIT, CLICK TO USE THE TOOL, H FOR HELP");
+    if play.rig.mode == Mode::Fly {
+        line.push_str("FLYING  \u{b7}  ");
+    }
+    line.push_str(ui::HINT);
     line
 }
 
@@ -943,11 +980,7 @@ fn measured(host: &Host, asked: &Asked) -> Result<(), Failed> {
     }
     session.advance(asked.skip)?;
     let grid = session.grid();
-    let orbit = asked.camera.map_or_else(
-        || Orbit::start(asked.which, grid),
-        |at| framed(asked.which, at, grid),
-    );
-    let camera = orbit_camera(&orbit, grid);
+    let camera = home(asked, asked.which, grid).camera();
     let mut totals = Vec::with_capacity(TIMED);
     let mut parts: Vec<Vec<Duration>> = (0..2 + stage::COUNT)
         .map(|_| Vec::with_capacity(TIMED))

@@ -266,10 +266,10 @@ fn every_letter_the_demo_writes_has_a_glyph() {
             text.push(ui::label(at, tool));
         }
     }
-    text.push(
-        "FIRE \u{b7} 144 FPS \u{b7} ACTIVE 12 OCTS (0.25%) \u{b7} PAUSED \u{b7} DRAG TO ORBIT, CLICK TO USE THE TOOL, H FOR HELP"
-            .to_owned(),
-    );
+    text.push(format!(
+        "FIRE \u{b7} 144 FPS \u{b7} ACTIVE 12 OCTS (0.25%) \u{b7} PAUSED \u{b7} FLYING \u{b7} {}",
+        ui::HINT
+    ));
     for line in &text {
         for letter in line.chars() {
             if letter != ' ' {

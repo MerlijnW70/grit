@@ -107,22 +107,194 @@ pub fn draw_corner(canvas: &mut Canvas<'_>, line: &str) {
     canvas.text((margin, margin), line, INK, scale);
 }
 
-/// Every control, a line each.
-pub const HELP: [&str; 13] = [
+/// What the user can press, click, drag or turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Input {
+    Digit(u32),
+    W,
+    A,
+    S,
+    D,
+    Q,
+    E,
+    F,
+    O,
+    R,
+    N,
+    H,
+    Space,
+    Shift,
+    Escape,
+    Drag,
+    ShiftDrag,
+    MiddleDrag,
+    RightDrag,
+    Wheel,
+    Click,
+    ClickBar,
+}
+
+impl Input {
+    /// The input the help panel names `name`.
+    #[allow(dead_code)]
+    pub fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "W" => Self::W,
+            "A" => Self::A,
+            "S" => Self::S,
+            "D" => Self::D,
+            "Q" => Self::Q,
+            "E" => Self::E,
+            "F" => Self::F,
+            "O" => Self::O,
+            "R" => Self::R,
+            "N" => Self::N,
+            "H" => Self::H,
+            "SPACE" => Self::Space,
+            "SHIFT" => Self::Shift,
+            "ESC" => Self::Escape,
+            "DRAG" => Self::Drag,
+            "SHIFT + DRAG" => Self::ShiftDrag,
+            "MIDDLE DRAG" => Self::MiddleDrag,
+            "RIGHT DRAG" => Self::RightDrag,
+            "WHEEL" => Self::Wheel,
+            "CLICK" => Self::Click,
+            "CLICK BAR" => Self::ClickBar,
+            _ => {
+                let digit = name.parse::<u32>().ok().filter(|&digit| digit <= 9)?;
+                Self::Digit(digit)
+            }
+        })
+    }
+}
+
+/// What an input does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Scene(usize),
+    Tool(usize),
+    Forward,
+    Left,
+    Back,
+    Right,
+    Down,
+    Up,
+    Faster,
+    Fly,
+    Overlay,
+    Restart,
+    Pause,
+    Step,
+    Help,
+    Quit,
+    Turn,
+    Pan,
+    Zoom,
+    UseTool,
+    KeepUsingTool,
+    PickTool,
+}
+
+impl Action {
+    /// Which way the action moves the camera while its key is held: right,
+    /// up and forward, as [`super::camera::View::walked`] takes them.
+    pub fn push(self) -> [f32; 3] {
+        match self {
+            Self::Forward => [0.0, 0.0, 1.0],
+            Self::Back => [0.0, 0.0, -1.0],
+            Self::Right => [1.0, 0.0, 0.0],
+            Self::Left => [-1.0, 0.0, 0.0],
+            Self::Up => [0.0, 1.0, 0.0],
+            Self::Down => [0.0, -1.0, 0.0],
+            _ => [0.0; 3],
+        }
+    }
+
+    /// Whether the action lasts as long as its key is held, rather than
+    /// happening once a press.
+    pub fn held(self) -> bool {
+        matches!(
+            self,
+            Self::Forward
+                | Self::Left
+                | Self::Back
+                | Self::Right
+                | Self::Down
+                | Self::Up
+                | Self::Faster
+        )
+    }
+}
+
+/// Every input and what it does: the demo reads its inputs from this
+/// list, and the help panel names each of them.
+pub const BINDINGS: [(Input, Action); 30] = [
+    (Input::Digit(0), Action::Scene(0)),
+    (Input::Digit(1), Action::Scene(1)),
+    (Input::Digit(2), Action::Scene(2)),
+    (Input::Digit(3), Action::Scene(3)),
+    (Input::Digit(4), Action::Tool(0)),
+    (Input::Digit(5), Action::Tool(1)),
+    (Input::Digit(6), Action::Tool(2)),
+    (Input::Digit(7), Action::Tool(3)),
+    (Input::Digit(8), Action::Tool(4)),
+    (Input::W, Action::Forward),
+    (Input::A, Action::Left),
+    (Input::S, Action::Back),
+    (Input::D, Action::Right),
+    (Input::Q, Action::Down),
+    (Input::E, Action::Up),
+    (Input::Shift, Action::Faster),
+    (Input::F, Action::Fly),
+    (Input::O, Action::Overlay),
+    (Input::R, Action::Restart),
+    (Input::Space, Action::Pause),
+    (Input::N, Action::Step),
+    (Input::H, Action::Help),
+    (Input::Escape, Action::Quit),
+    (Input::Drag, Action::Turn),
+    (Input::ShiftDrag, Action::Pan),
+    (Input::MiddleDrag, Action::Pan),
+    (Input::Wheel, Action::Zoom),
+    (Input::Click, Action::UseTool),
+    (Input::RightDrag, Action::KeepUsingTool),
+    (Input::ClickBar, Action::PickTool),
+];
+
+/// What `input` does, if anything.
+pub fn meaning(input: Input) -> Option<Action> {
+    BINDINGS
+        .iter()
+        .find(|(bound, _)| *bound == input)
+        .map(|&(_, action)| action)
+}
+
+/// Every control, a line each: the inputs, then two spaces or more, then
+/// what they do.
+pub const HELP: [&str; 19] = [
     "CONTROLS",
     "",
-    "DRAG               ORBIT THE CAMERA",
-    "WHEEL              ZOOM",
-    "CLICK              USE THE TOOL ONCE",
-    "RIGHT DRAG         KEEP USING THE TOOL",
-    "4 - 8 / CLICK BAR  PICK A TOOL",
-    "0  1  2  3         VALLEY, SAND, FIRE, CODE",
-    "R                  RESTART THE SCENE",
-    "SPACE / N          PAUSE / ONE STEP",
-    "A                  SHOW WHAT THE ENGINE STEPS",
-    "H                  THIS HELP",
-    "ESC                QUIT",
+    "DRAG                        TURN AROUND THE TARGET, OR LOOK WHEN FLYING",
+    "SHIFT + DRAG / MIDDLE DRAG  MOVE THE TARGET ACROSS THE VIEW",
+    "WHEEL                       ZOOM TO THE CURSOR",
+    "W A S D                     MOVE OVER THE GROUND, OR FLY AHEAD",
+    "Q / E                       DOWN / UP",
+    "SHIFT                       FASTER",
+    "F                           FLY, OR ORBIT AGAIN",
+    "",
+    "CLICK                       USE THE TOOL ONCE",
+    "RIGHT DRAG                  KEEP USING THE TOOL",
+    "4 - 8 / CLICK BAR           PICK A TOOL",
+    "0 1 2 3                     VALLEY, SAND, FIRE, CODE",
+    "R                           RESTART THE SCENE AND THE CAMERA",
+    "SPACE / N                   PAUSE / ONE STEP",
+    "O                           SHOW WHAT THE ENGINE STEPS",
+    "H                           THIS HELP",
+    "ESC                         QUIT",
 ];
+
+/// The controls the corner line names.
+pub const HINT: &str = "DRAG TURN, WHEEL ZOOM, WASD MOVE, F FLY, H HELP";
 
 /// Draws the help panel in the middle of the window.
 pub fn draw_help(canvas: &mut Canvas<'_>) {
