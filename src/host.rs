@@ -376,14 +376,70 @@ pub struct Host {
     sparse: bool,
     strict: bool,
     int64: bool,
+    #[cfg(feature = "window")]
     physical: vk::PhysicalDevice,
+    #[cfg(feature = "window")]
     presents: bool,
     dots: Dots,
 }
 
 /// The instance extensions a host that shows its pictures in a window asks
-/// for, when the loader offers all of them.
-const WINDOW_EXTENSIONS: [&CStr; 2] = [ash::khr::surface::NAME, ash::khr::win32_surface::NAME];
+/// for, when the loader offers all of them, and whether it did.
+#[cfg(feature = "window")]
+fn window_instance(entry: &ash::Entry, presenting: bool) -> (Vec<*const c_char>, bool) {
+    const WANTED: [&CStr; 2] = [ash::khr::surface::NAME, ash::khr::win32_surface::NAME];
+    let offered = if presenting {
+        unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let windowed = presenting
+        && WANTED.iter().all(|wanted| {
+            offered.iter().any(|one| {
+                one.extension_name_as_c_str()
+                    .is_ok_and(|name| name == *wanted)
+            })
+        });
+    let names = if windowed {
+        WANTED.iter().map(|name| name.as_ptr()).collect()
+    } else {
+        Vec::new()
+    };
+    (names, windowed)
+}
+
+#[cfg(not(feature = "window"))]
+fn window_instance(_: &ash::Entry, _: bool) -> (Vec<*const c_char>, bool) {
+    (Vec::new(), false)
+}
+
+/// The device extensions a device that presents asks for, when `windowed`
+/// and the device offers them.
+#[cfg(feature = "window")]
+fn window_device(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    windowed: bool,
+) -> Vec<*const c_char> {
+    let presents = windowed && {
+        let offered =
+            unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+        offered.iter().any(|one| {
+            one.extension_name_as_c_str()
+                .is_ok_and(|name| name == ash::khr::swapchain::NAME)
+        })
+    };
+    if presents {
+        vec![ash::khr::swapchain::NAME.as_ptr()]
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(not(feature = "window"))]
+fn window_device(_: &ash::Instance, _: vk::PhysicalDevice, _: bool) -> Vec<*const c_char> {
+    Vec::new()
+}
 
 impl Host {
     pub fn open() -> Result<Option<Self>, Error> {
@@ -400,6 +456,7 @@ impl Host {
     /// and a device that can present to it, where the loader and the device
     /// offer that; [`Host::presents`] tells whether they did. Everything
     /// else is as [`Host::open`] makes it.
+    #[cfg(feature = "window")]
     pub fn open_presenting() -> Result<Option<Self>, Error> {
         let pattern =
             std::env::var_os("GRIT_DEVICE").map(|held| held.to_string_lossy().into_owned());
@@ -416,23 +473,7 @@ impl Host {
 
         let application =
             vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
-        let offered = if presenting {
-            unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let windowed = presenting
-            && WINDOW_EXTENSIONS.iter().all(|wanted| {
-                offered.iter().any(|one| {
-                    one.extension_name_as_c_str()
-                        .is_ok_and(|name| name == *wanted)
-                })
-            });
-        let names: Vec<*const c_char> = if windowed {
-            WINDOW_EXTENSIONS.iter().map(|name| name.as_ptr()).collect()
-        } else {
-            Vec::new()
-        };
+        let (names, windowed) = window_instance(&entry, presenting);
         let create = vk::InstanceCreateInfo::default()
             .application_info(&application)
             .enabled_extension_names(&names);
@@ -577,19 +618,9 @@ impl Host {
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priorities)];
-        let presents = windowed && {
-            let offered = unsafe { instance.enumerate_device_extension_properties(physical) }
-                .unwrap_or_default();
-            offered.iter().any(|one| {
-                one.extension_name_as_c_str()
-                    .is_ok_and(|name| name == ash::khr::swapchain::NAME)
-            })
-        };
-        let mut extensions: Vec<*const c_char> = if presents {
-            vec![ash::khr::swapchain::NAME.as_ptr()]
-        } else {
-            Vec::new()
-        };
+        let mut extensions = window_device(&instance, physical, windowed);
+        #[cfg(feature = "window")]
+        let presents = !extensions.is_empty();
         let dots = unsafe { dots_of(&instance, physical) };
         let mut dotting = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
             .shader_integer_dot_product(true);
@@ -631,7 +662,9 @@ impl Host {
             sparse,
             strict,
             int64,
+            #[cfg(feature = "window")]
             physical,
+            #[cfg(feature = "window")]
             presents,
             dots,
             wedged: AtomicBool::new(false),
@@ -680,6 +713,7 @@ impl Host {
 
     /// Whether the host was made by [`Host::open_presenting`] and its device
     /// can present to a window.
+    #[cfg(feature = "window")]
     #[must_use]
     pub const fn presents(&self) -> bool {
         self.presents
@@ -690,14 +724,17 @@ impl Host {
         self.dots
     }
 
+    #[cfg(feature = "window")]
     pub(crate) const fn entry(&self) -> &ash::Entry {
         &self.entry
     }
 
+    #[cfg(feature = "window")]
     pub(crate) const fn instance(&self) -> &ash::Instance {
         &self.instance
     }
 
+    #[cfg(feature = "window")]
     pub(crate) const fn physical(&self) -> vk::PhysicalDevice {
         self.physical
     }

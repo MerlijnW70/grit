@@ -45,6 +45,8 @@ pub mod occupancy;
 pub mod post;
 pub mod present;
 pub mod shade;
+#[cfg(feature = "window")]
+pub mod swapchain;
 pub mod volume;
 
 use simdr::lanes::LaneError;
