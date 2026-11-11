@@ -240,6 +240,19 @@ impl<'held> Em<'held> {
         self.one(op::CONVERT_F_TO_S, self.uint, value)
     }
 
+    /// The bits of the float `value`, as a word.
+    pub fn float_bits(&mut self, value: Id) -> Result<Id, LaneError> {
+        self.one(op::BITCAST, self.uint, value)
+    }
+
+    pub fn floor(&mut self, value: Id) -> Result<Id, LaneError> {
+        self.glsl(Glsl::Floor, &[value])
+    }
+
+    pub fn fabs(&mut self, value: Id) -> Result<Id, LaneError> {
+        self.glsl(Glsl::FAbs, &[value])
+    }
+
     /// The float whose bits `value` holds.
     pub fn bits_float(&mut self, value: Id) -> Result<Id, LaneError> {
         self.one(op::BITCAST, self.float, value)

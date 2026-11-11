@@ -12,23 +12,36 @@ use simdr::lanes::LaneError;
 use simdr::module::Id;
 
 use super::emit::Em;
-use super::march::{Marching, Reader, World, sides};
+use super::march::{Marching, Ray, Reader, World, limit, sides};
 use super::{
-    Build, HIT_WORDS, Layout, MATERIAL_WORDS, MISS, Rays, Screen, UNIT, of, put, refuse, scene,
-    word,
+    BRICK_BITS, Build, FLOOR_RAYS, FOG_WORDS, GAS_WORDS, GASSY, HDR_WORDS, HIT_WORDS, Layout,
+    MATERIAL_WORDS, MISS, Rays, SPARE_WORDS, Screen, UNIT, brick_sides, flags, light, material, of,
+    put, refuse, scene, word,
 };
-use crate::layout::{BINDINGS, PIXELS, STATE};
+use crate::layout::{BINDINGS, PARAMS, PIXELS, STATE};
 use crate::sand::Grid;
 use crate::view3::Kinds;
 
-const SKY_DISC: f32 = 1400.0;
-const SKY_DISC_GAIN: f32 = 14.0;
-const SUN_HALO: f32 = 10.0;
-const SUN_HALO_GAIN: f32 = 0.3;
-const GAMMA: f32 = 1.0 / 2.2;
-const VIGNETTE: f32 = 0.16;
-const FAR: f32 = 1.0e30;
+const SUN_DISC: f32 = 0.9997;
+const SUN_DISC_EDGE: f32 = 0.9993;
+const SUN_DISC_GAIN: f32 = 9.0;
+const SUN_HALO: f32 = 48.0;
+const SUN_HALO_GAIN: f32 = 0.35;
+const HORIZON_GLOW: f32 = 3.0;
+pub(crate) const FAR: f32 = 1.0e30;
+const SKY_DISTANCE: f32 = 1.0e5;
 const FLOOR_REACH: f32 = 900.0;
+const FLOOR_HAZE: f32 = 2.2;
+const GAS_SUN: f32 = 0.6;
+const GAS_SKY: f32 = 0.45;
+const LINE_WIDE: f32 = 1.4;
+const FLOOR_MARGIN: f32 = 0.05;
+const PANE: f32 = 0.025;
+const BAND_PIXELS: f32 = 1.5;
+const BAND_FROM: f32 = 6.0;
+const BAND_OVER: f32 = 6.0;
+const ACTIVE_DIM: f32 = 0.2;
+const ACTIVE_KEPT: f32 = 0.45;
 
 /// The operations the light is written in.
 pub(crate) trait Shader {
@@ -64,18 +77,24 @@ pub(crate) trait Shader {
     fn pow(&mut self, a: Self::R, b: Self::R) -> Result<Self::R, LaneError>;
     fn sqrt(&mut self, a: Self::R) -> Result<Self::R, LaneError>;
     fn log(&mut self, a: Self::R) -> Result<Self::R, LaneError>;
+    fn floor(&mut self, a: Self::R) -> Result<Self::R, LaneError>;
+    fn fabs(&mut self, a: Self::R) -> Result<Self::R, LaneError>;
     fn fgt(&mut self, a: Self::R, b: Self::R) -> Result<Self::T, LaneError>;
     fn real(&mut self, a: Self::W) -> Result<Self::R, LaneError>;
     fn signed(&mut self, a: Self::W) -> Result<Self::R, LaneError>;
     fn whole(&mut self, a: Self::R) -> Result<Self::W, LaneError>;
     fn whole_signed(&mut self, a: Self::R) -> Result<Self::W, LaneError>;
     fn bits(&mut self, a: Self::W) -> Result<Self::R, LaneError>;
+    /// The bits of a float, as a word.
+    fn word_of(&mut self, a: Self::R) -> Result<Self::W, LaneError>;
     /// A word of `STATE`.
     fn cell(&mut self, at: Self::W) -> Result<Self::W, LaneError>;
     /// A word of `PIXELS` at a fixed place.
     fn fixed(&mut self, at: u32) -> Result<Self::W, LaneError>;
     /// A word of `PIXELS`.
     fn pixel(&mut self, at: Self::W) -> Result<Self::W, LaneError>;
+    /// The engine's frame: the first word of `PARAMS`.
+    fn frame(&mut self) -> Result<Self::W, LaneError>;
     /// Whether a ray from `origin` along `direction` meets a cell of a kind
     /// in `opaque`; nothing is traced where `going` is false.
     fn blocked(
@@ -87,7 +106,7 @@ pub(crate) trait Shader {
     ) -> Result<Self::T, LaneError>;
 }
 
-type V<R> = [R; 3];
+pub(crate) type V<R> = [R; 3];
 
 /// What the light needs to know when it is written.
 #[derive(Debug, Clone, Copy)]
@@ -99,32 +118,36 @@ pub(crate) struct Look {
     pub suns: u32,
 }
 
-struct Lit<S: Shader> {
-    toward: V<S::R>,
-    sun: V<S::R>,
-    zenith: V<S::R>,
-    horizon: V<S::R>,
-    ground: V<S::R>,
-    floor: V<S::R>,
-    haze: S::R,
-    exposure: S::R,
-    occlusion: S::R,
-    edge: S::R,
-    focal: S::R,
+pub(crate) struct Lit<S: Shader> {
+    pub toward: V<S::R>,
+    pub sun: V<S::R>,
+    pub zenith: V<S::R>,
+    pub horizon: V<S::R>,
+    pub ground: V<S::R>,
+    pub floor: V<S::R>,
+    pub haze: S::R,
+    pub exposure: S::R,
+    pub occlusion: S::R,
+    pub edge: S::R,
+    pub focal: S::R,
+    pub lamp: S::R,
+    pub bloom: S::R,
+    pub threshold: S::R,
+    pub glass: S::R,
+    pub blend: S::R,
+    pub trail: S::R,
+    pub contact: S::R,
+    pub glow: S::R,
 }
 
-struct Eye<S: Shader> {
-    origin: V<S::R>,
-    direction: V<S::R>,
-    length: S::R,
-    unit: V<S::R>,
+pub(crate) struct Eye<S: Shader> {
+    pub origin: V<S::R>,
+    pub direction: V<S::R>,
+    pub length: S::R,
+    pub unit: V<S::R>,
 }
 
-struct Surface<S: Shader> {
-    colour: V<S::R>,
-}
-
-fn v_map<S: Shader>(
+pub(crate) fn v_map<S: Shader>(
     s: &mut S,
     a: V<S::R>,
     mut each: impl FnMut(&mut S, S::R) -> Result<S::R, LaneError>,
@@ -132,7 +155,7 @@ fn v_map<S: Shader>(
     Ok([each(s, a[0])?, each(s, a[1])?, each(s, a[2])?])
 }
 
-fn v_zip<S: Shader>(
+pub(crate) fn v_zip<S: Shader>(
     s: &mut S,
     a: V<S::R>,
     b: V<S::R>,
@@ -145,7 +168,7 @@ fn v_zip<S: Shader>(
     ])
 }
 
-fn dot<S: Shader>(s: &mut S, a: V<S::R>, b: V<S::R>) -> Result<S::R, LaneError> {
+pub(crate) fn dot<S: Shader>(s: &mut S, a: V<S::R>, b: V<S::R>) -> Result<S::R, LaneError> {
     let x = s.fmul(a[0], b[0])?;
     let y = s.fmul(a[1], b[1])?;
     let z = s.fmul(a[2], b[2])?;
@@ -153,11 +176,16 @@ fn dot<S: Shader>(s: &mut S, a: V<S::R>, b: V<S::R>) -> Result<S::R, LaneError> 
     s.fadd(xy, z)
 }
 
-fn scaled<S: Shader>(s: &mut S, a: V<S::R>, by: S::R) -> Result<V<S::R>, LaneError> {
+pub(crate) fn scaled<S: Shader>(s: &mut S, a: V<S::R>, by: S::R) -> Result<V<S::R>, LaneError> {
     v_map(s, a, |s, value| s.fmul(value, by))
 }
 
-fn mix<S: Shader>(s: &mut S, a: V<S::R>, b: V<S::R>, by: S::R) -> Result<V<S::R>, LaneError> {
+pub(crate) fn mix<S: Shader>(
+    s: &mut S,
+    a: V<S::R>,
+    b: V<S::R>,
+    by: S::R,
+) -> Result<V<S::R>, LaneError> {
     v_zip(s, a, b, |s, a, b| {
         let gap = s.fsub(b, a)?;
         let part = s.fmul(gap, by)?;
@@ -165,13 +193,13 @@ fn mix<S: Shader>(s: &mut S, a: V<S::R>, b: V<S::R>, by: S::R) -> Result<V<S::R>
     })
 }
 
-fn lerp<S: Shader>(s: &mut S, a: S::R, b: S::R, by: S::R) -> Result<S::R, LaneError> {
+pub(crate) fn lerp<S: Shader>(s: &mut S, a: S::R, b: S::R, by: S::R) -> Result<S::R, LaneError> {
     let gap = s.fsub(b, a)?;
     let part = s.fmul(gap, by)?;
     s.fadd(a, part)
 }
 
-fn pick_v<S: Shader>(
+pub(crate) fn pick_v<S: Shader>(
     s: &mut S,
     when: S::T,
     yes: V<S::R>,
@@ -184,34 +212,76 @@ fn pick_v<S: Shader>(
     ])
 }
 
-fn real_at<S: Shader>(s: &mut S, at: u32) -> Result<S::R, LaneError> {
+/// `(value - from) / over`, kept between 0 and 1, smoothed at both ends.
+pub(crate) fn smooth<S: Shader>(
+    s: &mut S,
+    value: S::R,
+    from: f32,
+    over: f32,
+) -> Result<S::R, LaneError> {
+    let from = s.f(from)?;
+    let over = s.f(1.0 / over)?;
+    let gone = s.fsub(value, from)?;
+    let part = s.fmul(gone, over)?;
+    let t = s.clamp01(part)?;
+    let three = s.f(3.0)?;
+    let two = s.f(2.0)?;
+    let twice = s.fmul(t, two)?;
+    let rest = s.fsub(three, twice)?;
+    let square = s.fmul(t, t)?;
+    s.fmul(square, rest)
+}
+
+pub(crate) fn real_at<S: Shader>(s: &mut S, at: u32) -> Result<S::R, LaneError> {
     let held = s.fixed(at)?;
     s.bits(held)
 }
 
-fn reals_at<S: Shader>(s: &mut S, at: u32) -> Result<V<S::R>, LaneError> {
+pub(crate) fn reals_at<S: Shader>(s: &mut S, at: u32) -> Result<V<S::R>, LaneError> {
     Ok([real_at(s, at)?, real_at(s, at + 1)?, real_at(s, at + 2)?])
 }
 
-fn lit<S: Shader>(s: &mut S, look: &Look) -> Result<Lit<S>, LaneError> {
+/// The float at word `at` of `PIXELS`, given as a word.
+pub(crate) fn real_of<S: Shader>(s: &mut S, at: S::W) -> Result<S::R, LaneError> {
+    let held = s.pixel(at)?;
+    s.bits(held)
+}
+
+/// The word `at + by`.
+pub(crate) fn plus<S: Shader>(s: &mut S, at: S::W, by: u32) -> Result<S::W, LaneError> {
+    let by = s.u(by)?;
+    s.add(at, by)
+}
+
+pub(crate) fn lit<S: Shader>(s: &mut S, look: &Look) -> Result<Lit<S>, LaneError> {
     let at = word(look.layout.scene() + scene::LIGHT);
+    let one = |s: &mut S, field: usize| real_at(s, at + word(field));
+    let three = |s: &mut S, field: usize| reals_at(s, at + word(field));
     Ok(Lit {
-        toward: reals_at(s, at)?,
-        sun: reals_at(s, at + 3)?,
-        zenith: reals_at(s, at + 6)?,
-        horizon: reals_at(s, at + 9)?,
-        ground: reals_at(s, at + 12)?,
-        floor: reals_at(s, at + 15)?,
-        haze: real_at(s, at + 18)?,
-        exposure: real_at(s, at + 19)?,
-        occlusion: real_at(s, at + 20)?,
-        edge: real_at(s, at + 21)?,
-        focal: real_at(s, at + 22)?,
+        toward: three(s, light::TOWARD)?,
+        sun: three(s, light::SUN)?,
+        zenith: three(s, light::ZENITH)?,
+        horizon: three(s, light::HORIZON)?,
+        ground: three(s, light::GROUND)?,
+        floor: three(s, light::FLOOR)?,
+        haze: one(s, light::HAZE)?,
+        exposure: one(s, light::EXPOSURE)?,
+        occlusion: one(s, light::OCCLUSION)?,
+        edge: one(s, light::EDGE)?,
+        focal: one(s, light::FOCAL)?,
+        lamp: one(s, light::LAMP)?,
+        bloom: one(s, light::BLOOM)?,
+        threshold: one(s, light::THRESHOLD)?,
+        glass: one(s, light::GLASS)?,
+        blend: one(s, light::BLEND)?,
+        trail: one(s, light::TRAIL)?,
+        contact: one(s, light::CONTACT)?,
+        glow: one(s, light::GLOW)?,
     })
 }
 
 /// The direction of pixel `(x, y)`, as two's complement words.
-fn direction_words<S: Shader>(
+pub(crate) fn direction_words<S: Shader>(
     s: &mut S,
     look: &Look,
     (x, y): (S::W, S::W),
@@ -240,7 +310,11 @@ fn direction_words<S: Shader>(
     Ok(out)
 }
 
-fn eye<S: Shader>(s: &mut S, look: &Look, at: (S::W, S::W)) -> Result<Eye<S>, LaneError> {
+pub(crate) fn eye<S: Shader>(
+    s: &mut S,
+    look: &Look,
+    at: (S::W, S::W),
+) -> Result<Eye<S>, LaneError> {
     let base = word(look.layout.scene() + scene::ORIGIN);
     let sixteenth = s.f(1.0 / UNIT as f32)?;
     let mut origin = [sixteenth; 3];
@@ -266,44 +340,69 @@ fn eye<S: Shader>(s: &mut S, look: &Look, at: (S::W, S::W)) -> Result<Eye<S>, La
     })
 }
 
+/// The sky seen along the unit vector `way`: a smooth blend from a warm
+/// glow at the horizon, brightest toward the sun, to a softer colour
+/// overhead, with the sun's halo, and its disc when `disc`.
 fn sky<S: Shader>(s: &mut S, lit: &Lit<S>, way: V<S::R>, disc: bool) -> Result<V<S::R>, LaneError> {
     let none = s.f(0.0)?;
+    let one = s.f(1.0)?;
     let up = s.fsub(none, way[1])?;
     let high = s.clamp01(up)?;
-    let high = s.sqrt(high)?;
-    let colour = mix(s, lit.horizon, lit.zenith, high)?;
-    let three = s.f(3.0)?;
-    let below = s.fsub(none, up)?;
-    let below = s.fmul(below, three)?;
-    let below = s.clamp01(below)?;
-    let dim = s.f(0.82)?;
-    let floor = scaled(s, lit.horizon, dim)?;
-    let colour = mix(s, colour, floor, below)?;
+    let curve = s.f(0.6)?;
+    let lifted = s.fmax(high, none)?;
+    let height = s.pow(lifted, curve)?;
+    let colour = mix(s, lit.horizon, lit.zenith, height)?;
     let facing = dot(s, way, lit.toward)?;
-    let facing = s.fmax(facing, none)?;
+    let toward = s.fmax(facing, none)?;
+    let sunward = s.fadd(toward, one)?;
+    let half = s.f(0.5)?;
+    let sunward = s.fmul(sunward, half)?;
+    let sunward = s.fmul(sunward, sunward)?;
+    let fall = s.f(-HORIZON_GLOW)?;
+    let above = s.fabs(up)?;
+    let fall = s.fmul(above, fall)?;
+    let near = s.exp(fall)?;
+    let glow = s.fmul(near, sunward)?;
+    let glow = s.fmul(glow, lit.glow)?;
     let halo = s.f(SUN_HALO)?;
-    let halo = s.pow(facing, halo)?;
+    let halo = s.pow(toward, halo)?;
     let halo_gain = s.f(SUN_HALO_GAIN)?;
-    let mut glow = s.fmul(halo, halo_gain)?;
+    let halo = s.fmul(halo, halo_gain)?;
+    let mut light = s.fadd(glow, halo)?;
     if disc {
-        let sharp = s.f(SKY_DISC)?;
-        let sharp = s.pow(facing, sharp)?;
-        let gain = s.f(SKY_DISC_GAIN)?;
-        let sharp = s.fmul(sharp, gain)?;
-        glow = s.fadd(glow, sharp)?;
+        let shown = smooth(s, facing, SUN_DISC_EDGE, SUN_DISC - SUN_DISC_EDGE)?;
+        let gain = s.f(SUN_DISC_GAIN)?;
+        let shown = s.fmul(shown, gain)?;
+        light = s.fadd(light, shown)?;
     }
-    let sun = scaled(s, lit.sun, glow)?;
+    let sun = scaled(s, lit.sun, light)?;
     v_zip(s, colour, sun, S::fadd)
 }
 
-/// What a ray that meets no cell sees: the sky, or a plane under the grid
-/// lit by the sun, shadowed by the world and hazed with distance.
+/// A word hashed to spread its bits.
+pub(crate) fn hash<S: Shader>(s: &mut S, value: S::W) -> Result<S::W, LaneError> {
+    let mut x = value;
+    for (shift, factor) in [(16, 0x7FEB_352D), (15, 0x846C_A68B)] {
+        let moved = s.shr(x, shift)?;
+        x = s.xor(x, moved)?;
+        let factor = s.u(factor)?;
+        x = s.mul(x, factor)?;
+    }
+    let moved = s.shr(x, 16)?;
+    s.xor(x, moved)
+}
+
+/// What a ray that meets no cell sees, and how far it goes: the sky, or a
+/// warm floor under the grid, lit by the sun and shadowed by the world
+/// along one of the floor's sun rays, the one `pick` chooses, darkened
+/// next to the world, and fading into the sky with distance.
 fn backdrop<S: Shader>(
     s: &mut S,
     look: &Look,
     lit: &Lit<S>,
     eye: &Eye<S>,
-) -> Result<V<S::R>, LaneError> {
+    pick: S::W,
+) -> Result<(V<S::R>, S::R), LaneError> {
     let grid = look.grid;
     let above = sky(s, lit, eye.unit, true)?;
     let zero = s.f(0.0)?;
@@ -317,8 +416,10 @@ fn backdrop<S: Shader>(
     let unit = s.f(UNIT as f32)?;
     let mut near = down;
     let mut origin = [s.u(grid.deep * UNIT - 1)?; 3];
-    for axis in [0, 2] {
-        let low = s.f(of(sides(grid), axis) as f32 - FLOOR_REACH)?;
+    let mut outside = [zero; 2];
+    for (at, axis) in [0, 2].into_iter().enumerate() {
+        let side = of(sides(grid), axis) as f32;
+        let low = s.f(side - FLOOR_REACH)?;
         let high = s.f(FLOOR_REACH)?;
         let over = s.fgt(of(point, axis), low)?;
         let under = s.fgt(high, of(point, axis))?;
@@ -327,6 +428,14 @@ fn backdrop<S: Shader>(
         let sixteenths = s.fmul(of(point, axis), unit)?;
         let held = s.whole_signed(sixteenths)?;
         put(&mut origin, axis, held);
+        let before = s.fsub(zero, of(point, axis))?;
+        let end = s.f(side)?;
+        let after = s.fsub(of(point, axis), end)?;
+        let past = s.fmax(before, after)?;
+        let past = s.fmax(past, zero)?;
+        if let Some(slot) = outside.get_mut(at) {
+            *slot = past;
+        }
     }
     let zero_word = s.u(0)?;
     for slot in &mut origin {
@@ -337,39 +446,85 @@ fn backdrop<S: Shader>(
     let sunny = s.fgt(facing, zero)?;
     let going = s.both(near, sunny)?;
     let opaque = s.fixed(word(look.layout.scene() + scene::OPAQUE))?;
-    let suns = look.suns.max(1);
-    let share = s.f(1.0 / suns as f32)?;
+    let rays_count = 2 * look.suns.max(1);
+    let share = s.f(1.0 / rays_count as f32)?;
     let mut seen = zero;
-    for at_sun in 0..suns {
-        let base = word(look.layout.scene() + scene::SUN_RAYS) + 3 * at_sun;
-        let rays = [s.fixed(base)?, s.fixed(base + 1)?, s.fixed(base + 2)?];
+    let base = s.u(word(look.layout.scene() + scene::FLOOR_RAYS))?;
+    for at_ray in 0..rays_count {
+        let step = s.u(at_ray * (FLOOR_RAYS as u32 / rays_count).max(1))?;
+        let which = s.add(pick, step)?;
+        let which = s.and(which, FLOOR_RAYS as u32 - 1)?;
+        let three = s.u(3)?;
+        let at = s.mul(which, three)?;
+        let at = s.add(base, at)?;
+        let mut rays = [at; 3];
+        for (axis, slot) in rays.iter_mut().enumerate() {
+            let here = plus(s, at, word(axis))?;
+            *slot = s.pixel(here)?;
+        }
         let blocked = s.blocked(opaque, origin, rays, going)?;
         let open = s.pick_r(blocked, zero, share)?;
         seen = s.fadd(seen, open)?;
     }
-    let sky_amount = s.f(0.3)?;
+
+    let [dx, dz] = outside;
+    let dx = s.fmul(dx, dx)?;
+    let dz = s.fmul(dz, dz)?;
+    let apart = s.fadd(dx, dz)?;
+    let apart = s.sqrt(apart)?;
+    let size = s.f(grid.wide.max(grid.tall) as f32)?;
+    let tight = s.f(0.03)?;
+    let tight = s.fmul(size, tight)?;
+    let wide = s.f(0.16)?;
+    let wide = s.fmul(size, wide)?;
+    let into = s.fdiv(apart, tight)?;
+    let into = s.fsub(zero, into)?;
+    let close = s.exp(into)?;
+    let broad = s.fdiv(apart, wide)?;
+    let broad = s.fsub(zero, broad)?;
+    let broad = s.exp(broad)?;
+    let quarter = s.f(0.45)?;
+    let broad = s.fmul(broad, quarter)?;
+    let dark = s.fadd(close, broad)?;
+    let dark = s.fmul(dark, lit.contact)?;
+    let held = s.fsub(one, dark)?;
+    let held = s.fmax(held, zero)?;
+
+    let sky_amount = s.f(0.55)?;
+    let soft = s.fmul(seen, held)?;
     let mut colour = [zero; 3];
     for (channel, slot) in colour.iter_mut().enumerate() {
         let sun = s.fmul(of(lit.sun, channel), facing)?;
-        let sun = s.fmul(sun, seen)?;
+        let sun = s.fmul(sun, soft)?;
         let fill = s.fadd(of(lit.zenith, channel), of(lit.horizon, channel))?;
-        let sky = s.fmul(fill, sky_amount)?;
-        let light = s.fadd(sun, sky)?;
-        let albedo = of(lit.floor, channel);
-        *slot = s.fmul(albedo, light)?;
+        let fill = s.fmul(fill, sky_amount)?;
+        let fill = s.fmul(fill, held)?;
+        let light = s.fadd(sun, fill)?;
+        *slot = s.fmul(of(lit.floor, channel), light)?;
     }
     let distance = s.fmul(far, eye.length)?;
-    let thickness = s.fmul(distance, lit.haze)?;
+    let thick = s.f(FLOOR_HAZE)?;
+    let thick = s.fmul(lit.haze, thick)?;
+    let thickness = s.fmul(distance, thick)?;
     let thickness = s.fsub(zero, thickness)?;
     let left = s.exp(thickness)?;
     let fog = s.fsub(one, left)?;
-    let mist = sky(s, lit, eye.unit, false)?;
+    let level = [eye.unit[0], zero, eye.unit[2]];
+    let flat = dot(s, level, level)?;
+    let flat = s.sqrt(flat)?;
+    let tiny = s.f(1.0e-6)?;
+    let flat = s.fmax(flat, tiny)?;
+    let level = v_map(s, level, |s, value| s.fdiv(value, flat))?;
+    let mist = sky(s, lit, level, false)?;
     let hazed = mix(s, colour, mist, fog)?;
-    pick_v(s, down, hazed, above)
+    let colour = pick_v(s, down, hazed, above)?;
+    let endless = s.f(SKY_DISTANCE)?;
+    let distance = s.pick_r(down, distance, endless)?;
+    Ok((colour, distance))
 }
 
 /// The cell's point on each axis, from its index.
-fn point<S: Shader>(s: &mut S, grid: Grid, cell: S::W) -> Result<V<S::W>, LaneError> {
+pub(crate) fn point<S: Shader>(s: &mut S, grid: Grid, cell: S::W) -> Result<V<S::W>, LaneError> {
     let wide = grid.wide.trailing_zeros();
     let deep = grid.deep.trailing_zeros();
     let x = s.and(cell, grid.wide - 1)?;
@@ -380,7 +535,8 @@ fn point<S: Shader>(s: &mut S, grid: Grid, cell: S::W) -> Result<V<S::W>, LaneEr
     Ok([x, y, z])
 }
 
-/// The axis of a face (3 for [`INSIDE`]) and whether it faces up its axis.
+/// The axis of a face (3 for [`super::INSIDE`]) and whether it faces up its
+/// axis.
 fn face_parts<S: Shader>(s: &mut S, info: S::W) -> Result<(S::W, S::T), LaneError> {
     let face = s.and(info, 7)?;
     let axis = s.shr(face, 1)?;
@@ -415,6 +571,41 @@ fn entry<S: Shader>(
     Ok(far)
 }
 
+/// How far along the eye's direction it enters and leaves the grid's box;
+/// the entry is 0 for an eye inside it.
+fn boxed<S: Shader>(s: &mut S, grid: Grid, eye: &Eye<S>) -> Result<(S::R, S::R), LaneError> {
+    let none = s.f(0.0)?;
+    let far = s.f(FAR)?;
+    let mut enters = s.f(-FAR)?;
+    let mut leaves = far;
+    for (axis, side) in sides(grid).into_iter().enumerate() {
+        let side = s.f(side as f32)?;
+        let way = of(eye.direction, axis);
+        let tiny = s.f(1.0e-12)?;
+        let size = s.fabs(way)?;
+        let still = s.fgt(tiny, size)?;
+        let one = s.f(1.0)?;
+        let way = s.pick_r(still, one, way)?;
+        let low = s.fsub(none, of(eye.origin, axis))?;
+        let low = s.fdiv(low, way)?;
+        let high = s.fsub(side, of(eye.origin, axis))?;
+        let high = s.fdiv(high, way)?;
+        let first = s.fmin(low, high)?;
+        let last = s.fmax(low, high)?;
+        let outside_low = s.fgt(none, of(eye.origin, axis))?;
+        let outside_high = s.fgt(of(eye.origin, axis), side)?;
+        let reach = s.f(-FAR)?;
+        let without = s.pick_r(outside_low, far, reach)?;
+        let without = s.pick_r(outside_high, far, without)?;
+        let first = s.pick_r(still, without, first)?;
+        let last = s.pick_r(still, far, last)?;
+        enters = s.fmax(enters, first)?;
+        leaves = s.fmin(leaves, last)?;
+    }
+    let enters = s.fmax(enters, none)?;
+    Ok((enters, leaves))
+}
+
 /// How far along the eye's direction it leaves the grid.
 fn leaving<S: Shader>(s: &mut S, grid: Grid, eye: &Eye<S>) -> Result<S::R, LaneError> {
     let none = s.f(0.0)?;
@@ -440,44 +631,41 @@ fn leaving<S: Shader>(s: &mut S, grid: Grid, eye: &Eye<S>) -> Result<S::R, LaneE
     Ok(least)
 }
 
-fn kind_of<S: Shader>(s: &mut S, kinds: Kinds, held: S::W) -> Result<S::W, LaneError> {
+pub(crate) fn kind_of<S: Shader>(s: &mut S, kinds: Kinds, held: S::W) -> Result<S::W, LaneError> {
     let moved = s.shr(held, kinds.shift())?;
     s.and(moved, kinds.mask())
 }
 
-struct Stuff<S: Shader> {
-    albedo: V<S::R>,
-    jitter: S::R,
-    glow: S::R,
-    clear: S::R,
+pub(crate) struct Stuff<S: Shader> {
+    pub albedo: V<S::R>,
+    pub jitter: S::R,
+    pub glow: S::R,
+    pub clear: S::R,
+    pub strata: S::R,
+    pub gap: S::R,
 }
 
-fn stuff<S: Shader>(s: &mut S, look: &Look, kind: S::W) -> Result<Stuff<S>, LaneError> {
+pub(crate) fn stuff<S: Shader>(s: &mut S, look: &Look, kind: S::W) -> Result<Stuff<S>, LaneError> {
     let base = s.u(word(look.layout.table()))?;
     let size = s.u(word(MATERIAL_WORDS))?;
     let offset = s.mul(kind, size)?;
     let at = s.add(base, offset)?;
-    let mut values = Vec::with_capacity(6);
-    for slot in 0..6 {
-        let step = s.u(slot)?;
-        let here = s.add(at, step)?;
-        let held = s.pixel(here)?;
-        values.push(s.bits(held)?);
-    }
-    let get = |at: usize| values.get(at).copied();
-    let missing = LaneError::BadCarry {
-        given: values.len(),
-        wanted: 6,
+    let get = |s: &mut S, field: usize| -> Result<S::R, LaneError> {
+        let here = plus(s, at, word(field))?;
+        real_of(s, here)
     };
-    match (get(0), get(1), get(2), get(3), get(4), get(5)) {
-        (Some(r), Some(g), Some(b), Some(jitter), Some(glow), Some(clear)) => Ok(Stuff {
-            albedo: [r, g, b],
-            jitter,
-            glow,
-            clear,
-        }),
-        _ => Err(missing),
-    }
+    Ok(Stuff {
+        albedo: [
+            get(s, material::ALBEDO)?,
+            get(s, material::ALBEDO + 1)?,
+            get(s, material::ALBEDO + 2)?,
+        ],
+        jitter: get(s, material::JITTER)?,
+        glow: get(s, material::GLOW)?,
+        clear: get(s, material::CLEAR)?,
+        strata: get(s, material::STRATA)?,
+        gap: get(s, material::GAP)?,
+    })
 }
 
 /// `values` laid out on the grid's axes, given which axis a face is on:
@@ -511,18 +699,6 @@ fn from_axes<S: Shader>(s: &mut S, axis: S::W, values: V<S::R>) -> Result<[S::R;
     let second = s.pick_r(on_y, values[0], values[1])?;
     let second = s.pick_r(on_x, values[2], second)?;
     Ok([first, second])
-}
-
-fn hash<S: Shader>(s: &mut S, value: S::W) -> Result<S::W, LaneError> {
-    let mut x = value;
-    for (shift, factor) in [(16, 0x7FEB_352D), (15, 0x846C_A68B)] {
-        let moved = s.shr(x, shift)?;
-        x = s.xor(x, moved)?;
-        let factor = s.u(factor)?;
-        x = s.mul(x, factor)?;
-    }
-    let moved = s.shr(x, 16)?;
-    s.xor(x, moved)
 }
 
 /// A cell next to the face, given by its offsets along the face's axis and
@@ -560,6 +736,140 @@ fn neighbour<S: Shader>(
     let none = s.u(0)?;
     let index = s.pick(inside, index, none)?;
     Ok((inside, index))
+}
+
+/// A volume of `channels` floats a brick, starting at word `base`, read at
+/// `point` in cells, blended between the eight bricks around it.
+pub(crate) fn sampled<S: Shader>(
+    s: &mut S,
+    grid: Grid,
+    base: u32,
+    channels: u32,
+    point: V<S::R>,
+) -> Result<Vec<S::R>, LaneError> {
+    let sides = brick_sides(grid);
+    let zero = s.f(0.0)?;
+    let one = s.f(1.0)?;
+    let quarter = s.f(1.0 / (1 << BRICK_BITS) as f32)?;
+    let half = s.f(0.5)?;
+    let mut low = [s.u(0)?; 3];
+    let mut high = low;
+    let mut part = [zero; 3];
+    for axis in 0..3 {
+        let side = of(sides, axis);
+        let at = s.fmul(of(point, axis), quarter)?;
+        let at = s.fsub(at, half)?;
+        let below = s.floor(at)?;
+        let rest = s.fsub(at, below)?;
+        let last = s.f((side - 1) as f32)?;
+        let first = s.fmax(below, zero)?;
+        let first = s.fmin(first, last)?;
+        let next = s.fadd(below, one)?;
+        let next = s.fmax(next, zero)?;
+        let next = s.fmin(next, last)?;
+        let held = s.whole(first)?;
+        put(&mut low, axis, held);
+        let held = s.whole(next)?;
+        put(&mut high, axis, held);
+        let held = s.clamp01(rest)?;
+        put(&mut part, axis, held);
+    }
+    let across = of(sides, 0).trailing_zeros();
+    let down = of(sides, 1).trailing_zeros();
+    let mut out = vec![zero; channels as usize];
+    for corner in 0..8_usize {
+        let pick = |axis: usize| (corner >> axis) & 1 == 1;
+        let x = if pick(0) { high[0] } else { low[0] };
+        let y = if pick(1) { high[1] } else { low[1] };
+        let z = if pick(2) { high[2] } else { low[2] };
+        let mut weight = one;
+        for axis in 0..3 {
+            let share = if pick(axis) {
+                of(part, axis)
+            } else {
+                s.fsub(one, of(part, axis))?
+            };
+            weight = s.fmul(weight, share)?;
+        }
+        let z = s.shl(z, across + down)?;
+        let y = s.shl(y, across)?;
+        let index = s.or(z, y)?;
+        let index = s.or(index, x)?;
+        let count = s.u(channels)?;
+        let index = s.mul(index, count)?;
+        let start = s.u(base)?;
+        let index = s.add(index, start)?;
+        for (channel, slot) in (0_u32..).zip(out.iter_mut()) {
+            let here = plus(s, index, channel)?;
+            let value = real_of(s, here)?;
+            let value = s.fmul(value, weight)?;
+            *slot = s.fadd(*slot, value)?;
+        }
+    }
+    Ok(out)
+}
+
+/// The light a ray gathers through cell `cell` of a brick that holds gas,
+/// and how much of the light behind it still shows: `fog` is the light so
+/// far, red, green and blue, then the share that still shows. The gas is
+/// read between the bricks around the cell's middle, so its edges are soft.
+pub(crate) fn gas_step<S: Shader>(
+    s: &mut S,
+    look: &Look,
+    cell: S::W,
+    fog: [S::R; 4],
+) -> Result<[S::R; 4], LaneError> {
+    let layout = look.layout;
+    let grid = look.grid;
+    let at_light = word(layout.scene() + scene::LIGHT);
+    let sun = reals_at(s, at_light + word(light::SUN))?;
+    let zenith = reals_at(s, at_light + word(light::ZENITH))?;
+    let horizon = reals_at(s, at_light + word(light::HORIZON))?;
+    let lamp_gain = real_at(s, at_light + word(light::LAMP))?;
+    let gain = real_at(s, at_light + word(light::SMOKE))?;
+    let at = point(s, grid, cell)?;
+    let half = s.f(0.5)?;
+    let mut middle = [half; 3];
+    for (axis, slot) in middle.iter_mut().enumerate() {
+        let whole = s.real(of(at, axis))?;
+        *slot = s.fadd(whole, half)?;
+    }
+    let thick = sampled(s, grid, word(layout.gas()), word(GAS_WORDS), middle)?;
+    let zero = s.f(0.0)?;
+    let one = s.f(1.0)?;
+    let through = sampled(s, grid, word(layout.sunlit()), 1, middle)?;
+    let through = through.first().copied().unwrap_or(one);
+    let lamp = sampled(s, grid, word(layout.lamp(2)), 3, middle)?;
+    let taken = thick.first().copied().unwrap_or(zero);
+    let taken = s.fmul(taken, gain)?;
+    let taken = s.clamp01(taken)?;
+    let [red, green, blue, left] = fog;
+    let sun_gain = s.f(GAS_SUN)?;
+    let sky_gain = s.f(GAS_SKY)?;
+    let sunned = s.fmul(through, sun_gain)?;
+    let mut out = [red, green, blue];
+    for (channel, slot) in out.iter_mut().enumerate() {
+        let near = lamp.get(channel).copied().unwrap_or(zero);
+        let near = s.fmul(near, lamp_gain)?;
+        let direct = s.fmul(of(sun, channel), sunned)?;
+        let fill = s.fadd(of(zenith, channel), of(horizon, channel))?;
+        let fill = s.fmul(fill, sky_gain)?;
+        let light = s.fadd(direct, fill)?;
+        let light = s.fadd(light, near)?;
+        let colour = thick.get(channel + 1).copied().unwrap_or(zero);
+        let colour = s.fmul(colour, gain)?;
+        let gathered = s.fmul(colour, light)?;
+        let gathered = s.fmul(gathered, left)?;
+        *slot = s.fadd(*slot, gathered)?;
+    }
+    let kept = s.fsub(one, taken)?;
+    let left = s.fmul(left, kept)?;
+    Ok([out[0], out[1], out[2], left])
+}
+
+pub(crate) struct Surface<S: Shader> {
+    pub colour: V<S::R>,
+    pub glow: V<S::R>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -663,35 +973,33 @@ fn surface<S: Shader>(
     let mut corners_sun = [zero; 4];
     for (corner, (ao_slot, sun_slot)) in corners_ao.iter_mut().zip(&mut corners_sun).enumerate() {
         let (i, j) = (corner & 1, corner >> 1);
-        {
-            let side_a = of(of(shut, 2 * i), 1);
-            let side_b = of(of(shut, 1), 2 * j);
-            let diagonal = of(of(shut, 2 * i), 2 * j);
-            let count = s.fadd(side_a, side_b)?;
-            let both = s.fmul(side_a, side_b)?;
-            let pinned = s.fgt(both, zero)?;
-            let three_r = s.f(3.0)?;
-            let count = s.fadd(count, diagonal)?;
-            let count = s.pick_r(pinned, three_r, count)?;
-            let dark = s.fmul(count, lit.occlusion)?;
-            *ao_slot = s.fsub(one, dark)?;
+        let side_a = of(of(shut, 2 * i), 1);
+        let side_b = of(of(shut, 1), 2 * j);
+        let diagonal = of(of(shut, 2 * i), 2 * j);
+        let count = s.fadd(side_a, side_b)?;
+        let both = s.fmul(side_a, side_b)?;
+        let pinned = s.fgt(both, zero)?;
+        let three_r = s.f(3.0)?;
+        let count = s.fadd(count, diagonal)?;
+        let count = s.pick_r(pinned, three_r, count)?;
+        let dark = s.fmul(count, lit.occlusion)?;
+        *ao_slot = s.fsub(one, dark)?;
 
-            let first = if i == 1 { far_wall } else { near_wall };
-            let second = if j == 1 { far_wall } else { near_wall };
-            let inset = on_axes(s, axis, [normal_inset, first, second])?;
-            let origin = [
-                s.add(ahead[0], inset[0])?,
-                s.add(ahead[1], inset[1])?,
-                s.add(ahead[2], inset[2])?,
-            ];
-            let mut seen = zero;
-            for rays in &sun_rays {
-                let blocked = s.blocked(opaque, origin, *rays, lit_side)?;
-                let open = s.pick_r(blocked, zero, share)?;
-                seen = s.fadd(seen, open)?;
-            }
-            *sun_slot = seen;
+        let first = if i == 1 { far_wall } else { near_wall };
+        let second = if j == 1 { far_wall } else { near_wall };
+        let inset = on_axes(s, axis, [normal_inset, first, second])?;
+        let origin = [
+            s.add(ahead[0], inset[0])?,
+            s.add(ahead[1], inset[1])?,
+            s.add(ahead[2], inset[2])?,
+        ];
+        let mut seen = zero;
+        for rays in &sun_rays {
+            let blocked = s.blocked(opaque, origin, *rays, lit_side)?;
+            let open = s.pick_r(blocked, zero, share)?;
+            seen = s.fadd(seen, open)?;
         }
+        *sun_slot = seen;
     }
     let [ao_00, ao_10, ao_01, ao_11] = corners_ao;
     let ao_low = lerp(s, ao_00, ao_10, u)?;
@@ -702,10 +1010,20 @@ fn surface<S: Shader>(
     let sun_high = lerp(s, sun_01, sun_11, u)?;
     let shadow = lerp(s, sun_low, sun_high, v)?;
 
+    let half = s.f(0.5)?;
+    let lifted = scaled(s, normal, half)?;
+    let front_point = v_zip(s, hit, lifted, S::fadd)?;
+    let lamp = sampled(s, grid, word(look.layout.lamp(2)), 3, front_point)?;
+    let gases = s.fixed(word(look.layout.scene() + scene::GAS))?;
+    let no_gas = s.eq(gases, none_word)?;
+    let through = sampled(s, grid, word(look.layout.sunlit()), 1, front_point)?;
+    let through = through.first().copied().unwrap_or(one);
+    let through = s.pick_r(no_gas, one, through)?;
+    let shadow = s.fmul(shadow, through)?;
+
     let mixed = hash(s, cell)?;
     let mut jitters = [zero; 4];
     let byte = s.f(1.0 / 255.0)?;
-    let half = s.f(0.5)?;
     for (at_byte, slot) in jitters.iter_mut().enumerate() {
         let part = s.shr(mixed, 8 * at_byte as u32)?;
         let part = s.and(part, 0xFF)?;
@@ -713,6 +1031,22 @@ fn surface<S: Shader>(
         let part = s.fmul(part, byte)?;
         *slot = s.fsub(part, half)?;
     }
+    let column = s.shr(at[0], 3)?;
+    let row = s.shr(at[2], 3)?;
+    let row = s.shl(row, 12)?;
+    let column = s.or(column, row)?;
+    let wobble = hash(s, column)?;
+    let wobble = s.and(wobble, 3)?;
+    let layer = s.add(at[1], wobble)?;
+    let layer = s.shr(layer, 1)?;
+    let layer = s.shl(layer, 4)?;
+    let layer = s.or(layer, kind)?;
+    let band = hash(s, layer)?;
+    let band = s.and(band, 0xFF)?;
+    let band = s.real(band)?;
+    let band = s.fmul(band, byte)?;
+    let band = s.fsub(band, half)?;
+    let band = s.fmul(band, material.strata)?;
     let broad = s.f(1.6)?;
     let fine = s.f(0.4)?;
     let [red, green, blue, overall] = jitters;
@@ -723,6 +1057,7 @@ fn surface<S: Shader>(
         let shift = s.fadd(all, own)?;
         let shift = s.fmul(shift, material.jitter)?;
         let factor = s.fadd(one, shift)?;
+        let factor = s.fadd(factor, band)?;
         let factor = s.fmax(factor, zero)?;
         *slot = s.fmul(of(material.albedo, channel), factor)?;
     }
@@ -735,31 +1070,39 @@ fn surface<S: Shader>(
     let near_u = s.fmin(u, u_far)?;
     let near_v = s.fmin(v, v_far)?;
     let rim = s.fmin(near_u, near_v)?;
-    let pixel_wide = s.f(1.2)?;
+    let pixel_wide = s.f(BAND_PIXELS)?;
     let band = s.fdiv(pixel_wide, size)?;
-    let least_band = s.f(0.06)?;
+    let least_band = s.f(0.04)?;
     let band = s.fmax(band, least_band)?;
     let into = s.fdiv(rim, band)?;
     let into = s.clamp01(into)?;
     let outer = s.fsub(one, into)?;
-    let fade_from = s.f(3.0)?;
-    let fade = s.fsub(size, fade_from)?;
-    let quarter = s.f(0.25)?;
-    let fade = s.fmul(fade, quarter)?;
-    let fade = s.clamp01(fade)?;
+    let fade = smooth(s, size, BAND_FROM, BAND_OVER)?;
     let edge = s.fmul(outer, lit.edge)?;
     let edge = s.fmul(edge, fade)?;
     let edge = s.fsub(one, edge)?;
 
+    let tiny = s.f(1.0e-4)?;
+    let gap = s.fmax(material.gap, tiny)?;
+    let into_gap = s.fdiv(rim, gap)?;
+    let into_gap = s.clamp01(into_gap)?;
+    let has_gap = s.fgt(material.gap, zero)?;
+    let open = s.pick_r(has_gap, into_gap, one)?;
+    let deep = s.f(0.12)?;
+    let rest = s.f(0.88)?;
+    let open = s.fmul(open, rest)?;
+    let open = s.fadd(open, deep)?;
+
     let up_ness = s.fsub(zero, normal[1])?;
     let sky_part = s.f(0.15)?;
-    let sky_base = s.f(0.15)?;
+    let sky_base = s.f(0.2)?;
     let sky_amount = s.fmul(up_ness, sky_part)?;
     let sky_amount = s.fadd(sky_base, sky_amount)?;
     let ground_part = s.f(0.25)?;
     let ground_amount = s.fsub(one, up_ness)?;
     let ground_amount = s.fmul(ground_amount, ground_part)?;
     let mut colour = [zero; 3];
+    let mut glow = [zero; 3];
     for channel in 0..3 {
         let sun = s.fmul(of(lit.sun, channel), facing)?;
         let sun = s.fmul(sun, shadow)?;
@@ -770,42 +1113,110 @@ fn surface<S: Shader>(
         let ambient = s.fmul(ambient, occlusion)?;
         let light = s.fadd(sun, ambient)?;
         let light = s.fadd(light, of(warmth, channel))?;
+        let near = lamp.get(channel).copied().unwrap_or(zero);
+        let near = s.fmul(near, lit.lamp)?;
+        let light = s.fadd(light, near)?;
         let light = s.fmul(light, edge)?;
-        let own = s.fmul(of(albedo, channel), material.glow)?;
+        let light = s.fmul(light, open)?;
         let shade = s.fmul(of(albedo, channel), light)?;
-        let held = s.fadd(shade, own)?;
-        put(&mut colour, channel, held);
+        put(&mut colour, channel, shade);
+        let own = s.fmul(of(albedo, channel), material.glow)?;
+        let own = s.fmul(own, open)?;
+        put(&mut glow, channel, own);
     }
-    Ok(Surface { colour })
+    Ok(Surface { colour, glow })
 }
 
-fn tone<S: Shader>(s: &mut S, value: S::R) -> Result<S::R, LaneError> {
-    let a = s.f(2.51)?;
-    let b = s.f(0.03)?;
-    let c = s.f(2.43)?;
-    let d = s.f(0.59)?;
-    let e = s.f(0.14)?;
-    let top = s.fmul(value, a)?;
-    let top = s.fadd(top, b)?;
-    let top = s.fmul(top, value)?;
-    let bottom = s.fmul(value, c)?;
-    let bottom = s.fadd(bottom, d)?;
-    let bottom = s.fmul(bottom, value)?;
-    let bottom = s.fadd(bottom, e)?;
-    let mapped = s.fdiv(top, bottom)?;
-    let mapped = s.clamp01(mapped)?;
-    let gamma = s.f(GAMMA)?;
-    s.pow(mapped, gamma)
+/// What a pane of glass adds to the light, how much of the light behind it
+/// shows, and whether it stands above the floor.
+struct Glass<S: Shader> {
+    add: V<S::R>,
+    keep: S::R,
+    standing: S::T,
 }
 
-/// The colour of pixel `(x, y)`, given its four hit words, as `0x00RRGGBB`.
+/// The glass around the grid's box, seen at `far` along the eye's
+/// direction: what it adds to the light, how much of the light behind it
+/// shows, and whether the point is above the floor: the box has no glass
+/// under it.
+fn pane<S: Shader>(
+    s: &mut S,
+    look: &Look,
+    lit: &Lit<S>,
+    eye: &Eye<S>,
+    far: S::R,
+) -> Result<Glass<S>, LaneError> {
+    let grid = look.grid;
+    let zero = s.f(0.0)?;
+    let one = s.f(1.0)?;
+    let reach = scaled(s, eye.direction, far)?;
+    let point = v_zip(s, eye.origin, reach, S::fadd)?;
+    let bottom = s.f(grid.deep as f32)?;
+    let above = s.fsub(bottom, point[1])?;
+    let margin = s.f(FLOOR_MARGIN)?;
+    let standing = s.fgt(above, margin)?;
+    let mut apart = [zero; 3];
+    for (axis, side) in sides(grid).into_iter().enumerate() {
+        let side = s.f(side as f32)?;
+        let low = s.fabs(of(point, axis))?;
+        let high = s.fsub(side, of(point, axis))?;
+        let high = s.fabs(high)?;
+        let held = s.fmin(low, high)?;
+        put(&mut apart, axis, held);
+    }
+    let [a, b, c] = apart;
+    let least = s.fmin(a, b)?;
+    let least = s.fmin(least, c)?;
+    let most = s.fmax(a, b)?;
+    let most = s.fmax(most, c)?;
+    let sum = s.fadd(a, b)?;
+    let sum = s.fadd(sum, c)?;
+    let middle = s.fsub(sum, least)?;
+    let middle = s.fsub(middle, most)?;
+    let distance = s.fmul(far, eye.length)?;
+    let distance = s.fmax(distance, one)?;
+    let size = s.fdiv(lit.focal, distance)?;
+    let pixels = s.fmul(middle, size)?;
+    let wide = s.f(LINE_WIDE)?;
+    let line = s.fsub(wide, pixels)?;
+    let line = s.clamp01(line)?;
+    let line = s.fmul(line, lit.glass)?;
+    let faint = s.f(0.28)?;
+    let line = s.fmul(line, faint)?;
+    let tint = [s.f(0.78)?, s.f(0.92)?, s.f(0.82)?];
+    let shine = s.f(PANE)?;
+    let shine = s.fmul(shine, lit.glass)?;
+    let mut add = [zero; 3];
+    for (channel, slot) in add.iter_mut().enumerate() {
+        let reflected = s.fmul(of(lit.horizon, channel), shine)?;
+        let drawn = s.fmul(of(tint, channel), line)?;
+        *slot = s.fadd(reflected, drawn)?;
+    }
+    let keep = s.fsub(one, shine)?;
+    Ok(Glass {
+        add,
+        keep,
+        standing,
+    })
+}
+
+/// The light of a pixel before it is kept over frames.
+pub(crate) struct Hdr<S: Shader> {
+    pub colour: V<S::R>,
+    pub glow: V<S::R>,
+    pub distance: S::R,
+}
+
+/// The light of pixel `(x, y)`, given its four hit words and its four fog
+/// words.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn colour<S: Shader>(
+pub(crate) fn seen<S: Shader>(
     s: &mut S,
     look: &Look,
     (x, y): (S::W, S::W),
     hit: [S::W; 4],
-) -> Result<S::W, LaneError> {
+    fog: [S::W; 4],
+) -> Result<Hdr<S>, LaneError> {
     let lit = lit(s, look)?;
     let eye = eye(s, look, (x, y))?;
     let miss = s.u(MISS)?;
@@ -821,11 +1232,21 @@ pub(crate) fn colour<S: Shader>(
     let first = s.pick(first_missed, nothing, first)?;
     let behind = s.pick(behind_missed, nothing, behind)?;
 
-    let backdrop = backdrop(s, look, &lit, &eye)?;
+    let wide = s.u(look.screen.wide)?;
+    let seat = s.mul(y, wide)?;
+    let seat = s.add(seat, x)?;
+    let drawn = s.fixed(word(look.layout.scene() + scene::DRAWN))?;
+    let stir = s.u(0x9E37_79B9)?;
+    let stir = s.mul(drawn, stir)?;
+    let pick = s.xor(seat, stir)?;
+    let pick = hash(s, pick)?;
+    let (backdrop, far_away) = backdrop(s, look, &lit, &eye, pick)?;
     let ground = surface(s, look, &lit, &eye, (behind, behind_info))?;
-    let base = pick_v(s, has_behind, ground.colour, backdrop)?;
-
     let zero = s.f(0.0)?;
+    let base = pick_v(s, has_behind, ground.colour, backdrop)?;
+    let base_glow = [zero; 3];
+    let base_glow = pick_v(s, has_behind, ground.glow, base_glow)?;
+
     let one = s.f(1.0)?;
     let start = entry(s, look.grid, &eye, (first, first_info))?;
     let end = entry(s, look.grid, &eye, (behind, behind_info))?;
@@ -856,6 +1277,7 @@ pub(crate) fn colour<S: Shader>(
     let sun_share = s.f(0.3)?;
     let sky_share = s.f(0.4)?;
     let mut layer = [zero; 3];
+    let mut layer_glow = [zero; 3];
     for channel in 0..3 {
         let colour_kept = s.fsub(tint, of(water.albedo, channel))?;
         let lost = s.fmul(keep, colour_kept)?;
@@ -870,6 +1292,8 @@ pub(crate) fn colour<S: Shader>(
         let scatter = s.fadd(scatter, glow)?;
         let held = lerp(s, scatter, of(base, channel), through)?;
         put(&mut layer, channel, held);
+        let kept_glow = s.fmul(of(base_glow, channel), through)?;
+        put(&mut layer_glow, channel, kept_glow);
     }
     let cosine = dot(s, eye.unit, normal)?;
     let cosine = s.fsub(zero, cosine)?;
@@ -889,62 +1313,128 @@ pub(crate) fn colour<S: Shader>(
     let reflected = sky(s, &lit, mirrored, true)?;
     let layer = mix(s, layer, reflected, fresnel)?;
     let colour = pick_v(s, layered, layer, base)?;
+    let glow = pick_v(s, layered, layer_glow, base_glow)?;
 
     let distance = s.fmul(start, eye.length)?;
     let thickness = s.fmul(distance, lit.haze)?;
     let thickness = s.fsub(zero, thickness)?;
     let left = s.exp(thickness)?;
-    let fog = s.fsub(one, left)?;
+    let haze = s.fsub(one, left)?;
     let mist = sky(s, &lit, eye.unit, false)?;
-    let hazed = mix(s, colour, mist, fog)?;
+    let hazed = mix(s, colour, mist, haze)?;
     let colour = pick_v(s, has_first, hazed, colour)?;
+    let faded = scaled(s, glow, left)?;
+    let glow = pick_v(s, has_first, faded, glow)?;
 
-    let half = s.f(0.5)?;
-    let fx = s.real(x)?;
-    let fy = s.real(y)?;
-    let mid_x = s.f(look.screen.wide as f32 * 0.5)?;
-    let mid_y = s.f(look.screen.high as f32 * 0.5)?;
-    let dx = s.fadd(fx, half)?;
-    let dx = s.fsub(dx, mid_x)?;
-    let dy = s.fadd(fy, half)?;
-    let dy = s.fsub(dy, mid_y)?;
-    let dx = s.fmul(dx, dx)?;
-    let dy = s.fmul(dy, dy)?;
-    let r = s.fadd(dx, dy)?;
-    let corner = look.screen.wide as f32 * look.screen.wide as f32 * 0.25
-        + look.screen.high as f32 * look.screen.high as f32 * 0.25;
-    let corner = s.f(VIGNETTE / corner.max(1.0))?;
-    let dark = s.fmul(r, corner)?;
-    let vignette = s.fsub(one, dark)?;
-    let most = s.f(255.0)?;
-    let wide = s.u(look.screen.wide)?;
-    let seat = s.mul(y, wide)?;
-    let seat = s.add(seat, x)?;
-    let noise = hash(s, seat)?;
-    let noise = s.and(noise, 0xFF)?;
-    let noise = s.real(noise)?;
-    let step = s.f(1.0 / 256.0)?;
-    let noise = s.fmul(noise, step)?;
-    let mut packed = s.u(0)?;
-    for (channel, shift) in [(0, 16), (1, 8), (2, 0)] {
-        let value = s.fmul(of(colour, channel), lit.exposure)?;
-        let value = tone(s, value)?;
-        let value = s.fmul(value, vignette)?;
-        let value = s.fmul(value, most)?;
-        let value = s.fadd(value, noise)?;
-        let value = s.fmin(value, most)?;
-        let value = s.fmax(value, zero)?;
-        let value = s.whole(value)?;
-        let value = s.shl(value, shift)?;
-        packed = s.or(packed, value)?;
+    let fog = [
+        s.bits(fog[0])?,
+        s.bits(fog[1])?,
+        s.bits(fog[2])?,
+        s.bits(fog[3])?,
+    ];
+    let shows = fog[3];
+    let mut fogged = [zero; 3];
+    let mut fogged_glow = [zero; 3];
+    for channel in 0..3 {
+        let kept = s.fmul(of(colour, channel), shows)?;
+        let held = s.fadd(kept, of([fog[0], fog[1], fog[2]], channel))?;
+        put(&mut fogged, channel, held);
+        let kept = s.fmul(of(glow, channel), shows)?;
+        put(&mut fogged_glow, channel, kept);
     }
-    Ok(packed)
+
+    let endless = s.f(FAR)?;
+    let reached = s.pick_r(has_first, start, endless)?;
+    let (enters, leaves) = boxed(s, look.grid, &eye)?;
+    let met = s.fgt(leaves, enters)?;
+    let mut colour = fogged;
+    let mut glow = fogged_glow;
+    let floor_far = s.fdiv(far_away, eye.length)?;
+    let until = s.pick_r(has_first, reached, floor_far)?;
+    for crossing in [leaves, enters] {
+        let ahead = s.fgt(crossing, zero)?;
+        let before = s.fgt(until, crossing)?;
+        let shown = s.both(ahead, before)?;
+        let shown = s.both(shown, met)?;
+        let Glass {
+            add,
+            keep,
+            standing,
+        } = pane(s, look, &lit, &eye, crossing)?;
+        let shown = s.both(shown, standing)?;
+        let keep = s.pick_r(shown, keep, one)?;
+        for channel in 0..3 {
+            let kept = s.fmul(of(colour, channel), keep)?;
+            let added = s.pick_r(shown, of(add, channel), zero)?;
+            let held = s.fadd(kept, added)?;
+            put(&mut colour, channel, held);
+            let kept = s.fmul(of(glow, channel), keep)?;
+            put(&mut glow, channel, kept);
+        }
+    }
+
+    let flagged = s.fixed(word(look.layout.scene() + scene::FLAGS))?;
+    let overlay = s.and(flagged, flags::ACTIVE)?;
+    let none_word = s.u(0)?;
+    let overlay_off = s.eq(overlay, none_word)?;
+    let marked = active_at(s, look, first)?;
+    let marked = s.both(marked, has_first)?;
+    let dim = s.f(ACTIVE_DIM)?;
+    let teal = [s.f(0.06)?, s.f(0.34)?, s.f(0.28)?];
+    let kept = s.f(ACTIVE_KEPT)?;
+    let mut shown = [zero; 3];
+    let mut shown_glow = [zero; 3];
+    for channel in 0..3 {
+        let dimmed = s.fmul(of(colour, channel), dim)?;
+        let lifted = s.fmul(of(colour, channel), kept)?;
+        let lifted = s.fadd(lifted, of(teal, channel))?;
+        let over = s.pick_r(marked, lifted, dimmed)?;
+        let held = s.pick_r(overlay_off, of(colour, channel), over)?;
+        put(&mut shown, channel, held);
+        let dimmed = s.fmul(of(glow, channel), dim)?;
+        let over = s.pick_r(marked, of(teal, channel), dimmed)?;
+        let held = s.pick_r(overlay_off, of(glow, channel), over)?;
+        put(&mut shown_glow, channel, held);
+    }
+
+    let surface_far = s.fmul(start, eye.length)?;
+    let distance = s.pick_r(has_first, surface_far, far_away)?;
+    Ok(Hdr {
+        colour: shown,
+        glow: shown_glow,
+        distance,
+    })
+}
+
+/// Whether the oct that holds `cell` at the phase of the engine's frame was
+/// stepped this frame.
+pub(crate) fn active_at<S: Shader>(s: &mut S, look: &Look, cell: S::W) -> Result<S::T, LaneError> {
+    let grid = look.grid;
+    let frame = s.frame()?;
+    let phase = s.and(frame, 1)?;
+    let at = point(s, grid, cell)?;
+    let mut oct = s.u(0)?;
+    let mut shift = 0;
+    for (axis, side) in sides(grid).into_iter().enumerate() {
+        let moved = s.sub(of(at, axis), phase)?;
+        let moved = s.and(moved, side - 1)?;
+        let lattice = s.shr(moved, 1)?;
+        let placed = s.shl(lattice, shift)?;
+        oct = s.or(oct, placed)?;
+        shift += (side / 2).trailing_zeros();
+    }
+    let base = s.u(word(look.layout.active()))?;
+    let at = s.add(base, oct)?;
+    let stamp = s.pixel(at)?;
+    let next = plus(s, frame, 1)?;
+    s.eq(stamp, next)
 }
 
 /// The CPU side of [`Shader`].
 pub(crate) struct Plainly<'held> {
     pub world: World<'held>,
     pub pixels: &'held [u32],
+    pub frame: u32,
 }
 
 impl Shader for Plainly<'_> {
@@ -1036,6 +1526,12 @@ impl Shader for Plainly<'_> {
     fn log(&mut self, a: f32) -> Result<f32, LaneError> {
         Ok(a.ln())
     }
+    fn floor(&mut self, a: f32) -> Result<f32, LaneError> {
+        Ok(a.floor())
+    }
+    fn fabs(&mut self, a: f32) -> Result<f32, LaneError> {
+        Ok(a.abs())
+    }
     fn fgt(&mut self, a: f32, b: f32) -> Result<bool, LaneError> {
         Ok(a > b)
     }
@@ -1054,6 +1550,9 @@ impl Shader for Plainly<'_> {
     fn bits(&mut self, a: u32) -> Result<f32, LaneError> {
         Ok(f32::from_bits(a))
     }
+    fn word_of(&mut self, a: f32) -> Result<u32, LaneError> {
+        Ok(a.to_bits())
+    }
     fn cell(&mut self, at: u32) -> Result<u32, LaneError> {
         Ok(self.world.cells.get(at as usize).copied().unwrap_or(0))
     }
@@ -1062,6 +1561,9 @@ impl Shader for Plainly<'_> {
     }
     fn pixel(&mut self, at: u32) -> Result<u32, LaneError> {
         Ok(self.pixels.get(at as usize).copied().unwrap_or(0))
+    }
+    fn frame(&mut self) -> Result<u32, LaneError> {
+        Ok(self.frame)
     }
     fn blocked(
         &mut self,
@@ -1173,6 +1675,12 @@ impl Shader for Emitted<'_, '_> {
     fn log(&mut self, a: Id) -> Result<Id, LaneError> {
         self.em.log(a)
     }
+    fn floor(&mut self, a: Id) -> Result<Id, LaneError> {
+        self.em.floor(a)
+    }
+    fn fabs(&mut self, a: Id) -> Result<Id, LaneError> {
+        self.em.fabs(a)
+    }
     fn fgt(&mut self, a: Id, b: Id) -> Result<Id, LaneError> {
         self.em.fgt(a, b)
     }
@@ -1191,6 +1699,9 @@ impl Shader for Emitted<'_, '_> {
     fn bits(&mut self, a: Id) -> Result<Id, LaneError> {
         self.em.bits_float(a)
     }
+    fn word_of(&mut self, a: Id) -> Result<Id, LaneError> {
+        self.em.float_bits(a)
+    }
     fn cell(&mut self, at: Id) -> Result<Id, LaneError> {
         self.em.load(STATE, at)
     }
@@ -1199,6 +1710,9 @@ impl Shader for Emitted<'_, '_> {
     }
     fn pixel(&mut self, at: Id) -> Result<Id, LaneError> {
         self.em.load(PIXELS, at)
+    }
+    fn frame(&mut self) -> Result<Id, LaneError> {
+        self.em.load_u(PARAMS, 0)
     }
     fn blocked(
         &mut self,
@@ -1212,11 +1726,11 @@ impl Shader for Emitted<'_, '_> {
     }
 }
 
-fn kernel(subgroup: u32) -> Result<simdr::kernel::Kernel<simdr::lanes::U32>, LaneError> {
+pub(crate) fn kernel(subgroup: u32) -> Result<simdr::kernel::Kernel<simdr::lanes::U32>, LaneError> {
     Kernel::new(Shape::new(subgroup, subgroup, BINDINGS))
 }
 
-fn look_of(build: &Build) -> Look {
+pub(crate) fn look_of(build: &Build) -> Look {
     Look {
         grid: build.grid,
         kinds: build.kinds,
@@ -1226,34 +1740,65 @@ fn look_of(build: &Build) -> Look {
     }
 }
 
-/// The pixel a lane works on, whether it is on the screen, and its `x` and
-/// `y`.
-fn placed(em: &mut Em<'_>, build: &Build) -> Result<(Id, Id, Id, Id), LaneError> {
-    let pixel = em.invocation(build.subgroup)?;
-    let count = em.u(word(build.screen.pixels()))?;
+pub(crate) fn reader_of(build: &Build) -> Reader {
+    Reader {
+        grid: build.grid,
+        kinds: build.kinds,
+        bricks_at: word(build.layout().occupancy()),
+    }
+}
+
+/// The pixel a lane works on of a screen of `screen`, whether it is on the
+/// screen, and its `x` and `y`.
+pub(crate) fn placed(
+    em: &mut Em<'_>,
+    subgroup: u32,
+    screen: Screen,
+) -> Result<(Id, Id, Id, Id), LaneError> {
+    let pixel = em.invocation(subgroup)?;
+    let count = em.u(word(screen.pixels()))?;
     let shown = em.lt(pixel, count)?;
-    let wide = em.u(build.screen.wide)?;
+    let wide = em.u(screen.wide)?;
     let y = em.div(pixel, wide)?;
     let row = em.mul(y, wide)?;
     let x = em.sub(pixel, row)?;
     Ok((pixel, shown, x, y))
 }
 
+/// Where a lane stores word `slot` of its record of `words` words that
+/// starts at `base`: its own record when `shown`, else the spare words.
+pub(crate) fn seat(
+    em: &mut Em<'_>,
+    layout: &Layout,
+    (lane, shown, count): (Id, Id, Id),
+    base: usize,
+    words: usize,
+) -> Result<Id, LaneError> {
+    let size = em.u(word(words))?;
+    let at = em.mul(lane, size)?;
+    let start = em.u(word(base))?;
+    let at = em.add(start, at)?;
+    let past = em.sub(lane, count)?;
+    let spare_size = em.u(word(SPARE_WORDS))?;
+    let past = em.mul(past, spare_size)?;
+    let spare = em.u(word(layout.spare()))?;
+    let past = em.add(spare, past)?;
+    em.pick(shown, at, past)
+}
+
 /// The pass that marches every pixel's ray and writes its four hit words
-/// from [`Layout::hits`] on, as [`World::seen`] finds them.
+/// from [`Layout::hits`] on, as [`World::seen`] finds them, and the gas it
+/// crosses before its first hit from [`Layout::fog`] on.
+#[allow(clippy::too_many_lines)]
 pub fn primary(build: &Build) -> Result<Vec<u32>, LaneError> {
     refuse("render3::primary", build.grid, build.screen)?;
     let layout = build.layout();
     let grid = build.grid;
     let look = look_of(build);
-    let reader = Reader {
-        grid,
-        kinds: build.kinds,
-        bricks_at: word(layout.occupancy()),
-    };
+    let reader = reader_of(build);
     let mut kernel = kernel(build.subgroup)?;
     let mut em = Em::new(&mut kernel)?;
-    let (pixel, shown, x, y) = placed(&mut em, build)?;
+    let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let base = word(layout.scene());
     let mut origin = [pixel; 3];
     for (axis, slot) in origin.iter_mut().enumerate() {
@@ -1278,13 +1823,20 @@ pub fn primary(build: &Build) -> Result<Vec<u32>, LaneError> {
     let alive = em.flag(alive)?;
     let none = em.u(0)?;
     let miss = em.u(MISS)?;
-    let mut initial = vec![alive, none, miss, none, miss, none];
+    let nothing = em.f(0.0)?;
+    let nothing = em.float_bits(nothing)?;
+    let whole = em.f(1.0)?;
+    let whole = em.float_bits(whole)?;
+    const CARRIED: usize = 10;
+    let mut initial = vec![
+        alive, none, miss, none, miss, none, nothing, nothing, nothing, whole,
+    ];
     initial.extend(start.carried());
-    let out = em.looped(super::march::limit(grid), &initial, |em, words, run| {
+    let out = em.looped(limit(grid), &initial, |em, words, run| {
         let get = |at: usize| words.get(at).copied().unwrap_or(none);
-        let ray = start.with(words.get(6..).unwrap_or(&[]));
+        let ray = start.with(words.get(CARRIED..).unwrap_or(&[]));
         let through = em.ne_u(get(1), 0)?;
-        let (cell, kind, full) = reader.read(em, &ray)?;
+        let (cell, kind, full, brick) = reader.read_brick(em, &ray)?;
         let mask = em.pick(through, opaque, visible)?;
         let seen = em.bit(mask, kind)?;
         let stops = em.both(full, seen)?;
@@ -1300,6 +1852,27 @@ pub fn primary(build: &Build) -> Result<Vec<u32>, LaneError> {
         let ends = em.both(stops, stays)?;
         let behind = em.pick(ends, cell, get(4))?;
         let behind_info = em.pick(ends, found, get(5))?;
+        let gassy = em.and_u(brick, GASSY)?;
+        let gas = em.ne_u(gassy, 0)?;
+        let seen_now = em.not(stops)?;
+        let gas = em.both(gas, seen_now)?;
+        let gas = em.both(gas, before)?;
+        let fog_words = [get(6), get(7), get(8), get(9)];
+        let fog_words = em.when(gas, &fog_words, |em| {
+            let mut plain = Emitted { em, reader };
+            let fog = [
+                plain.bits(fog_words[0])?,
+                plain.bits(fog_words[1])?,
+                plain.bits(fog_words[2])?,
+                plain.bits(fog_words[3])?,
+            ];
+            let fog = gas_step(&mut plain, &look, cell, fog)?;
+            let mut out = Vec::with_capacity(4);
+            for value in fog {
+                out.push(plain.word_of(value)?);
+            }
+            Ok(out)
+        })?;
         let through = em.either(through, enters)?;
         let through = em.flag(through)?;
         let moved = ray.advanced(em, full)?;
@@ -1308,68 +1881,102 @@ pub fn primary(build: &Build) -> Result<Vec<u32>, LaneError> {
         let going = em.both(going, inside)?;
         let going = em.flag(going)?;
         let mut next = vec![going, through, first, first_info, behind, behind_info];
+        next.extend(fog_words);
         next.extend(moved.carried());
         Ok(next)
     })?;
-    let hits = em.u(word(layout.hits()))?;
-    let spare = em.u(word(layout.spare()))?;
     let count = em.u(word(build.screen.pixels()))?;
-    let past = em.sub(pixel, count)?;
-    let four = em.u(word(HIT_WORDS))?;
-    let at = em.mul(pixel, four)?;
-    let at = em.add(hits, at)?;
-    let past = em.mul(past, four)?;
-    let past = em.add(spare, past)?;
-    let at = em.pick(shown, at, past)?;
+    let at = seat(
+        &mut em,
+        &layout,
+        (pixel, shown, count),
+        layout.hits(),
+        HIT_WORDS,
+    )?;
     for slot in 0..HIT_WORDS {
         let step = em.u(word(slot))?;
         let into = em.add(at, step)?;
         let value = out.get(slot + 2).copied().unwrap_or(none);
         em.store(PIXELS, into, value)?;
     }
+    let at = seat(
+        &mut em,
+        &layout,
+        (pixel, shown, count),
+        layout.fog(),
+        FOG_WORDS,
+    )?;
+    for slot in 0..FOG_WORDS {
+        let step = em.u(word(slot))?;
+        let into = em.add(at, step)?;
+        let value = out.get(slot + 6).copied().unwrap_or(none);
+        em.store(PIXELS, into, value)?;
+    }
     kernel.finish()
 }
 
-/// The pass that lights every pixel from its hit words and writes its
-/// colour, `0x00RRGGBB`, into the first [`Screen::pixels`] words.
+/// The pass that lights every pixel from its hit words and its gas and
+/// writes its light, its glow and how far its ray went, from
+/// [`Layout::hdr`] on.
 pub fn shade(build: &Build) -> Result<Vec<u32>, LaneError> {
     refuse("render3::shade", build.grid, build.screen)?;
     let layout = build.layout();
     let look = look_of(build);
-    let reader = Reader {
-        grid: build.grid,
-        kinds: build.kinds,
-        bricks_at: word(layout.occupancy()),
-    };
+    let reader = reader_of(build);
     let mut kernel = kernel(build.subgroup)?;
     let mut em = Em::new(&mut kernel)?;
-    let (pixel, shown, x, y) = placed(&mut em, build)?;
+    let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let none = em.u(0)?;
-    let seat = em.pick(shown, pixel, none)?;
-    let four = em.u(word(HIT_WORDS))?;
-    let at = em.mul(seat, four)?;
-    let hits = em.u(word(layout.hits()))?;
-    let at = em.add(hits, at)?;
-    let mut hit = [none; 4];
-    for (slot, value) in hit.iter_mut().enumerate() {
-        let step = em.u(word(slot))?;
-        let from = em.add(at, step)?;
-        *value = em.load(PIXELS, from)?;
+    let place = em.pick(shown, pixel, none)?;
+    let mut hit = [none; HIT_WORDS];
+    let mut fog = [none; FOG_WORDS];
+    for (base, size, into) in [
+        (layout.hits(), HIT_WORDS, &mut hit),
+        (layout.fog(), FOG_WORDS, &mut fog),
+    ] {
+        let size_word = em.u(word(size))?;
+        let at = em.mul(place, size_word)?;
+        let start = em.u(word(base))?;
+        let at = em.add(start, at)?;
+        for (slot, value) in into.iter_mut().enumerate() {
+            let step = em.u(word(slot))?;
+            let from = em.add(at, step)?;
+            *value = em.load(PIXELS, from)?;
+        }
     }
-    let colour = {
+    let words = {
         let mut plain = Emitted {
             em: &mut em,
             reader,
         };
-        colour(&mut plain, &look, (x, y), hit)?
+        let light = seen(&mut plain, &look, (x, y), hit, fog)?;
+        hdr_words(&mut plain, &light)?
     };
-    let spare = em.u(word(layout.spare()))?;
     let count = em.u(word(build.screen.pixels()))?;
-    let past = em.sub(pixel, count)?;
-    let past = em.add(spare, past)?;
-    let into = em.pick(shown, pixel, past)?;
-    em.store(PIXELS, into, colour)?;
+    let at = seat(
+        &mut em,
+        &layout,
+        (pixel, shown, count),
+        layout.hdr(),
+        HDR_WORDS,
+    )?;
+    for (slot, value) in words.into_iter().enumerate() {
+        let step = em.u(word(slot))?;
+        let into = em.add(at, step)?;
+        em.store(PIXELS, into, value)?;
+    }
     kernel.finish()
+}
+
+/// The words of a pixel's [`Hdr`], in [`Layout::hdr`] order.
+pub(crate) fn hdr_words<S: Shader>(s: &mut S, light: &Hdr<S>) -> Result<Vec<S::W>, LaneError> {
+    let mut out = Vec::with_capacity(HDR_WORDS);
+    for value in light.colour.into_iter().chain(light.glow) {
+        out.push(s.word_of(value)?);
+    }
+    out.push(s.word_of(light.distance)?);
+    out.push(s.u(0)?);
+    Ok(out)
 }
 
 /// The picture on the CPU: the rays, the light, the materials and the sun
@@ -1379,12 +1986,32 @@ pub struct Shading<'held> {
     pub world: World<'held>,
     pub screen: Screen,
     pub layout: Layout,
-    /// `PIXELS` as the passes read it: at least up to the end of the scene.
+    /// `PIXELS` as the passes read it.
     pub pixels: &'held [u32],
     pub suns: u32,
+    /// The engine's frame, as the first word of `PARAMS` holds it.
+    pub frame: u32,
 }
 
 impl Shading<'_> {
+    pub(crate) fn look(&self) -> Look {
+        Look {
+            grid: self.world.grid,
+            kinds: self.world.kinds,
+            screen: self.screen,
+            layout: self.layout,
+            suns: self.suns.clamp(1, super::SUNS as u32),
+        }
+    }
+
+    pub(crate) fn plain(&self) -> Plainly<'_> {
+        Plainly {
+            world: self.world,
+            pixels: self.pixels,
+            frame: self.frame,
+        }
+    }
+
     /// The four hit words of every pixel, as [`primary`] writes them.
     #[must_use]
     pub fn hits(&self, rays: &Rays) -> Vec<u32> {
@@ -1398,33 +2025,83 @@ impl Shading<'_> {
         out
     }
 
-    /// The colour of every pixel, as [`shade`] writes it, from the hit
-    /// words `hits`.
-    pub fn picture(&self, hits: &[u32]) -> Result<Vec<u32>, LaneError> {
-        let look = Look {
-            grid: self.world.grid,
-            kinds: self.world.kinds,
-            screen: self.screen,
-            layout: self.layout,
-            suns: self.suns.clamp(1, super::SUNS as u32),
-        };
-        let mut plain = Plainly {
-            world: self.world,
-            pixels: self.pixels,
-        };
-        let mut out = Vec::with_capacity(self.screen.pixels());
-        for (at, hit) in hits.chunks(HIT_WORDS).enumerate() {
-            let at = word(at);
-            let x = at % self.screen.wide;
-            let y = at / self.screen.wide;
-            let get = |slot: usize| hit.get(slot).copied().unwrap_or(MISS);
-            out.push(colour(
-                &mut plain,
-                &look,
-                (x, y),
-                [get(0), get(1), get(2), get(3)],
-            )?);
+    /// The four fog words of every pixel, as [`primary`] writes them: the
+    /// gas each ray crosses before its first hit, read through the gas,
+    /// sun and lamp volumes `pixels` holds.
+    pub fn fog(&self, rays: &Rays) -> Result<Vec<u32>, LaneError> {
+        let look = self.look();
+        let mut plain = self.plain();
+        let mut out = Vec::with_capacity(self.screen.pixels() * FOG_WORDS);
+        for y in 0..self.screen.high {
+            for x in 0..self.screen.wide {
+                let direction = rays.direction(self.screen, (x, y));
+                let mut fog = [0.0, 0.0, 0.0, 1.0];
+                let mut failed = None;
+                self.world.gassed(rays.origin, direction, |cell| {
+                    if failed.is_none() {
+                        match gas_step(&mut plain, &look, cell, fog) {
+                            Ok(next) => fog = next,
+                            Err(why) => failed = Some(why),
+                        }
+                    }
+                });
+                if let Some(why) = failed {
+                    return Err(why);
+                }
+                out.extend(fog.map(f32::to_bits));
+            }
         }
         Ok(out)
+    }
+
+    /// The words [`shade`] writes for every pixel, from the hit and fog
+    /// words `pixels` holds.
+    pub fn shaded(&self) -> Result<Vec<u32>, LaneError> {
+        let look = self.look();
+        let mut plain = self.plain();
+        let layout = self.layout;
+        let mut out = Vec::with_capacity(self.screen.pixels() * HDR_WORDS);
+        for at in 0..self.screen.pixels() {
+            let x = word(at) % self.screen.wide;
+            let y = word(at) / self.screen.wide;
+            let get = |base: usize, slot: usize| {
+                self.pixels.get(base + at * 4 + slot).copied().unwrap_or(0)
+            };
+            let hit = [0, 1, 2, 3].map(|slot| get(layout.hits(), slot));
+            let fog = [0, 1, 2, 3].map(|slot| get(layout.fog(), slot));
+            let light = seen(&mut plain, &look, (x, y), hit, fog)?;
+            out.extend(hdr_words(&mut plain, &light)?);
+        }
+        Ok(out)
+    }
+}
+
+impl World<'_> {
+    /// Calls `visit` with every cell of a brick that holds gas a ray from
+    /// `origin` along `direction` crosses before it first meets a cell it
+    /// sees, as [`primary`] gathers them.
+    pub fn gassed(&self, origin: [i32; 3], direction: [i32; 3], mut visit: impl FnMut(u32)) {
+        let sides = sides(self.grid);
+        let Some(mut ray) = Ray::from(origin, direction).entered(sides) else {
+            return;
+        };
+        for _ in 0..limit(self.grid) {
+            let (cell, kind, full) = self.kind_at(&ray);
+            if full && (self.visible >> (kind & 31)) & 1 == 1 {
+                return;
+            }
+            let brick = self
+                .bricks
+                .get(super::march::brick_of(self.grid, ray.cell) as usize)
+                .copied()
+                .unwrap_or(0);
+            if brick & GASSY != 0 {
+                visit(cell);
+            }
+            ray = if full { ray.stepped() } else { ray.jumped() };
+            if !ray.inside(sides) {
+                return;
+            }
+        }
     }
 }

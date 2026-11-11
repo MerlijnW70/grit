@@ -1,12 +1,16 @@
-//! Which bricks hold a cell anyone sees, kept current from the octs the
-//! engine steps.
+//! Which bricks hold a cell anyone sees or gas, how much of each is gas and
+//! how much light its glowing cells give off, kept current from the octs
+//! the engine steps.
 
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 use simdr::module::Id;
 
 use super::emit::Em;
-use super::{BRICK_BITS, Build, of, put, refuse, scene, word};
+use super::{
+    BRICK_BITS, Build, GAS_WORDS, GASSY, MATERIAL_WORDS, Table, material, of, put, refuse, scene,
+    word,
+};
 use crate::layout::{BINDINGS, DENSE, GRAND, PARAMS, PIXELS, STATE};
 use crate::sand::Grid;
 use crate::view3::Kinds;
@@ -14,10 +18,11 @@ use crate::view3::Kinds;
 const SIDE: u32 = 1 << BRICK_BITS;
 const CELLS: u32 = SIDE * SIDE * SIDE;
 
-/// A word a brick of `grid`: 1 when one of its cells has a kind in
-/// `visible`, else 0.
+/// A word a brick of `grid`: bit 0 set when one of its cells has a kind in
+/// `shown`, and [`GASSY`] when one has a kind in `gases`. The passes count
+/// a brick as full for the kinds of [`Table::shown`].
 #[must_use]
-pub fn occupancy(grid: Grid, kinds: Kinds, visible: u32, cells: &[u32]) -> Vec<u32> {
+pub fn occupancy(grid: Grid, kinds: Kinds, shown: u32, gases: u32, cells: &[u32]) -> Vec<u32> {
     let across = grid.wide >> BRICK_BITS;
     let down = grid.deep >> BRICK_BITS;
     let mut out = vec![0; super::bricks(grid) as usize];
@@ -26,11 +31,14 @@ pub fn occupancy(grid: Grid, kinds: Kinds, visible: u32, cells: &[u32]) -> Vec<u
             for x in 0..grid.wide {
                 let at = ((z * grid.deep + y) * grid.wide + x) as usize;
                 let kind = kinds.of(cells.get(at).copied().unwrap_or(0));
-                if (visible >> kind) & 1 == 1 {
-                    let brick = (((z >> BRICK_BITS) * down + (y >> BRICK_BITS)) * across
-                        + (x >> BRICK_BITS)) as usize;
-                    if let Some(slot) = out.get_mut(brick) {
-                        *slot = 1;
+                let brick = (((z >> BRICK_BITS) * down + (y >> BRICK_BITS)) * across
+                    + (x >> BRICK_BITS)) as usize;
+                if let Some(slot) = out.get_mut(brick) {
+                    if (shown >> kind) & 1 == 1 {
+                        *slot |= 1;
+                    }
+                    if (gases >> kind) & 1 == 1 {
+                        *slot |= GASSY;
                     }
                 }
             }
@@ -43,15 +51,39 @@ fn kernel(subgroup: u32) -> Result<Kernel<U32>, LaneError> {
     Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))
 }
 
-/// Emits the rebuild of brick `brick`, given as its coordinates.
+/// The kinds a rebuild reads from the scene: those a brick counts as full
+/// for, the gases and the glowing kinds.
+#[derive(Debug, Clone, Copy)]
+struct Masks {
+    shown: Id,
+    gases: Id,
+    glowing: Id,
+}
+
+impl Masks {
+    fn of(em: &mut Em<'_>, build: &Build) -> Result<Self, LaneError> {
+        let base = word(build.layout().scene());
+        Ok(Self {
+            shown: em.load_u(PIXELS, base + word(scene::SHOWN))?,
+            gases: em.load_u(PIXELS, base + word(scene::GAS))?,
+            glowing: em.load_u(PIXELS, base + word(scene::GLOWING))?,
+        })
+    }
+}
+
+/// Emits the rebuild of the brick at `at`, given as its coordinates, whose
+/// index is `brick`: its occupancy word, its share of gas and the light it
+/// gives off. When the light changed, the frame plus one goes into
+/// [`super::Layout::changed`].
 fn rebuilt(
     em: &mut Em<'_>,
     build: &Build,
     at: [Id; 3],
-    visible: Id,
-    into: Id,
+    masks: Masks,
+    brick: Id,
 ) -> Result<(), LaneError> {
     let grid = build.grid;
+    let layout = build.layout();
     let wide = grid.wide.trailing_zeros();
     let deep = grid.deep.trailing_zeros();
     let mut corner = [at[0]; 3];
@@ -65,9 +97,16 @@ fn rebuilt(
     let first = em.or(first, corner[0])?;
     let one = em.u(1)?;
     let none = em.u(0)?;
+    let nothing = em.f(0.0)?;
+    let nothing = em.float_bits(nothing)?;
     let kinds = build.kinds;
-    let out = em.looped(CELLS, &[one, none], |em, words, run| {
-        let seen = words.get(1).copied().unwrap_or(none);
+    let table = em.u(word(layout.table()))?;
+    let size = em.u(word(MATERIAL_WORDS))?;
+    let initial = [
+        one, none, none, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
+    ];
+    let out = em.looped(CELLS, &initial, |em, words, run| {
+        let get = |at: usize| words.get(at).copied().unwrap_or(none);
         let x = em.and_u(run, SIDE - 1)?;
         let y = em.shr(run, BRICK_BITS)?;
         let y = em.and_u(y, SIDE - 1)?;
@@ -80,13 +119,110 @@ fn rebuilt(
         let held = em.load(STATE, cell)?;
         let kind = em.shr(held, kinds.shift())?;
         let kind = em.and_u(kind, kinds.mask())?;
-        let shown = em.bit(visible, kind)?;
+        let shown = em.bit(masks.shown, kind)?;
         let shown = em.flag(shown)?;
-        let seen = em.or(seen, shown)?;
-        Ok(vec![one, seen])
+        let seen = em.or(get(1), shown)?;
+        let gas = em.bit(masks.gases, kind)?;
+        let gas = em.flag(gas)?;
+        let gas = em.add(get(2), gas)?;
+        let glows = em.bit(masks.glowing, kind)?;
+        let light = [get(3), get(4), get(5)];
+        let light = em.when(glows, &light, |em| {
+            let at = em.mul(kind, size)?;
+            let at = em.add(table, at)?;
+            let glow_at = em.u(word(material::GLOW))?;
+            let glow_at = em.add(at, glow_at)?;
+            let glow = em.load(PIXELS, glow_at)?;
+            let glow = em.bits_float(glow)?;
+            let mut out = Vec::with_capacity(3);
+            for (channel, &before) in light.iter().enumerate() {
+                let here = em.u(word(material::ALBEDO + channel))?;
+                let here = em.add(at, here)?;
+                let albedo = em.load(PIXELS, here)?;
+                let albedo = em.bits_float(albedo)?;
+                let given = em.fmul(albedo, glow)?;
+                let before = em.bits_float(before)?;
+                let sum = em.fadd(before, given)?;
+                out.push(em.float_bits(sum)?);
+            }
+            Ok(out)
+        })?;
+        let gassy = em.bit(masks.gases, kind)?;
+        let thick = [get(6), get(7), get(8), get(9)];
+        let thick = em.when(gassy, &thick, |em| {
+            let at = em.mul(kind, size)?;
+            let at = em.add(table, at)?;
+            let clear_at = em.u(word(material::CLEAR))?;
+            let clear_at = em.add(at, clear_at)?;
+            let clear = em.load(PIXELS, clear_at)?;
+            let clear = em.bits_float(clear)?;
+            let clear = em.clamp01(clear)?;
+            let whole = em.f(1.0)?;
+            let taken = em.fsub(whole, clear)?;
+            let mut out = Vec::with_capacity(4);
+            let before = em.bits_float(thick[0])?;
+            let sum = em.fadd(before, taken)?;
+            out.push(em.float_bits(sum)?);
+            for (channel, &before) in thick.iter().skip(1).enumerate() {
+                let here = em.u(word(material::ALBEDO + channel))?;
+                let here = em.add(at, here)?;
+                let albedo = em.load(PIXELS, here)?;
+                let albedo = em.bits_float(albedo)?;
+                let given = em.fmul(albedo, taken)?;
+                let before = em.bits_float(before)?;
+                let sum = em.fadd(before, given)?;
+                out.push(em.float_bits(sum)?);
+            }
+            Ok(out)
+        })?;
+        let mut next = vec![one, seen, gas];
+        next.extend(light);
+        next.extend(thick);
+        Ok(next)
     })?;
-    let seen = out.get(1).copied().unwrap_or(none);
-    em.store(PIXELS, into, seen)
+    let get = |at: usize| out.get(at).copied().unwrap_or(none);
+    let occupancy = em.u(word(layout.occupancy()))?;
+    let into = em.add(occupancy, brick)?;
+    let some = em.ne(get(2), none)?;
+    let gassy = em.u(GASSY)?;
+    let gassy = em.pick(some, gassy, none)?;
+    let held = em.or(get(1), gassy)?;
+    em.store(PIXELS, into, held)?;
+    let share = em.f(1.0 / CELLS as f32)?;
+    let gas = em.u(word(layout.gas()))?;
+    let size = em.u(word(GAS_WORDS))?;
+    let start = em.mul(brick, size)?;
+    let start = em.add(gas, start)?;
+    for field in 0..GAS_WORDS {
+        let value = em.bits_float(get(6 + field))?;
+        let value = em.fmul(value, share)?;
+        let value = em.float_bits(value)?;
+        let step = em.u(word(field))?;
+        let into = em.add(start, step)?;
+        em.store(PIXELS, into, value)?;
+    }
+    let three = em.u(3)?;
+    let emission = em.u(word(layout.emission()))?;
+    let base = em.mul(brick, three)?;
+    let base = em.add(emission, base)?;
+    let mut changed = em.ne(none, none)?;
+    for channel in 0..3_u32 {
+        let step = em.u(channel)?;
+        let into = em.add(base, step)?;
+        let before = em.load(PIXELS, into)?;
+        let now = get(3 + channel as usize);
+        let differs = em.ne(before, now)?;
+        changed = em.either(changed, differs)?;
+        em.store(PIXELS, into, now)?;
+    }
+    let _ = em.when(changed, &[], |em| {
+        let frame = em.load_u(PARAMS, 0)?;
+        let stamp = em.add(frame, one)?;
+        let at = em.u(word(layout.changed()))?;
+        em.store(PIXELS, at, stamp)?;
+        Ok(Vec::new())
+    })?;
+    Ok(())
 }
 
 /// The pass that rebuilds every brick's word, one brick a lane; dispatch
@@ -100,17 +236,15 @@ pub fn filled(build: &Build) -> Result<Vec<u32>, LaneError> {
     let brick = em.invocation(build.subgroup)?;
     let count = em.u(layout.bricks)?;
     let inside = em.lt(brick, count)?;
-    let visible = em.load_u(PIXELS, word(layout.scene() + scene::VISIBLE))?;
+    let masks = Masks::of(&mut em, build)?;
     let across = (grid.wide >> BRICK_BITS).trailing_zeros();
     let down = (grid.deep >> BRICK_BITS).trailing_zeros();
     let x = em.and_u(brick, (1 << across) - 1)?;
     let y = em.shr(brick, across)?;
     let y = em.and_u(y, (1 << down) - 1)?;
     let z = em.shr(brick, across + down)?;
-    let base = em.u(word(layout.occupancy()))?;
-    let into = em.add(base, brick)?;
     let _ = em.when(inside, &[], |em| {
-        rebuilt(em, build, [x, y, z], visible, into)?;
+        rebuilt(em, build, [x, y, z], masks, brick)?;
         Ok(Vec::new())
     })?;
     kernel.finish()
@@ -132,13 +266,16 @@ pub fn occupied(build: &Build) -> Result<Vec<u32>, LaneError> {
     let claimed = em.load(DENSE, dump)?;
     let total = em.add(grand, claimed)?;
     let listed = em.lt(slot, total)?;
-    let visible = em.load_u(PIXELS, word(layout.scene() + scene::VISIBLE))?;
+    let masks = Masks::of(&mut em, build)?;
     let _ = em.when(listed, &[], |em| {
         let oct = em.load(DENSE, slot)?;
         let frame = em.load_u(PARAMS, 0)?;
         let phase = em.and_u(frame, 1)?;
         let one = em.u(1)?;
         let stamp = em.add(frame, one)?;
+        let active = em.u(word(layout.active()))?;
+        let mark = em.add(active, oct)?;
+        em.store(PIXELS, mark, stamp)?;
         let sides = [grid.wide, grid.deep, grid.tall];
         let halves = sides.map(|side| (side / 2).trailing_zeros());
         let mut spans = [[oct; 2]; 3];
@@ -159,7 +296,6 @@ pub fn occupied(build: &Build) -> Result<Vec<u32>, LaneError> {
         let across = (grid.wide >> BRICK_BITS).trailing_zeros();
         let down = (grid.deep >> BRICK_BITS).trailing_zeros();
         let claims = em.u(word(layout.claims()))?;
-        let bricks = em.u(word(layout.occupancy()))?;
         for corner in 0..8_usize {
             let at = [0, 1, 2].map(|axis| {
                 let [low, high] = of(spans, axis);
@@ -172,13 +308,66 @@ pub fn occupied(build: &Build) -> Result<Vec<u32>, LaneError> {
             let claim = em.add(claims, brick)?;
             let before = em.kernel.atomic_exchange_at(PIXELS, claim, stamp)?;
             let mine = em.ne(before, stamp)?;
-            let into = em.add(bricks, brick)?;
             let _ = em.when(mine, &[], |em| {
-                rebuilt(em, build, at, visible, into)?;
+                rebuilt(em, build, at, masks, brick)?;
                 Ok(Vec::new())
             })?;
         }
         Ok(Vec::new())
     })?;
     kernel.finish()
+}
+
+/// The light each brick of `grid` gives off, red, green and blue a brick,
+/// summed over its cells in the order [`filled`] reads them, and its gas,
+/// [`GAS_WORDS`] a brick: what the rebuild writes from
+/// [`super::Layout::emission`] and [`super::Layout::gas`] on.
+#[must_use]
+pub fn emission(grid: Grid, kinds: Kinds, table: &Table, cells: &[u32]) -> (Vec<f32>, Vec<f32>) {
+    let count = super::bricks(grid) as usize;
+    let mut light = vec![0.0_f32; 3 * count];
+    let mut gas = vec![0.0_f32; GAS_WORDS * count];
+    let [across, down, _] = super::brick_sides(grid);
+    for brick in 0..count {
+        let brick_word = super::word(brick);
+        let bx = brick_word % across;
+        let by = (brick_word / across) % down;
+        let bz = brick_word / (across * down);
+        let mut sum = [0.0_f32; 3];
+        let mut thick = [0.0_f32; GAS_WORDS];
+        for run in 0..CELLS {
+            let x = (bx << BRICK_BITS) + (run & (SIDE - 1));
+            let y = (by << BRICK_BITS) + ((run >> BRICK_BITS) & (SIDE - 1));
+            let z = (bz << BRICK_BITS) + (run >> (2 * BRICK_BITS));
+            let at = ((z * grid.deep + y) * grid.wide + x) as usize;
+            let kind = kinds.of(cells.get(at).copied().unwrap_or(0));
+            let made = table.material(kind);
+            if made.gas {
+                let taken = 1.0 - made.clear.clamp(0.0, 1.0);
+                for (slot, value) in thick.iter_mut().zip(
+                    [taken]
+                        .into_iter()
+                        .chain(made.albedo.map(|albedo| albedo * taken)),
+                ) {
+                    *slot += value;
+                }
+            }
+            if made.glow > 0.0 {
+                for (slot, albedo) in sum.iter_mut().zip(made.albedo) {
+                    *slot += albedo * made.glow;
+                }
+            }
+        }
+        for (channel, value) in sum.into_iter().enumerate() {
+            if let Some(slot) = light.get_mut(3 * brick + channel) {
+                *slot = value;
+            }
+        }
+        for (field, value) in thick.into_iter().enumerate() {
+            if let Some(slot) = gas.get_mut(GAS_WORDS * brick + field) {
+                *slot = value * (1.0 / CELLS as f32);
+            }
+        }
+    }
+    (light, gas)
 }

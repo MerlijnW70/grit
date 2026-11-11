@@ -304,7 +304,7 @@ const fn bit(mask: u32, at: u32) -> bool {
 }
 
 impl World<'_> {
-    fn kind_at(&self, ray: &Ray) -> (u32, u32, bool) {
+    pub(crate) fn kind_at(&self, ray: &Ray) -> (u32, u32, bool) {
         let cell = index(self.grid, ray.cell);
         let full = self
             .bricks
@@ -779,17 +779,27 @@ impl Reader {
     /// The cell index at the ray's cell, the kind of its word, and whether
     /// its brick holds a cell anyone sees.
     pub fn read(&self, em: &mut Em<'_>, ray: &Marching) -> Result<(Id, Id, Id), LaneError> {
+        let (cell, kind, full, _) = self.read_brick(em, ray)?;
+        Ok((cell, kind, full))
+    }
+
+    /// [`Reader::read`], and the occupancy word of the ray's brick.
+    pub fn read_brick(
+        &self,
+        em: &mut Em<'_>,
+        ray: &Marching,
+    ) -> Result<(Id, Id, Id, Id), LaneError> {
         let (cell, brick) = ray.places(em, self.grid)?;
         let base = em.u(self.bricks_at)?;
         let slot = em.add(base, brick)?;
-        let full = em.load(PIXELS, slot)?;
-        let full = em.ne_u(full, 0)?;
+        let held = em.load(PIXELS, slot)?;
+        let full = em.ne_u(held, 0)?;
         let none = em.u(0)?;
         let word = em.when(full, &[none], |em| Ok(vec![em.load(STATE, cell)?]))?;
         let word = word.first().copied().unwrap_or(none);
         let kind = em.shr(word, self.kinds.shift())?;
         let kind = em.and_u(kind, self.kinds.mask())?;
-        Ok((cell, kind, full))
+        Ok((cell, kind, full, held))
     }
 
     /// Whether a ray from `origin` along `direction` meets a cell of a kind

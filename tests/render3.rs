@@ -8,9 +8,13 @@ use grit::compact::Plan;
 use grit::layout::{BINDINGS, Dimension, PARAMS, PIXELS, STATE};
 use grit::live;
 use grit::render3::march::{Ray, World, brick_of, index, sides};
+use grit::render3::occupancy::emission;
+use grit::render3::post::develop;
+use grit::render3::volume::Volumes;
 use grit::render3::{
-    self, Build, Camera, HIT_WORDS, INSIDE, Light, MISS, Material, Rays, STEEPEST, Screen, Shading,
-    Table, UNIT, occupancy, scene_words,
+    self, Build, Camera, FOG_WORDS, Frame, GAS_WORDS, HIT_WORDS, INSIDE, Layout, Light, MISS,
+    Material, Rays, STEEPEST, Screen, Shading, Table, UNIT, flags, framed_words, occupancy,
+    scene_words, stage,
 };
 use grit::rule3::code::Code;
 use grit::rule3::heat::{self, Heat};
@@ -46,17 +50,18 @@ fn kinds(rule: &str) -> Kinds {
 }
 
 /// A table that shows kind 0 as empty, and the other kinds as opaque, seen
-/// through or empty, chosen by `seed`.
+/// through, glowing, gas or empty, chosen by `seed`.
 fn table(kinds: Kinds, seed: u64) -> Table {
     let mut state = seed;
     let mut out = Table::empty();
     for kind in 1..=kinds.mask() {
         let colour = next(&mut state) as u32 & 0xFF_FFFF;
-        let material = match below(&mut state, 5) {
+        let material = match below(&mut state, 6) {
             0 => continue,
             1 => Material::solid(colour, 0.3).clear(0.7),
             2 => Material::solid(colour, 0.2).glowing(2.0),
-            _ => Material::solid(colour, 0.25),
+            3 => Material::solid(colour, 0.0).gas(0.6),
+            _ => Material::solid(colour, 0.25).strata(0.2).gap(0.1),
         };
         out = out.with(kind, material);
     }
@@ -191,7 +196,7 @@ fn a_ray_crossing_empty_bricks_in_jumps_finds_what_the_plain_walk_finds() {
         for &(wide, deep, tall) in &grids {
             let grid = Grid::solid(wide, deep, tall).unwrap();
             let cells = clumped(grid, held, 0x11 + seed as u64);
-            let bricks = occupancy(grid, held, table.visible(), &cells);
+            let bricks = occupancy(grid, held, table.shown(), table.gases(), &cells);
             let world = plain_world(grid, held, &table, &cells, &bricks);
             for _ in 0..400 {
                 let made = rays(&mut state, grid, screen);
@@ -368,7 +373,7 @@ fn the_brick_watcher_runs_right_after_the_listed_step() {
         assert_eq!(groups[step + 1], vec![Plan::listed()]);
         assert_eq!(watched[before], added[0]);
         assert_eq!(watched.len(), passes.len() + added.len());
-        assert_eq!(&watched[watched.len() - 3..], &added[1..]);
+        assert_eq!(&watched[watched.len() - (added.len() - 1)..], &added[1..]);
     }
 }
 
@@ -382,7 +387,7 @@ fn plan_of(width: u32, grid: Grid) -> Plan {
 }
 
 /// A world held on the device with the picture's passes and nothing of the
-/// engine: the occupancy rebuild, the march and the shading, one a stage.
+/// engine: every pass after the brick watcher, one a stage.
 struct Still<'h> {
     held: Resident<'h>,
     build: Build,
@@ -390,12 +395,8 @@ struct Still<'h> {
 
 impl<'h> Still<'h> {
     fn new(host: &'h Host, build: Build, cells: &[u32]) -> Self {
-        let passes = [
-            render3::filled(&build).unwrap(),
-            render3::primary(&build).unwrap(),
-            render3::shade(&build).unwrap(),
-        ];
-        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let passes = build.passes().unwrap();
+        let modules: Vec<&[u32]> = passes[1..].iter().map(Vec::as_slice).collect();
         let mut sizes = [1_usize; BINDINGS as usize];
         sizes[PARAMS as usize] = Dimension::Three.params_words();
         sizes[STATE as usize] = build.grid.cells();
@@ -418,16 +419,20 @@ impl<'h> Still<'h> {
             .unwrap();
     }
 
-    fn run(&mut self, which: usize) {
-        let layout = self.build.layout();
-        let bricks = layout.bricks.div_ceil(self.build.subgroup);
-        let pixels = self.build.screen.groups(self.build.subgroup);
-        let mut stages = [
-            vec![Groups::Fixed(0)],
-            vec![Groups::Fixed(0)],
-            vec![Groups::Fixed(0)],
-        ];
-        stages[which] = vec![[Groups::Fixed(bricks), pixels, pixels][which]];
+    /// Runs the stages `which`, in [`stage`] order, alone.
+    fn run(&mut self, which: &[usize]) {
+        let all = self.build.stages(render3::Steps::ALL);
+        let stages: Vec<Vec<Groups>> = all
+            .into_iter()
+            .enumerate()
+            .map(|(at, groups)| {
+                if which.contains(&at) {
+                    groups
+                } else {
+                    vec![Groups::Fixed(0)]
+                }
+            })
+            .collect();
         let refs: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
         self.held.staged(&refs).unwrap();
     }
@@ -437,6 +442,23 @@ impl<'h> Still<'h> {
         all[at..].to_vec()
     }
 }
+
+const VOLUMES: [usize; 5] = [
+    stage::FILLED,
+    stage::LIT_ACROSS,
+    stage::LIT_DOWN,
+    stage::LIT_DEEP,
+    stage::SUNLIT,
+];
+
+const AFTER: [usize; 6] = [
+    stage::SHADE,
+    stage::RESOLVE,
+    stage::BLOOM_DOWN,
+    stage::BLOOM_ACROSS,
+    stage::BLOOM_UP,
+    stage::COMPOSITE,
+];
 
 fn first_difference(got: &[u32], want: &[u32], per: usize) -> Option<String> {
     if got.len() != want.len() {
@@ -480,7 +502,7 @@ fn the_device_march_finds_the_cpu_hits_bit_for_bit_for_random_cameras_and_worlds
             } else {
                 sparse(grid.cells(), held, 0x77 + seed as u64)
             };
-            let bricks = occupancy(grid, held, table.visible(), &cells);
+            let bricks = occupancy(grid, held, table.shown(), table.gases(), &cells);
             let world = plain_world(grid, held, &table, &cells, &bricks);
             for screen in screens {
                 let build = Build {
@@ -501,7 +523,7 @@ fn the_device_march_finds_the_cpu_hits_bit_for_bit_for_random_cameras_and_worlds
                         &Light::evening(8, 1.0),
                     ),
                 );
-                still.run(0);
+                still.run(&[stage::FILLED]);
                 let got = still.read(layout.occupancy(), layout.bricks as usize);
                 if got != bricks {
                     wrong.push(format!("{rule} {wide}x{deep}x{tall}: the bricks differ"));
@@ -512,7 +534,7 @@ fn the_device_march_finds_the_cpu_hits_bit_for_bit_for_random_cameras_and_worlds
                         &table,
                         &scene_words(&made, &table, &[], &Light::evening(8, 1.0)),
                     );
-                    still.run(1);
+                    still.run(&[stage::PRIMARY]);
                     let got = still.read(layout.hits(), screen.pixels() * HIT_WORDS);
                     let shading = Shading {
                         world,
@@ -520,6 +542,7 @@ fn the_device_march_finds_the_cpu_hits_bit_for_bit_for_random_cameras_and_worlds
                         layout,
                         pixels: &[],
                         suns: 1,
+                        frame: 0,
                     };
                     let want = shading.hits(&made);
                     if let Some(why) = first_difference(&got, &want, HIT_WORDS) {
@@ -562,6 +585,26 @@ fn widest(got: &[u32], want: &[u32]) -> (u32, usize) {
 /// The most any channel of a shaded pixel may differ from the CPU.
 const TOLERANCE: u32 = 2;
 
+/// The largest difference between two runs of floats, given as their bits,
+/// relative to the larger of the two and 1.
+fn float_gap(got: &[u32], want: &[u32]) -> f32 {
+    got.iter()
+        .zip(want)
+        .map(|(&a, &b)| {
+            let (a, b) = (f32::from_bits(a), f32::from_bits(b));
+            if a.is_nan() || b.is_nan() {
+                f32::INFINITY
+            } else {
+                (a - b).abs() / a.abs().max(b.abs()).max(1.0)
+            }
+        })
+        .fold(0.0, f32::max)
+}
+
+/// The most a float a pass writes may differ from the CPU's, relative to
+/// the larger of the two and 1.
+const FLOAT_TOLERANCE: f32 = 1.0e-4;
+
 #[test]
 fn the_shaded_picture_is_within_two_of_the_cpu_on_every_channel() {
     let Some(host) = device("render3 shading") else {
@@ -577,7 +620,7 @@ fn the_shaded_picture_is_within_two_of_the_cpu_on_every_channel() {
         let table = table(held, 0x61 + seed as u64);
         let grid = Grid::solid(16, 16, 16).unwrap();
         let cells = clumped(grid, held, 0x31 + seed as u64);
-        let bricks = occupancy(grid, held, table.visible(), &cells);
+        let bricks = occupancy(grid, held, table.shown(), table.gases(), &cells);
         let world = plain_world(grid, held, &table, &cells, &bricks);
         for suns in [1, 2, 4] {
             let build = Build {
@@ -589,7 +632,7 @@ fn the_shaded_picture_is_within_two_of_the_cpu_on_every_channel() {
             };
             let layout = build.layout();
             let mut still = Still::new(&host, build, &cells);
-            for _ in 0..3 {
+            for at in 0..3 {
                 let camera = Camera::looking(
                     [
                         between(&mut state, -20, 36) as f32,
@@ -600,27 +643,30 @@ fn the_shaded_picture_is_within_two_of_the_cpu_on_every_channel() {
                     0.9,
                 );
                 let made = camera.rays(grid, screen);
-                let light = Light::evening(screen.high, 0.9);
-                let suns_made = light.sun_rays(suns as usize, 0.05);
-                let scene = scene_words(&made, &table, &suns_made, &light);
+                let light = Light::at(screen.high, 0.9, at as f32 * 0.4);
+                let frame = Frame {
+                    suns: light.sun_rays(suns as usize, 0.05),
+                    floor: 0.05,
+                    before: camera.before(grid, screen),
+                    flags: if at == 0 { flags::RESET } else { flags::ACTIVE },
+                    drawn: at,
+                };
+                let scene = framed_words(&made, &table, &frame, &light);
                 still.set(&table, &scene);
-                still.run(0);
-                still.run(1);
-                still.run(2);
-                let hits = still.read(layout.hits(), screen.pixels() * HIT_WORDS);
+                still.run(&VOLUMES);
+                still.run(&[stage::PRIMARY]);
+                let mut image = still.read(0, layout.words());
+                still.run(&AFTER);
                 let got = still.read(0, screen.pixels());
-                let mut words = vec![0; layout.hits()];
-                words[layout.table()..layout.table() + table.words().len()]
-                    .copy_from_slice(&table.words());
-                words[layout.scene()..layout.scene() + scene.len()].copy_from_slice(&scene);
                 let shading = Shading {
                     world,
                     screen,
                     layout,
-                    pixels: &words,
+                    pixels: &[],
                     suns,
+                    frame: 0,
                 };
-                let want = shading.picture(&hits).unwrap();
+                let want = develop(&shading, &mut image).unwrap();
                 let (gap, over) = widest(&got, &want);
                 most = most.max(gap);
                 if over > 0 {
@@ -640,6 +686,250 @@ fn the_shaded_picture_is_within_two_of_the_cpu_on_every_channel() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A world of glowing cells, gas and solid cells in clumps, and a table that
+/// draws them so.
+fn lit_world(grid: Grid, kinds: Kinds, seed: u64) -> (Table, Vec<u32>) {
+    let mut state = seed;
+    let table = Table::empty()
+        .with(1, Material::solid(0x80_8080, 0.2))
+        .with(2, Material::solid(0xFF_7020, 0.4).glowing(2.0))
+        .with(3, Material::solid(0x50_4840, 0.0).gas(0.6))
+        .with(4, Material::solid(0x30_60A0, 0.1).clear(0.8));
+    let field = kinds.mask() << kinds.shift();
+    let cells = clumped(grid, kinds, seed)
+        .into_iter()
+        .map(|word| {
+            let kind = below(&mut state, 5) & kinds.mask();
+            (word & !field) | (kind << kinds.shift())
+        })
+        .collect();
+    (table, cells)
+}
+
+#[test]
+fn the_light_of_glowing_cells_and_the_gas_are_kept_a_brick_at_a_time_as_on_the_cpu() {
+    let Some(host) = device("render3 light volumes") else {
+        return;
+    };
+    let width = host.width();
+    let screen = Screen { wide: 13, high: 7 };
+    let mut wrong = Vec::new();
+    let mut most = 0.0_f32;
+    let mut foggy = 0;
+    let mut state = 0x11A;
+    for (seed, &(wide, deep, tall)) in [(16, 16, 16), (32, 8, 16)].iter().enumerate() {
+        let grid = Grid::solid(wide, deep, tall).unwrap();
+        let held = kinds("heat");
+        let (table, cells) = lit_world(grid, held, 0x77 + seed as u64);
+        let build = Build {
+            grid,
+            kinds: held,
+            screen,
+            subgroup: width,
+            suns: 1,
+        };
+        let layout = build.layout();
+        let mut still = Still::new(&host, build, &cells);
+        let light = Light::evening(screen.high, 0.9);
+        let side = wide as f32;
+        let made = Camera::looking(
+            [
+                side * 1.8 + between(&mut state, 0, 8) as f32,
+                -side * 0.7,
+                side * 1.6,
+            ],
+            [side * 0.5, deep as f32 * 0.5, tall as f32 * 0.5],
+            0.9,
+        )
+        .rays(grid, screen);
+        let frame = Frame {
+            suns: light.sun_rays(1, 0.05),
+            floor: 0.05,
+            flags: flags::RESET,
+            ..Frame::default()
+        };
+        still.set(&table, &framed_words(&made, &table, &frame, &light));
+        still.run(&VOLUMES);
+        still.run(&[stage::PRIMARY]);
+        let image = still.read(0, layout.words());
+        let (glow, gas) = emission(grid, held, &table, &cells);
+        let bricks = layout.bricks as usize;
+        let mut check = |name: &str, got: &[u32], want: &[u32]| {
+            let gap = float_gap(got, want);
+            most = most.max(gap);
+            if gap > FLOAT_TOLERANCE || got.len() != want.len() {
+                wrong.push(format!("{wide}x{deep}x{tall} {name}: off by {gap}"));
+            }
+        };
+        let words = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        check(
+            "light given off",
+            &image[layout.emission()..layout.emission() + 3 * bricks],
+            &words(&glow),
+        );
+        check(
+            "gas",
+            &image[layout.gas()..layout.gas() + GAS_WORDS * bricks],
+            &words(&gas),
+        );
+        let volumes = Volumes {
+            grid,
+            kinds: held,
+            layout,
+            pixels: &image,
+        };
+        for axis in 0..3 {
+            let want = volumes.spread(axis).unwrap();
+            let at = layout.lamp(axis as u32);
+            check(
+                &format!("light spread {axis}"),
+                &image[at..at + 3 * bricks],
+                &want,
+            );
+        }
+        check(
+            "sun through the gas",
+            &image[layout.sunlit()..layout.sunlit() + bricks],
+            &volumes.sunlit().unwrap(),
+        );
+        let bricks_now = occupancy(grid, held, table.shown(), table.gases(), &cells);
+        let world = plain_world(grid, held, &table, &cells, &bricks_now);
+        let shading = Shading {
+            world,
+            screen,
+            layout,
+            pixels: &image,
+            suns: 1,
+            frame: 0,
+        };
+        let fog = shading.fog(&made).unwrap();
+        check(
+            "fog",
+            &image[layout.fog()..layout.fog() + FOG_WORDS * screen.pixels()],
+            &fog,
+        );
+        let lamp = &image[layout.lamp(2)..layout.lamp(2) + 3 * bricks];
+        assert!(
+            lamp.iter().any(|&word| f32::from_bits(word) > 0.0),
+            "no light reached any brick"
+        );
+        foggy += fog
+            .chunks(FOG_WORDS)
+            .filter(|words| f32::from_bits(words[3]) < 1.0)
+            .count();
+    }
+    assert!(foggy > 0, "no ray crossed any gas");
+    println!(
+        "width {width}: the widest relative difference of the light volumes and the fog is {most}; {foggy} rays crossed gas"
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The longest run of rows in which column `x` of `picture` keeps one value.
+fn longest_run(picture: &[u32], screen: Screen, x: u32) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    let mut before = None;
+    for y in 0..screen.high {
+        let pixel = picture[(y * screen.wide + x) as usize];
+        run = if before == Some(pixel) { run + 1 } else { 1 };
+        before = Some(pixel);
+        longest = longest.max(run);
+    }
+    longest
+}
+
+/// The longest run of rows a column of the sky may keep one value.
+const LONGEST_SKY_RUN: usize = 12;
+
+#[test]
+fn the_sky_has_no_bands() {
+    let grid = Grid::solid(16, 16, 16).unwrap();
+    let held = kinds("sand");
+    let table = Table::empty();
+    let cells = vec![0; grid.cells()];
+    let bricks = occupancy(grid, held, table.shown(), table.gases(), &cells);
+    let world = plain_world(grid, held, &table, &cells, &bricks);
+    let mut longest = 0;
+    for (screen, pitch, dusk) in [
+        (Screen { wide: 5, high: 720 }, -0.15, 0.0),
+        (
+            Screen {
+                wide: 5,
+                high: 1080,
+            },
+            -0.35,
+            0.0,
+        ),
+        (
+            Screen {
+                wide: 5,
+                high: 1080,
+            },
+            -0.1,
+            1.0,
+        ),
+    ] {
+        let layout = Layout::new(grid, screen, 4);
+        let light = Light::at(screen.high, 0.9, dusk);
+        let camera = Camera {
+            at: [8.0, -40.0, -200.0],
+            yaw: 1.2,
+            pitch,
+            view: 0.9,
+        };
+        let made = camera.rays(grid, screen);
+        let frame = Frame {
+            suns: light.sun_rays(1, 0.05),
+            floor: 0.05,
+            before: camera.before(grid, screen),
+            flags: flags::RESET,
+            drawn: 0,
+        };
+        let mut image = vec![0; layout.words()];
+        let scene = framed_words(&made, &table, &frame, &light);
+        image[layout.scene()..layout.scene() + scene.len()].copy_from_slice(&scene);
+        let hits = Shading {
+            world,
+            screen,
+            layout,
+            pixels: &[],
+            suns: 1,
+            frame: 0,
+        }
+        .hits(&made);
+        image[layout.hits()..layout.hits() + hits.len()].copy_from_slice(&hits);
+        for pixel in 0..screen.pixels() {
+            image[layout.fog() + FOG_WORDS * pixel + 3] = 1.0_f32.to_bits();
+        }
+        let shading = Shading {
+            world,
+            screen,
+            layout,
+            pixels: &[],
+            suns: 1,
+            frame: 0,
+        };
+        let picture = develop(&shading, &mut image).unwrap();
+        for x in 0..screen.wide {
+            longest = longest.max(longest_run(&picture, screen, x));
+        }
+        let top = picture[0];
+        let bottom = picture[screen.pixels() - 1];
+        assert_ne!(top, bottom, "the sky does not change from top to bottom");
+    }
+    println!("the longest run of one value down a column of the sky is {longest} rows");
+    assert!(
+        longest < LONGEST_SKY_RUN,
+        "{longest} rows of one value: the sky shows bands"
+    );
+}
+
 struct Ran {
     name: &'static str,
     params: Vec<u32>,
@@ -655,7 +945,7 @@ fn running<R: Rule>(host: &Host, rule: &R, ran: &Ran) -> Vec<String> {
     let reference = Grid3::new(wide, deep, tall).unwrap();
     let plan = plan_of(width, grid);
     let held_kinds = kinds(ran.name);
-    let table = table(held_kinds, 0x4242);
+    let table = table(held_kinds, 0x4242).with(1, Material::solid(0xFF_8040, 0.2).glowing(2.0));
     let screen = Screen { wide: 24, high: 16 };
     let build = Build {
         grid,
@@ -684,7 +974,7 @@ fn running<R: Rule>(host: &Host, rule: &R, ran: &Ran) -> Vec<String> {
     live::seed(&mut held, grid, &plan).unwrap();
     held.write_at(PIXELS as usize, layout.table(), &table.words())
         .unwrap();
-    stages.extend(build.stages(false));
+    stages.extend(build.stages(render3::Steps::KEPT));
     let mut state = 0xF00D;
     let mut wrong = Vec::new();
     for frame in 0..16_u32 {
@@ -715,8 +1005,8 @@ fn running<R: Rule>(host: &Host, rule: &R, ran: &Ran) -> Vec<String> {
         let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
         held.staged(&groups).unwrap();
         cells = sand3::reference(rule, reference, frame, &cells, &ran.params);
-        let bricks = occupancy(grid, held_kinds, table.visible(), &cells);
-        let all = held.read(PIXELS as usize, layout.claims()).unwrap();
+        let bricks = occupancy(grid, held_kinds, table.shown(), table.gases(), &cells);
+        let all = held.read(PIXELS as usize, layout.words()).unwrap();
         if all[layout.occupancy()..layout.claims()] != bricks[..] {
             let differ = all[layout.occupancy()..]
                 .iter()
@@ -728,6 +1018,43 @@ fn running<R: Rule>(host: &Host, rule: &R, ran: &Ran) -> Vec<String> {
                 ran.name
             ));
         }
+        let (glow, _) = emission(grid, held_kinds, &table, &cells);
+        let given: Vec<u32> = glow.iter().map(|value| value.to_bits()).collect();
+        let bricks_count = layout.bricks as usize;
+        let got_glow = &all[layout.emission()..layout.emission() + 3 * bricks_count];
+        let gap = float_gap(got_glow, &given);
+        if gap > FLOAT_TOLERANCE {
+            wrong.push(format!(
+                "{} frame {frame}: the light given off is off by {gap}",
+                ran.name
+            ));
+        }
+        let later = &all;
+        let mut image = all.clone();
+        image[layout.emission()..layout.emission() + 3 * bricks_count].copy_from_slice(&given);
+        let mut spread = image.clone();
+        for axis in 0..3 {
+            let volumes = Volumes {
+                grid,
+                kinds: held_kinds,
+                layout,
+                pixels: &spread,
+            };
+            let words = volumes.spread(axis).unwrap();
+            let at = layout.lamp(axis as u32);
+            spread[at..at + words.len()].copy_from_slice(&words);
+        }
+        let at = layout.lamp(2);
+        let gap = float_gap(
+            &later[at..at + 3 * bricks_count],
+            &spread[at..at + 3 * bricks_count],
+        );
+        if gap > FLOAT_TOLERANCE {
+            wrong.push(format!(
+                "{} frame {frame}: the spread light is off by {gap}",
+                ran.name
+            ));
+        }
         let world = plain_world(grid, held_kinds, &table, &cells, &bricks);
         let shading = Shading {
             world,
@@ -735,6 +1062,7 @@ fn running<R: Rule>(host: &Host, rule: &R, ran: &Ran) -> Vec<String> {
             layout,
             pixels: &[],
             suns: 1,
+            frame: 0,
         };
         let want = shading.hits(&made);
         let got = &all[layout.hits()..layout.hits() + screen.pixels() * HIT_WORDS];
@@ -825,7 +1153,7 @@ fn a_quiet_world_rebuilds_no_brick() {
     .unwrap();
     held.write_at(PIXELS as usize, layout.table(), &table.words())
         .unwrap();
-    stages.extend(build.stages(false));
+    stages.extend(build.stages(render3::Steps::KEPT));
     let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
     let mut frames = 0;
     loop {
@@ -842,17 +1170,28 @@ fn a_quiet_world_rebuilds_no_brick() {
         held.staged(&groups).unwrap();
     }
     let claims = held.read(PIXELS as usize, layout.words()).unwrap();
+    let kept = layout.claims()..layout.emission();
     assert_eq!(
-        &claims[layout.claims()..],
-        &before[layout.claims()..],
+        &claims[kept.clone()],
+        &before[kept.clone()],
         "a quiet frame claimed a brick"
     );
+    assert_eq!(
+        &claims[layout.emission()..layout.sunlit()],
+        &before[layout.emission()..layout.sunlit()],
+        "a quiet frame changed the light of the bricks"
+    );
+    assert_eq!(
+        claims[layout.changed()],
+        before[layout.changed()],
+        "a quiet frame marked the light as changed"
+    );
     assert!(
-        claims[layout.claims()..].iter().all(|&stamp| stamp != 0),
+        claims[kept].iter().all(|&stamp| stamp != 0),
         "the seeded frame claims every brick"
     );
     println!("quiet after {frames} frames; three more claimed no brick");
-    let bricks = occupancy(grid, held_kinds, table.visible(), &cells);
+    let bricks = occupancy(grid, held_kinds, table.shown(), table.gases(), &cells);
     let got = &claims[layout.occupancy()..layout.claims()];
     let differ = got.iter().zip(&bricks).filter(|(a, b)| a != b).count();
     assert_eq!(
