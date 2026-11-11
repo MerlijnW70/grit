@@ -29,6 +29,8 @@ pub const HEAD: usize = 4;
 
 pub const TIER_BINDINGS: u32 = 8;
 
+pub const MOST_GROUPS: u32 = 65_535;
+
 pub const SPARSE_BINDINGS: u32 = 2 + TIER_BINDINGS;
 
 pub const FLAT: &str = "a brick pool holds a solid grid laid out for three axes";
@@ -55,6 +57,7 @@ pub struct Bricks {
     lattice: [u32; 3],
     capacity: u32,
     windows: Windows,
+    most: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +158,15 @@ impl Bricks {
             lattice,
             capacity,
             windows,
+            most: MOST_GROUPS,
         })
+    }
+
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub const fn taking_at_most(mut self, groups: u32) -> Self {
+        self.most = groups;
+        self
     }
 
     #[must_use]
@@ -210,6 +221,11 @@ impl Bricks {
 
     const fn inner(&self) -> [u32; 3] {
         [1 << self.bits[0], 1 << self.bits[1], 1 << self.bits[2]]
+    }
+
+    #[must_use]
+    pub const fn takes(&self) -> u32 {
+        self.count().div_ceil(self.most).next_power_of_two()
     }
 
     #[must_use]
@@ -1178,14 +1194,44 @@ pub fn take(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
 }
 
 fn taken<const LANES: u32>(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
+    use simdr::module::op;
+
+    let subgroup = bricks.subgroup;
+    let tier = bricks.tier();
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, bricks.bindings()))?;
+    let uint = kernel.index_type();
+    let group = kernel.workgroup_index();
+    let head = kernel.module().constant_u32(0)?;
+    let grand = kernel.load_at(tier.grand, head)?;
+    let per = bricks.takes();
+    let span = kernel.module().constant_u32(per)?;
+    let first = kernel.module().i_mul(uint, group, span)?;
+    let _ = kernel.repeat_rolled_many(per, uint, &[first], |kernel, carried, _| {
+        let rank = carried.first().copied().unwrap_or(first);
+        let truth = kernel.module().type_bool()?;
+        let listed = kernel
+            .module()
+            .binary(op::U_LESS_THAN, truth, rank, grand)?;
+        live::lane_if(kernel, listed, |kernel| {
+            take_one::<LANES>(kernel, bricks, rank)
+        })?;
+        let one = kernel.module().constant_u32(1)?;
+        Ok(vec![kernel.module().i_add(uint, rank, one)?])
+    })?;
+    kernel.finish()
+}
+
+fn take_one<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    bricks: &Bricks,
+    rank: Id,
+) -> Result<(), LaneError> {
     let subgroup = bricks.subgroup;
     let windows = bricks.windows();
     let table = bricks.table();
     let slots = bricks.slots();
     let tier = bricks.tier();
-    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, bricks.bindings()))?;
     let uint = kernel.index_type();
-    let rank = kernel.workgroup_index();
     let lane = kernel.local_index();
     let head = kernel.module().constant_u32(0)?;
     let top = kernel.load_at(slots, head)?;
@@ -1231,7 +1277,7 @@ fn taken<const LANES: u32>(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
             .copied()
             .ok_or(LaneError::NoOpenBlock { arm: "taking" })?
     };
-    live::lane_if(&mut kernel, taking, |kernel| {
+    live::lane_if(kernel, taking, |kernel| {
         let _ =
             kernel.repeat_rolled_many(per_lane, uint, &[start.id()], |kernel, carried, _| {
                 let at = carried.first().copied().unwrap_or(head);
@@ -1250,8 +1296,7 @@ fn taken<const LANES: u32>(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
         lanes.select(fine, scratch, flagged)?
     };
     let one = kernel.module().constant_u32(1)?;
-    kernel.store_at(slots, over_at.id(), one)?;
-    kernel.finish()
+    kernel.store_at(slots, over_at.id(), one)
 }
 
 fn brick_scans(subgroup: u32, plan: &Plan, tier: Tier) -> Result<Stages, LaneError> {
@@ -1325,7 +1370,7 @@ fn pooled(bricks: &Bricks, plan: &Plan, flags: Groups) -> Result<Stages, LaneErr
     freeing.extend(wipe_brick_totals(subgroup, plan, tier)?);
     stages.push(freeing);
     stages.push(vec![(lift(bricks)?, one), (wants(bricks, plan)?, flags)]);
-    stages.extend(ranked(bricks, plan, 1)?);
+    stages.extend(ranked(bricks, plan, bricks.takes())?);
     stages.push(vec![(take(bricks)?, listed)]);
     Ok(stages)
 }

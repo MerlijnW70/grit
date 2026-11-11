@@ -792,6 +792,29 @@ fn a_pool_split_over_windows_steps_to_the_dense_words() {
     }
 }
 
+#[cfg(feature = "faults")]
+#[test]
+fn a_take_that_serves_many_bricks_a_group_steps_to_the_dense_words() {
+    let name = "bricks few groups";
+    let Some(host) = device(name) else {
+        return;
+    };
+    let shape = world_for(host.width());
+    for most in [1, 3] {
+        let pooled = |grid: Grid, plan: &Plan| {
+            let few = Bricks::new(grid, plan, plan.blocks)
+                .unwrap()
+                .taking_at_most(most);
+            assert!(few.takes() > 1, "{name}: {most} groups");
+            few
+        };
+        let start = |grid: Grid3, side: [u32; 3], seed: u64| rain(grid, side, seed);
+        agree_in(&host, &sand(), shape, &start, 64, &pooled);
+        let start = |grid: Grid3, side: [u32; 3], seed: u64| clocks(grid, side, seed);
+        agree_in(&host, &ticking(), shape, &start, TICKS + 8, &pooled);
+    }
+}
+
 #[test]
 fn a_full_pool_stops_the_world_at_the_frame_before_with_a_named_error() {
     let name = "bricks full pool";
