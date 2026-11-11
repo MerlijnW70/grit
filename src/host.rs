@@ -407,6 +407,7 @@ impl Host {
     }
 
     fn made(pattern: Option<&str>, presenting: bool) -> Result<Option<Self>, Error> {
+        let _forming = crate::resident::forming();
         let entry = match unsafe { ash::Entry::load() } {
             Ok(entry) => entry,
             Err(ash::LoadingError::LibraryLoadFailure(_)) => return Ok(None),

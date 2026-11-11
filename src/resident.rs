@@ -443,6 +443,28 @@ fn staged(at: usize, count: usize, room: u64) -> Result<Span, Error> {
     })
 }
 
+/// Lets one thread of the process at a time open a host or build kernels.
+///
+/// lavapipe keeps the vector width it compiles for in one variable of the
+/// process. Every compile first sets it to the driver's default and only then
+/// to `LP_NATIVE_VECTOR_WIDTH`, and opening a device and compiling a kernel
+/// both read it. A host opened while another thread compiles can so report a
+/// subgroup its kernels never run at, and a kernel compiled while another
+/// thread compiles can run a subgroup narrower than the host reports; either
+/// way every subgroup sum it builds is wrong. A host is opened, and a resident
+/// is built, under this lock, and each pipeline of the resident is dispatched
+/// once with no group before it is handed out, so a driver that compiles at
+/// the first dispatch compiles then.
+static FORMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What [`crate::Host`] holds while it opens a device, and a resident while
+/// it is built.
+pub(crate) fn forming() -> std::sync::MutexGuard<'static, ()> {
+    FORMING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub struct Resident<'host> {
     host: &'host Host,
     direct: bool,
@@ -564,6 +586,7 @@ impl Host {
             | vk::MemoryPropertyFlags::HOST_VISIBLE
             | vk::MemoryPropertyFlags::HOST_COHERENT;
 
+        let _forming = forming();
         let mut made = Resident::building(self, direct, sizes.len());
         unsafe {
             for (at, &bytes) in lengths.iter().enumerate() {
@@ -629,6 +652,7 @@ impl Host {
         }
         made.built = true;
         self.owe();
+        unsafe { made.warm() }?;
         Ok(made)
     }
 
@@ -945,6 +969,49 @@ impl<'host> Resident<'host> {
             }
         }
         Ok(())
+    }
+
+    /// Dispatches every pipeline once with no group, so a driver that
+    /// compiles a pipeline at its first dispatch does it here, under
+    /// [`FORMING`]. The dispatches are kept apart by the barrier a frame puts
+    /// between its stages. A wedged host runs nothing, so it has nothing to
+    /// compile.
+    unsafe fn warm(&self) -> Result<(), Error> {
+        if self.pipelines.is_empty() || self.host.wedged() {
+            return Ok(());
+        }
+        let (layout, set) = (self.pipeline_layout, self.set);
+        let pipelines = &self.pipelines;
+        unsafe {
+            self.once(|device, command| {
+                device.cmd_bind_descriptor_sets(
+                    command,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                let between = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+                for (nth, &pipeline) in pipelines.iter().enumerate() {
+                    if nth > 0 {
+                        device.cmd_pipeline_barrier(
+                            command,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &between,
+                            &[],
+                            &[],
+                        );
+                    }
+                    device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    device.cmd_dispatch(command, 0, 0, 0);
+                }
+            })
+        }
     }
 
     unsafe fn record(&mut self) -> Result<(), Error> {
