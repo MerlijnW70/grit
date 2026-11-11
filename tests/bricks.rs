@@ -1022,6 +1022,59 @@ fn a_host_write_takes_a_brick_and_wakes_a_quiet_world() {
 }
 
 #[test]
+fn a_host_write_that_needs_more_slots_than_are_free_writes_nothing() {
+    let name = "bricks host write past the pool";
+    let Some(host) = device(name) else {
+        return;
+    };
+    let width = host.width();
+    let shape = world_for(width);
+    let (grid, reference3) = grids(shape.0, shape.1, shape.2);
+    let side = side_of(width, grid);
+    let start = pile(reference3, side, 0);
+    let plan = plan_of(width, grid);
+    let held = Bricks::new(grid, &plan, plan.blocks)
+        .unwrap()
+        .pack(&start)
+        .unwrap()
+        .held;
+    let mut sparse = Sparse::new(&host, &Sand, grid, Mode::Fine, Some(held + 1));
+    sparse.restart(&start, &[], 0);
+    let x = grid.wide - side[0] / 2;
+    let far = grid.tall - side[2] / 2;
+    let cells: Vec<(u32, u32)> = [(x, 1, far), (x, side[1] + 1, far)]
+        .iter()
+        .map(|&(x, y, z)| {
+            (
+                u32::try_from(reference3.index(x, y, z)).unwrap(),
+                sand2::SAND,
+            )
+        })
+        .collect();
+    let before = sparse.bricks.check(&mut sparse.held).unwrap();
+    let refused = sparse.bricks.put(&mut sparse.held, &sparse.plan, &cells);
+    assert!(
+        matches!(refused, Err(Error::PoolFull { slots }) if slots == held + 1),
+        "{name}: {refused:?}"
+    );
+    assert_eq!(sparse.bricks.check(&mut sparse.held).unwrap(), before);
+    assert_eq!(sparse.world().unwrap(), start, "{name}: a cell was written");
+    sparse.sound().unwrap();
+    let same = [(cells[0].0, sand2::AIR), (cells[1].0, sand2::AIR)];
+    sparse
+        .bricks
+        .put(&mut sparse.held, &sparse.plan, &same)
+        .unwrap();
+    assert_eq!(sparse.bricks.check(&mut sparse.held).unwrap(), before);
+    sparse
+        .bricks
+        .put(&mut sparse.held, &sparse.plan, &cells[..1])
+        .unwrap();
+    assert_eq!(sparse.bricks.check(&mut sparse.held).unwrap().free, 0);
+    sparse.sound().unwrap();
+}
+
+#[test]
 fn octs_are_numbered_brick_by_brick_and_a_block_is_a_brick() {
     for width in [4, 8, 16, 32, 64] {
         let (wide, deep, tall) = world_for(width);

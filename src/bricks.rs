@@ -608,38 +608,54 @@ impl Bricks {
             .read(DENSE as usize, grand as usize)?
             .into_iter()
             .collect();
+        let mut wanted = std::collections::BTreeSet::new();
+        for &(cell, word) in cells {
+            let Cell { brick, .. } = self.cell_of(Solid::point(grid, cell));
+            let entry = brick as usize * ENTRY;
+            let slot = table.get(entry).copied().unwrap_or(UNIFORM);
+            let value = table.get(entry + VALUE).copied().unwrap_or_default();
+            if slot == UNIFORM && word != value {
+                wanted.insert(brick);
+            }
+        }
+        if wanted.len() > top {
+            return Err(Error::PoolFull {
+                slots: self.capacity,
+            });
+        }
+
         let mut woken = std::collections::BTreeSet::new();
         for &(cell, word) in cells {
-            let point = Solid::point(grid, cell);
-            let Cell { brick, offset } = self.cell_of(point);
+            let Cell { brick, offset } = self.cell_of(Solid::point(grid, cell));
             let entry = brick as usize * ENTRY;
             let slot = table.get(entry).copied().unwrap_or(UNIFORM);
             let value = table.get(entry + VALUE).copied().unwrap_or_default();
             let slot = if slot != UNIFORM {
-                slot
+                Some(slot)
             } else if word == value {
-                continue;
+                None
             } else {
-                let Some(taken) = top.checked_sub(1).and_then(|at| stack.get(HEAD + at)) else {
+                let Some(&taken) = top.checked_sub(1).and_then(|at| stack.get(HEAD + at)) else {
                     return Err(Error::PoolFull {
                         slots: self.capacity,
                     });
                 };
-                let taken = *taken;
                 top -= 1;
                 live::write_state(held, self.windows, taken as usize * per, &vec![value; per])?;
                 if let Some(place) = table.get_mut(entry) {
                     *place = taken;
                 }
                 held.write_at(self.table() as usize, entry, &[taken])?;
-                taken
+                Some(taken)
             };
-            live::write_state(
-                held,
-                self.windows,
-                slot as usize * per + offset as usize,
-                &[word],
-            )?;
+            if let Some(slot) = slot {
+                live::write_state(
+                    held,
+                    self.windows,
+                    slot as usize * per + offset as usize,
+                    &[word],
+                )?;
+            }
             for phase in 0..2 {
                 let holder = Solid::held(grid, cell, phase);
                 woken.insert(self.oct_of(holder.block));
