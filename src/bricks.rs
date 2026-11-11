@@ -35,8 +35,6 @@ pub const MOST_GROUPS: u32 = 65_535;
 
 pub const SPARSE_BINDINGS: u32 = 2 + TIER_BINDINGS + LIST_BINDINGS;
 
-pub const SPAN: u32 = 1 << 16;
-
 pub const AWAKE_LEVEL: u32 = 2;
 
 pub const FLAT: &str = "a brick pool holds a solid grid laid out for three axes";
@@ -332,7 +330,7 @@ impl Bricks {
         let subgroup = plan.subgroup as usize;
         for (binding, words) in [
             (STATE, self.pool_words()),
-            (AWAKE, pool_octs + SPAN as usize),
+            (AWAKE, pool_octs),
             (
                 BUCKETS,
                 capacity * crate::sweep::stride(plan.subgroup) as usize,
@@ -580,6 +578,18 @@ impl Bricks {
             slots,
             held,
         })
+    }
+
+    pub fn restacked(&self, packed: Packed) -> Result<Packed, Error> {
+        if packed.held > self.capacity {
+            return Err(Error::PoolFull {
+                slots: self.capacity,
+            });
+        }
+        let top = self.capacity - packed.held;
+        let mut slots = vec![top, 0, 0, 0];
+        slots.extend((0..top).map(|place| self.capacity - 1 - place));
+        Ok(Packed { slots, ..packed })
     }
 
     pub fn raw(&self, held: &mut Resident<'_>) -> Result<(Vec<u32>, Vec<u32>), Error> {
@@ -952,6 +962,31 @@ fn ones<const LANES: u32>(
     lanes.select(truth, one, none)
 }
 
+fn truth<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    when: Vector<U32, LANES>,
+) -> Result<Id, LaneError> {
+    let mut lanes = kernel.lanes()?;
+    let none = lanes.splat_bits::<U32, LANES>(0)?;
+    let holds = lanes.greater_than(when, none)?;
+    holds
+        .strips()
+        .first()
+        .copied()
+        .ok_or(LaneError::NoOpenBlock { arm: "when" })
+}
+
+fn store_if<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    when: Vector<U32, LANES>,
+    binding: u32,
+    at: Id,
+    value: Id,
+) -> Result<(), LaneError> {
+    let holds = truth::<LANES>(kernel, when)?;
+    live::lane_if(kernel, holds, |kernel| kernel.store_at(binding, at, value))
+}
+
 fn listed_oct<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     bricks: &Bricks,
@@ -1014,7 +1049,6 @@ fn wake<const LANES: u32>(
     bricks: &Bricks,
     at: [Vector<U32, LANES>; 3],
     waking: Vector<U32, LANES>,
-    slot: Id,
 ) -> Result<(), LaneError> {
     use crate::geometry::Solid;
     use crate::layout::{AWAKE, HOT};
@@ -1033,33 +1067,20 @@ fn wake<const LANES: u32>(
                 (lanes.mul(brick, four)?, brick, local)
             };
             let entry = kernel.load_at(table, entry_at.id())?;
-            let (flag_at, hot_at) = {
+            let (flag_at, both) = {
                 let mut lanes = kernel.lanes()?;
                 let entry = lanes.splat_id::<U32, LANES>(entry)?;
-                let here = lanes.splat_id::<U32, LANES>(slot)?;
                 let uniform = lanes.splat_bits::<U32, LANES>(UNIFORM)?;
-                let none = lanes.splat_bits::<U32, LANES>(0)?;
                 let per = lanes.splat_bits::<U32, LANES>(bricks.per_block())?;
-                let span = lanes.splat_bits::<U32, LANES>(SPAN - 1)?;
-                let past = lanes.splat_bits::<U32, LANES>(bricks.pool_octs())?;
-                let cold = lanes.splat_bits::<U32, LANES>(bricks.cold)?;
                 let held = lanes.not_equal(entry, uniform)?;
                 let held = ones(&mut lanes, held)?;
                 let both = lanes.mul(held, waking)?;
-                let both = lanes.greater_than(both, none)?;
-                let wakes = lanes.greater_than(waking, none)?;
                 let start = lanes.mul(entry, per)?;
-                let flag = lanes.add(start, local)?;
-                let spread = lanes.and(here, span)?;
-                let scratch = lanes.add(past, spread)?;
-                (
-                    lanes.select(both, flag, scratch)?,
-                    lanes.select(wakes, brick, cold)?,
-                )
+                (lanes.add(start, local)?, both)
             };
             let mark = kernel.module().constant_u32(AWAKE_LEVEL)?;
-            kernel.store_at(AWAKE, flag_at.id(), mark)?;
-            kernel.store_at(HOT, hot_at.id(), mark)?;
+            store_if::<LANES>(kernel, both, AWAKE, flag_at.id(), mark)?;
+            store_if::<LANES>(kernel, waking, HOT, brick.id(), mark)?;
         }
         Ok(())
     })
@@ -1158,7 +1179,7 @@ fn settled<const LANES: u32, R: Rule>(
         holding.push(held);
     }
 
-    let step = {
+    let stepped = |kernel: &mut Kernel<U32>| {
         let mut lanes = kernel.lanes()?;
         let given = Given {
             frame,
@@ -1168,52 +1189,79 @@ fn settled<const LANES: u32, R: Rule>(
             places: [placed.block[0]; CORNERS],
             block: placed.block,
         };
-        ruled::<LANES, R>(&mut lanes, rule, &placing, words, given)?
+        ruled::<LANES, R>(&mut lanes, rule, &placing, words, given)
     };
 
     match act {
         Act::Dry => {
-            let spare = u32::try_from(bricks.count() as usize * ENTRY).unwrap_or(u32::MAX);
-            for ((cell, &value), (&held, out)) in placed
-                .cells
-                .iter()
-                .zip(&values)
-                .zip(holding.iter().zip(&step.out))
-            {
-                let (stamp, touched, wanted) = {
+            let stamp = {
+                let mut lanes = kernel.lanes()?;
+                let now = lanes.splat_id::<U32, LANES>(frame)?;
+                let one = lanes.splat_bits::<U32, LANES>(1)?;
+                let stamp = lanes.add(now, one)?;
+                lanes.max(stamp, one)?
+            };
+            let mut uniform_any = None;
+            for (index, (cell, &held)) in placed.cells.iter().zip(&holding).enumerate() {
+                let (touched, first, empty) = {
                     let mut lanes = kernel.lanes()?;
-                    let now = lanes.splat_id::<U32, LANES>(frame)?;
-                    let one = lanes.splat_bits::<U32, LANES>(1)?;
-                    let none = lanes.splat_bits::<U32, LANES>(0)?;
                     let four = lanes.splat_bits::<U32, LANES>(ENTRY as u32)?;
-                    let scratch = lanes.splat_bits::<U32, LANES>(spare)?;
-                    let scratch_next = lanes.splat_bits::<U32, LANES>(spare + 1)?;
                     let touched_at = lanes.splat_bits::<U32, LANES>(TOUCHED as u32)?;
-                    let wanted_at = lanes.splat_bits::<U32, LANES>(WANTED as u32)?;
-                    let stamp = lanes.add(now, one)?;
-                    let stamp = lanes.max(stamp, one)?;
+                    let none = lanes.splat_bits::<U32, LANES>(0)?;
                     let entry = lanes.mul(cell.brick, four)?;
-                    let listed = lanes.greater_than(inside, none)?;
-                    let touched = lanes.add(entry, touched_at)?;
-                    let touched = lanes.select(listed, touched, scratch)?;
-                    let value = lanes.splat_id::<U32, LANES>(value)?;
-                    let differs = lanes.not_equal(*out, value)?;
-                    let differs = ones(&mut lanes, differs)?;
-                    let uniform = lanes.equal(held, none)?;
-                    let uniform = ones(&mut lanes, uniform)?;
-                    let wants = lanes.mul(differs, uniform)?;
-                    let wants = lanes.mul(wants, inside)?;
-                    let wants = lanes.greater_than(wants, none)?;
-                    let wanted = lanes.add(entry, wanted_at)?;
-                    let wanted = lanes.select(wants, wanted, scratch_next)?;
-                    (stamp, touched, wanted)
+                    let mut first = inside;
+                    for earlier in placed.cells.iter().take(index) {
+                        let other = lanes.not_equal(earlier.brick, cell.brick)?;
+                        let other = ones(&mut lanes, other)?;
+                        first = lanes.mul(first, other)?;
+                    }
+                    let empty = lanes.equal(held, none)?;
+                    let empty = ones(&mut lanes, empty)?;
+                    let empty = match uniform_any {
+                        None => empty,
+                        Some(so_far) => lanes.max(so_far, empty)?,
+                    };
+                    (lanes.add(entry, touched_at)?, first, empty)
                 };
-                kernel.store_at(table, touched.id(), stamp.id())?;
-                kernel.store_at(table, wanted.id(), stamp.id())?;
+                uniform_any = Some(empty);
+                store_if::<LANES>(&mut kernel, first, table, touched.id(), stamp.id())?;
             }
+            let needs = {
+                let mut lanes = kernel.lanes()?;
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                let any = uniform_any.map_or(Ok(none), Ok::<_, LaneError>)?;
+                lanes.mul(any, inside)?
+            };
+            crate::gate::if_any::<LANES, _>(&mut kernel, needs.id(), |kernel| {
+                let step = stepped(kernel)?;
+                for ((cell, &value), (&held, out)) in placed
+                    .cells
+                    .iter()
+                    .zip(&values)
+                    .zip(holding.iter().zip(&step.out))
+                {
+                    let (wanted, wants) = {
+                        let mut lanes = kernel.lanes()?;
+                        let none = lanes.splat_bits::<U32, LANES>(0)?;
+                        let four = lanes.splat_bits::<U32, LANES>(ENTRY as u32)?;
+                        let wanted_at = lanes.splat_bits::<U32, LANES>(WANTED as u32)?;
+                        let entry = lanes.mul(cell.brick, four)?;
+                        let value = lanes.splat_id::<U32, LANES>(value)?;
+                        let differs = lanes.not_equal(*out, value)?;
+                        let differs = ones(&mut lanes, differs)?;
+                        let uniform = lanes.equal(held, none)?;
+                        let uniform = ones(&mut lanes, uniform)?;
+                        let wants = lanes.mul(differs, uniform)?;
+                        let wants = lanes.mul(wants, inside)?;
+                        (lanes.add(entry, wanted_at)?, wants)
+                    };
+                    store_if::<LANES>(kernel, wants, table, wanted.id(), stamp.id())?;
+                }
+                Ok(())
+            })?;
         }
         Act::Settle => {
-            let pool_scratch = u32::try_from(bricks.scratch()).unwrap_or(u32::MAX);
+            let step = stepped(&mut kernel)?;
             let go = {
                 let mut lanes = kernel.lanes()?;
                 let none = lanes.splat_bits::<U32, LANES>(0)?;
@@ -1225,28 +1273,25 @@ fn settled<const LANES: u32, R: Rule>(
             for (((address, &held), &value), out) in
                 addresses.iter().zip(&holding).zip(&values).zip(&step.out)
             {
-                let (at, lost) = {
+                let (kept, lost) = {
                     let mut lanes = kernel.lanes()?;
                     let none = lanes.splat_bits::<U32, LANES>(0)?;
-                    let scratch = lanes.splat_bits::<U32, LANES>(pool_scratch)?;
                     let kept = lanes.mul(go, held)?;
-                    let kept = lanes.greater_than(kept, none)?;
-                    let at = lanes.select(kept, *address, scratch)?;
                     let value = lanes.splat_id::<U32, LANES>(value)?;
                     let differs = lanes.not_equal(*out, value)?;
                     let differs = ones(&mut lanes, differs)?;
                     let uniform = lanes.equal(held, none)?;
                     let uniform = ones(&mut lanes, uniform)?;
                     let lost = lanes.mul(differs, uniform)?;
-                    let lost = lanes.mul(lost, go)?;
-                    let lost = lanes.greater_than(lost, none)?;
-                    let flagged = lanes.splat_bits::<U32, LANES>(LOST as u32)?;
-                    let elsewhere = lanes.splat_bits::<U32, LANES>(SCRATCH as u32)?;
-                    (at, lanes.select(lost, flagged, elsewhere)?)
+                    (kept, lanes.mul(lost, go)?)
                 };
-                live::state_store(&mut kernel, windows, at.id(), out.id())?;
+                let storing = truth::<LANES>(&mut kernel, kept)?;
+                live::lane_if(&mut kernel, storing, |kernel| {
+                    live::state_store(kernel, windows, address.id(), out.id())
+                })?;
+                let flagged = kernel.module().constant_u32(LOST as u32)?;
                 let one = kernel.module().constant_u32(1)?;
-                kernel.store_at(bricks.slots(), lost.id(), one)?;
+                store_if::<LANES>(&mut kernel, lost, bricks.slots(), flagged, one)?;
             }
 
             if listing == Listing::Listed {
@@ -1264,7 +1309,7 @@ fn settled<const LANES: u32, R: Rule>(
                     (lanes.mul(touched, go)?, go)
                 };
                 let at = placed.block;
-                wake::<LANES>(&mut kernel, bricks, at, waking, slot)?;
+                wake::<LANES>(&mut kernel, bricks, at, waking)?;
                 live::tally3::<LANES>(
                     &mut kernel,
                     live::Tallied3 {
@@ -2026,14 +2071,14 @@ fn closing(bricks: &Bricks, plan: &Plan, coarse: bool) -> Result<Stages, LaneErr
     let tiles = Groups::Fixed(plan.tiles);
     let one = Groups::Fixed(1);
     let flags = Groups::Fixed(bricks.count().div_ceil(subgroup));
-    let mut stages: Stages = Vec::new();
+    let mut chain: Stages = Vec::new();
     if coarse {
-        stages.push(vec![(
+        chain.push(vec![(
             live::mark_below(subgroup, Tier::COARSE, Over::Every, plan.blocks)?,
             tiles,
         )]);
-        stages.extend(live::coarse_scans(subgroup, plan)?);
-        stages.push(vec![
+        chain.extend(live::coarse_scans(subgroup, plan)?);
+        chain.push(vec![
             (
                 crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
                 tiles,
@@ -2044,8 +2089,8 @@ fn closing(bricks: &Bricks, plan: &Plan, coarse: bool) -> Result<Stages, LaneErr
             ),
         ]);
     }
-    stages.push(vec![(mark(bricks, listed)?, hot)]);
-    stages.extend(live::fine_scans(subgroup, plan)?);
+    chain.push(vec![(mark(bricks, listed)?, hot)]);
+    chain.extend(live::fine_scans(subgroup, plan)?);
     let held = crate::compact::Held {
         table: bricks.table(),
         entry: ENTRY as u32,
@@ -2053,25 +2098,36 @@ fn closing(bricks: &Bricks, plan: &Plan, coarse: bool) -> Result<Stages, LaneErr
         dump: bricks.dump(),
         upper: (plan.levels() > 2).then(|| plan.upper()),
     };
-    let mut gathering = vec![
-        (
-            crate::compact::gather_held(subgroup, Tier::FINE, listed, held)?,
-            hot,
-        ),
-        (wholes(bricks)?, flags),
-    ];
-    gathering.extend(wipe_brick_totals(subgroup, plan, bricks.tier())?);
-    stages.push(gathering);
-    let whole = bricks.whole_tier();
-    stages.push(vec![(
-        live::mark_below(subgroup, whole, Over::Every, bricks.count())?,
-        tiles,
+    chain.push(vec![(
+        crate::compact::gather_held(subgroup, Tier::FINE, listed, held)?,
+        hot,
     )]);
-    stages.extend(brick_scans(subgroup, plan, whole)?);
-    stages.push(vec![(
+
+    let whole = bricks.whole_tier();
+    let mut first = vec![(wholes(bricks)?, flags)];
+    first.extend(wipe_brick_totals(subgroup, plan, bricks.tier())?);
+    let mut beside: Stages = vec![
+        first,
+        vec![(
+            live::mark_below(subgroup, whole, Over::Every, bricks.count())?,
+            tiles,
+        )],
+    ];
+    beside.extend(brick_scans(subgroup, plan, whole)?);
+    beside.push(vec![(
         crate::compact::gather(subgroup, whole, Over::Every, plan.padded())?,
         tiles,
     )]);
+
+    let deepest = chain.len().max(beside.len());
+    let mut chain = chain.into_iter();
+    let mut beside = beside.into_iter();
+    let mut stages: Stages = Vec::with_capacity(deepest + 1);
+    for _ in 0..deepest {
+        let mut stage = chain.next().unwrap_or_default();
+        stage.extend(beside.next().unwrap_or_default());
+        stages.push(stage);
+    }
     stages.push(vec![(listing(bricks)?, one)]);
     Ok(stages)
 }
