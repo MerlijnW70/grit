@@ -549,6 +549,7 @@ fn parted(label: &str, grid: Grid3, frame: u32, got: &[u32], want: &[u32]) -> Op
 
 struct Run {
     mode: Mode,
+    bricks: u32,
     lowest: u32,
     highest: u32,
     last: u32,
@@ -564,7 +565,7 @@ fn agree<R: Rule>(
     frames: u32,
 ) -> Vec<Run> {
     let pooled = |grid: Grid, plan: &Plan| Bricks::new(grid, plan, plan.blocks).unwrap();
-    agree_in(host, subject, shape, start, frames, &pooled)
+    agree_in(host, subject, shape, start, (0, frames), &pooled)
 }
 
 fn agree_in<R: Rule>(
@@ -572,7 +573,7 @@ fn agree_in<R: Rule>(
     subject: &Subject<R>,
     shape: (u32, u32, u32),
     start: &dyn Fn(Grid3, [u32; 3], u64) -> Vec<u32>,
-    frames: u32,
+    (from, frames): (u32, u32),
     pooled: &Pooling<'_>,
 ) -> Vec<Run> {
     let width = host.width();
@@ -595,16 +596,18 @@ fn agree_in<R: Rule>(
                 sparse.bricks.windows().count()
             );
             let first = start(reference3, side, seed);
-            let opened = sparse.restart(&first, &subject.params, 0);
-            dense.restart(&first, &subject.params, 0);
+            let opened = sparse.restart(&first, &subject.params, from);
+            dense.restart(&first, &subject.params, from);
             let mut want = first.clone();
             let mut run = Run {
                 mode,
+                bricks: sparse.bricks.count(),
                 lowest: opened.held,
                 highest: opened.held,
                 last: opened.held,
             };
-            for frame in 0..frames {
+            for step in 0..frames {
+                let frame = from.wrapping_add(step);
                 sparse.step();
                 let (listed, full) = dense.step();
                 want = reference(&subject.rule, reference3, frame, &want, &subject.params);
@@ -754,9 +757,10 @@ fn a_uniform_brick_that_changes_every_frame_is_held_until_it_is_quiet() {
             "{name} {:?}: the clocks start uniform",
             run.mode
         );
-        assert!(
-            run.highest > 0,
-            "{name} {:?}: no clock took a brick",
+        assert_eq!(
+            run.highest,
+            run.bricks / 2,
+            "{name} {:?}: only the ticking half takes bricks",
             run.mode
         );
         if run.mode != Mode::Whole {
@@ -786,9 +790,9 @@ fn a_pool_split_over_windows_steps_to_the_dense_words() {
             split
         };
         let start = |grid: Grid3, side: [u32; 3], seed: u64| scene(&natured(), grid, side, seed);
-        agree_in(&host, &natured(), shape, &start, FRAMES, &pooled);
+        agree_in(&host, &natured(), shape, &start, (0, FRAMES), &pooled);
         let start = |grid: Grid3, side: [u32; 3], seed: u64| rain(grid, side, seed);
-        agree_in(&host, &sand(), shape, &start, 64, &pooled);
+        agree_in(&host, &sand(), shape, &start, (0, 64), &pooled);
     }
 }
 
@@ -809,9 +813,60 @@ fn a_take_that_serves_many_bricks_a_group_steps_to_the_dense_words() {
             few
         };
         let start = |grid: Grid3, side: [u32; 3], seed: u64| rain(grid, side, seed);
-        agree_in(&host, &sand(), shape, &start, 64, &pooled);
+        agree_in(&host, &sand(), shape, &start, (0, 64), &pooled);
         let start = |grid: Grid3, side: [u32; 3], seed: u64| clocks(grid, side, seed);
-        agree_in(&host, &ticking(), shape, &start, TICKS + 8, &pooled);
+        agree_in(&host, &ticking(), shape, &start, (0, TICKS + 8), &pooled);
+    }
+}
+
+#[test]
+fn the_stamps_hold_where_the_frame_counter_wraps() {
+    let name = "bricks wrap";
+    let Some(host) = device(name) else {
+        return;
+    };
+    let shape = world_for(host.width());
+    let pooled = |grid: Grid, plan: &Plan| Bricks::new(grid, plan, plan.blocks).unwrap();
+    let start = |grid: Grid3, side: [u32; 3], seed: u64| rain(grid, side, seed);
+    agree_in(&host, &sand(), shape, &start, (u32::MAX - 20, 64), &pooled);
+    let start = |grid: Grid3, side: [u32; 3], seed: u64| clocks(grid, side, seed);
+    let runs = agree_in(
+        &host,
+        &ticking(),
+        shape,
+        &start,
+        (u32::MAX - 9, TICKS + 8),
+        &pooled,
+    );
+    for run in &runs {
+        assert_eq!(
+            run.highest,
+            run.bricks / 2,
+            "{name} {:?}: only the ticking half takes bricks",
+            run.mode
+        );
+        if run.mode != Mode::Whole {
+            assert_eq!(
+                run.last, 0,
+                "{name} {:?}: a stopped clock kept its brick",
+                run.mode
+            );
+        }
+    }
+}
+
+#[test]
+fn a_world_one_brick_across_wakes_its_own_brick_through_the_torus() {
+    let name = "bricks thin";
+    let Some(host) = device(name) else {
+        return;
+    };
+    let (wide, deep, tall) = world_for(host.width());
+    for shape in [(wide / 4, deep, tall), (wide, deep, tall / 2)] {
+        let start = |grid: Grid3, side: [u32; 3], seed: u64| scene(&sand(), grid, side, seed);
+        agree(&host, &sand(), shape, &start, FRAMES);
+        let start = |grid: Grid3, side: [u32; 3], seed: u64| rain(grid, side, seed);
+        agree(&host, &sand(), shape, &start, 64);
     }
 }
 

@@ -842,6 +842,7 @@ fn settled<const LANES: u32, R: Rule>(
                     let touched_at = lanes.splat_bits::<U32, LANES>(TOUCHED as u32)?;
                     let wanted_at = lanes.splat_bits::<U32, LANES>(WANTED as u32)?;
                     let stamp = lanes.add(now, one)?;
+                    let stamp = lanes.max(stamp, one)?;
                     let entry = lanes.mul(cell.brick, four)?;
                     let listed = lanes.greater_than(inside, none)?;
                     let touched = lanes.add(entry, touched_at)?;
@@ -993,9 +994,16 @@ fn quieted<const LANES: u32>(bricks: &Bricks, plan: &Plan) -> Result<Vec<u32>, L
         let none = lanes.splat_bits::<U32, LANES>(0)?;
         let held = lanes.not_equal(entry, uniform)?;
         let held = ones(&mut lanes, held)?;
-        let last = lanes.equal(touched, now)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let before = lanes.max(now, one)?;
+        let stamp = lanes.add(now, one)?;
+        let stamp = lanes.max(stamp, one)?;
+        let last = lanes.equal(touched, before)?;
         let last = ones(&mut lanes, last)?;
-        let candidate = lanes.mul(held, last)?;
+        let fresh = lanes.not_equal(touched, stamp)?;
+        let fresh = ones(&mut lanes, fresh)?;
+        let quiet = lanes.mul(last, fresh)?;
+        let candidate = lanes.mul(held, quiet)?;
         let candidate = lanes.mul(candidate, inside)?;
         let picked = lanes.greater_than(candidate, none)?;
         let start = lanes.shift_left(entry, by)?;
@@ -1080,6 +1088,7 @@ fn wanting<const LANES: u32>(bricks: &Bricks, plan: &Plan) -> Result<Vec<u32>, L
         let one = lanes.splat_bits::<U32, LANES>(1)?;
         let uniform = lanes.splat_bits::<U32, LANES>(UNIFORM)?;
         let stamp = lanes.add(now, one)?;
+        let stamp = lanes.max(stamp, one)?;
         let fresh = lanes.equal(wanted, stamp)?;
         let fresh = ones(&mut lanes, fresh)?;
         let empty = lanes.equal(entry, uniform)?;
