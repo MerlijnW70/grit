@@ -534,9 +534,22 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                 };
                 let at = format!("{rule}@{wide}x{deep}x{tall}/screen-{screen_wide}x{screen_high}");
                 all.add(format!("render3::occupied/{at}"), render3::occupied(&build));
-                all.add(format!("render3::filled/{at}"), render3::filled(&build));
-                all.add(format!("render3::primary/{at}"), render3::primary(&build));
-                all.add(format!("render3::shade/{at}"), render3::shade(&build));
+                for (name, built) in render3::stage::NAMES.iter().zip([
+                    render3::filled(&build),
+                    render3::lit_across(&build),
+                    render3::lit_down(&build),
+                    render3::lit_deep(&build),
+                    render3::sunlit(&build),
+                    render3::primary(&build),
+                    render3::shade(&build),
+                    render3::resolve(&build),
+                    render3::bloom_down(&build),
+                    render3::bloom_across(&build),
+                    render3::bloom_up(&build),
+                    render3::composite(&build),
+                ]) {
+                    all.add(format!("render3::{name}/{at}"), built);
+                }
             }
         }
     }
