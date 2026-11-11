@@ -10,6 +10,7 @@ use grit::live;
 use grit::ops::{Helpers, Ops};
 use grit::rule3::code::{self, Code};
 use grit::rule3::heat::{self, Heat};
+use grit::rule3::nature::{self, Nature};
 use grit::rule3::sand::Sand;
 use grit::rule3::{
     CORNERS, Declared, FIRST_PARAM, MOST_COUNTS, Oct, OneStep, Rule, Ruled, Tally, Word, noise,
@@ -282,6 +283,108 @@ fn coded() -> Subject<Code> {
         calm: code::word(code::NOP, 0, 0),
         room: code_room,
         poured: code_poured,
+    }
+}
+
+/// Every kind of the nature rule, the inert ones too, at temperatures from
+/// 0 to 1199 around the thresholds, with any state and kept bits: fires and
+/// smoke of any life, running water, and air with any count.
+fn nature_cell(state: &mut u64) -> u32 {
+    let roll = next(state);
+    let kind = match roll % 40 {
+        0..12 => nature::AIR,
+        12..14 => nature::ROCK,
+        14..16 => nature::EARTH,
+        16..18 => nature::SAND,
+        18..20 => nature::SNOW,
+        20..21 => nature::ICE,
+        21..25 => nature::WATER,
+        25..27 => nature::WOOD,
+        27..29 => nature::LEAVES,
+        29..31 => nature::FIRE,
+        31..33 => nature::ASH,
+        33..35 => nature::SMOKE,
+        35..37 => nature::STEAM,
+        _ => nature::KINDS + ((roll >> 40) % 3) as u32,
+    };
+    let temperature = ((roll >> 8) % 1200) as u32;
+    let bits = ((roll >> 24) & 0xFFF) as u32;
+    nature::cell(kind, temperature) | (bits << 4)
+}
+
+const VALLEY_HEAT: u32 = 260;
+
+fn mix(x: u32, z: u32, seed: u64) -> u64 {
+    let mut state = seed ^ (u64::from(x) << 32) ^ u64::from(z).wrapping_mul(0x9E37_79B9);
+    next(&mut state)
+}
+
+/// A small valley at rest at one temperature below every threshold: rock
+/// ridges along the seams and a bowl between them, earth on the slopes,
+/// snow on the ridges, sand on the low ground, a lake in the bowl and
+/// trees of wood and leaves. It settles and falls quiet.
+fn valley(grid: Grid3, seed: u64) -> Vec<u32> {
+    let mut cells = vec![nature::air(VALLEY_HEAT, 0); grid.cells()];
+    let reach = (grid.wide / 2).min(grid.tall / 2);
+    let lake = 4.min(grid.deep / 2);
+    for z in 0..grid.tall {
+        for x in 0..grid.wide {
+            let near = x.min(grid.wide - x).min(z.min(grid.tall - z));
+            let roll = mix(x, z, seed);
+            let high = (2 + (reach - near) * 2 / 3 + (roll % 2) as u32).min(grid.deep - 2);
+            let top = grid.deep - high;
+            for y in top..grid.deep {
+                cells[grid.index(x, y, z)] = nature::cell(nature::ROCK, VALLEY_HEAT);
+            }
+            let surface = if near <= 1 {
+                nature::SNOW
+            } else if high <= lake + 1 {
+                nature::SAND
+            } else {
+                nature::EARTH
+            };
+            cells[grid.index(x, top, z)] = nature::cell(surface, VALLEY_HEAT);
+            for y in grid.deep - lake..top {
+                cells[grid.index(x, y, z)] = nature::cell(nature::WATER, VALLEY_HEAT);
+            }
+            if surface == nature::EARTH && (roll >> 8).is_multiple_of(7) && top >= 4 {
+                cells[grid.index(x, top - 1, z)] = nature::cell(nature::WOOD, VALLEY_HEAT);
+                cells[grid.index(x, top - 2, z)] = nature::cell(nature::WOOD, VALLEY_HEAT);
+                cells[grid.index(x, top - 3, z)] = nature::cell(nature::LEAVES, VALLEY_HEAT);
+            }
+        }
+    }
+    cells
+}
+
+/// A burning tree high over the valley with leaves around it, water and
+/// snow a little way off, and a hot cell of air.
+fn nature_poured(grid: Grid3) -> Vec<(u32, u32)> {
+    let mut cells = Vec::new();
+    for (dx, dz, word) in [
+        (0, 0, nature::alive(nature::FIRE, 900, nature::WOOD_LIFE)),
+        (1, 0, nature::cell(nature::LEAVES, VALLEY_HEAT)),
+        (0, 1, nature::cell(nature::WOOD, VALLEY_HEAT)),
+        (1, 1, nature::cell(nature::LEAVES, VALLEY_HEAT)),
+        (4, 1, nature::cell(nature::WATER, VALLEY_HEAT)),
+        (4, 3, nature::cell(nature::SNOW, VALLEY_HEAT)),
+        (2, 3, nature::cell(nature::AIR, 9000)),
+    ] {
+        let at = grid.index(grid.wide / 2 + dx, 1, grid.tall / 2 + dz);
+        cells.push((u32::try_from(at).unwrap(), word));
+    }
+    cells
+}
+
+fn natured() -> Subject<Nature> {
+    Subject {
+        name: "nature",
+        rule: Nature,
+        params: Vec::new(),
+        cell: nature_cell,
+        calm: nature::cell(nature::AIR, 300),
+        room: valley,
+        poured: nature_poured,
     }
 }
 
@@ -1071,6 +1174,30 @@ fn a_quiet_oct_stays_quiet_at_every_later_frame_under_every_rule() {
         }
         words
     });
+    let natured = natured();
+    quiet_stays_quiet(&natured, &mut |state| {
+        let temperature = (next(state) % 1200) as u32;
+        let mut words: [u32; 8] = std::array::from_fn(|_| nature_cell(state));
+        for word in &mut words {
+            if nature::conducts(nature::kind_of(*word)) {
+                *word = (*word & 0xFFFF) | (temperature << 16);
+            }
+        }
+        if next(state).is_multiple_of(2) {
+            for word in &mut words {
+                if matches!(
+                    nature::kind_of(*word),
+                    nature::FIRE | nature::SMOKE | nature::WOOD | nature::LEAVES
+                ) {
+                    *word = nature::cell(nature::ROCK, 0) | (*word & 0xFFF0);
+                }
+            }
+        }
+        if next(state).is_multiple_of(2) {
+            words[4..].fill(nature::cell(nature::ROCK, temperature));
+        }
+        words
+    });
     let coded = coded();
     quiet_stays_quiet(&coded, &mut |state| {
         let mut words: [u32; 8] = std::array::from_fn(|_| code_cell(state));
@@ -1165,6 +1292,12 @@ fn the_kernels_read_the_rules_parameters_and_nothing_more() {
                         .unwrap()
                         .words,
                 ),
+                (
+                    0,
+                    sand3::settle_by(&Nature, width, grid, u32::MAX)
+                        .unwrap()
+                        .words,
+                ),
             ] {
                 assert_eq!(params_read(&words), 1 + rule_params);
             }
@@ -1184,11 +1317,18 @@ fn the_kernels_read_the_rules_parameters_and_nothing_more() {
                 params_read(&live::settle3_by(&Code, width, grid).unwrap()),
                 2
             );
+            assert_eq!(
+                params_read(&live::settle3_by(&Nature, width, grid).unwrap()),
+                2
+            );
         }
     }
     let plan = Plan::over_in(16, 2, Dimension::Three).unwrap();
     assert_eq!(live::sizes3(&Sand, &plan), plan.sizes());
     assert_eq!(live::sizes3(&Code, &plan), plan.sizes());
+    let mut longer = plan.sizes();
+    longer[TALLY as usize] = Nature.tally().words().max(longer[TALLY as usize]);
+    assert_eq!(live::sizes3(&Nature, &plan), longer);
     let mut grown = plan.sizes();
     grown[PARAMS as usize] = FIRST_PARAM + 3;
     assert_eq!(live::sizes3(&Heat, &plan), grown);
@@ -1555,4 +1695,112 @@ fn a_rule_whose_tally_does_not_fit_builds_no_kernel() {
         assert!(sand3::settle_by(&rule, 16, grid, u32::MAX).is_ok());
         assert!(live::arranged3_by(&rule, 16, grid, &plan, true).is_ok());
     }
+}
+
+#[test]
+fn nature_listed_and_whole_equal_the_reference_on_random_worlds() {
+    matrix(&natured(), "random", random, 1);
+}
+
+#[test]
+fn nature_listed_and_whole_equal_the_reference_across_the_x_seam() {
+    seam(&natured(), Seam::X, "x seam");
+}
+
+#[test]
+fn nature_listed_and_whole_equal_the_reference_across_the_y_seam() {
+    seam(&natured(), Seam::Y, "y seam");
+}
+
+#[test]
+fn nature_listed_and_whole_equal_the_reference_across_the_z_seam() {
+    seam(&natured(), Seam::Z, "z seam");
+}
+
+#[test]
+fn nature_with_two_frames_in_flight_equals_the_reference() {
+    matrix(&natured(), "in flight", random, 2);
+}
+
+#[test]
+fn nature_falls_quiet_and_a_host_write_wakes_it() {
+    quiet_then_woken(&natured(), 1);
+}
+
+#[test]
+fn nature_falls_quiet_and_wakes_with_two_frames_in_flight() {
+    quiet_then_woken(&natured(), 2);
+}
+
+#[test]
+fn nature_listed_and_whole_equal_the_reference_on_small_and_thin_worlds() {
+    let subject = natured();
+    let Some(host) = device("nature small") else {
+        return;
+    };
+    for shape in SMALL {
+        for coarse in TIERS {
+            let Some(mut engine) = Engine::new(&host, &subject, shape, coarse) else {
+                continue;
+            };
+            for seed in SEEDS {
+                let first = random(&subject, engine.reference, seed);
+                engine.restart(&first, label("nature small", shape, coarse, seed));
+                engine.run(FRAMES, 1);
+                let room = valley(engine.reference, seed);
+                engine.restart(&room, label("nature small valley", shape, coarse, seed));
+                engine.run(FRAMES, 1);
+            }
+        }
+    }
+}
+
+/// A generated valley at rest, at one temperature with no fire: the list
+/// drains to empty on both tiers, every word is the CPU's, and the valley
+/// keeps its temperature, its snow, water, trees and sand.
+#[test]
+fn a_nature_valley_at_one_temperature_without_fire_drains_the_list() {
+    let subject = natured();
+    let Some(host) = device("nature valley") else {
+        return;
+    };
+    for shape in [(16, 16, 16), (32, 16, 32)] {
+        for coarse in TIERS {
+            let Some(mut engine) = Engine::new(&host, &subject, shape, coarse) else {
+                continue;
+            };
+            for (index, seed) in SEEDS.into_iter().enumerate() {
+                let start = valley(engine.reference, seed);
+                let first = u32::try_from(index).unwrap() * 3;
+                engine.restart_at(&start, label("nature valley", shape, coarse, seed), first);
+                let quiet = fall_quiet(&mut engine);
+                assert!(
+                    engine
+                        .want
+                        .iter()
+                        .all(|&word| nature::temperature_of(word) == VALLEY_HEAT)
+                );
+                for kind in [nature::SNOW, nature::WATER, nature::WOOD, nature::SAND] {
+                    assert!(
+                        engine
+                            .want
+                            .iter()
+                            .any(|&word| nature::kind_of(word) == kind)
+                    );
+                }
+                assert_eq!(engine.live.read(GRAND as usize, 1).unwrap(), [0]);
+                println!("{} quiet at frame {quiet}", engine.label);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_tally_holds_the_counts_of_the_nature_rule() {
+    let Some(host) = device("nature tally") else {
+        return;
+    };
+    let wanted = tally_holds_the_cpu_counts(&natured(), &host, SEEDS[1]);
+    assert_eq!(wanted.len(), 8);
+    assert!(wanted.iter().all(|&word| word > 0), "{wanted:?}");
 }
