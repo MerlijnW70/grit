@@ -32,7 +32,7 @@ use super::shade::{
 };
 use super::{
     BLOOM_SCALE, BLOOM_WORDS, Build, HDR_WORDS, HISTORY_WORDS, Layout, Screen, UNIT, flags, of,
-    put, refuse, scene, word,
+    put, refuse_build, scene, word,
 };
 use crate::layout::PIXELS;
 
@@ -523,12 +523,12 @@ fn pixel_pass(
     (base, words): (usize, usize),
     body: impl FnOnce(&mut Emitted<'_, '_>, &Look, (Id, Id)) -> Result<Vec<Id>, LaneError>,
 ) -> Result<Vec<u32>, LaneError> {
-    refuse(operation, build.grid, build.screen)?;
+    refuse_build(operation, build)?;
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, screen)?;
     let none = em.u(0)?;
     let x = em.pick(shown, x, none)?;
@@ -563,12 +563,12 @@ fn history_seat(em: &mut Em<'_>, layout: &Layout, scene_at: usize) -> Result<Id,
 /// The pass that keeps each pixel's light over frames, into the history of
 /// this frame's parity.
 pub fn resolve(build: &Build) -> Result<Vec<u32>, LaneError> {
-    refuse("render3::resolve", build.grid, build.screen)?;
+    refuse_build("render3::resolve", build)?;
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let none = em.u(0)?;
     let x = em.pick(shown, x, none)?;

@@ -17,7 +17,7 @@ use super::march::{Marching, Ray, Reader, World, limit, sides};
 use super::{
     BOUNCE_WORDS, BOUNCED, BRICK_BITS, Build, FLOOR_RAYS, FOG_WORDS, GAS_WORDS, GASSY, HDR_WORDS,
     HIT_WORDS, Layout, MATERIAL_WORDS, MISS, Rays, SPARE_WORDS, Screen, UNIT, brick_sides, flags,
-    light, material, of, put, refuse, scene, word,
+    light, material, of, put, refuse_build, scene, word,
 };
 use crate::layout::{PARAMS, PIXELS};
 use crate::sand::Grid;
@@ -2739,11 +2739,7 @@ impl Shader for Emitted<'_, '_> {
 }
 
 pub(crate) fn kernel(build: &Build) -> Result<simdr::kernel::Kernel<simdr::lanes::U32>, LaneError> {
-    Kernel::new(Shape::new(
-        build.subgroup,
-        build.subgroup,
-        build.windows.bindings(),
-    ))
+    Kernel::new(Shape::new(build.subgroup, build.subgroup, build.bindings()))
 }
 
 pub(crate) fn look_of(build: &Build) -> Look {
@@ -2807,13 +2803,13 @@ pub(crate) fn seat(
 /// crosses before its first hit from [`Layout::fog`] on.
 #[allow(clippy::too_many_lines)]
 pub fn primary(build: &Build) -> Result<Vec<u32>, LaneError> {
-    refuse("render3::primary", build.grid, build.screen)?;
+    refuse_build("render3::primary", build)?;
     let layout = build.layout();
     let grid = build.grid;
     let look = look_of(build);
     let reader = reader_of(build);
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let base = word(layout.scene());
     let mut origin = [pixel; 3];
@@ -2942,12 +2938,12 @@ pub fn primary(build: &Build) -> Result<Vec<u32>, LaneError> {
 /// writes its light, its glow and how far its ray went, from
 /// [`Layout::hdr`] on.
 pub fn shade(build: &Build) -> Result<Vec<u32>, LaneError> {
-    refuse("render3::shade", build.grid, build.screen)?;
+    refuse_build("render3::shade", build)?;
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let none = em.u(0)?;
     let place = em.pick(shown, pixel, none)?;
@@ -2997,12 +2993,12 @@ pub fn shade(build: &Build) -> Result<Vec<u32>, LaneError> {
 /// top of a liquid, and writes what they meet from [`Layout::bounces`] on,
 /// as [`Shading::bounces`] finds it.
 pub fn bounce(build: &Build) -> Result<Vec<u32>, LaneError> {
-    refuse("render3::bounce", build.grid, build.screen)?;
+    refuse_build("render3::bounce", build)?;
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, build.screen)?;
     let none = em.u(0)?;
     let place = em.pick(shown, pixel, none)?;

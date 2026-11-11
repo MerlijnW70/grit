@@ -20,7 +20,7 @@ use super::shade::{
 };
 use super::{
     BRICK_BITS, Build, GAS_WORDS, GASSY, LIGHT_REACH, Layout, SUN_STEPS, brick_sides, light, of,
-    put, refuse, scene, word,
+    put, refuse_build, scene, word,
 };
 use crate::layout::{PARAMS, PIXELS};
 use crate::sand::Grid;
@@ -195,12 +195,12 @@ fn bricked(em: &mut Em<'_>, build: &Build) -> Result<(Id, Id, Id), LaneError> {
 }
 
 fn spread_pass(build: &Build, axis: usize, operation: &'static str) -> Result<Vec<u32>, LaneError> {
-    refuse(operation, build.grid, build.screen)?;
+    refuse_build(operation, build)?;
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let (brick, inside, count) = bricked(&mut em, build)?;
     let frame = em.load_u(PARAMS, 0)?;
     let one = em.u(1)?;
@@ -244,12 +244,12 @@ pub fn lit_deep(build: &Build) -> Result<Vec<u32>, LaneError> {
 /// The pass that finds how much sun reaches each brick that holds gas
 /// through the gas; only those bricks walk toward the sun.
 pub fn sunlit(build: &Build) -> Result<Vec<u32>, LaneError> {
-    refuse("render3::sunlit", build.grid, build.screen)?;
+    refuse_build("render3::sunlit", build)?;
     let layout = build.layout();
     let look = look_of(build);
     let reader = reader_of(build);
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let (brick, inside, count) = bricked(&mut em, build)?;
     let none = em.u(0)?;
     let place = em.pick(inside, brick, none)?;

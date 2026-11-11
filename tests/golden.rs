@@ -375,6 +375,7 @@ fn catalog(width: u32) -> Vec<(String, String)> {
             subgroup: w,
             suns: 2,
             windows,
+            sparse: None,
         };
         all.add(
             format!("render3::occupied/split{at}"),
@@ -636,6 +637,7 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                     subgroup: w,
                     suns: 2,
                     windows: grit::layout::Windows::of(grid.cells()),
+                    sparse: None,
                 };
                 let at = format!("{rule}@{wide}x{deep}x{tall}/screen-{screen_wide}x{screen_high}");
                 all.add(format!("render3::occupied/{at}"), render3::occupied(&build));

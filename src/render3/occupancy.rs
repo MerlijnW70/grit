@@ -8,8 +8,8 @@ use simdr::module::Id;
 
 use super::emit::Em;
 use super::{
-    BRICK_BITS, Build, GAS_WORDS, GASSY, MATERIAL_WORDS, Table, WATER_WORDS, material, of, put,
-    refuse, scene, word,
+    BRICK_BITS, Build, GAS_WORDS, GASSY, MATERIAL_WORDS, Sparse, Table, WATER_WORDS, material, of,
+    put, refuse_build, scene, word,
 };
 use crate::layout::{DENSE, GRAND, PARAMS, PIXELS};
 use crate::sand::Grid;
@@ -48,11 +48,7 @@ pub fn occupancy(grid: Grid, kinds: Kinds, shown: u32, gases: u32, cells: &[u32]
 }
 
 fn kernel(build: &Build) -> Result<Kernel<U32>, LaneError> {
-    Kernel::<U32>::new(Shape::new(
-        build.subgroup,
-        build.subgroup,
-        build.windows.bindings(),
-    ))
+    Kernel::<U32>::new(Shape::new(build.subgroup, build.subgroup, build.bindings()))
 }
 
 /// The kinds a rebuild reads from the scene: those a brick counts as full
@@ -111,107 +107,137 @@ fn rebuilt(
     let initial = [
         one, none, none, nothing, nothing, nothing, nothing, nothing, nothing, nothing, none, none,
     ];
-    let out = em.looped(CELLS, &initial, |em, words, run| {
-        let get = |at: usize| words.get(at).copied().unwrap_or(none);
-        let x = em.and_u(run, SIDE - 1)?;
-        let y = em.shr(run, BRICK_BITS)?;
-        let y = em.and_u(y, SIDE - 1)?;
-        let y = em.shl(y, wide)?;
-        let z_in = em.shr(run, 2 * BRICK_BITS)?;
-        let z = em.shl(z_in, wide + deep)?;
-        let cell = em.add(first, x)?;
-        let cell = em.add(cell, y)?;
-        let cell = em.add(cell, z)?;
-        let column = em.add(corner[0], x)?;
-        let height = em.shr(run, BRICK_BITS)?;
-        let height = em.and_u(height, SIDE - 1)?;
-        let height = em.add(corner[1], height)?;
-        let row = em.add(corner[2], z_in)?;
-        let held = em.cell(cell)?;
-        let kind = em.shr(held, kinds.shift())?;
+    let mut plain = None;
+    if let Some(point) = em.world_point(corner)?
+        && let Some(entry) = em.entry(point)?
+    {
+        let kind = em.shr(entry.value, kinds.shift())?;
         let kind = em.and_u(kind, kinds.mask())?;
+        let busy = em.or(masks.glowing, masks.gases)?;
+        let busy = em.or(busy, masks.liquid)?;
+        let busy = em.bit(busy, kind)?;
+        let calm = em.not(busy)?;
+        let uniform = em.not(entry.held)?;
         let shown = em.bit(masks.shown, kind)?;
         let shown = em.flag(shown)?;
-        let seen = em.or(get(1), shown)?;
-        let gas = em.bit(masks.gases, kind)?;
-        let gas = em.flag(gas)?;
-        let gas = em.add(get(2), gas)?;
-        let glows = em.bit(masks.glowing, kind)?;
-        let light = [get(3), get(4), get(5)];
-        let light = em.when(glows, &light, |em| {
-            let at = em.mul(kind, size)?;
-            let at = em.add(table, at)?;
-            let glow_at = em.u(word(material::GLOW))?;
-            let glow_at = em.add(at, glow_at)?;
-            let glow = em.load(PIXELS, glow_at)?;
-            let glow = em.bits_float(glow)?;
-            let mut out = Vec::with_capacity(3);
-            for (channel, &before) in light.iter().enumerate() {
-                let here = em.u(word(material::ALBEDO + channel))?;
-                let here = em.add(at, here)?;
-                let albedo = em.load(PIXELS, here)?;
-                let albedo = em.bits_float(albedo)?;
-                let given = em.fmul(albedo, glow)?;
-                let before = em.bits_float(before)?;
-                let sum = em.fadd(before, given)?;
+        plain = Some((em.both(uniform, calm)?, shown));
+    }
+    let walk = |em: &mut Em<'_>| -> Result<Vec<Id>, LaneError> {
+        em.looped(CELLS, &initial, |em, words, run| {
+            let get = |at: usize| words.get(at).copied().unwrap_or(none);
+            let x = em.and_u(run, SIDE - 1)?;
+            let y = em.shr(run, BRICK_BITS)?;
+            let y = em.and_u(y, SIDE - 1)?;
+            let y = em.shl(y, wide)?;
+            let z_in = em.shr(run, 2 * BRICK_BITS)?;
+            let z = em.shl(z_in, wide + deep)?;
+            let cell = em.add(first, x)?;
+            let cell = em.add(cell, y)?;
+            let cell = em.add(cell, z)?;
+            let column = em.add(corner[0], x)?;
+            let height = em.shr(run, BRICK_BITS)?;
+            let height = em.and_u(height, SIDE - 1)?;
+            let height = em.add(corner[1], height)?;
+            let row = em.add(corner[2], z_in)?;
+            let held = em.cell(cell)?;
+            let kind = em.shr(held, kinds.shift())?;
+            let kind = em.and_u(kind, kinds.mask())?;
+            let shown = em.bit(masks.shown, kind)?;
+            let shown = em.flag(shown)?;
+            let seen = em.or(get(1), shown)?;
+            let gas = em.bit(masks.gases, kind)?;
+            let gas = em.flag(gas)?;
+            let gas = em.add(get(2), gas)?;
+            let glows = em.bit(masks.glowing, kind)?;
+            let light = [get(3), get(4), get(5)];
+            let light = em.when(glows, &light, |em| {
+                let at = em.mul(kind, size)?;
+                let at = em.add(table, at)?;
+                let glow_at = em.u(word(material::GLOW))?;
+                let glow_at = em.add(at, glow_at)?;
+                let glow = em.load(PIXELS, glow_at)?;
+                let glow = em.bits_float(glow)?;
+                let mut out = Vec::with_capacity(3);
+                for (channel, &before) in light.iter().enumerate() {
+                    let here = em.u(word(material::ALBEDO + channel))?;
+                    let here = em.add(at, here)?;
+                    let albedo = em.load(PIXELS, here)?;
+                    let albedo = em.bits_float(albedo)?;
+                    let given = em.fmul(albedo, glow)?;
+                    let before = em.bits_float(before)?;
+                    let sum = em.fadd(before, given)?;
+                    out.push(em.float_bits(sum)?);
+                }
+                Ok(out)
+            })?;
+            let gassy = em.bit(masks.gases, kind)?;
+            let thick = [get(6), get(7), get(8), get(9)];
+            let thick = em.when(gassy, &thick, |em| {
+                let at = em.mul(kind, size)?;
+                let at = em.add(table, at)?;
+                let clear_at = em.u(word(material::CLEAR))?;
+                let clear_at = em.add(at, clear_at)?;
+                let clear = em.load(PIXELS, clear_at)?;
+                let clear = em.bits_float(clear)?;
+                let clear = em.clamp01(clear)?;
+                let whole = em.f(1.0)?;
+                let taken = em.fsub(whole, clear)?;
+                let mut out = Vec::with_capacity(4);
+                let before = em.bits_float(thick[0])?;
+                let sum = em.fadd(before, taken)?;
                 out.push(em.float_bits(sum)?);
-            }
-            Ok(out)
-        })?;
-        let gassy = em.bit(masks.gases, kind)?;
-        let thick = [get(6), get(7), get(8), get(9)];
-        let thick = em.when(gassy, &thick, |em| {
-            let at = em.mul(kind, size)?;
-            let at = em.add(table, at)?;
-            let clear_at = em.u(word(material::CLEAR))?;
-            let clear_at = em.add(at, clear_at)?;
-            let clear = em.load(PIXELS, clear_at)?;
-            let clear = em.bits_float(clear)?;
-            let clear = em.clamp01(clear)?;
-            let whole = em.f(1.0)?;
-            let taken = em.fsub(whole, clear)?;
-            let mut out = Vec::with_capacity(4);
-            let before = em.bits_float(thick[0])?;
-            let sum = em.fadd(before, taken)?;
-            out.push(em.float_bits(sum)?);
-            for (channel, &before) in thick.iter().skip(1).enumerate() {
-                let here = em.u(word(material::ALBEDO + channel))?;
-                let here = em.add(at, here)?;
-                let albedo = em.load(PIXELS, here)?;
-                let albedo = em.bits_float(albedo)?;
-                let given = em.fmul(albedo, taken)?;
-                let before = em.bits_float(before)?;
-                let sum = em.fadd(before, given)?;
-                out.push(em.float_bits(sum)?);
-            }
-            Ok(out)
-        })?;
-        let liquid = em.bit(masks.liquid, kind)?;
-        let wet = em.flag(liquid)?;
-        let wet = em.add(get(10), wet)?;
-        let open = em.when(liquid, &[none], |em| {
-            let found = open_beside(em, build, masks, cell, [column, height, row])?;
-            let at = em.mul(kind, size)?;
-            let at = em.add(table, at)?;
-            let falls_at = em.u(word(material::FALLS))?;
-            let falls_at = em.add(at, falls_at)?;
-            let falls = em.load(PIXELS, falls_at)?;
-            let marked = em.ne(falls, none)?;
-            let bit_at = em.sub(falls, one)?;
-            let bit_at = em.pick(marked, bit_at, none)?;
-            let flagged = em.bit(held, bit_at)?;
-            let open = em.pick_t(marked, flagged, found)?;
-            Ok(vec![em.flag(open)?])
-        })?;
-        let open = open.first().copied().unwrap_or(none);
-        let spray = em.add(get(11), open)?;
-        let mut next = vec![one, seen, gas];
-        next.extend(light);
-        next.extend(thick);
-        next.push(wet);
-        next.push(spray);
-        Ok(next)
-    })?;
+                for (channel, &before) in thick.iter().skip(1).enumerate() {
+                    let here = em.u(word(material::ALBEDO + channel))?;
+                    let here = em.add(at, here)?;
+                    let albedo = em.load(PIXELS, here)?;
+                    let albedo = em.bits_float(albedo)?;
+                    let given = em.fmul(albedo, taken)?;
+                    let before = em.bits_float(before)?;
+                    let sum = em.fadd(before, given)?;
+                    out.push(em.float_bits(sum)?);
+                }
+                Ok(out)
+            })?;
+            let liquid = em.bit(masks.liquid, kind)?;
+            let wet = em.flag(liquid)?;
+            let wet = em.add(get(10), wet)?;
+            let open = em.when(liquid, &[none], |em| {
+                let found = open_beside(em, build, masks, cell, [column, height, row])?;
+                let at = em.mul(kind, size)?;
+                let at = em.add(table, at)?;
+                let falls_at = em.u(word(material::FALLS))?;
+                let falls_at = em.add(at, falls_at)?;
+                let falls = em.load(PIXELS, falls_at)?;
+                let marked = em.ne(falls, none)?;
+                let bit_at = em.sub(falls, one)?;
+                let bit_at = em.pick(marked, bit_at, none)?;
+                let flagged = em.bit(held, bit_at)?;
+                let open = em.pick_t(marked, flagged, found)?;
+                Ok(vec![em.flag(open)?])
+            })?;
+            let open = open.first().copied().unwrap_or(none);
+            let spray = em.add(get(11), open)?;
+            let mut next = vec![one, seen, gas];
+            next.extend(light);
+            next.extend(thick);
+            next.push(wet);
+            next.push(spray);
+            Ok(next)
+        })
+    };
+    let out = match plain {
+        Some((plain, shown)) => em.branch(
+            plain,
+            |_| {
+                Ok(vec![
+                    one, shown, none, nothing, nothing, nothing, nothing, nothing, nothing,
+                    nothing, none, none,
+                ])
+            },
+            walk,
+        )?,
+        None => walk(em)?,
+    };
     let get = |at: usize| out.get(at).copied().unwrap_or(none);
     let occupancy = em.u(word(layout.occupancy()))?;
     let into = em.add(occupancy, brick)?;
@@ -339,11 +365,11 @@ fn open_beside(
 /// The pass that rebuilds every brick's word, one brick a lane; dispatch
 /// it over [`super::bricks`] lanes.
 pub fn filled(build: &Build) -> Result<Vec<u32>, LaneError> {
-    refuse("render3::filled", build.grid, build.screen)?;
+    refuse_build("render3::filled", build)?;
     let layout = build.layout();
     let grid = build.grid;
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let brick = em.invocation(build.subgroup)?;
     let count = em.u(layout.bricks)?;
     let inside = em.lt(brick, count)?;
@@ -366,11 +392,14 @@ pub fn filled(build: &Build) -> Result<Vec<u32>, LaneError> {
 /// the listed octs, as the engine's step does, after that step. A brick's
 /// claim word holds the frame that last claimed it, plus one.
 pub fn occupied(build: &Build) -> Result<Vec<u32>, LaneError> {
-    refuse("render3::occupied", build.grid, build.screen)?;
+    refuse_build("render3::occupied", build)?;
+    if let Some(sparse) = build.sparse {
+        return occupied_sparse(build, sparse);
+    }
     let layout = build.layout();
     let grid = build.grid;
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let slot = em.invocation(build.subgroup)?;
     let grand = em.load_u(GRAND, 0)?;
     let dump = em.load_u(PARAMS, 1)?;
@@ -421,6 +450,138 @@ pub fn occupied(build: &Build) -> Result<Vec<u32>, LaneError> {
             let mine = em.ne(before, stamp)?;
             let _ = em.when(mine, &[], |em| {
                 rebuilt(em, build, at, masks, brick)?;
+                Ok(Vec::new())
+            })?;
+        }
+        Ok(Vec::new())
+    })?;
+    kernel.finish()
+}
+
+fn occupied_sparse(build: &Build, sparse: Sparse) -> Result<Vec<u32>, LaneError> {
+    let layout = build.layout();
+    let grid = build.grid;
+    let subgroup = build.subgroup;
+    let mut kernel = kernel(build)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
+    let slot = em.invocation(subgroup)?;
+    let k = sparse.octs_bits();
+    let grand = em.load_u(GRAND, 0)?;
+    let whole = em.load_u(sparse.whole_count, 0)?;
+    let short = em.u(subgroup - 1)?;
+    let rounded = em.add(grand, short)?;
+    let rounded = em.and_u(rounded, !(subgroup - 1))?;
+    let in_list = em.lt(slot, rounded)?;
+    let in_dense = em.lt(slot, grand)?;
+    let past = em.sub(slot, rounded)?;
+    let which = em.shr(past, k)?;
+    let local = em.and_u(past, (1 << k) - 1)?;
+    let in_whole = em.lt(which, whole)?;
+    let listed = em.pick_t(in_list, in_dense, in_whole)?;
+    let masks = Masks::of(&mut em, build)?;
+    let origin = em.origin().ok_or(LaneError::NoSuchForm {
+        operation: "render3::occupied",
+        because: super::UNFIT_SPARSE,
+    })?;
+    let _ = em.when(listed, &[], |em| {
+        let none = em.u(0)?;
+        let dense_at = em.pick(in_list, slot, none)?;
+        let whole_at = em.pick(in_list, none, which)?;
+        let from_list = em.load(DENSE, dense_at)?;
+        let brick = em.load(sparse.whole_list, whole_at)?;
+        let lifted = em.shl(brick, k)?;
+        let from_brick = em.add(lifted, local)?;
+        let oct = em.pick(in_list, from_list, from_brick)?;
+        let brick = em.shr(oct, k)?;
+        let inner = em.and_u(oct, (1 << k) - 1)?;
+        let lattice = sparse.lattice.map(u32::trailing_zeros);
+        let mut point = [oct; 3];
+        let (mut inner_shift, mut outer_shift) = (0, 0);
+        for axis in 0..3 {
+            let bits = of(sparse.bits, axis);
+            let across = of(lattice, axis);
+            let low = em.shr(inner, inner_shift)?;
+            let low = em.and_u(low, (1 << bits) - 1)?;
+            let high = em.shr(brick, outer_shift)?;
+            let high = em.and_u(high, (1 << across) - 1)?;
+            let high = em.shl(high, bits)?;
+            put(&mut point, axis, em.or(high, low)?);
+            inner_shift += bits;
+            outer_shift += across;
+        }
+        let frame = em.load_u(PARAMS, 0)?;
+        let phase = em.and_u(frame, 1)?;
+        let one = em.u(1)?;
+        let stamp = em.add(frame, one)?;
+        let sides = sparse.sides();
+        let window = [grid.wide, grid.deep, grid.tall];
+        let halves = window.map(|side| (side / 2).trailing_zeros());
+        let mut seen = em.eq(none, none)?;
+        let mut number = none;
+        let mut shift = 0;
+        for axis in 0..3 {
+            let half = em.shr(of(origin, axis), 1)?;
+            let at = em.sub(of(point, axis), half)?;
+            let at = em.and_u(at, of(sides, axis) / 2 - 1)?;
+            let limit = em.u(of(window, axis) / 2)?;
+            let inside = em.lt(at, limit)?;
+            seen = em.both(seen, inside)?;
+            let lifted = em.shl(at, shift)?;
+            number = em.or(number, lifted)?;
+            shift += of(halves, axis);
+        }
+        let _ = em.when(seen, &[], |em| {
+            let active = em.u(word(layout.active()))?;
+            let mark = em.add(active, number)?;
+            em.store(PIXELS, mark, stamp)?;
+            Ok(Vec::new())
+        })?;
+        let mut spans = [[oct; 2]; 3];
+        let mut within = [[seen; 2]; 3];
+        for axis in 0..3 {
+            let side = of(sides, axis);
+            let low = em.shl(of(point, axis), 1)?;
+            let low = em.add(low, phase)?;
+            let low = em.and_u(low, side - 1)?;
+            let high = em.add(low, one)?;
+            let high = em.and_u(high, side - 1)?;
+            let limit = em.u(of(window, axis))?;
+            let mut held = [low; 2];
+            let mut inside = [seen; 2];
+            for (at, (slot, flag)) in [low, high]
+                .into_iter()
+                .zip(held.iter_mut().zip(inside.iter_mut()))
+            {
+                let moved = em.sub(at, of(origin, axis))?;
+                let moved = em.and_u(moved, side - 1)?;
+                *flag = em.lt(moved, limit)?;
+                *slot = em.shr(moved, BRICK_BITS)?;
+            }
+            put(&mut spans, axis, held);
+            put(&mut within, axis, inside);
+        }
+        let across = (grid.wide >> BRICK_BITS).trailing_zeros();
+        let down = (grid.deep >> BRICK_BITS).trailing_zeros();
+        let claims = em.u(word(layout.claims()))?;
+        for corner in 0..8_usize {
+            let pick = |axis: usize| usize::from((corner >> axis) & 1 == 1);
+            let at = [0, 1, 2].map(|axis| of(spans, axis).get(pick(axis)).copied().unwrap_or(oct));
+            let flags =
+                [0, 1, 2].map(|axis| of(within, axis).get(pick(axis)).copied().unwrap_or(none));
+            let inside = em.both(flags[0], flags[1])?;
+            let inside = em.both(inside, flags[2])?;
+            let _ = em.when(inside, &[], |em| {
+                let z = em.shl(at[2], across + down)?;
+                let y = em.shl(at[1], across)?;
+                let brick = em.or(z, y)?;
+                let brick = em.or(brick, at[0])?;
+                let claim = em.add(claims, brick)?;
+                let before = em.kernel.atomic_exchange_at(PIXELS, claim, stamp)?;
+                let mine = em.ne(before, stamp)?;
+                let _ = em.when(mine, &[], |em| {
+                    rebuilt(em, build, at, masks, brick)?;
+                    Ok(Vec::new())
+                })?;
                 Ok(Vec::new())
             })?;
         }

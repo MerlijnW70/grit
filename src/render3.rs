@@ -231,6 +231,17 @@ pub fn fits(grid: Grid, screen: Screen) -> bool {
         && (1..=LARGEST_SCREEN).contains(&screen.high)
 }
 
+pub(crate) fn refuse_build(operation: &'static str, build: &Build) -> Result<(), LaneError> {
+    refuse(operation, build.grid, build.screen)?;
+    match build.sparse {
+        Some(sparse) if !sparse.fits(build.grid) => Err(LaneError::NoSuchForm {
+            operation,
+            because: UNFIT_SPARSE,
+        }),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn refuse(operation: &'static str, grid: Grid, screen: Screen) -> Result<(), LaneError> {
     if fits(grid, screen) {
         Ok(())
@@ -1326,6 +1337,95 @@ pub struct Build {
     /// How `STATE` lies over bindings: [`Windows::of`] the grid's cells,
     /// or the windows of the plan the engine runs.
     pub windows: Windows,
+    pub sparse: Option<Sparse>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sparse {
+    pub world: Grid,
+    pub bits: [u32; 3],
+    pub lattice: [u32; 3],
+    pub table: u32,
+    pub reach: u32,
+    pub whole_list: u32,
+    pub whole_count: u32,
+    pub origin: u32,
+}
+
+pub const UNFIT_SPARSE: &str =
+    "the world is not a power of two a side, or the window is larger than it or not even";
+
+impl Sparse {
+    #[must_use]
+    pub fn of(bricks: &crate::bricks::Bricks) -> Self {
+        Self {
+            world: bricks.grid(),
+            bits: bricks.bits(),
+            lattice: bricks.lattice(),
+            table: bricks.table(),
+            reach: bricks.bindings(),
+            whole_list: bricks.whole_list(),
+            whole_count: bricks.whole_count(),
+            origin: word(bricks.table_words()),
+        }
+    }
+
+    #[must_use]
+    pub const fn sides(&self) -> [u32; 3] {
+        [self.world.wide, self.world.deep, self.world.tall]
+    }
+
+    #[must_use]
+    pub const fn octs_bits(&self) -> u32 {
+        self.bits[0] + self.bits[1] + self.bits[2]
+    }
+
+    #[must_use]
+    pub const fn cell_bits(&self) -> u32 {
+        self.octs_bits() + 3
+    }
+
+    #[must_use]
+    pub const fn table_words(&self) -> usize {
+        self.origin as usize + 3
+    }
+
+    #[must_use]
+    pub fn sized(&self, mut sizes: Vec<usize>) -> Vec<usize> {
+        if let Some(held) = sizes.get_mut(self.table as usize) {
+            *held = (*held).max(self.table_words());
+        }
+        sizes
+    }
+
+    #[must_use]
+    pub fn fits(&self, grid: Grid) -> bool {
+        let window = march::sides(grid);
+        self.sides()
+            .iter()
+            .zip(window)
+            .all(|(&side, inside)| side.is_power_of_two() && inside <= side)
+    }
+
+    #[must_use]
+    pub fn corner(&self, grid: Grid, middle: [f32; 3]) -> [u32; 3] {
+        let window = march::sides(grid);
+        let mut out = [0; 3];
+        for axis in 0..3 {
+            let side = of(self.sides(), axis);
+            let inside = of(window, axis);
+            let wanted = of(middle, axis) - inside as f32 * 0.5;
+            let wanted = if inside >= side {
+                0
+            } else {
+                let step = i64::from(2_u32 << of(self.bits, axis));
+                let held = (wanted / step as f32).round() as i64 * step;
+                held.rem_euclid(i64::from(side)) as u32
+            };
+            put(&mut out, axis, wanted);
+        }
+        out
+    }
 }
 
 /// Which of the optional stages a frame runs: the full rebuild of every
@@ -1393,6 +1493,14 @@ impl Build {
         Layout::new(self.grid, self.screen, self.subgroup)
     }
 
+    #[must_use]
+    pub const fn bindings(&self) -> u32 {
+        match self.sparse {
+            Some(sparse) => sparse.reach,
+            None => self.windows.bindings(),
+        }
+    }
+
     /// Every pass: [`occupied`], then one a stage in [`stage`] order.
     pub fn passes(&self) -> Result<Vec<Vec<u32>>, LaneError> {
         Ok(vec![
@@ -1458,6 +1566,23 @@ pub fn watching(engine: crate::live::Loop, passes: Vec<Vec<u32>>) -> Option<crat
     let (mut modules, mut groups) = engine;
     let listed = crate::compact::Plan::listed();
     let stepped = groups.iter().position(|stage| stage == &vec![listed])?;
+    let before: usize = groups.iter().take(stepped + 1).map(Vec::len).sum();
+    let mut rest = passes.into_iter();
+    let watcher = rest.next()?;
+    modules.insert(before, watcher);
+    groups.insert(stepped + 1, vec![listed]);
+    modules.extend(rest);
+    Some((modules, groups))
+}
+
+#[must_use]
+pub fn watching_settled(
+    engine: crate::live::Loop,
+    passes: Vec<Vec<u32>>,
+) -> Option<crate::live::Loop> {
+    let (mut modules, mut groups) = engine;
+    let listed = crate::compact::Plan::listed();
+    let stepped = groups.iter().rposition(|stage| stage.contains(&listed))?;
     let before: usize = groups.iter().take(stepped + 1).map(Vec::len).sum();
     let mut rest = passes.into_iter();
     let watcher = rest.next()?;

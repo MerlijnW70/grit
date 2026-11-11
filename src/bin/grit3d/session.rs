@@ -176,6 +176,7 @@ impl<'h> Session<'h> {
             subgroup: width,
             suns: setup.suns,
             windows,
+            sparse: None,
         };
         let engine = live::wired3_by(rule, width, grid, &plan)?;
         let listed = Plan::listed();

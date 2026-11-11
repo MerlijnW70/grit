@@ -90,6 +90,7 @@ fn ran(host: &Host, width: u32, plan: Plan, coarse: bool, start: &[u32]) -> Vec<
         subgroup: width,
         suns: 1,
         windows,
+        sparse: None,
     };
     let layout = build.layout();
     let engine = live::arranged3(width, grid, &plan, coarse).unwrap();

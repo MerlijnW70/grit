@@ -6,7 +6,10 @@ use simdr::lanes::{LaneError, U32};
 use simdr::module::{Id, op};
 use simdr::spec::{Glsl, LoopControl, SelectionControl};
 
+use crate::bricks::UNIFORM;
 use crate::layout::Windows;
+
+use super::{Build, Sparse};
 
 const LOGICAL_NOT: u16 = 168;
 
@@ -26,6 +29,22 @@ pub struct Em<'held> {
     pub truth: Id,
     glsl: Id,
     state: Windows,
+    seen: Option<Seen>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    sparse: Sparse,
+    window: [u32; 3],
+    origin: [Id; 3],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Entry {
+    pub held: Id,
+    pub entry: Id,
+    pub value: Id,
+    pub offset: Id,
 }
 
 impl<'held> Em<'held> {
@@ -41,7 +60,112 @@ impl<'held> Em<'held> {
             truth,
             glsl,
             state: Windows::of(0),
+            seen: None,
         })
+    }
+
+    pub fn read_by(kernel: &'held mut Kernel<U32>, build: &Build) -> Result<Self, LaneError> {
+        let mut em = Self::reading(kernel, build.windows)?;
+        if let Some(sparse) = build.sparse {
+            let mut origin = [em.u(0)?; 3];
+            for (axis, slot) in origin.iter_mut().enumerate() {
+                *slot = em.load_u(sparse.table, sparse.origin + axis as u32)?;
+            }
+            let grid = build.grid;
+            em.seen = Some(Seen {
+                sparse,
+                window: [grid.wide, grid.deep, grid.tall].map(u32::trailing_zeros),
+                origin,
+            });
+        }
+        Ok(em)
+    }
+
+    #[must_use]
+    pub const fn sparse(&self) -> Option<Sparse> {
+        match self.seen {
+            Some(seen) => Some(seen.sparse),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> Option<[Id; 3]> {
+        self.seen.map(|seen| seen.origin)
+    }
+
+    fn point(&mut self, seen: Seen, at: Id) -> Result<[Id; 3], LaneError> {
+        let [wide, deep, _] = seen.window;
+        let x = self.and_u(at, (1 << wide) - 1)?;
+        let y = self.shr(at, wide)?;
+        let y = self.and_u(y, (1 << deep) - 1)?;
+        let z = self.shr(at, wide + deep)?;
+        self.placed(seen, [x, y, z])
+    }
+
+    fn placed(&mut self, seen: Seen, local: [Id; 3]) -> Result<[Id; 3], LaneError> {
+        let sides = seen.sparse.sides();
+        let mut out = local;
+        for ((slot, origin), side) in out.iter_mut().zip(seen.origin).zip(sides) {
+            let moved = self.add(*slot, origin)?;
+            *slot = self.and_u(moved, side - 1)?;
+        }
+        Ok(out)
+    }
+
+    pub fn world_point(&mut self, local: [Id; 3]) -> Result<Option<[Id; 3]>, LaneError> {
+        match self.seen {
+            Some(seen) => Ok(Some(self.placed(seen, local)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn entry(&mut self, point: [Id; 3]) -> Result<Option<Entry>, LaneError> {
+        let Some(seen) = self.seen else {
+            return Ok(None);
+        };
+        let sparse = seen.sparse;
+        let lattice = sparse.lattice.map(u32::trailing_zeros);
+        let mut brick = self.u(0)?;
+        let mut offset = self.u(0)?;
+        let mut brick_shift = 0;
+        let mut cell_shift = 0;
+        for ((at, bits), across) in point.into_iter().zip(sparse.bits).zip(lattice) {
+            let high = self.shr(at, bits + 1)?;
+            let high = self.shl(high, brick_shift)?;
+            brick = self.or(brick, high)?;
+            let low = self.and_u(at, (2 << bits) - 1)?;
+            let low = self.shl(low, cell_shift)?;
+            offset = self.or(offset, low)?;
+            brick_shift += across;
+            cell_shift += bits + 1;
+        }
+        let at = self.shl(brick, 2)?;
+        let entry = self.load(sparse.table, at)?;
+        let one = self.u(1)?;
+        let at = self.add(at, one)?;
+        let value = self.load(sparse.table, at)?;
+        let held = self.ne_u(entry, UNIFORM)?;
+        Ok(Some(Entry {
+            held,
+            entry,
+            value,
+            offset,
+        }))
+    }
+
+    pub fn held_cell(&mut self, entry: Entry) -> Result<Id, LaneError> {
+        let Some(seen) = self.seen else {
+            return Ok(entry.value);
+        };
+        let bits = seen.sparse.cell_bits();
+        let state = self.state;
+        let out = self.when(entry.held, &[entry.value], |em| {
+            let slot = em.shl(entry.entry, bits)?;
+            let at = em.or(slot, entry.offset)?;
+            Ok(vec![crate::live::state_load(em.kernel, state, at)?])
+        })?;
+        Ok(out.first().copied().unwrap_or(entry.value))
     }
 
     /// [`Em::new`] for a kernel that reads `STATE` laid out as `state`.
@@ -53,7 +177,14 @@ impl<'held> Em<'held> {
 
     /// Word `at` of `STATE`, from the window that holds it.
     pub fn cell(&mut self, at: Id) -> Result<Id, LaneError> {
-        crate::live::state_load(self.kernel, self.state, at)
+        let Some(seen) = self.seen else {
+            return crate::live::state_load(self.kernel, self.state, at);
+        };
+        let point = self.point(seen, at)?;
+        match self.entry(point)? {
+            Some(entry) => self.held_cell(entry),
+            None => crate::live::state_load(self.kernel, self.state, at),
+        }
     }
 
     pub fn u(&mut self, value: u32) -> Result<Id, LaneError> {

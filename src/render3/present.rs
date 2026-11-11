@@ -15,7 +15,7 @@ use simdr::module::Id;
 
 use super::emit::Em;
 use super::shade::{kernel, placed};
-use super::{Build, Layout, Screen, refuse, word};
+use super::{Build, Layout, Screen, refuse, refuse_build, word};
 use crate::layout::PIXELS;
 
 /// Where the window's words lie in `PIXELS`: its colours, then its overlay.
@@ -188,13 +188,13 @@ fn covered_em(em: &mut Em<'_>, pixel: Id, over: Id) -> Result<Id, LaneError> {
 /// over it, into the words [`Windowed::of`] gives. Dispatch it over
 /// `window.groups(subgroup)`.
 pub fn window(build: &Build, window: Screen) -> Result<Vec<u32>, LaneError> {
-    refuse("render3::window", build.grid, build.screen)?;
+    refuse_build("render3::window", build)?;
     refuse("render3::window", build.grid, window)?;
     let layout = build.layout();
     let held = Windowed::of(&layout, window);
     let from = build.screen;
     let mut kernel = kernel(build)?;
-    let mut em = Em::reading(&mut kernel, build.windows)?;
+    let mut em = Em::read_by(&mut kernel, build)?;
     let (pixel, shown, x, y) = placed(&mut em, build.subgroup, window)?;
     let none = em.u(0)?;
     let x = em.pick(shown, x, none)?;
