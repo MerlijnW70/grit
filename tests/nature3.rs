@@ -1,17 +1,21 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use grit::rule3::nature::{
-    AIR, ASH, BOIL, CHANCE, CONDENSE, DEEPEST, EARTH, FIRE, FLARE, GRANULAR, HELD, ICE, KINDS,
-    LEAVES, LEAVES_CATCHES, LEAVES_IGNITES, LEAVES_LIFE, MELT, MINUS_X, MINUS_Z, Nature, PLUS_X,
-    PLUS_Z, ROCK, SAND, SMOKE, SMOKE_LIFE, SNOW, STEAM, TOP, WATER, WINDOW, WOOD, WOOD_CATCHES,
-    WOOD_IGNITES, WOOD_LIFE, air, alive, cell, conducts, counted, density_of, depth_of, diffused,
-    held_of, kind_of, life_of, moved, reacted, running_of, steepness, stepped, temperature_of,
-    tired_of, touched,
+    AIR, ASH, BOIL, CHANCE, CHAR, CONDENSE, DEEPEST, EARTH, FALLING, FIRE, FLARE, GRANULAR, HELD,
+    HOT, ICE, KINDLES, KINDS, LEAVES, LEAVES_CATCHES, LEAVES_IGNITES, LEAVES_LIFE, MELT, MINUS_X,
+    MINUS_Z, Nature, PLUS_X, PLUS_Z, ROCK, SAND, SMOKE, SMOKE_MOST, SNOW, STEAM, TOP, WATER,
+    WINDOW, WOOD, WOOD_CATCHES, WOOD_IGNITES, WOOD_LIFE, WOODEN, air, alive, cell, conducts,
+    counted, density_of, depth_of, diffused, held_of, kind_of, life_of, moved, reacted, running_of,
+    smoke_heat, steepness, stepped, temperature_of, tired_of, touched,
 };
 use grit::rule3::{CORNERS, Oct, Rule, noise};
 use grit::sand3::{Grid3, reference};
 
 const SEEDS: [u64; 4] = [1, 7, 0x5EED, 0xDEAD_BEEF];
+
+/// The heat of the smoke the smoke test lets go, and the most a fire's
+/// smoke can outlive it by.
+const SMOKE_LIFE: u32 = 96;
 
 fn next(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -107,7 +111,7 @@ fn the_kind_is_the_low_nibble_and_the_temperature_the_high_half() {
         (running_of(water), held_of(water), tired_of(water)),
         (PLUS_X, 1, 3)
     );
-    assert_eq!(KINDS, 13);
+    assert_eq!(KINDS, 14);
     for kind in KINDS..16 {
         assert!(!conducts(kind));
         assert_eq!(density_of(kind), None);
@@ -139,9 +143,14 @@ fn the_density_order_is_smoke_steam_air_water_then_the_granular_kinds() {
                     (Some(above), Some(below)) if above > below
                 );
                 if trades {
+                    let fell = if upper == WATER {
+                        cells[0] | FALLING
+                    } else {
+                        cells[0]
+                    };
                     assert_eq!(
                         (after[0], after[4]),
-                        (cells[4], cells[0]),
+                        (cells[4], fell),
                         "{upper} over {lower}"
                     );
                 } else {
@@ -153,7 +162,12 @@ fn the_density_order_is_smoke_steam_air_water_then_the_granular_kinds() {
                 if !trades {
                     continue;
                 }
-                assert_eq!(moved(cells, x_first), cells, "{lower} over {upper} stays");
+                let unheld = |word: u32| word & !HELD;
+                assert_eq!(
+                    moved(cells, x_first).map(unheld),
+                    cells.map(unheld),
+                    "{lower} over {upper} stays"
+                );
             }
         }
     }
@@ -223,7 +237,13 @@ fn unburning(state: &mut u64) -> u32 {
         }
     };
     let temperature = ((roll >> 8) % u64::from(LEAVES_IGNITES)) as u32;
-    cell(kind, temperature) | (((roll >> 32) as u32 & 0xFFF) << 4)
+    let state = (roll >> 32) as u32 & 0xFFF;
+    let state = if kind == SMOKE {
+        (state & 0xF00) | ((state & 0xFF) % KINDLES)
+    } else {
+        state
+    };
+    cell(kind, temperature) | (state << 4)
 }
 
 #[test]
@@ -505,12 +525,13 @@ fn a_fire_in_a_small_forest_spreads_burns_out_and_leaves_ash() {
         "{fuel} fuel, {left} left, most fire {most_fire}, fire out at frame {out_at}, smoke gone at {frame}, highest smoke at y {highest}, crowns from y {crowns}"
     );
     assert!(left * 20 <= fuel, "{left} of {fuel} unburned");
-    assert_eq!(count(&cells, ASH), fuel - left);
+    assert_eq!(count(&cells, ASH) + count(&cells, CHAR), fuel - left);
+    assert!(count(&cells, CHAR) > 0, "no trunk stands as char");
     assert_eq!(count(&cells, FIRE), 0);
     assert_eq!(count(&cells, SMOKE), 0, "the smoke never faded");
     assert!(highest + 4 < crowns, "smoke rose only to y {highest}");
     assert!(frame > out_at, "smoke outlived the fire");
-    assert!(frame <= out_at + SMOKE_LIFE + 1);
+    assert!(frame <= out_at + SMOKE_MOST + 1);
 }
 
 #[test]
@@ -640,13 +661,15 @@ fn smoke_rises_drifts_with_the_wind_and_fades_to_air() {
     };
     let before = mean(&cells);
     let smoke = count(&cells, SMOKE);
+    let hot = run(grid, &cells, 0, SMOKE_LIFE - HOT);
+    assert_eq!(count(&hot, SMOKE), smoke, "hot smoke does not spread");
     let half = run(grid, &cells, 0, SMOKE_LIFE / 2);
     let drifted = mean(&half);
     println!(
         "smoke from {before:?} to {drifted:?} in {} frames",
         SMOKE_LIFE / 2
     );
-    assert_eq!(count(&half, SMOKE), smoke);
+    assert!(count(&half, SMOKE) >= smoke, "smoke was lost");
     assert!(drifted.0 > before.0 + 2.0, "no drift toward plus x");
     assert!(drifted.1 < before.1 - 8.0, "the smoke did not rise");
     let late = run(grid, &half, SMOKE_LIFE / 2, SMOKE_LIFE / 2 + 1);
@@ -777,9 +800,9 @@ fn each_reaction_happens_at_its_threshold() {
         reacted(cell(STEAM, CONDENSE - 1), 0),
         cell(WATER, CONDENSE - 1)
     );
-    for (fuel, ignites, life) in [
-        (WOOD, WOOD_IGNITES, WOOD_LIFE),
-        (LEAVES, LEAVES_IGNITES, LEAVES_LIFE),
+    for (fuel, ignites, life, wooden) in [
+        (WOOD, WOOD_IGNITES, WOOD_LIFE, WOODEN),
+        (LEAVES, LEAVES_IGNITES, LEAVES_LIFE, 0),
     ] {
         for nibble in 0..16 {
             assert_eq!(
@@ -788,16 +811,32 @@ fn each_reaction_happens_at_its_threshold() {
             );
             let lucky = reacted(cell(fuel, ignites) | kept, nibble);
             if nibble < CHANCE {
-                assert_eq!(lucky, alive(FIRE, ignites, life) | kept);
+                assert_eq!(lucky, alive(FIRE, ignites, life) | wooden | kept);
+                assert_eq!(life_of(lucky), life);
             } else {
                 assert_eq!(lucky, cell(fuel, ignites + 1) | kept, "warms by one");
             }
             let late = ignites + WINDOW;
-            assert_eq!(reacted(cell(fuel, late), nibble), alive(FIRE, late, life));
+            assert_eq!(
+                reacted(cell(fuel, late), nibble),
+                alive(FIRE, late, life) | wooden
+            );
             assert_eq!(reacted(cell(fuel, late - 1), 15), cell(fuel, late));
-            assert_eq!(reacted(cell(fuel, TOP), nibble), alive(FIRE, TOP, life));
+            assert_eq!(
+                reacted(cell(fuel, TOP), nibble),
+                alive(FIRE, TOP, life) | wooden
+            );
         }
     }
+    assert_eq!(
+        reacted(alive(FIRE, 700, 5) | WOODEN | kept, 0),
+        alive(FIRE, 700, 4) | WOODEN | kept
+    );
+    assert_eq!(
+        reacted(alive(FIRE, 700, 0) | WOODEN | kept, 0),
+        cell(CHAR, 700) | kept,
+        "burnt wood stands as char"
+    );
     assert_eq!(
         reacted(alive(FIRE, 700, 5) | kept, 0),
         alive(FIRE, 700, 4) | kept
@@ -831,13 +870,13 @@ fn each_reaction_happens_at_its_threshold() {
         let noise = nibble * 0x1111_1111;
         let after = touched(cells, noise);
         assert_eq!(kind_of(after[0]), SMOKE, "air over fire smokes");
-        assert_eq!(life_of(after[0]), SMOKE_LIFE);
+        assert_eq!(life_of(after[0]), smoke_heat(900));
         assert_eq!(temperature_of(after[0]), 300 + FLARE);
         assert_eq!(after[4], cells[4], "the fire keeps its heat");
         assert_eq!(after[2], cells[2], "rock does not warm");
         assert_eq!(after[1], cell(EARTH, 300 + FLARE));
         let wood = if nibble < WOOD_CATCHES {
-            alive(FIRE, 300, WOOD_LIFE)
+            alive(FIRE, 300, WOOD_LIFE) | WOODEN
         } else {
             cell(WOOD, 300 + FLARE)
         };
@@ -1040,12 +1079,12 @@ fn a_fire_dropped_into_a_quiet_valley_burns_out_and_the_valley_falls_quiet_again
             ] {
                 cells[grid.index(wide / 2 + dx, 1, tall / 2 + dz)] = word;
             }
-            let ash = count(&cells, ASH);
+            let ash = count(&cells, ASH) + count(&cells, CHAR);
             let (cells, quiet) = settled(grid, &cells, frame, 2048);
             assert_eq!(count(&cells, FIRE) + count(&cells, SMOKE), 0);
             assert!(quiet - frame > WOOD_LIFE, "the fire did not burn its life");
             assert_eq!(
-                count(&cells, ASH),
+                count(&cells, ASH) + count(&cells, CHAR),
                 ash + 4,
                 "the fire and its three fuel cells"
             );

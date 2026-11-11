@@ -305,7 +305,8 @@ fn nature_cell(state: &mut u64) -> u32 {
         31..33 => nature::ASH,
         33..35 => nature::SMOKE,
         35..37 => nature::STEAM,
-        _ => nature::KINDS + ((roll >> 40) % 3) as u32,
+        37..38 => nature::CHAR,
+        _ => nature::KINDS + ((roll >> 40) % 2) as u32,
     };
     let temperature = ((roll >> 8) % 1200) as u32;
     let bits = ((roll >> 24) & 0xFFF) as u32;
@@ -385,6 +386,21 @@ fn natured() -> Subject<Nature> {
         calm: nature::cell(nature::AIR, 300),
         room: valley,
         poured: nature_poured,
+    }
+}
+
+/// The sun of the sunlit nature subject: a frozen cell melts after two lit
+/// steps, so its rooms melt and fall quiet within the patience.
+const SUN: u32 = 255;
+
+/// Nature under the sun: the snow on the valley's ridges and the snow the
+/// host writes melt once the sky has come down to them, and the room falls
+/// quiet again.
+fn sunlit() -> Subject<Nature> {
+    Subject {
+        name: "nature in the sun",
+        params: vec![SUN],
+        ..natured()
     }
 }
 
@@ -1140,10 +1156,48 @@ fn the_device_noise_equals_the_cpu_noise_for_every_oct_and_frame() {
     }
 }
 
+/// Random nature octs at one temperature, half of them with no fire, smoke
+/// or fuel, half of them with a rock floor.
+fn nature_octs(state: &mut u64) -> [u32; 8] {
+    let temperature = (next(state) % 1200) as u32;
+    let mut words: [u32; 8] = std::array::from_fn(|_| nature_cell(state));
+    for word in &mut words {
+        if nature::conducts(nature::kind_of(*word)) {
+            *word = (*word & 0xFFFF) | (temperature << 16);
+        }
+    }
+    if next(state).is_multiple_of(2) {
+        for word in &mut words {
+            if matches!(
+                nature::kind_of(*word),
+                nature::FIRE | nature::SMOKE | nature::WOOD | nature::LEAVES
+            ) {
+                *word = nature::cell(nature::ROCK, 0) | (*word & 0xFFF0);
+            }
+        }
+    }
+    if next(state).is_multiple_of(2) {
+        words[4..].fill(nature::cell(nature::ROCK, temperature));
+    }
+    words
+}
+
 /// The rule property the listed frame needs, held on the CPU: an oct that a
 /// step leaves unchanged is left unchanged at every frame after, at the same
 /// lattice point.
 fn quiet_stays_quiet<R: Rule>(subject: &Subject<R>, octs: &mut dyn FnMut(&mut u64) -> [u32; 8]) {
+    quiet_stays_quiet_every(subject, 1, octs);
+}
+
+/// [`quiet_stays_quiet`] at every `stride`th frame after. A rule that reads
+/// the phase, as nature under the sun does, keeps a quiet oct quiet at the
+/// same phase, two frames later, which is what the listed frame needs; one
+/// frame later the same lattice point names other cells.
+fn quiet_stays_quiet_every<R: Rule>(
+    subject: &Subject<R>,
+    stride: u32,
+    octs: &mut dyn FnMut(&mut u64) -> [u32; 8],
+) {
     let mut state = 0x9E1_u64;
     let mut quiet = 0;
     for _ in 0..200_000 {
@@ -1169,7 +1223,7 @@ fn quiet_stays_quiet<R: Rule>(subject: &Subject<R>, octs: &mut dyn FnMut(&mut u6
             continue;
         }
         quiet += 1;
-        for later in 1..=8 {
+        for later in (stride..=8).step_by(stride as usize) {
             assert_eq!(
                 step(frame.wrapping_add(later)),
                 words,
@@ -1208,29 +1262,8 @@ fn a_quiet_oct_stays_quiet_at_every_later_frame_under_every_rule() {
         words
     });
     let natured = natured();
-    quiet_stays_quiet(&natured, &mut |state| {
-        let temperature = (next(state) % 1200) as u32;
-        let mut words: [u32; 8] = std::array::from_fn(|_| nature_cell(state));
-        for word in &mut words {
-            if nature::conducts(nature::kind_of(*word)) {
-                *word = (*word & 0xFFFF) | (temperature << 16);
-            }
-        }
-        if next(state).is_multiple_of(2) {
-            for word in &mut words {
-                if matches!(
-                    nature::kind_of(*word),
-                    nature::FIRE | nature::SMOKE | nature::WOOD | nature::LEAVES
-                ) {
-                    *word = nature::cell(nature::ROCK, 0) | (*word & 0xFFF0);
-                }
-            }
-        }
-        if next(state).is_multiple_of(2) {
-            words[4..].fill(nature::cell(nature::ROCK, temperature));
-        }
-        words
-    });
+    quiet_stays_quiet(&natured, &mut nature_octs);
+    quiet_stays_quiet_every(&sunlit(), 2, &mut nature_octs);
     let coded = coded();
     quiet_stays_quiet(&coded, &mut |state| {
         let mut words: [u32; 8] = std::array::from_fn(|_| code_cell(state));
@@ -1326,7 +1359,7 @@ fn the_kernels_read_the_rules_parameters_and_nothing_more() {
                         .words,
                 ),
                 (
-                    0,
+                    nature::PARAMS,
                     sand3::settle_by(&Nature, width, grid, u32::MAX)
                         .unwrap()
                         .words,
@@ -1352,7 +1385,7 @@ fn the_kernels_read_the_rules_parameters_and_nothing_more() {
             );
             assert_eq!(
                 params_read(&live::settle3_by(&Nature, width, grid).unwrap()),
-                2
+                2 + nature::PARAMS
             );
         }
     }
@@ -1361,6 +1394,7 @@ fn the_kernels_read_the_rules_parameters_and_nothing_more() {
     assert_eq!(live::sizes3(&Code, &plan), plan.sizes());
     let mut longer = plan.sizes();
     longer[TALLY as usize] = Nature.tally().words().max(longer[TALLY as usize]);
+    longer[PARAMS as usize] = FIRST_PARAM + nature::PARAMS;
     assert_eq!(live::sizes3(&Nature, &plan), longer);
     let mut grown = plan.sizes();
     grown[PARAMS as usize] = FIRST_PARAM + 3;
@@ -1763,6 +1797,43 @@ fn nature_falls_quiet_and_a_host_write_wakes_it() {
 #[test]
 fn nature_falls_quiet_and_wakes_with_two_frames_in_flight() {
     quiet_then_woken(&natured(), 2);
+}
+
+#[test]
+fn nature_in_the_sun_listed_and_whole_equal_the_reference_on_random_worlds() {
+    matrix(&sunlit(), "random", random, 1);
+}
+
+#[test]
+fn nature_in_the_sun_listed_and_whole_equal_the_reference_across_the_x_seam() {
+    seam(&sunlit(), Seam::X, "x seam");
+}
+
+#[test]
+fn nature_in_the_sun_listed_and_whole_equal_the_reference_across_the_y_seam() {
+    seam(&sunlit(), Seam::Y, "y seam");
+}
+
+#[test]
+fn nature_in_the_sun_listed_and_whole_equal_the_reference_across_the_z_seam() {
+    seam(&sunlit(), Seam::Z, "z seam");
+}
+
+#[test]
+fn nature_in_the_sun_with_two_frames_in_flight_equals_the_reference() {
+    matrix(&sunlit(), "in flight", random, 2);
+}
+
+/// Under the sun the room is quiet only once its lit snow has melted: the
+/// ridges' snow melts, the host's snow melts, and the room falls quiet.
+#[test]
+fn nature_in_the_sun_falls_quiet_once_its_snow_melts_and_a_host_write_wakes_it() {
+    quiet_then_woken(&sunlit(), 1);
+}
+
+#[test]
+fn nature_in_the_sun_falls_quiet_and_wakes_with_two_frames_in_flight() {
+    quiet_then_woken(&sunlit(), 2);
 }
 
 #[test]

@@ -245,7 +245,7 @@ fn the_rules_are_listed_with_their_parameter_counts() {
     let got = answer(&call(&mut Server::new(None), "grit_world_rules", "{}"));
     assert_eq!(
         written(got.get("rules").unwrap()),
-        "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":0}]"
+        "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":1}]"
     );
 }
 
@@ -265,7 +265,7 @@ fn an_unknown_rule_is_refused_and_the_refusal_lists_the_rules() {
             .unwrap();
         assert_eq!(
             written(told.get("rules").unwrap()),
-            "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":0}]"
+            "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":1}]"
         );
         let message = told.get("message").and_then(Json::text).unwrap();
         assert!(
@@ -739,7 +739,7 @@ fn a_nature_scene_run_through_the_tools_equals_the_cpu_reference() {
         }
     }
     let mut server = Server::new(Some(&host));
-    let world = created(&mut server, "nature", size, &[]);
+    let world = created(&mut server, "nature", size, &[0]);
     answer(&call(
         &mut server,
         "grit_world_write",
@@ -760,7 +760,7 @@ fn a_nature_scene_run_through_the_tools_equals_the_cpu_reference() {
     for batch in 0..8 {
         let got = step(&mut server, world, 16);
         assert_eq!(got.counted("frame"), Some(16 * (batch + 1)));
-        want = stepped("nature", grid, &want, &[], 16 * batch, 16);
+        want = stepped("nature", grid, &want, &[0], 16 * batch, 16);
         assert_eq!(read_all(&mut server, world, size), want, "batch {batch}");
         smoked = smoked.max(count(&want, nature::SMOKE));
     }
@@ -791,17 +791,23 @@ fn a_nature_scene_run_through_the_tools_equals_the_cpu_reference() {
         - count(&want, nature::WOOD)
         - count(&want, nature::LEAVES);
     println!(
-        "after 128 frames: {burnt} fuel burned, {} ash, most smoke {smoked}, {} fire, {} smoke, {} steam",
+        "after 128 frames: {burnt} fuel burned, {} ash, {} char, most smoke {smoked}, {} fire, {} smoke, {} steam",
         count(&want, nature::ASH),
+        count(&want, nature::CHAR),
         count(&want, nature::FIRE),
         count(&want, nature::SMOKE),
         count(&want, nature::STEAM)
     );
     assert!(burnt > 9, "the fire did not spread");
     assert_eq!(
-        count(&want, nature::ASH),
+        count(&want, nature::ASH) + count(&want, nature::CHAR),
         burnt + 1,
         "the fuel and the first fire"
+    );
+    assert_eq!(
+        count(&want, nature::CHAR),
+        count(&start, nature::WOOD) - count(&want, nature::WOOD),
+        "burnt wood stands as char"
     );
     assert!(smoked > 0);
     assert_eq!(count(&want, nature::STEAM), 0, "the steam condensed");
@@ -922,9 +928,13 @@ fn a_write_into_a_quiet_world_is_stepped_under_every_rule() {
     let size = [16, 8, 8];
     let grid = Grid3::new(16, 8, 8).unwrap();
     for rule in rules() {
-        let params: Vec<u32> = (0..rule.params())
-            .map(|at| heat::TUNED.get(at).copied().unwrap_or(1))
-            .collect();
+        let params: Vec<u32> = if rule.name() == "nature" {
+            vec![0]
+        } else {
+            (0..rule.params())
+                .map(|at| heat::TUNED.get(at).copied().unwrap_or(1))
+                .collect()
+        };
         let mut server = Server::new(Some(&host));
         let world = created(&mut server, rule.name(), size, &params);
         let quiet = step(&mut server, world, 2);
