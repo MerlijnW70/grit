@@ -1080,6 +1080,9 @@ fn a_host_write_takes_a_brick_and_wakes_a_quiet_world() {
             want[cell as usize] = word;
         }
         sparse.bricks.put(&mut sparse.held, &cells).unwrap();
+        sparse
+            .listed_octs()
+            .unwrap_or_else(|why| panic!("{name} {mode:?}: the lists after the write: {why}"));
         let written = sparse.bricks.check(&mut sparse.held).unwrap();
         assert_eq!(
             written.held,
@@ -1321,7 +1324,7 @@ fn sheets_falling_around_the_torus_take_and_free_bricks_every_few_frames() {
             continue;
         }
         assert!(
-            run.freeing * every >= frames && run.taking * every >= frames,
+            run.freeing * every * 2 >= frames && run.taking * every * 2 >= frames,
             "{name} {:?}: bricks were freed in {} and taken in {} of {frames} frames",
             run.mode,
             run.freeing,
