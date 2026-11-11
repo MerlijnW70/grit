@@ -18,6 +18,7 @@ use grit::netlist::{KINDS, Netlist};
 use grit::rule::{self, Kind, Pass};
 use grit::rule3::code::Code;
 use grit::rule3::heat::Heat;
+use grit::rule3::nature::Nature;
 use grit::sand::{self, AIR, Grid, SAND, View, WALL, WATER};
 use grit::{Groups, live, render3, sand3, sweep, view3};
 
@@ -461,6 +462,19 @@ fn catalog(width: u32) -> Vec<(String, String)> {
         all.add(
             format!("live::settle3_by/code{at}"),
             live::settle3_by(&Code, w, grid),
+        );
+    }
+
+    for (wide, deep, tall) in SOLIDS {
+        let grid = Grid::solid(wide, deep, tall).unwrap();
+        let at = format!("@{wide}x{deep}x{tall}");
+        all.add(
+            format!("sand3::settle_by/nature{at}"),
+            sand3::settle_by(&Nature, w, grid, u32::MAX).map(|built| built.words),
+        );
+        all.add(
+            format!("live::settle3_by/nature{at}"),
+            live::settle3_by(&Nature, w, grid),
         );
     }
 
