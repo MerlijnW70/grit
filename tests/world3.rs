@@ -963,7 +963,7 @@ fn fnv(held: &str, hash: u64) -> u64 {
 }
 
 /// The hash of every answer of [`script`]; the same on every card.
-const SCRIPT_HASH: u64 = 0xCA31_BDF9_914F_C775;
+const SCRIPT_HASH: u64 = 0x2276_1AFB_7B1C_8BAB;
 
 /// A fixed script of calls on a heat world and a sand world: the hash of
 /// every answer, which holds the reads, the tallies and the list lengths.
