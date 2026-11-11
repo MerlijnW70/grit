@@ -125,6 +125,26 @@ impl Limits {
         Ok(())
     }
 
+    /// [`Limits::admits`], and then refuses bindings whose bytes together
+    /// pass `heap`, the device's own memory, before anything is made.
+    pub fn admits_on(&self, sizes: &[usize], vast: Option<usize>, heap: u64) -> Result<(), Error> {
+        self.admits(sizes, vast)?;
+        let mut bytes = 0_u64;
+        for &words in sizes {
+            let held = u64::try_from(words.max(1))
+                .ok()
+                .and_then(|counted| counted.checked_mul(size_of::<u32>() as u64))
+                .ok_or(Error::NoMemory { bytes: u64::MAX })?;
+            bytes = bytes
+                .checked_add(held)
+                .ok_or(Error::NoMemory { bytes: u64::MAX })?;
+        }
+        if bytes > heap {
+            return Err(Error::TooMuchMemory { bytes, heap });
+        }
+        Ok(())
+    }
+
     /// Refuses the first pass whose workgroup count the device does not
     /// promise to dispatch. A `From` count is written on the device and is
     /// not known here.
@@ -176,6 +196,10 @@ pub enum Error {
         pass: usize,
         groups: u32,
         allowed: u32,
+    },
+    TooMuchMemory {
+        bytes: u64,
+        heap: u64,
     },
     NoMemory {
         bytes: u64,
@@ -285,6 +309,10 @@ impl std::fmt::Display for Error {
                 out,
                 "pass {pass} asks for {groups} workgroups, more than the device's {} of {allowed} lets one dispatch hold",
                 Limit::WorkGroupCount
+            ),
+            Self::TooMuchMemory { bytes, heap } => write!(
+                out,
+                "the bindings ask for {bytes} bytes together, more than the {heap} bytes of the device's own memory"
             ),
             Self::NoMemory { bytes } => write!(
                 out,
