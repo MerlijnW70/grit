@@ -239,6 +239,10 @@ pub enum Error {
         was: u32,
         now: u32,
     },
+    PoolFull {
+        slots: u32,
+    },
+    LostWrite,
     Lane(simdr::lanes::LaneError),
 }
 
@@ -360,6 +364,14 @@ impl std::fmt::Display for Error {
             Self::Strayed { at, was, now } => write!(
                 out,
                 "cell {at} did not come back to where it started: it was {was} and is now {now}"
+            ),
+            Self::PoolFull { slots } => write!(
+                out,
+                "the brick pool of {slots} slots is full: a frame wanted a brick it could not hold, and the world stopped at the frame before"
+            ),
+            Self::LostWrite => write!(
+                out,
+                "a frame wrote a uniform brick that held no slot, and the write was dropped"
             ),
             Self::Lane(why) => write!(out, "a kernel could not be built: {why}"),
         }

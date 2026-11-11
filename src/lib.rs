@@ -1,5 +1,6 @@
 pub mod bake;
 pub mod board;
+pub mod bricks;
 pub mod compact;
 pub mod gate;
 pub mod geometry;
