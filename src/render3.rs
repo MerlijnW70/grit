@@ -141,13 +141,13 @@ pub const LIGHT_REACH: u32 = 4;
 pub const SUN_STEPS: u32 = 24;
 
 /// The largest side of a grid the renderer draws.
-pub const LARGEST_SIDE: u32 = 512;
+pub const LARGEST_SIDE: u32 = 1024;
 
 /// The widest and tallest screen.
 pub const LARGEST_SCREEN: u32 = 4096;
 
 /// Why a pass refuses a grid.
-pub const UNFIT: &str = "the grid is not solid, has a side under 4 or over 512, or the screen is empty or over 4096 a side";
+pub const UNFIT: &str = "the grid is not solid, has a side under 4 or over 1024, or the screen is empty or over 4096 a side";
 
 /// The words of the scene block, in order.
 pub mod scene {

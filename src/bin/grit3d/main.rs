@@ -87,6 +87,9 @@ struct Asked {
     cycle: bool,
     generate: Option<u32>,
     readback: bool,
+    timed: usize,
+    shape: Option<[u32; 3]>,
+    engine: bool,
 }
 
 fn asked() -> Result<Asked, Failed> {
@@ -115,6 +118,9 @@ fn asked() -> Result<Asked, Failed> {
         cycle: false,
         generate: None,
         readback: false,
+        timed: TIMED,
+        shape: None,
+        engine: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(one) = args.next() {
@@ -127,7 +133,18 @@ fn asked() -> Result<Asked, Failed> {
                 let name = value()?;
                 held.which = Which::named(&name).ok_or(format!("no scene {name}"))?;
             }
-            "--size" => held.side = Some(value()?.parse()?),
+            "--size" => {
+                let text = value()?;
+                let sides: Vec<&str> = text.split('x').collect();
+                if let [wide, deep, tall] = sides.as_slice() {
+                    let shape = [wide.parse()?, deep.parse()?, tall.parse()?];
+                    held.side = Some(shape[0]);
+                    held.shape = Some(shape);
+                } else {
+                    held.side = Some(text.parse()?);
+                }
+            }
+            "--engine" => held.engine = true,
             "--width" => held.window.wide = value()?.parse()?,
             "--height" => held.window.high = value()?.parse()?,
             "--frames" => held.frames = Some(value()?.parse()?),
@@ -150,6 +167,7 @@ fn asked() -> Result<Asked, Failed> {
             "--skip" => held.skip = value()?.parse()?,
             "--cycle" => held.cycle = true,
             "--readback" => held.readback = true,
+            "--timed" => held.timed = value()?.parse()?,
             "--trace" => held.trace = Some(value()?.parse()?),
             "--generate" => held.generate = Some(value()?.parse()?),
             "--clean" => held.clean = true,
@@ -158,7 +176,7 @@ fn asked() -> Result<Asked, Failed> {
             "--measure" => held.measure = true,
             other => {
                 return Err(format!(
-                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle, --readback and --generate SIDE"
+                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle, --readback, --timed N, --engine and --generate SIDE; --size takes SIDE or WIDExDEEPxTALL"
                 )
                 .into());
             }
@@ -181,6 +199,15 @@ fn main() -> Result<(), Failed> {
         println!("no Vulkan device");
         return Ok(());
     };
+    if asked.engine {
+        return engined(&host, &asked);
+    }
+    if asked
+        .shape
+        .is_some_and(|[wide, deep, tall]| wide != deep || deep != tall)
+    {
+        return Err("a world that is not a cube runs only with --engine".into());
+    }
     if asked.measure {
         return measured(&host, &asked);
     }
@@ -974,19 +1001,22 @@ fn milliseconds(times: &mut [Duration]) -> (f64, f64) {
 
 fn measured(host: &Host, asked: &Asked) -> Result<(), Failed> {
     let quality = chosen(host, asked)?;
+    let clock = Instant::now();
     let mut session = Session::open(host, setup(asked, quality))?;
+    let opened = clock.elapsed();
     if !asked.gas {
         no_gas(&mut session)?;
     }
     session.advance(asked.skip)?;
     let grid = session.grid();
     let camera = home(asked, asked.which, grid).camera();
-    let mut totals = Vec::with_capacity(TIMED);
+    let timed = asked.timed.max(1);
+    let mut totals = Vec::with_capacity(timed);
     let mut parts: Vec<Vec<Duration>> = (0..2 + stage::COUNT)
-        .map(|_| Vec::with_capacity(TIMED))
+        .map(|_| Vec::with_capacity(timed))
         .collect();
-    let mut listed = Vec::with_capacity(TIMED);
-    for at in 0..WARM + TIMED {
+    let mut listed = Vec::with_capacity(timed);
+    for at in 0..WARM + timed {
         let first = at == 0;
         session.aim(&camera, false, first)?;
         let used = steps(&session, quality, first);
@@ -1007,18 +1037,27 @@ fn measured(host: &Host, asked: &Asked) -> Result<(), Failed> {
         listed.push(session.listed()?.len());
     }
     let (frame_min, frame_mid) = milliseconds(&mut totals);
+    let frame_tail = totals
+        .get((totals.len() * 99).div_ceil(100).saturating_sub(1))
+        .copied()
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0;
     listed.sort_unstable();
     let mut line = format!(
-        "{} | {} {}^3 | {} MiB on the device | {}x{} | quality {} suns {} | frames {WARM}..{} | listed octs median {} | frame {frame_min:.3}/{frame_mid:.3} ms",
+        "{} | {} {}x{}x{} | opened in {:.1} s | {} MiB on the device | {}x{} | quality {} suns {} | frames {WARM}..{} | listed octs median {} | frame {frame_min:.3}/{frame_mid:.3}/{frame_tail:.3} ms",
         host.name(),
         session.example.name,
         grid.wide,
+        grid.deep,
+        grid.tall,
+        opened.as_secs_f64(),
         session.bytes >> 20,
         session.build.screen.wide,
         session.build.screen.high,
         quality.name,
         session.build.suns,
-        WARM + TIMED,
+        WARM + timed,
         listed.get(listed.len() / 2).copied().unwrap_or(0),
     );
     let names = ["engine", "bricks"]
@@ -1034,5 +1073,107 @@ fn measured(host: &Host, asked: &Asked) -> Result<(), Failed> {
         1000.0 / frame_mid.max(1e-6)
     ));
     println!("{line}");
+    Ok(())
+}
+
+/// Times the scene's engine alone, with no picture, on the world `--size`
+/// names: how long the world takes to make, the bytes of the engine's
+/// bindings, and each frame on the device.
+fn engined(host: &Host, asked: &Asked) -> Result<(), Failed> {
+    use grit::rule3::code::Code;
+    use grit::rule3::heat::Heat;
+    use grit::rule3::nature::Nature;
+    use grit::rule3::sand::Sand;
+
+    match asked.which {
+        Which::Valley => engined_by(host, asked, &Nature),
+        Which::Sand => engined_by(host, asked, &Sand),
+        Which::Fire => engined_by(host, asked, &Heat),
+        Which::Code => engined_by(host, asked, &Code),
+    }
+}
+
+fn engined_by<R: grit::rule3::Rule>(host: &Host, asked: &Asked, rule: &R) -> Result<(), Failed> {
+    use grit::Groups;
+    use grit::compact::Plan;
+    use grit::layout::{Dimension, GRAND, PARAMS};
+    use grit::{live, sweep};
+
+    let side = asked.side.unwrap_or(QUALITIES[0].side);
+    let [wide, deep, tall] = asked.shape.unwrap_or([side; 3]);
+    let grid = grit::sand::Grid::solid(wide, deep, tall)?;
+    let example = asked.which.example();
+    let width = host.width();
+    let plan = Plan::over_in(
+        width,
+        grid.blocks().div_ceil(sweep::cells(width)),
+        Dimension::Three,
+    )?;
+    let windows = plan.windows();
+    let sizes = windows.laid(&live::sizes3(rule, &plan));
+    host.limits().admits_on(&sizes, None, host.heap())?;
+    let (passes, stages) = live::wired3_by(rule, width, grid, &plan)?;
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let mut held = host.resident(&sizes, &modules)?;
+
+    let clock = Instant::now();
+    let world = (example.scene)(grid);
+    let made = clock.elapsed();
+    let zeros = vec![0_u32; 1 << 24];
+    for (binding, &words) in sizes.iter().enumerate() {
+        let mut at = 0;
+        while at < words {
+            let run = zeros.len().min(words - at);
+            held.write_at(binding, at, zeros.get(..run).unwrap_or(&[]))?;
+            at += run;
+        }
+    }
+    live::write_state(&mut held, windows, 0, &world)?;
+    drop(world);
+    if !example.params.is_empty() {
+        held.write_at(PARAMS as usize, grit::rule3::FIRST_PARAM, &example.params)?;
+    }
+    held.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
+    live::seed(&mut held, grid, &plan)?;
+
+    let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
+    for _ in 0..asked.skip {
+        held.staged(&groups)?;
+    }
+    let timed = asked.timed.max(1);
+    let mut times = Vec::with_capacity(timed);
+    let mut listed = Vec::with_capacity(timed);
+    for at in 0..WARM + timed {
+        held.staged(&groups)?;
+        if at < WARM {
+            continue;
+        }
+        times.push(held.on_device().ok_or("the device keeps no timestamps")?);
+        listed.push(held.read(GRAND as usize, 1)?.first().copied().unwrap_or(0));
+    }
+    let (least, middle) = milliseconds(&mut times);
+    let tail = times
+        .get((times.len() * 99).div_ceil(100).saturating_sub(1))
+        .copied()
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0;
+    listed.sort_unstable();
+    let bytes: usize = sizes.iter().sum::<usize>() * 4;
+    println!(
+        "{} | {} engine alone {}x{}x{} | made in {:.1} s | {} MiB on the device over {} bindings, {} windows of STATE | steps {}..{} | listed octs median {} | frame {least:.3}/{middle:.3}/{tail:.3} ms",
+        host.name(),
+        example.name,
+        grid.wide,
+        grid.deep,
+        grid.tall,
+        made.as_secs_f64(),
+        bytes >> 20,
+        sizes.len(),
+        windows.count(),
+        asked.skip + WARM as u32,
+        asked.skip + (WARM + timed) as u32,
+        listed.get(listed.len() / 2).copied().unwrap_or(0),
+    );
     Ok(())
 }

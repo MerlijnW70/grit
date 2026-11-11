@@ -362,6 +362,37 @@ fn catalog(width: u32) -> Vec<(String, String)> {
             format!("live::settle3_in/nature/split-{}{at}", windows.count()),
             live::settle3_in(&Nature, w, grid, windows),
         );
+        if wide > render3::LARGEST_SIDE {
+            continue;
+        }
+        let build = render3::Build {
+            grid,
+            kinds: view3::Kinds::named("sand").unwrap(),
+            screen: render3::Screen {
+                wide: 1920,
+                high: 1080,
+            },
+            subgroup: w,
+            suns: 2,
+            windows,
+        };
+        all.add(
+            format!("render3::occupied/split{at}"),
+            render3::occupied(&build),
+        );
+        all.add(
+            format!("render3::filled/split{at}"),
+            render3::filled(&build),
+        );
+        all.add(
+            format!("render3::primary/split{at}"),
+            render3::primary(&build),
+        );
+        all.add(
+            format!("render3::bounce/split{at}"),
+            render3::bounce(&build),
+        );
+        all.add(format!("render3::shade/split{at}"), render3::shade(&build));
     }
 
     for (wide, deep) in GRIDS {
