@@ -23,6 +23,8 @@ const REPORT_512: u64 = 1_360_334_948;
 
 const PARAMS_GROWTH: u64 = 2 * 4;
 
+const SPARE_512: u64 = 536_870_912;
+
 fn octs_in(cells: usize) -> u32 {
     u32::try_from(cells / 8).unwrap()
 }
@@ -105,12 +107,12 @@ fn the_three_dimensional_layout_has_eight_corners_seven_tally_words_and_ten_para
 }
 
 #[test]
-fn a_three_dimensional_plan_holds_eight_cells_to_an_oct_in_the_grid_and_in_the_spare() {
+fn a_three_dimensional_plan_holds_eight_cells_to_an_oct_and_no_spare() {
     for blocks in [1, 5, 40] {
         let held = Plan::over_in(SUBGROUP, blocks, Dimension::Three).unwrap();
         assert_eq!(held.quads, held.per_block as usize * blocks as usize);
         assert_eq!(held.grid, held.quads * 8);
-        assert_eq!(held.sizes()[STATE as usize], held.quads * 16);
+        assert_eq!(held.sizes()[STATE as usize], held.quads * 8);
     }
 }
 
@@ -122,7 +124,7 @@ fn the_sizes_of_a_three_dimensional_world_follow_the_reports_words_per_oct() {
         let octs = cells / 8;
         let sizes = held.sizes();
         assert_eq!(held.quads, octs, "{side}");
-        assert_eq!(sizes[STATE as usize], 16 * octs, "{side}");
+        assert_eq!(sizes[STATE as usize], 8 * octs, "{side}");
         assert_eq!(sizes[AWAKE as usize], 2 * octs, "{side}");
         assert_eq!(sizes[BUCKETS as usize], octs + octs / 8, "{side}");
         assert_eq!(sizes[DENSE as usize], octs + octs / 8, "{side}");
@@ -130,14 +132,8 @@ fn the_sizes_of_a_three_dimensional_world_follow_the_reports_words_per_oct() {
         let slack = if side >= 256 { 0.001 } else { 0.05 };
         let per_cell = bytes(&sizes) as f64 / cells as f64;
         assert!(
-            (per_cell - 10.1353).abs() < slack,
-            "{side}: {per_cell} bytes a cell"
-        );
-        let spare = octs as u64 * 8 * 4;
-        let without = (bytes(&sizes) - spare) as f64 / cells as f64;
-        assert!(
-            (without - 6.1353).abs() < slack,
-            "{side}: {without} bytes a cell without the spare"
+            (per_cell - 6.1353).abs() < slack,
+            "{side}: {per_cell} bytes a cell, the report's figure without the spare"
         );
     }
 }
@@ -148,8 +144,8 @@ fn the_world_of_512_cubed_sums_to_the_bytes_the_report_computed() {
     let sizes = held.sizes();
     assert_eq!(held.quads, 16_777_216);
     assert_eq!(held.blocks, 65_536);
-    assert_eq!(bytes(&sizes), REPORT_512 + PARAMS_GROWTH);
-    assert_eq!(sizes[STATE as usize] as u64 * 4, 1_073_741_824);
+    assert_eq!(bytes(&sizes), REPORT_512 - SPARE_512 + PARAMS_GROWTH);
+    assert_eq!(sizes[STATE as usize] as u64 * 4, 536_870_912);
     assert_eq!(Plan::reach(SUBGROUP) * 8, CELLS_512 as u64);
 }
 
@@ -178,7 +174,7 @@ fn a_binding_range_of_four_gibibytes_admits_512_cubed_and_refuses_1024_cubed_by_
 
     let wide = world(64, 1024 * 1024 * 1024);
     let sizes = wide.sizes();
-    assert_eq!(sizes[STATE as usize] as u64 * 4, 8_589_934_592);
+    assert_eq!(sizes[STATE as usize] as u64 * 4, 4_294_967_296);
     let refused = admits.admits(&sizes, None);
     assert!(
         matches!(

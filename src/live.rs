@@ -983,8 +983,8 @@ pub fn settle3(subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
 /// by `rule` with 8 loads and 8 stores of `STATE` through
 /// [`crate::geometry::Solid`]. An oct that changes wakes itself and the 26
 /// octs around it ([`crate::geometry::Space::near`]), and the rule's counts
-/// go to the [`Dimension::Three`] tally. Lanes past the list store into the
-/// spare region of `STATE`, 8 words a slot from the grid's end.
+/// go to the [`Dimension::Three`] tally. Only the lanes inside the list
+/// store, so `STATE` holds the grid and nothing past it.
 pub fn settle3_by<R: Rule>(rule: &R, subgroup: u32, grid: Grid) -> Result<Vec<u32>, LaneError> {
     solid("live::settle3", grid)?;
     match subgroup {
@@ -998,6 +998,30 @@ pub fn settle3_by<R: Rule>(rule: &R, subgroup: u32, grid: Grid) -> Result<Vec<u3
             width: subgroup,
         }),
     }
+}
+
+/// Runs `body` in the lanes where `when`, a bool, holds, and in no other.
+pub fn lane_if<F>(
+    kernel: &mut Kernel<U32>,
+    when: simdr::module::Id,
+    body: F,
+) -> Result<(), LaneError>
+where
+    F: FnOnce(&mut Kernel<U32>) -> Result<(), LaneError>,
+{
+    use simdr::spec::SelectionControl;
+
+    let taken = kernel.module().alloc_id()?;
+    let merge = kernel.module().alloc_id()?;
+    kernel
+        .module()
+        .selection_merge(merge, SelectionControl::None)?;
+    kernel.module().branch_conditional(when, taken, merge)?;
+    kernel.module().label_at(taken)?;
+    body(kernel)?;
+    kernel.module().branch(merge)?;
+    kernel.module().label_at(merge)?;
+    Ok(())
 }
 
 fn listed3<const LANES: u32, R: Rule>(
@@ -1070,27 +1094,22 @@ fn listed3<const LANES: u32, R: Rule>(
         (step.out, step.counts, touched)
     };
 
-    let spare = {
+    let listed = {
         let mut lanes = kernel.lanes()?;
-        let past =
-            lanes.splat_bits::<U32, LANES>(u32::try_from(grid.cells()).unwrap_or(u32::MAX))?;
-        let mine = lanes.splat_id::<U32, LANES>(slot)?;
-        let shift = lanes.splat_bits::<U32, LANES>(Dimension::Three.corner_bits())?;
-        let along = lanes.shift_left(mine, shift)?;
-        lanes.add(past, along)?
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let listed = lanes.greater_than(inside, none)?;
+        listed
+            .strips()
+            .first()
+            .copied()
+            .ok_or(LaneError::NoOpenBlock { arm: "listed" })?
     };
-
-    for (corner, (place, value)) in placing.places.iter().zip(&settled).enumerate() {
-        let where_at = {
-            let mut lanes = kernel.lanes()?;
-            let none = lanes.splat_bits::<U32, LANES>(0)?;
-            let step = lanes.splat_bits::<U32, LANES>(u32::try_from(corner).unwrap_or(0))?;
-            let elsewhere = lanes.add(spare, step)?;
-            let listed = lanes.greater_than(inside, none)?;
-            lanes.select(listed, *place, elsewhere)?
-        };
-        kernel.store_at(STATE, where_at.id(), value.id())?;
-    }
+    lane_if(&mut kernel, listed, |kernel| {
+        for (place, value) in placing.places.iter().zip(&settled) {
+            kernel.store_at(STATE, place.id(), value.id())?;
+        }
+        Ok(())
+    })?;
 
     let block = Block::<LANES, 3> {
         subgroup,

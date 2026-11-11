@@ -124,6 +124,16 @@ impl Plan {
         })
     }
 
+    /// The words of `STATE`: the grid, and for a flat world the spare its
+    /// listed settle writes the lanes past the list into.
+    #[must_use]
+    pub const fn state_words(&self) -> usize {
+        match self.dimension {
+            Dimension::Two => self.grid + self.quads * self.dimension.corners(),
+            Dimension::Three => self.grid,
+        }
+    }
+
     #[must_use]
     pub const fn padded(&self) -> u32 {
         self.tiles * self.per_block
@@ -136,7 +146,7 @@ impl Plan {
         let spare = self.blocks as usize * self.subgroup as usize;
         [
             self.dimension.params_words(),
-            self.grid + self.quads * self.dimension.corners(),
+            self.state_words(),
             self.blocks as usize * sweep::stride(self.subgroup) as usize,
             padded,
             padded,
