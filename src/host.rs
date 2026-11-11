@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use ash::vk;
 
+use crate::ops::Dots;
 use crate::resident::Groups;
 use crate::resident::faults::{self, Step};
 
@@ -377,6 +378,7 @@ pub struct Host {
     int64: bool,
     physical: vk::PhysicalDevice,
     presents: bool,
+    dots: Dots,
 }
 
 /// The instance extensions a host that shows its pictures in a window asks
@@ -582,15 +584,22 @@ impl Host {
                     .is_ok_and(|name| name == ash::khr::swapchain::NAME)
             })
         };
-        let extensions: Vec<*const c_char> = if presents {
+        let mut extensions: Vec<*const c_char> = if presents {
             vec![ash::khr::swapchain::NAME.as_ptr()]
         } else {
             Vec::new()
         };
-        let create = vk::DeviceCreateInfo::default()
+        let dots = unsafe { dots_of(&instance, physical) };
+        let mut dotting = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
+            .shader_integer_dot_product(true);
+        let mut create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
-            .enabled_features(&wanted)
-            .enabled_extension_names(&extensions);
+            .enabled_features(&wanted);
+        if dots == Dots::Native {
+            extensions.push(ash::khr::shader_integer_dot_product::NAME.as_ptr());
+            create = create.push_next(&mut dotting);
+        }
+        let create = create.enabled_extension_names(&extensions);
 
         let made =
             unsafe { instance.create_device(physical, &create, faults::callbacks(Step::Device)) };
@@ -623,6 +632,7 @@ impl Host {
             int64,
             physical,
             presents,
+            dots,
             wedged: AtomicBool::new(false),
             owing: AtomicUsize::new(0),
         })
@@ -672,6 +682,11 @@ impl Host {
     #[must_use]
     pub const fn presents(&self) -> bool {
         self.presents
+    }
+
+    #[must_use]
+    pub const fn dots(&self) -> Dots {
+        self.dots
     }
 
     pub(crate) const fn entry(&self) -> &ash::Entry {
@@ -767,6 +782,27 @@ unsafe fn limits_of(instance: &ash::Instance, physical: vk::PhysicalDevice) -> L
         unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
     }
     Limits::of(&core, &subgroup, &third)
+}
+
+unsafe fn dots_of(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Dots {
+    let offered = unsafe { instance.enumerate_device_extension_properties(physical) }
+        .unwrap_or_default()
+        .iter()
+        .any(|one| {
+            one.extension_name_as_c_str()
+                .is_ok_and(|name| name == ash::khr::shader_integer_dot_product::NAME)
+        });
+    if !offered {
+        return Dots::Exact;
+    }
+    let mut dotting = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut dotting);
+    unsafe { instance.get_physical_device_features2(physical, &mut features) };
+    if dotting.shader_integer_dot_product == vk::TRUE {
+        Dots::Native
+    } else {
+        Dots::Exact
+    }
 }
 
 unsafe fn timestamps(

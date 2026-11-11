@@ -64,6 +64,9 @@ pub trait Ops {
     fn mul(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
     fn div(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
 
+    fn dot_signed(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
+    fn dot_unsigned(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
+
     fn equal(&mut self, left: Self::Word, right: Self::Word) -> Flag<Self::Word>;
     fn not_equal(&mut self, left: Self::Word, right: Self::Word) -> Flag<Self::Word>;
     fn less(&mut self, left: Self::Word, right: Self::Word) -> Flag<Self::Word>;
@@ -140,6 +143,30 @@ fn flagged(holds: bool) -> Flag<u32> {
     Flag(u32::from(holds))
 }
 
+fn signed(byte: u8) -> i32 {
+    i32::from(i8::from_le_bytes([byte]))
+}
+
+#[must_use]
+pub fn signed_lanes(word: u32) -> [i32; 4] {
+    let [first, second, third, fourth] = word.to_le_bytes();
+    [signed(first), signed(second), signed(third), signed(fourth)]
+}
+
+#[must_use]
+pub fn unsigned_lanes(word: u32) -> [i32; 4] {
+    word.to_le_bytes().map(i32::from)
+}
+
+fn summed(left: [i32; 4], right: [i32; 4]) -> u32 {
+    left.into_iter()
+        .zip(right)
+        .fold(0_i32, |total, (one, other)| {
+            total.wrapping_add(one.wrapping_mul(other))
+        })
+        .cast_unsigned()
+}
+
 impl Ops for Cpu {
     type Word = u32;
 
@@ -199,6 +226,16 @@ impl Ops for Cpu {
     }
 
     #[inline]
+    fn dot_signed(&mut self, left: u32, right: u32) -> u32 {
+        summed(signed_lanes(left), signed_lanes(right))
+    }
+
+    #[inline]
+    fn dot_unsigned(&mut self, left: u32, right: u32) -> u32 {
+        summed(unsigned_lanes(left), unsigned_lanes(right))
+    }
+
+    #[inline]
     fn equal(&mut self, left: u32, right: u32) -> Flag<u32> {
         flagged(left == right)
     }
@@ -241,18 +278,30 @@ impl Ops for Cpu {
 /// 0, and [`Device::finish`] returns the refusal. So a step written over
 /// [`Ops`] needs no error handling of its own, and a failed build is never
 /// mistaken for a kernel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Dots {
+    Native,
+    #[default]
+    Exact,
+}
+
 pub struct Device<'held, 'module, const LANES: u32> {
     lanes: &'held mut Lanes<'module>,
     zero: Word<LANES>,
     one: Word<LANES>,
     failed: Option<LaneError>,
     truths: BTreeMap<Id, Predicate<LANES>>,
+    dots: Dots,
 }
 
 type Emitted<const LANES: u32> = Result<Word<LANES>, LaneError>;
 
 impl<'held, 'module, const LANES: u32> Device<'held, 'module, LANES> {
     pub fn new(lanes: &'held mut Lanes<'module>) -> Result<Self, LaneError> {
+        Self::dotting(lanes, Dots::Exact)
+    }
+
+    pub fn dotting(lanes: &'held mut Lanes<'module>, dots: Dots) -> Result<Self, LaneError> {
         let zero = lanes.splat_bits::<U32, LANES>(0)?;
         let one = lanes.splat_bits::<U32, LANES>(1)?;
         Ok(Self {
@@ -261,6 +310,7 @@ impl<'held, 'module, const LANES: u32> Device<'held, 'module, LANES> {
             one,
             failed: None,
             truths: BTreeMap::new(),
+            dots,
         })
     }
 
@@ -306,6 +356,40 @@ impl<'held, 'module, const LANES: u32> Device<'held, 'module, LANES> {
 
     fn constant_word(&mut self, value: u32) -> Word<LANES> {
         self.emitted(|lanes| lanes.splat_bits::<U32, LANES>(value))
+    }
+
+    fn component(&mut self, word: Word<LANES>, lane: u32, sign: bool) -> Word<LANES> {
+        if sign {
+            let raised = match 24 - 8 * lane {
+                0 => word,
+                up => self.shift_left(word, up),
+            };
+            let by = self.constant_word(24);
+            self.emitted(|lanes| lanes.shift_right_arithmetic(raised, by))
+        } else {
+            let lowered = match lane {
+                0 => word,
+                _ => self.shift_right(word, 8 * lane),
+            };
+            match lane {
+                3 => lowered,
+                _ => self.masked(lowered, 0xFF),
+            }
+        }
+    }
+
+    fn exact_dot(&mut self, left: Word<LANES>, right: Word<LANES>, sign: bool) -> Word<LANES> {
+        let mut total = None;
+        for lane in 0..4 {
+            let one = self.component(left, lane, sign);
+            let other = self.component(right, lane, sign);
+            let product = self.mul(one, other);
+            total = Some(match total {
+                None => product,
+                Some(held) => self.add(held, product),
+            });
+        }
+        total.unwrap_or(self.zero)
     }
 }
 
@@ -360,6 +444,23 @@ impl<const LANES: u32> Ops for Device<'_, '_, LANES> {
             let divisor = lanes.max(right, one)?;
             lanes.div(left, divisor)
         })
+    }
+
+    fn dot_signed(&mut self, left: Self::Word, right: Self::Word) -> Self::Word {
+        match self.dots {
+            Dots::Native => self.emitted(|lanes| {
+                let total = lanes.dot_signed(left, right)?;
+                lanes.reinterpret(total)
+            }),
+            Dots::Exact => self.exact_dot(left, right, true),
+        }
+    }
+
+    fn dot_unsigned(&mut self, left: Self::Word, right: Self::Word) -> Self::Word {
+        match self.dots {
+            Dots::Native => self.emitted(|lanes| lanes.dot_unsigned(left, right)),
+            Dots::Exact => self.exact_dot(left, right, false),
+        }
     }
 
     fn equal(&mut self, left: Self::Word, right: Self::Word) -> Flag<Self::Word> {
