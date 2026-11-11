@@ -1,7 +1,9 @@
 mod font;
+mod life;
 mod scenes;
 mod session;
 mod ui;
+mod valley;
 
 use std::time::{Duration, Instant};
 
@@ -83,11 +85,15 @@ struct Asked {
     help: bool,
     gas: bool,
     tool: usize,
+    skip: u32,
+    trace: Option<u32>,
+    cycle: bool,
+    generate: Option<u32>,
 }
 
 fn asked() -> Result<Asked, Failed> {
     let mut held = Asked {
-        which: Which::Fire,
+        which: Which::Valley,
         side: None,
         window: Screen {
             wide: 1280,
@@ -106,6 +112,10 @@ fn asked() -> Result<Asked, Failed> {
         help: false,
         gas: true,
         tool: 0,
+        skip: 0,
+        trace: None,
+        cycle: false,
+        generate: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(one) = args.next() {
@@ -138,13 +148,17 @@ fn asked() -> Result<Asked, Failed> {
             "--smoothing" => held.smooth = value()? != "off",
             "--gas" => held.gas = value()? != "off",
             "--tool" => held.tool = value()?.parse()?,
+            "--skip" => held.skip = value()?.parse()?,
+            "--cycle" => held.cycle = true,
+            "--trace" => held.trace = Some(value()?.parse()?),
+            "--generate" => held.generate = Some(value()?.parse()?),
             "--clean" => held.clean = true,
             "--active" => held.active = true,
             "--help-panel" => held.help = true,
             "--measure" => held.measure = true,
             other => {
                 return Err(format!(
-                    "unknown argument {other}; grit3d takes --scene sand|fire|code, --size, --width, --height, --frames N, --shot FILE.png, --camera 0|1|2|3, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel and --measure"
+                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle and --generate SIDE"
                 )
                 .into());
             }
@@ -155,6 +169,9 @@ fn asked() -> Result<Asked, Failed> {
 
 fn main() -> Result<(), Failed> {
     let asked = asked()?;
+    if let Some(side) = asked.generate {
+        return generated(side);
+    }
     let Some(host) = Host::open()? else {
         println!("no Vulkan device");
         return Ok(());
@@ -162,7 +179,39 @@ fn main() -> Result<(), Failed> {
     if asked.measure {
         return measured(&host, &asked);
     }
+    if let Some(steps) = asked.trace {
+        return traced(&host, &asked, steps);
+    }
     shown(&host, &asked)
+}
+
+/// Times the valley's generator at a side of `side`.
+fn generated(side: u32) -> Result<(), Failed> {
+    let grid = grit::sand::Grid::solid(side, side, side)?;
+    let mut times = Vec::new();
+    let mut made = None;
+    for _ in 0..3 {
+        let clock = Instant::now();
+        made = Some(valley::made(grid, valley::SEED));
+        times.push(clock.elapsed());
+    }
+    let made = made.ok_or("no valley was made")?;
+    let hash = made
+        .cells
+        .iter()
+        .fold(0xCBF2_9CE4_8422_2325_u64, |hash, &word| {
+            (hash ^ u64::from(word)).wrapping_mul(0x0100_0000_01B3)
+        });
+    let wet = made.wet.iter().filter(|&&wet| wet > 0).count();
+    let peak = made.ground.iter().max().copied().unwrap_or(0);
+    let (least, middle) = milliseconds(&mut times);
+    println!(
+        "valley {side}^3 seed {:#x}: generated in {least:.0} ms at least, {middle:.0} ms the median of 3; world hash {hash:#018x}; peak {peak}, snowline {}, lake level {}, {wet} columns hold water",
+        valley::SEED,
+        made.snowline,
+        made.level
+    );
+    Ok(())
 }
 
 /// The quality to draw at: the one asked for, or the first, from the one
@@ -174,7 +223,7 @@ fn chosen(host: &Host, asked: &Asked) -> Result<Quality, Failed> {
     let start = usize::from(host.heap() < SMALL_HEAP);
     for quality in QUALITIES.iter().skip(start) {
         let mut session = Session::cold(host, setup(asked, *quality))?;
-        let camera = orbit_camera(&Orbit::start(session.grid()), session.grid());
+        let camera = orbit_camera(&Orbit::start(asked.which, session.grid()), session.grid());
         let mut times = Vec::new();
         for at in 0..8 {
             session.aim(&camera, false, at == 0)?;
@@ -231,7 +280,10 @@ struct Orbit {
 }
 
 impl Orbit {
-    fn start(grid: grit::sand::Grid) -> Self {
+    fn start(which: Which, grid: grit::sand::Grid) -> Self {
+        if which == Which::Valley {
+            return framed(which, 0, grid);
+        }
         let side = grid.wide as f32;
         Self {
             target: [side * 0.5, side * 0.72, side * 0.5],
@@ -264,6 +316,12 @@ fn orbit_camera(orbit: &Orbit, grid: grit::sand::Grid) -> Camera {
 fn framed(which: Which, camera: usize, grid: grit::sand::Grid) -> Orbit {
     let side = grid.wide as f32;
     let (yaw, pitch, far, height, across) = match (which, camera) {
+        (Which::Valley, 0) => (-2.35, 0.56, 1.6, 0.7, [0.5, 0.5]),
+        (Which::Valley, 1) => (-2.75, 0.3, 0.6, 0.66, [0.5, 0.56]),
+        (Which::Valley, 3) => (-2.0, 0.42, 0.42, 0.66, [0.6, 0.36]),
+        (Which::Valley, 5) => (-2.35, 0.5, 2.3, 0.56, [0.5, 0.5]),
+        (Which::Valley, 6) => (-2.0, 0.95, 0.35, 0.6, [0.33, 0.47]),
+        (Which::Valley, 7) => (-2.3, 0.36, 0.42, 0.78, [0.74, 0.62]),
         (_, 2) => (-2.35, 0.62, 3.0, 0.72, [0.5, 0.5]),
         (_, 4) => (-0.95, 0.16, 1.9, 0.62, [0.5, 0.5]),
         (Which::Sand, 0) => (-2.3, 0.6, 2.2, 0.74, [0.5, 0.5]),
@@ -272,6 +330,7 @@ fn framed(which: Which, camera: usize, grid: grit::sand::Grid) -> Orbit {
         (Which::Fire, 1) => (-1.75, 0.36, 1.0, 0.72, [0.62, 0.45]),
         (Which::Code, 0) => (-2.4, 0.5, 2.0, 0.72, [0.5, 0.5]),
         (Which::Code, 1) => (-1.2, 0.3, 0.8, 0.78, [0.45, 0.5]),
+        (Which::Valley, _) => (-2.0, 0.3, 0.6, 0.7, [0.5, 0.6]),
         (Which::Sand, _) => (2.45, 0.3, 0.75, 0.82, [1.0, 0.45]),
         (Which::Fire, _) => (-2.0, 0.3, 0.5, 0.72, [0.64, 0.44]),
         (Which::Code, _) => (-1.6, 0.15, 0.45, 0.8, [0.5, 0.6]),
@@ -328,6 +387,105 @@ fn upscaled(picture: &[u32], from: Screen, to: Screen) -> Vec<u32> {
     out
 }
 
+/// How many frames of a timed cycle are shown before the timing starts,
+/// and how many after its restart are timed on their own.
+const SETTLING: u32 = 30;
+const RESTARTING: usize = 40;
+
+/// The frame times of a whole cycle of a scene that lives on its own,
+/// from the [`SETTLING`]th frame to its restart: the wall time between
+/// frames in the window, the device time of each frame, and the frames of
+/// each phase; then the frames right after the restart, on their own.
+#[derive(Debug, Default)]
+struct Timing {
+    shown: u32,
+    wall: Vec<Duration>,
+    device: Vec<Duration>,
+    stepping: Vec<Duration>,
+    phases: [u32; 3],
+    restart: Option<(u32, Vec<Duration>, Vec<Duration>)>,
+}
+
+impl Timing {
+    /// Takes a frame: the wall time since the frame before, its device
+    /// time, the cycle as it stands after it, whether it stepped the engine
+    /// and whether the world restarted in it; true once the frames after
+    /// the restart are timed too.
+    fn add(
+        &mut self,
+        (wall, device): (Duration, Option<Duration>),
+        life: Option<&life::Cycle>,
+        (moving, restarted): (bool, bool),
+        steps: u32,
+    ) -> bool {
+        self.shown += 1;
+        if self.shown <= SETTLING {
+            return false;
+        }
+        if let Some((_, walls, devices)) = self.restart.as_mut() {
+            walls.push(wall);
+            devices.extend(device);
+            return walls.len() > RESTARTING;
+        }
+        self.wall.push(wall);
+        self.device.extend(device);
+        if moving {
+            self.stepping.extend(device);
+        }
+        let phase = match life.map(|life| life.phase) {
+            Some(life::Phase::Burning) => 1,
+            Some(life::Phase::After) => 2,
+            _ => 0,
+        };
+        if let Some(slot) = self.phases.get_mut(phase) {
+            *slot += 1;
+        }
+        if restarted {
+            self.restart = Some((steps, Vec::new(), Vec::new()));
+        }
+        false
+    }
+
+    fn report(&mut self) {
+        let line = |name: &str, times: &mut Vec<Duration>| {
+            times.sort_unstable();
+            let ms = |at: Option<&Duration>| at.copied().unwrap_or_default().as_secs_f64() * 1000.0;
+            println!(
+                "cycle {name}: {} frames, min {:.2} ms, median {:.2} ms, 99th {:.2} ms, worst {:.2} ms",
+                times.len(),
+                ms(times.first()),
+                ms(times.get(times.len() / 2)),
+                ms(times.get(times.len() * 99 / 100)),
+                ms(times.last()),
+            );
+        };
+        line("window", &mut self.wall);
+        line("device", &mut self.device);
+        line("device, frames with an engine step", &mut self.stepping);
+        println!(
+            "cycle frames: calm {}, burning {}, after {}",
+            self.phases[0], self.phases[1], self.phases[2]
+        );
+        if let Some((steps, walls, devices)) = &self.restart {
+            let worst = |times: &[Duration]| {
+                times
+                    .iter()
+                    .max()
+                    .copied()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    * 1000.0
+            };
+            println!(
+                "restart at engine step {steps}: of the {} frames after it, the worst took {:.2} ms in the window and {:.2} ms on the device",
+                walls.len(),
+                worst(walls),
+                worst(devices)
+            );
+        }
+    }
+}
+
 /// What the demo is doing between frames.
 struct Play {
     orbit: Orbit,
@@ -348,19 +506,12 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
     let window_screen = asked.window;
     let mut session = Session::open(host, setup(asked, quality))?;
     if !asked.gas {
-        session.example.table = session
-            .example
-            .table
-            .with(grit::rule3::heat::STEAM, grit::render3::Material::EMPTY);
-        session.held.write_at(
-            grit::layout::PIXELS as usize,
-            session.build.layout().table(),
-            &session.example.table.words(),
-        )?;
+        no_gas(&mut session)?;
     }
     if let Some(dusk) = asked.dusk {
         session.dusk = dusk;
     }
+    session.advance(asked.skip)?;
     println!(
         "{} width {} {} {}^3 window {}x{} drawn at {}x{} quality {} suns {}",
         host.name(),
@@ -378,7 +529,7 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
         .camera
         .map(|at| framed(asked.which, at, session.grid()));
     let mut play = Play {
-        orbit: fixed.unwrap_or_else(|| Orbit::start(session.grid())),
+        orbit: fixed.unwrap_or_else(|| Orbit::start(asked.which, session.grid())),
         manual: fixed.is_some(),
         last_input: Instant::now(),
         tool: asked.tool,
@@ -405,9 +556,12 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
     let mut active_count = 0_u32;
     let mut last_frame = Instant::now();
     let mut steady: Option<(Instant, u32)> = None;
+    let mut owed = 0.0_f32;
+    let mut timing = Timing::default();
     while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
         let now = Instant::now();
-        let spent = now.duration_since(last_frame).as_secs_f32().min(0.1);
+        let elapsed = now.duration_since(last_frame);
+        let spent = elapsed.as_secs_f32().min(0.1);
         last_frame = now;
         let mut step = false;
         let mut switch_to = None;
@@ -416,7 +570,10 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
             use minifb::{Key, KeyRepeat, MouseButton, MouseMode};
             let mut touched = false;
             let pressed = |key| window.is_key_pressed(key, KeyRepeat::No);
-            for (at, key) in [Key::Key1, Key::Key2, Key::Key3].into_iter().enumerate() {
+            for (at, key) in [Key::Key0, Key::Key1, Key::Key2, Key::Key3]
+                .into_iter()
+                .enumerate()
+            {
                 if pressed(key) {
                     switch_to = Which::ALL.get(at).copied();
                     touched = true;
@@ -520,8 +677,8 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
                 session.dusk = dusk;
             }
             play.tool = 0;
-            if switch_to.is_some() {
-                play.orbit = Orbit::start(session.grid());
+            if let Some(which) = switch_to {
+                play.orbit = Orbit::start(which, session.grid());
             }
             fresh = true;
         }
@@ -539,10 +696,34 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
         } else {
             session.aim(&camera, play.active, fresh)?;
         }
-        let moving = !play.paused || step;
+        if let Some(pace) = session.example.pace {
+            owed = (owed + pace * spent).min(1.0);
+        } else {
+            owed = 1.0;
+        }
+        let due = owed >= 1.0;
+        if due && !play.paused {
+            owed -= 1.0;
+        }
+        let moving = (!play.paused && due) || step;
         let (_, got) = session.frame(moving, light_steps, true)?;
-        fresh = false;
-        let mut frame = upscaled(&got, session.build.screen, window_screen);
+        fresh = std::mem::take(&mut session.restarted);
+        if asked.cycle
+            && timing.add(
+                (elapsed, session.held.on_device()),
+                session.life.as_ref(),
+                (moving, fresh),
+                session.steps,
+            )
+        {
+            timing.report();
+            break;
+        }
+        let mut frame = if session.build.screen == window_screen {
+            got
+        } else {
+            upscaled(&got, session.build.screen, window_screen)
+        };
         counted += 1;
         if clock.elapsed().as_secs_f64() >= 0.5 {
             rate = f64::from(counted) / clock.elapsed().as_secs_f64();
@@ -610,6 +791,63 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
     Ok(())
 }
 
+/// Draws no gas: every kind the table draws as gas is drawn as nothing.
+fn no_gas(session: &mut Session<'_>) -> Result<(), Failed> {
+    let gases = session.example.table.gases();
+    for kind in 0..32 {
+        if gases & (1 << kind) != 0 {
+            session.example.table = session
+                .example
+                .table
+                .with(kind, grit::render3::Material::EMPTY);
+        }
+    }
+    session.held.write_at(
+        grit::layout::PIXELS as usize,
+        session.build.layout().table(),
+        &session.example.table.words(),
+    )?;
+    Ok(())
+}
+
+/// Runs the scene's engine and its own cycle for `steps` steps with no
+/// picture, and prints its fire and smoke now and then.
+fn traced(host: &Host, asked: &Asked, steps: u32) -> Result<(), Failed> {
+    use grit::rule3::nature::{LEAVES, WOOD, kind_of};
+    let fuel = |cells: &[u32]| {
+        cells
+            .iter()
+            .filter(|&&word| [WOOD, LEAVES].contains(&kind_of(word)))
+            .count()
+    };
+    let quality = QUALITIES[0];
+    let mut session = Session::open(host, setup(asked, quality))?;
+    let before = fuel(&session.state()?);
+    let clock = Instant::now();
+    let mut last = None;
+    for at in 0..steps {
+        session.advance(1)?;
+        let phase = session.life.as_ref().map(|life| (life.phase, life.round));
+        if at % 64 == 0 || phase != last {
+            let (fire, smoke) = session.counts()?;
+            println!(
+                "step {} {phase:?} fire {fire} smoke {smoke} at {:.1} s",
+                session.steps,
+                clock.elapsed().as_secs_f64()
+            );
+        }
+        if phase.is_some_and(|(phase, _)| phase == life::Phase::After) && last != phase {
+            let after = fuel(&session.state()?);
+            println!(
+                "fuel {before} before the fire, {after} after it: {} burned",
+                before.saturating_sub(after)
+            );
+        }
+        last = phase;
+    }
+    Ok(())
+}
+
 fn use_tool(
     session: &mut Session<'_>,
     (x, y): (f32, f32),
@@ -642,20 +880,14 @@ fn measured(host: &Host, asked: &Asked) -> Result<(), Failed> {
     let quality = chosen(host, asked)?;
     let mut session = Session::open(host, setup(asked, quality))?;
     if !asked.gas {
-        session.example.table = session
-            .example
-            .table
-            .with(grit::rule3::heat::STEAM, grit::render3::Material::EMPTY);
-        session.held.write_at(
-            grit::layout::PIXELS as usize,
-            session.build.layout().table(),
-            &session.example.table.words(),
-        )?;
+        no_gas(&mut session)?;
     }
+    session.advance(asked.skip)?;
     let grid = session.grid();
-    let orbit = asked
-        .camera
-        .map_or_else(|| Orbit::start(grid), |at| framed(asked.which, at, grid));
+    let orbit = asked.camera.map_or_else(
+        || Orbit::start(asked.which, grid),
+        |at| framed(asked.which, at, grid),
+    );
     let camera = orbit_camera(&orbit, grid);
     let mut totals = Vec::with_capacity(TIMED);
     let mut parts: Vec<Vec<Duration>> = (0..2 + stage::COUNT)
@@ -685,10 +917,11 @@ fn measured(host: &Host, asked: &Asked) -> Result<(), Failed> {
     let (frame_min, frame_mid) = milliseconds(&mut totals);
     listed.sort_unstable();
     let mut line = format!(
-        "{} | {} {}^3 | {}x{} | quality {} suns {} | frames {WARM}..{} | listed octs median {} | frame {frame_min:.3}/{frame_mid:.3} ms",
+        "{} | {} {}^3 | {} MiB on the device | {}x{} | quality {} suns {} | frames {WARM}..{} | listed octs median {} | frame {frame_min:.3}/{frame_mid:.3} ms",
         host.name(),
         session.example.name,
         grid.wide,
+        session.bytes >> 20,
         session.build.screen.wide,
         session.build.screen.high,
         quality.name,

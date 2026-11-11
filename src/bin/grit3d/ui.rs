@@ -1,7 +1,7 @@
 use super::font::{Canvas, HIGH, width};
 use super::scenes::Tool;
 
-/// The number key of the first tool; keys 1 to 3 switch scenes.
+/// The number key of the first tool; keys 0 to 3 switch scenes.
 pub const FIRST_TOOL_KEY: u32 = 4;
 
 /// A box on the screen: its top left, width and height.
@@ -116,7 +116,7 @@ pub const HELP: [&str; 13] = [
     "CLICK              USE THE TOOL ONCE",
     "RIGHT DRAG         KEEP USING THE TOOL",
     "4 - 8 / CLICK BAR  PICK A TOOL",
-    "1  2  3            SAND, FIRE, CODE",
+    "0  1  2  3         VALLEY, SAND, FIRE, CODE",
     "R                  RESTART THE SCENE",
     "SPACE / N          PAUSE / ONE STEP",
     "A                  SHOW WHAT THE ENGINE STEPS",

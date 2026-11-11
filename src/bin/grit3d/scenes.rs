@@ -1,5 +1,5 @@
 use grit::geometry::Solid;
-use grit::render3::{Material, Table};
+use grit::render3::{Light, Material, Table};
 use grit::rule3::code;
 use grit::rule3::heat;
 use grit::sand::Grid;
@@ -13,19 +13,21 @@ pub struct Tool {
     pub radius: i32,
 }
 
-/// The three scenes, in the order of the keys that switch to them.
+/// The scenes, in the order of the keys that switch to them, from 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Which {
+    Valley,
     Sand,
     Fire,
     Code,
 }
 
 impl Which {
-    pub const ALL: [Self; 3] = [Self::Sand, Self::Fire, Self::Code];
+    pub const ALL: [Self; 4] = [Self::Valley, Self::Sand, Self::Fire, Self::Code];
 
     pub fn named(name: &str) -> Option<Self> {
         match name {
+            "valley" | "nature" => Some(Self::Valley),
             "sand" => Some(Self::Sand),
             "fire" | "heat" => Some(Self::Fire),
             "code" => Some(Self::Code),
@@ -35,6 +37,7 @@ impl Which {
 
     pub fn example(self) -> Example {
         match self {
+            Self::Valley => super::valley::example(),
             Self::Sand => sanded(),
             Self::Fire => fired(),
             Self::Code => coded(),
@@ -45,7 +48,10 @@ impl Which {
 /// A scene: its name, the rule that runs it and that rule's kind mapping,
 /// the rule's parameters, how its kinds look, its tools, how its world is
 /// made at a given grid, how many frames run before the first one shown,
-/// and how far toward dusk its light is.
+/// how far toward dusk its light is and how its light differs from the
+/// plain one, how many engine steps a second it runs at when it asks for
+/// a pace, the cycle it lives through on its own, if any, and the cells it
+/// writes before every engine step, found from its world.
 pub struct Example {
     pub name: &'static str,
     pub rule: &'static str,
@@ -55,6 +61,19 @@ pub struct Example {
     pub scene: fn(Grid) -> Vec<u32>,
     pub warm: u32,
     pub dusk: f32,
+    pub light: fn(Light) -> Light,
+    pub pace: Option<f32>,
+    pub life: Option<fn(Grid, &[u32]) -> super::life::Cycle>,
+    pub feed: Option<Feed>,
+}
+
+/// How a scene finds the cells it writes before every step from its world:
+/// each a cell index and its word.
+pub type Feed = fn(Grid, &[u32]) -> Vec<(u32, u32)>;
+
+/// The light as [`Light::at`] gives it.
+pub const fn plain(light: Light) -> Light {
+    light
 }
 
 fn put(cells: &mut [u32], grid: Grid, point: [i64; 3], word: u32) {
@@ -274,6 +293,10 @@ fn sanded() -> Example {
         ],
         warm: 60,
         dusk: 0.0,
+        light: plain,
+        pace: None,
+        life: None,
+        feed: None,
         scene: |grid| {
             let mut cells = vec![AIR; grid.cells()];
             let s = grid.wide as f32;
@@ -459,6 +482,10 @@ fn fired() -> Example {
         ],
         warm: 150,
         dusk: 0.0,
+        light: plain,
+        pace: None,
+        life: None,
+        feed: None,
         scene: |grid| {
             let mut cells = vec![cell(AIR, COLD); grid.cells()];
             let s = grid.wide as f32;
@@ -696,6 +723,10 @@ fn coded() -> Example {
         ],
         warm: 40,
         dusk: 0.35,
+        light: plain,
+        pace: None,
+        life: None,
+        feed: None,
         scene: |grid| {
             let mut cells = vec![word(NOP, 0, 0); grid.cells()];
             let (w, d, t) = (grid.wide, grid.deep, grid.tall);

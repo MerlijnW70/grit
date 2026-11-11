@@ -2,19 +2,26 @@ use std::time::Duration;
 
 use grit::compact::Plan;
 use grit::geometry::Solid;
-use grit::layout::{DENSE, Dimension, GRAND, PARAMS, PIXELS, STATE};
+use grit::layout::{DENSE, Dimension, GRAND, PARAMS, PIXELS, STATE, TALLY};
 use grit::render3::{
     self, Build, Camera, Frame, HIT_WORDS, INSIDE, Light, MISS, Screen, Steps, framed_words, stage,
 };
 use grit::rule3::code::Code;
 use grit::rule3::heat::Heat;
+use grit::rule3::nature::Nature;
 use grit::rule3::sand::Sand;
 use grit::rule3::{FIRST_PARAM, Rule};
 use grit::sand::Grid;
 use grit::view3::Kinds;
 use grit::{Groups, Host, Resident, live, sweep};
 
+use super::life::{Act, Cycle, Phase};
 use super::scenes::{Example, Tool, Which};
+use super::valley::FEED_EVERY;
+
+/// How many engine steps apart a burning world's fire and smoke are
+/// counted.
+pub const COUNT_EVERY: u32 = 4;
 
 pub type Failed = Box<dyn std::error::Error>;
 
@@ -60,6 +67,12 @@ pub struct Session<'h> {
     before: Option<Camera>,
     pub dusk: f32,
     pub steps: u32,
+    pub life: Option<Cycle>,
+    pub feed: Vec<(u32, u32)>,
+    /// The bytes of the buffers the session holds on the device.
+    pub bytes: usize,
+    start: Option<Vec<u32>>,
+    pub restarted: bool,
 }
 
 impl<'h> Session<'h> {
@@ -69,6 +82,9 @@ impl<'h> Session<'h> {
     pub fn open(host: &'h Host, setup: Setup) -> Result<Self, Failed> {
         let mut session = Self::cold(host, setup)?;
         session.warm(session.example.warm)?;
+        if session.life.is_some() {
+            session.start = Some(session.state()?);
+        }
         Ok(session)
     }
 
@@ -76,6 +92,7 @@ impl<'h> Session<'h> {
     pub fn cold(host: &'h Host, setup: Setup) -> Result<Self, Failed> {
         let example = setup.which.example();
         let mut session = match setup.which {
+            Which::Valley => Self::with(host, &Nature, example, setup)?,
             Which::Sand => Self::with(host, &Sand, example, setup)?,
             Which::Fire => Self::with(host, &Heat, example, setup)?,
             Which::Code => Self::with(host, &Code, example, setup)?,
@@ -128,11 +145,18 @@ impl<'h> Session<'h> {
         let layout = build.layout();
         let sizes = layout.sized(live::sizes3(rule, &plan));
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let bytes = sizes.iter().sum::<usize>() * 4;
         let mut held = host.resident(&sizes, &modules)?;
         for (binding, words) in sizes.iter().enumerate() {
             held.write(binding, &vec![0_u32; *words])?;
         }
-        held.write(STATE as usize, &(example.scene)(grid))?;
+        let world = (example.scene)(grid);
+        held.write(STATE as usize, &world)?;
+        let life = example.life.map(|made| made(grid, &world));
+        let feed = example
+            .feed
+            .map_or_else(Vec::new, |made| made(grid, &world));
+        drop(world);
         if !example.params.is_empty() {
             held.write_at(PARAMS as usize, FIRST_PARAM, &example.params)?;
         }
@@ -159,6 +183,11 @@ impl<'h> Session<'h> {
             before: None,
             dusk,
             steps: 0,
+            life,
+            feed,
+            bytes,
+            start: None,
+            restarted: false,
         })
     }
 
@@ -167,7 +196,7 @@ impl<'h> Session<'h> {
     }
 
     pub fn light(&self) -> Light {
-        Light::at(self.build.screen.high, VIEW, self.dusk)
+        (self.example.light)(Light::at(self.build.screen.high, VIEW, self.dusk))
     }
 
     /// Writes the scene words of the next frame, seen from `camera`, with
@@ -224,6 +253,9 @@ impl<'h> Session<'h> {
         steps: Steps,
         reading: bool,
     ) -> Result<(Duration, Vec<u32>), Failed> {
+        if moving {
+            self.fed()?;
+        }
         let all = self.stages(moving, steps);
         let groups: Vec<&[Groups]> = all.iter().map(Vec::as_slice).collect();
         let out = if reading {
@@ -235,8 +267,79 @@ impl<'h> Session<'h> {
         self.drawn = self.drawn.wrapping_add(1);
         if moving {
             self.steps = self.steps.wrapping_add(1);
+            self.lived()?;
         }
         Ok(out)
+    }
+
+    /// The fire and smoke cells of the world after the last step, as the
+    /// rule's tally counts them.
+    pub fn counts(&mut self) -> Result<(u32, u32), Failed> {
+        let words = self.held.read(TALLY as usize, 3)?;
+        Ok((
+            words.get(1).copied().unwrap_or(0),
+            words.get(2).copied().unwrap_or(0),
+        ))
+    }
+
+    /// Takes the scene's own cycle one step on, and does what it asks.
+    fn lived(&mut self) -> Result<(), Failed> {
+        let burning = self
+            .life
+            .as_ref()
+            .is_some_and(|life| life.phase == Phase::Burning);
+        let counted = if burning && self.steps.is_multiple_of(COUNT_EVERY) {
+            Some(self.counts()?)
+        } else {
+            None
+        };
+        let Some(life) = self.life.as_mut() else {
+            return Ok(());
+        };
+        match life.stepped(counted) {
+            Act::Nothing => {}
+            Act::Light(cells) => {
+                live::put3(&mut self.held, self.build.grid, &self.plan, &cells)?;
+            }
+            Act::Restart => self.restart()?,
+        }
+        Ok(())
+    }
+
+    /// Puts the world back as it was after its warm-up, at the frame it
+    /// was then.
+    pub fn restart(&mut self) -> Result<(), Failed> {
+        let Some(start) = self.start.as_ref() else {
+            return Ok(());
+        };
+        self.held.write(STATE as usize, start)?;
+        live::seed(&mut self.held, self.build.grid, &self.plan)?;
+        let warm = self.example.warm;
+        self.held
+            .write_at(PARAMS as usize, 0, &[warm.wrapping_sub(1)])?;
+        self.steps = warm;
+        self.restarted = true;
+        Ok(())
+    }
+
+    /// Runs `frames` frames of the engine, and the scene's own cycle, with
+    /// no picture.
+    pub fn advance(&mut self, frames: u32) -> Result<(), Failed> {
+        let mut all = self.stages.clone();
+        all.extend(
+            self.build
+                .stages(Steps::ALL)
+                .into_iter()
+                .map(|stage| stage.into_iter().map(|_| Groups::Fixed(0)).collect()),
+        );
+        for _ in 0..frames {
+            self.fed()?;
+            let groups: Vec<&[Groups]> = all.iter().map(Vec::as_slice).collect();
+            self.held.staged(&groups)?;
+            self.steps = self.steps.wrapping_add(1);
+            self.lived()?;
+        }
+        Ok(())
     }
 
     /// Runs `frames` frames of the engine alone, with no picture.
@@ -250,8 +353,80 @@ impl<'h> Session<'h> {
         );
         let groups: Vec<&[Groups]> = all.iter().map(Vec::as_slice).collect();
         for _ in 0..frames {
+            self.fed()?;
             self.held.staged(&groups)?;
             self.steps = self.steps.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// Writes the scene's feed, the cells it writes before every step.
+    fn fed(&mut self) -> Result<(), Failed> {
+        if !self.feed.is_empty() && self.steps.is_multiple_of(FEED_EVERY) {
+            let feed = std::mem::take(&mut self.feed);
+            let done = self.put_runs(&feed);
+            self.feed = feed;
+            done?;
+        }
+        Ok(())
+    }
+
+    /// Writes `cells`, each a cell index and its word, and wakes them as
+    /// [`live::put3`] does: the oct of either phase that holds each cell is
+    /// marked awake and hot and is on the list once, added after the octs
+    /// it held when it is not there yet. The words go in runs of
+    /// neighbouring indices, a write a run, so a feed of many cells costs a
+    /// few writes.
+    pub fn put_runs(&mut self, cells: &[(u32, u32)]) -> Result<(), Failed> {
+        use grit::layout::{AWAKE, HOT, INDIRECT};
+        use std::collections::BTreeSet;
+
+        let grid = self.build.grid;
+        let mut sorted = cells.to_vec();
+        sorted.sort_unstable_by_key(|&(cell, _)| cell);
+        sorted.dedup_by_key(|held| held.0);
+        if let Some(&(last, _)) = sorted.last()
+            && last as usize >= grid.cells()
+        {
+            return Err("a fed cell lies past the grid".into());
+        }
+        let grand = self
+            .held
+            .read(GRAND as usize, 1)?
+            .first()
+            .copied()
+            .unwrap_or(0);
+        for (start, words) in runs(sorted.iter().copied()) {
+            self.held.write_at(STATE as usize, start as usize, &words)?;
+        }
+        let woken: BTreeSet<u32> = sorted
+            .iter()
+            .flat_map(|&(cell, _)| (0..2).map(move |phase| Solid::held(grid, cell, phase).index))
+            .collect();
+        for (start, words) in runs(woken.iter().map(|&oct| (oct, 2))) {
+            self.held.write_at(AWAKE as usize, start as usize, &words)?;
+        }
+        let by = self.plan.per_block.trailing_zeros();
+        let hot: BTreeSet<u32> = woken.iter().map(|&oct| oct >> by).collect();
+        for (start, words) in runs(hot.iter().map(|&block| (block, 2))) {
+            self.held.write_at(HOT as usize, start as usize, &words)?;
+        }
+        let mut missing = woken;
+        for oct in self.held.read(DENSE as usize, grand as usize)? {
+            missing.remove(&oct);
+            if missing.is_empty() {
+                break;
+            }
+        }
+        if !missing.is_empty() {
+            let added: Vec<u32> = missing.into_iter().collect();
+            let count = grand.saturating_add(u32::try_from(added.len()).unwrap_or(u32::MAX));
+            self.held.write_at(DENSE as usize, grand as usize, &added)?;
+            self.held.write(GRAND as usize, &[count])?;
+            self.held.write(
+                INDIRECT as usize,
+                &[count.div_ceil(self.plan.subgroup), 1, 1],
+            )?;
         }
         Ok(())
     }
@@ -366,6 +541,22 @@ impl<'h> Session<'h> {
         }
         Ok(out)
     }
+}
+
+/// `pairs`, each an index and its word in rising order, gathered into runs
+/// of neighbouring indices: each run's first index and its words.
+pub fn runs(pairs: impl IntoIterator<Item = (u32, u32)>) -> Vec<(u32, Vec<u32>)> {
+    let mut out: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (at, word) in pairs {
+        if let Some((start, words)) = out.last_mut()
+            && u64::from(*start) + words.len() as u64 == u64::from(at)
+        {
+            words.push(word);
+            continue;
+        }
+        out.push((at, vec![word]));
+    }
+    out
 }
 
 /// The view of every camera, in radians.
