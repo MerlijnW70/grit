@@ -142,12 +142,15 @@ fn an_isolated_hot_spot_spreads_and_flattens() {
         let mut highest = 40_300;
         let mut lowest = 300;
         let mut frame = 0;
-        while highest > lowest + 1 {
+        let mut still = 0;
+        while still < 8 {
             assert!(
                 frame < 4096,
                 "{wide}x{deep}x{tall}: still {lowest} to {highest}"
             );
-            cells = reference(&Heat, grid, frame, &cells, &TUNED);
+            let next = reference(&Heat, grid, frame, &cells, &TUNED);
+            still = if next == cells { still + 1 } else { 0 };
+            cells = next;
             let now_high = cells
                 .iter()
                 .map(|&word| temperature_of(word))
@@ -171,8 +174,27 @@ fn an_isolated_hot_spot_spreads_and_flattens() {
         }
         assert_eq!(heat_of(&cells, |_| true), total);
         let even = u32::try_from(total / grid.cells() as u64).unwrap();
-        assert!(lowest == even, "{lowest} {even}");
-        println!("{wide}x{deep}x{tall}: flat at {lowest} to {highest} after {frame} frames");
+        assert!(
+            lowest <= even && even <= highest,
+            "{lowest} {even} {highest}"
+        );
+        for z in 0..tall {
+            for y in 0..deep {
+                for x in 0..wide {
+                    let here = temperature_of(cells[grid.index(x, y, z)]);
+                    for (dx, dy, dz) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+                        let there =
+                            cells[grid.index((x + dx) % wide, (y + dy) % deep, (z + dz) % tall)];
+                        assert!(
+                            here.abs_diff(temperature_of(there)) <= 1,
+                            "{wide}x{deep}x{tall}: ({x}, {y}, {z}) is {here}, its neighbour {}",
+                            temperature_of(there)
+                        );
+                    }
+                }
+            }
+        }
+        println!("{wide}x{deep}x{tall}: at rest from {lowest} to {highest} after {frame} frames");
     }
 }
 

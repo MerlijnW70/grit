@@ -24,7 +24,10 @@
 //! 2. **Diffusion** among the cells that conduct: every kind but [`WALL`] and
 //!    the inert kinds. Their total heat is shared out evenly; what does not
 //!    divide goes one degree each to the first conducting cells in corner
-//!    order. The total is kept exactly.
+//!    order. The total is kept exactly. An oct whose conducting cells differ
+//!    by one degree or less is left as it is: each share that acts then
+//!    strictly lowers the sum of the squared temperatures, so the heat comes
+//!    to rest.
 //! 3. **Movement**: in each of the four vertical pairs, a lighter cell under
 //!    a heavier one trades places with it, whole words, so heat moves with
 //!    its cell. Steam is lighter than air and air than water; the other
@@ -227,11 +230,22 @@ fn conducting<O: Ops>(ops: &mut O, word: O::Word) -> Flag<O::Word> {
 fn diffused_by<O: Ops>(ops: &mut O, cells: Octet<O::Word>) -> Octet<O::Word> {
     let conducts = cells.map(|word| conducting(ops, word));
     let mut total = ops.constant(0);
+    let mut warmest = ops.constant(0);
+    let mut coldest = ops.constant(u32::MAX);
     for corner in Corner::ALL {
         let warmth = ops.shift_right(cells[corner], HEAT_SHIFT);
         let held = ops.mul(warmth, conducts[corner].word());
         total = ops.add(total, held);
+        let warmer = ops.greater(warmth, warmest);
+        let warmer = ops.both(warmer, conducts[corner]);
+        warmest = ops.select(warmer, warmth, warmest);
+        let colder = ops.less(warmth, coldest);
+        let colder = ops.both(colder, conducts[corner]);
+        coldest = ops.select(colder, warmth, coldest);
     }
+    let gap = ops.sub(warmest, coldest);
+    let one = ops.constant(1);
+    let uneven = ops.greater(gap, one);
     let count = ops.count(conducts.0);
     let share = ops.div(total, count);
     let spread = ops.mul(share, count);
@@ -244,14 +258,17 @@ fn diffused_by<O: Ops>(ops: &mut O, cells: Octet<O::Word>) -> Octet<O::Word> {
         let extra = ops.greater(rest, rank);
         let temperature = ops.add(share, extra.word());
         let shared = with_temperature(ops, cells[corner], temperature);
-        out[corner] = ops.select(flag, shared, cells[corner]);
+        let acts = ops.both(flag, uneven);
+        out[corner] = ops.select(acts, shared, cells[corner]);
         rank = ops.add(rank, flag.word());
     }
     out
 }
 
 /// The diffusion of one oct: the heat of its conducting cells shared out
-/// evenly, the rest one degree each to the first of them in corner order.
+/// evenly, the rest one degree each to the first of them in corner order,
+/// but only when the warmest and the coldest of them differ by more than one
+/// degree. The total is kept exactly.
 #[must_use]
 pub fn diffused(cells: [u32; CORNERS]) -> [u32; CORNERS] {
     diffused_by(&mut Cpu, Octet(cells)).0
