@@ -29,9 +29,15 @@ pub const HEAD: usize = 4;
 
 pub const TIER_BINDINGS: u32 = 8;
 
+pub const LIST_BINDINGS: u32 = 2;
+
 pub const MOST_GROUPS: u32 = 65_535;
 
-pub const SPARSE_BINDINGS: u32 = 2 + TIER_BINDINGS;
+pub const SPARSE_BINDINGS: u32 = 2 + TIER_BINDINGS + LIST_BINDINGS;
+
+pub const SPAN: u32 = 1 << 16;
+
+pub const AWAKE_LEVEL: u32 = 2;
 
 pub const FLAT: &str = "a brick pool holds a solid grid laid out for three axes";
 pub const SMALL: &str = "a side of the grid is shorter than a brick's side";
@@ -58,6 +64,7 @@ pub struct Bricks {
     capacity: u32,
     windows: Windows,
     most: u32,
+    cold: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +166,7 @@ impl Bricks {
             capacity,
             windows,
             most: MOST_GROUPS,
+            cold: plan.padded(),
         })
     }
 
@@ -254,6 +262,41 @@ impl Bricks {
     }
 
     #[must_use]
+    pub const fn whole_list(&self) -> u32 {
+        self.windows.bindings() + 2 + TIER_BINDINGS
+    }
+
+    #[must_use]
+    pub const fn whole_count(&self) -> u32 {
+        self.whole_list() + 1
+    }
+
+    #[must_use]
+    pub const fn per_block(&self) -> u32 {
+        1 << self.octs_bits()
+    }
+
+    #[must_use]
+    pub const fn pool_octs(&self) -> u32 {
+        self.capacity * self.per_block()
+    }
+
+    #[must_use]
+    pub const fn dump(&self) -> u32 {
+        self.pool_octs()
+    }
+
+    #[must_use]
+    pub const fn whole_tier(&self) -> Tier {
+        let tier = self.tier();
+        Tier {
+            dense: self.whole_list(),
+            grand: self.whole_count(),
+            ..tier
+        }
+    }
+
+    #[must_use]
     pub const fn tier(&self) -> Tier {
         let first = self.windows.bindings() + 2;
         Tier {
@@ -275,9 +318,24 @@ impl Bricks {
 
     #[must_use]
     pub fn sizes<R: Rule>(&self, rule: &R, plan: &Plan) -> Vec<usize> {
+        use crate::layout::{AWAKE, BUCKETS};
+
         let mut sizes = live::sizes3(rule, plan);
-        if let Some(state) = sizes.get_mut(STATE as usize) {
-            *state = self.pool_words();
+        let capacity = self.capacity as usize;
+        let pool_octs = self.pool_octs() as usize;
+        let subgroup = plan.subgroup as usize;
+        for (binding, words) in [
+            (STATE, self.pool_words()),
+            (AWAKE, pool_octs + SPAN as usize),
+            (
+                BUCKETS,
+                capacity * crate::sweep::stride(plan.subgroup) as usize,
+            ),
+            (DENSE, pool_octs + capacity * subgroup + 1),
+        ] {
+            if let Some(size) = sizes.get_mut(binding as usize) {
+                *size = words;
+            }
         }
         let mut bound = self.windows.laid(&sizes);
         bound.resize(self.windows.bindings() as usize, 1);
@@ -293,9 +351,11 @@ impl Bricks {
             hot_padded,
             hot_padded,
             per_block,
-            padded + tiles * plan.subgroup as usize,
+            padded + tiles * subgroup,
             1,
             3,
+            padded + tiles * subgroup,
+            1,
         ]);
         bound
     }
@@ -578,14 +638,7 @@ impl Bricks {
         cells
     }
 
-    pub fn put(
-        &self,
-        held: &mut Resident<'_>,
-        plan: &Plan,
-        cells: &[(u32, u32)],
-    ) -> Result<(), Error> {
-        use crate::layout::{AWAKE, HOT, INDIRECT};
-
+    pub fn put(&self, held: &mut Resident<'_>, cells: &[(u32, u32)]) -> Result<(), Error> {
         let grid = self.grid;
         let past = grid.cells();
         if let Some(&(cell, _)) = cells.iter().find(|(cell, _)| *cell as usize >= past) {
@@ -595,6 +648,35 @@ impl Bricks {
                 held: past,
             });
         }
+        let points: Vec<([u32; 3], u32)> = cells
+            .iter()
+            .map(|&(cell, word)| (Solid::point(grid, cell), word))
+            .collect();
+        self.put_at(held, &points)
+    }
+
+    pub fn put_at(&self, held: &mut Resident<'_>, cells: &[([u32; 3], u32)]) -> Result<(), Error> {
+        use std::collections::BTreeSet;
+
+        use crate::layout::{AWAKE, HOT};
+
+        let grid = self.grid;
+        let sides = [grid.wide, grid.deep, grid.tall];
+        if let Some(&(point, _)) = cells
+            .iter()
+            .find(|(point, _)| point.iter().zip(sides).any(|(&at, side)| at >= side))
+        {
+            let needed = point
+                .iter()
+                .zip(sides)
+                .map(|(&at, side)| u64::from(at.max(side)))
+                .product::<u64>();
+            return Err(Error::Overrun {
+                index: STATE as usize,
+                needed: usize::try_from(needed).unwrap_or(usize::MAX),
+                held: grid.cells(),
+            });
+        }
         self.check(held)?;
         let mut table = held.read(self.table() as usize, self.table_words())?;
         let mut header = held.read(self.slots() as usize, HEAD)?;
@@ -602,15 +684,11 @@ impl Bricks {
         let stack = held.read(self.slots() as usize, HEAD + top)?;
         let mut top = top;
         let per = self.cells();
+        let per_block = self.per_block() as usize;
 
-        let grand = held.read(GRAND as usize, 1)?.first().copied().unwrap_or(0);
-        let mut octs: std::collections::BTreeSet<u32> = held
-            .read(DENSE as usize, grand as usize)?
-            .into_iter()
-            .collect();
-        let mut wanted = std::collections::BTreeSet::new();
-        for &(cell, word) in cells {
-            let Cell { brick, .. } = self.cell_of(Solid::point(grid, cell));
+        let mut wanted = BTreeSet::new();
+        for &(point, word) in cells {
+            let Cell { brick, .. } = self.cell_of(point);
             let entry = brick as usize * ENTRY;
             let slot = table.get(entry).copied().unwrap_or(UNIFORM);
             let value = table.get(entry + VALUE).copied().unwrap_or_default();
@@ -624,9 +702,20 @@ impl Bricks {
             });
         }
 
-        let mut woken = std::collections::BTreeSet::new();
-        for &(cell, word) in cells {
-            let Cell { brick, offset } = self.cell_of(Solid::point(grid, cell));
+        let (octs, bricks) = self.listed(held)?;
+        let mut listed: BTreeSet<u32> = held
+            .read(DENSE as usize, octs as usize)?
+            .into_iter()
+            .collect();
+        let mut whole: BTreeSet<u32> = held
+            .read(self.whole_list() as usize, bricks as usize)?
+            .into_iter()
+            .collect();
+
+        let levels = held.read(HOT as usize, self.count() as usize)?;
+        let mut woken = BTreeSet::new();
+        for &(point, word) in cells {
+            let Cell { brick, offset } = self.cell_of(point);
             let entry = brick as usize * ENTRY;
             let slot = table.get(entry).copied().unwrap_or(UNIFORM);
             let value = table.get(entry + VALUE).copied().unwrap_or_default();
@@ -642,6 +731,12 @@ impl Bricks {
                 };
                 top -= 1;
                 live::write_state(held, self.windows, taken as usize * per, &vec![value; per])?;
+                let level = levels.get(brick as usize).copied().unwrap_or_default();
+                held.write_at(
+                    AWAKE as usize,
+                    taken as usize * per_block,
+                    &vec![level; per_block],
+                )?;
                 if let Some(place) = table.get_mut(entry) {
                     *place = taken;
                 }
@@ -657,8 +752,7 @@ impl Bricks {
                 )?;
             }
             for phase in 0..2 {
-                let holder = Solid::held(grid, cell, phase);
-                woken.insert(self.oct_of(holder.block));
+                woken.insert(self.oct_of(self.holder(point, phase)));
             }
         }
         if let Some(word) = header.get_mut(TOP) {
@@ -666,17 +760,100 @@ impl Bricks {
         }
         held.write(self.slots() as usize, &header)?;
 
-        let by = plan.per_block.trailing_zeros();
+        let by = self.octs_bits();
         for &oct in &woken {
-            held.write_at(AWAKE as usize, oct as usize, &[2])?;
-            held.write_at(HOT as usize, (oct >> by) as usize, &[2])?;
+            let brick = oct >> by;
+            held.write_at(HOT as usize, brick as usize, &[AWAKE_LEVEL])?;
+            let slot = table
+                .get(brick as usize * ENTRY)
+                .copied()
+                .unwrap_or(UNIFORM);
+            if slot == UNIFORM {
+                whole.insert(brick);
+                continue;
+            }
+            let local = (oct & (self.per_block() - 1)) as usize;
+            held.write_at(
+                AWAKE as usize,
+                slot as usize * per_block + local,
+                &[AWAKE_LEVEL],
+            )?;
+            if !whole.contains(&brick) {
+                listed.insert(oct);
+            }
         }
-        octs.extend(woken);
-        let list: Vec<u32> = octs.into_iter().collect();
-        let count = u32::try_from(list.len()).unwrap_or(u32::MAX);
-        held.write(DENSE as usize, &list)?;
-        held.write(GRAND as usize, &[count])?;
-        held.write(INDIRECT as usize, &[count.div_ceil(plan.subgroup), 1, 1])
+        listed.retain(|oct| !whole.contains(&(oct >> by)));
+        self.list(
+            held,
+            &listed.into_iter().collect::<Vec<_>>(),
+            &whole.into_iter().collect::<Vec<_>>(),
+        )
+    }
+
+    #[must_use]
+    pub fn holder(&self, point: [u32; 3], phase: u32) -> [u32; 3] {
+        let sides = [self.grid.wide, self.grid.deep, self.grid.tall];
+        let mut block = [0; 3];
+        for ((slot, at), side) in block.iter_mut().zip(point).zip(sides) {
+            let shifted = (at + side - (phase & 1)) % side;
+            *slot = shifted / 2;
+        }
+        block
+    }
+
+    pub fn listed(&self, held: &mut Resident<'_>) -> Result<(u32, u32), Error> {
+        let octs = held.read(GRAND as usize, 1)?.first().copied().unwrap_or(0);
+        let bricks = held
+            .read(self.whole_count() as usize, 1)?
+            .first()
+            .copied()
+            .unwrap_or(0);
+        Ok((octs, bricks))
+    }
+
+    fn list(&self, held: &mut Resident<'_>, octs: &[u32], bricks: &[u32]) -> Result<(), Error> {
+        use crate::layout::INDIRECT;
+
+        let octs_count = u32::try_from(octs.len()).unwrap_or(u32::MAX);
+        let bricks_count = u32::try_from(bricks.len()).unwrap_or(u32::MAX);
+        if !octs.is_empty() {
+            held.write(DENSE as usize, octs)?;
+        }
+        if !bricks.is_empty() {
+            held.write(self.whole_list() as usize, bricks)?;
+        }
+        held.write(GRAND as usize, &[octs_count])?;
+        held.write(self.whole_count() as usize, &[bricks_count])?;
+        let groups =
+            octs_count.div_ceil(self.subgroup) + bricks_count * (self.per_block() / self.subgroup);
+        held.write(INDIRECT as usize, &[groups, 1, 1])
+    }
+
+    pub fn seed(&self, held: &mut Resident<'_>, plan: &Plan) -> Result<(), Error> {
+        use crate::layout::{AWAKE, HOT, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, TALLY};
+
+        let first = held.read(PARAMS as usize, 1)?;
+        let frame = first.first().copied().unwrap_or(u32::MAX);
+        held.write(PARAMS as usize, &[frame, self.dump()])?;
+        let table = held.read(self.table() as usize, self.table_words())?;
+        let per_block = self.per_block() as usize;
+        let marked = vec![AWAKE_LEVEL; per_block];
+        for brick in 0..self.count() as usize {
+            let slot = table.get(brick * ENTRY).copied().unwrap_or(UNIFORM);
+            if slot != UNIFORM {
+                held.write_at(AWAKE as usize, slot as usize * per_block, &marked)?;
+            }
+        }
+        let count = self.count();
+        held.write(HOT as usize, &vec![AWAKE_LEVEL; count as usize])?;
+        held.write_at(HOT as usize, self.cold as usize, &[0])?;
+        held.write(HOT_DENSE as usize, &(0..count).collect::<Vec<u32>>())?;
+        held.write(HOT_GRAND as usize, &[count])?;
+        held.write(HOT_INDIRECT as usize, &[count, 1, 1])?;
+        let hot_counts = plan.hot_tiles as usize * plan.per_block as usize;
+        held.write(HOT_COUNTS as usize, &vec![0; hot_counts.max(1)])?;
+        held.write(TALLY as usize, &vec![0; Dimension::Three.tally_words()])?;
+        self.list(held, &[], &(0..count).collect::<Vec<u32>>())
     }
 }
 
@@ -715,6 +892,119 @@ fn ones<const LANES: u32>(
     lanes.select(truth, one, none)
 }
 
+fn listed_oct<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    bricks: &Bricks,
+    slot: Id,
+) -> Result<(Id, Vector<U32, LANES>), LaneError> {
+    let subgroup = bricks.subgroup;
+    let head = kernel.module().constant_u32(0)?;
+    let grand = kernel.load_at(GRAND, head)?;
+    let whole = kernel.load_at(bricks.whole_count(), head)?;
+    let (dense_at, whole_at, local, in_list, inside) = {
+        let mut lanes = kernel.lanes()?;
+        let here = lanes.splat_id::<U32, LANES>(slot)?;
+        let listed = lanes.splat_id::<U32, LANES>(grand)?;
+        let bricks_listed = lanes.splat_id::<U32, LANES>(whole)?;
+        let short = lanes.splat_bits::<U32, LANES>(subgroup - 1)?;
+        let mask = lanes.splat_bits::<U32, LANES>(!(subgroup - 1))?;
+        let by = lanes.splat_bits::<U32, LANES>(bricks.octs_bits())?;
+        let low = lanes.splat_bits::<U32, LANES>(bricks.per_block() - 1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let rounded = lanes.add(listed, short)?;
+        let rounded = lanes.and(rounded, mask)?;
+        let in_list = lanes.greater_than(rounded, here)?;
+        let past = lanes.sub(here, rounded)?;
+        let which = lanes.shift_right_logical(past, by)?;
+        let local = lanes.and(past, low)?;
+        let in_dense = lanes.greater_than(listed, here)?;
+        let in_whole = lanes.greater_than(bricks_listed, which)?;
+        let dense_at = lanes.select(in_list, here, none)?;
+        let whole_at = lanes.select(in_whole, which, none)?;
+        let whole_at = lanes.select(in_list, none, whole_at)?;
+        let in_dense = ones(&mut lanes, in_dense)?;
+        let in_whole = ones(&mut lanes, in_whole)?;
+        let inside = lanes.select(in_list, in_dense, in_whole)?;
+        (
+            dense_at,
+            whole_at,
+            local,
+            ones(&mut lanes, in_list)?,
+            inside,
+        )
+    };
+    let from_list = kernel.load_at(DENSE, dense_at.id())?;
+    let brick = kernel.load_at(bricks.whole_list(), whole_at.id())?;
+    let oct = {
+        let mut lanes = kernel.lanes()?;
+        let from_list = lanes.splat_id::<U32, LANES>(from_list)?;
+        let brick = lanes.splat_id::<U32, LANES>(brick)?;
+        let by = lanes.splat_bits::<U32, LANES>(bricks.octs_bits())?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let lifted = lanes.shift_left(brick, by)?;
+        let from_brick = lanes.add(lifted, local)?;
+        let listed = lanes.greater_than(in_list, none)?;
+        lanes.select(listed, from_list, from_brick)?
+    };
+    Ok((oct.id(), inside))
+}
+
+fn wake<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    bricks: &Bricks,
+    at: [Vector<U32, LANES>; 3],
+    waking: Vector<U32, LANES>,
+    slot: Id,
+) -> Result<(), LaneError> {
+    use crate::geometry::Solid;
+    use crate::layout::{AWAKE, HOT};
+
+    let table = bricks.table();
+    crate::gate::if_any::<LANES, _>(kernel, waking.id(), |kernel| {
+        for offset in Solid::near() {
+            let (entry_at, brick, local) = {
+                let mut lanes = kernel.lanes()?;
+                let near = bricks.neighbour(&mut Emit::<LANES>(&mut lanes), at, offset)?;
+                let by = lanes.splat_bits::<U32, LANES>(bricks.octs_bits())?;
+                let low = lanes.splat_bits::<U32, LANES>(bricks.per_block() - 1)?;
+                let four = lanes.splat_bits::<U32, LANES>(ENTRY as u32)?;
+                let brick = lanes.shift_right_logical(near, by)?;
+                let local = lanes.and(near, low)?;
+                (lanes.mul(brick, four)?, brick, local)
+            };
+            let entry = kernel.load_at(table, entry_at.id())?;
+            let (flag_at, hot_at) = {
+                let mut lanes = kernel.lanes()?;
+                let entry = lanes.splat_id::<U32, LANES>(entry)?;
+                let here = lanes.splat_id::<U32, LANES>(slot)?;
+                let uniform = lanes.splat_bits::<U32, LANES>(UNIFORM)?;
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                let per = lanes.splat_bits::<U32, LANES>(bricks.per_block())?;
+                let span = lanes.splat_bits::<U32, LANES>(SPAN - 1)?;
+                let past = lanes.splat_bits::<U32, LANES>(bricks.pool_octs())?;
+                let cold = lanes.splat_bits::<U32, LANES>(bricks.cold)?;
+                let held = lanes.not_equal(entry, uniform)?;
+                let held = ones(&mut lanes, held)?;
+                let both = lanes.mul(held, waking)?;
+                let both = lanes.greater_than(both, none)?;
+                let wakes = lanes.greater_than(waking, none)?;
+                let start = lanes.mul(entry, per)?;
+                let flag = lanes.add(start, local)?;
+                let spread = lanes.and(here, span)?;
+                let scratch = lanes.add(past, spread)?;
+                (
+                    lanes.select(both, flag, scratch)?,
+                    lanes.select(wakes, brick, cold)?,
+                )
+            };
+            let mark = kernel.module().constant_u32(AWAKE_LEVEL)?;
+            kernel.store_at(AWAKE, flag_at.id(), mark)?;
+            kernel.store_at(HOT, hot_at.id(), mark)?;
+        }
+        Ok(())
+    })
+}
+
 fn settled<const LANES: u32, R: Rule>(
     rule: &R,
     bricks: &Bricks,
@@ -736,30 +1026,13 @@ fn settled<const LANES: u32, R: Rule>(
     let slot = kernel.module().i_add(uint, base, lane)?;
 
     let (frame, params) = frame_and_params(&mut kernel, rule)?;
-    let second = kernel.module().constant_u32(1)?;
-    let dump_base = kernel.load_at(PARAMS, second)?;
 
-    let (oct, inside, counted_in) = match listing {
-        Listing::Listed => {
-            let head = kernel.module().constant_u32(0)?;
-            let grand = kernel.load_at(GRAND, head)?;
-            let claimed = kernel.load_at(DENSE, dump_base)?;
-            let (inside, counted_in) = {
-                let mut lanes = kernel.lanes()?;
-                let here = lanes.splat_id::<U32, LANES>(slot)?;
-                let listed = lanes.splat_id::<U32, LANES>(grand)?;
-                let added = lanes.splat_id::<U32, LANES>(claimed)?;
-                let total = lanes.add(listed, added)?;
-                let settled = lanes.greater_than(total, here)?;
-                let counted = lanes.greater_than(listed, here)?;
-                (ones(&mut lanes, settled)?, ones(&mut lanes, counted)?)
-            };
-            (kernel.load_at(DENSE, slot)?, inside, counted_in)
-        }
+    let (oct, inside) = match listing {
+        Listing::Listed => listed_oct::<LANES>(&mut kernel, bricks, slot)?,
         Listing::Every => {
             let mut lanes = kernel.lanes()?;
             let one = lanes.splat_bits::<U32, LANES>(1)?;
-            (slot, one, one)
+            (slot, one)
         }
     };
 
@@ -917,7 +1190,7 @@ fn settled<const LANES: u32, R: Rule>(
             }
 
             if listing == Listing::Listed {
-                let (touched, waking, counting) = {
+                let (waking, counting) = {
                     let mut lanes = kernel.lanes()?;
                     let one = lanes.splat_bits::<U32, LANES>(1)?;
                     let none = lanes.splat_bits::<U32, LANES>(0)?;
@@ -928,19 +1201,10 @@ fn settled<const LANES: u32, R: Rule>(
                         let differs = lanes.select(same, none, one)?;
                         touched = lanes.add(touched, differs)?;
                     }
-                    let running = lanes.greater_than(go, none)?;
-                    let counting = lanes.select(running, counted_in, none)?;
-                    (touched, go, counting)
+                    (lanes.mul(touched, go)?, go)
                 };
-                let grid = bricks.grid;
                 let at = placed.block;
-                live::woken_by::<LANES, 3, 8, 27, _>(
-                    &mut kernel,
-                    live::Block { subgroup, grid, at },
-                    [touched, waking],
-                    dump_base,
-                    |lanes, offset| bricks.neighbour(&mut Emit::<LANES>(lanes), at, offset),
-                )?;
+                wake::<LANES>(&mut kernel, bricks, at, waking, slot)?;
                 live::tally3::<LANES>(
                     &mut kernel,
                     live::Tallied3 {
@@ -1281,8 +1545,10 @@ fn take_one<const LANES: u32>(
     };
     let slot = kernel.load_at(slots, pop.id())?;
     let value = kernel.load_at(table, value_at.id())?;
+    let level = kernel.load_at(crate::layout::HOT, brick)?;
     let per_lane = u32::try_from(bricks.cells()).unwrap_or(u32::MAX) / subgroup;
-    let start = {
+    let flags_per_lane = bricks.per_block() / subgroup;
+    let (start, flags_from) = {
         let mut lanes = kernel.lanes()?;
         let slot = lanes.splat_id::<U32, LANES>(slot)?;
         let seat = lanes.splat_id::<U32, LANES>(lane)?;
@@ -1290,7 +1556,14 @@ fn take_one<const LANES: u32>(
         let run = lanes.splat_bits::<U32, LANES>(per_lane)?;
         let first = lanes.shift_left(slot, by)?;
         let along = lanes.mul(seat, run)?;
-        lanes.add(first, along)?
+        let by = lanes.splat_bits::<U32, LANES>(bricks.octs_bits())?;
+        let flags_run = lanes.splat_bits::<U32, LANES>(flags_per_lane)?;
+        let flags_first = lanes.shift_left(slot, by)?;
+        let flags_along = lanes.mul(seat, flags_run)?;
+        (
+            lanes.add(first, along)?,
+            lanes.add(flags_first, flags_along)?,
+        )
     };
     let taking = {
         let mut lanes = kernel.lanes()?;
@@ -1310,6 +1583,17 @@ fn take_one<const LANES: u32>(
                 let one = kernel.module().constant_u32(1)?;
                 Ok(vec![kernel.module().i_add(uint, at, one)?])
             })?;
+        let _ = kernel.repeat_rolled_many(
+            flags_per_lane,
+            uint,
+            &[flags_from.id()],
+            |kernel, carried, _| {
+                let at = carried.first().copied().unwrap_or(head);
+                kernel.store_at(crate::layout::AWAKE, at, level)?;
+                let one = kernel.module().constant_u32(1)?;
+                Ok(vec![kernel.module().i_add(uint, at, one)?])
+            },
+        )?;
         kernel.store_at(table, entry_at.id(), slot)
     })?;
     let over_at = {
@@ -1322,6 +1606,247 @@ fn take_one<const LANES: u32>(
     };
     let one = kernel.module().constant_u32(1)?;
     kernel.store_at(slots, over_at.id(), one)
+}
+
+fn held_or_not(kernel: &mut Kernel<U32>, entry: Id) -> Result<(Id, Id), LaneError> {
+    use simdr::module::op;
+
+    let truth = kernel.module().type_bool()?;
+    let uniform = kernel.module().constant_u32(UNIFORM)?;
+    let held = kernel
+        .module()
+        .binary(op::I_NOT_EQUAL, truth, entry, uniform)?;
+    let not_held = kernel.module().binary(op::I_EQUAL, truth, entry, uniform)?;
+    Ok((held, not_held))
+}
+
+fn lowered<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    was: Vector<U32, LANES>,
+) -> Result<Vector<U32, LANES>, LaneError> {
+    let one = lanes.splat_bits::<U32, LANES>(1)?;
+    let floored = lanes.max(was, one)?;
+    lanes.sub(floored, one)
+}
+
+pub fn decay(bricks: &Bricks, over: Over) -> Result<Vec<u32>, LaneError> {
+    let subgroup = bricks.subgroup;
+    widths!(subgroup, decayed, [], (bricks, over))
+}
+
+fn decayed<const LANES: u32>(bricks: &Bricks, over: Over) -> Result<Vec<u32>, LaneError> {
+    use crate::layout::{AWAKE, HOT};
+    use crate::sweep::PER_LANE;
+
+    let subgroup = bricks.subgroup;
+    let table = bricks.table();
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, bricks.bindings()))?;
+    let uint = kernel.index_type();
+    let block = crate::compact::owned(&mut kernel, over)?;
+    let lane = kernel.local_index();
+    let four = kernel.module().constant_u32(ENTRY as u32)?;
+    let at = kernel.module().i_mul(uint, block, four)?;
+    let entry = kernel.load_at(table, at)?;
+    let (held, not_held) = held_or_not(&mut kernel, entry)?;
+
+    live::lane_if(&mut kernel, held, |kernel| {
+        let uint = kernel.index_type();
+        let span = kernel.module().constant_u32(bricks.per_block())?;
+        let start = kernel.module().i_mul(uint, entry, span)?;
+        let run = kernel.module().constant_u32(PER_LANE)?;
+        let along = kernel.module().i_mul(uint, lane, run)?;
+        let mine = kernel.module().i_add(uint, start, along)?;
+        let mut places = Vec::with_capacity(PER_LANE as usize);
+        let mut was = Vec::with_capacity(PER_LANE as usize);
+        for offset in 0..PER_LANE {
+            let along = kernel.module().constant_u32(offset)?;
+            let place = kernel.module().i_add(uint, mine, along)?;
+            was.push(kernel.load_at(AWAKE, place)?);
+            places.push(place);
+        }
+        let mut highest = kernel.module().constant_u32(0)?;
+        for (&place, &held) in places.iter().zip(&was) {
+            let (lower, top) = {
+                let mut lanes = kernel.lanes()?;
+                let held = lanes.splat_id::<U32, 1>(held)?;
+                let lower = lowered(&mut lanes, held)?;
+                let so_far = lanes.splat_id::<U32, 1>(highest)?;
+                (lower, lanes.max(so_far, lower)?)
+            };
+            kernel.store_at(AWAKE, place, lower.id())?;
+            highest = top.id();
+        }
+        let flag = {
+            let mut lanes = kernel.lanes()?;
+            let mine = lanes.splat_id::<U32, LANES>(highest)?;
+            lanes.reduce_max::<U32, LANES>(mine)?
+        };
+        kernel.store_at(HOT, block, flag)
+    })?;
+    live::lane_if(&mut kernel, not_held, |kernel| {
+        let level = kernel.load_at(HOT, block)?;
+        let lower = {
+            let mut lanes = kernel.lanes()?;
+            let level = lanes.splat_id::<U32, 1>(level)?;
+            lowered(&mut lanes, level)?
+        };
+        kernel.store_at(HOT, block, lower.id())
+    })?;
+    kernel.finish()
+}
+
+pub fn mark(bricks: &Bricks, over: Over) -> Result<Vec<u32>, LaneError> {
+    let subgroup = bricks.subgroup;
+    widths!(subgroup, marked, [], (bricks, over))
+}
+
+fn marked<const LANES: u32>(bricks: &Bricks, over: Over) -> Result<Vec<u32>, LaneError> {
+    use crate::layout::AWAKE;
+    use crate::sweep::{self, PER_LANE};
+
+    let subgroup = bricks.subgroup;
+    let table = bricks.table();
+    let fine = Tier::FINE;
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, bricks.bindings()))?;
+    let uint = kernel.index_type();
+    let block = crate::compact::owned(&mut kernel, over)?;
+    let lane = kernel.local_index();
+    let four = kernel.module().constant_u32(ENTRY as u32)?;
+    let at = kernel.module().i_mul(uint, block, four)?;
+    let entry = kernel.load_at(table, at)?;
+    let (held, _) = held_or_not(&mut kernel, entry)?;
+
+    live::lane_if(&mut kernel, held, |kernel| {
+        let uint = kernel.index_type();
+        let span = kernel.module().constant_u32(bricks.per_block())?;
+        let run = kernel.module().constant_u32(PER_LANE)?;
+        let along = kernel.module().i_mul(uint, lane, run)?;
+        let start = kernel.module().i_mul(uint, entry, span)?;
+        let mine = kernel.module().i_add(uint, start, along)?;
+        let first = kernel.module().i_mul(uint, block, span)?;
+        let named = kernel.module().i_add(uint, first, along)?;
+        let wide = kernel.module().constant_u32(sweep::stride(subgroup))?;
+        let region = kernel.module().i_mul(uint, entry, wide)?;
+        let dump_start = kernel.module().i_add(uint, region, span)?;
+        let dump_mine = kernel.module().i_add(uint, dump_start, lane)?;
+
+        let mut octs = Vec::with_capacity(PER_LANE as usize);
+        let mut flags = Vec::with_capacity(PER_LANE as usize);
+        for step in 0..PER_LANE {
+            let along = kernel.module().constant_u32(step)?;
+            let place = kernel.module().i_add(uint, mine, along)?;
+            flags.push(kernel.load_at(AWAKE, place)?);
+            octs.push(kernel.module().i_add(uint, named, along)?);
+        }
+        let mut serial = Vec::with_capacity(PER_LANE as usize);
+        let carried = {
+            let mut lanes = kernel.lanes()?;
+            let mut running = lanes.splat_bits::<U32, LANES>(0)?;
+            for &flag in &flags {
+                let held = lanes.splat_id::<U32, LANES>(flag)?;
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                let listed = lanes.greater_than(held, none)?;
+                let counted = ones(&mut lanes, listed)?;
+                serial.push(running);
+                running = lanes.add(running, counted)?;
+            }
+            running
+        };
+        let (before, total) = {
+            let mut lanes = kernel.lanes()?;
+            let before = lanes.prefix_sum_exclusive::<U32, LANES>(carried)?;
+            let total = lanes.reduce_sum::<U32, LANES>(carried)?;
+            (before, total)
+        };
+        kernel.store_at(fine.counts, block, total)?;
+        for ((oct, &flag), earlier) in octs.iter().zip(&flags).zip(serial) {
+            let place = {
+                let mut lanes = kernel.lanes()?;
+                let here = lanes.splat_id::<U32, LANES>(region)?;
+                let elsewhere = lanes.splat_id::<U32, LANES>(dump_mine)?;
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                let awake = lanes.splat_id::<U32, LANES>(flag)?;
+                let within = lanes.add(before, earlier)?;
+                let bucket = lanes.add(here, within)?;
+                let listed = lanes.greater_than(awake, none)?;
+                lanes.select(listed, bucket, elsewhere)?
+            };
+            kernel.store_at(fine.buckets, place.id(), *oct)?;
+        }
+        Ok(())
+    })?;
+    kernel.finish()
+}
+
+pub fn wholes(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
+    let subgroup = bricks.subgroup;
+    widths!(subgroup, wholed, [], (bricks))
+}
+
+fn wholed<const LANES: u32>(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
+    use crate::layout::HOT;
+
+    let subgroup = bricks.subgroup;
+    let table = bricks.table();
+    let tier = bricks.tier();
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, bricks.bindings()))?;
+    let brick = per_brick(&mut kernel, subgroup)?;
+    let (at, hot_at) = {
+        let mut lanes = kernel.lanes()?;
+        let here = lanes.splat_id::<U32, LANES>(brick)?;
+        let count = lanes.splat_bits::<U32, LANES>(bricks.count())?;
+        let cold = lanes.splat_bits::<U32, LANES>(bricks.cold)?;
+        let four = lanes.splat_bits::<U32, LANES>(ENTRY as u32)?;
+        let inside = lanes.greater_than(count, here)?;
+        let clamped = lanes.select(inside, here, count)?;
+        let hot_at = lanes.select(inside, here, cold)?;
+        (lanes.mul(clamped, four)?, hot_at)
+    };
+    let entry = kernel.load_at(table, at.id())?;
+    let level = kernel.load_at(HOT, hot_at.id())?;
+    let flag = {
+        let mut lanes = kernel.lanes()?;
+        let entry = lanes.splat_id::<U32, LANES>(entry)?;
+        let level = lanes.splat_id::<U32, LANES>(level)?;
+        let uniform = lanes.splat_bits::<U32, LANES>(UNIFORM)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let empty = lanes.equal(entry, uniform)?;
+        let empty = ones(&mut lanes, empty)?;
+        let awake = lanes.greater_than(level, none)?;
+        let awake = ones(&mut lanes, awake)?;
+        lanes.mul(empty, awake)?
+    };
+    kernel.store_at(tier.flags, hot_at.id(), flag.id())?;
+    kernel.finish()
+}
+
+pub fn listing(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
+    use crate::layout::INDIRECT;
+    use simdr::module::op;
+
+    let subgroup = bricks.subgroup;
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, 1, bricks.bindings()))?;
+    let uint = kernel.index_type();
+    let head = kernel.module().constant_u32(0)?;
+    let grand = kernel.load_at(GRAND, head)?;
+    let whole = kernel.load_at(bricks.whole_count(), head)?;
+    let short = kernel.module().constant_u32(subgroup - 1)?;
+    let by = kernel.module().constant_u32(subgroup.trailing_zeros())?;
+    let per = kernel
+        .module()
+        .constant_u32(bricks.per_block() / subgroup)?;
+    let rounded = kernel.module().i_add(uint, grand, short)?;
+    let groups = kernel
+        .module()
+        .binary(op::SHIFT_RIGHT_LOGICAL, uint, rounded, by)?;
+    let more = kernel.module().i_mul(uint, whole, per)?;
+    let total = kernel.module().i_add(uint, groups, more)?;
+    let one = kernel.module().constant_u32(1)?;
+    let two = kernel.module().constant_u32(2)?;
+    kernel.store_at(INDIRECT, head, total)?;
+    kernel.store_at(INDIRECT, one, one)?;
+    kernel.store_at(INDIRECT, two, one)?;
+    kernel.finish()
 }
 
 fn brick_scans(subgroup: u32, plan: &Plan, tier: Tier) -> Result<Stages, LaneError> {
@@ -1360,8 +1885,16 @@ fn wipe_brick_totals(
 }
 
 fn ranked(bricks: &Bricks, plan: &Plan, per_group: u32) -> Result<Stages, LaneError> {
+    ranked_in(bricks, plan, per_group, bricks.tier())
+}
+
+fn ranked_in(
+    bricks: &Bricks,
+    plan: &Plan,
+    per_group: u32,
+    tier: Tier,
+) -> Result<Stages, LaneError> {
     let subgroup = bricks.subgroup;
-    let tier = bricks.tier();
     let tiles = Groups::Fixed(plan.tiles);
     let mut stages = vec![vec![(
         live::mark_below(subgroup, tier, Over::Every, bricks.count())?,
@@ -1400,6 +1933,89 @@ fn pooled(bricks: &Bricks, plan: &Plan, flags: Groups) -> Result<Stages, LaneErr
     Ok(stages)
 }
 
+fn fits(operation: &'static str, bricks: &Bricks, plan: &Plan) -> Result<(), LaneError> {
+    live::fits_pool(operation, bricks.grid, plan)
+}
+
+fn opening<R: Rule>(
+    rule: &R,
+    bricks: &Bricks,
+    plan: &Plan,
+    coarse: bool,
+) -> Result<Vec<(Vec<u32>, Groups)>, LaneError> {
+    use crate::sweep::COUNTS;
+
+    let subgroup = bricks.subgroup;
+    let (listed, hot) = live::tiers(plan, coarse);
+    let tiles = Groups::Fixed(plan.tiles);
+    let one = Groups::Fixed(1);
+    let mut first = vec![
+        (live::tick(subgroup)?, one),
+        (decay(bricks, listed)?, hot),
+        (live::wipe3(subgroup, rule.tally().words())?, one),
+        (live::wipe_counts(subgroup, COUNTS)?, tiles),
+    ];
+    first.extend(live::totals_wiped(subgroup, plan)?);
+    first.extend(wipe_brick_totals(subgroup, plan, bricks.tier())?);
+    Ok(first)
+}
+
+fn closing(bricks: &Bricks, plan: &Plan, coarse: bool) -> Result<Stages, LaneError> {
+    let subgroup = bricks.subgroup;
+    let (listed, hot) = live::tiers(plan, coarse);
+    let tiles = Groups::Fixed(plan.tiles);
+    let one = Groups::Fixed(1);
+    let flags = Groups::Fixed(bricks.count().div_ceil(subgroup));
+    let mut stages: Stages = Vec::new();
+    if coarse {
+        stages.push(vec![(
+            live::mark_below(subgroup, Tier::COARSE, Over::Every, plan.blocks)?,
+            tiles,
+        )]);
+        stages.extend(live::coarse_scans(subgroup, plan)?);
+        stages.push(vec![
+            (
+                crate::compact::gather(subgroup, Tier::COARSE, Over::Every, plan.hot_dump())?,
+                tiles,
+            ),
+            (
+                crate::compact::prepare(subgroup, 1, Tier::COARSE)?,
+                Groups::Counting(1),
+            ),
+        ]);
+    }
+    stages.push(vec![(mark(bricks, listed)?, hot)]);
+    stages.extend(live::fine_scans(subgroup, plan)?);
+    let held = crate::compact::Held {
+        table: bricks.table(),
+        entry: ENTRY as u32,
+        reach: bricks.bindings(),
+        dump: bricks.dump(),
+        upper: (plan.levels() > 2).then(|| plan.upper()),
+    };
+    let mut gathering = vec![
+        (
+            crate::compact::gather_held(subgroup, Tier::FINE, listed, held)?,
+            hot,
+        ),
+        (wholes(bricks)?, flags),
+    ];
+    gathering.extend(wipe_brick_totals(subgroup, plan, bricks.tier())?);
+    stages.push(gathering);
+    let whole = bricks.whole_tier();
+    stages.push(vec![(
+        live::mark_below(subgroup, whole, Over::Every, bricks.count())?,
+        tiles,
+    )]);
+    stages.extend(brick_scans(subgroup, plan, whole)?);
+    stages.push(vec![(
+        crate::compact::gather(subgroup, whole, Over::Every, plan.padded())?,
+        tiles,
+    )]);
+    stages.push(vec![(listing(bricks)?, one)]);
+    Ok(stages)
+}
+
 pub fn arranged<R: Rule>(
     rule: &R,
     bricks: &Bricks,
@@ -1407,15 +2023,11 @@ pub fn arranged<R: Rule>(
     coarse: bool,
 ) -> Result<Loop, LaneError> {
     let subgroup = bricks.subgroup;
-    let grid = bricks.grid;
-    live::fits("bricks::arranged", grid, plan)?;
+    fits("bricks::arranged", bricks, plan)?;
     let flags = Groups::Fixed(bricks.count().div_ceil(subgroup));
-    let tier = bricks.tier();
 
-    let mut first = live::opening3(rule, subgroup, plan, coarse)?;
-    first.extend(wipe_brick_totals(subgroup, plan, tier)?);
     let mut stages: Stages = vec![
-        first,
+        opening(rule, bricks, plan, coarse)?,
         vec![(
             settle(rule, bricks, Act::Dry, Listing::Listed)?,
             Plan::listed(),
@@ -1429,14 +2041,14 @@ pub fn arranged<R: Rule>(
             Plan::listed(),
         ),
     ]);
-    stages.extend(live::closing3(subgroup, grid, plan, coarse)?);
+    stages.extend(closing(bricks, plan, coarse)?);
     Ok(live::staged(stages))
 }
 
 pub fn whole<R: Rule>(rule: &R, bricks: &Bricks, plan: &Plan) -> Result<Loop, LaneError> {
     let subgroup = bricks.subgroup;
     let grid = bricks.grid;
-    live::fits("bricks::whole", grid, plan)?;
+    fits("bricks::whole", bricks, plan)?;
     let flags = Groups::Fixed(bricks.count().div_ceil(subgroup));
     let every = Groups::Fixed(grid.blocks().div_ceil(subgroup));
     let tier = bricks.tier();

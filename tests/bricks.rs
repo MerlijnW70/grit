@@ -391,15 +391,17 @@ impl<'host> Sparse<'host> {
                 .write_at(PARAMS as usize, FIRST_PARAM, params)
                 .unwrap();
         }
-        if self.mode != Mode::Whole {
-            live::seed(&mut self.held, self.grid, &self.plan).unwrap();
-        }
         self.held
             .write(PARAMS as usize, &[frame.wrapping_sub(1)])
             .unwrap();
-        self.bricks
+        let opened = self
+            .bricks
             .write(&mut self.held, &self.plan, start)
-            .unwrap()
+            .unwrap();
+        if self.mode != Mode::Whole {
+            self.bricks.seed(&mut self.held, &self.plan).unwrap();
+        }
+        opened
     }
 
     fn step(&mut self) {
@@ -419,6 +421,33 @@ impl<'host> Sparse<'host> {
         let pool =
             live::read_state(&mut self.held, self.bricks.windows(), self.bricks.scratch()).unwrap();
         self.bricks.unpack(&table, &pool)
+    }
+
+    fn listed_octs(&mut self) -> Result<std::collections::BTreeSet<u32>, String> {
+        let (octs, whole) = self.bricks.listed(&mut self.held).unwrap();
+        let mut listed: Vec<u32> = self
+            .held
+            .read(grit::layout::DENSE as usize, octs as usize)
+            .unwrap();
+        let bricks = self
+            .held
+            .read(self.bricks.whole_list() as usize, whole as usize)
+            .unwrap();
+        let per_block = self.bricks.per_block();
+        let by = self.bricks.octs_bits();
+        for brick in bricks {
+            listed.extend((0..per_block).map(|local| (brick << by) | local));
+        }
+        let mut set = std::collections::BTreeSet::new();
+        for oct in listed {
+            if oct >= self.grid.blocks() {
+                return Err(format!("oct {oct} past the grid is listed"));
+            }
+            if !set.insert(oct) {
+                return Err(format!("oct {oct} is listed twice"));
+            }
+        }
+        Ok(set)
     }
 
     fn held_bricks(&mut self) -> std::collections::BTreeSet<u32> {
@@ -526,6 +555,19 @@ impl<'host> Dense<'host> {
         }
     }
 
+    fn listed(&mut self, bricks: &Bricks) -> Vec<u32> {
+        let grand = self.live.read(grit::layout::GRAND as usize, 1).unwrap()[0];
+        let rows = self
+            .live
+            .read(grit::layout::DENSE as usize, grand as usize)
+            .unwrap();
+        let across = self.grid.wide / 2;
+        let down = self.grid.deep / 2;
+        rows.into_iter()
+            .map(|row| bricks.oct_of([row % across, (row / across) % down, row / (across * down)]))
+            .collect()
+    }
+
     fn step(&mut self) -> (Vec<u32>, Vec<u32>) {
         let cells = self.grid.cells();
         let groups: Vec<&[Groups]> = self.stages.iter().map(Vec::as_slice).collect();
@@ -559,6 +601,8 @@ fn parted(label: &str, grid: Grid3, frame: u32, got: &[u32], want: &[u32]) -> Op
 
 struct Run {
     mode: Mode,
+    listed_dense: u64,
+    listed_sparse: u64,
     bricks: u32,
     freed: u32,
     lowest: u32,
@@ -613,6 +657,8 @@ fn agree_in<R: Rule>(
             let mut held_before = sparse.held_bricks();
             let mut run = Run {
                 mode,
+                listed_dense: 0,
+                listed_sparse: 0,
                 bricks: sparse.bricks.count(),
                 freed: 0,
                 lowest: opened.held,
@@ -653,6 +699,22 @@ fn agree_in<R: Rule>(
                 if let Some(failed) = failed {
                     panic!("{failed}");
                 }
+                if mode != Mode::Whole {
+                    let covered = sparse.listed_octs().unwrap_or_else(|why| {
+                        panic!("{label}: frame {frame}: the sparse list: {why}")
+                    });
+                    let wanted = dense.listed(&sparse.bricks);
+                    if let Some(missing) = wanted.iter().find(|oct| !covered.contains(oct)) {
+                        panic!(
+                            "{label}: frame {frame}: oct {missing} at {:?} is listed by the dense engine and not by the sparse one ({} dense, {} sparse)",
+                            sparse.bricks.oct_at(*missing),
+                            wanted.len(),
+                            covered.len()
+                        );
+                    }
+                    run.listed_dense += wanted.len() as u64;
+                    run.listed_sparse += covered.len() as u64;
+                }
                 let now = sparse.held_bricks();
                 run.freed += u32::try_from(held_before.difference(&now).count()).unwrap();
                 held_before = now;
@@ -663,13 +725,15 @@ fn agree_in<R: Rule>(
             }
             assert_ne!(want, first, "{label}: nothing moved");
             println!(
-                "{label}: {frames} frames equal; {} bricks, {} held at start, {}..{} held, {} at the end, {} freed",
+                "{label}: {frames} frames equal; {} bricks, {} held at start, {}..{} held, {} at the end, {} freed; octs listed dense {} sparse {}",
                 sparse.bricks.count(),
                 opened.held,
                 run.lowest,
                 run.highest,
                 run.last,
-                run.freed
+                run.freed,
+                run.listed_dense,
+                run.listed_sparse
             );
             runs.push(run);
         }
@@ -984,8 +1048,7 @@ fn a_host_write_takes_a_brick_and_wakes_a_quiet_world() {
             sparse.step();
             want = reference(&Sand, reference3, frame, &want, &[]);
             frame += 1;
-            let grand = sparse.held.read(grit::layout::GRAND as usize, 1).unwrap()[0];
-            if grand == 0 {
+            if sparse.bricks.listed(&mut sparse.held).unwrap() == (0, 0) {
                 quiet = Some(frame);
                 break;
             }
@@ -1009,10 +1072,7 @@ fn a_host_write_takes_a_brick_and_wakes_a_quiet_world() {
         for &(cell, word) in &cells {
             want[cell as usize] = word;
         }
-        sparse
-            .bricks
-            .put(&mut sparse.held, &sparse.plan, &cells)
-            .unwrap();
+        sparse.bricks.put(&mut sparse.held, &cells).unwrap();
         let written = sparse.bricks.check(&mut sparse.held).unwrap();
         assert_eq!(
             written.held,
@@ -1025,7 +1085,8 @@ fn a_host_write_takes_a_brick_and_wakes_a_quiet_world() {
             sparse.step();
             want = reference(&Sand, reference3, frame, &want, &[]);
             frame += 1;
-            listed += sparse.held.read(grit::layout::GRAND as usize, 1).unwrap()[0];
+            let (octs, bricks) = sparse.bricks.listed(&mut sparse.held).unwrap();
+            listed += octs + bricks;
             let world = sparse.world().unwrap();
             if let Some(failed) = parted(name, reference3, frame - 1, &world, &want) {
                 panic!("{mode:?} after the write: {failed}");
@@ -1073,7 +1134,7 @@ fn a_host_write_that_needs_more_slots_than_are_free_writes_nothing() {
         })
         .collect();
     let before = sparse.bricks.check(&mut sparse.held).unwrap();
-    let refused = sparse.bricks.put(&mut sparse.held, &sparse.plan, &cells);
+    let refused = sparse.bricks.put(&mut sparse.held, &cells);
     assert!(
         matches!(refused, Err(Error::PoolFull { slots }) if slots == held + 1),
         "{name}: {refused:?}"
@@ -1082,15 +1143,9 @@ fn a_host_write_that_needs_more_slots_than_are_free_writes_nothing() {
     assert_eq!(sparse.world().unwrap(), start, "{name}: a cell was written");
     sparse.sound().unwrap();
     let same = [(cells[0].0, sand2::AIR), (cells[1].0, sand2::AIR)];
-    sparse
-        .bricks
-        .put(&mut sparse.held, &sparse.plan, &same)
-        .unwrap();
+    sparse.bricks.put(&mut sparse.held, &same).unwrap();
     assert_eq!(sparse.bricks.check(&mut sparse.held).unwrap(), before);
-    sparse
-        .bricks
-        .put(&mut sparse.held, &sparse.plan, &cells[..1])
-        .unwrap();
+    sparse.bricks.put(&mut sparse.held, &cells[..1]).unwrap();
     assert_eq!(sparse.bricks.check(&mut sparse.held).unwrap().free, 0);
     sparse.sound().unwrap();
 }
