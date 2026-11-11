@@ -128,13 +128,15 @@ impl Kinds {
     }
 
     /// The mapping of the rule the world tools list under `rule`: `sand`
-    /// shows its material, `heat` its kind and `code` its instruction.
+    /// shows its material, `heat` and `nature` their kind and `code` its
+    /// instruction.
     #[must_use]
     pub fn named(rule: &str) -> Option<Self> {
         match rule {
             "sand" => Self::new(0x3, 0),
             "heat" => Self::new(0xF, 0),
             "code" => Self::new(0xF, 24),
+            "nature" => Self::new(0xF, 0),
             _ => None,
         }
     }

@@ -7,6 +7,7 @@ use common::device;
 use grit::Host;
 use grit::rule3::code::{self, ADD, DATA, HALT, MOVE, PLUS_X, PLUS_Z};
 use grit::rule3::heat;
+use grit::rule3::nature;
 use grit::sand3::Grid3;
 use grit::serve::handle;
 use grit::serve3::{READ_MOST, STEP_MOST, Server, WORLD_TOOLS, rules};
@@ -244,7 +245,7 @@ fn the_rules_are_listed_with_their_parameter_counts() {
     let got = answer(&call(&mut Server::new(None), "grit_world_rules", "{}"));
     assert_eq!(
         written(got.get("rules").unwrap()),
-        "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0}]"
+        "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":0}]"
     );
 }
 
@@ -264,7 +265,7 @@ fn an_unknown_rule_is_refused_and_the_refusal_lists_the_rules() {
             .unwrap();
         assert_eq!(
             written(told.get("rules").unwrap()),
-            "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0}]"
+            "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":0}]"
         );
         let message = told.get("message").and_then(Json::text).unwrap();
         assert!(
@@ -687,6 +688,126 @@ fn a_heat_world_run_through_the_tools_equals_the_cpu_reference() {
             .collect();
         assert_eq!(held, rows);
     }
+}
+
+/// A small scene of the nature rule driven through the tools, create,
+/// write, step and read: rock under earth, a tree whose crown burns, a
+/// column of sand and one of snow in the air, a pool of water and a cloud
+/// of steam. Every frame read equals the CPU reference, the kinds read by
+/// slice equal the reference's, and the scene changes as the rule says:
+/// the fire spreads and burns out to ash, smoke rises and fades, sand and
+/// snow fall, and the steam condenses.
+#[test]
+fn a_nature_scene_run_through_the_tools_equals_the_cpu_reference() {
+    let Some(host) = device("world nature scene") else {
+        return;
+    };
+    let size = [16, 16, 16];
+    let grid = Grid3::new(16, 16, 16).unwrap();
+    let warmth = 300;
+    let mut cells = Vec::new();
+    for z in 0..16 {
+        for x in 0..16 {
+            cells.push((x, 15, z, nature::cell(nature::ROCK, warmth)));
+            cells.push((x, 14, z, nature::cell(nature::EARTH, warmth)));
+        }
+    }
+    for y in 10..14 {
+        cells.push((4, y, 4, nature::cell(nature::WOOD, warmth)));
+    }
+    for z in 3..6 {
+        for x in 3..6 {
+            for y in 8..10 {
+                cells.push((x, y, z, nature::cell(nature::LEAVES, warmth)));
+            }
+        }
+    }
+    cells.push((
+        4,
+        9,
+        4,
+        nature::alive(nature::FIRE, 900, nature::LEAVES_LIFE),
+    ));
+    for y in 2..6 {
+        cells.push((10, y, 10, nature::cell(nature::SAND, warmth)));
+        cells.push((12, y, 4, nature::cell(nature::SNOW, 250)));
+    }
+    for z in 9..12 {
+        for x in 2..5 {
+            cells.push((x, 13, z, nature::cell(nature::WATER, warmth)));
+            cells.push((x + 8, 12, z, nature::cell(nature::STEAM, 340)));
+        }
+    }
+    let mut server = Server::new(Some(&host));
+    let world = created(&mut server, "nature", size, &[]);
+    answer(&call(
+        &mut server,
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
+    ));
+    let mut want = vec![0_u32; grid.cells()];
+    for &(x, y, z, word) in &cells {
+        want[grid.index(x, y, z)] = word;
+    }
+    let start = want.clone();
+    let count = |cells: &[u32], kind: u32| {
+        cells
+            .iter()
+            .filter(|&&word| nature::kind_of(word) == kind)
+            .count()
+    };
+    let mut smoked = 0;
+    for batch in 0..8 {
+        let got = step(&mut server, world, 16);
+        assert_eq!(got.counted("frame"), Some(16 * (batch + 1)));
+        want = stepped("nature", grid, &want, &[], 16 * batch, 16);
+        assert_eq!(read_all(&mut server, world, size), want, "batch {batch}");
+        smoked = smoked.max(count(&want, nature::SMOKE));
+    }
+    let layer = answer(&call(
+        &mut server,
+        "grit_world_slice",
+        &format!("{{\"world\":{world},\"axis\":\"z\",\"at\":4}}"),
+    ));
+    let rows: Vec<String> = (0..16)
+        .map(|y| {
+            (0..16)
+                .map(|x| {
+                    let kind = nature::kind_of(want[grid.index(x, y, 4)]);
+                    char::from(b"0123456789abcdef"[kind as usize])
+                })
+                .collect()
+        })
+        .collect();
+    let held: Vec<&str> = layer
+        .get("rows")
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .map(|one| one.text().unwrap())
+        .collect();
+    assert_eq!(held, rows);
+    let burnt = count(&start, nature::WOOD) + count(&start, nature::LEAVES)
+        - count(&want, nature::WOOD)
+        - count(&want, nature::LEAVES);
+    println!(
+        "after 128 frames: {burnt} fuel burned, {} ash, most smoke {smoked}, {} fire, {} smoke, {} steam",
+        count(&want, nature::ASH),
+        count(&want, nature::FIRE),
+        count(&want, nature::SMOKE),
+        count(&want, nature::STEAM)
+    );
+    assert!(burnt > 9, "the fire did not spread");
+    assert_eq!(
+        count(&want, nature::ASH),
+        burnt + 1,
+        "the fuel and the first fire"
+    );
+    assert!(smoked > 0);
+    assert_eq!(count(&want, nature::STEAM), 0, "the steam condensed");
+    assert_eq!(count(&want, nature::SAND), 4);
+    assert_eq!(nature::kind_of(want[grid.index(10, 13, 10)]), nature::SAND);
+    assert_ne!(want, start);
 }
 
 /// Words a rule is written into a quiet world with: any word, a box of
