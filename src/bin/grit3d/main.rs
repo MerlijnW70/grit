@@ -1051,6 +1051,17 @@ fn measured(host: &Host, asked: &Asked) -> Result<(), Failed> {
     let clock = Instant::now();
     let mut session = Session::open(host, setup(asked, quality))?;
     let opened = clock.elapsed();
+    if let Some(pool) = session.pool.as_ref() {
+        let world = pool.bricks.grid();
+        println!(
+            "world {}x{}x{} made and packed on the host in {:.1} s of the {:.1} s to open",
+            world.wide,
+            world.deep,
+            world.tall,
+            pool.made.as_secs_f64(),
+            opened.as_secs_f64()
+        );
+    }
     if !asked.gas {
         no_gas(&mut session)?;
     }

@@ -254,6 +254,7 @@ impl<'h> Session<'h> {
         let capacity = (packed.held + (packed.held / 4).max(1024)).clamp(1, most);
         let bricks = Bricks::new(world, &plan, capacity)?;
         let packed = bricks.restacked(packed)?;
+        let generated = clock.elapsed();
         let reading = Sparse::of(&bricks);
         let build = Build {
             grid: view,
@@ -355,7 +356,7 @@ impl<'h> Session<'h> {
                 bricks,
                 reading,
                 corner: [0; 3],
-                made: clock.elapsed(),
+                made: generated,
                 start,
                 land,
                 refill: true,
