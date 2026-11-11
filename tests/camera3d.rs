@@ -9,6 +9,9 @@ mod font;
 #[path = "../src/bin/grit3d/life.rs"]
 #[allow(dead_code)]
 mod life;
+#[path = "../src/bin/grit3d/open.rs"]
+#[allow(dead_code)]
+mod open;
 #[path = "../src/bin/grit3d/scenes.rs"]
 #[allow(dead_code)]
 mod scenes;

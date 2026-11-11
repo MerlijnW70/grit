@@ -1,120 +1,26 @@
 use std::time::{Duration, Instant};
 
-use grit::bricks::{Bricks, Content, Packed};
+use grit::bricks::{Bricks, Packed};
 use grit::compact::Plan;
 use grit::layout::{AWAKE, BUCKETS, DENSE, PARAMS, STATE};
 use grit::rule3::Rule;
-use grit::rule3::nature::{ROCK, cell, open_air};
 use grit::sand::Grid;
 use grit::{Groups, Host, Resident, sweep};
 
+use super::open::Land;
 use super::session::Failed;
-use super::valley;
 
-pub const OPEN: [u32; 3] = [4096, 256, 4096];
-
-pub const VALLEY: [u32; 3] = [512, 256, 512];
-
-pub const GROUND: u32 = 48;
+pub use super::session::OPEN;
 
 pub enum World {
     Dense(Vec<u32>),
-    Open(Open),
-}
-
-pub struct Open {
-    grid: Grid,
-    valley: Vec<u32>,
-    from: [u32; 3],
-    shape: [u32; 3],
-}
-
-fn sides_of(grid: Grid) -> [u32; 3] {
-    [grid.wide, grid.deep, grid.tall]
-}
-
-impl Open {
-    #[must_use]
-    pub fn new(grid: Grid) -> Self {
-        let [wide, deep, tall] = sides_of(grid);
-        let [valley_wide, valley_deep, valley_tall] = VALLEY;
-        let shape = [
-            valley_wide.min(wide),
-            valley_deep.min(deep),
-            valley_tall.min(tall),
-        ];
-        let made = Grid::solid(shape[0], shape[1], shape[2]).map_or_else(
-            |_| Vec::new(),
-            |inner| valley::made(inner, valley::SEED).cells,
-        );
-        let from = [
-            (wide - shape[0]) / 2,
-            deep - shape[1],
-            (tall - shape[2]) / 2,
-        ];
-        Self {
-            grid,
-            valley: made,
-            from,
-            shape,
-        }
-    }
-
-    fn inside(&self, point: [u32; 3]) -> Option<usize> {
-        let mut local = [0_usize; 3];
-        for (((slot, at), from), side) in local.iter_mut().zip(point).zip(self.from).zip(self.shape)
-        {
-            let at = at.checked_sub(from).filter(|&at| at < side)?;
-            *slot = at as usize;
-        }
-        let [x, y, z] = local;
-        let [wide, deep, _] = self.shape.map(|side| side as usize);
-        Some(x + wide * (y + deep * z))
-    }
-
-    fn word(&self, point: [u32; 3]) -> u32 {
-        if let Some(at) = self.inside(point) {
-            return self.valley.get(at).copied().unwrap_or_default();
-        }
-        let [_, y, _] = point;
-        let height = self.grid.deep - 1 - y;
-        if height < GROUND {
-            cell(ROCK, valley::AMBIENT)
-        } else {
-            open_air(valley::AMBIENT, height - GROUND)
-        }
-    }
-
-    pub fn content(&self, bricks: &Bricks, brick: u32) -> Content {
-        let cells = bricks.cells();
-        let corner = bricks.point_of(brick, 0);
-        let [x, y, z] = corner;
-        let [wide, deep, tall] = bricks.sides();
-        let touches = [x, x + wide - 1].iter().any(|&across| {
-            [z, z + tall - 1].iter().any(|&along| {
-                [y, y + deep - 1]
-                    .iter()
-                    .any(|&down| self.inside([across, down, along]).is_some())
-            })
-        });
-        if !touches {
-            let top = self.word(corner);
-            if (y..y + deep).all(|row| self.word([x, row, z]) == top) {
-                return Content::Uniform(top);
-            }
-        }
-        Content::Mixed(
-            (0..cells)
-                .map(|offset| self.word(bricks.point_of(brick, u32::try_from(offset).unwrap_or(0))))
-                .collect(),
-        )
-    }
+    Open(Land),
 }
 
 fn packed_for(bricks: &Bricks, world: &World) -> Result<Packed, Failed> {
     Ok(match world {
         World::Dense(cells) => bricks.pack(cells)?,
-        World::Open(open) => bricks.compose(|brick| open.content(bricks, brick))?,
+        World::Open(land) => bricks.compose(|brick| land.content(bricks, brick))?,
     })
 }
 

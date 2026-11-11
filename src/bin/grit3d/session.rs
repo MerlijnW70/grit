@@ -1,11 +1,13 @@
 use std::time::Duration;
 
+use grit::bricks::{Bricks, Packed};
 use grit::compact::Plan;
 use grit::geometry::Solid;
 use grit::layout::{DENSE, Dimension, GRAND, PARAMS, PIXELS, STATE, TALLY, Windows};
 use grit::render3::present::Windowed;
 use grit::render3::{
-    self, Build, Camera, Frame, HIT_WORDS, INSIDE, Light, MISS, Screen, Steps, framed_words, stage,
+    self, Build, Camera, Frame, HIT_WORDS, INSIDE, Light, MISS, Screen, Sparse, Steps,
+    framed_words, stage,
 };
 use grit::rule3::code::Code;
 use grit::rule3::heat::Heat;
@@ -17,6 +19,7 @@ use grit::view3::Kinds;
 use grit::{Groups, Host, Resident, Run, Ticket, live, sweep};
 
 use super::life::{Act, Cycle, Phase};
+use super::open::{self, Land};
 use super::scenes::{Example, Tool, Which};
 use super::valley::FEED_EVERY;
 
@@ -51,6 +54,26 @@ pub struct Setup {
     pub side: u32,
     pub screen: Screen,
     pub suns: u32,
+    pub sparse: bool,
+    pub at: Option<[u32; 2]>,
+    pub world: Option<[u32; 3]>,
+}
+
+pub const OPEN: [u32; 3] = [4096, 256, 4096];
+
+pub struct Pool {
+    pub bricks: Bricks,
+    pub reading: Sparse,
+    pub corner: [u32; 3],
+    pub made: std::time::Duration,
+    start: Option<Packed>,
+    land: Option<Land>,
+    refill: bool,
+}
+
+enum Made {
+    Cells(Vec<u32>),
+    Land(Land),
 }
 
 /// A running scene on the device with its picture's passes.
@@ -88,6 +111,7 @@ pub struct Session<'h> {
     /// The height of the glass box's top, in cells down from the grid's
     /// top.
     pub top: f32,
+    pub pool: Option<Pool>,
 }
 
 /// A frame on the device: its ticket, whether it stepped the engine, and
@@ -134,12 +158,44 @@ impl<'h> Session<'h> {
     pub fn cold_in(host: &'h Host, setup: Setup, window: Option<Screen>) -> Result<Self, Failed> {
         let example = setup.which.example();
         let mut session = match setup.which {
+            Which::Open => {
+                let [wide, deep, tall] = setup.world.unwrap_or(OPEN);
+                let world = Grid::solid(wide, deep, tall)?;
+                let side = (setup.side * 4).min(1024).min(world.wide).min(world.tall);
+                let view = Grid::solid(side, world.deep, side)?;
+                let clock = std::time::Instant::now();
+                let land = Land::new(world, open::SEED);
+                let made = clock.elapsed();
+                let middle = setup.at.map_or(
+                    [world.wide as f32 / 2.0, world.tall as f32 / 2.0],
+                    |[x, z]| [x as f32, z as f32],
+                );
+                let mut session = Self::pooled(
+                    host,
+                    &Nature,
+                    example,
+                    setup,
+                    (world, view, [middle[0], 0.0, middle[1]]),
+                    Made::Land(land),
+                    window,
+                )?;
+                if let Some(pool) = session.pool.as_mut() {
+                    pool.made += made;
+                }
+                session
+            }
+            Which::Valley if setup.sparse => {
+                Self::dense_pooled(host, &Nature, example, setup, window)?
+            }
+            Which::Sand if setup.sparse => Self::dense_pooled(host, &Sand, example, setup, window)?,
+            Which::Fire if setup.sparse => Self::dense_pooled(host, &Heat, example, setup, window)?,
+            Which::Code if setup.sparse => Self::dense_pooled(host, &Code, example, setup, window)?,
             Which::Valley => Self::with(host, &Nature, example, setup, window)?,
             Which::Sand => Self::with(host, &Sand, example, setup, window)?,
             Which::Fire => Self::with(host, &Heat, example, setup, window)?,
             Which::Code => Self::with(host, &Code, example, setup, window)?,
         };
-        let side = setup.side as f32;
+        let side = session.build.grid.wide as f32;
         let camera = Camera::looking(
             [side * 1.5, -side * 0.8, side * 1.5],
             [side * 0.5, side * 0.7, side * 0.5],
@@ -148,6 +204,260 @@ impl<'h> Session<'h> {
         session.aim(&camera, false, true)?;
         session.before = None;
         Ok(session)
+    }
+
+    fn dense_pooled<R: Rule>(
+        host: &'h Host,
+        rule: &R,
+        example: Example,
+        setup: Setup,
+        window: Option<Screen>,
+    ) -> Result<Self, Failed> {
+        let grid = Grid::solid(setup.side, setup.side, setup.side)?;
+        let cells = (example.scene)(grid);
+        Self::pooled(
+            host,
+            rule,
+            example,
+            setup,
+            (grid, grid, [0.0; 3]),
+            Made::Cells(cells),
+            window,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn pooled<R: Rule>(
+        host: &'h Host,
+        rule: &R,
+        example: Example,
+        setup: Setup,
+        (world, view, middle): (Grid, Grid, [f32; 3]),
+        made: Made,
+        window: Option<Screen>,
+    ) -> Result<Self, Failed> {
+        let clock = std::time::Instant::now();
+        let width = host.width();
+        if !render3::fits(view, setup.screen) {
+            return Err(render3::UNFIT.into());
+        }
+        let kinds = Kinds::named(example.rule).ok_or("no kinds for the rule")?;
+        let plan = Plan::bricked(width, world.blocks().div_ceil(sweep::cells(width)))?;
+        let most = u32::try_from(((1_u64 << 32) - 1) / (u64::from(plan.per_block) * 8))
+            .unwrap_or(u32::MAX)
+            .min(plan.blocks);
+        let probe = Bricks::new(world, &plan, most)?;
+        let packed = match &made {
+            Made::Cells(cells) => probe.pack(cells)?,
+            Made::Land(land) => probe.compose(|brick| land.content(&probe, brick))?,
+        };
+        let capacity = (packed.held + (packed.held / 4).max(1024)).clamp(1, most);
+        let bricks = Bricks::new(world, &plan, capacity)?;
+        let packed = bricks.restacked(packed)?;
+        let reading = Sparse::of(&bricks);
+        let build = Build {
+            grid: view,
+            kinds,
+            screen: setup.screen,
+            subgroup: width,
+            suns: setup.suns,
+            windows: bricks.windows(),
+            sparse: Some(reading),
+        };
+        let engine = grit::bricks::arranged(rule, &bricks, &plan, true)?;
+        let listed = Plan::listed();
+        let watcher = engine
+            .1
+            .iter()
+            .rposition(|stage| stage.contains(&listed))
+            .ok_or("the engine has no listed step")?
+            + 1;
+        let mut all = build.passes()?;
+        let windowed = match window {
+            Some(window) => {
+                all.push(render3::present::window(&build, window)?);
+                Some(Windowed::of(&build.layout(), window))
+            }
+            None => None,
+        };
+        let (passes, stages) =
+            render3::watching_settled(engine, all).ok_or("the engine has no listed step")?;
+        let layout = build.layout();
+        let mut sizes = reading.sized(bricks.sizes(rule, &plan));
+        if let Some(slot) = sizes.get_mut(PIXELS as usize) {
+            *slot = (*slot)
+                .max(layout.words())
+                .max(windowed.map_or(0, |held| held.words()));
+        }
+        host.limits().admits_on(&sizes, None, host.heap())?;
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let bytes = sizes.iter().sum::<usize>() * 4;
+        let mut held = host.resident(&sizes, &modules)?;
+        let zeros = vec![0_u32; ZEROS.min(sizes.iter().copied().max().unwrap_or(0))];
+        for (binding, &words) in sizes.iter().enumerate() {
+            let mut at = 0;
+            while at < words {
+                let run = zeros.len().min(words - at);
+                held.write_at(binding, at, zeros.get(..run).unwrap_or(&[]))?;
+                at += run;
+            }
+        }
+        if !example.params.is_empty() {
+            held.write_at(PARAMS as usize, FIRST_PARAM, &example.params)?;
+        }
+        held.write(PARAMS as usize, &[u32::MAX])?;
+        bricks.write_packed(&mut held, &plan, &packed)?;
+        bricks.seed(&mut held, &plan)?;
+        held.write_at(PIXELS as usize, layout.table(), &example.table.words())?;
+        let (life, feed, top, land) = match made {
+            Made::Cells(cells) => (
+                example.life.map(|made| made(world, &cells)),
+                example
+                    .feed
+                    .map_or_else(Vec::new, |made| made(world, &cells)),
+                glass_top(world, kinds, example.table.visible(), &cells),
+                None,
+            ),
+            Made::Land(land) => (None, Vec::new(), 0.0, Some(land)),
+        };
+        let start = life.is_some().then_some(packed);
+        let still = stages
+            .iter()
+            .map(|stage| stage.iter().map(|_| Groups::Fixed(0)).collect())
+            .collect();
+        let engine_stages = stages.len();
+        let dusk = example.dusk;
+        let mut session = Self {
+            held,
+            build,
+            plan,
+            example,
+            setup,
+            stages,
+            still,
+            watcher,
+            engine_stages,
+            drawn: 0,
+            before: None,
+            dusk,
+            steps: 0,
+            life,
+            feed,
+            bytes,
+            start: None,
+            restarted: false,
+            windowed,
+            sizes,
+            ahead: None,
+            longest: 0,
+            top,
+            pool: Some(Pool {
+                bricks,
+                reading,
+                corner: [0; 3],
+                made: clock.elapsed(),
+                start,
+                land,
+                refill: true,
+            }),
+        };
+        session.placed(reading.corner(view, middle))?;
+        Ok(session)
+    }
+
+    fn placed(&mut self, corner: [u32; 3]) -> Result<(), Failed> {
+        let view = self.build.grid;
+        let Some(pool) = self.pool.as_mut() else {
+            return Ok(());
+        };
+        pool.corner = corner;
+        pool.refill = true;
+        self.held.write_at(
+            pool.reading.table as usize,
+            pool.reading.origin as usize,
+            &corner,
+        )?;
+        if let Some(land) = pool.land.as_ref() {
+            let world = pool.bricks.grid();
+            let mut tops = Vec::with_capacity((view.wide * view.tall) as usize);
+            for z in 0..view.tall {
+                for x in 0..view.wide {
+                    let at = [(x + corner[0]) % world.wide, (z + corner[2]) % world.tall];
+                    tops.push(land.top(at[0], at[1]));
+                }
+            }
+            self.top = glass_over(tops, view.deep);
+        }
+        Ok(())
+    }
+
+    pub fn follow(&mut self, look: [f32; 3]) -> Result<Option<[f32; 3]>, Failed> {
+        let view = self.build.grid;
+        let Some(pool) = self.pool.as_ref() else {
+            return Ok(None);
+        };
+        let world = pool.bricks.grid();
+        if view == world {
+            return Ok(None);
+        }
+        let sides = [view.wide, view.deep, view.tall];
+        let near = [0, 2].iter().all(|&axis| {
+            let side = sides.get(axis).copied().unwrap_or(1) as f32;
+            let at = look.get(axis).copied().unwrap_or(0.0);
+            (at - side * 0.5).abs() <= side * 0.125
+        });
+        if near {
+            return Ok(None);
+        }
+        let old = pool.corner;
+        let world_sides = [world.wide, world.deep, world.tall];
+        let middle = [0, 1, 2].map(|axis| {
+            look.get(axis).copied().unwrap_or(0.0) + old.get(axis).copied().unwrap_or(0) as f32
+        });
+        let corner = pool.reading.corner(view, middle);
+        let by = [0, 1, 2].map(|axis| {
+            let side = i64::from(world_sides.get(axis).copied().unwrap_or(1));
+            let moved = i64::from(corner.get(axis).copied().unwrap_or(0))
+                - i64::from(old.get(axis).copied().unwrap_or(0));
+            let wrapped = (moved + side / 2).rem_euclid(side) - side / 2;
+            wrapped as f32
+        });
+        if by == [0.0; 3] {
+            return Ok(None);
+        }
+        self.placed(corner)?;
+        Ok(Some(by))
+    }
+
+    pub fn world_point(&self, cell: u32) -> [u32; 3] {
+        let view = self.build.grid;
+        let local = Solid::point(view, cell);
+        match self.pool.as_ref() {
+            Some(pool) => {
+                let world = pool.bricks.grid();
+                let sides = [world.wide, world.deep, world.tall];
+                [0, 1, 2].map(|axis| {
+                    let at = local.get(axis).copied().unwrap_or(0)
+                        + pool.corner.get(axis).copied().unwrap_or(0);
+                    at % sides.get(axis).copied().unwrap_or(1)
+                })
+            }
+            None => local,
+        }
+    }
+
+    fn put_world(&mut self, cells: &[(u32, u32)]) -> Result<(), Failed> {
+        let Some(pool) = self.pool.as_ref() else {
+            live::put3(&mut self.held, self.build.grid, &self.plan, cells)?;
+            return Ok(());
+        };
+        let world = pool.bricks.grid();
+        let points: Vec<([u32; 3], u32)> = cells
+            .iter()
+            .map(|&(cell, word)| (Solid::point(world, cell), word))
+            .collect();
+        pool.bricks.put_at(&mut self.held, &points)?;
+        Ok(())
     }
 
     fn with<R: Rule>(
@@ -263,6 +573,7 @@ impl<'h> Session<'h> {
             ahead: None,
             longest: 0,
             top,
+            pool: None,
         })
     }
 
@@ -286,7 +597,8 @@ impl<'h> Session<'h> {
             .copied()
             .unwrap_or([0.0, 0.0]);
         let rays = camera.rays_shifted(grid, screen, shift);
-        let reset = fresh || self.before.is_none();
+        let refill = self.pool.as_ref().is_some_and(|pool| pool.refill);
+        let reset = fresh || refill || self.before.is_none();
         let before = self.before.unwrap_or(*camera).before(grid, screen);
         let mut flags = 0;
         if reset {
@@ -318,11 +630,21 @@ impl<'h> Session<'h> {
         } else {
             self.still.clone()
         };
-        all.extend(self.build.stages(steps));
+        let refill = self.pool.as_ref().is_some_and(|pool| pool.refill);
+        all.extend(self.build.stages(Steps {
+            refill: steps.refill || refill,
+            ..steps
+        }));
         if self.windowed.is_some() {
             all.push(vec![Groups::Fixed(0)]);
         }
         all
+    }
+
+    fn refilled(&mut self) {
+        if let Some(pool) = self.pool.as_mut() {
+            pool.refill = false;
+        }
     }
 
     /// Runs a frame and gives its time and, when `reading`, its colours.
@@ -343,6 +665,7 @@ impl<'h> Session<'h> {
         } else {
             (self.held.staged(&groups)?, Vec::new())
         };
+        self.refilled();
         self.drawn = self.drawn.wrapping_add(1);
         if moving {
             self.steps = self.steps.wrapping_add(1);
@@ -371,6 +694,7 @@ impl<'h> Session<'h> {
             self.fed(true)?;
         }
         let ahead = !self.feed.is_empty()
+            && self.pool.is_none()
             && moving
             && (self.steps.wrapping_add(1)).is_multiple_of(FEED_EVERY);
         let all = self.shown_stages(moving, steps);
@@ -384,6 +708,7 @@ impl<'h> Session<'h> {
         } else {
             self.held.submit_reading(&groups, tally.0, tally.1)?
         };
+        self.refilled();
         Ok(Pending {
             ticket,
             moving,
@@ -468,7 +793,7 @@ impl<'h> Session<'h> {
             Act::Nothing => {}
             Act::Light(cells) => {
                 self.ahead = None;
-                live::put3(&mut self.held, self.build.grid, &self.plan, &cells)?;
+                self.put_world(&cells)?;
             }
             Act::Restart => self.restart()?,
         }
@@ -478,6 +803,21 @@ impl<'h> Session<'h> {
     /// Puts the world back as it was after its warm-up, at the frame it
     /// was then.
     pub fn restart(&mut self) -> Result<(), Failed> {
+        if let Some(pool) = self.pool.as_ref() {
+            let Some(start) = pool.start.as_ref() else {
+                return Ok(());
+            };
+            pool.bricks
+                .write_packed(&mut self.held, &self.plan, start)?;
+            self.held.write(PARAMS as usize, &[u32::MAX])?;
+            pool.bricks.seed(&mut self.held, &self.plan)?;
+            let warm = self.example.warm;
+            self.held
+                .write_at(PARAMS as usize, 0, &[warm.wrapping_sub(1)])?;
+            self.steps = warm;
+            self.restarted = true;
+            return Ok(());
+        }
         let Some(start) = self.start.as_ref() else {
             return Ok(());
         };
@@ -545,7 +885,11 @@ impl<'h> Session<'h> {
             let list = ahead
                 .filter(|(drawn, _)| early && *drawn == self.drawn)
                 .map(|(_, list)| list);
-            let done = self.put_runs(&feed, list.as_deref());
+            let done = if self.pool.is_some() {
+                self.put_world(&feed)
+            } else {
+                self.put_runs(&feed, list.as_deref())
+            };
             self.feed = feed;
             done?;
         }
@@ -653,8 +997,24 @@ impl<'h> Session<'h> {
     ) -> Result<Vec<(u32, u32)>, Failed> {
         self.ahead = None;
         let writes = stroked(self.build.grid, (cell, face), tool);
-        live::put3(&mut self.held, self.build.grid, &self.plan, &writes)?;
+        if let Some(pool) = self.pool.as_ref() {
+            let points: Vec<([u32; 3], u32)> = writes
+                .iter()
+                .map(|&(cell, word)| (self.world_point(cell), word))
+                .collect();
+            pool.bricks.put_at(&mut self.held, &points)?;
+        } else {
+            live::put3(&mut self.held, self.build.grid, &self.plan, &writes)?;
+        }
         Ok(writes)
+    }
+
+    pub fn listed_count(&mut self) -> Result<usize, Failed> {
+        if let Some(pool) = self.pool.as_ref() {
+            let (octs, whole) = pool.bricks.listed(&mut self.held)?;
+            return Ok(octs as usize + whole as usize * pool.bricks.per_block() as usize);
+        }
+        Ok(self.listed()?.len())
     }
 
     /// The octs the engine steps next frame: its list, read back.
@@ -714,6 +1074,9 @@ impl<'h> Session<'h> {
 
     #[allow(dead_code)]
     pub fn state(&mut self) -> Result<Vec<u32>, Failed> {
+        if let Some(pool) = self.pool.as_ref() {
+            return Ok(pool.bricks.read(&mut self.held)?);
+        }
         Ok(live::read_state(
             &mut self.held,
             self.build.windows,
@@ -795,6 +1158,17 @@ pub fn glass_top(grid: Grid, kinds: Kinds, visible: u32, cells: &[u32]) -> f32 {
         .copied()
         .unwrap_or(grid.deep);
     grid.deep.saturating_sub(height + GLASS_MARGIN) as f32
+}
+
+pub fn glass_over(mut tops: Vec<u32>, deep: u32) -> f32 {
+    tops.retain(|&top| top > 0);
+    tops.sort_unstable();
+    let at = (tops.len() as f32 * GLASS_SHARE) as usize;
+    let height = tops
+        .get(at.min(tops.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(deep);
+    deep.saturating_sub(height + GLASS_MARGIN) as f32
 }
 
 /// The view of every camera, in radians.

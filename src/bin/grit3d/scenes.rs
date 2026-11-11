@@ -20,10 +20,11 @@ pub enum Which {
     Sand,
     Fire,
     Code,
+    Open,
 }
 
 impl Which {
-    pub const ALL: [Self; 4] = [Self::Valley, Self::Sand, Self::Fire, Self::Code];
+    pub const ALL: [Self; 5] = [Self::Valley, Self::Sand, Self::Fire, Self::Code, Self::Open];
 
     pub fn named(name: &str) -> Option<Self> {
         match name {
@@ -31,6 +32,7 @@ impl Which {
             "sand" => Some(Self::Sand),
             "fire" | "heat" => Some(Self::Fire),
             "code" => Some(Self::Code),
+            "open" => Some(Self::Open),
             _ => None,
         }
     }
@@ -41,8 +43,19 @@ impl Which {
             Self::Sand => sanded(),
             Self::Fire => fired(),
             Self::Code => coded(),
+            Self::Open => opened(),
         }
     }
+}
+
+fn opened() -> Example {
+    let mut example = dressed(super::valley::example());
+    example.name = "open world";
+    example.scene = |_| Vec::new();
+    example.warm = 2;
+    example.life = None;
+    example.feed = None;
+    example
 }
 
 /// A scene: its name, the rule that runs it and that rule's kind mapping,

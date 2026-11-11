@@ -156,6 +156,10 @@ impl View {
             (Which::Valley, 5) => (-2.35, 0.5, 2.3, 0.56, [0.5, 0.5]),
             (Which::Valley, 6) => (-2.0, 0.95, 0.35, 0.6, [0.33, 0.47]),
             (Which::Valley, 7) => (-2.3, 0.36, 0.42, 0.78, [0.74, 0.62]),
+            (Which::Open, 0) => (-2.3, 0.62, 0.95, 0.2, [0.5, 0.5]),
+            (Which::Open, 1) => (-2.6, 0.06, 0.1, 0.19, [0.5, 0.5]),
+            (Which::Open, 2) => (-1.9, 0.3, 0.4, 0.2, [0.5, 0.5]),
+            (Which::Open, _) => (-0.8, 0.4, 0.6, 0.2, [0.5, 0.5]),
             (_, 2) => (-2.35, 0.62, 3.0, 0.72, [0.5, 0.5]),
             (_, 4) => (-0.95, 0.16, 1.9, 0.62, [0.5, 0.5]),
             (Which::Sand, 0) => (-2.3, 0.6, 2.2, 0.74, [0.5, 0.5]),
@@ -390,6 +394,20 @@ impl Rig {
     #[must_use]
     pub fn camera(&self) -> Camera {
         self.shown.camera()
+    }
+
+    #[must_use]
+    pub fn look(&self) -> [f32; 3] {
+        match self.mode {
+            Mode::Fly => self.shown.eye(),
+            Mode::Orbit => self.shown.target,
+        }
+    }
+
+    pub fn moved(&mut self, by: [f32; 3]) {
+        for view in [&mut self.goal, &mut self.shown] {
+            view.target = less(view.target, by);
+        }
     }
 
     fn asked(&mut self, view: View) {

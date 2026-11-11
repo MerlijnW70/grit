@@ -228,7 +228,7 @@ impl Action {
 
 /// Every input and what it does: the demo reads its inputs from this
 /// list, and the help panel names each of them.
-pub const BINDINGS: [(Input, Action); 30] = [
+pub const BINDINGS: [(Input, Action); 31] = [
     (Input::Digit(0), Action::Scene(0)),
     (Input::Digit(1), Action::Scene(1)),
     (Input::Digit(2), Action::Scene(2)),
@@ -238,6 +238,7 @@ pub const BINDINGS: [(Input, Action); 30] = [
     (Input::Digit(6), Action::Tool(2)),
     (Input::Digit(7), Action::Tool(3)),
     (Input::Digit(8), Action::Tool(4)),
+    (Input::Digit(9), Action::Scene(4)),
     (Input::W, Action::Forward),
     (Input::A, Action::Left),
     (Input::S, Action::Back),
@@ -271,7 +272,7 @@ pub fn meaning(input: Input) -> Option<Action> {
 
 /// Every control, a line each: the inputs, then two spaces or more, then
 /// what they do.
-pub const HELP: [&str; 19] = [
+pub const HELP: [&str; 20] = [
     "CONTROLS",
     "",
     "DRAG                        TURN AROUND THE TARGET, OR LOOK WHEN FLYING",
@@ -286,6 +287,7 @@ pub const HELP: [&str; 19] = [
     "RIGHT DRAG                  KEEP USING THE TOOL",
     "4 - 8 / CLICK BAR           PICK A TOOL",
     "0 1 2 3                     VALLEY, SAND, FIRE, CODE",
+    "9                           THE OPEN WORLD, 4096 BY 4096",
     "R                           RESTART THE SCENE AND THE CAMERA",
     "SPACE / N                   PAUSE / ONE STEP",
     "O                           SHOW WHAT THE ENGINE STEPS",

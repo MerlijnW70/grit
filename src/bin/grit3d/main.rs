@@ -1,6 +1,7 @@
 mod camera;
 mod font;
 mod life;
+mod open;
 mod scenes;
 mod session;
 mod sparse;
@@ -94,6 +95,7 @@ struct Asked {
     sparse: bool,
     open: bool,
     slots: Option<u32>,
+    at: Option<[u32; 2]>,
 }
 
 fn asked() -> Result<Asked, Failed> {
@@ -128,6 +130,7 @@ fn asked() -> Result<Asked, Failed> {
         sparse: false,
         open: false,
         slots: None,
+        at: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(one) = args.next() {
@@ -156,7 +159,15 @@ fn asked() -> Result<Asked, Failed> {
             "--open" => {
                 held.open = true;
                 held.sparse = true;
-                held.which = Which::Valley;
+                held.which = Which::Open;
+            }
+            "--at" => {
+                let text = value()?;
+                let parts: Vec<&str> = text.split(',').collect();
+                let [x, z] = parts.as_slice() else {
+                    return Err(format!("--at takes X,Z, not {text}").into());
+                };
+                held.at = Some([x.parse()?, z.parse()?]);
             }
             "--slots" => held.slots = Some(value()?.parse()?),
             "--width" => held.window.wide = value()?.parse()?,
@@ -190,7 +201,7 @@ fn asked() -> Result<Asked, Failed> {
             "--measure" => held.measure = true,
             other => {
                 return Err(format!(
-                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle, --readback, --timed N, --engine, --sparse, --open, --slots N and --generate SIDE; --size takes SIDE or WIDExDEEPxTALL"
+                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code|open, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle, --readback, --timed N, --engine, --sparse, --open, --at X,Z, --slots N and --generate SIDE; --size takes SIDE or WIDExDEEPxTALL"
                 )
                 .into());
             }
@@ -216,14 +227,14 @@ fn main() -> Result<(), Failed> {
     if asked.engine {
         return engined(&host, &asked);
     }
-    if asked.sparse {
-        return Err("a sparse world runs only with --engine in this build".into());
-    }
-    if asked
-        .shape
-        .is_some_and(|[wide, deep, tall]| wide != deep || deep != tall)
+    if asked.which != Which::Open
+        && asked
+            .shape
+            .is_some_and(|[wide, deep, tall]| wide != deep || deep != tall)
     {
-        return Err("a world that is not a cube runs only with --engine".into());
+        return Err(
+            "a world that is not a cube runs only with --engine or as the open world".into(),
+        );
     }
     if asked.measure {
         return measured(&host, &asked);
@@ -305,6 +316,9 @@ fn setup(asked: &Asked, quality: Quality) -> Setup {
             high: (asked.window.high / scale).max(1),
         },
         suns: asked.suns.unwrap_or(quality.suns),
+        sparse: asked.sparse,
+        at: asked.at,
+        world: asked.shape.filter(|_| asked.which == Which::Open),
     }
 }
 
@@ -792,6 +806,9 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
             fresh = true;
         }
         play.rig.tick(push, fast, spent);
+        if let Some(by) = session.follow(play.rig.look())? {
+            play.rig.moved(by);
+        }
         let camera = play.rig.camera();
         let mut light_steps = steps(&session, quality, fresh);
         light_steps.refill = fresh;
@@ -1051,7 +1068,7 @@ fn measured(host: &Host, asked: &Asked) -> Result<(), Failed> {
         for (slot, time) in parts.iter_mut().zip(times) {
             slot.push(time);
         }
-        listed.push(session.listed()?.len());
+        listed.push(session.listed_count()?);
     }
     let (frame_min, frame_mid) = milliseconds(&mut totals);
     let frame_tail = totals
@@ -1103,7 +1120,7 @@ fn engined(host: &Host, asked: &Asked) -> Result<(), Failed> {
     use grit::rule3::sand::Sand;
 
     match asked.which {
-        Which::Valley => engined_by(host, asked, &Nature),
+        Which::Valley | Which::Open => engined_by(host, asked, &Nature),
         Which::Sand => engined_by(host, asked, &Sand),
         Which::Fire => engined_by(host, asked, &Heat),
         Which::Code => engined_by(host, asked, &Code),
@@ -1127,7 +1144,7 @@ fn engined_by<R: grit::rule3::Rule>(host: &Host, asked: &Asked, rule: &R) -> Res
     if asked.sparse {
         let clock = Instant::now();
         let world = if asked.open {
-            sparse::World::Open(sparse::Open::new(grid))
+            sparse::World::Open(open::Land::new(grid, open::SEED))
         } else {
             sparse::World::Dense((example.scene)(grid))
         };

@@ -10,6 +10,9 @@ mod font;
 #[path = "../src/bin/grit3d/life.rs"]
 #[allow(dead_code)]
 mod life;
+#[path = "../src/bin/grit3d/open.rs"]
+#[allow(dead_code)]
+mod open;
 #[path = "../src/bin/grit3d/scenes.rs"]
 #[allow(dead_code)]
 mod scenes;
@@ -37,12 +40,19 @@ use session::{Session, Setup};
 
 const SIDE: u32 = 32;
 
+const DENSE: [Which; 4] = [Which::Valley, Which::Sand, Which::Fire, Which::Code];
+
+const LAND: [u32; 3] = [256, 64, 256];
+
 fn setup(which: Which) -> Setup {
     Setup {
         which,
         side: SIDE,
         screen: Screen { wide: 16, high: 12 },
         suns: 1,
+        sparse: false,
+        at: None,
+        world: (which == Which::Open).then_some(LAND),
     }
 }
 
@@ -86,6 +96,7 @@ fn stepped(which: Which, frame: u32, cells: &[u32], params: &[u32]) -> Vec<u32> 
         Which::Sand => one(&Sand, grid, frame, cells, params),
         Which::Fire => one(&Heat, grid, frame, cells, params),
         Which::Code => one(&Code, grid, frame, cells, params),
+        Which::Open => panic!("the open world has no dense run"),
     }
 }
 
@@ -147,7 +158,7 @@ fn a_tool_stroke_goes_through_put3_and_the_listed_engine_stays_equal_to_the_whol
         return;
     };
     let mut wrong = Vec::new();
-    for which in Which::ALL {
+    for which in DENSE {
         let mut session = Session::open(&host, setup(which)).unwrap();
         let mut cells = session.state().unwrap();
         let camera = looking(&session);
@@ -206,7 +217,7 @@ fn the_active_overlay_marks_exactly_the_octs_the_engine_steps() {
         return;
     };
     let mut checked = 0;
-    for which in Which::ALL {
+    for which in DENSE {
         let mut session = Session::open(&host, setup(which)).unwrap();
         let camera = looking(&session);
         for at in 0..6 {
@@ -411,5 +422,184 @@ fn a_frame_shown_from_the_device_steps_the_world_as_a_frame_read_back_does() {
     assert!(burning > 0, "the fire never burned in the frames tested");
     println!(
         "140 frames, {burning} burning: the world shown from the device equals the one read back"
+    );
+}
+
+fn sparse_setup(which: Which) -> Setup {
+    Setup {
+        sparse: true,
+        ..setup(which)
+    }
+}
+
+fn picture(session: &mut Session<'_>, camera: &Camera, at: u32, moving: bool) -> Vec<u32> {
+    session.aim(camera, false, at == 0).unwrap();
+    let steps = Steps {
+        refill: at == 0,
+        ..Steps::ALL
+    };
+    session.frame(moving, steps, true).unwrap().1
+}
+
+fn landed(session: &mut Session<'_>, at: u32) -> Option<(u32, u32)> {
+    let screen = session.build.screen;
+    (0..screen.pixels() as u32).find_map(|step| {
+        let pixel = (
+            (screen.wide / 2 + at + step) % screen.wide,
+            (screen.high / 2 + step / screen.wide) % screen.high,
+        );
+        session.under(pixel).unwrap()
+    })
+}
+
+#[test]
+fn every_scene_run_sparse_draws_and_steps_as_the_dense_one_with_its_tools() {
+    let Some(host) = device("grit3d sparse") else {
+        return;
+    };
+    let mut wrong = Vec::new();
+    for which in DENSE {
+        let mut dense = Session::open(&host, setup(which)).unwrap();
+        let mut sparse = Session::open(&host, sparse_setup(which)).unwrap();
+        assert!(sparse.pool.is_some() && dense.pool.is_none());
+        let camera = looking(&dense);
+        let mut strokes = 0;
+        for at in 0..24_u32 {
+            if at % 4 == 2 {
+                let tool = dense.example.tools[(at as usize / 4) % dense.example.tools.len()];
+                let seen = landed(&mut dense, at);
+                assert_eq!(seen, landed(&mut sparse, at), "{which:?} frame {at}: hits");
+                if let Some(seen) = seen {
+                    let want = dense.stroke(seen, tool).unwrap();
+                    let got = sparse.stroke(seen, tool).unwrap();
+                    assert_eq!(got, want, "{which:?} frame {at}: the stroke");
+                    strokes += usize::from(!want.is_empty());
+                }
+            }
+            let want = picture(&mut dense, &camera, at, true);
+            let got = picture(&mut sparse, &camera, at, true);
+            if got != want {
+                let differ = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                wrong.push(format!("{which:?} frame {at}: {differ} pixels differ"));
+                break;
+            }
+            if at % 8 == 7 && sparse.state().unwrap() != dense.state().unwrap() {
+                wrong.push(format!("{which:?} frame {at}: the worlds differ"));
+                break;
+            }
+        }
+        let used = {
+            let pool = sparse.pool.as_ref().unwrap();
+            pool.bricks.check(&mut sparse.held).unwrap()
+        };
+        println!(
+            "{which:?}: 24 frames, {strokes} strokes through put_at, the sparse picture equal to the dense one; pool {} of {} slots held",
+            used.held, used.capacity
+        );
+        assert!(strokes > 0, "{which:?}: no stroke landed");
+    }
+    assert!(
+        wrong.is_empty(),
+        "{}",
+        wrong.join(
+            "
+"
+        )
+    );
+}
+
+#[test]
+fn the_open_world_follows_the_camera_and_takes_the_tools_where_they_land() {
+    let Some(host) = device("grit3d open") else {
+        return;
+    };
+    let small = Setup {
+        side: 16,
+        ..setup(Which::Open)
+    };
+    let mut session = Session::open(&host, small).unwrap();
+    let view = session.grid();
+    let world = session.pool.as_ref().unwrap().bricks.grid();
+    assert_eq!([view.wide, view.deep, view.tall], [64, LAND[1], 64]);
+    assert_eq!(world, Grid::solid(LAND[0], LAND[1], LAND[2]).unwrap());
+    let side = view.wide as f32;
+    let camera = Camera::looking(
+        [side * 1.2, -side * 0.5, side * 1.3],
+        [side * 0.5, view.deep as f32 * 0.6, side * 0.5],
+        0.62,
+    );
+    let mut first = Vec::new();
+    for at in 0..8 {
+        first = picture(&mut session, &camera, at, false);
+    }
+    let sky = first[0];
+    let land = first.iter().filter(|&&pixel| pixel != sky).count();
+    assert!(
+        land > first.len() / 4,
+        "the open world shows little: {land}"
+    );
+
+    let before = session.pool.as_ref().unwrap().corner;
+    assert_eq!(session.follow([side * 0.5, 0.0, side * 0.5]).unwrap(), None);
+    let by = session
+        .follow([side * 0.5 + 40.0, 0.0, side * 0.5 - 30.0])
+        .unwrap()
+        .expect("the window stays put when the camera leaves its middle");
+    let after = session.pool.as_ref().unwrap().corner;
+    for axis in [0, 2] {
+        let side = [world.wide, world.deep, world.tall][axis];
+        assert_eq!(
+            (before[axis] as f32 + by[axis] + side as f32) as u32 % side,
+            after[axis]
+        );
+    }
+    assert_eq!(by[1], 0.0);
+    let moved = picture(&mut session, &camera, 1, false);
+
+    let middle = [after[0] + view.wide / 2, after[2] + view.tall / 2];
+    let mut fresh = Session::open(
+        &host,
+        Setup {
+            at: Some(middle),
+            ..small
+        },
+    )
+    .unwrap();
+    assert_eq!(fresh.pool.as_ref().unwrap().corner, after);
+    let want = picture(&mut fresh, &camera, 0, false);
+    let differ = moved.iter().zip(&want).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        differ, 0,
+        "the moved window draws other pixels than a window opened there"
+    );
+
+    let tool = session.example.tools[0];
+    let seen = landed(&mut session, 0).expect("no pixel sees the ground");
+    let writes = session.stroke(seen, tool).unwrap();
+    assert!(!writes.is_empty());
+    let cells = session.state().unwrap();
+    for &(cell, word) in &writes {
+        let point = session.world_point(cell);
+        let at = grit::geometry::Solid::cell(world, point) as usize;
+        assert_eq!(cells[at], word, "the stroke at {point:?} of the world");
+    }
+    for at in 0..4 {
+        picture(&mut session, &camera, at + 2, true);
+    }
+    let used = {
+        let pool = session.pool.as_ref().unwrap();
+        pool.bricks.check(&mut session.held).unwrap()
+    };
+    println!(
+        "open world {}x{}x{} through a {}x{}x{} window: moved by {by:?} to {after:?}, {land} pixels of land, a stroke of {} cells through put_at, pool {} of {} slots held",
+        world.wide,
+        world.deep,
+        world.tall,
+        view.wide,
+        view.deep,
+        view.tall,
+        writes.len(),
+        used.held,
+        used.capacity
     );
 }

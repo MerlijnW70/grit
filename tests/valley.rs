@@ -10,6 +10,9 @@ mod font;
 #[path = "../src/bin/grit3d/life.rs"]
 #[allow(dead_code)]
 mod life;
+#[path = "../src/bin/grit3d/open.rs"]
+#[allow(dead_code)]
+mod open;
 #[path = "../src/bin/grit3d/scenes.rs"]
 #[allow(dead_code)]
 mod scenes;
@@ -265,6 +268,9 @@ fn setup(side: u32) -> Setup {
         which: Which::Valley,
         side,
         screen: Screen { wide: 16, high: 12 },
+        sparse: false,
+        at: None,
+        world: None,
         suns: 1,
     }
 }
