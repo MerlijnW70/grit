@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 use simdr::lanes::LaneError;
 
+use crate::bricks::{Bricks, Content, PoolUse};
+
 use crate::compact::Plan;
 use crate::host::Host;
 use crate::layout::{BINDINGS, Dimension, GRAND, PARAMS, STATE, TALLY};
@@ -34,6 +36,8 @@ pub const SLICE_MOST: u64 = 65536;
 /// The most frames one `grit_world_step` runs.
 pub const STEP_MOST: u32 = 65536;
 
+pub const SLOTS_LEAST: u32 = 64;
+
 /// How many frames go to the device at a time.
 const BATCH: u32 = 64;
 
@@ -57,6 +61,10 @@ pub trait Listed {
 
     /// The bindings' sizes, as [`live::sizes3`] gives them.
     fn sizes(&self, plan: &Plan) -> [usize; BINDINGS as usize];
+
+    fn bricked(&self, bricks: &Bricks, plan: &Plan) -> Result<Loop, LaneError>;
+
+    fn bricked_sizes(&self, bricks: &Bricks, plan: &Plan) -> Vec<usize>;
 
     /// One frame on the CPU, as [`crate::sand3::reference`] steps it.
     fn reference(&self, grid: Grid3, frame: u32, cells: &[u32], params: &[u32]) -> Vec<u32>;
@@ -92,6 +100,14 @@ impl<R: Rule> Listed for Named<R> {
 
     fn sizes(&self, plan: &Plan) -> [usize; BINDINGS as usize] {
         live::sizes3(&self.rule, plan)
+    }
+
+    fn bricked(&self, bricks: &Bricks, plan: &Plan) -> Result<Loop, LaneError> {
+        crate::bricks::arranged(&self.rule, bricks, plan, true)
+    }
+
+    fn bricked_sizes(&self, bricks: &Bricks, plan: &Plan) -> Vec<usize> {
+        bricks.sizes(&self.rule, plan)
     }
 
     fn reference(&self, grid: Grid3, frame: u32, cells: &[u32], params: &[u32]) -> Vec<u32> {
@@ -257,6 +273,8 @@ pub fn refusal_name(why: &(dyn std::error::Error + 'static)) -> &'static str {
         return "lane";
     }
     match why.downcast_ref::<crate::host::Error>() {
+        Some(crate::host::Error::PoolFull { .. }) => "pool_full",
+        Some(crate::host::Error::LostWrite) => "lost_write",
         Some(crate::host::Error::TooLarge { .. }) => "too_large",
         Some(crate::host::Error::TooManyGroups { .. }) => "too_many_groups",
         Some(crate::host::Error::NoComputeDevice) => "no_compute_device",
@@ -331,6 +349,7 @@ struct World<'host> {
     solid: Grid3,
     plan: Plan,
     frame: u32,
+    pool: Option<Bricks>,
 }
 
 impl World<'_> {
@@ -353,6 +372,10 @@ impl World<'_> {
     }
 
     fn listed(&mut self) -> Result<u32, Failed> {
+        if let Some(bricks) = self.pool.as_ref() {
+            let (octs, whole) = bricks.listed(&mut self.live)?;
+            return Ok(octs.saturating_add(whole.saturating_mul(bricks.per_block())));
+        }
         Ok(self
             .live
             .read(GRAND as usize, 1)?
@@ -360,6 +383,71 @@ impl World<'_> {
             .copied()
             .unwrap_or(0))
     }
+
+    fn reported(&mut self, mut answer: Vec<(&'static str, Json)>) -> Result<Json, Failed> {
+        if let Some(bricks) = self.pool.as_ref() {
+            let used = bricks.pool_use(&mut self.live)?;
+            answer.push(("sparse", Json::Bool(true)));
+            answer.push(("pool_use", pooled(used)));
+        }
+        Ok(map(answer))
+    }
+
+    fn cells_at(&mut self, points: &[[u32; 3]]) -> Result<Vec<u32>, Failed> {
+        let Some(bricks) = self.pool.as_ref() else {
+            let last = points.iter().map(|&at| self.index(at)).max().unwrap_or(0);
+            let state = self.live.read(STATE as usize, last + 1)?;
+            return points
+                .iter()
+                .map(|&at| {
+                    state
+                        .get(self.index(at))
+                        .copied()
+                        .ok_or_else(|| "the world read back short".into())
+                })
+                .collect();
+        };
+        bricks.check(&mut self.live)?;
+        let table = self
+            .live
+            .read(bricks.table() as usize, bricks.table_words())?;
+        let per = bricks.cells();
+        let places: Vec<crate::bricks::Cell<u32>> =
+            points.iter().map(|&at| bricks.cell_of(at)).collect();
+        let slot_of = |brick: u32| {
+            table
+                .get(brick as usize * crate::bricks::ENTRY)
+                .copied()
+                .unwrap_or(crate::bricks::UNIFORM)
+        };
+        let reach = places
+            .iter()
+            .map(|place| slot_of(place.brick))
+            .filter(|&slot| slot != crate::bricks::UNIFORM)
+            .map(|slot| (slot as usize + 1) * per)
+            .max()
+            .unwrap_or(0);
+        let pool = live::read_state(&mut self.live, bricks.windows(), reach)?;
+        Ok(places
+            .iter()
+            .map(
+                |place| match bricks.brick_words(&table, &pool, place.brick) {
+                    Content::Uniform(value) => value,
+                    Content::Mixed(words) => words.get(place.offset as usize).copied().unwrap_or(0),
+                },
+            )
+            .collect())
+    }
+}
+
+fn pooled(used: PoolUse) -> Json {
+    map(vec![
+        ("held", counted(used.held)),
+        ("free", counted(used.free)),
+        ("capacity", counted(used.capacity)),
+        ("overflow", Json::Bool(used.overflow)),
+        ("lost", Json::Bool(used.lost)),
+    ])
 }
 
 enum Slot<'host> {
@@ -446,20 +534,51 @@ impl<'host> Server<'host> {
         let tall = needed(held, "tall")?;
         let host = self.host.ok_or(crate::host::Error::NoComputeDevice)?;
 
+        let sparse = match held.get("sparse") {
+            None => false,
+            Some(Json::Bool(sparse)) => *sparse,
+            Some(other) => {
+                return Err(malformed(format!(
+                    "sparse is {}, which is not true or false",
+                    crate::wire::written(other)
+                )));
+            }
+        };
+        let slots = number(held, "slots")?;
         let grid = Grid::solid(wide, deep, tall)?;
         let width = host.width();
-        let plan = Plan::over_in(
-            width,
-            grid.blocks().div_ceil(sweep::cells(width)),
-            Dimension::Three,
-        )?;
-        let (passes, stages) = rule.wired(width, grid, &plan)?;
+        let blocks = grid.blocks().div_ceil(sweep::cells(width));
+        let plan = if sparse {
+            Plan::bricked(width, blocks)?
+        } else {
+            Plan::over_in(width, blocks, Dimension::Three)?
+        };
+        let pool = if sparse {
+            let most = u32::try_from(((1_u64 << 32) - 1) / (u64::from(plan.per_block) * 8))
+                .unwrap_or(u32::MAX)
+                .min(plan.blocks);
+            let capacity = slots
+                .unwrap_or((plan.blocks / 4).max(SLOTS_LEAST))
+                .clamp(1, most);
+            Some(Bricks::new(grid, &plan, capacity)?)
+        } else {
+            None
+        };
+        let ((passes, stages), sizes) = match pool.as_ref() {
+            Some(bricks) => (
+                rule.bricked(bricks, &plan)?,
+                rule.bricked_sizes(bricks, &plan),
+            ),
+            None => (rule.wired(width, grid, &plan)?, rule.sizes(&plan).to_vec()),
+        };
         let solid = Grid3::new(grid.wide, grid.deep, grid.tall).ok_or_else(|| {
             malformed(format!(
                 "a world of {wide} by {deep} by {tall} cells is not solid"
             ))
         })?;
-        let sizes = rule.sizes(&plan);
+        if pool.is_some() {
+            host.limits().admits_on(&sizes, None, host.heap())?;
+        }
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
         let mut live = host.resident(&sizes, &modules)?;
         for (binding, room) in sizes.iter().enumerate() {
@@ -468,8 +587,18 @@ impl<'host> Server<'host> {
         if !params.is_empty() {
             live.write_at(PARAMS as usize, FIRST_PARAM, &params)?;
         }
-        live.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
-        live::seed(&mut live, grid, &plan)?;
+        match pool.as_ref() {
+            Some(bricks) => {
+                live.write(PARAMS as usize, &[u32::MAX])?;
+                let packed = bricks.compose(|_| Content::Uniform(0))?;
+                bricks.write_packed(&mut live, &plan, &packed)?;
+                bricks.seed(&mut live, &plan)?;
+            }
+            None => {
+                live.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
+                live::seed(&mut live, grid, &plan)?;
+            }
+        }
 
         let mut world = World {
             rule,
@@ -479,13 +608,14 @@ impl<'host> Server<'host> {
             solid,
             plan,
             frame: 0,
+            pool,
         };
         let listed = world.listed()?;
         let id = self.next;
         self.next = id
             .checked_add(1)
             .ok_or_else(|| malformed("every world number has been used".to_owned()))?;
-        let answer = map(vec![
+        let answer = world.reported(vec![
             ("world", counted(id)),
             ("rule", text(world.rule.name())),
             (
@@ -496,7 +626,7 @@ impl<'host> Server<'host> {
             ("cells", Json::Int(i64::try_from(solid.cells())?)),
             ("frame", counted(world.frame)),
             ("listed", counted(listed)),
-        ]);
+        ])?;
         self.worlds.insert(id, Slot::Open(Box::new(world)));
         Ok(answer)
     }
@@ -521,6 +651,7 @@ impl<'host> Server<'host> {
             }));
         }
         let mut cells = Vec::with_capacity(list.len());
+        let mut points = Vec::with_capacity(list.len());
         for (at, one) in list.iter().enumerate() {
             let got = words(one, &format!("cell {at}"))?;
             let [x, y, z, word] = <[u32; 4]>::try_from(got.as_slice()).map_err(|_| {
@@ -529,16 +660,22 @@ impl<'host> Server<'host> {
                 ))
             })?;
             world.inside([x, y, z], &format!("cell {at} at"))?;
-            cells.push((u32::try_from(world.index([x, y, z]))?, word));
+            points.push(([x, y, z], word));
+            if world.pool.is_none() {
+                cells.push((u32::try_from(world.index([x, y, z]))?, word));
+            }
         }
-        live::put3(&mut world.live, world.grid, &world.plan, &cells)?;
+        match world.pool.as_ref() {
+            Some(bricks) => bricks.put_at(&mut world.live, &points)?,
+            None => live::put3(&mut world.live, world.grid, &world.plan, &cells)?,
+        }
         let listed = world.listed()?;
-        Ok(map(vec![
+        world.reported(vec![
             ("world", counted(needed(held, "world")?)),
-            ("written", counted(u32::try_from(cells.len())?)),
+            ("written", counted(u32::try_from(points.len())?)),
             ("frame", counted(world.frame)),
             ("listed", counted(listed)),
-        ]))
+        ])
     }
 
     fn stepped(&mut self, held: &Json) -> Result<Json, Failed> {
@@ -566,7 +703,7 @@ impl<'host> Server<'host> {
         world.frame = world.frame.wrapping_add(frames);
         let tally = world.live.read(TALLY as usize, world.rule.tally_words())?;
         let listed = world.listed()?;
-        Ok(map(vec![
+        world.reported(vec![
             ("world", counted(needed(held, "world")?)),
             ("frames", counted(frames)),
             ("frame", counted(world.frame)),
@@ -575,7 +712,7 @@ impl<'host> Server<'host> {
                 Json::List(tally.iter().map(|one| counted(*one)).collect()),
             ),
             ("listed", counted(listed)),
-        ]))
+        ])
     }
 
     fn read(&mut self, held: &Json) -> Result<Json, Failed> {
@@ -599,20 +736,19 @@ impl<'host> Server<'host> {
                 most: READ_MOST,
             }));
         }
-        let state = world.live.read(STATE as usize, world.index(to) + 1)?;
-        let mut words = Vec::new();
-        let mut kinds = BTreeMap::new();
+        let mut points = Vec::new();
         for z in from[2]..=to[2] {
             for y in from[1]..=to[1] {
                 for x in from[0]..=to[0] {
-                    let word = state
-                        .get(world.index([x, y, z]))
-                        .copied()
-                        .ok_or("the world read back short")?;
-                    *kinds.entry(world.rule.kind(word)).or_insert(0_u32) += 1;
-                    words.push(counted(word));
+                    points.push([x, y, z]);
                 }
             }
+        }
+        let mut words = Vec::new();
+        let mut kinds = BTreeMap::new();
+        for word in world.cells_at(&points)? {
+            *kinds.entry(world.rule.kind(word)).or_insert(0_u32) += 1;
+            words.push(counted(word));
         }
         Ok(map(vec![
             ("world", counted(needed(held, "world")?)),
@@ -679,17 +815,20 @@ impl<'host> Server<'host> {
             }
             held
         };
-        let last = place(side(down) - 1, side(across) - 1);
-        let state = world.live.read(STATE as usize, world.index(last) + 1)?;
-        let mut rows = Vec::new();
+        let mut points = Vec::new();
         for row in 0..side(down) {
+            for column in 0..side(across) {
+                points.push(place(row, column));
+            }
+        }
+        let state = world.cells_at(&points)?;
+        let mut rows = Vec::new();
+        let mut read = state.into_iter();
+        for _ in 0..side(down) {
             let mut kinds = String::new();
             let mut words = Vec::new();
-            for column in 0..side(across) {
-                let word = state
-                    .get(world.index(place(row, column)))
-                    .copied()
-                    .ok_or("the world read back short")?;
+            for _ in 0..side(across) {
+                let word = read.next().ok_or("the world read back short")?;
                 if shown == "kinds" {
                     let kind = world.rule.kind(word);
                     kinds.push(
@@ -887,6 +1026,20 @@ fn world_tools() -> Vec<Json> {
                 ("deep", property("integer", "cells along y, which is down")),
                 ("tall", property("integer", "cells along z; at least 2")),
                 ("rule", property("string", "a name grit_world_rules lists")),
+                (
+                    "sparse",
+                    property(
+                        "boolean",
+                        "hold only bricks that are not all one word; false if left out",
+                    ),
+                ),
+                (
+                    "slots",
+                    property(
+                        "integer",
+                        "for a sparse world, how many bricks it may hold; a quarter of them if left out",
+                    ),
+                ),
                 (
                     "params",
                     map(vec![

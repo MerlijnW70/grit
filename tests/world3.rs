@@ -1115,3 +1115,208 @@ fn a_fixed_script_of_calls_reads_the_same_twice_and_on_every_card() {
     assert_eq!(first, second);
     assert_eq!(first, SCRIPT_HASH, "{first:#018x}");
 }
+
+fn created_with(
+    server: &mut Server<'_>,
+    rule: &str,
+    size: [u32; 3],
+    params: &[u32],
+    rest: &str,
+) -> Json {
+    answer(&call(
+        server,
+        "grit_world_create",
+        &format!(
+            "{{\"wide\":{},\"deep\":{},\"tall\":{},\"rule\":\"{rule}\",\"params\":{params:?}{rest}}}",
+            size[0], size[1], size[2]
+        ),
+    ))
+}
+
+fn read_layers(server: &mut Server<'_>, world: u32, size: [u32; 3]) -> Vec<u32> {
+    let layers = (4096 / (size[0] * size[1])).max(1);
+    let mut out = Vec::new();
+    for from in (0..size[2]).step_by(layers as usize) {
+        let to = (from + layers).min(size[2]) - 1;
+        let got = answer(&call(
+            server,
+            "grit_world_read",
+            &format!(
+                "{{\"world\":{world},\"from\":[0,0,{from}],\"to\":[{},{},{to}]}}",
+                size[0] - 1,
+                size[1] - 1
+            ),
+        ));
+        out.extend(numbers(&got, "cells"));
+    }
+    out
+}
+
+fn pool_of(got: &Json) -> (u32, u32, u32, bool, bool) {
+    let pool = got.get("pool_use").unwrap();
+    let flag = |key: &str| match pool.get(key) {
+        Some(Json::Bool(held)) => *held,
+        other => panic!("{key} is {other:?}"),
+    };
+    let (held, free, capacity) = (
+        pool.counted("held").unwrap(),
+        pool.counted("free").unwrap(),
+        pool.counted("capacity").unwrap(),
+    );
+    assert_eq!(held + free, capacity, "{}", written(got));
+    (held, free, capacity, flag("overflow"), flag("lost"))
+}
+
+#[test]
+fn a_sparse_world_through_the_tools_steps_as_the_dense_one_and_reports_its_pool() {
+    let Some(host) = device("world sparse") else {
+        return;
+    };
+    let size = [32, 32, 32];
+    let grid = Grid3::new(32, 32, 32).unwrap();
+    for rule in rules() {
+        let params: Vec<u32> = if rule.name() == "nature" {
+            vec![0]
+        } else {
+            (0..rule.params())
+                .map(|at| heat::TUNED.get(at).copied().unwrap_or(1))
+                .collect()
+        };
+        let mut server = Server::new(Some(&host));
+        let dense = created(&mut server, rule.name(), size, &params);
+        let made = created_with(&mut server, rule.name(), size, &params, ",\"sparse\":true");
+        let sparse = made.counted("world").unwrap();
+        assert_eq!(made.get("sparse"), Some(&Json::Bool(true)));
+        let (_, free, capacity, overflow, lost) = pool_of(&made);
+        assert_eq!(
+            (free, overflow, lost),
+            (capacity, false, false),
+            "{}",
+            rule.name()
+        );
+        assert!(capacity >= 8, "{}: {capacity} slots", rule.name());
+        let mut state = 0x5BA_45E ^ u64::from(rule.params() as u32);
+        let mut cells = Vec::new();
+        for _ in 0..300 {
+            let at = next(&mut state);
+            cells.push((
+                4 + (at % 20) as u32,
+                2 + ((at >> 8) % 12) as u32,
+                6 + ((at >> 16) % 20) as u32,
+                wild(&mut state, rule.name()),
+            ));
+        }
+        let text = writing(&cells);
+        let mut start = vec![0_u32; grid.cells()];
+        for (x, y, z, word) in &cells {
+            start[grid.index(*x, *y, *z)] = *word;
+        }
+        let mut answers = Vec::new();
+        for world in [dense, sparse] {
+            answers.push(answer(&call(
+                &mut server,
+                "grit_world_write",
+                &format!("{{\"world\":{world},\"cells\":{text}}}"),
+            )));
+        }
+        assert!(answers[0].get("pool_use").is_none() && answers[0].get("sparse").is_none());
+        let (held, _, _, overflow, lost) = pool_of(&answers[1]);
+        assert!(held > 0 && !overflow && !lost, "{}", rule.name());
+        let mut frame = 0;
+        for frames in [1, 7, 24] {
+            let stepped_dense = step(&mut server, dense, frames);
+            let stepped_sparse = step(&mut server, sparse, frames);
+            assert_eq!(
+                stepped_dense.get("tally").map(written),
+                stepped_sparse.get("tally").map(written),
+                "{}",
+                rule.name()
+            );
+            let (_, _, _, overflow, lost) = pool_of(&stepped_sparse);
+            assert!(!overflow && !lost, "{}", rule.name());
+            frame += frames;
+            let want = stepped(rule.name(), grid, &start, &params, 0, frame);
+            assert_eq!(read_layers(&mut server, dense, size), want, "{}", rule.name());
+            assert_eq!(
+                read_layers(&mut server, sparse, size),
+                want,
+                "{} sparse",
+                rule.name()
+            );
+        }
+        for axis in ["x", "y", "z"] {
+            let arguments = |world: u32| {
+                format!("{{\"world\":{world},\"axis\":\"{axis}\",\"at\":9,\"as\":\"words\"}}")
+            };
+            let want = answer(&call(&mut server, "grit_world_slice", &arguments(dense)));
+            let got = answer(&call(&mut server, "grit_world_slice", &arguments(sparse)));
+            assert_eq!(
+                got.get("rows"),
+                want.get("rows"),
+                "{} slice {axis}",
+                rule.name()
+            );
+        }
+        println!(
+            "{}: a sparse world through the tools equals the dense one and the CPU over {frame} frames; {held} bricks held after the write",
+            rule.name()
+        );
+    }
+}
+
+#[test]
+fn a_sparse_world_without_room_refuses_a_write_and_stops_with_its_pool_full() {
+    let Some(host) = device("world sparse full") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let size = [32, 64, 32];
+    let made = created_with(
+        &mut server,
+        "sand",
+        size,
+        &[],
+        ",\"sparse\":true,\"slots\":1",
+    );
+    let world = made.counted("world").unwrap();
+    assert_eq!(pool_of(&made), (0, 1, 1, false, false));
+    let apart = writing(&[(1, 1, 1, grit::sand::SAND), (1, 60, 30, grit::sand::SAND)]);
+    let refused = call(
+        &mut server,
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":{apart}}}"),
+    );
+    assert_eq!(refusal(&refused), "pool_full");
+    for corner in ["[0,0,0],\"to\":[3,3,3]", "[0,58,28],\"to\":[3,61,31]"] {
+        let got = answer(&call(
+            &mut server,
+            "grit_world_read",
+            &format!("{{\"world\":{world},\"from\":{corner}}}"),
+        ));
+        assert_eq!(numbers(&got, "cells"), vec![0; 64], "{corner}");
+    }
+    let grains: Vec<(u32, u32, u32, u32)> = (0..8)
+        .flat_map(|x| (0..4).map(move |z| (x + 4, 2, z + 2, grit::sand::SAND)))
+        .collect();
+    let wrote = answer(&call(
+        &mut server,
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&grains)),
+    ));
+    assert_eq!(pool_of(&wrote), (1, 0, 1, false, false));
+    let fell = step(&mut server, world, 64);
+    let (_, _, _, overflow, _) = pool_of(&fell);
+    assert!(overflow, "{}", written(&fell));
+    let read = call(
+        &mut server,
+        "grit_world_read",
+        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[3,3,3]}}"),
+    );
+    assert_eq!(refusal(&read), "pool_full");
+    let wrong = call(
+        &mut server,
+        "grit_world_create",
+        "{\"wide\":32,\"deep\":32,\"tall\":32,\"rule\":\"sand\",\"sparse\":3}",
+    );
+    assert_eq!(refusal(&wrong), "malformed");
+}
