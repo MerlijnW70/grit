@@ -19,8 +19,8 @@ use super::shade::{
     Emitted, Look, Plainly, Shader, kernel, look_of, plus, reader_of, real_at, real_of, seat,
 };
 use super::{
-    BRICK_BITS, Build, GAS_WORDS, LIGHT_REACH, Layout, SUN_STEPS, brick_sides, light, of, put,
-    refuse, scene, word,
+    BRICK_BITS, Build, GAS_WORDS, GASSY, LIGHT_REACH, Layout, SUN_STEPS, brick_sides, light, of,
+    put, refuse, scene, word,
 };
 use crate::layout::{PARAMS, PIXELS};
 use crate::sand::Grid;
@@ -95,9 +95,15 @@ fn spread<S: Shader>(
     Ok(out)
 }
 
-/// How much sun reaches brick `brick` through the gas between it and the
-/// sun, found [`SUN_STEPS`] bricks toward the sun.
-fn through<S: Shader>(s: &mut S, look: &Look, brick: S::W) -> Result<S::R, LaneError> {
+/// How much sun reaches a point `centre`, in bricks, through the gas
+/// between it and the sun, found at [`SUN_STEPS`] points a brick apart
+/// toward the sun, the first `first` bricks from it.
+pub(crate) fn sun_through<S: Shader>(
+    s: &mut S,
+    look: &Look,
+    centre: [S::R; 3],
+    first: f32,
+) -> Result<S::R, LaneError> {
     let grid = look.grid;
     let sides = brick_sides(grid);
     let across = sides[0].trailing_zeros();
@@ -110,16 +116,7 @@ fn through<S: Shader>(s: &mut S, look: &Look, brick: S::W) -> Result<S::R, LaneE
         real_at(s, at_light + word(light::TOWARD) + 2)?,
     ];
     let smoke = real_at(s, at_light + word(light::SMOKE))?;
-    let half = s.f(0.5)?;
-    let mut centre = [half; 3];
     let shifts = [0, across, across + down];
-    for axis in 0..3 {
-        let part = s.shr(brick, of(shifts, axis))?;
-        let part = s.and(part, of(sides, axis) - 1)?;
-        let part = s.real(part)?;
-        let held = s.fadd(part, half)?;
-        put(&mut centre, axis, held);
-    }
     let zero = s.f(0.0)?;
     let gas = s.u(word(look.layout.gas()))?;
     let none = s.u(0)?;
@@ -128,7 +125,7 @@ fn through<S: Shader>(s: &mut S, look: &Look, brick: S::W) -> Result<S::R, LaneE
         let mut index = none;
         let mut inside = s.eq(none, none)?;
         for axis in 0..3 {
-            let far = s.f(step as f32)?;
+            let far = s.f(first + (step - 1) as f32)?;
             let moved = s.fmul(of(toward, axis), far)?;
             let at = s.fadd(of(centre, axis), moved)?;
             let below = s.fgt(zero, at)?;
@@ -155,6 +152,38 @@ fn through<S: Shader>(s: &mut S, look: &Look, brick: S::W) -> Result<S::R, LaneE
     let lost = s.fmul(total, density)?;
     let lost = s.fsub(zero, lost)?;
     s.exp(lost)
+}
+
+/// How much sun reaches brick `brick` through the gas between it and the
+/// sun, found [`SUN_STEPS`] bricks toward the sun, when the brick holds
+/// gas; 1 for a brick that holds none, which no ray walks from.
+fn through<S: Shader>(s: &mut S, look: &Look, brick: S::W) -> Result<S::R, LaneError> {
+    let grid = look.grid;
+    let sides = brick_sides(grid);
+    let across = sides[0].trailing_zeros();
+    let down = sides[1].trailing_zeros();
+    let occupancy = s.u(word(look.layout.occupancy()))?;
+    let at = s.add(occupancy, brick)?;
+    let held = s.pixel(at)?;
+    let gassy = s.and(held, GASSY)?;
+    let none = s.u(0)?;
+    let clean = s.eq(gassy, none)?;
+    let walked = s.not(clean)?;
+    let one = s.f(1.0)?;
+    let gate = s.open(walked)?;
+    let half = s.f(0.5)?;
+    let mut centre = [half; 3];
+    let shifts = [0, across, across + down];
+    for axis in 0..3 {
+        let part = s.shr(brick, of(shifts, axis))?;
+        let part = s.and(part, of(sides, axis) - 1)?;
+        let part = s.real(part)?;
+        let held = s.fadd(part, half)?;
+        put(&mut centre, axis, held);
+    }
+    let value = sun_through(s, look, centre, 1.0)?;
+    let closed = s.close(gate, &[value], &[one])?;
+    Ok(closed.first().copied().unwrap_or(one))
 }
 
 /// The lane's brick, whether it is one, and how many there are.
@@ -212,7 +241,8 @@ pub fn lit_deep(build: &Build) -> Result<Vec<u32>, LaneError> {
     spread_pass(build, 2, "render3::lit_deep")
 }
 
-/// The pass that finds how much sun reaches each brick through the gas.
+/// The pass that finds how much sun reaches each brick that holds gas
+/// through the gas; only those bricks walk toward the sun.
 pub fn sunlit(build: &Build) -> Result<Vec<u32>, LaneError> {
     refuse("render3::sunlit", build.grid, build.screen)?;
     let layout = build.layout();

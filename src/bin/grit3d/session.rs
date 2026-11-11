@@ -3,6 +3,7 @@ use std::time::Duration;
 use grit::compact::Plan;
 use grit::geometry::Solid;
 use grit::layout::{DENSE, Dimension, GRAND, PARAMS, PIXELS, STATE, TALLY};
+use grit::render3::present::Windowed;
 use grit::render3::{
     self, Build, Camera, Frame, HIT_WORDS, INSIDE, Light, MISS, Screen, Steps, framed_words, stage,
 };
@@ -13,7 +14,7 @@ use grit::rule3::sand::Sand;
 use grit::rule3::{FIRST_PARAM, Rule};
 use grit::sand::Grid;
 use grit::view3::Kinds;
-use grit::{Groups, Host, Resident, live, sweep};
+use grit::{Groups, Host, Resident, Run, Ticket, live, sweep};
 
 use super::life::{Act, Cycle, Phase};
 use super::scenes::{Example, Tool, Which};
@@ -73,14 +74,49 @@ pub struct Session<'h> {
     pub bytes: usize,
     start: Option<Vec<u32>>,
     pub restarted: bool,
+    /// Where the window's words lie, when the session draws into a window
+    /// on the device.
+    pub windowed: Option<Windowed>,
+    /// The words each binding holds.
+    sizes: Vec<usize>,
+    /// The engine's list as a frame read it, and the frame count it was
+    /// read at: what the next feed finds the list in.
+    ahead: Option<(u32, Vec<u32>)>,
+    /// The longest list a feed has met, so the next frame that reads the
+    /// list ahead of a feed reads enough of it.
+    longest: u32,
+    /// The height of the glass box's top, in cells down from the grid's
+    /// top.
+    pub top: f32,
 }
+
+/// A frame on the device: its ticket, whether it stepped the engine, and
+/// whether it reads the list ahead of a feed.
+#[must_use]
+pub struct Pending {
+    ticket: Ticket,
+    moving: bool,
+    ahead: bool,
+}
+
+/// The cells the glass box reaches above the content it holds.
+pub const GLASS_MARGIN: u32 = 6;
+
+/// The share of the columns the glass box holds whole.
+pub const GLASS_SHARE: f32 = 0.9;
 
 impl<'h> Session<'h> {
     /// The session of `setup`, its world written and warmed up. The scene
     /// words are written before the warm-up, so the bricks the engine's
     /// frames rebuild know which kinds are seen, gas or glowing.
     pub fn open(host: &'h Host, setup: Setup) -> Result<Self, Failed> {
-        let mut session = Self::cold(host, setup)?;
+        Self::open_in(host, setup, None)
+    }
+
+    /// [`Session::open`], drawing into a window of `window` pixels on the
+    /// device too when `window` is given.
+    pub fn open_in(host: &'h Host, setup: Setup, window: Option<Screen>) -> Result<Self, Failed> {
+        let mut session = Self::cold_in(host, setup, window)?;
         session.warm(session.example.warm)?;
         if session.life.is_some() {
             session.start = Some(session.state()?);
@@ -90,12 +126,18 @@ impl<'h> Session<'h> {
 
     /// The session of `setup`, its world written, with no warm-up.
     pub fn cold(host: &'h Host, setup: Setup) -> Result<Self, Failed> {
+        Self::cold_in(host, setup, None)
+    }
+
+    /// [`Session::cold`], drawing into a window of `window` pixels on the
+    /// device too when `window` is given.
+    pub fn cold_in(host: &'h Host, setup: Setup, window: Option<Screen>) -> Result<Self, Failed> {
         let example = setup.which.example();
         let mut session = match setup.which {
-            Which::Valley => Self::with(host, &Nature, example, setup)?,
-            Which::Sand => Self::with(host, &Sand, example, setup)?,
-            Which::Fire => Self::with(host, &Heat, example, setup)?,
-            Which::Code => Self::with(host, &Code, example, setup)?,
+            Which::Valley => Self::with(host, &Nature, example, setup, window)?,
+            Which::Sand => Self::with(host, &Sand, example, setup, window)?,
+            Which::Fire => Self::with(host, &Heat, example, setup, window)?,
+            Which::Code => Self::with(host, &Code, example, setup, window)?,
         };
         let side = setup.side as f32;
         let camera = Camera::looking(
@@ -113,6 +155,7 @@ impl<'h> Session<'h> {
         rule: &R,
         example: Example,
         setup: Setup,
+        window: Option<Screen>,
     ) -> Result<Self, Failed> {
         let width = host.width();
         let grid = Grid::solid(setup.side, setup.side, setup.side)?;
@@ -140,10 +183,21 @@ impl<'h> Session<'h> {
             .position(|stage| stage == &vec![listed])
             .ok_or("the engine has no listed step")?
             + 1;
+        let mut all = build.passes()?;
+        let windowed = match window {
+            Some(window) => {
+                all.push(render3::present::window(&build, window)?);
+                Some(Windowed::of(&build.layout(), window))
+            }
+            None => None,
+        };
         let (passes, stages) =
-            render3::watching(engine, build.passes()?).ok_or("the engine has no listed step")?;
+            render3::watching(engine, all).ok_or("the engine has no listed step")?;
         let layout = build.layout();
-        let sizes = layout.sized(live::sizes3(rule, &plan));
+        let mut sizes = layout.sized(live::sizes3(rule, &plan));
+        if let (Some(held), Some(slot)) = (windowed, sizes.get_mut(PIXELS as usize)) {
+            *slot = (*slot).max(held.words());
+        }
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
         let bytes = sizes.iter().sum::<usize>() * 4;
         let mut held = host.resident(&sizes, &modules)?;
@@ -152,6 +206,7 @@ impl<'h> Session<'h> {
         }
         let world = (example.scene)(grid);
         held.write(STATE as usize, &world)?;
+        let top = glass_top(grid, kinds, example.table.visible(), &world);
         let life = example.life.map(|made| made(grid, &world));
         let feed = example
             .feed
@@ -188,6 +243,11 @@ impl<'h> Session<'h> {
             bytes,
             start: None,
             restarted: false,
+            windowed,
+            sizes: sizes.to_vec(),
+            ahead: None,
+            longest: 0,
+            top,
         })
     }
 
@@ -226,6 +286,7 @@ impl<'h> Session<'h> {
             before,
             flags,
             drawn: self.drawn,
+            top: self.top,
         };
         let words = framed_words(&rays, &self.example.table, &frame, &light);
         self.held
@@ -243,6 +304,9 @@ impl<'h> Session<'h> {
             self.still.clone()
         };
         all.extend(self.build.stages(steps));
+        if self.windowed.is_some() {
+            all.push(vec![Groups::Fixed(0)]);
+        }
         all
     }
 
@@ -254,7 +318,7 @@ impl<'h> Session<'h> {
         reading: bool,
     ) -> Result<(Duration, Vec<u32>), Failed> {
         if moving {
-            self.fed()?;
+            self.fed(false)?;
         }
         let all = self.stages(moving, steps);
         let groups: Vec<&[Groups]> = all.iter().map(Vec::as_slice).collect();
@@ -272,6 +336,87 @@ impl<'h> Session<'h> {
         Ok(out)
     }
 
+    /// The stages of a frame shown in the window on the device: those of
+    /// [`Session::stages`], then the window's.
+    pub fn shown_stages(&self, moving: bool, steps: Steps) -> Vec<Vec<Groups>> {
+        let mut all = self.stages(moving, steps);
+        if let (Some(held), Some(last)) = (self.windowed, all.last_mut()) {
+            *last = vec![held.window.groups(self.build.subgroup)];
+        }
+        all
+    }
+
+    /// Sends a frame to the device without waiting for it, with the window's
+    /// stage, and asks it to read back the rule's tally and, when the next
+    /// frame feeds the world, the engine's list, so neither costs a wait of
+    /// its own. Before it, the feed is written when the frame steps the
+    /// engine and one is due, from the list the frame before read.
+    pub fn submit(&mut self, moving: bool, steps: Steps) -> Result<Pending, Failed> {
+        if moving {
+            self.fed(true)?;
+        }
+        let ahead = !self.feed.is_empty()
+            && moving
+            && (self.steps.wrapping_add(1)).is_multiple_of(FEED_EVERY);
+        let all = self.shown_stages(moving, steps);
+        let groups: Vec<&[Groups]> = all.iter().map(Vec::as_slice).collect();
+        let tally = (TALLY as usize, 3);
+        let ticket = if ahead {
+            let held = self.sizes.get(DENSE as usize).copied().unwrap_or(0);
+            let wanted = (self.longest as usize * 2 + 1024).min(held);
+            self.held
+                .submit_reading_both(&groups, tally, (DENSE as usize, wanted))?
+        } else {
+            self.held.submit_reading(&groups, tally.0, tally.1)?
+        };
+        Ok(Pending {
+            ticket,
+            moving,
+            ahead,
+        })
+    }
+
+    /// Waits for a frame [`Session::submit`] sent, keeps what it read, and
+    /// takes the scene's cycle on with the tally it read.
+    pub fn land(&mut self, pending: Pending) -> Result<Duration, Failed> {
+        let (spent, tally, list) = if pending.ahead {
+            self.held.wait_reading_both(pending.ticket)?
+        } else {
+            let (spent, tally) = self.held.wait_reading(pending.ticket)?;
+            (spent, tally, Vec::new())
+        };
+        self.drawn = self.drawn.wrapping_add(1);
+        self.ahead = pending.ahead.then_some((self.drawn, list));
+        if pending.moving {
+            self.steps = self.steps.wrapping_add(1);
+            let counts = (
+                tally.get(1).copied().unwrap_or(0),
+                tally.get(2).copied().unwrap_or(0),
+            );
+            self.lived_with(Some(counts))?;
+        }
+        Ok(spent)
+    }
+
+    /// Writes `rows` of the window's overlay, each a first row and its
+    /// words, in one write.
+    pub fn overlay(&mut self, rows: &[(u32, Vec<u32>)]) -> Result<(), Failed> {
+        let Some(held) = self.windowed else {
+            return Ok(());
+        };
+        let wide = held.window.wide as usize;
+        let runs: Vec<Run<'_>> = rows
+            .iter()
+            .map(|(row, words)| Run {
+                index: PIXELS as usize,
+                at: held.overlay + *row as usize * wide,
+                words,
+            })
+            .collect();
+        self.held.write_many(&runs)?;
+        Ok(())
+    }
+
     /// The fire and smoke cells of the world after the last step, as the
     /// rule's tally counts them.
     pub fn counts(&mut self) -> Result<(u32, u32), Failed> {
@@ -284,12 +429,20 @@ impl<'h> Session<'h> {
 
     /// Takes the scene's own cycle one step on, and does what it asks.
     fn lived(&mut self) -> Result<(), Failed> {
+        self.lived_with(None)
+    }
+
+    /// [`Session::lived`], with the tally already read when `read` gives it.
+    fn lived_with(&mut self, read: Option<(u32, u32)>) -> Result<(), Failed> {
         let burning = self
             .life
             .as_ref()
             .is_some_and(|life| life.phase == Phase::Burning);
         let counted = if burning && self.steps.is_multiple_of(COUNT_EVERY) {
-            Some(self.counts()?)
+            match read {
+                Some(counts) => Some(counts),
+                None => Some(self.counts()?),
+            }
         } else {
             None
         };
@@ -299,6 +452,7 @@ impl<'h> Session<'h> {
         match life.stepped(counted) {
             Act::Nothing => {}
             Act::Light(cells) => {
+                self.ahead = None;
                 live::put3(&mut self.held, self.build.grid, &self.plan, &cells)?;
             }
             Act::Restart => self.restart()?,
@@ -312,6 +466,7 @@ impl<'h> Session<'h> {
         let Some(start) = self.start.as_ref() else {
             return Ok(());
         };
+        self.ahead = None;
         self.held.write(STATE as usize, start)?;
         live::seed(&mut self.held, self.build.grid, &self.plan)?;
         let warm = self.example.warm;
@@ -332,8 +487,11 @@ impl<'h> Session<'h> {
                 .into_iter()
                 .map(|stage| stage.into_iter().map(|_| Groups::Fixed(0)).collect()),
         );
+        if self.windowed.is_some() {
+            all.push(vec![Groups::Fixed(0)]);
+        }
         for _ in 0..frames {
-            self.fed()?;
+            self.fed(false)?;
             let groups: Vec<&[Groups]> = all.iter().map(Vec::as_slice).collect();
             self.held.staged(&groups)?;
             self.steps = self.steps.wrapping_add(1);
@@ -351,20 +509,28 @@ impl<'h> Session<'h> {
                 .into_iter()
                 .map(|stage| stage.into_iter().map(|_| Groups::Fixed(0)).collect()),
         );
+        if self.windowed.is_some() {
+            all.push(vec![Groups::Fixed(0)]);
+        }
         let groups: Vec<&[Groups]> = all.iter().map(Vec::as_slice).collect();
         for _ in 0..frames {
-            self.fed()?;
+            self.fed(false)?;
             self.held.staged(&groups)?;
             self.steps = self.steps.wrapping_add(1);
         }
         Ok(())
     }
 
-    /// Writes the scene's feed, the cells it writes before every step.
-    fn fed(&mut self) -> Result<(), Failed> {
+    /// Writes the scene's feed, the cells it writes before every step; from
+    /// the list the frame before read when `early` and it read one.
+    fn fed(&mut self, early: bool) -> Result<(), Failed> {
+        let ahead = self.ahead.take();
         if !self.feed.is_empty() && self.steps.is_multiple_of(FEED_EVERY) {
             let feed = std::mem::take(&mut self.feed);
-            let done = self.put_runs(&feed);
+            let list = ahead
+                .filter(|(drawn, _)| early && *drawn == self.drawn)
+                .map(|(_, list)| list);
+            let done = self.put_runs(&feed, list.as_deref());
             self.feed = feed;
             done?;
         }
@@ -375,9 +541,9 @@ impl<'h> Session<'h> {
     /// [`live::put3`] does: the oct of either phase that holds each cell is
     /// marked awake and hot and is on the list once, added after the octs
     /// it held when it is not there yet. The words go in runs of
-    /// neighbouring indices, a write a run, so a feed of many cells costs a
-    /// few writes.
-    pub fn put_runs(&mut self, cells: &[(u32, u32)]) -> Result<(), Failed> {
+    /// neighbouring indices, all in one write. The list is found in `list`
+    /// when it is given and holds the whole of it, else read.
+    fn put_runs(&mut self, cells: &[(u32, u32)], list: Option<&[u32]>) -> Result<(), Failed> {
         use grit::layout::{AWAKE, HOT, INDIRECT};
         use std::collections::BTreeSet;
 
@@ -396,24 +562,34 @@ impl<'h> Session<'h> {
             .first()
             .copied()
             .unwrap_or(0);
-        for (start, words) in runs(sorted.iter().copied()) {
-            self.held.write_at(STATE as usize, start as usize, &words)?;
-        }
+        self.longest = self.longest.max(grand);
+        let mut writes: Vec<(usize, usize, Vec<u32>)> = runs(sorted.iter().copied())
+            .into_iter()
+            .map(|(start, words)| (STATE as usize, start as usize, words))
+            .collect();
         let woken: BTreeSet<u32> = sorted
             .iter()
             .flat_map(|&(cell, _)| (0..2).map(move |phase| Solid::held(grid, cell, phase).index))
             .collect();
         for (start, words) in runs(woken.iter().map(|&oct| (oct, 2))) {
-            self.held.write_at(AWAKE as usize, start as usize, &words)?;
+            writes.push((AWAKE as usize, start as usize, words));
         }
         let by = self.plan.per_block.trailing_zeros();
         let hot: BTreeSet<u32> = woken.iter().map(|&oct| oct >> by).collect();
         for (start, words) in runs(hot.iter().map(|&block| (block, 2))) {
-            self.held.write_at(HOT as usize, start as usize, &words)?;
+            writes.push((HOT as usize, start as usize, words));
         }
+        let read;
+        let listed = match list {
+            Some(held) if held.len() >= grand as usize => held.get(..grand as usize).unwrap_or(&[]),
+            _ => {
+                read = self.held.read(DENSE as usize, grand as usize)?;
+                read.as_slice()
+            }
+        };
         let mut missing = woken;
-        for oct in self.held.read(DENSE as usize, grand as usize)? {
-            missing.remove(&oct);
+        for oct in listed {
+            missing.remove(oct);
             if missing.is_empty() {
                 break;
             }
@@ -421,13 +597,23 @@ impl<'h> Session<'h> {
         if !missing.is_empty() {
             let added: Vec<u32> = missing.into_iter().collect();
             let count = grand.saturating_add(u32::try_from(added.len()).unwrap_or(u32::MAX));
-            self.held.write_at(DENSE as usize, grand as usize, &added)?;
-            self.held.write(GRAND as usize, &[count])?;
-            self.held.write(
+            writes.push((DENSE as usize, grand as usize, added));
+            writes.push((GRAND as usize, 0, vec![count]));
+            writes.push((
                 INDIRECT as usize,
-                &[count.div_ceil(self.plan.subgroup), 1, 1],
-            )?;
+                0,
+                vec![count.div_ceil(self.plan.subgroup), 1, 1],
+            ));
         }
+        let batch: Vec<Run<'_>> = writes
+            .iter()
+            .map(|(index, at, words)| Run {
+                index: *index,
+                at: *at,
+                words,
+            })
+            .collect();
+        self.held.write_many(&batch)?;
         Ok(())
     }
 
@@ -449,6 +635,7 @@ impl<'h> Session<'h> {
         (cell, face): (u32, u32),
         tool: Tool,
     ) -> Result<Vec<(u32, u32)>, Failed> {
+        self.ahead = None;
         let writes = stroked(self.build.grid, (cell, face), tool);
         live::put3(&mut self.held, self.build.grid, &self.plan, &writes)?;
         Ok(writes)
@@ -557,6 +744,37 @@ pub fn runs(pairs: impl IntoIterator<Item = (u32, u32)>) -> Vec<(u32, Vec<u32>)>
         out.push((at, vec![word]));
     }
     out
+}
+
+/// Where the glass box around `cells` begins, in cells down from the grid's
+/// top: [`GLASS_MARGIN`] cells above the height that [`GLASS_SHARE`] of the
+/// columns that hold a cell of a kind in `visible` reach no higher than,
+/// so a lone peak may stand out of the box; never above the grid.
+pub fn glass_top(grid: Grid, kinds: Kinds, visible: u32, cells: &[u32]) -> f32 {
+    let plane = grid.wide as usize * grid.deep as usize;
+    let wide = grid.wide as usize;
+    let mut tops = Vec::with_capacity(wide * grid.tall as usize);
+    for z in 0..grid.tall as usize {
+        for x in 0..wide {
+            let seen = (0..grid.deep).find(|&y| {
+                let at = z * plane + y as usize * wide + x;
+                let kind = cells
+                    .get(at)
+                    .map_or(0, |&word| (word >> kinds.shift()) & kinds.mask());
+                (visible >> (kind & 31)) & 1 == 1
+            });
+            if let Some(y) = seen {
+                tops.push(grid.deep - y);
+            }
+        }
+    }
+    tops.sort_unstable();
+    let at = (tops.len() as f32 * GLASS_SHARE) as usize;
+    let height = tops
+        .get(at.min(tops.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(grid.deep);
+    grid.deep.saturating_sub(height + GLASS_MARGIN) as f32
 }
 
 /// The view of every camera, in radians.

@@ -82,9 +82,18 @@ fn table(kinds: Kinds, seed: u64) -> Table {
             1 => Material::solid(colour, 0.3).clear(0.7),
             2 => Material::solid(colour, 0.2).glowing(2.0),
             3 => Material::solid(colour, 0.0).gas(0.6),
+            4 if below(&mut state, 2) == 0 => {
+                liquid(colour, colour ^ 0x40_4040).falls_by(below(&mut state, 32))
+            }
             4 => liquid(colour, colour ^ 0x40_4040),
-            5 => detailed(colour, colour ^ 0x30_5030),
-            _ => Material::solid(colour, 0.25).strata(0.2).gap(0.1),
+            5 => detailed(colour, colour ^ 0x30_5030)
+                .topped(colour ^ 0x20_4020)
+                .hue(0.7),
+            _ => Material::solid(colour, 0.25)
+                .strata(0.2)
+                .gap(0.1)
+                .topped(colour ^ 0x10_2010)
+                .hue(0.4),
         };
         out = out.with(kind, material);
     }
@@ -691,6 +700,7 @@ fn the_shaded_picture_is_within_two_of_the_cpu_on_every_channel() {
                     before: camera.before(grid, screen),
                     flags: if at == 0 { flags::RESET } else { flags::ACTIVE },
                     drawn: at,
+                    top: (at * 5) as f32,
                 };
                 let scene = framed_words(&made, &table, &frame, &light);
                 still.set(&table, &scene);
@@ -728,14 +738,16 @@ fn the_shaded_picture_is_within_two_of_the_cpu_on_every_channel() {
 }
 
 /// A world of glowing cells, gas and solid cells in clumps, and a table that
-/// draws them so.
-fn lit_world(grid: Grid, kinds: Kinds, seed: u64) -> (Table, Vec<u32>) {
+/// draws them so; its liquid falls where the rule marks it when `marked`,
+/// else where its neighbours leave it free.
+fn lit_world(grid: Grid, kinds: Kinds, seed: u64, marked: bool) -> (Table, Vec<u32>) {
     let mut state = seed;
+    let water = liquid(0x30_60A0, 0x10_2040);
     let table = Table::empty()
         .with(1, Material::solid(0x80_8080, 0.2))
         .with(2, Material::solid(0xFF_7020, 0.4).glowing(2.0))
         .with(3, Material::solid(0x50_4840, 0.0).gas(0.6))
-        .with(4, liquid(0x30_60A0, 0x10_2040));
+        .with(4, if marked { water.falls_by(30) } else { water });
     let field = kinds.mask() << kinds.shift();
     let cells = clumped(grid, kinds, seed)
         .into_iter()
@@ -753,21 +765,24 @@ fn the_light_of_glowing_cells_and_the_gas_are_kept_a_brick_at_a_time_as_on_the_c
         return;
     };
     let width = host.width();
-    let screen = Screen { wide: 13, high: 7 };
+    let screen = Screen { wide: 29, high: 15 };
     let mut wrong = Vec::new();
     let mut most = 0.0_f32;
     let mut foggy = 0;
     let mut state = 0x11A;
-    for (seed, &(wide, deep, tall)) in [(16, 16, 16), (32, 8, 16)].iter().enumerate() {
+    for (seed, &(wide, deep, tall, suns)) in [(16, 16, 16, 1), (32, 8, 16, 2), (16, 16, 16, 2)]
+        .iter()
+        .enumerate()
+    {
         let grid = Grid::solid(wide, deep, tall).unwrap();
         let held = kinds("heat");
-        let (table, cells) = lit_world(grid, held, 0x77 + seed as u64);
+        let (table, cells) = lit_world(grid, held, 0x77 + seed as u64, seed == 0);
         let build = Build {
             grid,
             kinds: held,
             screen,
             subgroup: width,
-            suns: 1,
+            suns,
         };
         let layout = build.layout();
         let mut still = Still::new(&host, build, &cells);
@@ -855,7 +870,7 @@ fn the_light_of_glowing_cells_and_the_gas_are_kept_a_brick_at_a_time_as_on_the_c
             screen,
             layout,
             pixels: &image,
-            suns: 1,
+            suns,
             frame: 0,
         };
         let fog = shading.fog(&made).unwrap();
@@ -941,6 +956,7 @@ fn the_sky_has_no_bands() {
             before: camera.before(grid, screen),
             flags: flags::RESET,
             drawn: 0,
+            top: 0.0,
         };
         let mut image = vec![0; layout.words()];
         let scene = framed_words(&made, &table, &frame, &light);
@@ -1528,4 +1544,129 @@ fn a_liquid_top_sends_its_rays_from_the_point_met_and_mirrors_its_fall() {
         vec![MISS, 0, MISS, 0],
         "a top that is not liquid sends nothing"
     );
+}
+
+#[test]
+fn the_window_pass_stretches_the_picture_and_lays_the_overlay_as_the_cpu_does() {
+    use grit::render3::present::{Windowed, window, windowed};
+    let Some(host) = device("render3 window") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::solid(8, 8, 8).unwrap();
+    let held = kinds("sand");
+    let mut state = 0x3D1;
+    let mut checked = 0;
+    let mut laid = 0;
+    for (from, to) in [
+        ((13, 7), (40, 21)),
+        ((16, 9), (16, 9)),
+        ((7, 5), (23, 17)),
+        ((20, 12), (9, 5)),
+    ] {
+        let screen = Screen {
+            wide: from.0,
+            high: from.1,
+        };
+        let target = Screen {
+            wide: to.0,
+            high: to.1,
+        };
+        let build = Build {
+            grid,
+            kinds: held,
+            screen,
+            subgroup: width,
+            suns: 1,
+        };
+        let layout = build.layout();
+        let place = Windowed::of(&layout, target);
+        let mut passes = build.passes().unwrap();
+        passes.push(window(&build, target).unwrap());
+        let modules: Vec<&[u32]> = passes[1..].iter().map(Vec::as_slice).collect();
+        let mut sizes = [1_usize; BINDINGS as usize];
+        sizes[PARAMS as usize] = Dimension::Three.params_words();
+        sizes[STATE as usize] = grid.cells();
+        let mut sizes = layout.sized(sizes);
+        sizes[PIXELS as usize] = sizes[PIXELS as usize].max(place.words());
+        let mut resident = host.resident(&sizes, &modules).unwrap();
+        for (binding, &words) in sizes.iter().enumerate() {
+            resident.write(binding, &vec![0; words]).unwrap();
+        }
+        let picture: Vec<u32> = (0..screen.pixels())
+            .map(|_| next(&mut state) as u32 & 0x00FF_FFFF)
+            .collect();
+        let overlay: Vec<u32> = (0..target.pixels())
+            .map(|_| match below(&mut state, 3) {
+                0 => 0,
+                1 => {
+                    let cover = below(&mut state, 256);
+                    (cover << 24) | (next(&mut state) as u32 & 0x007F_7F7F)
+                }
+                _ => 0xFF00_0000 | (next(&mut state) as u32 & 0x00FF_FFFF),
+            })
+            .collect();
+        laid += overlay.iter().filter(|&&word| word != 0).count();
+        resident.write_at(PIXELS as usize, 0, &picture).unwrap();
+        resident
+            .write_at(PIXELS as usize, place.overlay, &overlay)
+            .unwrap();
+        let mut stages: Vec<Vec<Groups>> = build
+            .stages(render3::Steps::ALL)
+            .into_iter()
+            .map(|stage| stage.into_iter().map(|_| Groups::Fixed(0)).collect())
+            .collect();
+        stages.push(vec![target.groups(width)]);
+        let refs: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
+        resident.staged(&refs).unwrap();
+        let all = resident
+            .read(PIXELS as usize, place.colours + target.pixels())
+            .unwrap();
+        let got = &all[place.colours..];
+        let want = windowed(&picture, screen, target, &overlay);
+        let differ = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differ, 0,
+            "{from:?} to {to:?}: {differ} pixels differ from the CPU"
+        );
+        assert_eq!(&all[..screen.pixels()], picture.as_slice());
+        checked += target.pixels();
+    }
+    println!(
+        "width {width}: {checked} window pixels, {laid} under the overlay, 0 differ from the CPU"
+    );
+}
+
+#[test]
+fn the_window_stretch_reads_the_picture_where_a_scaled_pixel_falls() {
+    use grit::render3::present::tap;
+    for (from, to) in [
+        (640, 1920),
+        (13, 40),
+        (16, 16),
+        (20, 9),
+        (1, 7),
+        (360, 1080),
+    ] {
+        for at in 0..to {
+            let (low, high, share) = tap(at, from, to);
+            let place = ((at as f64 + 0.5) * from as f64 / to as f64 - 0.5).max(0.0);
+            let whole = (place.floor() as u32).min(from - 1);
+            assert_eq!(low, whole, "{from} to {to}, pixel {at}");
+            assert_eq!(
+                high,
+                (whole + 1).min(from - 1),
+                "{from} to {to}, pixel {at}"
+            );
+            let wanted = if place.floor() as u32 > from - 1 {
+                0.0
+            } else {
+                (place - place.floor()) * 256.0
+            };
+            assert!(
+                (f64::from(share) - wanted).abs() < 1.0,
+                "{from} to {to}, pixel {at}: share {share}, wanted {wanted}"
+            );
+        }
+    }
 }

@@ -8,6 +8,7 @@ mod valley;
 use std::time::{Duration, Instant};
 
 use grit::Host;
+use grit::render3::present::{Presenter, windowed};
 use grit::render3::{self, Camera, Screen, Steps, stage};
 
 use font::Canvas;
@@ -89,6 +90,7 @@ struct Asked {
     trace: Option<u32>,
     cycle: bool,
     generate: Option<u32>,
+    readback: bool,
 }
 
 fn asked() -> Result<Asked, Failed> {
@@ -116,6 +118,7 @@ fn asked() -> Result<Asked, Failed> {
         trace: None,
         cycle: false,
         generate: None,
+        readback: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(one) = args.next() {
@@ -150,6 +153,7 @@ fn asked() -> Result<Asked, Failed> {
             "--tool" => held.tool = value()?.parse()?,
             "--skip" => held.skip = value()?.parse()?,
             "--cycle" => held.cycle = true,
+            "--readback" => held.readback = true,
             "--trace" => held.trace = Some(value()?.parse()?),
             "--generate" => held.generate = Some(value()?.parse()?),
             "--clean" => held.clean = true,
@@ -158,7 +162,7 @@ fn asked() -> Result<Asked, Failed> {
             "--measure" => held.measure = true,
             other => {
                 return Err(format!(
-                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle and --generate SIDE"
+                    "unknown argument {other}; grit3d takes --scene valley|sand|fire|code, --size, --width, --height, --frames N, --shot FILE.png, --camera N, --suns 1-4, --quality full|half|third, --dusk 0-1, --smoothing on|off, --gas on|off, --tool N, --clean, --active, --help-panel, --measure, --skip STEPS, --trace STEPS, --cycle, --readback and --generate SIDE"
                 )
                 .into());
             }
@@ -172,7 +176,12 @@ fn main() -> Result<(), Failed> {
     if let Some(side) = asked.generate {
         return generated(side);
     }
-    let Some(host) = Host::open()? else {
+    let opened = if asked.readback {
+        Host::open()?
+    } else {
+        Host::open_presenting()?
+    };
+    let Some(host) = opened else {
         println!("no Vulkan device");
         return Ok(());
     };
@@ -343,48 +352,45 @@ fn framed(which: Which, camera: usize, grid: grit::sand::Grid) -> Orbit {
     }
 }
 
-/// Where each pixel of a line `to` long reads a line `from` long: the
-/// first pixel, the next, and the share of the next, out of 256.
-fn taps(from: u32, to: u32) -> Vec<(usize, usize, u32)> {
-    let scale = from as f32 / to.max(1) as f32;
-    (0..to)
-        .map(|at| {
-            let place = ((at as f32 + 0.5) * scale - 0.5).max(0.0);
-            let low = (place as u32).min(from.saturating_sub(1));
-            let high = (low + 1).min(from.saturating_sub(1));
-            let share = ((place - low as f32) * 256.0).round().clamp(0.0, 256.0) as u32;
-            (low as usize, high as usize, share)
-        })
-        .collect()
-}
-
-/// Two pixels, `0x00RRGGBB`, blended by `share` out of 256 toward `b`.
-const fn blend(a: u32, b: u32, share: u32) -> u32 {
-    let keep = 256 - share;
-    let red_blue = ((a & 0x00FF_00FF) * keep + (b & 0x00FF_00FF) * share) >> 8;
-    let green = ((a & 0x0000_FF00) * keep + (b & 0x0000_FF00) * share) >> 8;
-    (red_blue & 0x00FF_00FF) | (green & 0x0000_FF00)
-}
-
 /// `picture`, drawn on `from`, stretched over `to` and blended between the
-/// four pixels around each.
+/// four pixels around each, as the device's window pass stretches it.
 fn upscaled(picture: &[u32], from: Screen, to: Screen) -> Vec<u32> {
     if from == to {
         return picture.to_vec();
     }
-    let across = taps(from.wide, to.wide);
-    let down = taps(from.high, to.high);
-    let wide = from.wide as usize;
-    let get = |x: usize, y: usize| picture.get(y * wide + x).copied().unwrap_or(0);
-    let mut out = Vec::with_capacity(to.pixels());
-    for &(top, bottom, share_y) in &down {
-        for &(left, right, share_x) in &across {
-            let upper = blend(get(left, top), get(right, top), share_x);
-            let lower = blend(get(left, bottom), get(right, bottom), share_x);
-            out.push(blend(upper, lower, share_y));
+    windowed(picture, from, to, &[])
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> isize;
+}
+
+/// A presenter on `window`, when the host's device can present to it.
+#[cfg(windows)]
+fn presenter_for<'h>(
+    host: &'h Host,
+    window: &minifb::Window,
+    size: Screen,
+) -> Option<Presenter<'h>> {
+    if !host.presents() {
+        return None;
+    }
+    let hwnd = window.get_window_handle() as isize;
+    let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+    match unsafe { Presenter::new(host, hwnd, module, size) } {
+        Ok(made) => Some(made),
+        Err(why) => {
+            println!("the window is not presented from the device: {why}");
+            None
         }
     }
-    out
+}
+
+#[cfg(not(windows))]
+fn presenter_for<'h>(_: &'h Host, _: &minifb::Window, _: Screen) -> Option<Presenter<'h>> {
+    None
 }
 
 /// How many frames of a timed cycle are shown before the timing starts,
@@ -504,7 +510,8 @@ struct Play {
 fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
     let quality = chosen(host, asked)?;
     let window_screen = asked.window;
-    let mut session = Session::open(host, setup(asked, quality))?;
+    let on_device = (host.presents() && !asked.readback).then_some(window_screen);
+    let mut session = Session::open_in(host, setup(asked, quality), on_device)?;
     if !asked.gas {
         no_gas(&mut session)?;
     }
@@ -547,6 +554,20 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
         minifb::WindowOptions::default(),
     )?;
     window.set_target_fps(0);
+    let mut presenter = if on_device.is_some() {
+        presenter_for(host, &window, window_screen)
+    } else {
+        None
+    };
+    println!(
+        "the window is shown {}",
+        presenter.as_ref().map_or_else(
+            || "by reading each picture back".to_owned(),
+            |held| format!("from the device, presenting in {} mode", held.mode())
+        )
+    );
+    let mut overlay = ui::Overlay::new((window_screen.wide, window_screen.high));
+    let mut drawn_ui: Option<(String, usize, bool)> = None;
     let mut shown = 0_u32;
     let mut fresh = true;
     let mut picture = Vec::new();
@@ -671,8 +692,13 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
         if let Some(which) = switch_to.or(restart.then_some(session.setup.which)) {
             let mut wanted = setup(asked, quality);
             wanted.which = which;
+            if let Some(held) = presenter.as_mut() {
+                held.settle()?;
+            }
             drop(session);
-            session = Session::open(host, wanted)?;
+            session = Session::open_in(host, wanted, on_device)?;
+            overlay = ui::Overlay::new((window_screen.wide, window_screen.high));
+            drawn_ui = None;
             if let Some(dusk) = asked.dusk {
                 session.dusk = dusk;
             }
@@ -706,7 +732,58 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
             owed -= 1.0;
         }
         let moving = (!play.paused && due) || step;
-        let (_, got) = session.frame(moving, light_steps, true)?;
+        let last = asked.frames.is_some_and(|last| shown + 1 >= last);
+        let line = corner_line(&session, rate, &play, active_count);
+        if let Some(held) = presenter.as_mut() {
+            if !asked.clean {
+                let key = (line.clone(), play.tool, play.help);
+                if drawn_ui.as_ref() != Some(&key) {
+                    let tools = session.example.tools.clone();
+                    let size = (window_screen.wide, window_screen.high);
+                    let (tool, help) = (play.tool, play.help);
+                    let rows = overlay.redrawn(ui::bands(&tools, size, help), |canvas| {
+                        ui::draw_all(canvas, &line, &tools, tool, help);
+                    });
+                    session.overlay(&rows)?;
+                    drawn_ui = Some(key);
+                }
+            }
+            let pending = session.submit(moving, light_steps)?;
+            if let Some(placed) = session.windowed {
+                held.present(&session.held, placed)?;
+            }
+            session.land(pending)?;
+            window.update();
+            if last && asked.shot.is_some() {
+                let colours = session
+                    .held
+                    .read(grit::layout::PIXELS as usize, session.build.screen.pixels())?;
+                picture = upscaled(&colours, session.build.screen, window_screen);
+            }
+        } else {
+            let (_, got) = session.frame(moving, light_steps, true)?;
+            let mut frame = upscaled(&got, session.build.screen, window_screen);
+            if !asked.clean {
+                let mut canvas = Canvas {
+                    pixels: &mut frame,
+                    wide: window_screen.wide,
+                    high: window_screen.high,
+                };
+                ui::draw_all(
+                    &mut canvas,
+                    &line,
+                    &session.example.tools,
+                    play.tool,
+                    play.help,
+                );
+            }
+            window.update_with_buffer(
+                &frame,
+                window_screen.wide as usize,
+                window_screen.high as usize,
+            )?;
+            picture = frame;
+        }
         fresh = std::mem::take(&mut session.restarted);
         if asked.cycle
             && timing.add(
@@ -719,11 +796,6 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
             timing.report();
             break;
         }
-        let mut frame = if session.build.screen == window_screen {
-            got
-        } else {
-            upscaled(&got, session.build.screen, window_screen)
-        };
         counted += 1;
         if clock.elapsed().as_secs_f64() >= 0.5 {
             rate = f64::from(counted) / clock.elapsed().as_secs_f64();
@@ -733,36 +805,6 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
                 active_count = session.active()?;
             }
         }
-        if !asked.clean {
-            let mut canvas = Canvas {
-                pixels: &mut frame,
-                wide: window_screen.wide,
-                high: window_screen.high,
-            };
-            let mut line = format!("{}  \u{b7}  {rate:.0} FPS  \u{b7}  ", session.example.name);
-            if play.active {
-                let octs = session.grid().blocks().max(1);
-                line.push_str(&format!(
-                    "ACTIVE {active_count} OCTS ({:.2}%)  \u{b7}  ",
-                    f64::from(active_count) * 100.0 / f64::from(octs)
-                ));
-            }
-            if play.paused {
-                line.push_str("PAUSED  \u{b7}  ");
-            }
-            line.push_str("DRAG TO ORBIT, CLICK TO USE THE TOOL, H FOR HELP");
-            ui::draw_corner(&mut canvas, &line);
-            ui::draw_bar(&mut canvas, &session.example.tools, play.tool);
-            if play.help {
-                ui::draw_help(&mut canvas);
-            }
-        }
-        window.update_with_buffer(
-            &frame,
-            window_screen.wide as usize,
-            window_screen.high as usize,
-        )?;
-        picture = frame;
         shown += 1;
         if shown == 30 {
             steady = Some((Instant::now(), shown));
@@ -789,6 +831,23 @@ fn shown(host: &Host, asked: &Asked) -> Result<(), Failed> {
         );
     }
     Ok(())
+}
+
+/// The line the window shows at its top left.
+fn corner_line(session: &Session<'_>, rate: f64, play: &Play, active_count: u32) -> String {
+    let mut line = format!("{}  \u{b7}  {rate:.0} FPS  \u{b7}  ", session.example.name);
+    if play.active {
+        let octs = session.grid().blocks().max(1);
+        line.push_str(&format!(
+            "ACTIVE {active_count} OCTS ({:.2}%)  \u{b7}  ",
+            f64::from(active_count) * 100.0 / f64::from(octs)
+        ));
+    }
+    if play.paused {
+        line.push_str("PAUSED  \u{b7}  ");
+    }
+    line.push_str("DRAG TO ORBIT, CLICK TO USE THE TOOL, H FOR HELP");
+    line
 }
 
 /// Draws no gas: every kind the table draws as gas is drawn as nothing.

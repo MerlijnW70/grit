@@ -186,7 +186,17 @@ fn rebuilt(
         let wet = em.flag(liquid)?;
         let wet = em.add(get(10), wet)?;
         let open = em.when(liquid, &[none], |em| {
-            let open = open_beside(em, build, masks, cell, [column, height, row])?;
+            let found = open_beside(em, build, masks, cell, [column, height, row])?;
+            let at = em.mul(kind, size)?;
+            let at = em.add(table, at)?;
+            let falls_at = em.u(word(material::FALLS))?;
+            let falls_at = em.add(at, falls_at)?;
+            let falls = em.load(PIXELS, falls_at)?;
+            let marked = em.ne(falls, none)?;
+            let bit_at = em.sub(falls, one)?;
+            let bit_at = em.pick(marked, bit_at, none)?;
+            let flagged = em.bit(held, bit_at)?;
+            let open = em.pick_t(marked, flagged, found)?;
             Ok(vec![em.flag(open)?])
         })?;
         let open = open.first().copied().unwrap_or(none);
@@ -470,10 +480,11 @@ pub fn emission(grid: Grid, kinds: Kinds, table: &Table, cells: &[u32]) -> (Vec<
 }
 
 /// The water of each brick of `grid`, [`WATER_WORDS`] a brick: the share of
-/// its cells of a liquid kind, and the share that fall free: above a cell
-/// of a liquid or of no kind `table` shows, inside the grid, and with a
-/// cell of no kind it shows beside them along x or z inside the grid, and
-/// none it shows under that one: what
+/// its cells of a liquid kind, and the share that fall free: those whose
+/// word has the bit their material's `falls` names, or, for a material
+/// that names none, those above a cell of a liquid or of no kind `table`
+/// shows, inside the grid, and with a cell of no kind it shows beside them
+/// along x or z inside the grid, and none it shows under that one: what
 /// the rebuild writes from [`super::Layout::water`] on.
 #[must_use]
 pub fn watered(grid: Grid, kinds: Kinds, table: &Table, cells: &[u32]) -> Vec<f32> {
@@ -498,10 +509,20 @@ pub fn watered(grid: Grid, kinds: Kinds, table: &Table, cells: &[u32]) -> Vec<f3
             let x = (bx << BRICK_BITS) + (run & (SIDE - 1));
             let y = (by << BRICK_BITS) + ((run >> BRICK_BITS) & (SIDE - 1));
             let z = (bz << BRICK_BITS) + (run >> (2 * BRICK_BITS));
-            if !bit(liquid, kind_at(x, y, z)) {
+            let kind = kind_at(x, y, z);
+            if !bit(liquid, kind) {
                 continue;
             }
             wet += 1;
+            let falls = table.material(kind).falls;
+            if falls > 0 {
+                let at = ((z * grid.deep + y) * grid.wide + x) as usize;
+                let held = cells.get(at).copied().unwrap_or(0);
+                if (held >> ((falls - 1) & 31)) & 1 == 1 {
+                    spray += 1;
+                }
+                continue;
+            }
             let rests = y + 1 >= grid.deep || {
                 let under = kind_at(x, y + 1, z);
                 bit(shown, under) && !bit(liquid, under)

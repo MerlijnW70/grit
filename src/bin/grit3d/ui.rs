@@ -152,3 +152,119 @@ pub fn draw_help(canvas: &mut Canvas<'_>) {
         );
     }
 }
+
+/// Draws everything the window lays over the picture: the corner line, the
+/// tool bar with tool `chosen` lit, and the help panel when `help`.
+pub fn draw_all(canvas: &mut Canvas<'_>, line: &str, tools: &[Tool], chosen: usize, help: bool) {
+    draw_corner(canvas, line);
+    draw_bar(canvas, tools, chosen);
+    if help {
+        draw_help(canvas);
+    }
+}
+
+/// The rows of a window `wide` by `high` that [`draw_all`] can draw on,
+/// each a first row and the row past the last.
+pub fn bands(tools: &[Tool], (wide, high): (u32, u32), help: bool) -> Vec<(u32, u32)> {
+    let scale = scale_of(high);
+    let mut out = vec![(0, (20 + HIGH + 2) * scale)];
+    if let Some(area) = bar(tools, (wide, high)).first() {
+        let from = area.y.max(0) as u32;
+        out.push((from, (from + area.high + 2).min(high)));
+    }
+    if help {
+        let line = (HIGH + 5) * scale;
+        let tall = line * HELP.len() as u32 + 28 * scale;
+        let from = high.saturating_sub(tall) / 2;
+        out.push((from, (from + tall + 2).min(high)));
+    }
+    out.into_iter()
+        .map(|(from, to)| (from.min(high), to.min(high)))
+        .collect()
+}
+
+/// What the window lays over the picture on the device, kept as the words
+/// [`grit::render3::present::covered`] reads: drawn twice, over black and
+/// over white, so how much each pixel covers is what the two differ by.
+pub struct Overlay {
+    wide: u32,
+    high: u32,
+    black: Vec<u32>,
+    white: Vec<u32>,
+    sent: Vec<u32>,
+    bands: Vec<(u32, u32)>,
+}
+
+impl Overlay {
+    pub fn new((wide, high): (u32, u32)) -> Self {
+        let pixels = wide as usize * high as usize;
+        Self {
+            wide,
+            high,
+            black: vec![0; pixels],
+            white: vec![0x00FF_FFFF; pixels],
+            sent: vec![0; pixels],
+            bands: Vec::new(),
+        }
+    }
+
+    /// Draws with `draw` over the rows `bands` gives, and gives the rows
+    /// whose words changed since the last time, each its row and words.
+    pub fn redrawn(
+        &mut self,
+        bands: Vec<(u32, u32)>,
+        draw: impl Fn(&mut Canvas<'_>),
+    ) -> Vec<(u32, Vec<u32>)> {
+        let wide = self.wide as usize;
+        let mut rows: Vec<u32> = self
+            .bands
+            .iter()
+            .chain(&bands)
+            .flat_map(|&(from, to)| from..to)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        for &row in &rows {
+            let span = row as usize * wide..(row as usize + 1) * wide;
+            if let Some(black) = self.black.get_mut(span.clone()) {
+                black.fill(0);
+            }
+            if let Some(white) = self.white.get_mut(span) {
+                white.fill(0x00FF_FFFF);
+            }
+        }
+        for (pixels, _) in [(&mut self.black, 0), (&mut self.white, 1)] {
+            let mut canvas = Canvas {
+                pixels,
+                wide: self.wide,
+                high: self.high,
+            };
+            draw(&mut canvas);
+        }
+        self.bands = bands;
+        let mut out = Vec::new();
+        for row in rows {
+            let span = row as usize * wide..(row as usize + 1) * wide;
+            let (Some(black), Some(white)) =
+                (self.black.get(span.clone()), self.white.get(span.clone()))
+            else {
+                continue;
+            };
+            let words: Vec<u32> = black
+                .iter()
+                .zip(white)
+                .map(|(&dark, &light)| {
+                    let keep = ((light >> 8) & 0xFF).saturating_sub((dark >> 8) & 0xFF);
+                    ((255 - keep) << 24) | (dark & 0x00FF_FFFF)
+                })
+                .collect();
+            if let Some(sent) = self.sent.get_mut(span)
+                && *sent != words
+            {
+                sent.copy_from_slice(&words);
+                out.push((row, words));
+            }
+        }
+        out
+    }
+}

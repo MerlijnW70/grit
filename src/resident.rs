@@ -1063,6 +1063,12 @@ impl Resident<'_> {
         self.buffers.len()
     }
 
+    /// The device's buffer of binding `index`, for work recorded outside the
+    /// resident on the same queue.
+    pub(crate) fn buffer(&self, index: usize) -> Option<vk::Buffer> {
+        self.buffers.get(index).map(|held| held.handle)
+    }
+
     #[must_use]
     pub fn passes(&self) -> usize {
         self.pipelines.len()

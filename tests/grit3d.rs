@@ -290,3 +290,90 @@ fn every_letter_the_demo_writes_has_a_glyph() {
     canvas.text((1, 1), "GRIT", 0x00FF_FFFF, 1);
     assert!(pixels.contains(&0x00FF_FFFF));
 }
+
+#[test]
+fn the_glass_box_holds_most_of_the_valley_and_leaves_its_peak_out() {
+    let grid = Grid::solid(64, 64, 64).unwrap();
+    let example = Which::Valley.example();
+    let cells = (example.scene)(grid);
+    let kinds = grit::view3::Kinds::named(example.rule).unwrap();
+    let visible = example.table.visible();
+    let top = session::glass_top(grid, kinds, visible, &cells);
+    let mut tops = Vec::new();
+    for z in 0..grid.tall {
+        for x in 0..grid.wide {
+            let seen = (0..grid.deep).find(|&y| {
+                let word = cells[((z * grid.deep + y) * grid.wide + x) as usize];
+                let kind = (word >> kinds.shift()) & kinds.mask();
+                (visible >> kind) & 1 == 1
+            });
+            if let Some(y) = seen {
+                tops.push(y);
+            }
+        }
+    }
+    let inside = tops
+        .iter()
+        .filter(|&&y| y as f32 >= top + session::GLASS_MARGIN as f32)
+        .count();
+    let highest = tops.iter().copied().min().unwrap();
+    println!(
+        "64^3 valley: the glass begins {top} cells down; {inside} of {} columns lie a margin inside it; the highest cell is {highest} down",
+        tops.len()
+    );
+    assert!(top > 0.0, "the glass reaches the grid's top");
+    assert!(
+        inside as f32 >= tops.len() as f32 * session::GLASS_SHARE,
+        "the glass leaves out more columns than it should"
+    );
+    assert!(
+        (highest as f32) < top,
+        "the peak does not stand out of the glass"
+    );
+}
+
+#[test]
+fn a_frame_shown_from_the_device_steps_the_world_as_a_frame_read_back_does() {
+    let Some(host) = device("grit3d present path") else {
+        return;
+    };
+    let window = Screen { wide: 37, high: 29 };
+    let mut shown = Session::open_in(&host, setup(Which::Valley), Some(window)).unwrap();
+    let mut read = Session::open(&host, setup(Which::Valley)).unwrap();
+    let side = SIDE as f32;
+    let camera = Camera::looking(
+        [side * 1.5, -side * 0.8, side * 1.5],
+        [side * 0.5, side * 0.7, side * 0.5],
+        0.62,
+    );
+    let mut burning = 0;
+    for frame in 0..140 {
+        shown.aim(&camera, false, frame == 0).unwrap();
+        read.aim(&camera, false, frame == 0).unwrap();
+        let pending = shown.submit(true, Steps::KEPT).unwrap();
+        shown.land(pending).unwrap();
+        read.frame(true, Steps::KEPT, false).unwrap();
+        assert_eq!(shown.steps, read.steps, "frame {frame}: steps");
+        let phases = (
+            shown.life.as_ref().map(|life| (life.phase, life.round)),
+            read.life.as_ref().map(|life| (life.phase, life.round)),
+        );
+        assert_eq!(phases.0, phases.1, "frame {frame}: the cycle");
+        if phases
+            .0
+            .is_some_and(|(phase, _)| phase == life::Phase::Burning)
+        {
+            burning += 1;
+        }
+        if frame % 20 == 19 {
+            assert!(
+                shown.state().unwrap() == read.state().unwrap(),
+                "frame {frame}: the worlds differ"
+            );
+        }
+    }
+    assert!(burning > 0, "the fire never burned in the frames tested");
+    println!(
+        "140 frames, {burning} burning: the world shown from the device equals the one read back"
+    );
+}

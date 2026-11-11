@@ -375,7 +375,13 @@ pub struct Host {
     sparse: bool,
     strict: bool,
     int64: bool,
+    physical: vk::PhysicalDevice,
+    presents: bool,
 }
+
+/// The instance extensions a host that shows its pictures in a window asks
+/// for, when the loader offers all of them.
+const WINDOW_EXTENSIONS: [&CStr; 2] = [ash::khr::surface::NAME, ash::khr::win32_surface::NAME];
 
 impl Host {
     pub fn open() -> Result<Option<Self>, Error> {
@@ -385,6 +391,20 @@ impl Host {
     }
 
     pub fn matching(pattern: Option<&str>) -> Result<Option<Self>, Error> {
+        Self::made(pattern, false)
+    }
+
+    /// [`Host::open`], on an instance that can make a Win32 window's surface
+    /// and a device that can present to it, where the loader and the device
+    /// offer that; [`Host::presents`] tells whether they did. Everything
+    /// else is as [`Host::open`] makes it.
+    pub fn open_presenting() -> Result<Option<Self>, Error> {
+        let pattern =
+            std::env::var_os("GRIT_DEVICE").map(|held| held.to_string_lossy().into_owned());
+        Self::made(pattern.as_deref(), true)
+    }
+
+    fn made(pattern: Option<&str>, presenting: bool) -> Result<Option<Self>, Error> {
         let entry = match unsafe { ash::Entry::load() } {
             Ok(entry) => entry,
             Err(ash::LoadingError::LibraryLoadFailure(_)) => return Ok(None),
@@ -393,7 +413,26 @@ impl Host {
 
         let application =
             vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
-        let create = vk::InstanceCreateInfo::default().application_info(&application);
+        let offered = if presenting {
+            unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let windowed = presenting
+            && WINDOW_EXTENSIONS.iter().all(|wanted| {
+                offered.iter().any(|one| {
+                    one.extension_name_as_c_str()
+                        .is_ok_and(|name| name == *wanted)
+                })
+            });
+        let names: Vec<*const c_char> = if windowed {
+            WINDOW_EXTENSIONS.iter().map(|name| name.as_ptr()).collect()
+        } else {
+            Vec::new()
+        };
+        let create = vk::InstanceCreateInfo::default()
+            .application_info(&application)
+            .enabled_extension_names(&names);
 
         let instance = match unsafe { entry.create_instance(&create, None) } {
             Ok(instance) => instance,
@@ -401,7 +440,7 @@ impl Host {
             Err(code) => return Err(Error::NoInstance(code)),
         };
 
-        unsafe { Self::on(entry, instance, pattern) }.map(Some)
+        unsafe { Self::on(entry, instance, pattern, windowed) }.map(Some)
     }
 
     #[must_use]
@@ -440,6 +479,7 @@ impl Host {
         entry: ash::Entry,
         instance: ash::Instance,
         pattern: Option<&str>,
+        windowed: bool,
     ) -> Result<Self, Error> {
         let candidates = match unsafe { instance.enumerate_physical_devices() } {
             Ok(candidates) => candidates,
@@ -534,9 +574,23 @@ impl Host {
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priorities)];
+        let presents = windowed && {
+            let offered = unsafe { instance.enumerate_device_extension_properties(physical) }
+                .unwrap_or_default();
+            offered.iter().any(|one| {
+                one.extension_name_as_c_str()
+                    .is_ok_and(|name| name == ash::khr::swapchain::NAME)
+            })
+        };
+        let extensions: Vec<*const c_char> = if presents {
+            vec![ash::khr::swapchain::NAME.as_ptr()]
+        } else {
+            Vec::new()
+        };
         let create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
-            .enabled_features(&wanted);
+            .enabled_features(&wanted)
+            .enabled_extension_names(&extensions);
 
         let made =
             unsafe { instance.create_device(physical, &create, faults::callbacks(Step::Device)) };
@@ -567,6 +621,8 @@ impl Host {
             sparse,
             strict,
             int64,
+            physical,
+            presents,
             wedged: AtomicBool::new(false),
             owing: AtomicUsize::new(0),
         })
@@ -609,6 +665,25 @@ impl Host {
     #[must_use]
     pub const fn int64(&self) -> bool {
         self.int64
+    }
+
+    /// Whether the host was made by [`Host::open_presenting`] and its device
+    /// can present to a window.
+    #[must_use]
+    pub const fn presents(&self) -> bool {
+        self.presents
+    }
+
+    pub(crate) const fn entry(&self) -> &ash::Entry {
+        &self.entry
+    }
+
+    pub(crate) const fn instance(&self) -> &ash::Instance {
+        &self.instance
+    }
+
+    pub(crate) const fn physical(&self) -> vk::PhysicalDevice {
+        self.physical
     }
 
     pub(crate) const fn device(&self) -> &ash::Device {

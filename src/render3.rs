@@ -43,6 +43,7 @@ pub mod emit;
 pub mod march;
 pub mod occupancy;
 pub mod post;
+pub mod present;
 pub mod shade;
 pub mod volume;
 
@@ -84,7 +85,7 @@ pub const SUNS: usize = 4;
 pub const FLOOR_RAYS: usize = 16;
 
 /// The words of a kind in the material table.
-pub const MATERIAL_WORDS: usize = 26;
+pub const MATERIAL_WORDS: usize = 30;
 
 /// The words a pixel's bounced rays take: the cell the mirrored ray meets
 /// and its face, then the cell the bent ray meets and its face.
@@ -165,10 +166,13 @@ pub mod scene {
     pub const FLAGS: usize = LIQUID + 1;
     /// A count the host raises every frame it draws.
     pub const DRAWN: usize = FLAGS + 1;
+    /// Where the glass box around the world begins, in cells down from the
+    /// grid's top, as a float.
+    pub const TOP: usize = DRAWN + 1;
     /// [`super::FLOOR_RAYS`] whole-number directions toward the sun, spread
     /// over a square across it: each pixel of the floor traces some of
     /// them, starting at one its own hash picks.
-    pub const FLOOR_RAYS: usize = DRAWN + 1;
+    pub const FLOOR_RAYS: usize = TOP + 1;
     /// The camera of the frame before, in floats: where it stood, its
     /// forward, and its right and up each divided by the spread of a pixel.
     pub const BEFORE: usize = FLOOR_RAYS + 3 * super::FLOOR_RAYS;
@@ -669,7 +673,14 @@ impl Camera {
 /// - `wets`: how much darker and shinier it gets next to water;
 /// - `sparkle`: how often its surface glints in the sun;
 /// - `liquid`: drawn as a liquid: its top mirrors and bends light, its
-///   colour deepens to `deep` with the water a ray crosses, and it foams.
+///   colour deepens to `deep` with the water a ray crosses, and it foams;
+/// - `top`: its colour on faces that look up, where `albedo` is its colour
+///   on the others;
+/// - `hue`: how much its cells, and patches of them, vary in hue, from cool
+///   to warm;
+/// - `falls`: for a liquid, the bit of the cell's word, plus one, that the
+///   rule sets on a cell that falls free; 0 when the renderer finds falling
+///   cells by their neighbours.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Material {
     pub albedo: [f32; 3],
@@ -691,6 +702,9 @@ pub struct Material {
     pub sparkle: f32,
     pub liquid: bool,
     pub deep: [f32; 3],
+    pub top: [f32; 3],
+    pub hue: f32,
+    pub falls: u32,
 }
 
 impl Material {
@@ -715,6 +729,9 @@ impl Material {
         sparkle: 0.0,
         liquid: false,
         deep: [0.0; 3],
+        top: [0.0; 3],
+        hue: 0.0,
+        falls: 0,
     };
 
     /// The linear light of `rgb`, an sRGB triple.
@@ -737,8 +754,30 @@ impl Material {
             shine: 0.04,
             tint: albedo,
             deep: albedo,
+            top: albedo,
             ..Self::EMPTY
         }
+    }
+
+    /// Faces that look up drawn in `rgb`, an sRGB triple.
+    #[must_use]
+    pub fn topped(mut self, rgb: u32) -> Self {
+        self.top = Self::linear(rgb);
+        self
+    }
+
+    #[must_use]
+    pub const fn hue(mut self, hue: f32) -> Self {
+        self.hue = hue;
+        self
+    }
+
+    /// A liquid whose falling cells the rule marks with bit `bit` of their
+    /// word.
+    #[must_use]
+    pub const fn falls_by(mut self, bit: u32) -> Self {
+        self.falls = bit + 1;
+        self
     }
 
     #[must_use]
@@ -850,6 +889,11 @@ impl Material {
             self.deep[0].to_bits(),
             self.deep[1].to_bits(),
             self.deep[2].to_bits(),
+            self.top[0].to_bits(),
+            self.top[1].to_bits(),
+            self.top[2].to_bits(),
+            self.hue.to_bits(),
+            self.falls,
         ];
         for (slot, value) in out.iter_mut().zip(values) {
             *slot = value;
@@ -879,6 +923,9 @@ pub mod material {
     pub const SPARKLE: usize = 20;
     pub const LIQUID: usize = 21;
     pub const DEEP: usize = 22;
+    pub const TOP: usize = 25;
+    pub const HUE: usize = 28;
+    pub const FALLS: usize = 29;
 }
 
 /// A material for every kind a [`Kinds`] mapping gives.
@@ -983,7 +1030,11 @@ impl Table {
 /// - `smoke`: how much thicker gas is drawn than one cell of it takes
 ///   light, for rays from the eye and toward the sun alike;
 /// - `contact`: how dark the floor is right next to the world;
-/// - `glow`: how bright the sky is around the sun near the horizon.
+/// - `glow`: how bright the sky is around the sun near the horizon;
+/// - `phase`: how strongly gas scatters the sun forward, from 0, evenly,
+///   toward 1;
+/// - `billow`: how much a noise breaks the edge of the gas into billows;
+/// - `ember`: how strongly the light of glowing cells below gas lights it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Light {
     pub toward_sun: [f32; 3],
@@ -1006,10 +1057,13 @@ pub struct Light {
     pub smoke: f32,
     pub contact: f32,
     pub glow: f32,
+    pub phase: f32,
+    pub billow: f32,
+    pub ember: f32,
 }
 
 /// The words of a [`Light`].
-pub const LIGHT_WORDS: usize = 33;
+pub const LIGHT_WORDS: usize = 36;
 
 /// Where each field of a [`Light`] lies in its words.
 pub mod light {
@@ -1033,6 +1087,9 @@ pub mod light {
     pub const SMOKE: usize = 29;
     pub const CONTACT: usize = 30;
     pub const GLOW: usize = 31;
+    pub const PHASE: usize = 32;
+    pub const BILLOW: usize = 33;
+    pub const EMBER: usize = 34;
 }
 
 fn mixed(a: [f32; 3], b: [f32; 3], by: f32) -> [f32; 3] {
@@ -1077,6 +1134,9 @@ impl Light {
             smoke: 2.0,
             contact: 0.6,
             glow: 0.55 * day + 0.3 * dusk,
+            phase: 0.55,
+            billow: 0.6,
+            ember: 2.5,
         }
     }
 
@@ -1099,6 +1159,9 @@ impl Light {
             self.smoke,
             self.contact,
             self.glow,
+            self.phase,
+            self.billow,
+            self.ember,
         ];
         let values = self
             .toward_sun
@@ -1176,8 +1239,9 @@ impl Light {
 
 /// What a frame tells the passes beyond the camera, the table and the
 /// light: the sun rays of the faces, how widely the floor's sun rays
-/// spread, the camera of the frame before, the [`flags`], and a count
-/// raised every frame drawn.
+/// spread, the camera of the frame before, the [`flags`], a count raised
+/// every frame drawn, and where the glass box begins, in cells down from
+/// the grid's top.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Frame {
     pub suns: Vec<[i32; 3]>,
@@ -1185,6 +1249,7 @@ pub struct Frame {
     pub before: [u32; 12],
     pub flags: u32,
     pub drawn: u32,
+    pub top: f32,
 }
 
 /// The scene block of `PIXELS`: the rays, the kinds seen, opaque, gas and
@@ -1224,6 +1289,7 @@ pub fn framed_words(rays: &Rays, table: &Table, frame: &Frame, light: &Light) ->
     put(scene::LIQUID, table.liquids());
     put(scene::FLAGS, frame.flags);
     put(scene::DRAWN, frame.drawn);
+    put(scene::TOP, frame.top.to_bits());
     for (at, sun) in frame.suns.iter().take(SUNS).enumerate() {
         for axis in 0..3 {
             put(scene::SUN_RAYS + 3 * at + axis, of(*sun, axis) as u32);
