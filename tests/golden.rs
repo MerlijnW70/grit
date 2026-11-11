@@ -541,6 +541,7 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                     render3::lit_deep(&build),
                     render3::sunlit(&build),
                     render3::primary(&build),
+                    render3::bounce(&build),
                     render3::shade(&build),
                     render3::resolve(&build),
                     render3::bloom_down(&build),
