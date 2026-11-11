@@ -574,6 +574,33 @@ fn catalog(width: u32) -> Vec<(String, String)> {
                 live::arranged3(w, grid, &plan, coarse),
             );
         }
+        let Ok(pool) = grit::bricks::Bricks::new(grid, &plan, plan.blocks) else {
+            continue;
+        };
+        all.text(
+            format!("bricks{at}"),
+            &format!(
+                "{:?} sides {:?} lattice {:?}",
+                pool.sizes(&grit::rule3::sand::Sand, &plan),
+                pool.sides(),
+                pool.lattice()
+            ),
+        );
+        for coarse in [false, true] {
+            let tier = if coarse { "coarse" } else { "fine" };
+            all.loop_of(
+                &format!("bricks::arranged/sand/{tier}{at}"),
+                grit::bricks::arranged(&grit::rule3::sand::Sand, &pool, &plan, coarse),
+            );
+            all.loop_of(
+                &format!("bricks::arranged/nature/{tier}{at}"),
+                grit::bricks::arranged(&Nature, &pool, &plan, coarse),
+            );
+        }
+        all.loop_of(
+            &format!("bricks::whole/sand{at}"),
+            grit::bricks::whole(&grit::rule3::sand::Sand, &pool, &plan),
+        );
     }
 
     for (wide, deep, tall) in SOLIDS {
