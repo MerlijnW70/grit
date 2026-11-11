@@ -896,6 +896,136 @@ fn the_light_of_glowing_cells_and_the_gas_are_kept_a_brick_at_a_time_as_on_the_c
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A sheet of lone water cells over a dark wall, some of them marked with
+/// the nature rule's falling bit: the pictures of `named` and of the same
+/// table naming no bit or another one, as the pixels of the marked and of
+/// the other cells.
+fn drops_seen(named: Option<u32>) -> (Vec<u32>, Vec<u32>) {
+    use grit::rule3::nature::FALLING;
+    let grid = Grid::solid(16, 16, 16).unwrap();
+    let held = kinds("nature");
+    let water = liquid(0x30_60A0, 0x10_2040);
+    let water = named.map_or(water, |bit| water.falls_by(bit));
+    let table = Table::empty()
+        .with(1, Material::solid(0x18_1818, 0.2))
+        .with(2, water);
+    let mut cells = vec![0; grid.cells()];
+    let mut marked = Vec::new();
+    for y in 2..14 {
+        for x in 2..14 {
+            if (x + y) % 2 == 0 {
+                let mark = (x * 7 + y * 13) % 3 == 0;
+                let at = index(grid, [x, y, 8]) as usize;
+                cells[at] = 2 | if mark { FALLING } else { 0 };
+                marked.push((at as u32, mark));
+            }
+        }
+    }
+    for y in 0..16 {
+        for x in 0..16 {
+            cells[index(grid, [x, y, 15]) as usize] = 1;
+        }
+    }
+    let Some(host) = device("render3 falling bit") else {
+        return (Vec::new(), Vec::new());
+    };
+    let screen = Screen { wide: 64, high: 64 };
+    let build = Build {
+        grid,
+        kinds: held,
+        screen,
+        subgroup: host.width(),
+        suns: 2,
+    };
+    let layout = build.layout();
+    let mut still = Still::new(&host, build, &cells);
+    let camera = Camera::looking([8.0, 8.0, -12.0], [8.0, 8.0, 8.0], 0.6);
+    let made = camera.rays(grid, screen);
+    let light = Light::at(screen.high, 0.9, 0.0);
+    let frame = Frame {
+        suns: light.sun_rays(2, 0.05),
+        floor: 0.05,
+        before: camera.before(grid, screen),
+        flags: flags::RESET,
+        ..Frame::default()
+    };
+    still.set(&table, &framed_words(&made, &table, &frame, &light));
+    still.run(&VOLUMES);
+    still.run(&[stage::PRIMARY, stage::BOUNCE]);
+    let hits = still.read(layout.hits(), screen.pixels() * HIT_WORDS);
+    still.run(&AFTER);
+    let picture = still.read(0, screen.pixels());
+    let mut on_marked = Vec::new();
+    let mut on_other = Vec::new();
+    for (pixel, hit) in hits.chunks(HIT_WORDS).enumerate() {
+        let Some(&(_, mark)) = marked.iter().find(|&&(cell, _)| cell == hit[0]) else {
+            continue;
+        };
+        let word = picture[pixel];
+        let least = [16, 8, 0]
+            .iter()
+            .map(|shift| (word >> shift) & 0xFF)
+            .min()
+            .unwrap();
+        if mark {
+            on_marked.push(least);
+        } else {
+            on_other.push(least);
+        }
+    }
+    (on_marked, on_other)
+}
+
+#[test]
+fn a_table_naming_the_falling_bit_shades_exactly_the_marked_cells_as_falling() {
+    use grit::rule3::nature::FALLING;
+    let bit = FALLING.trailing_zeros();
+    let (marked, other) = drops_seen(Some(bit));
+    if marked.is_empty() && other.is_empty() {
+        return;
+    }
+    let (dimmest, brightest) = (
+        marked.iter().min().copied().unwrap_or(0),
+        other.iter().max().copied().unwrap_or(0),
+    );
+    println!(
+        "falling bit {bit}: {} pixels on marked cells, the dimmest channel at least {dimmest}; {} on the others, at most {brightest}",
+        marked.len(),
+        other.len()
+    );
+    assert!(
+        marked.len() >= 40,
+        "{} pixels see a marked cell",
+        marked.len()
+    );
+    assert!(other.len() >= 80, "{} pixels see another cell", other.len());
+    assert!(
+        dimmest > brightest,
+        "marked cells are not set apart: {dimmest} against {brightest}"
+    );
+    let (none, any) = drops_seen(None);
+    let (elsewhere_marked, elsewhere_other) = drops_seen(Some(bit - 1));
+    let falling = |held: &[u32]| held.iter().filter(|&&least| least >= dimmest).count();
+    println!(
+        "no bit named: {} of {} marked and {} of {} other pixels white; another bit named: {} and {}",
+        falling(&none),
+        none.len(),
+        falling(&any),
+        any.len(),
+        falling(&elsewhere_marked),
+        falling(&elsewhere_other)
+    );
+    assert!(
+        falling(&any) * 2 > any.len(),
+        "with no bit named, a lone drop over open air is falling"
+    );
+    assert_eq!(
+        falling(&elsewhere_marked) + falling(&elsewhere_other),
+        0,
+        "a table that names another bit reads that one"
+    );
+}
+
 /// The longest run of rows in which column `x` of `picture` keeps one value.
 fn longest_run(picture: &[u32], screen: Screen, x: u32) -> usize {
     let mut longest = 0;

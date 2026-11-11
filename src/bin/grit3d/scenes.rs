@@ -71,7 +71,7 @@ pub struct Example {
 /// gloss and moss on the ground, needles lit on top and varied in hue,
 /// grass over soil, and water that is a liquid.
 fn dressed(mut example: Example) -> Example {
-    use grit::rule3::nature::{ASH, EARTH, LEAVES, ROCK, SAND, SMOKE, SNOW, WATER, WOOD};
+    use grit::rule3::nature::{ASH, EARTH, FALLING, LEAVES, ROCK, SAND, SMOKE, SNOW, WATER, WOOD};
     let table = example.table;
     example.table = table
         .with(
@@ -114,7 +114,8 @@ fn dressed(mut example: Example) -> Example {
                 .clear(0.8)
                 .surface(0.06, 0.02)
                 .detail(0.0, 0.55, 0.0, 0.0)
-                .liquid(0x002F_7FA8),
+                .liquid(0x002F_7FA8)
+                .falls_by(FALLING.trailing_zeros()),
         )
         .with(
             WOOD,

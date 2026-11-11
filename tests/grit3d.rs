@@ -292,6 +292,42 @@ fn every_letter_the_demo_writes_has_a_glyph() {
 }
 
 #[test]
+fn the_valleys_water_falls_where_the_nature_rule_marks_it_and_nowhere_else() {
+    use grit::render3::occupancy::watered;
+    use grit::rule3::nature::{EARTH, FALLING, WATER};
+    let grid = Grid::solid(16, 16, 16).unwrap();
+    let example = Which::Valley.example();
+    let kinds = grit::view3::Kinds::named(example.rule).unwrap();
+    assert_eq!(
+        example.table.material(WATER).falls,
+        FALLING.trailing_zeros() + 1,
+        "the valley's water does not name the rule's falling bit"
+    );
+    let mut cells = vec![0_u32; grid.cells()];
+    let mut marked = 0;
+    for z in 0..4_u32 {
+        for y in 0..4_u32 {
+            for x in 0..4_u32 {
+                let at = ((z * grid.deep + y) * grid.wide + x) as usize;
+                let fell = (x + 2 * y + 3 * z) % 3 == 0;
+                marked += u32::from(fell);
+                cells[at] = (WATER << kinds.shift()) | if fell { FALLING } else { 0 };
+            }
+        }
+    }
+    cells[((grid.deep - 1) * grid.wide + 8) as usize] = EARTH << kinds.shift();
+    let water = watered(grid, kinds, &example.table, &cells);
+    let spray = water.get(1).copied().unwrap_or(0.0);
+    println!("one brick of water, {marked} of 64 cells marked: spray share {spray}");
+    assert!(marked > 0 && marked < 64);
+    assert!(
+        (spray - marked as f32 / 64.0).abs() < 1.0e-6,
+        "spray share {spray}, the marked share is {}",
+        marked as f32 / 64.0
+    );
+}
+
+#[test]
 fn the_glass_box_holds_most_of_the_valley_and_leaves_its_peak_out() {
     let grid = Grid::solid(64, 64, 64).unwrap();
     let example = Which::Valley.example();
