@@ -64,6 +64,10 @@ required-features = ["window"]
 name = "grit-mcp"
 path = "src/bin/grit-mcp.rs"
 
+[[bin]]
+name = "grit-bake"
+path = "src/bin/grit-bake.rs"
+
 [[test]]
 name = "descending"
 required-features = ["deep"]
