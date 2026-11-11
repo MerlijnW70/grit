@@ -421,6 +421,16 @@ impl<'host> Sparse<'host> {
         self.bricks.unpack(&table, &pool)
     }
 
+    fn held_bricks(&mut self) -> std::collections::BTreeSet<u32> {
+        let table = self
+            .held
+            .read(self.bricks.table() as usize, self.bricks.table_words())
+            .unwrap();
+        (0..self.bricks.count())
+            .filter(|&brick| table[brick as usize * ENTRY] != UNIFORM)
+            .collect()
+    }
+
     fn sound(&mut self) -> Result<(), String> {
         let capacity = self.bricks.capacity();
         let table = self
@@ -550,6 +560,7 @@ fn parted(label: &str, grid: Grid3, frame: u32, got: &[u32], want: &[u32]) -> Op
 struct Run {
     mode: Mode,
     bricks: u32,
+    freed: u32,
     lowest: u32,
     highest: u32,
     last: u32,
@@ -599,9 +610,11 @@ fn agree_in<R: Rule>(
             let opened = sparse.restart(&first, &subject.params, from);
             dense.restart(&first, &subject.params, from);
             let mut want = first.clone();
+            let mut held_before = sparse.held_bricks();
             let mut run = Run {
                 mode,
                 bricks: sparse.bricks.count(),
+                freed: 0,
                 lowest: opened.held,
                 highest: opened.held,
                 last: opened.held,
@@ -640,6 +653,9 @@ fn agree_in<R: Rule>(
                 if let Some(failed) = failed {
                     panic!("{failed}");
                 }
+                let now = sparse.held_bricks();
+                run.freed += u32::try_from(held_before.difference(&now).count()).unwrap();
+                held_before = now;
                 let used = sparse.bricks.check(&mut sparse.held).unwrap();
                 run.lowest = run.lowest.min(used.held);
                 run.highest = run.highest.max(used.held);
@@ -647,12 +663,13 @@ fn agree_in<R: Rule>(
             }
             assert_ne!(want, first, "{label}: nothing moved");
             println!(
-                "{label}: {frames} frames equal; {} bricks, {} held at start, {}..{} held, {} at the end",
+                "{label}: {frames} frames equal; {} bricks, {} held at start, {}..{} held, {} at the end, {} freed",
                 sparse.bricks.count(),
                 opened.held,
                 run.lowest,
                 run.highest,
-                run.last
+                run.last,
+                run.freed
             );
             runs.push(run);
         }
@@ -709,14 +726,18 @@ fn a_pile_falls_through_an_air_brick_that_is_taken_and_freed_again() {
             "{name}: the falling pile took no brick"
         );
         if run.mode == Mode::Whole {
+            assert_eq!(
+                run.freed, 0,
+                "{name}: every brick is touched every frame of the whole grid, so none is quiet"
+            );
             continue;
         }
         assert!(
-            run.last < run.highest,
-            "{name} {:?}: no brick the pile passed was freed: {} held at most, {} at the end",
+            run.freed > 0 && run.highest > run.lowest,
+            "{name} {:?}: the pile took {} bricks and freed {}",
             run.mode,
-            run.highest,
-            run.last
+            run.highest - run.lowest,
+            run.freed
         );
     }
 }
@@ -735,7 +756,7 @@ fn sheets_that_leave_a_brick_empty_for_one_frame_step_to_the_dense_words() {
             continue;
         }
         assert!(
-            run.last < run.highest,
+            run.freed > 0,
             "{name} {:?}: no brick the sheets passed was freed",
             run.mode
         );
