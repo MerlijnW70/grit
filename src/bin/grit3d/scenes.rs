@@ -37,7 +37,7 @@ impl Which {
 
     pub fn example(self) -> Example {
         match self {
-            Self::Valley => super::valley::example(),
+            Self::Valley => dressed(super::valley::example()),
             Self::Sand => sanded(),
             Self::Fire => fired(),
             Self::Code => coded(),
@@ -65,6 +65,76 @@ pub struct Example {
     pub pace: Option<f32>,
     pub life: Option<fn(Grid, &[u32]) -> super::life::Cycle>,
     pub feed: Option<Feed>,
+}
+
+/// The valley with its kinds dressed as the renderer can draw them: detail,
+/// gloss and moss on the ground, needles lit on top and varied in hue,
+/// grass over soil, and water that is a liquid.
+fn dressed(mut example: Example) -> Example {
+    use grit::rule3::nature::{ASH, EARTH, LEAVES, ROCK, SAND, SMOKE, SNOW, WATER, WOOD};
+    let table = example.table;
+    example.table = table
+        .with(
+            ROCK,
+            table
+                .material(ROCK)
+                .surface(0.82, 0.04)
+                .detail(0.35, 0.5, 0.6, 0.15)
+                .mossy(0.35, 0x0058_6440)
+                .wets(0.8),
+        )
+        .with(
+            EARTH,
+            table
+                .material(EARTH)
+                .topped(0x0050_5A26)
+                .hue(0.3)
+                .detail(0.5, 0.45, 0.15, 0.0)
+                .wets(0.7),
+        )
+        .with(
+            SAND,
+            table
+                .material(SAND)
+                .surface(0.95, 0.03)
+                .detail(0.45, 0.35, 0.0, 0.0)
+                .wets(1.0),
+        )
+        .with(
+            SNOW,
+            table
+                .material(SNOW)
+                .surface(0.55, 0.02)
+                .detail(0.15, 0.35, 0.0, 0.0)
+                .sparkle(1.0),
+        )
+        .with(
+            WATER,
+            Material::solid(0x003F_B5B0, 0.02)
+                .clear(0.8)
+                .surface(0.06, 0.02)
+                .detail(0.0, 0.55, 0.0, 0.0)
+                .liquid(0x002F_7FA8),
+        )
+        .with(
+            WOOD,
+            table
+                .material(WOOD)
+                .hue(0.25)
+                .detail(0.6, 0.5, 0.2, 0.9)
+                .mossy(0.3, 0x004F_5E32),
+        )
+        .with(
+            LEAVES,
+            Material::solid(0x001E_3520, 0.3)
+                .topped(0x005A_6430)
+                .hue(1.2)
+                .surface(0.75, 0.03)
+                .detail(0.6, 0.5, 0.0, 0.1),
+        )
+        .with(ASH, table.material(ASH).detail(0.5, 0.0, 0.0, 0.0))
+        .with(SMOKE, Material::solid(0x006E_6862, 0.0).gas(0.62));
+    example
 }
 
 /// How a scene finds the cells it writes before every step from its world:
