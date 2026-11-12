@@ -980,8 +980,13 @@ fn a_step_halved_down_to_nothing_stops_the_walk_where_its_best_round_was() {
     );
     assert_eq!(
         answer.counted("rounds"),
-        Some(4),
-        "it gave up on the fourth round and did not walk the other eight"
+        Some(7),
+        "four rounds along the slope and three beside its best, and not the other five"
+    );
+    assert_eq!(
+        answer.counted("probed"),
+        Some(3),
+        "a step of one tries the neighbours of its best round it has not walked before it stops"
     );
     assert_eq!(
         answer.counted("turning"),
@@ -1023,8 +1028,8 @@ fn a_cell_that_landed_under_the_target_pulls_the_other_way_from_one_that_landed_
     let trail = answer.get("trail").and_then(Json::list).unwrap();
     assert_eq!(
         trail.len(),
-        4,
-        "the walk it makes when the signs are kept apart"
+        7,
+        "the walk it makes when the signs are kept apart, four rounds along the slope and three beside its best"
     );
     assert_eq!(
         trail[2].counted("turning"),
@@ -1349,14 +1354,22 @@ fn a_walk_with_nowhere_left_to_step_says_it_stalled() {
     let Some(host) = device("a_walk_with_nowhere_left_to_step_says_it_stalled") else {
         return;
     };
-    let held = settled(&host, 7);
+    let held = settled(&host, 13);
     assert_eq!(
         held.get("stalled"),
         Some(&Json::Bool(true)),
-        "the seventh round has no step left to take: {}",
+        "after six neighbours of its best the thirteenth round has no step left to take: {}",
         written(&held)
     );
-    assert_eq!(held.get("trail").and_then(Json::list).unwrap().len(), 7);
+    assert_eq!(held.get("trail").and_then(Json::list).unwrap().len(), 13);
+    assert_eq!(held.counted("probed"), Some(6));
+    let short = settled(&host, 12);
+    assert_eq!(
+        short.get("stalled"),
+        Some(&Json::Bool(false)),
+        "one neighbour still untried is not stalled: {}",
+        written(&short)
+    );
 }
 
 #[test]
@@ -1436,14 +1449,14 @@ fn a_round_counts_as_unmoved_only_when_the_distance_stayed_where_it_was() {
         .collect();
     assert_eq!(
         gaps,
-        vec![759, 1292, 759, 759, 759],
+        vec![759, 1292, 759, 759, 759, 759, 759, 759],
         "this walk goes off, comes back, and then sits still: {}",
         written(&held)
     );
     assert_eq!(
         held.counted("unmoved"),
-        Some(2),
-        "five rounds hold four steps between them, and two of those four left the distance where it was; a counter that says five is counting rounds rather than stillness"
+        Some(5),
+        "eight rounds hold seven steps between them, and five of those seven left the distance where it was; a counter that says eight is counting rounds rather than stillness"
     );
 }
 

@@ -343,3 +343,40 @@ fn what_slope_answers_settle_takes_back_and_lands_on_exactly() {
         written(&held)
     );
 }
+
+#[test]
+fn a_step_of_one_tries_the_neighbours_before_it_stops() {
+    let Some(host) = device("a_step_of_one_tries_the_neighbours_before_it_stops") else {
+        return;
+    };
+    let (cells, secret) = scattered(1);
+    let want = written(walked(&host, &cells, secret).get("ended").unwrap());
+    let held = structured(
+        Some(&host),
+        "grit_settle",
+        &format!(
+            "{{\"kind\":\"smooth\",\"wide\":16,\"deep\":16,\"depth\":8,\"cells\":{cells},\"want\":{want},\"turning\":2000,\"swing\":2000,\"step\":256,\"rounds\":64,\"ceiling\":8192}}"
+        ),
+    );
+    eprintln!(
+        "secret {secret:?}, found ({:?}, {:?}) apart {:?} after {:?} rounds, {:?} of them beside its best",
+        held.counted("turning"),
+        held.counted("swing"),
+        held.get("apart"),
+        held.counted("rounds"),
+        held.counted("probed")
+    );
+    assert!(
+        held.counted("probed").unwrap() > 0,
+        "the walk ended beside the answer only by trying a neighbour: {}",
+        written(&held)
+    );
+    assert_eq!(held.get("apart").and_then(Json::int), Some(0));
+    assert_eq!(
+        (
+            held.counted("turning").unwrap(),
+            held.counted("swing").unwrap()
+        ),
+        secret
+    );
+}

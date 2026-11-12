@@ -1338,7 +1338,7 @@ pub(crate) fn tools() -> Json {
         ),
         tool(
             "grit_settle",
-            "Walk a grid forward, see how far it landed from the one you asked for, and move the two rule parameters downhill against that distance. The step is taken from the walk's own adjoint rather than from a guess: the weight carried back is the sign of the residual a cell at a time, so what comes back is the gradient of the distance with respect to the parameters. Returns the trail it walked, the nearest it got, and the parameters that got it there. Distance is counted exactly on the host. A run that did not close means these parameters, at this step and this many rounds, did not get nearer - never that none would.",
+            "Walk a grid forward, see how far it landed from the one you asked for, and move the two rule parameters downhill against that distance. The step is taken from the walk's own adjoint rather than from a guess: the weight carried back is the sign of the residual a cell at a time, so what comes back is the gradient of the distance with respect to the parameters. When both ways along the slope come out worse at a step of one, it tries every neighbour of its best point before it stops. Returns the trail it walked, the nearest it got, and the parameters that got it there. Distance is counted exactly on the host. A run that did not close means these parameters, at this step and this many rounds, did not get nearer - never that none would.",
             object(settling, &["want"]),
         ),
         tool(
@@ -1651,6 +1651,29 @@ fn moved(now: u32, slope: i64, step: u32, most: u32, against: bool) -> u32 {
     }
 }
 
+fn beside(turning: u32, swing: u32, ceiling: u32) -> Vec<(u32, u32)> {
+    let mut all = Vec::new();
+    for (across, down) in [
+        (1, 1),
+        (-1, -1),
+        (1, -1),
+        (-1, 1),
+        (0, 1),
+        (0, -1),
+        (1, 0),
+        (-1, 0),
+    ] {
+        let one = (
+            turning.saturating_add_signed(across).min(ceiling),
+            swing.saturating_add_signed(down).min(ceiling),
+        );
+        if one != (turning, swing) && !all.contains(&one) {
+            all.push(one);
+        }
+    }
+    all
+}
+
 fn under(held: &Json, knob: &Whole, ceiling: u32) -> Result<u32, Box<dyn std::error::Error>> {
     let value = knob.count(held, "$")?;
     if value > ceiling {
@@ -1701,7 +1724,12 @@ fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error:
     let mut against = false;
     let mut turned_around = 0_u32;
     let mut unmoved = 0_u32;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut probing: Vec<(u32, u32)> = Vec::new();
+    let mut probed = 0_u32;
+    let mut probing_from = None;
     for _ in 0..rounds {
+        seen.insert((turning, swing));
         board.tune(turning, swing)?;
         // Forward once to see where it lands, then again inside carry, which
         // cannot know the residual before the grid has been walked.
@@ -1740,22 +1768,48 @@ fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error:
                 let there = (held_turning, held_swing, (held_down, held_swung));
                 if gap < held {
                     best = Some((gap, turning, swing, down_turning, down_swing));
+                    probing.clear();
+                    probing_from = None;
                     here
+                } else if probing_from == Some((held_turning, held_swing)) {
+                    match probing.pop() {
+                        Some(next) => {
+                            probed += 1;
+                            (turning, swing) = next;
+                            continue;
+                        }
+                        None => {
+                            step = 0;
+                            stalled = true;
+                            break;
+                        }
+                    }
                 } else if !against {
                     against = true;
                     turned_around += 1;
                     there
-                } else {
-                    // Both ways were worse, so the step is too long. Sign-only
-                    // steps on whole numbers overshoot and then sit swinging
-                    // between two values; going back with half the step turns
-                    // that into an answer.
+                } else if step > 1 {
                     against = false;
                     step /= 2;
-                    // No guard on the halved step reaching nothing: a step of
-                    // nothing moves neither parameter, and the check below
-                    // that nothing moved is the one that stops the walk.
                     there
+                } else {
+                    probing = beside(held_turning, held_swing, ceiling)
+                        .into_iter()
+                        .filter(|one| !seen.contains(one))
+                        .collect();
+                    probing_from = Some((held_turning, held_swing));
+                    match probing.pop() {
+                        Some(next) => {
+                            probed += 1;
+                            (turning, swing) = next;
+                            continue;
+                        }
+                        None => {
+                            step = 0;
+                            stalled = true;
+                            break;
+                        }
+                    }
                 }
             }
         };
@@ -1794,6 +1848,7 @@ fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error:
         ("stalled", Json::Bool(stalled)),
         ("turned_around", counted(turned_around)),
         ("unmoved", counted(unmoved)),
+        ("probed", counted(probed)),
         ("step", counted(step)),
         ("trail", Json::List(trail)),
         ("checked_on_the_host", Json::Bool(true)),
@@ -1806,7 +1861,7 @@ fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error:
         (
             "a_round_that_did_not_close",
             text(
-                "means these rule parameters, at this step and this many rounds, did not get nearer - not that no parameters would. Stalled means the step had nowhere smaller to go, so more rounds would not help; a step that ran out of rounds instead would. turned_around counts the rounds where the slope pointed uphill and the distance, which is exact, said otherwise. unmoved counts rounds where moving the parameters changed the distance by nothing at all, which means they have no purchase at this depth and these cell values rather than that they are right.",
+                "means these rule parameters, at this step and this many rounds, did not get nearer - not that no parameters would. Stalled means a step of one found no neighbour of the best point nearer than it, so more rounds would not help; a walk that ran out of rounds instead would. probed counts the rounds spent on those neighbours. turned_around counts the rounds where the slope pointed uphill and the distance, which is exact, said otherwise. unmoved counts rounds where moving the parameters changed the distance by nothing at all, which means they have no purchase at this depth and these cell values rather than that they are right.",
             ),
         ),
     ]))
