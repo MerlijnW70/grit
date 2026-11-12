@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use super::dag::{AT, Dag, FIRST_PARAM, FRAME};
 use super::parse::{Path, Program, clipped, described, limited, refused};
 use super::trace::Tracer;
+use super::value::{Items, Value};
 use super::{Code, Refusal, limits};
 use crate::ops::{Cpu, Ops};
 use crate::rule3::{CORNERS, noise_by};
@@ -14,15 +14,6 @@ const KNOWN_INT: &str = "an int, known when the law compiles";
 const KNOWN_CHOICE: &str = "an int or a flag, known when the law compiles";
 
 const LIVE: &str = "known only when the law runs";
-
-#[derive(Clone, Debug)]
-enum Value {
-    Int(u32),
-    Word(u32),
-    Truth(bool),
-    Flag(u32),
-    List(Rc<[Value]>),
-}
 
 #[derive(Clone, Copy, Debug)]
 enum Operand {
@@ -113,9 +104,9 @@ const fn spoken(operand: Operand) -> Value {
     }
 }
 
-fn list(value: &Value, path: &Path<'_>) -> Result<Rc<[Value]>, Refusal> {
+fn list(value: &Value, path: &Path<'_>) -> Result<Items, Refusal> {
     match value {
-        Value::List(items) => Ok(Rc::clone(items)),
+        Value::List(items) => Ok(items.clone()),
         other => Err(refused(Code::Type, path, "a vec", kind(other))),
     }
 }
@@ -136,8 +127,11 @@ fn binder<'p>(json: &'p Json, path: &Path<'_>) -> Result<&'p str, Refusal> {
     }
 }
 
-fn item(items: &[Value], index: u32, path: &Path<'_>) -> Result<Value, Refusal> {
-    match usize::try_from(index).ok().and_then(|at| items.get(at)) {
+fn item(items: &Items, index: u32, path: &Path<'_>) -> Result<Value, Refusal> {
+    match usize::try_from(index)
+        .ok()
+        .and_then(|at| items.items().get(at))
+    {
         Some(value) => Ok(value.clone()),
         None => Err(limited(
             Code::Index,
@@ -147,6 +141,20 @@ fn item(items: &[Value], index: u32, path: &Path<'_>) -> Result<Value, Refusal> 
             items.len() as u64,
         )),
     }
+}
+
+fn built(items: Vec<Value>, path: &Path<'_>) -> Result<Value, Refusal> {
+    let made = Items::new(items);
+    if made.depth() > limits::VALUES {
+        return Err(limited(
+            Code::ValueDepth,
+            path,
+            format!("a value of vecs nested at most {} deep", limits::VALUES),
+            format!("vecs nested {} deep", made.depth()),
+            limits::VALUES as u64,
+        ));
+    }
+    Ok(Value::List(made))
 }
 
 fn too_deep(path: &Path<'_>) -> Refusal {
@@ -449,7 +457,7 @@ impl<'p> Expander<'_, 'p> {
             made.push(self.eval(one, &path.index(index + 1), depth)?);
         }
         self.spend(made.len(), path)?;
-        Ok(Value::List(made.into()))
+        built(made, path)
     }
 
     fn ranged(
@@ -460,7 +468,7 @@ impl<'p> Expander<'_, 'p> {
     ) -> Result<Value, Refusal> {
         let many = self.int_at(args, 0, path, depth)?;
         self.spend(usize::try_from(many).unwrap_or(usize::MAX), path)?;
-        Ok(Value::List((0..many).map(Value::Int).collect()))
+        built((0..many).map(Value::Int).collect(), path)
     }
 
     fn indexed(
@@ -485,11 +493,11 @@ impl<'p> Expander<'_, 'p> {
         let value = self.eval(arg(args, 2), &path.index(3), depth)?;
         item(&items, index, &path.index(2))?;
         self.spend(items.len(), path)?;
-        let mut made = items.to_vec();
+        let mut made = items.items().to_vec();
         if let Some(slot) = usize::try_from(index).ok().and_then(|at| made.get_mut(at)) {
             *slot = value;
         }
-        Ok(Value::List(made.into()))
+        built(made, path)
     }
 
     fn mapped(
@@ -503,7 +511,7 @@ impl<'p> Expander<'_, 'p> {
         let items = self.list_at(args, 1, path, depth)?;
         self.spend(items.len(), path)?;
         let mut made = Vec::with_capacity(items.len());
-        for one in items.iter() {
+        for one in items.items() {
             let value = self.bound(&[(name, one.clone())], arg(args, 2), &path.index(3), depth)?;
             if mapping {
                 made.push(value);
@@ -511,7 +519,7 @@ impl<'p> Expander<'_, 'p> {
                 made.push(one.clone());
             }
         }
-        Ok(Value::List(made.into()))
+        built(made, path)
     }
 
     fn reduced(
@@ -524,7 +532,7 @@ impl<'p> Expander<'_, 'p> {
         let name = binder(arg(args, 2), &path.index(3))?;
         let mut value = self.eval(arg(args, 1), &path.index(2), depth)?;
         let items = self.list_at(args, 3, path, depth)?;
-        for one in items.iter() {
+        for one in items.items() {
             value = self.bound(
                 &[(acc, value), (name, one.clone())],
                 arg(args, 4),
@@ -543,7 +551,7 @@ impl<'p> Expander<'_, 'p> {
     ) -> Result<Value, Refusal> {
         let items = self.list_at(args, 0, path, depth)?;
         self.spend(items.len(), path)?;
-        Ok(Value::List(items.iter().rev().cloned().collect()))
+        built(items.items().iter().rev().cloned().collect(), path)
     }
 
     fn joined(
@@ -557,9 +565,13 @@ impl<'p> Expander<'_, 'p> {
             parts.push(self.list_at(args, index, path, depth)?);
         }
         self.spend(parts.iter().map(|part| part.len()).sum(), path)?;
-        Ok(Value::List(
-            parts.iter().flat_map(|part| part.iter().cloned()).collect(),
-        ))
+        built(
+            parts
+                .iter()
+                .flat_map(|part| part.items().iter().cloned())
+                .collect(),
+            path,
+        )
     }
 
     fn param(&mut self, args: &'p [Json], path: &Path<'_>, depth: usize) -> Result<Value, Refusal> {
@@ -602,7 +614,7 @@ impl<'p> Expander<'_, 'p> {
         at: usize,
         path: &Path<'_>,
         depth: usize,
-    ) -> Result<Rc<[Value]>, Refusal> {
+    ) -> Result<Items, Refusal> {
         let here = path.index(at + 1);
         let value = self.eval(arg(args, at), &here, depth)?;
         list(&value, &here)
@@ -739,8 +751,9 @@ impl<'p> Expander<'_, 'p> {
             },
             "count" => {
                 let items = list(&value(0), &at(0))?;
+                self.spend(items.len(), path)?;
                 let mut truths = Vec::with_capacity(items.len());
-                for item in items.iter() {
+                for item in items.items() {
                     truths.push(truth(item, &at(0))?);
                 }
                 if truths.iter().all(|one| matches!(one, Truth::Known(_))) {
@@ -811,20 +824,21 @@ fn first_plane(program: &Program<'_>) -> u32 {
 
 fn cells_of(program: &Program<'_>) -> Value {
     if program.channels <= 1 {
-        return Value::List((0..8).map(Value::Word).collect());
+        return Value::list((0..8).map(Value::Word).collect());
     }
     let first = first_plane(program);
     let corners = u32::try_from(CORNERS).unwrap_or(8);
-    Value::List(
+    Value::list(
         (0..corners)
             .map(|corner| {
-                let words: Vec<Value> = (0..program.channels)
-                    .map(|plane| match plane {
-                        0 => Value::Word(corner),
-                        _ => Value::Word(first + (plane - 1) * corners + corner),
-                    })
-                    .collect();
-                Value::List(words.into())
+                Value::list(
+                    (0..program.channels)
+                        .map(|plane| match plane {
+                            0 => Value::Word(corner),
+                            _ => Value::Word(first + (plane - 1) * corners + corner),
+                        })
+                        .collect(),
+                )
             })
             .collect(),
     )
@@ -842,7 +856,7 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
     globals.insert("frame", Value::Word(FRAME));
     globals.insert(
         "at",
-        Value::List([AT, AT + 1, AT + 2].into_iter().map(Value::Word).collect()),
+        Value::list([AT, AT + 1, AT + 2].into_iter().map(Value::Word).collect()),
     );
     for &(name, value) in &program.consts {
         globals.insert(name, Value::Int(value));
@@ -863,7 +877,7 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
     let Value::List(halves) = &result else {
         return Err(shaped(&step, kind(&result)));
     };
-    let [out, counts] = &**halves else {
+    let [out, counts] = halves.items() else {
         return Err(shaped(&step, kind(&result)));
     };
     let (Value::List(out), Value::List(counts)) = (out, counts) else {
@@ -880,7 +894,7 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
     let mut ids = [0_u32; CORNERS];
     let mut upper = vec![[0_u32; CORNERS]; usize::try_from(planes - 1).unwrap_or(0)];
     if planes > 1 {
-        for (index, one) in out.iter().enumerate() {
+        for (index, one) in out.items().iter().enumerate() {
             let Value::List(words) = one else {
                 return Err(shaped_planes(
                     &step,
@@ -895,7 +909,7 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
                     format!("{} at out[{index}]", kind(one)),
                 ));
             }
-            for (plane, word) in words.iter().enumerate() {
+            for (plane, word) in words.items().iter().enumerate() {
                 let made = operand(word, &step).map_err(|_| {
                     shaped_planes(
                         &step,
@@ -916,14 +930,14 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
             }
         }
     } else {
-        for (slot, (index, one)) in ids.iter_mut().zip(out.iter().enumerate()) {
+        for (slot, (index, one)) in ids.iter_mut().zip(out.items().iter().enumerate()) {
             let made = operand(one, &step)
                 .map_err(|_| shaped(&step, format!("{} at out[{index}]", kind(one))))?;
             *slot = expander.id(made, &step)?;
         }
     }
     let mut tallied = Vec::with_capacity(counts.len());
-    for (index, one) in counts.iter().enumerate() {
+    for (index, one) in counts.items().iter().enumerate() {
         let made = operand(one, &step)
             .map_err(|_| shaped(&step, format!("{} at counts[{index}]", kind(one))))?;
         tallied.push(expander.id(made, &step)?);

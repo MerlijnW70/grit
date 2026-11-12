@@ -12,6 +12,7 @@ pub mod limits;
 pub mod parse;
 pub mod quiet;
 pub mod trace;
+pub mod value;
 
 pub use dag::{Dag, Node};
 pub use trace::trace;
@@ -33,6 +34,7 @@ pub enum Code {
     Nodes,
     Work,
     Depth,
+    ValueDepth,
     Name,
     Literal,
     Reserved,
@@ -48,7 +50,7 @@ pub enum Code {
 }
 
 impl Code {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Json,
         Self::Size,
         Self::Trailing,
@@ -64,6 +66,7 @@ impl Code {
         Self::Nodes,
         Self::Work,
         Self::Depth,
+        Self::ValueDepth,
         Self::Name,
         Self::Literal,
         Self::Reserved,
@@ -96,6 +99,7 @@ impl Code {
             Self::Nodes => "nodes",
             Self::Work => "work",
             Self::Depth => "depth",
+            Self::ValueDepth => "value_depth",
             Self::Name => "name",
             Self::Literal => "literal",
             Self::Reserved => "reserved",
