@@ -24,6 +24,8 @@ pub const BINDINGS: u32 = 8;
 
 pub const ROWS: u32 = 32;
 
+pub const MARKED_INPUTS: u32 = 12;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TooDeep {
     Inputs { inputs: u32, limit: u32 },
@@ -98,10 +100,10 @@ fn counted<const LANES: u32>(
 }
 
 pub fn marked(subgroup: u32, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    if shape.inputs > 12 {
+    if shape.inputs > MARKED_INPUTS {
         return Err(Box::new(TooDeep::Inputs {
             inputs: shape.inputs,
-            limit: 12,
+            limit: MARKED_INPUTS,
         }));
     }
     Ok(match subgroup {
