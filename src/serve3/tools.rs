@@ -6,7 +6,7 @@ use crate::host::Host;
 use crate::wire::{Json, counted, map, text};
 
 use super::budget::{
-    self, BATCH_MOST, BUDGET_MOST_MS, BUDGET_MS, Pace, SUBMIT_MOST_MS, Stop, world_cost,
+    self, BATCH_MOST, BUDGET_MOST_MS, BUDGET_MS, Pace, SUBMIT_MOST_MS, Stop, Work, world_cost,
 };
 use super::errors::{self, Code, Refusal};
 use super::journal::{self, Entry, Ledger, Made};
@@ -496,7 +496,16 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let (grid, sizes) = shaped(host, rule.as_ref(), &made)?;
     made.size = [grid.wide, grid.deep, grid.tall];
     let bytes = admitted(server, host, &sizes, "the world")?;
+    server.fits(
+        server.book.rates.estimate(Work::Build, bytes),
+        "building the world",
+    )?;
+    let began = Instant::now();
     let world = World::create(host, &made.branch())?;
+    server
+        .book
+        .rates
+        .measure(Work::Build, bytes, began.elapsed());
     let id = server.number()?;
     let pace = first_pace(&world);
     let mut live = super::Live { world, rule };
@@ -920,6 +929,17 @@ fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
 
 fn closed(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let world = int(held, "world")?;
+    if let Some(ledger) = server.book.earlier.remove(&world) {
+        server.book.broken_earlier.remove(&world);
+        if let Some(keep) = server.book.keep.as_ref() {
+            keep.forget(world);
+        }
+        server.book.release(ledger.sum());
+        return Ok(map(vec![
+            ("world", counted(world)),
+            ("closed", Json::Bool(true)),
+        ]));
+    }
     if !server.book.held.contains_key(&world) {
         server.world(held)?;
     }

@@ -1,10 +1,11 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::branch::World;
 use crate::branch::format;
 use crate::wire::{Json, counted, map, text};
 
-use super::budget::{Short, counted64};
+use super::budget::{Short, Work, counted64};
 use super::errors::Code;
 use super::journal::{self, Keep, Ledger, Made, Snap, hex, regular, tail_sum};
 use super::schema::{property, whole, with};
@@ -12,7 +13,7 @@ use super::tools::{
     admitted, first_pace, int, limited, refused, reported, sized, tool, unread, words_of,
     world_number,
 };
-use super::{Failed, Live, PAGE_BYTES, Server, Tool, image_shaped, paced, rule_of, shaped};
+use super::{Failed, Live, PAGE_BYTES, Server, Tool, image_shaped, rule_of, shaped};
 
 pub const TOOLS: &[Tool] = &[
     Tool {
@@ -167,9 +168,17 @@ fn saved(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             format!("a file named {name} is already in the server directory"),
         ));
     }
+    server.world(held)?;
+    let size = server.book.held.get(&number).map_or(0, |held| held.bytes);
+    server.fits(
+        server.book.rates.estimate(Work::Save, size),
+        &format!("writing world {number} to a file"),
+    )?;
+    let began = Instant::now();
     let live = server.world(held)?;
     let image = live.world.image()?;
     let bytes = format::store(&path, &image).map_err(|why| file_refusal(&why, &name))?;
+    server.book.rates.measure(Work::Save, size, began.elapsed());
     let sum = tail_sum(&path).map_err(|why| super::io_refusal(&why))?;
     Ok(map(vec![
         ("world", counted(number)),
@@ -224,6 +233,11 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
             what: format!("the file {name}{}", journal::SUFFIX),
         }));
     }
+    server.fits(
+        server.book.rates.estimate(Work::File, length),
+        &format!("reading the file {name}{}", journal::SUFFIX),
+    )?;
+    let began = Instant::now();
     let pending = keep
         .copied(&path, server.book.next)
         .map_err(|why| super::io_refusal(&why))?;
@@ -234,14 +248,27 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
             return Err(file_refusal(&why, name));
         }
     };
+    server
+        .book
+        .rates
+        .measure(Work::File, length, began.elapsed());
     let (sum, _) = keep
         .settle(&pending)
         .map_err(|why| super::io_refusal(&why))?;
     let opened = (|| {
         let rule = rule_of(host, image.law.name())?;
         let sizes = image_shaped(host, rule.as_ref(), &image)?;
-        admitted(server, host, &sizes, "the world")?;
+        let bytes = admitted(server, host, &sizes, "the world")?;
+        server.fits(
+            server.book.rates.estimate(Work::Build, bytes),
+            "building the world from the file",
+        )?;
+        let began = Instant::now();
         let world = World::open(host, &image)?;
+        server
+            .book
+            .rates
+            .measure(Work::Build, bytes, began.elapsed());
         Ok::<_, Failed>(Live { world, rule })
     })();
     let mut live = match opened {
@@ -284,6 +311,16 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
 }
 
 fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
+    if let Some(why) = server.book.broken_earlier.get(&number) {
+        return Err(refused(
+            Code::BadFile,
+            "$.name",
+            format!(
+                "world {number} cannot be rebuilt ({}); close it to remove its files",
+                super::errors::shown(why)
+            ),
+        ));
+    }
     let Some(ledger) = server.book.earlier.get(&number).cloned() else {
         if server.live.contains_key(&number) {
             return Err(refused(
@@ -301,16 +338,23 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
     let host = server.host.ok_or(crate::host::Error::NoComputeDevice)?;
     let rule = rule_of(host, &ledger.made().rule)?;
     let (_, sizes) = shaped(host, rule.as_ref(), ledger.made())?;
-    admitted(server, host, &sizes, "the world")?;
-    let mut pace = super::budget::Pace::first(0);
-    let guard = server.guard();
-    let world = journal::rebuilt(
-        host,
-        &ledger,
-        server.book.keep.as_ref(),
-        &guard,
-        |world, frames| paced(world, frames, &mut pace, &guard),
+    let bytes = admitted(server, host, &sizes, "the world")?;
+    server.fits(
+        server.replay_estimate(&ledger, bytes),
+        &format!("rebuilding world {number} from its journal"),
     )?;
+    let mut pace = super::budget::Pace::first(0);
+    let world = match server.replayed_world(host, &ledger, &mut pace, bytes) {
+        Ok(world) => world,
+        Err(why) => {
+            let stopped = why.downcast_ref::<super::budget::Halted>().is_some();
+            if !stopped && !super::lost_device(why.as_ref()) && !server.wedged() {
+                let said = super::refused_with(why.as_ref()).0.message;
+                server.book.broken_earlier.insert(number, said);
+            }
+            return Err(why);
+        }
+    };
     let mut live = Live { world, rule };
     let bytes = super::world_bytes(host, &live);
     let replayed = u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX);
@@ -361,8 +405,13 @@ fn listed(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         items.push(item);
     }
     for (number, ledger) in &server.book.earlier {
+        let kind = if server.book.broken_earlier.contains_key(number) {
+            "broken"
+        } else {
+            "kept"
+        };
         let mut item = vec![
-            ("kind", text("kept")),
+            ("kind", text(kind)),
             ("world", counted(*number)),
             ("name", text(&kept_name(*number))),
         ];
@@ -421,8 +470,17 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .cloned()
         .ok_or_else(|| unread("world"))?;
     server.book.memory.admits(source.bytes, "the fork")?;
+    server.fits(
+        server.book.rates.estimate(Work::Fork, source.bytes),
+        &format!("copying world {number}"),
+    )?;
+    let began = Instant::now();
     let live = server.world(held)?;
     let fork = live.world.fork()?;
+    server
+        .book
+        .rates
+        .measure(Work::Fork, source.bytes, began.elapsed());
     let rule = rule_of(host, fork.rule())?;
     let id = server.number()?;
     let mut live = Live { world: fork, rule };
@@ -464,6 +522,12 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             ],
         );
     }
+    let size = server.book.held.get(&from).map_or(0, |held| held.bytes);
+    server.fits(
+        server.book.rates.estimate(Work::Fork, size),
+        &format!("copying world {from} into world {number}"),
+    )?;
+    let began = Instant::now();
     let mut source = server.live.remove(&from).ok_or_else(|| unread("from"))?;
     let done = server
         .live
@@ -472,6 +536,7 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .and_then(|target| target.world.restore(&mut source.world));
     server.live.insert(from, source);
     done?;
+    server.book.rates.measure(Work::Fork, size, began.elapsed());
     let taken = server
         .book
         .held

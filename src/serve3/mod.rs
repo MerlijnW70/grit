@@ -217,6 +217,8 @@ pub struct Book {
     memory_fixed: bool,
     lost: bool,
     restorations: u64,
+    rates: budget::Rates,
+    broken_earlier: BTreeMap<u32, String>,
     stats: Stats,
     ignored: Vec<String>,
     #[cfg(feature = "faults")]
@@ -256,6 +258,22 @@ impl Book {
             }
         }
         let earlier: BTreeMap<u32, Ledger> = found;
+        let mut broken_earlier = BTreeMap::new();
+        if let Some(keep) = keep.as_ref() {
+            for (number, ledger) in &earlier {
+                if let Some(sum) = ledger.sum()
+                    && journal::tail_sum(&keep.snapshot(&sum)).ok() != Some(sum)
+                {
+                    broken_earlier.insert(
+                        *number,
+                        format!(
+                            "its snapshot snap-{} is gone or changed",
+                            journal::hex(&sum)
+                        ),
+                    );
+                }
+            }
+        }
         if let Some(keep) = keep.as_ref() {
             keep.sweep(&sums);
         }
@@ -274,6 +292,8 @@ impl Book {
             memory_fixed: options.memory.is_some(),
             lost: false,
             restorations: 0,
+            rates: budget::Rates::default(),
+            broken_earlier,
             stats: Stats::default(),
             ignored,
             #[cfg(feature = "faults")]
@@ -292,6 +312,8 @@ impl Book {
             memory_fixed: false,
             lost: false,
             restorations: 0,
+            rates: budget::Rates::default(),
+            broken_earlier: BTreeMap::new(),
             stats: Stats::default(),
             ignored: Vec::new(),
             #[cfg(feature = "faults")]
@@ -606,9 +628,16 @@ impl<'host> Server<'host> {
         if !was_lost {
             return (server, restored);
         }
-        let numbers: Vec<u32> = server.book.held.keys().copied().collect();
-        for number in numbers {
-            restored.push(server.rebuild(number));
+        for (number, held) in &mut server.book.held {
+            if held.broken.is_some() {
+                continue;
+            }
+            let note = map(vec![
+                ("world", counted(*number)),
+                ("frame", counted(held.ledger.frame)),
+                ("pending", Json::Bool(true)),
+            ]);
+            restored.push(note);
         }
         server.book.restorations = server.book.restorations.saturating_add(1);
         if server.wedged() {
@@ -617,34 +646,85 @@ impl<'host> Server<'host> {
         (server, restored)
     }
 
-    fn rebuild(&mut self, number: u32) -> Json {
+    fn replay_estimate(&self, ledger: &Ledger, bytes: u64) -> Duration {
+        let rates = &self.book.rates;
+        let snapshot = match (&ledger.base, self.book.keep.as_ref()) {
+            (Base::Snapshot(snap), Some(keep)) if snap.image.is_none() => {
+                std::fs::metadata(keep.snapshot(&snap.sum)).map_or(Duration::ZERO, |found| {
+                    rates.estimate(budget::Work::File, found.len())
+                })
+            }
+            _ => Duration::ZERO,
+        };
+        rates
+            .estimate(budget::Work::Build, bytes)
+            .saturating_add(snapshot)
+            .saturating_add(rates.replaying(ledger.replay()))
+    }
+
+    fn fits(&self, needs: Duration, what: &str) -> Result<(), Failed> {
+        let left = self.clock.left();
+        if needs > left {
+            return Err(Box::new(budget::too_slow(needs, left, what)));
+        }
+        Ok(())
+    }
+
+    fn replayed_world(
+        &mut self,
+        host: &'host Host,
+        ledger: &Ledger,
+        pace: &mut Pace,
+        bytes: u64,
+    ) -> Result<World<'host>, Failed> {
+        let guard = self.guard();
+        let began = Instant::now();
+        let mut stepping = Duration::ZERO;
+        let world = journal::rebuilt(
+            host,
+            ledger,
+            self.book.keep.as_ref(),
+            &guard,
+            |world, frames| {
+                let started = Instant::now();
+                let ran = paced(world, frames, pace, &guard);
+                stepping = stepping.saturating_add(started.elapsed());
+                ran
+            },
+        )?;
+        let rates = &mut self.book.rates;
+        rates.measure(
+            budget::Work::Build,
+            bytes,
+            began.elapsed().saturating_sub(stepping),
+        );
+        rates.measure_replay(ledger.replay(), stepping);
+        Ok(world)
+    }
+
+    fn rebuild(&mut self, number: u32) -> Result<(), Failed> {
         let Some(held) = self.book.held.get(&number) else {
-            return Json::Null;
+            return Ok(());
         };
         let ledger = held.ledger.clone();
+        let bytes = held.bytes;
         let mut pace = held.pace;
         let from_frame = match &ledger.base {
             Base::Created(_) => 0,
             Base::Snapshot(snap) => snap.frame,
         };
         let replayed = u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX);
-        let built = match self.host {
-            None => Err(Box::new(crate::host::Error::NoComputeDevice) as Failed),
-            Some(host) => {
-                let guard = budget::Guard::default();
-                journal::rebuilt(
-                    host,
-                    &ledger,
-                    self.book.keep.as_ref(),
-                    &guard,
-                    |world, frames| paced(world, frames, &mut pace, &guard),
-                )
-                .and_then(|world| {
-                    let rule = rule_of(host, world.rule())?;
-                    Ok(Live { world, rule })
-                })
-            }
-        };
+        let host = self.host.ok_or(crate::host::Error::NoComputeDevice)?;
+        self.fits(
+            self.replay_estimate(&ledger, bytes),
+            &format!("rebuilding world {number} after the lost device"),
+        )?;
+        let built = self
+            .replayed_world(host, &ledger, &mut pace, bytes)
+            .and_then(|world| {
+                let rule = rule_of(host, world.rule())?;
+                Ok(Live { world, rule })
+            });
         let mut note = vec![
             ("world", counted(number)),
             ("from_frame", counted(from_frame)),
@@ -657,22 +737,24 @@ impl<'host> Server<'host> {
                 self.live.insert(number, live);
             }
             Err(why) => {
-                let said = refused_with(why.as_ref()).0.message;
-                if self.host.is_none() || self.wedged() || lost_device(why.as_ref()) {
-                    self.book.lost = true;
-                } else {
-                    broken = Some(said.clone());
+                if why.downcast_ref::<budget::Halted>().is_some() {
+                    return Err(why);
                 }
+                let said = refused_with(why.as_ref()).0.message;
+                if self.wedged() || lost_device(why.as_ref()) {
+                    self.lose();
+                    return Err(why);
+                }
+                broken = Some(said.clone());
                 note.push(("failed", text(&said)));
             }
         }
-        let note = map(note);
         if let Some(held) = self.book.held.get_mut(&number) {
             held.broken = broken;
             held.pace = pace;
-            held.note = Some(note.clone());
+            held.note = Some(map(note));
         }
-        note
+        Ok(())
     }
 
     #[must_use]
@@ -737,6 +819,15 @@ impl<'host> Server<'host> {
     }
 
     fn world_at(&mut self, number: u32, field: &str) -> Result<&mut Live<'host>, Failed> {
+        let pending = !self.live.contains_key(&number)
+            && self
+                .book
+                .held
+                .get(&number)
+                .is_some_and(|held| held.broken.is_none());
+        if pending && !self.book.lost && !self.wedged() {
+            self.rebuild(number)?;
+        }
         if self.live.contains_key(&number) {
             return self
                 .live
@@ -793,7 +884,7 @@ impl<'host> Server<'host> {
         let id = self.book.next;
         let next = id
             .checked_add(1)
-            .filter(|_| id <= journal::NUMBER_MOST)
+            .filter(|_| id < journal::NUMBER_MOST)
             .ok_or_else(|| {
                 Box::new(
                     Refusal::new(
@@ -846,7 +937,7 @@ impl<'host> Server<'host> {
         let keep = self.book.keep.clone();
         let failed = keep
             .as_ref()
-            .and_then(|keep| keep.append(number, &entry).err());
+            .and_then(|keep| keep.append(number, &entry, spent).err());
         let held = self.book.held.get_mut(&number)?;
         held.ledger.push(entry, spent);
         failed.map(|why| text(&format!("the journal could not be written: {why}")))
@@ -854,7 +945,9 @@ impl<'host> Server<'host> {
 
     fn settle(&mut self, number: u32) -> Option<Json> {
         let held = self.book.held.get(&number)?;
-        if !held.ledger.due(held.bytes) || self.clock.left() < held.ledger.snapping(held.bytes) {
+        if !held.ledger.due(held.bytes, self.book.rates.replay())
+            || self.clock.left() < held.ledger.snapping(held.bytes)
+        {
             return None;
         }
         match self.snap_now(number) {
@@ -870,7 +963,7 @@ impl<'host> Server<'host> {
         let Some(held) = self.book.held.get(&number) else {
             return Ok(None);
         };
-        if !held.ledger.due(held.bytes) {
+        if !held.ledger.due(held.bytes, self.book.rates.replay()) {
             return Ok(None);
         }
         let needs = held.ledger.snapping(held.bytes);
@@ -920,10 +1013,10 @@ impl<'host> Server<'host> {
     }
 
     fn overdue(&self, number: u32, extra: Duration) -> bool {
-        self.book
-            .held
-            .get(&number)
-            .is_some_and(|held| held.ledger.over(extra, held.bytes))
+        self.book.held.get(&number).is_some_and(|held| {
+            held.ledger
+                .over(extra, held.bytes, self.book.rates.replay())
+        })
     }
 
     fn snapping(&self, number: u32) -> Duration {
@@ -993,6 +1086,7 @@ impl<'host> Server<'host> {
                     ),
                 ),
                 ("longest_frames", counted(self.book.stats.longest_frames)),
+                ("rates", self.book.rates.shown()),
                 (
                     "read_waits",
                     budget::counted64(
