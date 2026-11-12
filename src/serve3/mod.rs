@@ -993,6 +993,22 @@ impl<'host> Server<'host> {
                     ),
                 ),
                 ("longest_frames", counted(self.book.stats.longest_frames)),
+                (
+                    "read_waits",
+                    budget::counted64(
+                        self.live
+                            .values()
+                            .fold(0_u64, |all, one| all.saturating_add(one.world.read_waits())),
+                    ),
+                ),
+                (
+                    "words_read",
+                    budget::counted64(
+                        self.live
+                            .values()
+                            .fold(0_u64, |all, one| all.saturating_add(one.world.words_read())),
+                    ),
+                ),
             ]),
             directory: self
                 .book
@@ -1188,7 +1204,7 @@ fn snapshot(
     }
 }
 
-pub fn shaped(host: &Host, rule: &dyn Listed, made: &Made) -> Result<(Grid, Vec<usize>), Failed> {
+pub fn shaped(host: &Host, _: &dyn Listed, made: &Made) -> Result<(Grid, Vec<usize>), Failed> {
     let [wide, deep, tall] = made.size;
     let grid = Grid::solid(wide, deep, tall)?;
     if grid.tall < 2 {
@@ -1200,37 +1216,19 @@ pub fn shaped(host: &Host, rule: &dyn Listed, made: &Made) -> Result<(Grid, Vec<
             ),
         )));
     }
-    let width = host.width();
-    let blocks = grid.blocks().div_ceil(sweep::cells(width));
-    let plan = if made.sparse {
-        Plan::bricked(width, blocks)?
-    } else {
-        Plan::over_in(width, blocks, Dimension::Three)?
-    };
-    let sizes = if made.sparse {
-        let most = u32::try_from(((1_u64 << 32) - 1) / (u64::from(plan.per_block) * 8))
-            .unwrap_or(u32::MAX)
-            .min(plan.blocks);
-        let brick_cells = u64::from(plan.per_block) * 8;
-        let least = u32::try_from(POOL_LEAST_CELLS.div_ceil(brick_cells)).unwrap_or(u32::MAX);
-        let capacity = made
-            .slots
-            .unwrap_or((plan.blocks / 4).max(least))
-            .clamp(1, most.max(1));
-        let bricks = Bricks::new(grid, &plan, capacity)?;
-        rule.bricked_sizes(&bricks, &plan)
-    } else {
-        if Grid3::new(grid.wide, grid.deep, grid.tall).is_none() {
-            return Err(Box::new(Refusal::new(
-                errors::Code::Unfit,
-                "$",
-                format!(
-                    "a dense world of {wide} by {deep} by {tall} cells is not solid; ask for a sparse one"
-                ),
-            )));
-        }
-        plan.windows().laid(&rule.sizes(&plan))
-    };
+    if !made.sparse && Grid3::new(grid.wide, grid.deep, grid.tall).is_none() {
+        let width = host.width();
+        let blocks = grid.blocks().div_ceil(sweep::cells(width));
+        Plan::over_in(width, blocks, Dimension::Three)?;
+        return Err(Box::new(Refusal::new(
+            errors::Code::Unfit,
+            "$",
+            format!(
+                "a dense world of {wide} by {deep} by {tall} cells is not solid; ask for a sparse one"
+            ),
+        )));
+    }
+    let sizes = crate::branch::sizes_of(host, &made.branch())?;
     Ok((grid, sizes))
 }
 
@@ -1264,16 +1262,8 @@ pub fn image_shaped(
     Ok(shaped(host, rule, &made)?.1)
 }
 
-fn world_bytes(host: &Host, live: &Live<'_>) -> u64 {
-    let made = Made {
-        rule: live.world.rule().to_owned(),
-        params: live.world.params().to_vec(),
-        size: live.world.size(),
-        sparse: live.world.pool().is_some(),
-        slots: live.world.pool().map(|bricks| bricks.capacity()),
-    };
-    shaped(host, live.rule.as_ref(), &made)
-        .map_or(budget::WORLD_LEAST, |(_, sizes)| budget::world_cost(&sizes))
+fn world_bytes(_: &Host, live: &Live<'_>) -> u64 {
+    budget::world_cost(live.world.sizes())
 }
 
 impl transport::Served for Server<'_> {

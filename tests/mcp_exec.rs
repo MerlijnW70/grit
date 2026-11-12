@@ -2063,3 +2063,91 @@ fn a_kept_number_out_of_range_or_past_next_is_ignored_by_name() {
         assert_eq!(opened.int_at("frame"), 2);
     }
 }
+
+fn read_meter(server: &mut Server<'_>) -> (i64, i64) {
+    let told = described(server).get("submissions").cloned().unwrap();
+    (told.int_at("read_waits"), told.int_at("words_read"))
+}
+
+#[test]
+fn reading_one_cell_costs_the_same_device_waits_and_words_whatever_the_world_size() {
+    let Some(host) = device("one-cell read cost") else {
+        return;
+    };
+    let large = budgeted_side(&host);
+    let mut server = Server::new(Some(&host));
+    let mut costs = Vec::new();
+    for (sparse, side) in [(false, 16), (false, 128), (true, 32), (true, large)] {
+        let world = create(
+            &mut server,
+            &format!(
+                "{{\"wide\":{side},\"deep\":{side},\"tall\":{side},\"rule\":\"sand\",\"sparse\":{sparse}}}"
+            ),
+        );
+        let last = side - 1;
+        answer(&call(
+            &mut server,
+            "grit_world_write",
+            &format!("{{\"world\":{world},\"cells\":[[1,1,1,7],[{last},{last},{last},9]]}}"),
+        ));
+        for (at, want) in [([1, 1, 1], 7), ([last, last, last], 9), ([2, 3, 4], 0)] {
+            let before = read_meter(&mut server);
+            let got = answer(&call(
+                &mut server,
+                "grit_world_read",
+                &format!(
+                    "{{\"world\":{world},\"from\":[{},{},{}],\"to\":[{},{},{}]}}",
+                    at[0], at[1], at[2], at[0], at[1], at[2]
+                ),
+            ));
+            let after = read_meter(&mut server);
+            assert_eq!(numbers(&got, "cells"), [want]);
+            let cost = (after.0 - before.0, after.1 - before.1);
+            eprintln!(
+                "sparse {sparse} side {side} cell {at:?}: {} waits, {} words",
+                cost.0, cost.1
+            );
+            assert!(cost.0 >= 1 && cost.0 <= 2, "{cost:?}");
+            assert!(
+                cost.1 >= 1,
+                "the read did not go through the targeted reader: {cost:?}"
+            );
+            costs.push((sparse, at == [1, 1, 1] || at == [2, 3, 4], cost));
+        }
+        if side <= 256 {
+            let before = read_meter(&mut server);
+            answer(&call(
+                &mut server,
+                "grit_world_slice",
+                &format!(
+                    "{{\"world\":{world},\"axis\":\"z\",\"at\":{last},\"cursor\":{}}}",
+                    last.saturating_sub(1)
+                ),
+            ));
+            let after = read_meter(&mut server);
+            assert!(
+                after.0 - before.0 <= 2,
+                "slice: {} waits",
+                after.0 - before.0
+            );
+        }
+        answer(&call(
+            &mut server,
+            "grit_world_close",
+            &format!("{{\"world\":{world}}}"),
+        ));
+    }
+    for sparse in [false, true] {
+        let words: Vec<i64> = costs
+            .iter()
+            .filter(|(kind, _, _)| *kind == sparse)
+            .map(|(_, _, cost)| cost.1)
+            .collect();
+        let most = words.iter().copied().max().unwrap();
+        let least = words.iter().copied().min().unwrap();
+        assert!(
+            most <= least.max(1) * 4,
+            "sparse {sparse}: words read for one cell range from {least} to {most}"
+        );
+    }
+}
