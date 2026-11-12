@@ -1119,3 +1119,159 @@ fn the_law_kernels_equal_their_cpu_replay_on_the_device() {
         on_device(&host, "heat law", &heat, &Heat, &params, heat_cell);
     }
 }
+
+const FOLDED: [u32; 16] = [
+    0,
+    1,
+    2,
+    3,
+    7,
+    31,
+    32,
+    33,
+    0x7F,
+    0x80,
+    0xFF,
+    0xFF00,
+    0x0102_FF80,
+    123_456_789,
+    0x8000_0000,
+    u32::MAX,
+];
+
+fn first_word(step: &str) -> u32 {
+    let law = compiled(&template(&format!(
+        "[\"vec\",[\"put\",\"cells\",0,{step}],[\"vec\",0]]"
+    )));
+    law.step(Oct {
+        words: [0; CORNERS],
+        frame: 0,
+        at: [0; 3],
+        params: &[],
+    })
+    .out[0]
+}
+
+fn known(value: u32) -> String {
+    value.to_string()
+}
+
+fn unknown(value: u32) -> String {
+    format!("[\"add\",[\"at\",\"cells\",1],{value}]")
+}
+
+fn flag(value: u32, runtime: bool) -> String {
+    if runtime {
+        format!("[\"ne\",{},0]", unknown(value))
+    } else {
+        known(value)
+    }
+}
+
+#[test]
+fn a_folded_constant_means_what_the_runtime_operation_computes() {
+    let binary = [
+        "add", "sub", "mul", "div", "and", "or", "xor", "dot_s", "dot_u",
+    ];
+    let compares = ["eq", "ne", "lt", "le", "gt", "ge"];
+    let mut checked = 0;
+    for left in FOLDED {
+        for right in FOLDED {
+            for op in binary {
+                let folded = first_word(&format!("[\"{op}\",{left},{right}]"));
+                for (one, other) in [
+                    (unknown(left), known(right)),
+                    (known(left), unknown(right)),
+                    (unknown(left), unknown(right)),
+                ] {
+                    let ran = first_word(&format!("[\"{op}\",{one},{other}]"));
+                    assert_eq!(folded, ran, "{op} {left} {right}");
+                    checked += 1;
+                }
+            }
+            for op in compares {
+                let folded = first_word(&format!("[\"word\",[\"{op}\",{left},{right}]]"));
+                let ran = first_word(&format!("[\"word\",[\"{op}\",{},{right}]]", unknown(left)));
+                assert_eq!(folded, ran, "{op} {left} {right}");
+                checked += 1;
+            }
+            for op in ["both", "either"] {
+                let folded = first_word(&format!("[\"word\",[\"{op}\",{left},{right}]]"));
+                for (one, other) in [(true, false), (false, true), (true, true)] {
+                    let ran = first_word(&format!(
+                        "[\"word\",[\"{op}\",{},{}]]",
+                        flag(left, one),
+                        flag(right, other)
+                    ));
+                    assert_eq!(folded, ran, "{op} {left} {right}");
+                    checked += 1;
+                }
+            }
+            let folded = first_word(&format!("[\"sel\",{left},{right},{left}]"));
+            let ran = first_word(&format!("[\"sel\",{},{right},{left}]", flag(left, true)));
+            assert_eq!(folded, ran, "sel {left} {right}");
+            let folded = first_word(&format!("[\"count\",[\"vec\",{left},{right},{left}]]"));
+            let ran = first_word(&format!(
+                "[\"count\",[\"vec\",{},{right},{}]]",
+                flag(left, true),
+                flag(left, false)
+            ));
+            assert_eq!(folded, ran, "count {left} {right}");
+            checked += 2;
+        }
+        for op in ["shl", "shr"] {
+            for by in [0, 1, 4, 16, 31, 32, 33, 64] {
+                let folded = first_word(&format!("[\"{op}\",{left},{by}]"));
+                let ran = first_word(&format!("[\"{op}\",{},{by}]", unknown(left)));
+                assert_eq!(folded, ran, "{op} {left} {by}");
+                checked += 1;
+            }
+        }
+        for (op, runtime) in [("not", unknown(left)), ("denied", flag(left, true))] {
+            let wrap = |inner: String| {
+                if op == "denied" {
+                    format!("[\"word\",[\"denied\",{inner}]]")
+                } else {
+                    format!("[\"not\",{inner}]")
+                }
+            };
+            assert_eq!(
+                first_word(&wrap(known(left))),
+                first_word(&wrap(runtime)),
+                "{op} {left}"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            first_word(&format!("[\"word\",{left}]")),
+            first_word(&format!("[\"word\",{}]", flag(left, true))),
+            "word {left}"
+        );
+        checked += 1;
+    }
+    println!("{checked} folded expressions equal their runtime twins");
+}
+
+#[test]
+fn copying_a_vec_costs_work_for_every_item() {
+    let put = template(
+        "[\"vec\",\"cells\",[\"vec\",[\"at\",[\"fold\",\"v\",[\"range\",100000],\"i\",[\"range\",1000],[\"put\",\"v\",0,\"i\"]],0]]]",
+    );
+    let why = refused_at(&put, Code::Work, "$.step[2][1][1][5]");
+    assert_eq!(why.limit, Some(limits::WORK));
+    let doubled = template(
+        "[\"vec\",\"cells\",[\"vec\",[\"at\",[\"fold\",\"v\",[\"vec\",0],\"i\",[\"range\",22],[\"concat\",\"v\",\"v\"]],0]]]",
+    );
+    refused_at(&doubled, Code::Work, "$.step[2][1][1][5]");
+    for (name, body) in [
+        ("map", "[\"map\",\"x\",\"v\",\"x\"]"),
+        ("filter", "[\"filter\",\"x\",\"v\",1]"),
+        ("rev", "[\"rev\",\"v\"]"),
+    ] {
+        let copied = template(&format!(
+            "[\"vec\",\"cells\",[\"vec\",[\"at\",[\"fold\",\"v\",[\"range\",100000],\"i\",[\"range\",100],{body}],0]]]"
+        ));
+        let why = refusal(&copied);
+        assert_eq!(why.code, Code::Work, "{name}: {why}");
+    }
+}
