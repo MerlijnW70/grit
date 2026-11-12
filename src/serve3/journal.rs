@@ -12,6 +12,8 @@ use super::errors::{Code, Refusal, shown};
 
 pub const NAME_MOST: usize = 64;
 
+pub const NUMBER_MOST: u32 = 1 << 31;
+
 pub const SUFFIX: &str = ".grit";
 
 const KEPT: &str = "kept";
@@ -166,10 +168,25 @@ impl Ledger {
 
     #[must_use]
     pub fn due(&self, world_bytes: u64) -> bool {
+        self.over(Duration::ZERO, world_bytes)
+    }
+
+    #[must_use]
+    pub fn over(&self, extra: Duration, world_bytes: u64) -> bool {
         let bytes = usize::try_from(world_bytes)
             .unwrap_or(usize::MAX)
             .max(JOURNAL_LEAST);
-        self.bytes > bytes || self.replay > REPLAY_LEAST.max(self.snapping.saturating_mul(4))
+        self.bytes > bytes || self.replay.saturating_add(extra) > self.replay_most()
+    }
+
+    #[must_use]
+    pub fn replay_most(&self) -> Duration {
+        REPLAY_LEAST.max(self.snapping.saturating_mul(4))
+    }
+
+    #[must_use]
+    pub const fn replay(&self) -> Duration {
+        self.replay
     }
 
     pub fn rebase(&mut self, snap: Arc<Snap>, cost: Duration) {
@@ -283,6 +300,58 @@ pub fn tail_sum(path: &Path) -> io::Result<[u8; 32]> {
 pub struct Keep {
     root: PathBuf,
     kept: PathBuf,
+    lock: Option<Arc<File>>,
+}
+
+pub const LOCK: &str = "lock";
+
+#[cfg(unix)]
+fn locked(file: &File) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    unsafe extern "C" {
+        fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    const EXCLUSIVE: std::ffi::c_int = 2;
+    const WITHOUT_WAITING: std::ffi::c_int = 4;
+    let done = unsafe { flock(file.as_raw_fd(), EXCLUSIVE | WITHOUT_WAITING) };
+    if done == 0 {
+        return Ok(true);
+    }
+    let why = io::Error::last_os_error();
+    if why.kind() == io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(why)
+    }
+}
+
+#[cfg(unix)]
+fn lock_file(path: &Path) -> io::Result<Option<File>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    Ok(locked(&file)?.then_some(file))
+}
+
+#[cfg(windows)]
+fn lock_file(path: &Path) -> io::Result<Option<File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const SHARING_VIOLATION: i32 = 32;
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(why) if why.raw_os_error() == Some(SHARING_VIOLATION) => Ok(None),
+        Err(why) => Err(why),
+    }
 }
 
 impl Keep {
@@ -294,7 +363,30 @@ impl Keep {
         if fs::symlink_metadata(&kept)?.file_type().is_symlink() {
             return Err(io::Error::other("the kept directory is a link"));
         }
-        Ok(Self { root, kept })
+        Ok(Self {
+            root,
+            kept,
+            lock: None,
+        })
+    }
+
+    pub fn locked(dir: &Path) -> io::Result<Self> {
+        let mut keep = Self::at(dir)?;
+        let path = keep.kept.join(LOCK);
+        match lock_file(&path)? {
+            Some(file) => {
+                keep.lock = Some(Arc::new(file));
+                Ok(keep)
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "another grit server holds the directory {}: its lock {} is taken; give this server a directory of its own",
+                    keep.root.display(),
+                    path.display()
+                ),
+            )),
+        }
     }
 
     #[must_use]
@@ -420,11 +512,24 @@ impl Keep {
 
     #[must_use]
     pub fn next(&self) -> u32 {
-        fs::read_to_string(self.kept.join(NEXT))
-            .ok()
-            .and_then(|held| held.trim().parse::<u32>().ok())
-            .unwrap_or(1)
-            .max(1)
+        self.next_checked().0.unwrap_or(1)
+    }
+
+    #[must_use]
+    pub fn next_checked(&self) -> (Option<u32>, Option<String>) {
+        let Ok(held) = fs::read_to_string(self.kept.join(NEXT)) else {
+            return (None, None);
+        };
+        match held.trim().parse::<u32>() {
+            Ok(next) if (1..=NUMBER_MOST).contains(&next) => (Some(next), None),
+            _ => (
+                None,
+                Some(format!(
+                    "kept/{NEXT}: {} is not a world number from 1 to {NUMBER_MOST}, so it was ignored",
+                    shown(&format!("{:?}", held.trim()))
+                )),
+            ),
+        }
     }
 
     pub fn set_next(&self, next: u32) -> io::Result<()> {
@@ -435,8 +540,14 @@ impl Keep {
 
     #[must_use]
     pub fn earlier(&self) -> Vec<(u32, Ledger)> {
+        self.scan().0
+    }
+
+    #[must_use]
+    pub fn scan(&self) -> (Vec<(u32, Ledger)>, Vec<String>) {
+        let mut ignored = Vec::new();
         let Ok(entries) = fs::read_dir(&self.kept) else {
-            return Vec::new();
+            return (Vec::new(), ignored);
         };
         let mut found = Vec::new();
         for entry in entries.flatten() {
@@ -448,24 +559,34 @@ impl Keep {
             else {
                 continue;
             };
-            let Some(number) = stem.parse::<u32>().ok() else {
+            let named = format!("kept/{}", shown(&file.to_string_lossy()));
+            let number = stem
+                .parse::<u32>()
+                .ok()
+                .filter(|number| (1..=NUMBER_MOST).contains(number) && number.to_string() == stem);
+            let Some(number) = number else {
+                ignored.push(format!(
+                    "{named}: not a world number from 1 to {NUMBER_MOST}, so it was ignored"
+                ));
                 continue;
             };
-            if number == 0 || number.to_string() != stem {
-                continue;
-            }
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
             if !kind.is_file() {
+                ignored.push(format!("{named}: not a file, so it was ignored"));
                 continue;
             }
-            if let Some(ledger) = self.read_journal(number) {
-                found.push((number, ledger));
+            match self.read_journal(number) {
+                Some(ledger) => found.push((number, ledger)),
+                None => ignored.push(format!(
+                    "{named}: its first record is not a whole world, so it was ignored"
+                )),
             }
         }
         found.sort_by_key(|(number, _)| *number);
-        found
+        ignored.sort();
+        (found, ignored)
     }
 
     fn read_journal(&self, world: u32) -> Option<Ledger> {
@@ -734,6 +855,7 @@ pub fn rebuilt<'host>(
     host: &'host Host,
     ledger: &Ledger,
     keep: Option<&Keep>,
+    guard: &super::budget::Guard,
     mut stepping: impl FnMut(&mut World<'host>, u32) -> Result<(), super::Failed>,
 ) -> Result<World<'host>, super::Failed> {
     let mut world = match &ledger.base {
@@ -763,10 +885,30 @@ pub fn rebuilt<'host>(
             }
         },
     };
-    for entry in &ledger.entries {
+    let of = ledger.entries.len();
+    for (at, entry) in ledger.entries.iter().enumerate() {
+        let halted = |stop, frame| {
+            Box::new(super::budget::Halted {
+                stop,
+                entries: at,
+                of,
+                frame,
+                goal: ledger.frame,
+            }) as super::Failed
+        };
+        if let Some(stop) = guard.stop() {
+            return Err(halted(stop, world.frame()));
+        }
         match entry {
             Entry::Write(cells) => world.write(cells)?,
-            Entry::Step(frames) => stepping(&mut world, *frames)?,
+            Entry::Step(frames) => {
+                if let Err(why) = stepping(&mut world, *frames) {
+                    return Err(match why.downcast_ref::<super::budget::Cut>() {
+                        Some(cut) => halted(cut.0, world.frame()),
+                        None => why,
+                    });
+                }
+            }
         }
     }
     if world.frame() != ledger.frame {

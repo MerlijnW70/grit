@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::wire::{Json, map};
@@ -125,6 +127,85 @@ impl Clock {
         self.began.elapsed()
     }
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct Guard {
+    pub deadline: Option<Instant>,
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Guard {
+    #[must_use]
+    pub fn stop(&self) -> Option<Stop> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        {
+            return Some(Stop::Cancelled);
+        }
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            .then_some(Stop::Budget)
+    }
+
+    #[must_use]
+    pub fn left(&self) -> Duration {
+        self.deadline.map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cut(pub Stop);
+
+impl std::fmt::Display for Cut {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "the replay stopped on {}", self.0.name())
+    }
+}
+
+impl std::error::Error for Cut {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Halted {
+    pub stop: Stop,
+    pub entries: usize,
+    pub of: usize,
+    pub frame: u32,
+    pub goal: u32,
+}
+
+impl Halted {
+    #[must_use]
+    pub fn refusal(&self) -> Refusal {
+        let field = match self.stop {
+            Stop::Budget => "$.budget_ms",
+            Stop::Cancelled => "$",
+        };
+        Refusal::new(
+            self.stop.code(),
+            field,
+            format!(
+                "the world's journal was replayed through {} of its {} entries, to frame {} of {}, before the call stopped on {}; nothing was opened",
+                self.entries,
+                self.of,
+                self.frame,
+                self.goal,
+                self.stop.name()
+            ),
+        )
+    }
+}
+
+impl std::fmt::Display for Halted {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{}", self.refusal().message)
+    }
+}
+
+impl std::error::Error for Halted {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Short {
