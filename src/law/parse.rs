@@ -237,6 +237,8 @@ const KEYS: [&str; 9] = [
     "law", "name", "params", "channels", "halo", "tally", "consts", "defs", "step",
 ];
 
+const OPTIONAL: [&str; 1] = ["reversible"];
+
 const TALLY_KEYS: [&str; 2] = ["counts", "weighted"];
 
 fn is_op(name: &str) -> bool {
@@ -260,6 +262,7 @@ pub struct Program<'p> {
     pub channels: u32,
     pub halo: u32,
     pub tally: Tally,
+    pub reversible: bool,
     pub consts: Vec<(&'p str, u32)>,
     pub defs: Vec<Def<'p>>,
     pub named: HashMap<&'p str, usize>,
@@ -309,18 +312,20 @@ fn fields<'p>(
     json: &'p Json,
     path: &Path<'_>,
     keys: &[&str],
+    optional: &[&str],
 ) -> Result<&'p [(String, Json)], Refusal> {
     let Json::Map(fields) = json else {
         return Err(refused(Code::Shape, path, "an object", described(json)));
     };
     if let Some((name, _)) = fields
         .iter()
-        .find(|(name, _)| !keys.contains(&name.as_str()))
+        .find(|(name, _)| !keys.contains(&name.as_str()) && !optional.contains(&name.as_str()))
     {
+        let known: Vec<&str> = keys.iter().chain(optional).copied().collect();
         return Err(refused(
             Code::UnknownKey,
             &path.key(name),
-            format!("only the keys {}", keys.join(", ")),
+            format!("only the keys {}", known.join(", ")),
             format!("the key {}", wire::written(&Json::Text(clipped(name)))),
         ));
     }
@@ -337,11 +342,15 @@ fn fields<'p>(
     Ok(fields)
 }
 
-fn field<'p>(fields: &'p [(String, Json)], key: &str) -> &'p Json {
+fn fields_of<'p>(fields: &'p [(String, Json)], key: &str) -> Option<&'p Json> {
     fields
         .iter()
         .find(|(name, _)| name == key)
-        .map_or(&Json::Null, |(_, one)| one)
+        .map(|(_, one)| one)
+}
+
+fn field<'p>(fields: &'p [(String, Json)], key: &str) -> &'p Json {
+    fields_of(fields, key).unwrap_or(&Json::Null)
 }
 
 fn whole(
@@ -413,7 +422,7 @@ fn named<'p>(json: &'p Json, path: &Path<'_>, what: &str) -> Result<&'p str, Ref
 pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
     let root = Path::root();
     walked(json, &root, 0)?;
-    let top = fields(json, &root, &KEYS)?;
+    let top = fields(json, &root, &KEYS, &OPTIONAL)?;
     whole(
         field(top, "law"),
         &root.key("law"),
@@ -460,7 +469,7 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
         "a halo radius",
     )?;
     let tally_path = root.key("tally");
-    let tallied = fields(field(top, "tally"), &tally_path, &TALLY_KEYS)?;
+    let tallied = fields(field(top, "tally"), &tally_path, &TALLY_KEYS, &[])?;
     let counts = whole(
         field(tallied, "counts"),
         &tally_path.key("counts"),
@@ -476,6 +485,18 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
                 Code::Shape,
                 &tally_path.key("weighted"),
                 "true or false",
+                described(other),
+            ));
+        }
+    };
+    let reversible = match fields_of(top, "reversible") {
+        None => false,
+        Some(Json::Bool(true)) => true,
+        Some(other) => {
+            return Err(refused(
+                Code::Shape,
+                &root.key("reversible"),
+                "true, or no key for a law that is not reversible",
                 described(other),
             ));
         }
@@ -575,6 +596,7 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
             counts: usize::try_from(counts).unwrap_or(usize::MAX),
             weighted,
         },
+        reversible,
         consts,
         defs,
         named: by_name,
