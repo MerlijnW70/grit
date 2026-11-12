@@ -408,13 +408,21 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ),
         None => (rule.wired(width, grid, &plan)?, rule.sizes(&plan).to_vec()),
     };
-    let solid = Grid3::new(grid.wide, grid.deep, grid.tall).ok_or_else(|| {
-        refused(
+    if pool.is_none() && Grid3::new(grid.wide, grid.deep, grid.tall).is_none() {
+        return Err(refused(
             Code::Unfit,
             "$",
-            format!("a world of {wide} by {deep} by {tall} cells is not solid"),
-        )
-    })?;
+            format!(
+                "a dense world of {wide} by {deep} by {tall} cells is not solid; ask for a sparse one"
+            ),
+        ));
+    }
+    let solid = Grid3 {
+        wide: grid.wide,
+        deep: grid.deep,
+        tall: grid.tall,
+    };
+    let cells = u64::from(solid.wide) * u64::from(solid.deep) * u64::from(solid.tall);
     if pool.is_some() {
         host.limits().admits_on(&sizes, None, host.heap())?;
     }
@@ -467,7 +475,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             Json::List(params.iter().map(|one| counted(*one)).collect()),
         ),
         ("size", sized(world.size())),
-        ("cells", Json::Int(i64::try_from(solid.cells())?)),
+        ("cells", Json::Int(i64::try_from(cells)?)),
         ("frame", counted(world.frame)),
         ("listed", counted(listed)),
     ])?;

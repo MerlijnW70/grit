@@ -1315,3 +1315,46 @@ fn a_step_at_the_frame_cap_passes_the_schema_and_one_past_it_does_not() {
         ("malformed", "$.slots")
     );
 }
+
+#[test]
+fn a_sparse_world_past_four_billion_cells_opens_and_keeps_a_far_cell() {
+    let Some(host) = device("sparse past u32 cells") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let made = answer(&call(
+        &mut server,
+        "grit_world_create",
+        "{\"wide\":4096,\"deep\":256,\"tall\":4096,\"rule\":\"sand\",\"sparse\":true,\"slots\":64}",
+    ));
+    assert_eq!(made.get("cells"), Some(&Json::Int(1 << 32)));
+    let world = made.counted("world").unwrap();
+    answer(&call(
+        &mut server,
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":[[4095,255,4095,3],[0,0,0,2]]}}"),
+    ));
+    let got = answer(&call(
+        &mut server,
+        "grit_world_read",
+        &format!("{{\"world\":{world},\"from\":[4094,254,4094],\"to\":[4095,255,4095]}}"),
+    ));
+    let cells: Vec<i64> = got
+        .get("cells")
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .map(|one| one.int().unwrap())
+        .collect();
+    assert_eq!(cells, [0, 0, 0, 0, 0, 0, 0, 3]);
+    let told = refused(&call(
+        &mut server,
+        "grit_world_create",
+        "{\"wide\":4096,\"deep\":256,\"tall\":4096,\"rule\":\"sand\"}",
+    ));
+    assert!(
+        ["unfit", "too_big", "too_large"].contains(&told.code.as_str()),
+        "{}",
+        told.code
+    );
+}
