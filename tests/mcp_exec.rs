@@ -1741,14 +1741,23 @@ fn an_open_of_a_kept_world_stops_on_its_budget_and_its_cancel_and_opens_nothing(
         dir: Some(scratch.dir()),
         memory: None,
     });
+    let built = Instant::now();
+    let probe = answer(&run.ask(
+        "grit_world_create",
+        "{\"wide\":8,\"deep\":8,\"tall\":8,\"rule\":\"sand\"}",
+    ))
+    .int_at("world");
+    let build = built.elapsed();
+    answer(&run.ask("grit_world_close", &format!("{{\"world\":{probe}}}")));
+    eprintln!("building the world itself takes {build:?}, one step no budget can cut");
     let began = Instant::now();
     let id = run.send(
         "grit_world_open",
         "{\"name\":\"world-1\",\"budget_ms\":300}",
     );
-    let Some(got) = run.within(id, Duration::from_millis(300 + 1000)) else {
+    let Some(got) = run.within(id, Duration::from_millis(300 + 1000) + build) else {
         std::mem::forget(run);
-        panic!("an open with budget_ms 300 had not answered after 1.3 s");
+        panic!("an open with budget_ms 300 had not answered after 1.3 s and {build:?}");
     };
     eprintln!("open stopped by its budget after {:?}", began.elapsed());
     let told = refused(&got);
@@ -1781,9 +1790,9 @@ fn an_open_of_a_kept_world_stops_on_its_budget_and_its_cancel_and_opens_nothing(
     assert!(asked.elapsed() < Duration::from_millis(500));
     let cancelled = Instant::now();
     run.cancel(id);
-    let Some(got) = run.within(id, Duration::from_millis(1000)) else {
+    let Some(got) = run.within(id, Duration::from_millis(1000) + build) else {
         std::mem::forget(run);
-        panic!("a cancelled open had not answered after 1 s");
+        panic!("a cancelled open had not answered after 1 s and {build:?}");
     };
     eprintln!("open stopped by its cancel after {:?}", cancelled.elapsed());
     let told = refused(&got);
