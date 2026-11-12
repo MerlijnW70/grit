@@ -1847,8 +1847,12 @@ fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error:
     let mut probing: Vec<(u32, u32)> = Vec::new();
     let mut probed = 0_u32;
     let mut probing_from = None;
+    let mut probe = false;
     for _ in 0..rounds {
         seen.insert((turning, swing));
+        if probe {
+            probed += 1;
+        }
         board.tune(turning, swing)?;
         // Forward once to see where it lands, then again inside carry, which
         // cannot know the residual before the grid has been walked.
@@ -1910,7 +1914,7 @@ fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error:
                 moved(best_turning, best_down, step, ceiling, against),
                 moved(best_swing, best_swung, step, ceiling, against),
             );
-            if candidate != home {
+            if candidate != home && !seen.contains(&candidate) {
                 break Some(candidate);
             }
             if !against {
@@ -1925,9 +1929,7 @@ fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error:
         };
         match next {
             Some(one) => {
-                if probing_from == Some(home) {
-                    probed += 1;
-                }
+                probe = probing_from == Some(home);
                 (turning, swing) = one;
             }
             None => {
