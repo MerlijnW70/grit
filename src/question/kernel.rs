@@ -7,7 +7,7 @@ use crate::bricks::{ENTRY, UNIFORM};
 use crate::live::{lane_if, state_load};
 use crate::ops::Device;
 
-use super::reduce::{COUNTER, RESULT};
+use super::reduce::{COPIES, COUNTER, RESULT};
 use super::{Layout, Map, Measure, Reduce, Region, Seen};
 
 pub const FROM: usize = 0;
@@ -299,6 +299,7 @@ struct Given {
     to: [Id; 3],
     sides: [Id; 3],
     bins: u32,
+    copy: Id,
 }
 
 fn accumulators(reduce: Reduce) -> usize {
@@ -503,7 +504,7 @@ fn binned<const L: u32>(
         let flush = e.and(moving, held)?;
         let two = e.k(2)?;
         let doubled = e.mul(cur, two)?;
-        let base = e.k(RESULT as u32)?;
+        let base = e.v(given.copy)?;
         let at = e.add(base, doubled)?;
         let next = e.sel(moving, bin, cur)?;
         let grown = e.wide_add(run, weight)?;
@@ -1120,7 +1121,7 @@ fn finished<const L: u32>(
                 let held = e.ne(either, none)?;
                 let two = e.k(2)?;
                 let doubled = e.mul(cur, two)?;
-                let base = e.k(RESULT as u32)?;
+                let base = e.v(given.copy)?;
                 (e.truth(held)?, e.add(base, doubled)?, run)
             };
             lane_if(kernel, flush, |kernel| {
@@ -1184,16 +1185,28 @@ fn emitted<const L: u32, M: Map>(map: &M, shape: &Shape) -> Result<Vec<u32>, Lan
         first: [pick(FIRST), pick(FIRST + 1), pick(FIRST + 2)],
         span: [pick(SPAN), pick(SPAN + 1), pick(SPAN + 2)],
     };
+    let bins = match shape.reduce {
+        Reduce::Histogram { bins } => bins,
+        _ => 0,
+    };
+    let copy = {
+        let mut lanes = kernel.lanes()?;
+        let mut e = E::<L>(&mut lanes);
+        let group = e.v(group)?;
+        let which = e.masked(group, COPIES as u32 - 1)?;
+        let stride = e.k(2 * (bins + 1))?;
+        let offset = e.mul(which, stride)?;
+        let base = e.k(RESULT as u32)?;
+        e.add(base, offset)?.id()
+    };
     let given = Given {
         shape: *shape,
         lane,
         from: [pick(FROM), pick(FROM + 1), pick(FROM + 2)],
         to: [pick(TO), pick(TO + 1), pick(TO + 2)],
         sides: [pick(SIDES), pick(SIDES + 1), pick(SIDES + 2)],
-        bins: match shape.reduce {
-            Reduce::Histogram { bins } => bins,
-            _ => 0,
-        },
+        bins,
+        copy,
     };
     let state = start(&mut kernel, shape)?;
     let state = looped(&mut kernel, params.per, &state, |kernel, carried, step| {

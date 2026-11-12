@@ -4,6 +4,8 @@ pub const RESULT: usize = 24;
 
 pub const COUNTER: usize = 4;
 
+pub const COPIES: usize = 128;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Measure {
     Count,
@@ -69,7 +71,7 @@ impl Reduce {
         match self {
             Self::Count | Self::Sum | Self::Differ(_) => 2,
             Self::Min | Self::Max => 1,
-            Self::Histogram { bins } => 2 * (bins as usize + 1),
+            Self::Histogram { bins } => 2 * (bins as usize + 1) * COPIES,
             Self::Moments => 8,
         }
     }
@@ -116,9 +118,14 @@ impl Reduce {
             Self::Max => Answer::Max(result.first().copied().unwrap_or(0)),
             Self::Histogram { bins } => {
                 let bins = bins as usize;
+                let total = |bin: usize| {
+                    (0..COPIES)
+                        .map(|copy| wide(result, copy * (bins + 1) + bin))
+                        .fold(0_u64, u64::wrapping_add)
+                };
                 Answer::Histogram {
-                    bins: (0..bins).map(|bin| wide(result, bin)).collect(),
-                    past: wide(result, bins),
+                    bins: (0..bins).map(total).collect(),
+                    past: total(bins),
                 }
             }
             Self::Moments => Answer::Moments {
