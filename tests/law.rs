@@ -1295,3 +1295,31 @@ fn a_name_is_found_without_scanning_every_binding_before_it() {
     );
     assert!(took.as_secs() < 3, "{took:?}");
 }
+
+#[test]
+fn a_name_of_the_most_bytes_compiles_and_one_byte_more_is_refused() {
+    let named = |name: &str| edited(SAND, |json| set(field(json, "consts"), name, Json::Int(1)));
+    let most = "N".repeat(limits::NAME);
+    assert_eq!(compiled(&named(&most)).name(), "sand");
+    let past = "N".repeat(limits::NAME + 1);
+    let why = refused_at(
+        &named(&past),
+        Code::Name,
+        &format!("$.consts[\"{}...\"]", "N".repeat(limits::SHOWN)),
+    );
+    assert_eq!(why.limit, Some(limits::NAME as u64));
+    let long = "n".repeat(100_000);
+    let read = template(&format!(
+        "[\"let\",[[\"{long}\",0]],[\"vec\",\"cells\",[\"vec\",[\"fold\",\"a\",0,\"i\",[\"range\",450000],\"{long}\"]]]]"
+    ));
+    refused_at(&read, Code::Name, "$.step[1][0][0]");
+    let called = template(&format!("[\"vec\",\"cells\",[\"vec\",[\"{long}\",0]]]"));
+    refused_at(&called, Code::Name, "$.step[2][1][0]");
+    let unknown = edited(SAND, |json| set(json, &long, Json::Int(1)));
+    let why = refused_at(
+        &unknown,
+        Code::UnknownKey,
+        &format!("$[\"{}...\"]", "n".repeat(limits::SHOWN)),
+    );
+    assert!(why.found.len() < 100, "{}", why.found.len());
+}

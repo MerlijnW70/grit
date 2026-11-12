@@ -60,13 +60,13 @@ impl<'a> Path<'a> {
         for step in steps.into_iter().rev() {
             match step {
                 Step::Root => {}
-                Step::Key(key) if plain(key) => {
+                Step::Key(key) if plain(key) && key.len() <= limits::NAME => {
                     out.push('.');
                     out.push_str(key);
                 }
                 Step::Key(key) => {
                     out.push('[');
-                    out.push_str(&wire::written(&Json::Text(key.to_owned())));
+                    out.push_str(&wire::written(&Json::Text(clipped(key))));
                     out.push(']');
                 }
                 Step::Index(index) => {
@@ -390,9 +390,22 @@ fn literal(json: &Json, path: &Path<'_>) -> Result<u32, Refusal> {
     }
 }
 
+fn short(name: &str, path: &Path<'_>) -> Result<(), Refusal> {
+    if name.len() > limits::NAME {
+        return Err(limited(
+            Code::Name,
+            path,
+            format!("a name of at most {} bytes", limits::NAME),
+            format!("{} bytes", name.len()),
+            limits::NAME as u64,
+        ));
+    }
+    Ok(())
+}
+
 fn named<'p>(json: &'p Json, path: &Path<'_>, what: &str) -> Result<&'p str, Refusal> {
     match json {
-        Json::Text(held) => Ok(held),
+        Json::Text(held) => short(held, path).map(|()| held.as_str()),
         other => Err(refused(Code::Shape, path, what, described(other))),
     }
 }
@@ -479,6 +492,7 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
     let mut consts = Vec::with_capacity(const_fields.len());
     for (key, value) in const_fields {
         let here = consts_path.key(key);
+        short(key, &here)?;
         if INPUTS.contains(&key.as_str()) {
             return Err(refused(
                 Code::Reserved,
@@ -502,6 +516,7 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
     let mut by_name = HashMap::with_capacity(def_fields.len());
     for (key, value) in def_fields {
         let here = defs_path.key(key);
+        short(key, &here)?;
         if is_op(key) {
             return Err(refused(
                 Code::Reserved,
@@ -629,6 +644,7 @@ impl<'p> Checking<'_, 'p> {
         match json {
             Json::Int(_) => literal(json, path).map(|_| ()),
             Json::Text(name) => {
+                short(name, path)?;
                 if self.bound.get(name.as_str()).is_some_and(|&many| many > 0)
                     || self.globals.contains(name.as_str())
                 {
@@ -669,6 +685,7 @@ impl<'p> Checking<'_, 'p> {
                 described(head),
             ));
         };
+        short(op, &path.index(0))?;
         if op == "look" {
             return Err(refused(
                 Code::Unsupported,

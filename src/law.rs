@@ -33,6 +33,7 @@ pub enum Code {
     Nodes,
     Work,
     Depth,
+    Name,
     Literal,
     Reserved,
     UnknownName,
@@ -46,7 +47,7 @@ pub enum Code {
 }
 
 impl Code {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Json,
         Self::Size,
         Self::Trailing,
@@ -62,6 +63,7 @@ impl Code {
         Self::Nodes,
         Self::Work,
         Self::Depth,
+        Self::Name,
         Self::Literal,
         Self::Reserved,
         Self::UnknownName,
@@ -92,6 +94,7 @@ impl Code {
             Self::Nodes => "nodes",
             Self::Work => "work",
             Self::Depth => "depth",
+            Self::Name => "name",
             Self::Literal => "literal",
             Self::Reserved => "reserved",
             Self::UnknownName => "unknown_name",

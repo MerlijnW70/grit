@@ -18,9 +18,11 @@ pub const WORK: u64 = 1_000_000;
 
 pub const DEPTH: usize = 128;
 
+pub const NAME: usize = 64;
+
 pub const SHOWN: usize = 64;
 
-pub const ALL: [(&str, u64); 8] = [
+pub const ALL: [(&str, u64); 9] = [
     ("body_bytes", BODY as u64),
     ("nodes", NODES as u64),
     ("params", PARAMS as u64),
@@ -29,4 +31,5 @@ pub const ALL: [(&str, u64); 8] = [
     ("halo", HALO as u64),
     ("work", WORK),
     ("depth", DEPTH as u64),
+    ("name_bytes", NAME as u64),
 ];
