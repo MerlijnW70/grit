@@ -25,6 +25,8 @@ pub const WORK: u64 = 1 << 20;
 
 pub const RUNGS: usize = 64;
 
+pub const SEEDING: u32 = 0x1234_5678;
+
 pub struct Found {
     pub marks: u32,
     pub full: u32,
@@ -54,8 +56,28 @@ fn columns(exam: &Exam) -> Vec<u32> {
     held
 }
 
+#[must_use]
+pub const fn mixed(held: u32) -> u32 {
+    let held = (held ^ (held >> 16)).wrapping_mul(0x85eb_ca6b);
+    let held = (held ^ (held >> 13)).wrapping_mul(0xc2b2_ae35);
+    held ^ (held >> 16)
+}
+
+#[must_use]
+pub const fn restarted(seed: u32, restart: u32) -> u32 {
+    if restart == 0 {
+        seed
+    } else {
+        mixed(seed ^ mixed(restart.wrapping_mul(0x9e37_79b9)))
+    }
+}
+
+const fn salt(seed: u32) -> u32 {
+    mixed(seed) ^ mixed(SEEDING)
+}
+
 fn crowd_of(shape: Netlist, seed: u32, many: u32) -> Vec<u32> {
-    let mut state = seed | 1;
+    let mut state = (SEEDING ^ salt(seed)) | 1;
     (0..many)
         .flat_map(|_| {
             (0..shape.gates)
@@ -72,9 +94,21 @@ fn crowd_of(shape: Netlist, seed: u32, many: u32) -> Vec<u32> {
 
 #[must_use]
 pub fn seeded(many: u32) -> Vec<u32> {
+    seeded_by(many, SEEDING)
+}
+
+#[must_use]
+pub fn seeded_by(many: u32, seed: u32) -> Vec<u32> {
+    let salt = salt(seed);
     (0..many)
-        .map(|who| who.wrapping_mul(2_654_435_761) | 1)
+        .map(|who| (who.wrapping_mul(2_654_435_761) ^ salt) | 1)
         .collect()
+}
+
+#[must_use]
+pub fn opening(shape: Netlist, seed: u32, restart: u32, many: u32) -> (Vec<u32>, Vec<u32>) {
+    let seed = restarted(seed, restart);
+    (crowd_of(shape, seed, many), seeded_by(many, seed))
 }
 
 fn times(parts: &[u32]) -> Result<usize, Box<dyn std::error::Error>> {
@@ -161,6 +195,8 @@ pub fn sought(
     exam: &Exam,
     many: u32,
     rounds: u32,
+    seed: u32,
+    restart: u32,
 ) -> Result<Found, Box<dyn std::error::Error>> {
     let width = host.width();
     let many = whole(many, width);
@@ -171,13 +207,13 @@ pub fn sought(
     let sizes = room(shape, many)?;
     let mut resident = host.resident(&sizes, &modules)?;
 
-    resident.write(HELD as usize, &crowd_of(shape, 0x1234_5678, many))?;
+    let (crowd, seeds) = opening(shape, seed, restart, many);
+    resident.write(HELD as usize, &crowd)?;
     for binding in [TRIAL, VALUES, SCORE, BEST] {
         let held = sizes.get(binding as usize).copied().unwrap_or(0);
         resident.write(binding as usize, &vec![0_u32; held])?;
     }
     resident.write(WANTED as usize, &columns(exam))?;
-    let seeds = seeded(many);
     resident.write(SEED as usize, &seeds)?;
 
     let over = Groups::Fixed(many.div_ceil(width));
@@ -220,14 +256,17 @@ pub fn pressed(
     exam: &Exam,
     many: u32,
     rounds: u32,
+    seed: u32,
 ) -> Result<Found, Box<dyn std::error::Error>> {
     let mut crowd = many;
+    let mut restart = 0_u32;
     loop {
-        let found = sought(host, shape, exam, crowd, rounds)?;
+        let found = sought(host, shape, exam, crowd, rounds, seed, restart)?;
         if found.marks >= found.full || crowd >= CROWD {
             return Ok(found);
         }
         crowd = crowd.saturating_mul(2).min(CROWD);
+        restart += 1;
     }
 }
 
@@ -244,6 +283,7 @@ pub fn least(
     table: &[u32],
     many: u32,
     rounds: u32,
+    seed: u32,
 ) -> Result<Vec<Rung>, Box<dyn std::error::Error>> {
     let mut rungs = Vec::new();
     let mut gates = shape.gates;
@@ -251,7 +291,7 @@ pub fn least(
     while gates >= shape.outputs.max(1) && missed < PATIENCE && rungs.len() < RUNGS {
         let narrowed = Netlist::over(shape.inputs, shape.outputs, gates, shape.kinds)?;
         let exam = Exam::of(narrowed, table.to_vec())?;
-        let found = pressed(host, narrowed, &exam, many, rounds)?;
+        let found = pressed(host, narrowed, &exam, many, rounds, seed)?;
         let solved = found.marks >= found.full;
         rungs.push(Rung { gates, found });
         if solved {
@@ -356,6 +396,8 @@ pub fn machined(
     traces: &[(Vec<u32>, Vec<u32>)],
     many: u32,
     rounds: u32,
+    seed: u32,
+    restart: u32,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
     let shape = held.shape()?;
     let width = host.width();
@@ -379,7 +421,8 @@ pub fn machined(
         feed.len().max(1),
     ];
     let mut resident = host.resident(&sizes, &modules)?;
-    resident.write(HELD as usize, &crowd_of(shape, 0x1234_5678, many))?;
+    let (crowd, seeds) = opening(shape, seed, restart, many);
+    resident.write(HELD as usize, &crowd)?;
     for binding in [TRIAL, VALUES, SCORE, BEST] {
         let room = sizes.get(binding as usize).copied().unwrap_or(0);
         resident.write(binding as usize, &vec![0_u32; room])?;
@@ -388,7 +431,6 @@ pub fn machined(
     if !feed.is_empty() {
         resident.write(FEED as usize, &feed)?;
     }
-    let seeds = seeded(many);
     resident.write(SEED as usize, &seeds)?;
 
     let over = Groups::Fixed(many.div_ceil(width));
@@ -430,14 +472,17 @@ pub fn pressed_machine(
     traces: &[(Vec<u32>, Vec<u32>)],
     many: u32,
     rounds: u32,
+    seed: u32,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
     let mut crowd = many;
+    let mut restart = 0_u32;
     loop {
-        let ran = machined(host, held, traces, crowd, rounds)?;
+        let ran = machined(host, held, traces, crowd, rounds, seed, restart)?;
         if ran.marks >= ran.full || crowd >= CROWD {
             return Ok(ran);
         }
         crowd = crowd.saturating_mul(2).min(CROWD);
+        restart += 1;
     }
 }
 
@@ -609,6 +654,8 @@ fn gate() -> Json {
     ])
 }
 
+const SEED_SAID: &str = "where the search starts, 305419896 when left out; the same seed and arguments give the same answer, and each time the search raises its own crowd it starts again from a fresh seed drawn from this one";
+
 pub(crate) fn tools() -> Json {
     let table = map(vec![
         ("type", text("array")),
@@ -633,6 +680,7 @@ pub(crate) fn tools() -> Json {
     let mut seeking = shape.clone();
     seeking.push(("crowd", counting("how many candidates to start the search with; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent")));
     seeking.push(("rounds", counting("how many generations to allow")));
+    seeking.push(("seed", counting(SEED_SAID)));
     let mut checking = shape;
     checking.push((
         "chip",
@@ -664,6 +712,7 @@ pub(crate) fn tools() -> Json {
         "rounds",
         counting("how many generations to allow at each rung"),
     ));
+    laddering.push(("seed", counting(SEED_SAID)));
     let trace = map(vec![
         ("type", text("array")),
         (
@@ -721,6 +770,7 @@ pub(crate) fn tools() -> Json {
             ),
         ),
         ("rounds", counting("how many generations to allow")),
+        ("seed", counting(SEED_SAID)),
         (
             "chip",
             map(vec![
@@ -1880,7 +1930,8 @@ pub(crate) fn ran(
             };
             let many = number(held, "crowd", CROWD)?.clamp(64, CROWD);
             let rounds = number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20);
-            pressed_machine(host, machine, &traces, many, rounds)?
+            let seed = number(held, "seed", SEEDING)?;
+            pressed_machine(host, machine, &traces, many, rounds, seed)?
         };
         return Ok(map(vec![
             ("solved", Json::Bool(told.marks >= told.full)),
@@ -1946,7 +1997,11 @@ pub(crate) fn ran(
             };
             let many = number(held, "crowd", CROWD)?.clamp(64, CROWD);
             let rounds = number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20);
-            Ok(told(&pressed(host, shape, &exam, many, rounds)?, true))
+            let seed = number(held, "seed", SEEDING)?;
+            Ok(told(
+                &pressed(host, shape, &exam, many, rounds, seed)?,
+                true,
+            ))
         }
         "grit_least" => {
             let Some(host) = host else {
@@ -1955,7 +2010,8 @@ pub(crate) fn ran(
             let many = number(held, "crowd", CROWD)?.clamp(64, CROWD);
             let rounds = number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20);
             let table: Vec<u32> = (0..shape.words()).map(|row| exam.asked(row)).collect();
-            let rungs = least(host, shape, &table, many, rounds)?;
+            let seed = number(held, "seed", SEEDING)?;
+            let rungs = least(host, shape, &table, many, rounds, seed)?;
             let smallest = rungs
                 .iter()
                 .filter(|rung| rung.found.marks >= rung.found.full)
