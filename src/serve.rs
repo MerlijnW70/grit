@@ -76,21 +76,44 @@ const fn salt(seed: u32) -> u32 {
     mixed(seed) ^ mixed(SEEDING)
 }
 
-const fn started(state: u32) -> u32 {
-    if state == 0 { 0x8000_0000 } else { state }
+pub const ASIDE: u32 = 0x9e37_79b9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rolls {
+    state: u32,
+    flip: u32,
+}
+
+impl Rolls {
+    #[must_use]
+    pub const fn from(start: u32) -> Self {
+        if start == 0 {
+            Self {
+                state: ASIDE,
+                flip: ASIDE,
+            }
+        } else {
+            Self {
+                state: start,
+                flip: 0,
+            }
+        }
+    }
+
+    pub const fn rolled(&mut self) -> u32 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 17;
+        self.state ^= self.state << 5;
+        self.state ^ self.flip
+    }
 }
 
 fn crowd_of(shape: Netlist, seed: u32, many: u32) -> Vec<u32> {
-    let mut state = started((SEEDING | 1) ^ salt(seed));
+    let mut rolls = Rolls::from((SEEDING | 1) ^ salt(seed));
     (0..many)
         .flat_map(|_| {
             (0..shape.gates)
-                .map(|at| {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    drawn(&shape, at, state).pack()
-                })
+                .map(|at| drawn(&shape, at, rolls.rolled()).pack())
                 .collect::<Vec<u32>>()
         })
         .collect()
@@ -105,7 +128,10 @@ pub fn seeded(many: u32) -> Vec<u32> {
 pub fn seeded_by(many: u32, seed: u32) -> Vec<u32> {
     let salt = salt(seed);
     (0..many)
-        .map(|who| (who.wrapping_mul(2_654_435_761) ^ salt) | 1)
+        .map(|who| match (who.wrapping_mul(2_654_435_761) | 1) ^ salt {
+            0 => mixed(salt) | 1,
+            one => one,
+        })
         .collect()
 }
 
@@ -221,13 +247,8 @@ impl Effort {
 
 #[must_use]
 pub fn shaken(shape: Netlist, held: &[u32], shake: u32, seed: u32) -> Vec<u32> {
-    let mut state = started(seed);
-    let mut roll = || {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        state
-    };
+    let mut rolls = Rolls::from(seed);
+    let mut roll = || rolls.rolled();
     let gates = shape.gates.max(1) as usize;
     let mut held = held.to_vec();
     for one in held.chunks_mut(gates) {
