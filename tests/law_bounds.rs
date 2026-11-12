@@ -499,3 +499,398 @@ fn every_operation_costs_bounded_time_per_unit_it_charges() {
         worst.0
     );
 }
+
+struct Gen {
+    state: u64,
+    ints: Vec<String>,
+    vecs: Vec<String>,
+    flags: Vec<String>,
+    fresh: u32,
+    defs: u32,
+}
+
+impl Gen {
+    fn next(&mut self) -> u64 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state
+    }
+
+    fn below(&mut self, most: u64) -> u64 {
+        if most == 0 { 0 } else { self.next() % most }
+    }
+
+    fn chance(&mut self, per_mille: u64) -> bool {
+        self.below(1000) < per_mille
+    }
+
+    fn size(&mut self) -> u64 {
+        let bits = if self.chance(20) {
+            12 + self.below(9)
+        } else {
+            self.below(9)
+        };
+        self.below(1 << bits) + 1
+    }
+
+    fn name(&mut self, stem: &str) -> String {
+        self.fresh += 1;
+        format!("{stem}{}", self.fresh)
+    }
+
+    fn pick(&mut self, from: &[String]) -> Option<String> {
+        if from.is_empty() {
+            return None;
+        }
+        let at = self.below(from.len() as u64) as usize;
+        Some(format!("\"{}\"", from[at]))
+    }
+
+    fn int(&mut self, depth: u32) -> String {
+        if depth == 0 || self.chance(250) {
+            return match self.below(3) {
+                0 => self.pick(&self.ints.clone()).unwrap_or_else(|| "7".into()),
+                1 => ["\"X\"", "\"Y\"", "\"Z\""][self.below(3) as usize].into(),
+                _ => self.size().to_string(),
+            };
+        }
+        let d = depth - 1;
+        match self.below(11) {
+            0 | 1 => {
+                let op =
+                    ["add", "sub", "mul", "and", "or", "xor", "shr", "div"][self.below(8) as usize];
+                format!("[\"{op}\",{},{}]", self.int(d), self.int(d))
+            }
+            2 => format!("[\"count\",{}]", self.flag_vec(d)),
+            3 => format!("[\"at\",{},0]", self.vec(d)),
+            4 => {
+                let acc = self.name("a");
+                let each = self.name("i");
+                let init = self.int(d);
+                let list = self.vec(d);
+                self.ints.push(acc.clone());
+                self.ints.push(each.clone());
+                let body = self.int(d);
+                self.ints.pop();
+                self.ints.pop();
+                format!("[\"fold\",\"{acc}\",{init},\"{each}\",{list},{body}]")
+            }
+            5 => format!("[\"if\",{},{},{}]", self.flag(d), self.int(d), self.int(d)),
+            6 => format!("[\"word\",{}]", self.flag(d)),
+            7 => format!("[\"sel\",{},{},{}]", self.flag(d), self.int(d), self.int(d)),
+            8 => self.call(d),
+            9 => {
+                let mut bindings = Vec::new();
+                let wide = self.size().min(400);
+                for _ in 0..wide {
+                    let name = self.name("b");
+                    bindings.push(format!("[\"{name}\",{}]", self.int(d.min(2))));
+                    self.ints.push(name);
+                }
+                let body = self.int(d);
+                for _ in 0..wide {
+                    self.ints.pop();
+                }
+                format!("[\"let\",[{}],{body}]", bindings.join(","))
+            }
+            _ => format!("[\"not\",{}]", self.int(d)),
+        }
+    }
+
+    fn flag(&mut self, depth: u32) -> String {
+        if depth == 0 || self.chance(200) {
+            return match self.pick(&self.flags.clone()) {
+                Some(name) if self.chance(500) => name,
+                _ => format!("[\"eq\",{},{}]", self.size(), self.size() % 3),
+            };
+        }
+        let d = depth - 1;
+        match self.below(5) {
+            0 => format!("[\"lt\",{},{}]", self.int(d), self.int(d)),
+            1 => format!("[\"both\",{},{}]", self.flag(d), self.flag(d)),
+            2 => format!("[\"either\",{},{}]", self.flag(d), self.flag(d)),
+            3 => format!("[\"denied\",{}]", self.flag(d)),
+            _ => format!("[\"ne\",{},[\"param\",0]]", self.int(d)),
+        }
+    }
+
+    fn flag_vec(&mut self, depth: u32) -> String {
+        let d = depth.saturating_sub(1);
+        let name = self.name("x");
+        let list = self.vec(d);
+        self.ints.push(name.clone());
+        let test = format!("[\"lt\",\"{name}\",{}]", self.int(d));
+        self.ints.pop();
+        format!("[\"map\",\"{name}\",{list},{test}]")
+    }
+
+    fn vec(&mut self, depth: u32) -> String {
+        if depth == 0 || self.chance(200) {
+            return match self.pick(&self.vecs.clone()) {
+                Some(name) if self.chance(500) => name,
+                _ => format!("[\"range\",{}]", self.size()),
+            };
+        }
+        let d = depth - 1;
+        match self.below(10) {
+            0 => format!("[\"range\",{}]", self.size()),
+            1 => {
+                let many = self.below(12);
+                let items: Vec<String> = (0..many).map(|_| self.int(d.min(1))).collect();
+                format!("[\"vec\",{}]", items.join(","))
+            }
+            2 => {
+                let name = self.name("x");
+                let list = self.vec(d);
+                self.ints.push(name.clone());
+                let body = self.int(d);
+                self.ints.pop();
+                format!("[\"map\",\"{name}\",{list},{body}]")
+            }
+            3 => {
+                let name = self.name("x");
+                let list = self.vec(d);
+                self.ints.push(name.clone());
+                let test = self.flag(d);
+                self.ints.pop();
+                format!("[\"filter\",\"{name}\",{list},{test}]")
+            }
+            4 => format!("[\"rev\",{}]", self.vec(d)),
+            5 => format!("[\"concat\",{},{}]", self.vec(d), self.vec(d)),
+            6 => format!("[\"put\",{},0,{}]", self.vec(d), self.int(d)),
+            7 => {
+                let acc = self.name("v");
+                let each = self.name("i");
+                let init = self.vec(d);
+                format!(
+                    "[\"fold\",\"{acc}\",{init},\"{each}\",[\"range\",{}],[\"concat\",\"{acc}\",\"{acc}\"]]",
+                    self.below(24)
+                )
+            }
+            8 => {
+                let acc = self.name("v");
+                let each = self.name("i");
+                let rounds = if self.chance(100) {
+                    self.size()
+                } else {
+                    self.below(80)
+                };
+                format!(
+                    "[\"at\",[\"fold\",\"{acc}\",[\"vec\"],\"{each}\",[\"range\",{rounds}],[\"vec\",\"{acc}\",\"{acc}\"]],0]"
+                )
+            }
+            _ => {
+                let acc = self.name("v");
+                let each = self.name("i");
+                let init = self.vec(d);
+                let list = self.vec(d);
+                self.vecs.push(acc.clone());
+                self.ints.push(each.clone());
+                let body = self.vec(d);
+                self.vecs.pop();
+                self.ints.pop();
+                format!("[\"fold\",\"{acc}\",{init},\"{each}\",{list},{body}]")
+            }
+        }
+    }
+
+    fn call(&mut self, depth: u32) -> String {
+        if self.defs == 0 {
+            return self.int(0);
+        }
+        let which = self.below(u64::from(self.defs));
+        format!("[\"d{which}\",{}]", self.int(depth))
+    }
+
+    fn deep(&mut self) -> String {
+        let levels = self.below(140);
+        let mut out = String::from("1");
+        for _ in 0..levels {
+            out = match self.below(3) {
+                0 => format!("[\"fold\",\"a\",{out},\"i\",[\"range\",2],[\"add\",\"a\",\"i\"]]"),
+                1 => format!("[\"not\",{out}]"),
+                _ => format!("[\"at\",[\"vec\",{out}],0]"),
+            };
+        }
+        out
+    }
+
+    fn program(&mut self) -> String {
+        self.ints.clear();
+        self.vecs.clear();
+        self.flags.clear();
+        self.fresh = 0;
+        self.defs = if self.chance(300) {
+            self.below(200) as u32
+        } else {
+            0
+        };
+        let mut defs = Vec::new();
+        let chained = self.chance(300);
+        for at in 0..self.defs {
+            let body = if at + 1 < self.defs && (chained || self.chance(700)) {
+                if !chained && self.chance(300) {
+                    format!(
+                        "[\"fold\",\"a\",\"x\",\"i\",[\"range\",{}],[\"d{}\",[\"add\",\"a\",\"i\"]]]",
+                        self.below(4),
+                        at + 1
+                    )
+                } else {
+                    format!("[\"d{}\",[\"add\",\"x\",{}]]", at + 1, self.below(9))
+                }
+            } else {
+                self.ints.push("x".into());
+                let saved = self.defs;
+                self.defs = 0;
+                let body = self.int(3);
+                self.defs = saved;
+                self.ints.pop();
+                body
+            };
+            defs.push(format!("\"d{at}\":[[\"x\"],{body}]"));
+        }
+        let mut bindings = Vec::new();
+        let wide = 1 + self.below(6);
+        for _ in 0..wide {
+            let name = self.name("t");
+            let depth = 1 + self.below(6) as u32;
+            match self.below(4) {
+                0 => {
+                    bindings.push(format!("[\"{name}\",{}]", self.vec(depth)));
+                    self.vecs.push(name);
+                }
+                1 => {
+                    bindings.push(format!("[\"{name}\",{}]", self.flag(depth)));
+                    self.flags.push(name);
+                }
+                2 if self.chance(150) => {
+                    bindings.push(format!("[\"{name}\",{}]", self.deep()));
+                    self.ints.push(name);
+                }
+                _ => {
+                    bindings.push(format!("[\"{name}\",{}]", self.int(depth)));
+                    self.ints.push(name);
+                }
+            }
+        }
+        let count = if chained && self.defs > 0 {
+            String::from("[\"d0\",1]")
+        } else {
+            self.int(2)
+        };
+        let out = if self.chance(100) {
+            String::from("[\"rev\",\"cells\"]")
+        } else {
+            String::from("\"cells\"")
+        };
+        let step = format!(
+            "[\"let\",[{}],[\"vec\",{out},[\"vec\",{count}]]]",
+            bindings.join(",")
+        );
+        law(1, &defs.join(","), &step)
+    }
+}
+
+const EXPENSIVE: u64 = 100_000;
+
+const WORKERS: u64 = 4;
+
+const CASE_MOST: Duration = Duration::from_secs(if cfg!(debug_assertions) { 10 } else { 1 });
+
+type Tally = (
+    std::collections::BTreeMap<&'static str, u64>,
+    u64,
+    (Duration, String),
+    Duration,
+    u64,
+);
+
+fn fuzzed(worker: u64) -> Tally {
+    let mut generator = Gen {
+        state: 0xC1F0_0000 + worker * 7919 + 1,
+        ints: Vec::new(),
+        vecs: Vec::new(),
+        flags: Vec::new(),
+        fresh: 0,
+        defs: 0,
+    };
+    let mut codes = std::collections::BTreeMap::new();
+    let mut laws = 0_u64;
+    let mut slowest = (Duration::ZERO, String::new());
+    let mut total = Duration::ZERO;
+    let mut heavy = 0_u64;
+    for _ in 0..EXPENSIVE / WORKERS {
+        let text = generator.program();
+        let (made, took) = timed(&text);
+        total += took;
+        if took > slowest.0 {
+            slowest = (took, text.clone());
+        }
+        match made {
+            Ok(law) => {
+                laws += 1;
+                if law.work() * 2 > limits::WORK || law.nodes() * 2 > limits::NODES {
+                    heavy += 1;
+                }
+            }
+            Err(why) => {
+                assert!(why.path.starts_with('$'), "{why}");
+                assert!(Code::ALL.contains(&why.code), "{why}");
+                if matches!(
+                    why.code,
+                    Code::Work | Code::Nodes | Code::ValueDepth | Code::Depth
+                ) {
+                    heavy += 1;
+                }
+                *codes.entry(why.code.name()).or_insert(0_u64) += 1;
+            }
+        }
+        assert!(took <= CASE_MOST, "{took:?} for {text}");
+    }
+    (codes, laws, slowest, total, heavy)
+}
+
+#[test]
+fn compile_is_bounded_on_a_seeded_fuzz_of_expensive_programs() {
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|worker| {
+            std::thread::Builder::new()
+                .stack_size(STACK)
+                .spawn(move || fuzzed(worker))
+                .unwrap()
+        })
+        .collect();
+    let mut codes = std::collections::BTreeMap::new();
+    let mut laws = 0;
+    let mut heavy = 0;
+    let mut slowest = (Duration::ZERO, String::new());
+    let mut total = Duration::ZERO;
+    for worker in workers {
+        let (some, made, slow, spent, weighty) = worker.join().unwrap();
+        for (code, many) in some {
+            *codes.entry(code).or_insert(0) += many;
+        }
+        laws += made;
+        heavy += weighty;
+        total += spent;
+        if slow.0 > slowest.0 {
+            slowest = slow;
+        }
+    }
+    println!(
+        "{EXPENSIVE} programs: {laws} laws, {heavy} at a cost limit or past half of one, refusals {codes:?}"
+    );
+    println!(
+        "compile time: mean {:.3} ms, slowest {:.1} ms ({} bytes), bound {} ms",
+        total.as_secs_f64() * 1e3 / EXPENSIVE as f64,
+        slowest.0.as_secs_f64() * 1e3,
+        slowest.1.len(),
+        CASE_MOST.as_millis()
+    );
+    assert!(laws * 10 > EXPENSIVE, "{laws}");
+    assert!(heavy * 50 > EXPENSIVE, "{heavy}");
+    for code in ["work", "nodes", "value_depth", "depth", "index"] {
+        assert!(codes.contains_key(code), "no {code} refusal: {codes:?}");
+    }
+}
