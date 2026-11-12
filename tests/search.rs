@@ -6,7 +6,7 @@ use common::device;
 
 use grit::marking::{BINDINGS, HELD, SEED, TRIAL, turned_on, words_of};
 use grit::netlist::{Gate, Netlist, drawn, turned};
-use grit::serve::{SEEDING, handle, opening};
+use grit::serve::{SEEDING, handle, mixed, opening};
 use grit::wire::{Json, read, written};
 use grit::{Groups, Host};
 
@@ -372,4 +372,38 @@ fn a_seed_gives_the_same_answer_twice_and_another_seed_another() {
     let one = asked(11);
     assert_eq!(one, asked(11), "a run is reproducible from its seed");
     assert_ne!(one, asked(12), "another seed searches other ground");
+}
+
+const fn unmixed(held: u32) -> u32 {
+    let held = held ^ (held >> 16);
+    let held = held.wrapping_mul(0x7ed1_b41d);
+    let held = held ^ (held >> 13) ^ (held >> 26);
+    let held = held.wrapping_mul(0xa5cb_9243);
+    held ^ (held >> 16)
+}
+
+#[test]
+fn seeds_whose_mix_differs_in_its_lowest_bit_open_their_own_crowds() {
+    let shape = shape();
+    for seed in [SEEDING, 1, 7, 12_345] {
+        let twin = unmixed(mixed(seed) ^ 1);
+        assert_eq!(mixed(twin), mixed(seed) ^ 1);
+        assert_ne!(
+            opening(shape, seed, 0, 256).0,
+            opening(shape, twin, 0, 256).0,
+            "seeds {seed} and {twin} open one crowd"
+        );
+    }
+    let gates = shape.gates as usize;
+    let empty = unmixed(mixed(SEEDING) ^ SEEDING ^ 1);
+    let (crowd, _) = opening(shape, empty, 0, 64);
+    assert!(
+        crowd
+            .chunks(gates)
+            .skip(1)
+            .any(|one| one != &crowd[..gates]),
+        "the seed whose crowd state would be zero still draws a crowd"
+    );
+    let high = unmixed(mixed(SEEDING) ^ SEEDING ^ 1 ^ 0x8000_0000);
+    assert_ne!(opening(shape, empty, 0, 64), opening(shape, high, 0, 64));
 }

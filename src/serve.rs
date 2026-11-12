@@ -76,8 +76,12 @@ const fn salt(seed: u32) -> u32 {
     mixed(seed) ^ mixed(SEEDING)
 }
 
+const fn started(state: u32) -> u32 {
+    if state == 0 { 0x8000_0000 } else { state }
+}
+
 fn crowd_of(shape: Netlist, seed: u32, many: u32) -> Vec<u32> {
-    let mut state = (SEEDING ^ salt(seed)) | 1;
+    let mut state = started((SEEDING | 1) ^ salt(seed));
     (0..many)
         .flat_map(|_| {
             (0..shape.gates)
@@ -217,7 +221,7 @@ impl Effort {
 
 #[must_use]
 pub fn shaken(shape: Netlist, held: &[u32], shake: u32, seed: u32) -> Vec<u32> {
-    let mut state = seed | 1;
+    let mut state = started(seed);
     let mut roll = || {
         state ^= state << 13;
         state ^= state >> 17;
