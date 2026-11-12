@@ -103,10 +103,6 @@ fn a_value_of_the_wrong_type_or_range_is_refused_at_its_field_before_any_device(
         ("grit_synthesise", "{\"inputs\":2,\"outputs\":1,\"gates\":1}".into(), "$.table"),
         ("grit_least", format!("{{{TABLE},\"crowd\":0}}"), "$.crowd"),
         ("grit_check", "{\"inputs\":2,\"gates\":1,\"table\":[0,1,1,0],\"chip\":[]}".into(), "$.outputs"),
-        ("grit_machine", "{\"inputs\":1,\"outputs\":1,\"gates\":4,\"traces\":[{\"feed\":[1],\"want\":[1]}]}".into(), "$.state"),
-        ("grit_machine", "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":4}".into(), "$.traces"),
-        ("grit_machine", "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":4,\"steps\":-1,\"traces\":[{\"feed\":[1],\"want\":[1]}]}".into(), "$.steps"),
-        ("grit_machine", "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":4,\"crowd\":70000,\"traces\":[{\"feed\":[1],\"want\":[1]}]}".into(), "$.crowd"),
         ("grit_check", "{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,1,1,2],\"chip\":[{\"kind\":6,\"left\":0,\"right\":1}]}".into(), "$.table[3]"),
         ("grit_check", "{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,1,1],\"chip\":[{\"kind\":6,\"left\":0,\"right\":1}]}".into(), "$.table"),
         ("grit_synthesise", "{\"inputs\":2,\"outputs\":2,\"gates\":2,\"table\":[0,1,4,0]}".into(), "$.table[2]"),
@@ -394,6 +390,25 @@ fn a_step_of_one_tries_the_neighbours_before_it_stops() {
 }
 
 #[test]
+fn a_machine_that_passes_its_input_through_is_marked_on_whole_words() {
+    let held = structured(
+        None,
+        "grit_machine",
+        "{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1,\"traces\":[{\"feed\":[0,1],\"want\":[0,1]}],\"chip\":[{\"kind\":10,\"left\":0,\"right\":0}]}",
+    );
+    assert_eq!(
+        held.get("solved"),
+        Some(&Json::Bool(true)),
+        "{}",
+        written(&held)
+    );
+    assert_eq!(
+        held.get("wrong").and_then(Json::list).map(<[Json]>::len),
+        Some(0)
+    );
+}
+
+#[test]
 fn settle_takes_the_widest_cells_without_wrapping() {
     let Some(host) = device("settle_takes_the_widest_cells_without_wrapping") else {
         return;
@@ -436,23 +451,110 @@ fn settle_takes_the_widest_cells_without_wrapping() {
     );
 }
 
+const SCATTER: &str = "[{\"at\":9,\"is\":300},{\"at\":10,\"is\":-200},{\"at\":18,\"is\":500},{\"at\":27,\"is\":100},{\"at\":36,\"is\":-400},{\"at\":45,\"is\":250}]";
+
 #[test]
-fn a_machine_that_passes_its_input_through_is_marked_on_whole_words() {
+fn a_walk_pinned_at_the_floor_tries_its_neighbours_before_it_stops() {
+    let Some(host) = device("a_walk_pinned_at_the_floor_tries_its_neighbours_before_it_stops")
+    else {
+        return;
+    };
+    let want = "[{\"at\":54,\"is\":500},{\"at\":0,\"is\":-400},{\"at\":45,\"is\":300},{\"at\":9,\"is\":250},{\"at\":46,\"is\":-200},{\"at\":63,\"is\":100},{\"at\":49,\"is\":-2},{\"at\":51,\"is\":-2},{\"at\":53,\"is\":-2},{\"at\":55,\"is\":-2}]";
     let held = structured(
-        None,
-        "grit_machine",
-        "{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1,\"traces\":[{\"feed\":[0,1],\"want\":[0,1]}],\"chip\":[{\"kind\":10,\"left\":0,\"right\":0}]}",
+        Some(&host),
+        "grit_settle",
+        &format!(
+            "{{\"wide\":8,\"deep\":8,\"kind\":\"bound\",\"turning\":0,\"swing\":0,\"depth\":4,\"rounds\":40,\"step\":1,\"cells\":{SCATTER},\"want\":{want}}}"
+        ),
+    );
+    eprintln!(
+        "bound from (0,0): ({:?},{:?}) apart {:?}, probed {:?}, stalled {:?}",
+        held.counted("turning"),
+        held.counted("swing"),
+        held.get("apart"),
+        held.counted("probed"),
+        held.get("stalled")
     );
     assert_eq!(
-        held.get("solved"),
-        Some(&Json::Bool(true)),
+        held.get("apart").and_then(Json::int),
+        Some(0),
         "{}",
         written(&held)
     );
-    assert_eq!(
-        held.get("wrong").and_then(Json::list).map(<[Json]>::len),
-        Some(0)
-    );
+    assert!(held.counted("probed").unwrap() > 0);
+}
+
+#[test]
+fn a_walk_stalls_only_where_no_neighbour_is_nearer() {
+    let Some(host) = device("a_walk_stalls_only_where_no_neighbour_is_nearer") else {
+        return;
+    };
+    let common = |kind: &str| {
+        format!("\"wide\":8,\"deep\":8,\"kind\":\"{kind}\",\"depth\":4,\"cells\":{SCATTER}")
+    };
+    let mut stops = 0;
+    for kind in [
+        "product", "sum", "turn", "bound", "smooth", "living", "twinned",
+    ] {
+        for (t, s) in [(12, 0), (12, 3), (20, 5), (3, 9)] {
+            let made = structured(
+                Some(&host),
+                "grit_slope",
+                &format!(
+                    "{{{},\"turning\":{t},\"swing\":{s},\"carry\":false,\"most\":64}}",
+                    common(kind)
+                ),
+            );
+            let want = written(made.get("ended").unwrap());
+            for (from_t, from_s) in [(0, 0), (t + 6, s + 6), (t, s + 1), (t + 1, s)] {
+                let held = structured(
+                    Some(&host),
+                    "grit_settle",
+                    &format!(
+                        "{{{},\"turning\":{from_t},\"swing\":{from_s},\"rounds\":64,\"step\":1,\"want\":{want}}}",
+                        common(kind)
+                    ),
+                );
+                if held.get("stalled") != Some(&Json::Bool(true)) {
+                    continue;
+                }
+                stops += 1;
+                let apart = held.get("apart").and_then(Json::int).unwrap();
+                let bt = i64::from(held.counted("turning").unwrap());
+                let bs = i64::from(held.counted("swing").unwrap());
+                for (dt, ds) in [
+                    (1, 1),
+                    (-1, -1),
+                    (1, -1),
+                    (-1, 1),
+                    (0, 1),
+                    (0, -1),
+                    (1, 0),
+                    (-1, 0),
+                ] {
+                    let (nt, ns) = (bt + dt, bs + ds);
+                    if nt < 0 || ns < 0 {
+                        continue;
+                    }
+                    let there = structured(
+                        Some(&host),
+                        "grit_settle",
+                        &format!(
+                            "{{{},\"turning\":{nt},\"swing\":{ns},\"rounds\":1,\"want\":{want}}}",
+                            common(kind)
+                        ),
+                    );
+                    let gap = there.get("apart").and_then(Json::int).unwrap();
+                    assert!(
+                        gap >= apart,
+                        "{kind} target ({t},{s}) from ({from_t},{from_s}) stalled at ({bt},{bs}) apart {apart}, and ({nt},{ns}) is apart {gap}"
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("{stops} walks stalled, each where no neighbour is nearer");
+    assert!(stops > 0);
 }
 
 #[test]

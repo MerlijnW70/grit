@@ -920,7 +920,7 @@ fn a_parameter_with_no_purchase_is_counted_rather_than_mistaken_for_an_answer() 
     // like having arrived, so it is said rather than left to look like success.
     // Measured: the distance is 1101 at turning 12, 20, 30 and 40, at swing 0,
     // 2, 3, 5 and 8, and at depth 6, 8 and 10. Nothing the walk can move moves
-    // it, so the first round has nowhere to step and the walk says it stalled.
+    // it, so it walks the neighbours of the start, finds none nearer and stalls.
     let start = "[{\"at\":528,\"is\":600},{\"at\":529,\"is\":500}]";
     let answer = structured(&call(
         Some(&host),
@@ -940,12 +940,23 @@ fn a_parameter_with_no_purchase_is_counted_rather_than_mistaken_for_an_answer() 
         "no grip is not arrival and must not read like it"
     );
     let trail = answer.get("trail").and_then(Json::list).unwrap();
-    assert_eq!(trail.len(), 1, "there was nowhere to step from the start");
-    assert_eq!(trail[0].counted("turning"), Some(20), "it never left");
+    assert_eq!(
+        trail.len(),
+        6,
+        "the slope gave nowhere to step, so the start and its five neighbours were walked"
+    );
+    assert!(
+        trail
+            .iter()
+            .all(|one| one.get("apart").and_then(Json::int) == Some(1101)),
+        "every neighbour is as far off as the start"
+    );
+    assert_eq!(answer.counted("turning"), Some(20), "it never left");
+    assert_eq!(answer.counted("probed"), Some(5));
     assert_eq!(
         answer.counted("unmoved"),
-        Some(0),
-        "one round holds no step between rounds to have stood still across"
+        Some(5),
+        "six rounds hold five steps between them and none of them moved the distance"
     );
 }
 

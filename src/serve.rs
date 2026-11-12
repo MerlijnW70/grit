@@ -1405,7 +1405,7 @@ pub(crate) fn tools() -> Json {
         ),
         tool(
             "grit_settle",
-            "Walk a grid forward, see how far it landed from the one you asked for, and move the two rule parameters downhill against that distance. The step is taken from the walk's own adjoint rather than from a guess: the weight carried back is the sign of the residual a cell at a time, so what comes back is the gradient of the distance with respect to the parameters. When both ways along the slope come out worse at a step of one, it tries every neighbour of its best point before it stops. Returns the trail it walked, the nearest it got, and the parameters that got it there. Distance is counted exactly on the host. A run that did not close means these parameters, at this step and this many rounds, did not get nearer - never that none would.",
+            "Walk a grid forward, see how far it landed from the one you asked for, and move the two rule parameters downhill against that distance. The step is taken from the walk's own adjoint rather than from a guess: the weight carried back is the sign of the residual a cell at a time, so what comes back is the gradient of the distance with respect to the parameters. Whenever the slope gives it no step left to take, it tries every neighbour of its best point at a step of one before it stops. Returns the trail it walked, the nearest it got, and the parameters that got it there. Distance is counted exactly on the host. A run that did not close means these parameters, at this step and this many rounds, did not get nearer - never that none would.",
             object(settling, &["want"]),
         ),
         tool(
@@ -1776,6 +1776,17 @@ fn under(held: &Json, knob: &Whole, ceiling: u32) -> Result<u32, Box<dyn std::er
     Ok(value)
 }
 
+fn untried(
+    (turning, swing): (u32, u32),
+    ceiling: u32,
+    seen: &std::collections::BTreeSet<(u32, u32)>,
+) -> Vec<(u32, u32)> {
+    beside(turning, swing, ceiling)
+        .into_iter()
+        .filter(|one| !seen.contains(one))
+        .collect()
+}
+
 fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
     let wide = SLOPE_WIDE.count(held, "$")?;
     let deep = SLOPE_DEEP.count(held, "$")?;
@@ -1842,72 +1853,68 @@ fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error:
         if before.is_some_and(|held| held == gap) {
             unmoved += 1;
         }
-        let here = (turning, swing, (down_turning, down_swing));
-        // Every branch below but the first reads `best`, and the first is the
-        // one that runs while it is still empty, so there is no arm here for a
-        // round that has nothing to go back to.
-        let (from_turning, from_swing, downhill) = match best {
-            None => {
+        let improved = match best {
+            Some((held, ..)) if gap >= held => false,
+            _ => {
                 best = Some((gap, turning, swing, down_turning, down_swing));
-                here
+                probing.clear();
+                probing_from = None;
+                true
             }
-            Some((held, held_turning, held_swing, held_down, held_swung)) => {
-                let there = (held_turning, held_swing, (held_down, held_swung));
-                if gap < held {
-                    best = Some((gap, turning, swing, down_turning, down_swing));
-                    probing.clear();
-                    probing_from = None;
-                    here
-                } else if probing_from == Some((held_turning, held_swing)) {
-                    match probing.pop() {
-                        Some(next) => {
-                            probed += 1;
-                            (turning, swing) = next;
-                            continue;
-                        }
-                        None => {
-                            step = 0;
-                            stalled = true;
-                            break;
-                        }
-                    }
-                } else if !against {
+        };
+        let Some((_, best_turning, best_swing, best_down, best_swung)) = best else {
+            break;
+        };
+        let home = (best_turning, best_swing);
+        let mut failed = !improved;
+        let next = loop {
+            if probing_from == Some(home) {
+                break probing.pop();
+            }
+            if failed {
+                failed = false;
+                if !against {
                     against = true;
                     turned_around += 1;
-                    there
                 } else if step > 1 {
                     against = false;
                     step /= 2;
-                    there
                 } else {
-                    probing = beside(held_turning, held_swing, ceiling)
-                        .into_iter()
-                        .filter(|one| !seen.contains(one))
-                        .collect();
-                    probing_from = Some((held_turning, held_swing));
-                    match probing.pop() {
-                        Some(next) => {
-                            probed += 1;
-                            (turning, swing) = next;
-                            continue;
-                        }
-                        None => {
-                            step = 0;
-                            stalled = true;
-                            break;
-                        }
-                    }
+                    probing = untried(home, ceiling, &seen);
+                    probing_from = Some(home);
+                    continue;
                 }
             }
+            let candidate = (
+                moved(best_turning, best_down, step, ceiling, against),
+                moved(best_swing, best_swung, step, ceiling, against),
+            );
+            if candidate != home {
+                break Some(candidate);
+            }
+            if !against {
+                against = true;
+            } else if step > 1 {
+                against = false;
+                step /= 2;
+            } else {
+                probing = untried(home, ceiling, &seen);
+                probing_from = Some(home);
+            }
         };
-        let moved_turning = moved(from_turning, downhill.0, step, ceiling, against);
-        let moved_swing = moved(from_swing, downhill.1, step, ceiling, against);
-        if moved_turning == from_turning && moved_swing == from_swing {
-            stalled = true;
-            break;
+        match next {
+            Some(one) => {
+                if probing_from == Some(home) {
+                    probed += 1;
+                }
+                (turning, swing) = one;
+            }
+            None => {
+                step = 0;
+                stalled = true;
+                break;
+            }
         }
-        turning = moved_turning;
-        swing = moved_swing;
     }
 
     let (gap, turning, swing, _, _) = best.ok_or("no round was walked")?;
