@@ -42,6 +42,10 @@ impl<W> Flag<W> {
     pub fn word(self) -> W {
         self.0
     }
+
+    pub(crate) const fn raised(word: W) -> Self {
+        Self(word)
+    }
 }
 
 /// The operations a rule's step is written in. See the module for what each
