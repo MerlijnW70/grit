@@ -503,6 +503,32 @@ fn a_budget_outside_its_range_is_refused_before_anything_runs() {
 }
 
 #[test]
+fn a_call_counts_its_budget_from_its_own_arrival() {
+    let (exec, answers) = Exec::spawn(Box::new(|| Ok(None)), &Options::default()).unwrap();
+    let flat = "{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,0,0,1],\"chip\":[{\"kind\":8,\"left\":0,\"right\":1}]}";
+    exec.line(&line(1, "grit_check", flat));
+    let got = answers.recv_timeout(WAIT).unwrap();
+    assert_eq!(got.get("id").and_then(Json::int), Some(1));
+    exec.line(&line(2, "grit_world_rules", "{}"));
+    let got = answers.recv_timeout(WAIT).unwrap();
+    assert_eq!(got.get("id").and_then(Json::int), Some(2));
+    std::thread::sleep(Duration::from_millis(300));
+    exec.line(&line(3, "grit_world_rules", "{\"budget_ms\":100}"));
+    let got = answers.recv_timeout(WAIT).unwrap();
+    assert_eq!(got.get("id").and_then(Json::int), Some(3));
+    let told = answer(&got);
+    assert!(told.get("rules").is_some(), "{}", written(&told));
+    exec.line(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":4}}",
+    );
+    exec.line(&line(4, "grit_world_rules", "{}"));
+    let got = answers.recv_timeout(WAIT).unwrap();
+    assert_eq!(got.get("id").and_then(Json::int), Some(4));
+    answer(&got);
+    exec.finish();
+}
+
+#[test]
 fn a_list_of_many_files_comes_in_pages_that_join_to_the_whole() {
     let scratch = Scratch::new("pages");
     let options = Options {

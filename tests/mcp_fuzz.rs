@@ -1548,6 +1548,7 @@ fn file_device_line(
                 "grit_world_restore",
                 "grit_world_list",
                 "grit_world_close",
+                "grit_world_close",
             ]);
             let budget = if rng.chance(20) {
                 ",\"budget_ms\":1"
@@ -1569,7 +1570,7 @@ fn file_device_line(
                     tool,
                     format!("{{\"world\":{world},\"from\":{from}{budget}}}"),
                 ),
-                "grit_world_close" if !rng.chance(6) => ("grit_world_list", "{}".to_owned()),
+                "grit_world_close" if open.len() <= 4 => ("grit_world_list", "{}".to_owned()),
                 "grit_world_list" => (tool, "{}".to_owned()),
                 _ => (tool, format!("{{\"world\":{world}{budget}}}")),
             };
