@@ -518,7 +518,8 @@ struct Copier<'d> {
     dag: &'d Dag,
     nodes: Vec<Node>,
     reaches: Vec<u8>,
-    lasting: HashMap<u32, u32>,
+    copies: HashMap<u32, (u32, [u32; CORNERS])>,
+    undone: [u32; CORNERS],
 }
 
 impl Copier<'_> {
@@ -528,32 +529,43 @@ impl Copier<'_> {
         id
     }
 
+    fn fresh(&self, id: u32) -> Option<u32> {
+        let &(copy, seen) = self.copies.get(&id)?;
+        let reached = at(&self.reaches, id);
+        let unchanged = (0..CORNERS)
+            .all(|word| reached & bit(word) == 0 || seen.get(word) == self.undone.get(word));
+        unchanged.then_some(copy)
+    }
+
+    fn remember(&mut self, id: u32, copy: u32) {
+        self.copies.insert(id, (copy, self.undone));
+    }
+
     fn copied(&mut self, root: u32, now: &HashMap<u32, u32>) -> u32 {
-        let mut made: HashMap<u32, u32> = HashMap::new();
         let mut stack = vec![(root, false)];
         while let Some((id, expanded)) = stack.pop() {
-            if made.contains_key(&id) {
+            if self.fresh(id).is_some() {
                 continue;
             }
-            if let Some(&held) = now.get(&id).or_else(|| self.lasting.get(&id)) {
-                made.insert(id, held);
+            if let Some(&held) = now.get(&id) {
+                self.remember(id, held);
                 continue;
             }
             let node = node_at(self.dag, id);
             if let Node::Input(_) = node {
-                made.insert(id, id);
+                self.remember(id, id);
                 continue;
             }
             if !expanded {
                 stack.push((id, true));
                 for one in operands(node).iter().flatten() {
-                    if !made.contains_key(one) {
+                    if self.fresh(*one).is_none() {
                         stack.push((*one, false));
                     }
                 }
                 continue;
             }
-            let moved = |one: u32| made.get(&one).copied().unwrap_or(one);
+            let moved = |one: u32| self.fresh(one).unwrap_or(one);
             let rebuilt = match node {
                 Node::Not(one) => Node::Not(moved(one)),
                 Node::Shl(one, by) => Node::Shl(moved(one), by),
@@ -579,12 +591,9 @@ impl Copier<'_> {
                 other => other,
             };
             let new = self.push(rebuilt);
-            if at(&self.reaches, id) == 0 {
-                self.lasting.insert(id, new);
-            }
-            made.insert(id, new);
+            self.remember(id, new);
         }
-        made.get(&root).copied().unwrap_or(root)
+        self.fresh(root).unwrap_or(root)
     }
 }
 
@@ -596,7 +605,8 @@ fn undone(dag: &Dag, steps: &[Lift]) -> Dag {
         dag,
         nodes: (0..inputs).map(Node::Input).collect(),
         reaches: masks(dag).reaches,
-        lasting: HashMap::new(),
+        copies: HashMap::new(),
+        undone: [0; CORNERS],
     };
     let mut current: [u32; CORNERS] = core::array::from_fn(word_of);
     let mut holding: [u32; CORNERS] = *dag.out();
@@ -608,6 +618,9 @@ fn undone(dag: &Dag, steps: &[Lift]) -> Dag {
             continue;
         };
         let made = copier.push(lift.how.undone().node(*word, by));
+        if let Some(count) = copier.undone.get_mut(lift.word) {
+            *count += 1;
+        }
         now.remove(held);
         *held = lift.before;
         *word = made;
