@@ -49,7 +49,7 @@ pub fn score(word: u32, toward: u32) -> i32 {
     Cpu.dot_signed(word, toward).cast_signed()
 }
 
-fn stepped<O: Ops>(ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word> {
+pub fn stepped<O: Ops>(ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word> {
     let toward = param_by(ops, oct.params, 0);
     let bias = ops.constant(BIAS);
     let start = Octet(oct.words);

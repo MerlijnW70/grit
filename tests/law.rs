@@ -1298,3 +1298,68 @@ fn a_name_of_the_most_bytes_compiles_and_one_byte_more_is_refused() {
     );
     assert!(why.found.len() < 100, "{}", why.found.len());
 }
+
+struct EmbedExact;
+
+impl grit::rule3::Declared for EmbedExact {
+    fn params(&self) -> usize {
+        grit::rule3::embed::PARAMS
+    }
+
+    fn tally(&self) -> grit::rule3::Tally {
+        grit::rule3::embed::Embed::default().tally()
+    }
+}
+
+impl OneStep for EmbedExact {
+    fn one_step<O: grit::ops::Ops>(
+        &self,
+        ops: &mut O,
+        oct: Oct<'_, O::Word>,
+    ) -> grit::rule3::Ruled<O::Word> {
+        grit::rule3::embed::stepped(ops, oct)
+    }
+}
+
+#[test]
+fn the_trace_of_embed_replays_with_identical_kernels() {
+    let dag = law::trace(&EmbedExact);
+    let embed = grit::rule3::embed::Embed::default();
+    let mut state = 0x1234_5678_9ABC_DEF1_u64;
+    let mut differ = 0;
+    for _ in 0..TRACED_OCTS {
+        let case = Case {
+            words: core::array::from_fn(|_| word(&mut state)),
+            frame: word(&mut state),
+            at: [word(&mut state), word(&mut state), word(&mut state)],
+        };
+        let params = [word(&mut state)];
+        let made = embed.step(Oct {
+            words: case.words,
+            frame: case.frame,
+            at: case.at,
+            params: &params,
+        });
+        if (made.out.to_vec(), made.counts) != ruled(&dag, case, &params) {
+            differ += 1;
+        }
+    }
+    println!(
+        "embed: {} nodes; {differ} of {TRACED_OCTS} octs differ",
+        dag.len()
+    );
+    assert_eq!(differ, 0);
+    let grid = Grid::solid(32, 32, 32).unwrap();
+    for width in WIDTHS {
+        let one = sand3::settle_by(&embed, width, grid, u32::MAX)
+            .unwrap()
+            .words;
+        let other = sand3::settle_by(&dag, width, grid, u32::MAX).unwrap().words;
+        println!(
+            "embed width {width}: {} words, identical {}",
+            one.len(),
+            one == other
+        );
+        assert_eq!(one, other, "embed width {width}");
+    }
+}
