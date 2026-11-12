@@ -500,6 +500,53 @@ fn every_operation_costs_bounded_time_per_unit_it_charges() {
     );
 }
 
+fn lifted(lifts: u32) -> String {
+    let cells: Vec<String> = (0..8)
+        .map(|k| match k {
+            0 => format!(
+                "[\"fold\",\"w\",[\"at\",\"cells\",0],\"i\",[\"range\",{lifts}],[\"add\",\"w\",\"b\"]]"
+            ),
+            _ => format!("[\"at\",\"cells\",{k}]"),
+        })
+        .collect();
+    let shared = limits::NODES as u32 - lifts - 40;
+    law(
+        1,
+        "",
+        &format!(
+            "[\"let\",[[\"b\",[\"fold\",\"a\",[\"param\",0],\"i\",[\"range\",{shared}],[\"not\",\"a\"]]]],[\"vec\",[\"vec\",{}],[\"vec\",0]]]",
+            cells.join(",")
+        ),
+    )
+    .replacen("\"halo\":0,", "\"halo\":0,\"reversible\":true,", 1)
+}
+
+#[test]
+fn a_reversible_law_is_checked_in_time_bounded_per_unit() {
+    for lifts in [2_000, 4_000, 8_000] {
+        let text = lifted(lifts);
+        let law = Law::compile(&text).unwrap();
+        assert!(law.reversible());
+        let units = law.work() + law.nodes() as u64;
+        let took = (0..3)
+            .map(|_| timed(&text).1)
+            .min()
+            .unwrap_or(Duration::ZERO);
+        let nanos = took.as_secs_f64() * 1e9 / units as f64;
+        println!(
+            "{lifts} lifts over a shared {} nodes: {} nodes, work {}, {:.2} ms, {nanos:.1} ns a unit",
+            limits::NODES as u32 - lifts - 40,
+            law.nodes(),
+            law.work(),
+            took.as_secs_f64() * 1e3
+        );
+        assert!(
+            nanos <= NANOS_PER_UNIT,
+            "{lifts} lifts: {nanos:.1} ns a unit"
+        );
+    }
+}
+
 struct Gen {
     state: u64,
     ints: Vec<String>,
@@ -788,7 +835,12 @@ impl Gen {
             "[\"let\",[{}],[\"vec\",{out},[\"vec\",{count}]]]",
             bindings.join(",")
         );
-        law(1, &defs.join(","), &step)
+        let text = law(1, &defs.join(","), &step);
+        if self.chance(100) {
+            text.replacen("\"halo\":0,", "\"halo\":0,\"reversible\":true,", 1)
+        } else {
+            text
+        }
     }
 }
 
