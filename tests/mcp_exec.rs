@@ -529,6 +529,31 @@ fn a_call_counts_its_budget_from_its_own_arrival() {
 }
 
 #[test]
+fn a_tally_word_past_what_json_integers_hold_is_reported_as_its_decimal_string() {
+    use grit::serve3::tools::exactly;
+    for (value, shown) in [
+        (0_u128, "0"),
+        (u128::from(u32::MAX), "4294967295"),
+        (1 << 32, "4294967296"),
+        ((1 << 63) - 1, "9223372036854775807"),
+        (1 << 63, "\"9223372036854775808\""),
+        ((1 << 96) - 1, "\"79228162514264337593543950335\""),
+    ] {
+        let got = exactly(value);
+        assert_eq!(written(&got), shown);
+        let back = match &got {
+            Json::Int(one) => u128::try_from(*one).unwrap(),
+            Json::Text(one) => one.parse::<u128>().unwrap(),
+            other => panic!("{}", written(other)),
+        };
+        assert_eq!(back, value);
+    }
+    let mut server = Server::new(None);
+    let limits = described(&mut server).get("limits").cloned().unwrap();
+    assert!(limits.get("tally_words").and_then(Json::text).is_some());
+}
+
+#[test]
 fn a_list_of_many_files_comes_in_pages_that_join_to_the_whole() {
     let scratch = Scratch::new("pages");
     let options = Options {

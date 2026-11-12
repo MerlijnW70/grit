@@ -676,7 +676,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     let snapshot = server.settle(number);
     let live = server.world(held)?;
-    let tally = live.world.tally()?;
+    let tally: Vec<u128> = live.world.tally()?.into_iter().map(u128::from).collect();
     let listed = live.world.listed()?;
     let mut answer = vec![
         ("world", counted(number)),
@@ -684,7 +684,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ("frame", counted(live.world.frame())),
         (
             "tally",
-            Json::List(tally.iter().map(|one| counted(*one)).collect()),
+            Json::List(tally.iter().map(|one| exactly(*one)).collect()),
         ),
         ("listed", counted(listed)),
     ];
@@ -713,6 +713,11 @@ impl std::fmt::Display for Lost {
 }
 
 impl std::error::Error for Lost {}
+
+#[must_use]
+pub fn exactly(value: u128) -> Json {
+    i64::try_from(value).map_or_else(|_| text(&value.to_string()), Json::Int)
+}
 
 pub(super) fn cells_at(world: &mut World<'_>, points: &[[u32; 3]]) -> Result<Vec<u32>, Failed> {
     let image = world.image()?;
@@ -982,6 +987,12 @@ pub fn describe(status: &Status) -> Json {
                 ("batch_frames", number(BATCH_MOST)),
                 ("name_bytes", number(journal::NAME_MOST)),
                 ("world_least_bytes", number(budget::WORLD_LEAST)),
+                (
+                    "tally_words",
+                    text(
+                        "a whole number up to 9223372036854775807, and past it the same number as a decimal string",
+                    ),
+                ),
                 ("queue_calls", number(super::exec::QUEUE_MOST)),
                 (
                     "memory_share",
