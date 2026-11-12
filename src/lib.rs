@@ -1,12 +1,15 @@
 pub mod bake;
+pub mod batch;
 pub mod board;
 pub mod bricks;
 pub mod compact;
 pub mod gate;
 pub mod geometry;
+pub mod halo;
 pub mod host;
 pub mod law;
 pub mod layout;
+pub mod learn;
 pub mod live;
 pub mod machine;
 pub mod marking;

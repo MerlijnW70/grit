@@ -4,10 +4,13 @@ use crate::ops::Ops;
 use crate::rule3::{Declared, Oct, OneStep, Ruled, Tally};
 use crate::wire::{self, Json};
 
+pub mod adjoint;
 pub mod dag;
 pub mod expand;
+pub mod learn;
 pub mod limits;
 pub mod parse;
+pub mod quiet;
 pub mod trace;
 
 pub use dag::{Dag, Node};
