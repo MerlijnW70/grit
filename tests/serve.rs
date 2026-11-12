@@ -1540,23 +1540,18 @@ fn a_crowd_is_rounded_up_to_whole_subgroups() {
 }
 
 #[test]
-fn a_crowd_over_the_ceiling_is_held_to_it() {
-    let Some(host) = device("a_crowd_over_the_ceiling_is_held_to_it") else {
-        return;
-    };
-    let held = structured(&call(
-        Some(&host),
+fn a_crowd_over_the_ceiling_is_refused_and_names_the_ceiling() {
+    let answer = call(
+        None,
         "grit_synthesise",
         &format!(
             "{{\"inputs\":4,\"outputs\":1,\"gates\":3,\"table\":[{}],\"crowd\":1048576,\"rounds\":10}}",
             parity()
         ),
-    ));
-    assert!(
-        held.counted("crowd").unwrap() <= 65536,
-        "{}",
-        written(&held)
     );
+    let told = structured(&answer);
+    assert_eq!(told.get("field").and_then(Json::text), Some("$.crowd"));
+    assert_eq!(told.counted("limit"), Some(65536), "{}", written(&answer));
 }
 
 #[test]
@@ -1802,15 +1797,16 @@ fn a_spout_stops_at_its_frame_whatever_the_batch() {
             ),
         )
     };
-    for (spout, frames) in [
-        (7, 45),
-        (1, 45),
-        (30, 45),
-        (0, 45),
-        (45, 45),
-        (60, 45),
-        (19, 20),
-    ] {
+    let longer = refusal(&call(
+        None,
+        "grit_pour",
+        "{\"wide\":32,\"deep\":32,\"frames\":45,\"brush\":{\"at\":50,\"is\":\"sand\",\"span\":1,\"frames\":60}}",
+    ));
+    assert!(
+        longer.contains("60") && longer.contains("45"),
+        "a spout that would pour past the end of the run is refused, not cut short: {longer}"
+    );
+    for (spout, frames) in [(7, 45), (1, 45), (30, 45), (0, 45), (45, 45), (19, 20)] {
         let alone = run(1, spout, frames);
         for batch in [3, 7, 8, 20, 256] {
             let batched = run(batch, spout, frames);

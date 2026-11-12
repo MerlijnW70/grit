@@ -631,10 +631,6 @@ fn number_at(
         })
 }
 
-fn number(held: &Json, key: &str, or: u32) -> Result<u32, Box<dyn std::error::Error>> {
-    number_at(held, "$", key, or)
-}
-
 fn needed(held: &Json, place: &str, key: &str) -> Result<u32, Box<dyn std::error::Error>> {
     if held.get(key).is_none() {
         return Err(malformed(
@@ -674,11 +670,22 @@ fn numbers(held: &Json, place: &str, key: &str) -> Result<Vec<u32>, Box<dyn std:
         .collect()
 }
 
+fn present(held: &Json, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if held.get(key).is_none() {
+        return Err(malformed(
+            format!("$.{key}"),
+            format!("{key} is missing from {}", shown_value(held)),
+        ));
+    }
+    Ok(())
+}
+
 fn asked(held: &Json) -> Result<(Netlist, Exam), Box<dyn std::error::Error>> {
-    let inputs = number(held, "inputs", 4)?;
-    let outputs = number(held, "outputs", 1)?;
-    let gates = number(held, "gates", 8)?;
+    let inputs = needed(held, "$", "inputs")?;
+    let outputs = needed(held, "$", "outputs")?;
+    let gates = needed(held, "$", "gates")?;
     let shape = Netlist::over(inputs, outputs, gates, 16)?;
+    present(held, "table")?;
     let table = numbers(held, "$", "table")?;
     Ok((shape, Exam::of(shape, table)?))
 }
@@ -715,620 +722,640 @@ fn given(held: &Json, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Er
     Ok(gates)
 }
 
-fn fields(named: &[(&str, &str)]) -> Json {
+#[derive(Debug, Clone, Copy)]
+struct Whole {
+    key: &'static str,
+    least: i64,
+    most: i64,
+    or: Option<i64>,
+    said: &'static str,
+}
+
+const WORD: i64 = u32::MAX as i64;
+
+impl Whole {
+    fn shown(&self) -> (&'static str, Json) {
+        let mut held = vec![
+            ("type", text("integer")),
+            ("minimum", Json::Int(self.least)),
+            ("maximum", Json::Int(self.most)),
+        ];
+        if let Some(or) = self.or {
+            held.push(("default", Json::Int(or)));
+        }
+        held.push(("description", text(self.said)));
+        (self.key, map(held))
+    }
+
+    fn read(&self, held: &Json, place: &str) -> Result<i64, Box<dyn std::error::Error>> {
+        let field = format!("{place}.{}", self.key);
+        let Some(one) = held.get(self.key) else {
+            return self.or.ok_or_else(|| {
+                malformed(
+                    field,
+                    format!("{} is missing from {}", self.key, shown_value(held)),
+                )
+            });
+        };
+        match one.int() {
+            Some(value) if (self.least..=self.most).contains(&value) => Ok(value),
+            Some(value) => Err(Box::new(
+                Refusal::new(
+                    Code::Malformed,
+                    &field,
+                    format!(
+                        "{} is {value}, outside {} to {}",
+                        self.key, self.least, self.most
+                    ),
+                )
+                .limited(Json::Int(if value < self.least {
+                    self.least
+                } else {
+                    self.most
+                })),
+            )),
+            None => Err(malformed(
+                field,
+                format!(
+                    "{} is {}, which is not a whole number from {} to {}",
+                    self.key,
+                    shown_value(one),
+                    self.least,
+                    self.most
+                ),
+            )),
+        }
+    }
+
+    fn count(&self, held: &Json, place: &str) -> Result<u32, Box<dyn std::error::Error>> {
+        Ok(u32::try_from(self.read(held, place)?)?)
+    }
+
+    fn cell(&self, held: &Json, place: &str) -> Result<u32, Box<dyn std::error::Error>> {
+        Ok(i32::try_from(self.read(held, place)?)?.cast_unsigned())
+    }
+}
+
+fn beyond(field: String, what: String, limit: u32) -> Box<dyn std::error::Error> {
+    Box::new(Refusal::new(Code::Malformed, &field, what).limited(counted(limit)))
+}
+
+fn flag(held: &Json, place: &str, key: &str, or: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    match held.get(key) {
+        None => Ok(or),
+        Some(Json::Bool(one)) => Ok(*one),
+        Some(one) => Err(malformed(
+            format!("{place}.{key}"),
+            format!("{key} is {}, which is not true or false", shown_value(one)),
+        )),
+    }
+}
+
+fn named_in<'held>(
+    held: &'held Json,
+    place: &str,
+    key: &str,
+    among: &[&str],
+    or: &'held str,
+) -> Result<&'held str, Box<dyn std::error::Error>> {
+    let Some(one) = held.get(key) else {
+        return Ok(or);
+    };
+    match one.text() {
+        Some(name) if among.contains(&name) => Ok(name),
+        _ => Err(malformed(
+            format!("{place}.{key}"),
+            format!(
+                "{key} is {}, which is not one of {}",
+                shown_value(one),
+                among.join(", ")
+            ),
+        )),
+    }
+}
+
+fn listed<'held>(
+    held: &'held Json,
+    place: &str,
+    key: &str,
+) -> Result<&'held [Json], Box<dyn std::error::Error>> {
+    match held.get(key) {
+        None => Ok(&[]),
+        Some(one) => one.list().ok_or_else(|| {
+            malformed(
+                format!("{place}.{key}"),
+                format!("{key} is {}, which is not a list", shown_value(one)),
+            )
+        }),
+    }
+}
+
+fn choice(key: &'static str, among: &[&str], or: &str, said: &'static str) -> (&'static str, Json) {
+    (
+        key,
+        map(vec![
+            ("type", text("string")),
+            (
+                "enum",
+                Json::List(among.iter().map(|one| text(one)).collect()),
+            ),
+            ("default", text(or)),
+            ("description", text(said)),
+        ]),
+    )
+}
+
+fn yes_or_no(key: &'static str, or: bool, said: &'static str) -> (&'static str, Json) {
+    (
+        key,
+        map(vec![
+            ("type", text("boolean")),
+            ("default", Json::Bool(or)),
+            ("description", text(said)),
+        ]),
+    )
+}
+
+fn object(properties: Vec<(&'static str, Json)>, required: &[&str]) -> Json {
     map(vec![
         ("type", text("object")),
+        ("properties", map(properties)),
         (
-            "properties",
-            map(named
-                .iter()
-                .map(|(name, kind)| (*name, map(vec![("type", text(kind))])))
-                .collect()),
+            "required",
+            Json::List(required.iter().map(|one| text(one)).collect()),
         ),
     ])
 }
+
+fn array(items: Json, said: &str) -> Json {
+    map(vec![
+        ("type", text("array")),
+        ("items", items),
+        ("description", text(said)),
+    ])
+}
+
+const CROWDED: Whole = Whole {
+    key: "crowd",
+    least: 64,
+    most: CROWD as i64,
+    or: Some(CROWD as i64),
+    said: "how many candidates to start the search with, rounded up to whole subgroups of the device; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent",
+};
+
+const GENERATIONS: Whole = Whole {
+    key: "rounds",
+    least: 1,
+    most: 1 << 20,
+    or: Some(ROUNDS as i64),
+    said: "how many generations to allow, at each rung of a ladder",
+};
+
+const SEEDED: Whole = Whole {
+    key: "seed",
+    least: 0,
+    most: WORD,
+    or: Some(SEEDING as i64),
+    said: "where the search starts; the same seed and arguments give the same answer, and each time the search raises its own crowd it starts again from a fresh seed drawn from this one",
+};
+
+const STALLED: Whole = Whole {
+    key: "stall",
+    least: 0,
+    most: 1 << 20,
+    or: Some(STALL as i64),
+    said: "how many rounds the whole crowd may stand on one score before every candidate is shaken out of where it stands, the best so far kept aside; 0 never shakes",
+};
+
+const SHAKEN: Whole = Whole {
+    key: "shake",
+    least: 0,
+    most: SHAKES as i64,
+    or: Some(SHAKE as i64),
+    said: "how many changes each candidate takes at once when the crowd is shaken, so it can cross a ridge that one change at a time cannot",
+};
+
+const STEPS: Whole = Whole {
+    key: "steps",
+    least: 0,
+    most: WORD,
+    or: None,
+    said: "how many steps a run lasts; taken from the longest run given when it is left out. Steps are worth more than runs: the same count of marks spread over longer runs holds on unseen runs where short ones do not",
+};
+
+const fn sized(key: &'static str, least: i64, most: i64, or: i64, said: &'static str) -> Whole {
+    Whole {
+        key,
+        least,
+        most,
+        or: Some(or),
+        said,
+    }
+}
+
+const fn needed_whole(key: &'static str, said: &'static str) -> Whole {
+    Whole {
+        key,
+        least: 0,
+        most: WORD,
+        or: None,
+        said,
+    }
+}
+
+const SLOPE_WIDE: Whole = sized(
+    "wide",
+    2,
+    256,
+    32,
+    "cells across; rounded up to a power of two",
+);
+
+const SLOPE_DEEP: Whole = sized(
+    "deep",
+    2,
+    256,
+    32,
+    "cells down; rounded up to a power of two",
+);
+
+const POUR_WIDE: Whole = sized(
+    "wide",
+    16,
+    1024,
+    128,
+    "cells across; rounded up to a power of two",
+);
+
+const POUR_DEEP: Whole = sized(
+    "deep",
+    16,
+    1024,
+    128,
+    "cells down; rounded up to a power of two",
+);
+
+const DEPTH: Whole = sized("depth", 1, 1 << 12, 16, "how many frames to walk");
+
+const LOUDEST: Whole = sized(
+    "most",
+    1,
+    1 << 12,
+    32,
+    "how many cells to name in each answer, loudest first",
+);
+
+const TURNING: Whole = sized(
+    "turning",
+    0,
+    WORD,
+    KNOB as i64,
+    "the first rule parameter, the one the gradient calls turning",
+);
+
+const SWING: Whole = sized("swing", 0, WORD, 0, "the second rule parameter");
+
+const AT: Whole = Whole {
+    key: "at",
+    least: 0,
+    most: WORD,
+    or: None,
+    said: "the cell whose weight is carried back, numbered row by row from the top left; the middle of the grid if left out, and it must lie inside the grid",
+};
+
+const FILL: Whole = sized(
+    "fill",
+    i32::MIN as i64,
+    i32::MAX as i64,
+    0,
+    "what every cell holds before the named ones are set; a cell holds a signed 32-bit number, written as the tools answer it",
+);
+
+const IS: Whole = sized(
+    "is",
+    i32::MIN as i64,
+    i32::MAX as i64,
+    1,
+    "what the cell holds, a signed 32-bit number exactly as the tools answer a cell",
+);
+
+const PLACE: Whole = needed_whole(
+    "at",
+    "the cell, numbered row by row from the top left; it must lie inside the grid",
+);
+
+const SETTLE_ROUNDS: Whole = sized(
+    "rounds",
+    1,
+    1 << 10,
+    8,
+    "how many rounds to walk, each one forward walk and one walk back",
+);
+
+const STEP: Whole = sized(
+    "step",
+    1,
+    1 << 16,
+    1,
+    "how far a parameter moves in one round to start with; they are whole numbers, so this is whole too, and it halves each time both ways along the slope came out worse",
+);
+
+const CEILING: Whole = sized(
+    "ceiling",
+    0,
+    WORD,
+    1 << 14,
+    "how high a parameter may climb; the starting turning and swing may not be above it",
+);
+
+const FRAMES: Whole = sized("frames", 1, 1 << 14, 200, "how many frames to step");
+
+const BATCH: Whole = sized(
+    "batch",
+    1,
+    256,
+    20,
+    "how many frames go to the device at a time",
+);
+
+const STANDING: Whole = sized(
+    "most",
+    1,
+    1 << 14,
+    64,
+    "how many settled cells to name one by one",
+);
+
+const SPAN: Whole = sized("span", 0, WORD, 49, "how wide the spout pours");
+
+const SPOUT: Whole = Whole {
+    key: "at",
+    least: 0,
+    most: WORD,
+    or: None,
+    said: "the cell the spout pours from, numbered row by row from the top left; it must lie inside the grid, and without it nothing pours",
+};
+
+const POURING: Whole = Whole {
+    key: "frames",
+    least: 0,
+    most: WORD,
+    or: None,
+    said: "how many frames the spout pours before it shuts off; half the frames of the run when left out, and never more than they are",
+};
 
 fn gate() -> Json {
-    fields(&[
-        ("kind", "integer"),
-        ("left", "integer"),
-        ("right", "integer"),
+    object(
+        vec![
+            needed_whole(
+                "kind",
+                "which of the sixteen two-input functions, as its truth table",
+            )
+            .shown(),
+            needed_whole(
+                "left",
+                "the source it reads first: an input, then the gates before it",
+            )
+            .shown(),
+            needed_whole("right", "the source it reads second").shown(),
+        ],
+        &["kind", "left", "right"],
+    )
+}
+
+fn cell_list(said: &str) -> Json {
+    array(object(vec![PLACE.shown(), IS.shown()], &["at"]), said)
+}
+
+fn tool(name: &str, said: &str, schema: Json) -> Json {
+    map(vec![
+        ("name", text(name)),
+        ("description", text(said)),
+        ("inputSchema", schema),
     ])
 }
 
-const SEED_SAID: &str = "where the search starts, 305419896 when left out; the same seed and arguments give the same answer, and each time the search raises its own crowd it starts again from a fresh seed drawn from this one";
-
-const STALL_SAID: &str = "how many rounds the whole crowd may stand on one score before every candidate is shaken out of where it stands, the best so far kept aside; 300 when left out, 0 never shakes";
-
-const SHAKE_SAID: &str = "how many changes each candidate takes at once when the crowd is shaken, so it can cross a ridge that one change at a time cannot; 6 when left out, at most 64";
-
 pub(crate) fn tools() -> Json {
-    let table = map(vec![
-        ("type", text("array")),
-        ("items", map(vec![("type", text("integer"))])),
-        (
-            "description",
-            text("one word a row, the wanted output bits, lowest output in bit zero"),
+    let table = (
+        "table",
+        array(
+            map(vec![("type", text("integer"))]),
+            "one word a row, the wanted output bits, lowest output in bit zero",
         ),
-    ]);
-    let counting = |what: &str| map(vec![("type", text("integer")), ("description", text(what))]);
+    );
     let shape = vec![
-        (
+        needed_whole(
             "inputs",
-            counting(
-                "how many inputs; the table grows as two to this power, so every added input doubles the rows to mark",
-            ),
-        ),
-        ("outputs", counting("how many outputs")),
-        ("gates", counting("how many two-input gates it may use")),
-        ("table", table),
+            "how many inputs; the table grows as two to this power, so every added input doubles the rows to mark",
+        )
+        .shown(),
+        needed_whole("outputs", "how many outputs").shown(),
+        needed_whole("gates", "how many two-input gates it may use").shown(),
+        table,
+    ];
+    let search = [
+        CROWDED.shown(),
+        GENERATIONS.shown(),
+        SEEDED.shown(),
+        STALLED.shown(),
+        SHAKEN.shown(),
     ];
     let mut seeking = shape.clone();
-    seeking.push(("crowd", counting("how many candidates to start the search with; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent")));
-    seeking.push(("rounds", counting("how many generations to allow")));
-    seeking.push(("seed", counting(SEED_SAID)));
-    seeking.push(("stall", counting(STALL_SAID)));
-    seeking.push(("shake", counting(SHAKE_SAID)));
-    let mut checking = shape;
+    seeking.extend(search.iter().cloned());
+    let mut checking = shape.clone();
     checking.push((
         "chip",
-        map(vec![
-            ("type", text("array")),
-            (
-                "description",
-                text("the gates to check, each an object of kind, left and right"),
-            ),
-            ("items", gate()),
-        ]),
+        array(
+            gate(),
+            "the gates to check, each an object of kind, left and right",
+        ),
     ));
-    let held = |what: Vec<(&str, Json)>| {
-        let required = ["inputs", "outputs", "gates", "table", "chip"]
-            .into_iter()
-            .filter(|name| what.iter().any(|(held, _)| held == name))
-            .map(text)
-            .collect();
-        map(vec![
-            ("type", text("object")),
-            ("properties", map(what)),
-            ("required", Json::List(required)),
-        ])
-    };
-    let mut laddering = checking.clone();
-    laddering.retain(|(name, _)| *name != "chip");
-    laddering.push(("crowd", counting("how many candidates to start the search with; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent")));
-    laddering.push((
-        "rounds",
-        counting("how many generations to allow at each rung"),
+    let trace = array(
+        object(
+            vec![
+                (
+                    "feed",
+                    array(
+                        map(vec![("type", text("integer"))]),
+                        "one word a step, the input bits for that step",
+                    ),
+                ),
+                (
+                    "want",
+                    array(
+                        map(vec![("type", text("integer"))]),
+                        "one word a step, the output bits wanted at that step",
+                    ),
+                ),
+            ],
+            &[],
+        ),
+        "the runs it must get right, each a feed and the answer wanted",
+    );
+    let mut running = vec![
+        needed_whole("state", "how many bits it may remember").shown(),
+        needed_whole("inputs", "how many inputs it reads each step").shown(),
+        needed_whole("outputs", "how many outputs it writes each step").shown(),
+        needed_whole("gates", "how many two-input gates it may use").shown(),
+        STEPS.shown(),
+        ("traces", trace),
+    ];
+    running.extend(search.iter().cloned());
+    running.push((
+        "chip",
+        array(
+            gate(),
+            "the gates of a machine to mark, each an object of kind, left and right; give this and nothing is searched, the machine is only run on the traces and marked, which is how a machine found on one set of runs is tried on runs it has never seen",
+        ),
     ));
-    laddering.push(("seed", counting(SEED_SAID)));
-    laddering.push(("stall", counting(STALL_SAID)));
-    laddering.push(("shake", counting(SHAKE_SAID)));
-    let trace = map(vec![
-        ("type", text("array")),
+    let kind = choice(
+        "kind",
+        &KINDS_NAMED,
+        "living",
+        "which rule the cells follow",
+    );
+    let sloping = vec![
+        SLOPE_WIDE.shown(),
+        SLOPE_DEEP.shown(),
+        kind.clone(),
+        TURNING.shown(),
+        SWING.shown(),
+        DEPTH.shown(),
+        AT.shown(),
+        FILL.shown(),
         (
-            "items",
+            "cells",
+            cell_list(
+                "the cells to set before the walk, each an object of at and is; everything else takes fill",
+            ),
+        ),
+        yes_or_no(
+            "carry",
+            true,
+            "false walks forward only and answers without a slope",
+        ),
+        LOUDEST.shown(),
+    ];
+    let settling = vec![
+        SLOPE_WIDE.shown(),
+        SLOPE_DEEP.shown(),
+        kind,
+        Whole {
+            said: "where the first rule parameter starts",
+            ..TURNING
+        }
+        .shown(),
+        Whole {
+            said: "where the second rule parameter starts",
+            ..SWING
+        }
+        .shown(),
+        Whole {
+            said: "how many frames each round walks",
+            ..DEPTH
+        }
+        .shown(),
+        SETTLE_ROUNDS.shown(),
+        STEP.shown(),
+        CEILING.shown(),
+        Whole {
+            said: "what every cell holds before the named ones are set, in both grids; a cell holds a signed 32-bit number, written as the tools answer it",
+            ..FILL
+        }
+        .shown(),
+        (
+            "cells",
+            cell_list("the grid to start from, each an object of at and is"),
+        ),
+        (
+            "want",
+            cell_list(
+                "the grid to land on, each an object of at and is, exactly as grit_slope answers ended; this is what the rounds walk towards",
+            ),
+        ),
+    ];
+    let stuff = |said: &'static str| choice("is", &STUFF_NAMED, "sand", said);
+    let pouring = vec![
+        POUR_WIDE.shown(),
+        POUR_DEEP.shown(),
+        FRAMES.shown(),
+        yes_or_no(
+            "walls",
+            true,
+            "a floor and two sides, so falling things land; false lets everything leave by the bottom",
+        ),
+        (
+            "cells",
+            array(
+                object(vec![PLACE.shown(), stuff("what to place there")], &["at"]),
+                "what to place before the first frame, each an object of at and is, where is names one of air, water, sand, wall",
+            ),
+        ),
+        (
+            "brush",
             map(vec![
                 ("type", text("object")),
                 (
+                    "description",
+                    text(
+                        "a spout that pours: at names the cell it pours from, is what it pours, span how wide, frames how long it keeps pouring before it shuts off",
+                    ),
+                ),
+                (
                     "properties",
                     map(vec![
-                        (
-                            "feed",
-                            map(vec![
-                                ("type", text("array")),
-                                (
-                                    "description",
-                                    text("one word a step, the input bits for that step"),
-                                ),
-                            ]),
-                        ),
-                        (
-                            "want",
-                            map(vec![
-                                ("type", text("array")),
-                                (
-                                    "description",
-                                    text("one word a step, the output bits wanted at that step"),
-                                ),
-                            ]),
-                        ),
+                        SPOUT.shown(),
+                        stuff("what the spout pours"),
+                        SPAN.shown(),
+                        POURING.shown(),
                     ]),
                 ),
             ]),
         ),
-        (
-            "description",
-            text("the runs it must get right, each a feed and the answer wanted"),
-        ),
-    ]);
-    let running = vec![
-        ("state", counting("how many bits it may remember")),
-        ("inputs", counting("how many inputs it reads each step")),
-        ("outputs", counting("how many outputs it writes each step")),
-        ("gates", counting("how many two-input gates it may use")),
-        (
-            "steps",
-            counting(
-                "how many steps a run lasts; taken from the longest run given when it is left out. Steps are worth more than runs: the same count of marks spread over longer runs holds on unseen runs where short ones do not",
-            ),
-        ),
-        ("traces", trace),
-        (
-            "crowd",
-            counting(
-                "how many candidates to start the search with; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent",
-            ),
-        ),
-        ("rounds", counting("how many generations to allow")),
-        ("seed", counting(SEED_SAID)),
-        ("stall", counting(STALL_SAID)),
-        ("shake", counting(SHAKE_SAID)),
-        (
-            "chip",
-            map(vec![
-                ("type", text("array")),
-                (
-                    "description",
-                    text(
-                        "the gates of a machine to mark, each an object of kind, left and right; give this and nothing is searched, the machine is only run on the traces and marked, which is how a machine found on one set of runs is tried on runs it has never seen",
-                    ),
-                ),
-                ("items", gate()),
-            ]),
-        ),
+        STANDING.shown(),
+        BATCH.shown(),
     ];
     Json::List(vec![
-        map(vec![
-            ("name", text("grit_machine")),
-            (
-                "description",
-                text(
-                    "Search for a synchronous machine, a circuit with state, that answers every run it is given. A run is a feed of input words and the output words wanted at each step; the machine starts from a state of all zeros. Returns the gates, what the best machine says on each run, and which step of which run it gets wrong, all marked on the host. Pass chip to mark a machine you already hold instead of searching for one. Solved means every run in the request is answered, which is not the same as holding the rule behind them: take the gates it returns, pass them back as chip with runs it has never seen, and read the marks. Runs that last longer pin a machine down on far fewer marks than short runs do.",
-                ),
-            ),
-            (
-                "inputSchema",
-                map(vec![
-                    ("type", text("object")),
-                    ("properties", map(running)),
-                    (
-                        "required",
-                        Json::List(vec![
-                            text("state"),
-                            text("inputs"),
-                            text("outputs"),
-                            text("gates"),
-                            text("traces"),
-                        ]),
-                    ),
-                ]),
-            ),
-        ]),
-        map(vec![
-            ("name", text("grit_synthesise")),
-            (
-                "description",
-                text(
-                    "Search for a circuit of two-input gates that answers a truth table exactly. Returns the circuit and the marks it scores, checked on the host, or the best it reached with the rounds and crowd it spent. While it has not solved, the search doubles the crowd itself up to 65536 before giving an answer, so a result that is not solved is evidence about the gate budget rather than about a crowd the caller happened to pick.",
-                ),
-            ),
-            ("inputSchema", held(seeking)),
-        ]),
-        map(vec![
-            ("name", text("grit_least")),
-            (
-                "description",
-                text(
-                    "Walk the gate budget down from the one given, searching at each rung, and keep going past a rung that fails until two in a row fail. Solving is not monotone in the budget: a smaller circuit can be found where a larger one was not, so stopping at the first failure names the edge of a hole rather than the floor. Returns the ladder, which shows any holes, the smallest budget that did solve, and its circuit. Each rung doubles its crowd up to 65536 before it gives up, so a rung that fails has been pressed rather than merely tried. A rung that did not solve means not found within the rounds and crowd spent, which the answer carries, and never that no such circuit exists.",
-                ),
-            ),
-            ("inputSchema", held(laddering)),
-        ]),
-        map(vec![
-            ("name", text("grit_slope")),
-            (
-                "description",
-                text(
-                    "Step a grid of cells forward under one of the rules and carry a weight back through the same walk, which is how far the cell you name depends on everything else. Returns where the grid ended, which cells the weight reached and how loudly, how far it travelled, and the two rule gradients as an exact fraction. The walk back is not a second model of the first: the frames are undone and recomputed, so a depth that would not fit on the card as a tape still runs. Nothing is searched and nothing is fitted; this is the derivative, and what to do with it is the caller's.",
-                ),
-            ),
-            (
-                "inputSchema",
-                map(vec![
-                    ("type", text("object")),
-                    (
-                        "properties",
-                        map(vec![
-                            (
-                                "wide",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("cells across; rounded up to a power of two"),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "deep",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("cells down; rounded up to a power of two"),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "kind",
-                                map(vec![
-                                    ("type", text("string")),
-                                    (
-                                        "enum",
-                                        Json::List(
-                                            KINDS_NAMED.iter().map(|one| text(one)).collect(),
-                                        ),
-                                    ),
-                                    ("description", text("which rule the cells follow")),
-                                ]),
-                            ),
-                            (
-                                "turning",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text(
-                                            "the first rule parameter, the one the gradient calls turning",
-                                        ),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "swing",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    ("description", text("the second rule parameter")),
-                                ]),
-                            ),
-                            (
-                                "depth",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    ("description", text("how many frames to walk")),
-                                ]),
-                            ),
-                            (
-                                "at",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text(
-                                            "the cell whose weight is carried back; the middle of the grid if left out",
-                                        ),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "fill",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("what every cell holds before the named ones are set"),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "cells",
-                                map(vec![
-                                    ("type", text("array")),
-                                    (
-                                        "description",
-                                        text(
-                                            "the cells to set before the walk, each an object of at and is; everything else takes fill",
-                                        ),
-                                    ),
-                                    ("items", fields(&[("at", "integer"), ("is", "integer")])),
-                                ]),
-                            ),
-                            (
-                                "carry",
-                                map(vec![
-                                    ("type", text("boolean")),
-                                    (
-                                        "description",
-                                        text(
-                                            "false walks forward only and answers without a slope",
-                                        ),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "most",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text(
-                                            "how many cells to name in each answer, loudest first",
-                                        ),
-                                    ),
-                                ]),
-                            ),
-                        ]),
-                    ),
-                ]),
-            ),
-        ]),
-        map(vec![
-            ("name", text("grit_settle")),
-            (
-                "description",
-                text(
-                    "Walk a grid forward, see how far it landed from the one you asked for, and move the two rule parameters downhill against that distance. The step is taken from the walk's own adjoint rather than from a guess: the weight carried back is the sign of the residual a cell at a time, so what comes back is the gradient of the distance with respect to the parameters. Returns the trail it walked, the nearest it got, and the parameters that got it there. Distance is counted exactly on the host. A run that did not close means these parameters, at this step and this many rounds, did not get nearer - never that none would.",
-                ),
-            ),
-            (
-                "inputSchema",
-                map(vec![
-                    ("type", text("object")),
-                    (
-                        "properties",
-                        map(vec![
-                            (
-                                "wide",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("cells across; rounded up to a power of two"),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "deep",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("cells down; rounded up to a power of two"),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "kind",
-                                map(vec![
-                                    ("type", text("string")),
-                                    (
-                                        "enum",
-                                        Json::List(
-                                            KINDS_NAMED.iter().map(|one| text(one)).collect(),
-                                        ),
-                                    ),
-                                    ("description", text("which rule the cells follow")),
-                                ]),
-                            ),
-                            (
-                                "turning",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    ("description", text("where the first rule parameter starts")),
-                                ]),
-                            ),
-                            (
-                                "swing",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("where the second rule parameter starts"),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "depth",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    ("description", text("how many frames each round walks")),
-                                ]),
-                            ),
-                            (
-                                "rounds",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    ("description", text("how many downhill steps to take")),
-                                ]),
-                            ),
-                            (
-                                "step",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text(
-                                            "how far a parameter moves in one round; they are whole numbers, so this is whole too",
-                                        ),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "ceiling",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    ("description", text("how high a parameter may climb")),
-                                ]),
-                            ),
-                            (
-                                "fill",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text(
-                                            "what every cell holds before the named ones are set, in both grids",
-                                        ),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "cells",
-                                map(vec![
-                                    ("type", text("array")),
-                                    (
-                                        "description",
-                                        text("the grid to start from, each an object of at and is"),
-                                    ),
-                                    ("items", fields(&[("at", "integer"), ("is", "integer")])),
-                                ]),
-                            ),
-                            (
-                                "want",
-                                map(vec![
-                                    ("type", text("array")),
-                                    (
-                                        "description",
-                                        text(
-                                            "the grid to land on, each an object of at and is; this is what the rounds walk towards",
-                                        ),
-                                    ),
-                                    ("items", fields(&[("at", "integer"), ("is", "integer")])),
-                                ]),
-                            ),
-                        ]),
-                    ),
-                    ("required", Json::List(vec![text("want")])),
-                ]),
-            ),
-        ]),
-        map(vec![
-            ("name", text("grit_pour")),
-            (
-                "description",
-                text(
-                    "Pour sand or water into a room and step it until it settles. Returns how much of each thing ended where, how many cells of sand and water lie in each row, and how many quads the work list actually named on an average look. That last number is the point of the engine rather than a detail of it: the frame costs what is moving, not what the grid could hold, so a settled room is cheap however large it is. Nothing is searched and nothing is judged; this is what happened.",
-                ),
-            ),
-            (
-                "inputSchema",
-                map(vec![
-                    ("type", text("object")),
-                    (
-                        "properties",
-                        map(vec![
-                            (
-                                "wide",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("cells across; rounded up to a power of two"),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "deep",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("cells down; rounded up to a power of two"),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "frames",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    ("description", text("how many frames to step")),
-                                ]),
-                            ),
-                            (
-                                "walls",
-                                map(vec![
-                                    ("type", text("boolean")),
-                                    (
-                                        "description",
-                                        text(
-                                            "a floor and two sides, so falling things land; false lets everything leave by the bottom",
-                                        ),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "cells",
-                                map(vec![
-                                    ("type", text("array")),
-                                    (
-                                        "description",
-                                        text(
-                                            "what to place before the first frame, each an object of at and is, where is names one of air, water, sand, wall",
-                                        ),
-                                    ),
-                                    ("items", fields(&[("at", "integer"), ("is", "string")])),
-                                ]),
-                            ),
-                            (
-                                "brush",
-                                map(vec![
-                                    ("type", text("object")),
-                                    (
-                                        "description",
-                                        text(
-                                            "a spout that pours: at names the cell it pours from, is what it pours, span how wide, frames how long it keeps pouring before it shuts off",
-                                        ),
-                                    ),
-                                    (
-                                        "properties",
-                                        map(vec![
-                                            ("at", map(vec![("type", text("integer"))])),
-                                            ("is", map(vec![("type", text("string"))])),
-                                            ("span", map(vec![("type", text("integer"))])),
-                                            ("frames", map(vec![("type", text("integer"))])),
-                                        ]),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "most",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("how many settled cells to name one by one"),
-                                    ),
-                                ]),
-                            ),
-                            (
-                                "batch",
-                                map(vec![
-                                    ("type", text("integer")),
-                                    (
-                                        "description",
-                                        text("how many frames go to the device at a time"),
-                                    ),
-                                ]),
-                            ),
-                        ]),
-                    ),
-                ]),
-            ),
-        ]),
-        map(vec![
-            ("name", text("grit_check")),
-            (
-                "description",
-                text(
-                    "Mark a given circuit against a truth table and name the rows it gets wrong. Nothing is searched.",
-                ),
-            ),
-            ("inputSchema", held(checking)),
-        ]),
+        tool(
+            "grit_machine",
+            "Search for a synchronous machine, a circuit with state, that answers every run it is given. A run is a feed of input words and the output words wanted at each step; the machine starts from a state of all zeros. Returns the gates, what the best machine says on each run, and which step of which run it gets wrong, all marked on the host. Pass chip to mark a machine you already hold instead of searching for one. Solved means every run in the request is answered, which is not the same as holding the rule behind them: take the gates it returns, pass them back as chip with runs it has never seen, and read the marks. Runs that last longer pin a machine down on far fewer marks than short runs do.",
+            object(running, &["state", "inputs", "outputs", "gates", "traces"]),
+        ),
+        tool(
+            "grit_synthesise",
+            "Search for a circuit of two-input gates that answers a truth table exactly. Returns the circuit and the marks it scores, checked on the host, or the best it reached with the rounds and crowd it spent. While it has not solved, the search doubles the crowd itself up to 65536 before giving an answer, so a result that is not solved is evidence about the gate budget rather than about a crowd the caller happened to pick.",
+            object(seeking.clone(), &["inputs", "outputs", "gates", "table"]),
+        ),
+        tool(
+            "grit_least",
+            "Walk the gate budget down from the one given, searching at each rung, and keep going past a rung that fails until two in a row fail. Solving is not monotone in the budget: a smaller circuit can be found where a larger one was not, so stopping at the first failure names the edge of a hole rather than the floor. Returns the ladder, which shows any holes, the smallest budget that did solve, and its circuit. Each rung doubles its crowd up to 65536 before it gives up, so a rung that fails has been pressed rather than merely tried. A rung that did not solve means not found within the rounds and crowd spent, which the answer carries, and never that no such circuit exists.",
+            object(seeking, &["inputs", "outputs", "gates", "table"]),
+        ),
+        tool(
+            "grit_slope",
+            "Step a grid of cells forward under one of the rules and carry a weight back through the same walk, which is how far the cell you name depends on everything else. Returns where the grid ended, which cells the weight reached and how loudly, how far it travelled, and the two rule gradients as an exact fraction. The walk back is not a second model of the first: the frames are undone and recomputed, so a depth that would not fit on the card as a tape still runs. Nothing is searched and nothing is fitted; this is the derivative, and what to do with it is the caller's. Every cell value, given or answered, is a signed 32-bit number, so what one call answers another takes back as it is.",
+            object(sloping, &[]),
+        ),
+        tool(
+            "grit_settle",
+            "Walk a grid forward, see how far it landed from the one you asked for, and move the two rule parameters downhill against that distance. The step is taken from the walk's own adjoint rather than from a guess: the weight carried back is the sign of the residual a cell at a time, so what comes back is the gradient of the distance with respect to the parameters. Returns the trail it walked, the nearest it got, and the parameters that got it there. Distance is counted exactly on the host. A run that did not close means these parameters, at this step and this many rounds, did not get nearer - never that none would.",
+            object(settling, &["want"]),
+        ),
+        tool(
+            "grit_pour",
+            "Pour sand or water into a room and step it until it settles. Returns how much of each thing ended where, how many cells of sand and water lie in each row, and how many quads the work list actually named on an average look. That last number is the point of the engine rather than a detail of it: the frame costs what is moving, not what the grid could hold, so a settled room is cheap however large it is. Nothing is searched and nothing is judged; this is what happened.",
+            object(pouring, &[]),
+        ),
+        tool(
+            "grit_check",
+            "Mark a given circuit against a truth table and name the rows it gets wrong. Nothing is searched.",
+            object(checking, &["inputs", "outputs", "gates", "table", "chip"]),
+        ),
     ])
 }
 
 fn asked_machine(held: &Json) -> Result<(Machine, Runs), Box<dyn std::error::Error>> {
+    present(held, "traces")?;
     let given = match held.get("traces") {
         None => &[][..],
         Some(one) => one.list().ok_or_else(|| {
@@ -1354,13 +1381,17 @@ fn asked_machine(held: &Json) -> Result<(Machine, Runs), Box<dyn std::error::Err
         .map(|(_, want)| u32::try_from(want.len()).unwrap_or(u32::MAX))
         .max()
         .unwrap_or(0);
+    let steps = match held.get("steps") {
+        None => longest,
+        Some(_) => STEPS.count(held, "$")?,
+    };
     let machine = Machine::over(
-        number(held, "state", 2)?,
-        number(held, "inputs", 1)?,
-        number(held, "outputs", 1)?,
-        number(held, "gates", 12)?,
+        needed(held, "$", "state")?,
+        needed(held, "$", "inputs")?,
+        needed(held, "$", "outputs")?,
+        needed(held, "$", "gates")?,
         16,
-        number(held, "steps", longest)?,
+        steps,
     )?;
     if traces.is_empty() || machine.steps == 0 {
         return Err(
@@ -1399,30 +1430,49 @@ pub const KINDS_NAMED: [&str; 7] = [
 
 /// A cell and what is in it, so neither the start nor the answer has to spell
 /// out every cell of the grid. The engine is sparse and so is this.
-fn sown(held: &Json, grid: Grid, fill: u32) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+fn inside(grid: Grid, at: u32, field: String) -> Result<usize, Box<dyn std::error::Error>> {
+    let cells = u32::try_from(grid.cells())?;
+    if at >= cells {
+        return Err(beyond(
+            field,
+            format!("at {at} is outside the {cells} cells of this grid"),
+            cells - 1,
+        ));
+    }
+    Ok(at as usize)
+}
+
+fn sown(
+    held: &Json,
+    key: &str,
+    grid: Grid,
+    fill: u32,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     let mut cells = vec![fill; grid.cells()];
-    for one in held.get("cells").and_then(Json::list).unwrap_or(&[]) {
-        let at = one.counted("at").ok_or("a cell needs an at")? as usize;
-        let value = one.counted("is").unwrap_or(1);
-        let held = cells
-            .get_mut(at)
-            .ok_or_else(|| format!("at {at} is outside the {} cells of this grid", grid.cells()))?;
-        *held = value;
+    for (place, one) in listed(held, "$", key)?.iter().enumerate() {
+        let here = format!("$.{key}[{place}]");
+        let at = inside(grid, PLACE.count(one, &here)?, format!("{here}.at"))?;
+        let value = IS.cell(one, &here)?;
+        if let Some(slot) = cells.get_mut(at) {
+            *slot = value;
+        }
     }
     Ok(cells)
 }
 
-fn wanted(held: &Json, grid: Grid, fill: u32) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let mut cells = vec![fill; grid.cells()];
-    for one in held.get("want").and_then(Json::list).unwrap_or(&[]) {
-        let at = one.counted("at").ok_or("a wanted cell needs an at")? as usize;
-        let value = one.counted("is").unwrap_or(1);
-        let held = cells
-            .get_mut(at)
-            .ok_or_else(|| format!("at {at} is outside the {} cells of this grid", grid.cells()))?;
-        *held = value;
-    }
-    Ok(cells)
+fn rule_named(held: &Json) -> Result<(&str, Kind), Box<dyn std::error::Error>> {
+    let named = named_in(held, "$", "kind", &KINDS_NAMED, "living")?;
+    let kind = kind_named(named).ok_or_else(|| {
+        malformed(
+            "$.kind".to_owned(),
+            format!(
+                "kind {} is not one of {}",
+                shown(named),
+                KINDS_NAMED.join(", ")
+            ),
+        )
+    })?;
+    Ok((named, kind))
 }
 
 /// The non-zero entries, loudest first, and no more than `most` of them.
@@ -1468,36 +1518,30 @@ fn reached(grid: Grid, slope: &[i32], at: usize) -> u32 {
         .unwrap_or(0)
 }
 
-fn slid(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
-    let wide = held.counted("wide").unwrap_or(32).clamp(2, 256);
-    let deep = held.counted("deep").unwrap_or(32).clamp(2, 256);
+fn device(host: Option<&Host>) -> Result<&Host, Box<dyn std::error::Error>> {
+    host.ok_or_else(|| Box::new(crate::host::Error::NoComputeDevice).into())
+}
+
+fn slid(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+    let wide = SLOPE_WIDE.count(held, "$")?;
+    let deep = SLOPE_DEEP.count(held, "$")?;
     let grid = Grid::of(wide, deep);
-    let named = held.get("kind").and_then(Json::text).unwrap_or("living");
-    let kind = kind_named(named).ok_or_else(|| {
-        malformed(
-            "$.kind".to_owned(),
-            format!(
-                "kind {} is not one of {}",
-                shown(named),
-                KINDS_NAMED.join(", ")
-            ),
-        )
-    })?;
-    let turning = held.counted("turning").unwrap_or(KNOB);
-    let swing = held.counted("swing").unwrap_or(0);
-    let depth = held.counted("depth").unwrap_or(16).clamp(1, 1 << 12);
-    let most = held.counted("most").unwrap_or(32).clamp(1, 4096) as usize;
-    let middle = (grid.deep / 2 * grid.wide + grid.wide / 2) as usize;
-    let at = held.counted("at").unwrap_or(middle as u32) as usize;
-    if at >= grid.cells() {
-        return Err(format!("at {at} is outside the {} cells of this grid", grid.cells()).into());
-    }
-    let cells = sown(held, grid, held.counted("fill").unwrap_or(0))?;
+    let (named, kind) = rule_named(held)?;
+    let turning = TURNING.count(held, "$")?;
+    let swing = SWING.count(held, "$")?;
+    let depth = DEPTH.count(held, "$")?;
+    let most = LOUDEST.count(held, "$")? as usize;
+    let middle = grid.deep / 2 * grid.wide + grid.wide / 2;
+    let at = match held.get("at") {
+        None => middle,
+        Some(_) => AT.count(held, "$")?,
+    };
+    let at = inside(grid, at, "$.at".to_owned())?;
+    let carrying = flag(held, "$", "carry", true)?;
+    let cells = sown(held, "cells", grid, FILL.cell(held, "$")?)?;
+    let host = device(host)?;
 
     let mut board = seated(host, grid, kind, (turning, swing), depth)?;
-    // Json carries no bool accessor, and adding one for this would be a change
-    // to the wire format's shape rather than to this tool.
-    let carrying = !matches!(held.get("carry"), Some(Json::Bool(false)));
     let (ended, slope) = if carrying {
         let mut weight = vec![0_u32; grid.cells()];
         let seat = weight.get_mut(at).ok_or("at is outside the grid")?;
@@ -1607,31 +1651,38 @@ fn moved(now: u32, slope: i64, step: u32, most: u32, against: bool) -> u32 {
     }
 }
 
-fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
-    let wide = held.counted("wide").unwrap_or(32).clamp(2, 256);
-    let deep = held.counted("deep").unwrap_or(32).clamp(2, 256);
-    let grid = Grid::of(wide, deep);
-    let named = held.get("kind").and_then(Json::text).unwrap_or("living");
-    let kind = kind_named(named).ok_or_else(|| {
-        malformed(
-            "$.kind".to_owned(),
+fn under(held: &Json, knob: &Whole, ceiling: u32) -> Result<u32, Box<dyn std::error::Error>> {
+    let value = knob.count(held, "$")?;
+    if value > ceiling {
+        return Err(beyond(
+            format!("$.{}", knob.key),
             format!(
-                "kind {} is not one of {}",
-                shown(named),
-                KINDS_NAMED.join(", ")
+                "{} starts at {value}, above the ceiling of {ceiling} it may climb to",
+                knob.key
             ),
-        )
-    })?;
-    let depth = held.counted("depth").unwrap_or(16).clamp(1, 1 << 12);
-    let rounds = held.counted("rounds").unwrap_or(8).clamp(1, 1 << 10);
-    let step = held.counted("step").unwrap_or(1).clamp(1, 1 << 16);
-    let ceiling = held.counted("ceiling").unwrap_or(1 << 14);
-    let fill = held.counted("fill").unwrap_or(0);
-    let cells = sown(held, grid, fill)?;
-    let want = wanted(held, grid, fill)?;
+            ceiling,
+        ));
+    }
+    Ok(value)
+}
 
-    let mut turning = held.counted("turning").unwrap_or(KNOB).min(ceiling);
-    let mut swing = held.counted("swing").unwrap_or(0).min(ceiling);
+fn settled(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+    let wide = SLOPE_WIDE.count(held, "$")?;
+    let deep = SLOPE_DEEP.count(held, "$")?;
+    let grid = Grid::of(wide, deep);
+    let (named, kind) = rule_named(held)?;
+    let depth = DEPTH.count(held, "$")?;
+    let rounds = SETTLE_ROUNDS.count(held, "$")?;
+    let step = STEP.count(held, "$")?;
+    let ceiling = CEILING.count(held, "$")?;
+    let fill = FILL.cell(held, "$")?;
+    let cells = sown(held, "cells", grid, fill)?;
+    present(held, "want")?;
+    let want = sown(held, "want", grid, fill)?;
+
+    let mut turning = under(held, &TURNING, ceiling)?;
+    let mut swing = under(held, &SWING, ceiling)?;
+    let host = device(host)?;
     let mut board = seated(host, grid, kind, (turning, swing), depth)?;
 
     let mut trail = Vec::new();
@@ -1791,15 +1842,72 @@ fn walled(grid: Grid, walls: bool) -> Vec<u32> {
     cells
 }
 
-fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
-    let width = host.width();
-    let wide = held.counted("wide").unwrap_or(128).clamp(16, 1024);
-    let deep = held.counted("deep").unwrap_or(128).clamp(16, 1024);
+fn poured(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+    let wide = POUR_WIDE.count(held, "$")?;
+    let deep = POUR_DEEP.count(held, "$")?;
     let grid = Grid::of(wide, deep);
-    let frames = held.counted("frames").unwrap_or(200).clamp(1, 1 << 14);
-    let batch = held.counted("batch").unwrap_or(20).clamp(1, 256);
-    let most = held.counted("most").unwrap_or(64).clamp(1, 1 << 14) as usize;
-    let walls = !matches!(held.get("walls"), Some(Json::Bool(false)));
+    let frames = FRAMES.count(held, "$")?;
+    let batch = BATCH.count(held, "$")?;
+    let most = STANDING.count(held, "$")? as usize;
+    let walls = flag(held, "$", "walls", true)?;
+    let mut placed = Vec::new();
+    for (place, one) in listed(held, "$", "cells")?.iter().enumerate() {
+        let here = format!("$.cells[{place}]");
+        let at = inside(grid, PLACE.count(one, &here)?, format!("{here}.at"))?;
+        let named = named_in(one, &here, "is", &STUFF_NAMED, "sand")?;
+        let stuff = stuff_named(named).ok_or_else(|| {
+            malformed(
+                format!("{here}.is"),
+                format!("{} is not one of {}", shown(named), STUFF_NAMED.join(", ")),
+            )
+        })?;
+        placed.push((at, stuff));
+    }
+    let brush = match held.get("brush") {
+        None => None,
+        Some(one @ Json::Map(_)) => Some(one),
+        Some(one) => {
+            return Err(malformed(
+                "$.brush".to_owned(),
+                format!("brush is {}, which is not an object", shown_value(one)),
+            ));
+        }
+    };
+    let spout = match brush.and_then(|one| one.get("at")) {
+        None => None,
+        Some(_) => {
+            let at = SPOUT.count(brush.unwrap_or(&Json::Null), "$.brush")?;
+            let at = inside(grid, at, "$.brush.at".to_owned())?;
+            let at = u32::try_from(at)?;
+            Some((at % grid.wide, at / grid.wide))
+        }
+    };
+    let empty = map(Vec::new());
+    let brushed = brush.unwrap_or(&empty);
+    let span = SPAN.count(brushed, "$.brush")?;
+    let pouring = match brushed.get("frames") {
+        None => frames / 2,
+        Some(_) => {
+            let pouring = POURING.count(brushed, "$.brush")?;
+            if pouring > frames {
+                return Err(beyond(
+                    "$.brush.frames".to_owned(),
+                    format!("the spout pours for {pouring} frames of a run of {frames}"),
+                    frames,
+                ));
+            }
+            pouring
+        }
+    };
+    let named = named_in(brushed, "$.brush", "is", &STUFF_NAMED, "sand")?;
+    let stuff = stuff_named(named).ok_or_else(|| {
+        malformed(
+            "$.brush.is".to_owned(),
+            format!("{} is not one of {}", shown(named), STUFF_NAMED.join(", ")),
+        )
+    })?;
+    let host = device(host)?;
+    let width = host.width();
 
     let quads = grid.quads();
     let plan = Plan::over(width, quads.div_ceil(sweep::cells(width)))?;
@@ -1813,52 +1921,15 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
     }
 
     let mut cells = walled(grid, walls);
-    for (place, one) in held
-        .get("cells")
-        .and_then(Json::list)
-        .unwrap_or(&[])
-        .iter()
-        .enumerate()
-    {
-        let at = one.counted("at").ok_or("a cell needs an at")? as usize;
-        let named = one.get("is").and_then(Json::text).unwrap_or("sand");
-        let stuff = stuff_named(named).ok_or_else(|| {
-            malformed(
-                format!("$.cells[{place}].is"),
-                format!("{} is not one of {}", shown(named), STUFF_NAMED.join(", ")),
-            )
-        })?;
-        let slot = cells
-            .get_mut(at)
-            .ok_or_else(|| format!("at {at} is outside the {} cells", grid.cells()))?;
-        *slot = stuff;
+    for (at, stuff) in placed {
+        if let Some(slot) = cells.get_mut(at) {
+            *slot = stuff;
+        }
     }
 
     resident.write(STATE as usize, &cells)?;
     resident.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
     crate::live::seed(&mut resident, grid, &plan)?;
-
-    // The brush is what pours. Left out, whatever the caller placed is all
-    // there is, and the answer is about how that settles.
-    let brush = held.get("brush");
-    let spout = brush
-        .and_then(|one| one.counted("at"))
-        .map(|at| (at % grid.wide, at / grid.wide));
-    let span = brush.and_then(|one| one.counted("span")).unwrap_or(49);
-    let pouring = brush
-        .and_then(|one| one.counted("frames"))
-        .unwrap_or(frames / 2)
-        .min(frames);
-    let named = brush
-        .and_then(|one| one.get("is"))
-        .and_then(Json::text)
-        .unwrap_or("sand");
-    let stuff = stuff_named(named).ok_or_else(|| {
-        malformed(
-            "$.brush.is".to_owned(),
-            format!("{} is not one of {}", shown(named), STUFF_NAMED.join(", ")),
-        )
-    })?;
 
     // A step never crosses the frame the spout shuts at, so the pour stops on
     // that frame and not at the end of the batch it falls in.
@@ -1991,11 +2062,11 @@ pub const SHAKES: u32 = 64;
 
 fn effort(held: &Json) -> Result<Effort, Box<dyn std::error::Error>> {
     Ok(Effort {
-        crowd: number(held, "crowd", CROWD)?.clamp(64, CROWD),
-        rounds: number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20),
-        seed: number(held, "seed", SEEDING)?,
-        stall: number(held, "stall", STALL)?.min(1 << 20),
-        shake: number(held, "shake", SHAKE)?.min(SHAKES),
+        crowd: CROWDED.count(held, "$")?,
+        rounds: GENERATIONS.count(held, "$")?,
+        seed: SEEDED.count(held, "$")?,
+        stall: STALLED.count(held, "$")?,
+        shake: SHAKEN.count(held, "$")?,
     })
 }
 
@@ -2005,34 +2076,23 @@ pub(crate) fn ran(
     held: &Json,
 ) -> Result<Json, Box<dyn std::error::Error>> {
     if name == "grit_slope" {
-        let Some(host) = host else {
-            return Err(Box::new(crate::host::Error::NoComputeDevice));
-        };
         return slid(host, held);
     }
     if name == "grit_pour" {
-        let Some(host) = host else {
-            return Err(Box::new(crate::host::Error::NoComputeDevice));
-        };
         return poured(host, held);
     }
     if name == "grit_settle" {
-        let Some(host) = host else {
-            return Err(Box::new(crate::host::Error::NoComputeDevice));
-        };
         return settled(host, held);
     }
     if name == "grit_machine" {
         let (machine, traces) = asked_machine(held)?;
         let steps = machine.steps;
+        let effort = effort(held)?;
         let told = if held.get("chip").is_some() {
             let shape = machine.shape()?;
             marked_machine(machine, &traces, &given(held, shape)?)?
         } else {
-            let Some(host) = host else {
-                return Err(Box::new(crate::host::Error::NoComputeDevice));
-            };
-            pressed_machine(host, machine, &traces, effort(held)?)?
+            pressed_machine(device(host)?, machine, &traces, effort)?
         };
         return Ok(map(vec![
             ("solved", Json::Bool(told.marks >= told.full)),
@@ -2093,16 +2153,12 @@ pub(crate) fn ran(
             Ok(told(&checked(shape, &exam, &gates)?, false))
         }
         "grit_synthesise" => {
-            let Some(host) = host else {
-                return Err(Box::new(crate::host::Error::NoComputeDevice));
-            };
-            Ok(told(&pressed(host, shape, &exam, effort(held)?)?, true))
+            let effort = effort(held)?;
+            Ok(told(&pressed(device(host)?, shape, &exam, effort)?, true))
         }
         "grit_least" => {
-            let Some(host) = host else {
-                return Err(Box::new(crate::host::Error::NoComputeDevice));
-            };
             let effort = effort(held)?;
+            let host = device(host)?;
             let many = effort.crowd;
             let rounds = effort.rounds;
             let table: Vec<u32> = (0..shape.words()).map(|row| exam.asked(row)).collect();
