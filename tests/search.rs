@@ -6,7 +6,7 @@ use common::device;
 
 use grit::marking::{BINDINGS, HELD, SEED, TRIAL, turned_on, words_of};
 use grit::netlist::{Gate, Netlist, drawn, turned};
-use grit::serve::{SEEDING, handle, mixed, opening};
+use grit::serve::{ASIDE, Rolls, SEEDING, handle, mixed, opening, shaken};
 use grit::wire::{Json, read, written};
 use grit::{Groups, Host};
 
@@ -406,4 +406,152 @@ fn seeds_whose_mix_differs_in_its_lowest_bit_open_their_own_crowds() {
     );
     let high = unmixed(mixed(SEEDING) ^ SEEDING ^ 1 ^ 0x8000_0000);
     assert_ne!(opening(shape, empty, 0, 64), opening(shape, high, 0, 64));
+}
+
+const K: u32 = 2_654_435_761;
+
+fn rolled(state: u32) -> u32 {
+    let state = state ^ (state << 13);
+    let state = state ^ (state >> 17);
+    state ^ (state << 5)
+}
+
+#[test]
+fn the_roll_has_no_word_it_keeps_but_zero() {
+    let mut rows: Vec<u32> = (0..32).map(|bit| rolled(1 << bit) ^ (1 << bit)).collect();
+    let mut rank = 0;
+    for bit in 0..32 {
+        let Some(at) = (rank..rows.len()).find(|at| (rows[*at] >> bit) & 1 == 1) else {
+            continue;
+        };
+        rows.swap(rank, at);
+        let pivot = rows[rank];
+        for (other, one) in rows.iter_mut().enumerate() {
+            if other != rank && (*one >> bit) & 1 == 1 {
+                *one ^= pivot;
+            }
+        }
+        rank += 1;
+    }
+    assert_eq!(
+        rank, 32,
+        "the roll minus the identity must be invertible, so no word but zero rolls to itself"
+    );
+}
+
+#[test]
+fn the_stream_of_a_zero_start_is_no_other_start_stream() {
+    let mut zero = Rolls::from(0);
+    let (first, second) = (zero.rolled(), zero.rolled());
+    let mut taken = Rolls::from(ASIDE);
+    assert_ne!((first, second), (taken.rolled(), taken.rolled()));
+    for start in [
+        1_u32,
+        2,
+        ASIDE,
+        rolled(ASIDE),
+        first,
+        second,
+        u32::MAX,
+        0x8000_0000,
+    ] {
+        let mut other = Rolls::from(start);
+        let one = other.rolled();
+        let two = other.rolled();
+        assert_ne!(
+            (first, second),
+            (one, two),
+            "the zero start rolls as the start {start}"
+        );
+        assert_eq!(
+            one,
+            rolled(start),
+            "a start that is not zero rolls as it always did"
+        );
+    }
+    let shape = shape();
+    let crowd = opening(shape, SEEDING, 0, 64).0;
+    assert_ne!(
+        shaken(shape, &crowd, 6, 0),
+        shaken(shape, &crowd, 6, ASIDE),
+        "the shake whose seed is zero shakes as no other seed does"
+    );
+}
+
+#[test]
+fn twin_seeds_hand_the_device_no_seed_in_common() {
+    let shape = shape();
+    let many = 4096;
+    for seed in [SEEDING, 1, 7, 12_345, 0, u32::MAX] {
+        let twin = unmixed(mixed(seed) ^ 1);
+        let one = opening(shape, seed, 0, many);
+        let two = opening(shape, twin, 0, many);
+        assert_ne!(one.0, two.0, "seeds {seed} and {twin} open one crowd");
+        let shared = one.1.iter().zip(&two.1).filter(|(a, b)| a == b).count();
+        assert_eq!(
+            shared, 0,
+            "seeds {seed} and {twin} hand {shared} candidates the same device seed"
+        );
+        assert!(one.1.iter().chain(&two.1).all(|held| *held != 0));
+    }
+}
+
+#[test]
+fn the_seed_whose_state_would_be_zero_shares_its_crowd_with_no_other() {
+    let shape = shape();
+    let empty = unmixed(mixed(SEEDING) ^ SEEDING ^ 1);
+    let high = unmixed(mixed(SEEDING) ^ SEEDING ^ 1 ^ 0x8000_0000);
+    let aside = unmixed(mixed(SEEDING) ^ SEEDING ^ 1 ^ ASIDE);
+    let (crowd, _) = opening(shape, empty, 0, 64);
+    for other in [high, aside, SEEDING] {
+        assert_ne!(
+            crowd,
+            opening(shape, other, 0, 64).0,
+            "seeds {empty} and {other} open one crowd"
+        );
+    }
+}
+
+#[test]
+fn a_device_seed_that_would_be_zero_is_one_no_other_candidate_holds() {
+    let shape = Netlist::over(3, 1, 4, 16).unwrap();
+    let many = 1024;
+    let plain = opening(shape, SEEDING, 0, many).1;
+    for who in [0_u32, 1, 2, 77, 1023] {
+        let salt = who.wrapping_mul(K) | 1;
+        let seed = unmixed(salt ^ mixed(SEEDING));
+        let seeds = opening(shape, seed, 0, many).1;
+        assert!(
+            seeds.iter().all(|held| *held != 0),
+            "seed {seed} hands the device a zero"
+        );
+        let mut sorted = seeds.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            seeds.len(),
+            "seed {seed} gives two candidates one seed"
+        );
+        let twin = opening(shape, unmixed(mixed(seed) ^ 1), 0, many).1;
+        for (name, other) in [("the default seed", &plain), ("its twin", &twin)] {
+            let shared = (0..many as usize)
+                .filter(|at| seeds[*at] == other[*at])
+                .count();
+            assert_eq!(
+                shared, 0,
+                "seed {seed} and {name} share {shared} device seeds"
+            );
+        }
+        let partner = unmixed(salt ^ (mixed(salt) | 1) ^ mixed(SEEDING));
+        let theirs = opening(shape, partner, 0, many).1;
+        let shared: Vec<usize> = (0..many as usize)
+            .filter(|at| seeds[*at] == theirs[*at])
+            .collect();
+        assert_eq!(
+            shared,
+            vec![who as usize],
+            "seed {seed} shares more than the one candidate a 32-bit seed must share with some other seed"
+        );
+    }
 }
