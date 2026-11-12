@@ -1036,11 +1036,22 @@ fn a_world_past_the_memory_budget_is_refused_before_anything_is_made() {
 }
 
 fn budgeted_side(host: &Host) -> u32 {
+    let sand = rules()
+        .into_iter()
+        .find(|one| one.name() == "sand")
+        .unwrap();
     let mut side = 512;
     while side > 32 {
-        let grid = grit::sand::Grid::solid(side, side, side).unwrap();
-        let blocks = grid.blocks().div_ceil(grit::sweep::cells(host.width()));
-        if grit::compact::Plan::bricked(host.width(), blocks).is_ok() {
+        let made = Made {
+            rule: "sand".to_owned(),
+            params: Vec::new(),
+            size: [side, side, side],
+            sparse: true,
+            slots: None,
+        };
+        if let Ok((_, sizes)) = grit::serve3::shaped(host, sand.as_ref(), &made)
+            && host.limits().admits(&sizes, None).is_ok()
+        {
             return side;
         }
         side /= 2;
