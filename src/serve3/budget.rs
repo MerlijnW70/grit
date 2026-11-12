@@ -333,9 +333,17 @@ pub const WORLD_LEAST: u64 = 1 << 20;
 
 const FIXED_BYTES: f64 = 4_194_304.0;
 
-const EASING: f64 = 0.75;
+pub const WINDOW: usize = 9;
+
+pub const STEP_MOST_FACTOR: f64 = 4.0;
+
+const SIMILAR: f64 = 16.0;
 
 const RATIO_LEAST_RECORDED: Duration = Duration::from_millis(50);
+
+const RATIO_LEAST: f64 = 1.0;
+
+const RATIO_MOST: f64 = 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
@@ -343,90 +351,144 @@ pub enum Work {
     Fork,
     Save,
     File,
+    Write,
 }
 
 impl Work {
+    pub const ALL: [Self; 5] = [Self::Build, Self::Fork, Self::Save, Self::File, Self::Write];
+
     const fn index(self) -> usize {
         match self {
             Self::Build => 0,
             Self::Fork => 1,
             Self::Save => 2,
             Self::File => 3,
+            Self::Write => 4,
+        }
+    }
+
+    const fn prior(self) -> f64 {
+        match self {
+            Self::Build | Self::Fork => 2e-9,
+            Self::Save | Self::File => 4e-9,
+            Self::Write => 2e-4,
+        }
+    }
+
+    const fn fixed(self) -> f64 {
+        match self {
+            Self::Write => 0.0,
+            _ => FIXED_BYTES,
         }
     }
 
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Build => "building a world",
-            Self::Fork => "copying a world",
-            Self::Save => "writing a world to a file",
-            Self::File => "reading a world file",
+            Self::Build => "build",
+            Self::Fork => "fork",
+            Self::Save => "save",
+            Self::File => "file",
+            Self::Write => "write",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
+struct Kept {
+    seen: std::collections::VecDeque<(f64, f64)>,
+}
+
+pub const PADDED: usize = 3;
+
+fn median(mut held: Vec<f64>, prior: f64) -> f64 {
+    while held.len() < PADDED {
+        held.push(prior);
+    }
+    held.sort_by(f64::total_cmp);
+    held.get((held.len() - 1) / 2).copied().unwrap_or(prior)
+}
+
+impl Kept {
+    fn rate(&self, prior: f64, bytes: f64) -> f64 {
+        let similar: Vec<f64> = self
+            .seen
+            .iter()
+            .filter(|(size, _)| *size * SIMILAR >= bytes && *size <= bytes * SIMILAR)
+            .map(|(_, rate)| *rate)
+            .collect();
+        let chosen = if similar.is_empty() {
+            self.seen.iter().map(|(_, rate)| *rate).collect()
+        } else {
+            similar
+        };
+        median(chosen, prior)
+    }
+
+    fn push(&mut self, bytes: f64, rate: f64) {
+        if self.seen.len() == WINDOW {
+            self.seen.pop_front();
+        }
+        self.seen.push_back((bytes, rate));
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Rates {
-    seconds_per_byte: [f64; 4],
-    measured: [bool; 4],
-    replay: f64,
-    replay_measured: bool,
+    kinds: [Kept; 5],
+    replay: Kept,
 }
 
-impl Default for Rates {
-    fn default() -> Self {
-        Self {
-            seconds_per_byte: [2e-9, 2e-9, 4e-9, 4e-9],
-            measured: [false; 4],
-            replay: 2.0,
-            replay_measured: false,
-        }
-    }
-}
-
-fn eased(old: f64, sample: f64) -> f64 {
-    if !sample.is_finite() || sample <= 0.0 {
-        return old;
-    }
-    sample.max(old * EASING)
+fn bounded(sample: f64, around: f64, least: f64, most: f64) -> f64 {
+    sample
+        .clamp(around / STEP_MOST_FACTOR, around * STEP_MOST_FACTOR)
+        .clamp(least, most)
 }
 
 impl Rates {
+    fn kept(&self, work: Work) -> Option<&Kept> {
+        self.kinds.get(work.index())
+    }
+
+    #[must_use]
+    pub fn rate(&self, work: Work, bytes: u64) -> f64 {
+        let size = bytes as f64 + work.fixed();
+        self.kept(work)
+            .map_or(work.prior(), |kept| kept.rate(work.prior(), size))
+    }
+
+    #[must_use]
+    pub fn observed(&self, work: Work) -> usize {
+        self.kept(work).map_or(0, |kept| kept.seen.len())
+    }
+
     #[must_use]
     pub fn estimate(&self, work: Work, bytes: u64) -> Duration {
-        let rate = self
-            .seconds_per_byte
-            .get(work.index())
-            .copied()
-            .unwrap_or(1e-8);
-        Duration::try_from_secs_f64((bytes as f64 + FIXED_BYTES) * rate).unwrap_or(Duration::MAX)
+        let size = bytes as f64 + work.fixed();
+        Duration::try_from_secs_f64(size * self.rate(work, bytes)).unwrap_or(Duration::MAX)
     }
 
     pub fn measure(&mut self, work: Work, bytes: u64, spent: Duration) {
-        let index = work.index();
-        let sample = spent.as_secs_f64() / (bytes as f64 + FIXED_BYTES);
-        if let (Some(rate), Some(measured)) = (
-            self.seconds_per_byte.get_mut(index),
-            self.measured.get_mut(index),
-        ) {
-            *rate = if *measured {
-                eased(*rate, sample)
-            } else {
-                sample
-            };
-            *measured = true;
+        let size = bytes as f64 + work.fixed();
+        let sample = spent.as_secs_f64() / size;
+        if !sample.is_finite() || sample <= 0.0 {
+            return;
+        }
+        let around = self.rate(work, bytes);
+        let taken = bounded(sample, around, 0.0, f64::MAX);
+        if let Some(kept) = self.kinds.get_mut(work.index()) {
+            kept.push(size, taken);
         }
     }
 
     #[must_use]
-    pub const fn replay(&self) -> f64 {
-        self.replay
+    pub fn replay(&self) -> f64 {
+        self.replay.rate(2.0, 1.0).clamp(RATIO_LEAST, RATIO_MOST)
     }
 
     #[must_use]
     pub fn replaying(&self, recorded: Duration) -> Duration {
-        recorded.mul_f64(self.replay.max(1.0))
+        recorded.mul_f64(self.replay())
     }
 
     pub fn measure_replay(&mut self, recorded: Duration, spent: Duration) {
@@ -434,41 +496,41 @@ impl Rates {
             return;
         }
         let sample = spent.as_secs_f64() / recorded.as_secs_f64();
-        self.replay = if self.replay_measured {
-            eased(self.replay, sample)
-        } else {
-            sample.max(1.0)
-        };
-        self.replay_measured = true;
+        if !sample.is_finite() || sample <= 0.0 {
+            return;
+        }
+        let taken = bounded(sample, self.replay(), RATIO_LEAST, RATIO_MOST);
+        self.replay.push(1.0, taken);
     }
 
     #[must_use]
     pub fn shown(&self) -> Json {
-        let one = |work: Work| {
-            let index = work.index();
-            let rate = self.seconds_per_byte.get(index).copied().unwrap_or(0.0);
-            map(vec![
+        let mut shown: Vec<(&'static str, Json)> = Work::ALL
+            .iter()
+            .map(|work| {
+                let rate = self.rate(*work, 0);
+                let seen = self.kept(*work).map_or(0, |kept| kept.seen.len());
                 (
-                    "bytes_per_second",
-                    counted64(if rate > 0.0 { (1.0 / rate) as u64 } else { 0 }),
-                ),
-                (
-                    "measured",
-                    Json::Bool(self.measured.get(index).copied().unwrap_or(false)),
-                ),
-            ])
-        };
-        map(vec![
-            ("build", one(Work::Build)),
-            ("fork", one(Work::Fork)),
-            ("save", one(Work::Save)),
-            ("file", one(Work::File)),
-            (
-                "replay_per_recorded_percent",
-                counted64((self.replay * 100.0) as u64),
-            ),
-            ("replay_measured", Json::Bool(self.replay_measured)),
-        ])
+                    work.name(),
+                    map(vec![
+                        (
+                            "bytes_per_second",
+                            counted64(if rate > 0.0 { (1.0 / rate) as u64 } else { 0 }),
+                        ),
+                        ("observations", counted64(seen as u64)),
+                    ]),
+                )
+            })
+            .collect();
+        shown.push((
+            "replay_per_recorded_percent",
+            counted64((self.replay() * 100.0) as u64),
+        ));
+        shown.push((
+            "replay_observations",
+            counted64(self.replay.seen.len() as u64),
+        ));
+        map(shown)
     }
 }
 

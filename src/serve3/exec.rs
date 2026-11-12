@@ -196,9 +196,19 @@ fn work(
         loop {
             let job = match waiting.take() {
                 Some(Waiting::Unrun(job)) => job,
-                None => match jobs.recv() {
+                None => match jobs.try_recv() {
                     Ok(job) => job,
-                    Err(_) => break,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        if !server.lost() && server.idle() {
+                            shared.publish(&server);
+                            continue;
+                        }
+                        match jobs.recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => break,
                 },
             };
             if server.lost() && !retried {
