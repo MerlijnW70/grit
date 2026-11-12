@@ -1175,6 +1175,37 @@ fn stale_temporary_files_never_block_a_save() {
 }
 
 #[test]
+fn a_capacity_of_zero_is_refused_and_one_holds_a_world_of_uniform_bricks() {
+    let uniform = |capacity| {
+        heat_image(
+            [4, 4, 4],
+            State::Sparse {
+                capacity,
+                sides: [2, 2, 2],
+                table: [format::UNIFORM, 5].repeat(8),
+                pool: Vec::new(),
+            },
+        )
+    };
+    assert_eq!(
+        decoded(&format::encoded(&uniform(0))),
+        Err(Refused::Sizes {
+            what: "capacity",
+            header: 0,
+            found: 0
+        })
+    );
+    assert_eq!(decoded(&format::encoded(&uniform(1))), Ok(uniform(1)));
+    assert_eq!(decoded(&format::encoded(&uniform(8))), Ok(uniform(8)));
+    assert_eq!(refusal_of(&uniform(9)), "sizes");
+    let cells = vec![5; 64];
+    assert_eq!(
+        format::bricked(&cells, [4, 4, 4], [2, 2, 2], Some(0)),
+        uniform(1).state
+    );
+}
+
+#[test]
 fn a_held_brick_uniform_in_every_plane_is_refused_by_name() {
     let mut table = vec![0, 0];
     table.extend([format::UNIFORM, 0].repeat(7));
@@ -1322,6 +1353,273 @@ fn a_world_tally_past_four_billion_is_exact() {
         world.step(1).unwrap();
         assert_eq!(world.tally().unwrap(), want, "sparse {sparse}");
     }
+}
+
+fn evaluated(formula: &str, values: &BTreeMap<&str, u64>) -> u64 {
+    let formula = formula.replace(' ', "");
+    if let Some(open) = formula.find('(') {
+        let close = formula.find(')').unwrap();
+        let inner = evaluated(&formula[open + 1..close], values);
+        let rest = formula[close + 1..].trim_start_matches('·');
+        assert_eq!(open, 0, "{formula}");
+        return if rest.is_empty() {
+            inner
+        } else {
+            inner * evaluated(rest, values)
+        };
+    }
+    formula
+        .split('+')
+        .map(|term| {
+            term.split('·')
+                .map(|factor| {
+                    if let Some(inner) = factor.strip_prefix('⌈') {
+                        let inner = inner.strip_suffix('⌉').unwrap();
+                        let (top, bottom) = inner.split_once('/').unwrap();
+                        return evaluated(top, values).div_ceil(evaluated(bottom, values));
+                    }
+                    let digits: String = factor.chars().take_while(char::is_ascii_digit).collect();
+                    let name = &factor[digits.len()..];
+                    let number = if digits.is_empty() {
+                        1
+                    } else {
+                        digits.parse().unwrap()
+                    };
+                    let value = if name.is_empty() {
+                        1
+                    } else {
+                        *values
+                            .get(name)
+                            .unwrap_or_else(|| panic!("the format names {name:?}"))
+                    };
+                    number * value
+                })
+                .product::<u64>()
+        })
+        .sum()
+}
+
+struct Documented {
+    header: Vec<(String, String, String)>,
+    orders: Vec<(String, Vec<[u8; 4]>)>,
+    payloads: BTreeMap<[u8; 4], String>,
+}
+
+fn table_rows(text: &str, heading: &str) -> Vec<Vec<String>> {
+    let block = text
+        .split("\n\n")
+        .find(|block| block.trim_start().starts_with(heading))
+        .unwrap_or_else(|| panic!("the format has no table {heading:?}"));
+    block
+        .lines()
+        .skip(2)
+        .map(|line| {
+            let line = line.trim();
+            let inner = line.strip_prefix('|').unwrap().strip_suffix('|').unwrap();
+            inner
+                .split('|')
+                .map(|cell| cell.trim().to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+fn tag_of(cell: &str) -> [u8; 4] {
+    let inner = cell.trim().trim_matches('`');
+    inner.as_bytes().try_into().unwrap()
+}
+
+fn documented() -> Documented {
+    let text =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/world-format.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+    let header = table_rows(&text, "| Offset |")
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone(), row[2].clone()))
+        .collect();
+    let orders = table_rows(&text, "| World |")
+        .into_iter()
+        .map(|row| {
+            let tags = row[1].split(", ").map(tag_of).collect();
+            (row[0].clone(), tags)
+        })
+        .collect();
+    let payloads = table_rows(&text, "| Tag |")
+        .into_iter()
+        .map(|row| (tag_of(&row[0]), row[1].clone()))
+        .collect();
+    let capacity = text
+        .lines()
+        .find(|line| line.starts_with("| 72 + 4P |"))
+        .unwrap();
+    assert!(capacity.contains("at least 1"), "{capacity}");
+    Documented {
+        header,
+        orders,
+        payloads,
+    }
+}
+
+fn read_by_the_document(bytes: &[u8], doc: &Documented) -> Vec<u32> {
+    let params = u64::from(word_at(bytes, 44));
+    let mut values = BTreeMap::from([("P", params)]);
+    let mut fields = BTreeMap::new();
+    let mut expected = 0;
+    for (offset, length, field) in &doc.header {
+        let at = evaluated(offset, &values);
+        assert_eq!(at, expected, "{field} starts where the field before ends");
+        if length.is_empty() {
+            break;
+        }
+        let length = evaluated(length, &values);
+        fields.insert(field.as_str(), (at as usize, length as usize));
+        expected = at + length;
+    }
+    let field = |name: &str, index: usize| word_at(bytes, fields[name].0 + 4 * index);
+    assert_eq!(&bytes[..fields["magic"].1], b"GRITWLD1");
+    assert_eq!(field("version", 0), 1);
+    for (index, name) in ["x", "y", "z"].into_iter().enumerate() {
+        values.insert(name, u64::from(field("size", index)));
+    }
+    let planes = field("channels", 0);
+    assert!((1..=4).contains(&planes));
+    values.insert("k", u64::from(planes));
+    let sparse = field("sparse", 0) == 1;
+    let sides = [0, 1, 2].map(|index| field("brick sides", index));
+    let cells_per = sides.iter().map(|&side| u64::from(side)).product::<u64>();
+    let cells = values["x"] * values["y"] * values["z"];
+    if sparse {
+        values.insert("c", cells_per);
+        values.insert("bricks", cells / cells_per);
+    } else {
+        assert_eq!(field("capacity", 0), 0);
+        assert_eq!(sides, [0, 0, 0]);
+    }
+    let mut at = expected as usize;
+    let mut tags = Vec::new();
+    let mut payloads = BTreeMap::new();
+    loop {
+        let tag: [u8; 4] = bytes[at..at + 4].try_into().unwrap();
+        tags.push(tag);
+        let words = u64::from_le_bytes(bytes[at + 4..at + 12].try_into().unwrap());
+        let payload: Vec<u32> = (0..words as usize)
+            .map(|index| word_at(bytes, at + 12 + 4 * index))
+            .collect();
+        if tag == *b"TABL" {
+            let held = payload
+                .chunks(2)
+                .take(values["bricks"] as usize)
+                .filter(|entry| entry[0] != format::UNIFORM)
+                .count();
+            values.insert("held", held as u64);
+            let capacity = u64::from(field("capacity", 0));
+            assert!((held.max(1) as u64..=values["bricks"]).contains(&capacity));
+        }
+        if tag == *b"RULE" || tag == *b"LAW " {
+            values.insert("n", u64::from(payload[0]));
+        }
+        assert_eq!(
+            words,
+            evaluated(&doc.payloads[&tag], &values),
+            "section {}",
+            String::from_utf8_lossy(&tag)
+        );
+        if tag == *b"SUM " {
+            assert_eq!(at + 12 + 32, bytes.len());
+            assert_eq!(&bytes[at + 12..], &sha256(&bytes[..at]));
+            break;
+        }
+        payloads.insert(tag, payload);
+        at += 12 + 4 * words as usize;
+    }
+    let lawful = tags[0] == *b"LAW ";
+    let kind = format!(
+        "{}, {}",
+        if sparse { "sparse" } else { "dense" },
+        if lawful { "law" } else { "built-in rule" }
+    );
+    let order = &doc
+        .orders
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .unwrap_or_else(|| panic!("the format has no section order for a {kind} world"))
+        .1;
+    assert_eq!(&tags, order, "{kind}");
+    let text = &payloads[&tags[0]];
+    let text_bytes: Vec<u8> = text[1..]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let length = text[0] as usize;
+    assert!(text_bytes[length..].iter().all(|&byte| byte == 0));
+    assert_eq!(
+        &bytes[fields["law hash"].0..][..32],
+        &sha256(&text_bytes[..length])
+    );
+    if !lawful {
+        assert_eq!(planes, 1);
+    }
+    if !sparse {
+        return payloads[b"DENS"].clone();
+    }
+    let table = &payloads[b"TABL"];
+    let pool = &payloads[b"POOL"];
+    let size = [values["x"], values["y"], values["z"]];
+    let lattice = [0, 1, 2].map(|axis| size[axis] / u64::from(sides[axis]));
+    let bricks = values["bricks"] as usize;
+    let held = values["held"] as usize;
+    let per = cells_per as usize;
+    let mut out = Vec::new();
+    for plane in 0..planes as usize {
+        for z in 0..size[2] {
+            for y in 0..size[1] {
+                for x in 0..size[0] {
+                    let point = [x, y, z];
+                    let brick_at = [0, 1, 2].map(|axis| point[axis] / u64::from(sides[axis]));
+                    let inside = [0, 1, 2].map(|axis| point[axis] % u64::from(sides[axis]));
+                    let brick = ((brick_at[2] * lattice[1] + brick_at[1]) * lattice[0]
+                        + brick_at[0]) as usize;
+                    let offset = ((inside[2] * u64::from(sides[1]) + inside[1])
+                        * u64::from(sides[0])
+                        + inside[0]) as usize;
+                    let slot = table[2 * brick];
+                    out.push(if slot == format::UNIFORM {
+                        if plane == 0 {
+                            table[2 * brick + 1]
+                        } else {
+                            table[2 * bricks + (plane - 1) * bricks + brick]
+                        }
+                    } else {
+                        assert_eq!(table[2 * brick + 1], 0);
+                        if plane > 0 {
+                            assert_eq!(table[2 * bricks + (plane - 1) * bricks + brick], 0);
+                        }
+                        pool[plane * held * per + slot as usize * per + offset]
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_checked_in_files_read_by_the_documented_layout() {
+    let doc = documented();
+    for (name, bytes) in [
+        ("dense", DENSE_FIXTURE),
+        ("sparse", SPARSE_FIXTURE),
+        ("two planes", TWO_PLANES_FIXTURE),
+    ] {
+        let cells = read_by_the_document(bytes, &doc);
+        let image = decoded(bytes).unwrap();
+        assert_eq!(cells, image.unpacked(), "{name}");
+        assert_eq!(format::encoded(&image), bytes, "{name}");
+    }
+    let two = decoded(TWO_PLANES_FIXTURE).unwrap();
+    assert_eq!(two.channels(), 2);
+    assert!(matches!(two.law, Law::Law { .. }));
 }
 
 #[test]
