@@ -1075,7 +1075,10 @@ impl Bricks {
         held.write(HOT_INDIRECT as usize, &[count, 1, 1])?;
         let hot_counts = plan.hot_tiles as usize * plan.per_block as usize;
         held.write(HOT_COUNTS as usize, &vec![0; hot_counts.max(1)])?;
-        held.write(TALLY as usize, &vec![0; Dimension::Three.tally_words()])?;
+        held.write(
+            TALLY as usize,
+            &vec![0; Dimension::Three.tally_words() * live::TALLY_SPAN],
+        )?;
         self.list(held, &[], &(0..count).collect::<Vec<u32>>())
     }
 

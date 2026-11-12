@@ -304,7 +304,7 @@ impl Plan {
             // written past its end.
             self.quads + self.quads.max(self.dimension.seats()),
             1,
-            self.dimension.tally_words(),
+            self.dimension.tally_words() * crate::live::TALLY_SPAN,
             self.padded() as usize + 1,
             self.tiles as usize * sweep::stride(self.subgroup) as usize,
             hot_padded,

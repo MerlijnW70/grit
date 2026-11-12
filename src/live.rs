@@ -443,7 +443,7 @@ pub fn sizes3<R: Rule>(rule: &R, plan: &crate::compact::Plan) -> [usize; BINDING
         *params = (*params).max(crate::rule3::FIRST_PARAM) + rule.params();
     }
     if let Some(tally) = sizes.get_mut(TALLY as usize) {
-        *tally = (*tally).max(rule.tally().words());
+        *tally = (*tally).max(rule.tally().words() * TALLY_SPAN);
     }
     sizes
 }
@@ -852,7 +852,10 @@ pub fn seed(
     held.write(HOT_INDIRECT as usize, &[plan.blocks, 1, 1])?;
     held.write(HOT_COUNTS as usize, &vec![0; words(HOT_COUNTS).max(1)])?;
 
-    held.write(TALLY as usize, &vec![0; plan.dimension.tally_words()])
+    held.write(
+        TALLY as usize,
+        &vec![0; plan.dimension.tally_words() * TALLY_SPAN],
+    )
 }
 
 pub fn decay(subgroup: u32, over: Over) -> Result<Vec<u32>, LaneError> {
@@ -961,7 +964,7 @@ pub fn wipe_in(subgroup: u32, dimension: Dimension) -> Result<Vec<u32>, LaneErro
         kernel.store_at(HOT_TOTALS, at, nothing)?;
     }
 
-    for word in 0..dimension.tally_words() {
+    for word in 0..dimension.tally_words() * TALLY_SPAN {
         let at = kernel
             .module()
             .constant_u32(u32::try_from(word).unwrap_or(0))?;
@@ -991,7 +994,7 @@ pub fn wipe3(subgroup: u32, words: usize) -> Result<Vec<u32>, LaneError> {
         kernel.store_at(HOT_TOTALS, at, nothing)?;
     }
 
-    for word in 0..words {
+    for word in 0..words * TALLY_SPAN {
         let at = kernel
             .module()
             .constant_u32(u32::try_from(word).unwrap_or(0))?;
@@ -1504,7 +1507,7 @@ pub(crate) fn tally3<const LANES: u32>(
     kernel: &mut Kernel<U32>,
     what: Tallied3<'_, LANES>,
 ) -> Result<(), LaneError> {
-    use crate::layout::{COARSE, TALLY};
+    use crate::layout::COARSE;
 
     let Tallied3 {
         counted,
@@ -1512,7 +1515,6 @@ pub(crate) fn tally3<const LANES: u32>(
         inside,
         weighted,
     } = what;
-    let first = kernel.local_index();
 
     let shares = {
         let mut lanes = kernel.lanes()?;
@@ -1522,44 +1524,285 @@ pub(crate) fn tally3<const LANES: u32>(
 
         let mut shares = Vec::with_capacity(counted.len() + 4);
         for &count in counted {
-            shares.push(lanes.select(listed, count, none)?);
+            shares.push((lanes.select(listed, count, none)?, None));
         }
-        if weighted && let Some(&moved) = shares.first() {
+        if weighted && let Some(&(moved, _)) = shares.first() {
             let by = lanes.splat_bits::<U32, LANES>(COARSE)?;
-            let mut weighted = at;
-            for value in &mut weighted {
-                *value = lanes.shift_right_logical(*value, by)?;
-            }
-            for value in &mut weighted {
-                *value = lanes.mul(*value, moved)?;
+            let mut weighted = Vec::with_capacity(3);
+            for value in at {
+                let value = lanes.shift_right_logical(value, by)?;
+                let (low, high) = wide_mul::<LANES>(&mut lanes, value, moved)?;
+                weighted.push((low, Some(high)));
             }
             let stirred = lanes.greater_than(moved, none)?;
             let stirred = lanes.select(stirred, one, none)?;
             shares.extend(weighted);
-            shares.push(stirred);
+            shares.push((stirred, None));
         }
         shares
     };
+    tally_wide::<LANES>(kernel, &shares)
+}
 
-    for (word, share) in shares.into_iter().enumerate() {
-        let total = {
-            let mut lanes = kernel.lanes()?;
-            lanes.reduce_sum::<U32, LANES>(share)?
+pub const TALLY_SPAN: usize = 3;
+
+pub fn read_tally(held: &mut crate::Resident<'_>, words: usize) -> Result<Vec<u128>, crate::Error> {
+    use crate::layout::TALLY;
+
+    let raw = held.read(TALLY as usize, words * TALLY_SPAN)?;
+    Ok((0..words)
+        .map(|word| {
+            let part = |at: usize| u128::from(raw.get(at).copied().unwrap_or(0));
+            part(word) | part(words + word) << 32 | part(2 * words + word) << 64
+        })
+        .collect())
+}
+
+type Lane<const LANES: u32> = Vector<U32, LANES>;
+
+fn wide_mul<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    left: Lane<LANES>,
+    right: Lane<LANES>,
+) -> Result<(Lane<LANES>, Lane<LANES>), LaneError> {
+    let mask = lanes.splat_bits::<U32, LANES>(0xFFFF)?;
+    let sixteen = lanes.splat_bits::<U32, LANES>(16)?;
+    let one = lanes.splat_bits::<U32, LANES>(1)?;
+    let none = lanes.splat_bits::<U32, LANES>(0)?;
+    let left_low = lanes.and(left, mask)?;
+    let left_high = lanes.shift_right_logical(left, sixteen)?;
+    let right_low = lanes.and(right, mask)?;
+    let right_high = lanes.shift_right_logical(right, sixteen)?;
+    let lowest = lanes.mul(left_low, right_low)?;
+    let across = lanes.mul(left_low, right_high)?;
+    let down = lanes.mul(left_high, right_low)?;
+    let highest = lanes.mul(left_high, right_high)?;
+    let middle = lanes.add(across, down)?;
+    let middle_over = lanes.less_than(middle, across)?;
+    let middle_over = lanes.select(middle_over, one, none)?;
+    let lifted = lanes.shift_left(middle, sixteen)?;
+    let low = lanes.add(lowest, lifted)?;
+    let low_over = lanes.less_than(low, lowest)?;
+    let low_over = lanes.select(low_over, one, none)?;
+    let dropped = lanes.shift_right_logical(middle, sixteen)?;
+    let carried = lanes.shift_left(middle_over, sixteen)?;
+    let high = lanes.add(highest, dropped)?;
+    let high = lanes.add(high, carried)?;
+    let high = lanes.add(high, low_over)?;
+    Ok((low, high))
+}
+
+fn over<const LANES: u32>(
+    lanes: &mut Lanes<'_>,
+    sum: Lane<LANES>,
+    part: Lane<LANES>,
+) -> Result<Lane<LANES>, LaneError> {
+    let one = lanes.splat_bits::<U32, LANES>(1)?;
+    let none = lanes.splat_bits::<U32, LANES>(0)?;
+    let wrapped = lanes.less_than(sum, part)?;
+    lanes.select(wrapped, one, none)
+}
+
+fn tally_wide<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    shares: &[(Lane<LANES>, Option<Lane<LANES>>)],
+) -> Result<(), LaneError> {
+    let first = kernel.local_index();
+    let (leading, small, large) = {
+        let mut lanes = kernel.lanes()?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let seat = lanes.splat_id::<U32, LANES>(first)?;
+        let leading = lanes.equal(seat, none)?;
+        let leading = leading
+            .strips()
+            .first()
+            .copied()
+            .ok_or(LaneError::NoOpenBlock { arm: "tally" })?;
+        let by = lanes.splat_bits::<U32, LANES>(26)?;
+        let mut large = none;
+        for &(low, high) in shares {
+            let top = lanes.shift_right_logical(low, by)?;
+            large = lanes.or(large, top)?;
+            if let Some(high) = high {
+                large = lanes.or(large, high)?;
+            }
+        }
+        let any = lanes.reduce_or::<U32, LANES>(large)?;
+        let any = lanes.splat_id::<U32, LANES>(any)?;
+        let small = lanes.equal(any, none)?;
+        let large = lanes.not_equal(any, none)?;
+        let strip = |truth: simdr::lanes::Predicate<LANES>| {
+            truth
+                .strips()
+                .first()
+                .copied()
+                .ok_or(LaneError::NoOpenBlock { arm: "tally" })
         };
-        let mine = {
-            let mut lanes = kernel.lanes()?;
-            let none = lanes.splat_bits::<U32, LANES>(0)?;
-            let seat = lanes.splat_id::<U32, LANES>(first)?;
-            let sum = lanes.splat_id::<U32, LANES>(total)?;
-            let leading = lanes.equal(seat, none)?;
-            lanes.select(leading, sum, none)?
-        };
-        let at = kernel
-            .module()
-            .constant_u32(u32::try_from(word).unwrap_or(0))?;
-        let _ = kernel.atomic_add_at(TALLY, at, mine.id())?;
+        (leading, strip(small)?, strip(large)?)
+    };
+    lane_if(kernel, small, |kernel| {
+        tally_small::<LANES>(kernel, shares, leading)
+    })?;
+    lane_if(kernel, large, |kernel| {
+        tally_exact::<LANES>(kernel, shares, leading)
+    })
+}
+
+fn tally_small<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    shares: &[(Lane<LANES>, Option<Lane<LANES>>)],
+    leading: simdr::module::Id,
+) -> Result<(), LaneError> {
+    use crate::layout::TALLY;
+
+    let words = shares.len();
+    let mut sums = Vec::with_capacity(words);
+    for &(low, _) in shares {
+        let mut lanes = kernel.lanes()?;
+        let sum = lanes.reduce_sum::<U32, LANES>(low)?;
+        sums.push(lanes.splat_id::<U32, LANES>(sum)?);
     }
-    Ok(())
+    lane_if(kernel, leading, |kernel| {
+        for (word, &sum) in sums.iter().enumerate() {
+            let at = kernel
+                .module()
+                .constant_u32(u32::try_from(word).unwrap_or(0))?;
+            let was = kernel.atomic_add_at(TALLY, at, sum.id())?;
+            let carried = {
+                let mut lanes = kernel.lanes()?;
+                let was = lanes.splat_id::<U32, LANES>(was)?;
+                let total = lanes.add(was, sum)?;
+                let wrapped = lanes.less_than(total, was)?;
+                wrapped
+                    .strips()
+                    .first()
+                    .copied()
+                    .ok_or(LaneError::NoOpenBlock { arm: "tally" })?
+            };
+            lane_if(kernel, carried, |kernel| {
+                let at = kernel
+                    .module()
+                    .constant_u32(u32::try_from(words + word).unwrap_or(0))?;
+                let one = kernel.module().constant_u32(1)?;
+                let was = kernel.atomic_add_at(TALLY, at, one)?;
+                let topped = {
+                    let mut lanes = kernel.lanes()?;
+                    let was = lanes.splat_id::<U32, LANES>(was)?;
+                    let full = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
+                    let topped = lanes.equal(was, full)?;
+                    topped
+                        .strips()
+                        .first()
+                        .copied()
+                        .ok_or(LaneError::NoOpenBlock { arm: "tally" })?
+                };
+                lane_if(kernel, topped, |kernel| {
+                    let at = kernel
+                        .module()
+                        .constant_u32(u32::try_from(2 * words + word).unwrap_or(0))?;
+                    let one = kernel.module().constant_u32(1)?;
+                    let _ = kernel.atomic_add_at(TALLY, at, one)?;
+                    Ok(())
+                })
+            })?;
+        }
+        Ok(())
+    })
+}
+
+fn tally_exact<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    shares: &[(Lane<LANES>, Option<Lane<LANES>>)],
+    leading: simdr::module::Id,
+) -> Result<(), LaneError> {
+    use crate::layout::TALLY;
+
+    let words = shares.len();
+    let mut totals = Vec::with_capacity(words);
+    for &(low, high) in shares {
+        let halves = {
+            let mut lanes = kernel.lanes()?;
+            let mask = lanes.splat_bits::<U32, LANES>(0xFFFF)?;
+            let sixteen = lanes.splat_bits::<U32, LANES>(16)?;
+            let mut halves = vec![
+                lanes.and(low, mask)?,
+                lanes.shift_right_logical(low, sixteen)?,
+            ];
+            if let Some(high) = high {
+                halves.push(lanes.and(high, mask)?);
+                halves.push(lanes.shift_right_logical(high, sixteen)?);
+            }
+            halves
+        };
+        let mut sums = Vec::with_capacity(halves.len());
+        for half in halves {
+            let mut lanes = kernel.lanes()?;
+            let sum = lanes.reduce_sum::<U32, LANES>(half)?;
+            sums.push(lanes.splat_id::<U32, LANES>(sum)?);
+        }
+        totals.push(sums);
+    }
+    lane_if(kernel, leading, |kernel| {
+        for (word, sums) in totals.iter().enumerate() {
+            let [bottom, second, rest @ ..] = sums.as_slice() else {
+                continue;
+            };
+            let (low, middle, top) = {
+                let mut lanes = kernel.lanes()?;
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                let sixteen = lanes.splat_bits::<U32, LANES>(16)?;
+                let mask = lanes.splat_bits::<U32, LANES>(0xFFFF)?;
+                let lifted = lanes.shift_left(*second, sixteen)?;
+                let low = lanes.add(*bottom, lifted)?;
+                let carry = over::<LANES>(&mut lanes, low, lifted)?;
+                let middle = lanes.shift_right_logical(*second, sixteen)?;
+                let (third, fourth) = match rest {
+                    [third, fourth] => (*third, *fourth),
+                    _ => (none, none),
+                };
+                let middle = lanes.add(middle, third)?;
+                let fourth_low = lanes.and(fourth, mask)?;
+                let fourth_low = lanes.shift_left(fourth_low, sixteen)?;
+                let grown = lanes.add(middle, fourth_low)?;
+                let first_over = over::<LANES>(&mut lanes, grown, fourth_low)?;
+                let middle = lanes.add(grown, carry)?;
+                let second_over = over::<LANES>(&mut lanes, middle, grown)?;
+                let top = lanes.shift_right_logical(fourth, sixteen)?;
+                let top = lanes.add(top, first_over)?;
+                let top = lanes.add(top, second_over)?;
+                (low, middle, top)
+            };
+            let at = |kernel: &mut Kernel<U32>, part: usize| {
+                kernel
+                    .module()
+                    .constant_u32(u32::try_from(part * words + word).unwrap_or(0))
+            };
+            let low_at = at(kernel, 0)?;
+            let was = kernel.atomic_add_at(TALLY, low_at, low.id())?;
+            let middle = {
+                let mut lanes = kernel.lanes()?;
+                let was = lanes.splat_id::<U32, LANES>(was)?;
+                let sum = lanes.add(was, low)?;
+                let carry = over::<LANES>(&mut lanes, sum, was)?;
+                let added = lanes.add(middle, carry)?;
+                let passed = over::<LANES>(&mut lanes, added, middle)?;
+                (added, passed)
+            };
+            let middle_at = at(kernel, 1)?;
+            let was = kernel.atomic_add_at(TALLY, middle_at, middle.0.id())?;
+            let top = {
+                let mut lanes = kernel.lanes()?;
+                let was = lanes.splat_id::<U32, LANES>(was)?;
+                let sum = lanes.add(was, middle.0)?;
+                let carry = over::<LANES>(&mut lanes, sum, was)?;
+                let top = lanes.add(top, carry)?;
+                lanes.add(top, middle.1)?
+            };
+            let top_at = at(kernel, 2)?;
+            let _ = kernel.atomic_add_at(TALLY, top_at, top.id())?;
+        }
+        Ok(())
+    })
 }
 
 struct Tallying<const LANES: u32, const AXES: usize> {
@@ -1577,7 +1820,7 @@ fn tally<const LANES: u32, const AXES: usize>(
     kernel: &mut Kernel<U32>,
     what: Tallying<LANES, AXES>,
 ) -> Result<(), LaneError> {
-    use crate::layout::{COARSE, TALLY};
+    use crate::layout::COARSE;
 
     let Tallying {
         counted,
@@ -1585,7 +1828,6 @@ fn tally<const LANES: u32, const AXES: usize>(
         inside,
     } = what;
     let [moved, wet, dry] = counted;
-    let first = kernel.local_index();
 
     let shares = {
         let mut lanes = kernel.lanes()?;
@@ -1600,43 +1842,23 @@ fn tally<const LANES: u32, const AXES: usize>(
         let dry = keep(&mut lanes, dry)?;
 
         let by = lanes.splat_bits::<U32, LANES>(COARSE)?;
-        let mut weighted = at;
-        for value in &mut weighted {
-            *value = lanes.shift_right_logical(*value, by)?;
-        }
-        for value in &mut weighted {
-            *value = lanes.mul(*value, moved)?;
+        let mut weighted = Vec::with_capacity(AXES);
+        for value in at {
+            let value = lanes.shift_right_logical(value, by)?;
+            let (low, high) = wide_mul::<LANES>(&mut lanes, value, moved)?;
+            weighted.push((low, Some(high)));
         }
 
         let stirred = lanes.greater_than(moved, none)?;
         let stirred = lanes.select(stirred, one, none)?;
 
         let mut shares = Vec::with_capacity(AXES + 4);
-        shares.extend([moved, wet, dry]);
+        shares.extend([(moved, None), (wet, None), (dry, None)]);
         shares.extend(weighted);
-        shares.push(stirred);
+        shares.push((stirred, None));
         shares
     };
-
-    for (word, share) in shares.into_iter().enumerate() {
-        let total = {
-            let mut lanes = kernel.lanes()?;
-            lanes.reduce_sum::<U32, LANES>(share)?
-        };
-        let mine = {
-            let mut lanes = kernel.lanes()?;
-            let none = lanes.splat_bits::<U32, LANES>(0)?;
-            let seat = lanes.splat_id::<U32, LANES>(first)?;
-            let sum = lanes.splat_id::<U32, LANES>(total)?;
-            let leading = lanes.equal(seat, none)?;
-            lanes.select(leading, sum, none)?
-        };
-        let at = kernel
-            .module()
-            .constant_u32(u32::try_from(word).unwrap_or(0))?;
-        let _ = kernel.atomic_add_at(TALLY, at, mine.id())?;
-    }
-    Ok(())
+    tally_wide::<LANES>(kernel, &shares)
 }
 
 pub struct Corners<const LANES: u32> {

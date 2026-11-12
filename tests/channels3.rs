@@ -643,3 +643,145 @@ fn planes_past_their_limits_are_refused_by_name() {
     let why = sand3::settle_by(&still_law(2), 32, huge, 65_535).unwrap_err();
     assert!(format!("{why:?}").contains(sand3::PLANES_PAST), "{why:?}");
 }
+
+fn exact(raw: &[u32], words: usize) -> Vec<u128> {
+    (0..words)
+        .map(|word| {
+            let part = |at: usize| u128::from(raw.get(at).copied().unwrap_or(0));
+            part(word) | part(words + word) << 32 | part(2 * words + word) << 64
+        })
+        .collect()
+}
+
+#[test]
+fn a_tally_past_four_billion_is_exact() {
+    use grit::layout::{COARSE, TALLY};
+
+    let Some(host) = device("channels3") else {
+        return;
+    };
+    let width = host.width();
+    let most = u32::MAX;
+    let text = "{\"law\":1,\"name\":\"heavy\",\"params\":0,\"channels\":1,\"halo\":0,\"tally\":{\"counts\":1,\"weighted\":true},\"consts\":{},\"defs\":{},\"step\":[\"vec\",\"cells\",[\"vec\",4294967295]]}";
+    let law = Law::compile(text).unwrap();
+    let grid = Grid::solid(SIZE[0], SIZE[1], SIZE[2]).unwrap();
+    let plan = plan_of(width, grid);
+    let octs = grid.blocks();
+    let lattice = [SIZE[0] / 2, SIZE[1] / 2, SIZE[2] / 2];
+    let mut want = vec![u128::from(octs) * u128::from(most)];
+    for side in lattice {
+        let others = u128::from(octs / side);
+        let along: u128 = (0..side).map(|at| u128::from(at >> COARSE)).sum();
+        want.push(along * others * u128::from(most));
+    }
+    want.push(u128::from(octs));
+    assert!(want[1] > u128::from(u32::MAX));
+
+    for sparse in [false, true] {
+        let pool = Bricks::new(grid, &plan, plan.blocks).unwrap();
+        let ((passes, stages), sizes) = if sparse {
+            (
+                bricks::arranged(&law, &pool, &plan, true).unwrap(),
+                pool.sizes(&law, &plan),
+            )
+        } else {
+            (
+                live::wired3_by(&law, width, grid, &plan).unwrap(),
+                plan.windows().laid(&live::sizes3(&law, &plan)),
+            )
+        };
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let mut held = host.resident(&sizes, &modules).unwrap();
+        for (binding, &words) in sizes.iter().enumerate() {
+            held.write(binding, &vec![0_u32; words]).unwrap();
+        }
+        held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
+            .unwrap();
+        if sparse {
+            pool.write(&mut held, &plan, &vec![3; grid.cells()])
+                .unwrap();
+            pool.seed(&mut held, &plan).unwrap();
+        } else {
+            live::seed(&mut held, grid, &plan).unwrap();
+        }
+        let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
+        held.staged(&groups).unwrap();
+        let raw = held.read(TALLY as usize, 15).unwrap();
+        assert_eq!(exact(&raw, 5), want, "sparse {sparse}");
+        assert_eq!(
+            live::read_tally(&mut held, 5).unwrap(),
+            want,
+            "sparse {sparse}"
+        );
+    }
+}
+
+#[test]
+fn a_flat_tally_past_four_billion_is_exact() {
+    use grit::layout::{COARSE, TALLY, TALLY_WORDS};
+    use grit::sand::{AIR, SAND, WATER, material_of};
+
+    let Some(host) = device("channels3") else {
+        return;
+    };
+    let width = host.width();
+    let grid = Grid::of(32_768, 512);
+    let quads = grid.quads();
+    let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
+    let (passes, stages) = live::wired(width, grid, &plan, None).unwrap();
+    let sizes = plan.sizes();
+    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    let mut held = host.resident(&sizes, &modules).unwrap();
+    for (binding, &words) in sizes.iter().enumerate() {
+        held.write(binding, &vec![0_u32; words]).unwrap();
+    }
+    let cells = grid.cells();
+    let before: Vec<u32> = (0..cells)
+        .map(|at| {
+            let row = at / grid.wide as usize;
+            if row.is_multiple_of(2) && row > 0 {
+                SAND
+            } else {
+                AIR
+            }
+        })
+        .collect();
+    held.write(STATE as usize, &before).unwrap();
+    held.write(PARAMS as usize, &[u32::MAX, plan.dump()])
+        .unwrap();
+    live::seed(&mut held, grid, &plan).unwrap();
+    let groups: Vec<&[Groups]> = stages.iter().map(Vec::as_slice).collect();
+    held.staged(&groups).unwrap();
+    let after = held.read(STATE as usize, cells).unwrap();
+    let raw = held.read(TALLY as usize, 3 * TALLY_WORDS).unwrap();
+    let got = exact(&raw, TALLY_WORDS);
+
+    let mut want = vec![0_u128; TALLY_WORDS];
+    for quad in 0..quads {
+        let column = (quad % grid.across()) * 2;
+        let row = (quad / grid.across()) * 2;
+        let corners = [
+            (row * grid.wide + column) as usize,
+            (row * grid.wide + column + 1) as usize,
+            ((row + 1) * grid.wide + column) as usize,
+            ((row + 1) * grid.wide + column + 1) as usize,
+        ];
+        let moved = corners
+            .iter()
+            .filter(|&&at| before[at] != after[at])
+            .count() as u128;
+        want[0] += moved;
+        for at in corners {
+            match material_of(after[at]) {
+                WATER => want[1] += 1,
+                SAND => want[2] += 1,
+                _ => {}
+            }
+        }
+        want[3] += u128::from((quad % grid.across()) >> COARSE) * moved;
+        want[4] += u128::from((quad / grid.across()) >> COARSE) * moved;
+        want[5] += u128::from(moved > 0);
+    }
+    assert!(want[3] > u128::from(u32::MAX), "{want:?}");
+    assert_eq!(got, want);
+}
