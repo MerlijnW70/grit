@@ -1550,15 +1550,20 @@ fn rule_named(held: &Json) -> Result<(&str, Kind), Box<dyn std::error::Error>> {
 }
 
 /// The non-zero entries, loudest first, and no more than `most` of them.
-fn loudest(held: &[i32], most: usize) -> (Json, u32) {
+fn loudest(held: &[i32], most: usize, quiet: i32) -> (Json, u32) {
     let mut heard: Vec<(usize, i32)> = held
         .iter()
         .enumerate()
-        .filter(|(_, one)| **one != 0)
+        .filter(|(_, one)| **one != quiet)
         .map(|(at, one)| (at, *one))
         .collect();
     let count = heard.len() as u32;
-    heard.sort_by_key(|(at, one)| (std::cmp::Reverse(one.unsigned_abs()), *at));
+    heard.sort_by_key(|(at, one)| {
+        (
+            std::cmp::Reverse((i64::from(*one) - i64::from(quiet)).unsigned_abs()),
+            *at,
+        )
+    });
     heard.truncate(most);
     (
         Json::List(
@@ -1612,7 +1617,8 @@ fn slid(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Er
     };
     let at = inside(grid, at, "$.at".to_owned())?;
     let carrying = flag(held, "$", "carry", true)?;
-    let cells = sown(held, "cells", grid, FILL.cell(held, "$")?)?;
+    let fill = FILL.cell(held, "$")?;
+    let cells = sown(held, "cells", grid, fill)?;
     let host = device(host)?;
 
     let mut board = seated(host, grid, kind, (turning, swing), depth)?;
@@ -1633,7 +1639,7 @@ fn slid(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Er
     };
 
     let settled: Vec<i32> = ended.iter().map(|one| *one as i32).collect();
-    let (shown, standing) = loudest(&settled, most);
+    let (shown, standing) = loudest(&settled, most, fill.cast_signed());
     let mut answer = vec![
         (
             "grid",
@@ -1648,10 +1654,17 @@ fn slid(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Er
         ("at", counted(at as u32)),
         ("ended", shown),
         ("standing", counted(standing)),
+        ("fill", Json::Int(i64::from(fill.cast_signed()))),
+        (
+            "ended_means",
+            text(
+                "every cell that does not hold fill, up to most of them, those furthest from fill first; a cell left unnamed holds fill, so ended passed back as want with the same fill is this grid",
+            ),
+        ),
         ("checked_on_the_host", Json::Bool(true)),
     ];
     if let Some(slope) = slope {
-        let (shown, heard) = loudest(&slope, most);
+        let (shown, heard) = loudest(&slope, most, 0);
         let (turning, swing, over) = board.told_parts()?;
         answer.push(("slope", shown));
         answer.push(("heard", counted(heard)));

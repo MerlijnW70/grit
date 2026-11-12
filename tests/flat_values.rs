@@ -454,3 +454,37 @@ fn a_machine_that_passes_its_input_through_is_marked_on_whole_words() {
         Some(0)
     );
 }
+
+#[test]
+fn what_slope_answers_settle_takes_back_whatever_the_fill() {
+    let Some(host) = device("what_slope_answers_settle_takes_back_whatever_the_fill") else {
+        return;
+    };
+    for kind in [
+        "product", "sum", "turn", "bound", "smooth", "living", "twinned",
+    ] {
+        for fill in [0_i64, 7, -3] {
+            let common = format!(
+                "\"wide\":4,\"deep\":4,\"kind\":\"{kind}\",\"turning\":12,\"swing\":0,\"depth\":3,\"fill\":{fill},\"cells\":[{{\"at\":5,\"is\":40}},{{\"at\":10,\"is\":0}}]"
+            );
+            let made = structured(
+                Some(&host),
+                "grit_slope",
+                &format!("{{{common},\"carry\":false,\"most\":4096}}"),
+            );
+            assert_eq!(made.get("fill").and_then(Json::int), Some(fill));
+            let want = written(made.get("ended").unwrap());
+            let held = structured(
+                Some(&host),
+                "grit_settle",
+                &format!("{{{common},\"rounds\":1,\"want\":{want}}}"),
+            );
+            assert_eq!(
+                held.get("apart").and_then(Json::int),
+                Some(0),
+                "{kind} fill {fill}: {}",
+                written(&held)
+            );
+        }
+    }
+}
