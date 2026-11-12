@@ -1,0 +1,16 @@
+{
+ "law": 1,
+ "name": "mix",
+ "params": 2,
+ "channels": 1,
+ "halo": 0,
+ "reversible": true,
+ "tally": {"counts": 1, "weighted": false},
+ "consts": {"DROP": 4, "POINT": 12, "BELOW": 4},
+ "defs": {
+  "share": [["w", "by"], ["shr", ["mul", ["shr", "w", "DROP"], "by"], "POINT"]],
+  "poured": [["c"], ["fold", "d", "c", "k", ["range", 4], ["put", "d", ["add", "k", "BELOW"], ["add", ["at", "d", ["add", "k", "BELOW"]], ["share", ["at", "d", "k"], ["param", 0]]]]]],
+  "drawn": [["c"], ["fold", "d", "c", "k", ["range", 4], ["put", "d", "k", ["sub", ["at", "d", "k"], ["share", ["at", "d", ["add", "k", "BELOW"]], ["param", 1]]]]]]
+ },
+ "step": ["let", [["out", ["drawn", ["poured", "cells"]]]], ["vec", "out", ["vec", ["count", ["map", "k", ["range", 8], ["ne", ["at", "cells", "k"], ["at", "out", "k"]]]]]]]
+}

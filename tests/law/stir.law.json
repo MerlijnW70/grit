@@ -1,0 +1,17 @@
+{
+ "law": 1,
+ "name": "stir",
+ "params": 3,
+ "channels": 1,
+ "halo": 0,
+ "reversible": true,
+ "tally": {"counts": 1, "weighted": false},
+ "consts": {"DROP": 4, "POINT": 12},
+ "defs": {
+  "share": [["w", "by"], ["shr", ["mul", ["shr", "w", "DROP"], "by"], "POINT"]],
+  "heads": [["n", "k"], ["ne", ["and", ["shr", "n", "k"], 1], 0]],
+  "pushed": [["c", "n"], ["fold", "d", "c", "k", ["vec", 0, 2, 4, 6], ["put", "d", ["add", "k", 1], ["add", ["at", "d", ["add", "k", 1]], ["share", ["at", "d", "k"], ["sel", ["heads", "n", "k"], ["param", 0], ["param", 1]]]]]]],
+  "pulled": [["c"], ["fold", "d", "c", "k", ["vec", 0, 2, 4, 6], ["put", "d", "k", ["sub", ["at", "d", "k"], ["share", ["at", "d", ["add", "k", 1]], ["param", 2]]]]]]
+ },
+ "step": ["let", [["n", ["noise"]], ["out", ["pulled", ["pushed", "cells", "n"]]]], ["vec", "out", ["vec", ["count", ["map", "k", ["range", 8], ["ne", ["at", "cells", "k"], ["at", "out", "k"]]]]]]]
+}
