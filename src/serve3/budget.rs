@@ -248,6 +248,13 @@ impl Memory {
     }
 }
 
+pub const WORLD_LEAST: u64 = 1 << 20;
+
+#[must_use]
+pub fn world_cost(sizes: &[usize]) -> u64 {
+    bytes_of(sizes).max(WORLD_LEAST)
+}
+
 #[must_use]
 pub fn bytes_of(sizes: &[usize]) -> u64 {
     sizes.iter().fold(0_u64, |all, &words| {

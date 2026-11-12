@@ -667,8 +667,8 @@ impl<'host> Server<'host> {
         self.live.len()
     }
 
-    pub fn arriving(&mut self, arrived: Instant, cancel: Option<Arc<AtomicBool>>) {
-        self.arrived = Some(arrived);
+    pub fn arriving(&mut self, arrived: Option<Instant>, cancel: Option<Arc<AtomicBool>>) {
+        self.arrived = arrived;
         self.cancel = cancel;
     }
 
@@ -796,7 +796,7 @@ impl<'host> Server<'host> {
 
     fn settle(&mut self, number: u32) -> Option<Json> {
         let held = self.book.held.get(&number)?;
-        if !held.ledger.due(held.bytes) {
+        if !held.ledger.due(held.bytes) || self.clock.left() < held.ledger.snapping(held.bytes) {
             return None;
         }
         let made = held.ledger.made().clone();
@@ -936,6 +936,7 @@ impl<'host> Server<'host> {
                 Vec::new(),
             );
         }
+        let wedged_before = self.wedged();
         #[cfg(feature = "faults")]
         {
             let armed = self
@@ -950,7 +951,7 @@ impl<'host> Server<'host> {
         }
         let number = number_of(&given, "world");
         let ran = (tool.run)(self, &given);
-        let lost = self.wedged()
+        let lost = (!wedged_before && self.wedged())
             || ran
                 .as_ref()
                 .err()
@@ -969,7 +970,7 @@ impl<'host> Server<'host> {
             Ok(result) => delivery(result),
             Err(why) => {
                 let (mut refusal, mut more) = refused_with(why.as_ref());
-                if lost {
+                if lost && why.downcast_ref::<crate::host::Error>().is_some() {
                     refusal.code = errors::Code::DeviceLost;
                 }
                 if let Some(note) = note {
@@ -1138,7 +1139,8 @@ fn world_bytes(host: &Host, live: &Live<'_>) -> u64 {
         sparse: live.world.pool().is_some(),
         slots: live.world.pool().map(|bricks| bricks.capacity()),
     };
-    shaped(host, live.rule.as_ref(), &made).map_or(0, |(_, sizes)| budget::bytes_of(&sizes))
+    shaped(host, live.rule.as_ref(), &made)
+        .map_or(budget::WORLD_LEAST, |(_, sizes)| budget::world_cost(&sizes))
 }
 
 impl transport::Served for Server<'_> {
