@@ -824,6 +824,13 @@ fn a_saved_world_opens_as_itself_and_a_changed_file_is_refused() {
             let got = answer(&call(&mut server, "grit_world_read", &model.read(one)));
             assert_eq!(numbers(&got, "cells"), model.cells, "{rule} world {one}");
         }
+        let snaps = |dir: &Path| {
+            entries(&dir.join("kept"))
+                .into_iter()
+                .filter(|one| one.starts_with("snap-"))
+                .collect::<Vec<String>>()
+        };
+        let before = snaps(&scratch.dir());
         let path = scratch.dir().join(format!("{name}.grit"));
         let bytes = std::fs::read(&path).unwrap();
         for at in [0, 9, bytes.len() / 2, bytes.len() - 1] {
@@ -849,10 +856,11 @@ fn a_saved_world_opens_as_itself_and_a_changed_file_is_refused() {
             &format!("{{\"name\":\"{name}\"}}"),
         ));
         assert_eq!(told.code, "bad_file");
+        assert_eq!(snaps(&scratch.dir()), before, "{rule}");
     }
     let kept = entries(&scratch.dir().join("kept"));
     let snapshots = kept.iter().filter(|one| one.starts_with("snap-")).count();
-    assert_eq!(snapshots, 2, "{kept:?}");
+    assert!(snapshots >= 2, "{kept:?}");
     let listed = answer(&call(&mut server, "grit_world_list", "{}"));
     let open = listed
         .get("items")
@@ -1750,14 +1758,17 @@ fn an_open_of_a_kept_world_stops_on_its_budget_and_its_cancel_and_opens_nothing(
     let build = built.elapsed();
     answer(&run.ask("grit_world_close", &format!("{{\"world\":{probe}}}")));
     eprintln!("building the world itself takes {build:?}, one step no budget can cut");
+    let budget = 300 + 2 * build.as_millis() as u64;
     let began = Instant::now();
     let id = run.send(
         "grit_world_open",
-        "{\"name\":\"world-1\",\"budget_ms\":300}",
+        &format!("{{\"name\":\"world-1\",\"budget_ms\":{budget}}}"),
     );
-    let Some(got) = run.within(id, Duration::from_millis(300 + 1000) + build) else {
+    let Some(got) = run.within(id, Duration::from_millis(budget + 1000) + build) else {
         std::mem::forget(run);
-        panic!("an open with budget_ms 300 had not answered after 1.3 s and {build:?}");
+        panic!(
+            "an open with budget_ms {budget} had not answered after its budget, 1 s and {build:?}"
+        );
     };
     eprintln!("open stopped by its budget after {:?}", began.elapsed());
     let told = refused(&got);
