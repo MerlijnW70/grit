@@ -590,3 +590,96 @@ fn what_slope_answers_settle_takes_back_whatever_the_fill() {
         }
     }
 }
+
+#[test]
+fn a_walk_never_walks_a_point_twice() {
+    let Some(host) = device("a_walk_never_walks_a_point_twice") else {
+        return;
+    };
+    let mut runs = 0;
+    let mut probes = 0;
+    for kind in [
+        "product", "sum", "turn", "bound", "smooth", "living", "twinned",
+    ] {
+        for (t, s) in [(12_u32, 0_u32), (12, 3), (3, 9)] {
+            let made = structured(
+                Some(&host),
+                "grit_slope",
+                &format!(
+                    "{{\"wide\":8,\"deep\":8,\"kind\":\"{kind}\",\"turning\":{t},\"swing\":{s},\"depth\":4,\"cells\":{SCATTER},\"carry\":false,\"most\":64}}"
+                ),
+            );
+            let want = written(made.get("ended").unwrap());
+            for (from_t, from_s, step, ceiling) in [
+                (0, 0, 1, 16384),
+                (0, 0, 8, 16384),
+                (t + 6, s + 6, 4, 16384),
+                (1, 1, 8, 16384),
+                (t, s, 8, t.max(s) + 1),
+                (t + 1, s, 16, t.max(s) + 1),
+                (0, 0, 4, 0),
+            ] {
+                if from_t > ceiling || from_s > ceiling {
+                    continue;
+                }
+                runs += 1;
+                let args = format!(
+                    "{{\"wide\":8,\"deep\":8,\"kind\":\"{kind}\",\"turning\":{from_t},\"swing\":{from_s},\"depth\":4,\"rounds\":60,\"step\":{step},\"ceiling\":{ceiling},\"fill\":0,\"cells\":{SCATTER},\"want\":{want}}}"
+                );
+                let held = structured(Some(&host), "grit_settle", &args);
+                let trail = held.get("trail").and_then(Json::list).unwrap();
+                let mut seen = std::collections::BTreeSet::new();
+                for (at, one) in trail.iter().enumerate() {
+                    let point = (
+                        one.counted("turning").unwrap(),
+                        one.counted("swing").unwrap(),
+                    );
+                    assert!(
+                        seen.insert(point),
+                        "{args}: round {at} walks {point:?} again"
+                    );
+                }
+                let probed = held.counted("probed").unwrap() as usize;
+                assert!(
+                    probed < trail.len(),
+                    "{args}: {probed} probes in {} rounds",
+                    trail.len()
+                );
+                probes += probed;
+            }
+        }
+    }
+    eprintln!("{runs} walks, {probes} probes, no point walked twice");
+    assert!(probes > 0);
+}
+
+#[test]
+fn probed_counts_the_neighbours_walked_and_no_more() {
+    let Some(host) = device("probed_counts_the_neighbours_walked_and_no_more") else {
+        return;
+    };
+    let start = "[{\"at\":528,\"is\":600},{\"at\":529,\"is\":500}]";
+    for rounds in 1..=8_u32 {
+        let held = structured(
+            Some(&host),
+            "grit_settle",
+            &format!(
+                "{{\"wide\":32,\"deep\":32,\"depth\":6,\"turning\":20,\"rounds\":{rounds},\"step\":4,\"fill\":0,\"cells\":{start},\"want\":[{{\"at\":528,\"is\":1}}]}}"
+            ),
+        );
+        let walked = held.get("trail").and_then(Json::list).unwrap().len() as u32;
+        assert_eq!(walked, rounds.min(6), "{}", written(&held));
+        assert_eq!(
+            held.counted("probed"),
+            Some(walked - 1),
+            "after the start every round walked a neighbour, and {walked} rounds were walked: {}",
+            written(&held)
+        );
+        assert_eq!(
+            held.get("stalled"),
+            Some(&Json::Bool(rounds >= 6)),
+            "{}",
+            written(&held)
+        );
+    }
+}
