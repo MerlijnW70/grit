@@ -21,6 +21,7 @@
              "SAND_STEEP": 1, "ASH_STEEP": 2, "SNOW_STEEP": 4, "EARTH_STEEP": 6,
              "STIR_KEY": 1540483477, "STIR_FACTOR": 739982445},
   "defs": {
+    "never": [[], ["ne", 0, 0]],
     "kind": [["w"], ["and", "w", "KIND_MASK"]],
     "is_kind": [["w", "k"], ["eq", ["kind", "w"], "k"]],
     "temp": [["w"], ["shr", "w", "HEAT_SHIFT"]],
@@ -65,7 +66,7 @@
         ["sel", ["eq", "held", "SMOKE"], "smoke", "burnt"]]],
 
     "hot_smoke": [["w"], ["both", ["is_kind", "w", "SMOKE"], ["ge", ["state", "w"], "KINDLES"]]],
-    "holds": [["cells", "k"], ["fold", "found", 0, "w", "cells", ["either", "found", ["is_kind", "w", "k"]]]],
+    "holds": [["cells", "k"], ["fold", "found", ["never"], "w", "cells", ["either", "found", ["is_kind", "w", "k"]]]],
     "quenched": [["w", "quench"],
       ["let", [["steam", ["with_temp", ["turned", "w", "STEAM", 0], ["larger", ["temp", "w"], "BOIL"]]],
                ["put_out", ["sel", ["both", "quench", ["is_kind", "w", "FIRE"]], ["burnt_out", "w"], "w"]]],
@@ -92,10 +93,10 @@
       ["let", [["quench", ["both", ["holds", "cells", "FIRE"], ["holds", "cells", "WATER"]]],
                ["put_out", ["map", "w", "cells", ["quenched", "w", "quench"]]],
                ["burning", ["holds", "put_out", "FIRE"]],
-               ["under", ["fold", "found", 0, "k", ["filter", "k", ["range", 8], ["side", "k", "Y"]],
+               ["under", ["fold", "found", ["never"], "k", ["filter", "k", ["range", 8], ["side", "k", "Y"]],
                  ["either", "found", ["either", ["is_kind", ["at", "put_out", "k"], "FIRE"], ["hot_smoke", ["at", "put_out", "k"]]]]]],
                ["lit", ["map", "k", ["range", 8],
-                 ["caught", ["at", "put_out", "k"], ["nibble", "noise", "k"], "burning", ["if", ["upper", "k"], "under", 0]]]],
+                 ["caught", ["at", "put_out", "k"], ["nibble", "noise", "k"], "burning", ["if", ["upper", "k"], "under", ["never"]]]]],
                ["warmed", ["map", "w", "lit", ["flared", "w", "burning"]]]],
         ["fold", "c", "warmed", "top", ["range", 4], ["put", "c", "top", ["smoked", ["at", "c", "top"], ["at", "c", ["xor", "top", "Y"]]]]]]],
 
@@ -264,7 +265,7 @@
         ["fold", "c", "cells", "t", ["range", 4],
           ["let", [["bottom", ["xor", "t", "Y"]],
                    ["upper", ["at", "c", "t"]],
-                   ["lit_upper", ["sel", ["both", "shines", "top"], ["shone", "upper", "top", 0, "power"], "upper"]],
+                   ["lit_upper", ["sel", ["both", "shines", "top"], ["shone", "upper", "top", ["never"], "power"], "upper"]],
                    ["through", ["both", ["is_kind", "lit_upper", "AIR"], ["eq", ["and", "lit_upper", "SKY"], "SKY"]]],
                    ["lit_lower", ["sel", "shines", ["shone", ["at", "c", "bottom"], "through", "gaining", "power"], ["at", "c", "bottom"]]]],
             ["put", ["put", "c", "t", "lit_upper"], "bottom", "lit_lower"]]]]]

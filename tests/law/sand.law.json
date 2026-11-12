@@ -54,7 +54,7 @@
                    ["after_z", ["sel", ["both", "set", ["at", "by_z", 0]], ["at", "by_z", 1], "w"]]],
             ["sel", ["both", "set", ["at", "by_x", 0]], ["at", "by_x", 1], "after_z"]]]],
         ["run", ["fold", "c", "started_all", "axis", ["vec", "X", "Z"],
-          ["fold", "d", "c", "low", ["filter", "k", ["range", 8], ["eq", ["side", "k", "axis"], 0]],
+          ["fold", "d", "c", "low", ["filter", "k", ["range", 8], ["denied", ["side", "k", "axis"]]],
             ["swapped", "d", "low", ["nb", "low", "axis"],
               ["along", "axis", ["at", "d", "low"], ["at", "d", ["nb", "low", "axis"]]]]]]],
         ["falls", ["concat",

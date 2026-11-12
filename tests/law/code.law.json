@@ -10,6 +10,7 @@
              "PAYLOAD": 16777215, "INSTRUCTION_SHIFT": 24, "INSTRUCTION_BITS": 15,
              "WAY_SHIFT": 28, "WAY_BITS": 7},
   "defs": {
+    "never": [[], ["ne", 0, 0]],
     "priority": [[], ["vec", "X", "Y", "Z"]],
     "instruction": [["w"], ["and", ["shr", "w", "INSTRUCTION_SHIFT"], "INSTRUCTION_BITS"]],
     "way": [["w"], ["and", ["shr", "w", "WAY_SHIFT"], "WAY_BITS"]],
@@ -42,7 +43,7 @@
                ["added", ["or", ["and", "source", ["not", "PAYLOAD"]], "total"]]],
         ["vec", ["either", "into_empty", "into_data"], ["sel", "sums", "added", "source"]]]],
     "resolved": [["turned", "instructions", "target"],
-      ["fold", "state", ["vec", ["at", "turned", "target"], 0, ["vec"]], "place", ["range", 3],
+      ["fold", "state", ["vec", ["at", "turned", "target"], ["never"], ["vec"]], "place", ["range", 3],
         ["let", [["axis", ["at", ["priority"], "place"]],
                  ["claim", ["claimed", "turned", "instructions", ["xor", "target", "axis"], "target", "axis"]],
                  ["claims", ["at", "claim", 0]],

@@ -24,9 +24,9 @@ const CODE: &str = include_str!("law/code.law.json");
 
 const EMBED: &str = include_str!("law/embed.law.json");
 
-const NATURE_HASH: &str = "6ad32eff8473aa86b96b9544bb5cb5430c8f972c4479448c66c893c3a955db84";
+const NATURE_HASH: &str = "2eed8f63c4f202c06c152693c39798a5f332ed4c2f268db4ca5af64f52c9b33b";
 
-const CODE_HASH: &str = "db856fbabda0292caca7e409aa6f95b5952dfee30d7d6cec381af80555ef6f64";
+const CODE_HASH: &str = "aedb8e70723d1a7be8acebca2d0458b52e2b44b74a2f3fc74a19ee58831b7f9d";
 
 const EMBED_HASH: &str = "8966573f4ba850c92243ecb06dff789a415263bd2c1517c18423f65603d76005";
 
@@ -512,7 +512,7 @@ fn survivors<R: Rule>(text: &str, rule: &R, sets: &Sets) -> Vec<String> {
     left
 }
 
-const NATURE_EQUIVALENT: [&str; 14] = [
+const NATURE_EQUIVALENT: [&str; 13] = [
     "$.consts.RUNNING_MASK 112->113",
     "$.consts.WORN 1792->1793",
     "$.consts.WOODEN 2048->2049",
@@ -526,7 +526,6 @@ const NATURE_EQUIVALENT: [&str; 14] = [
     "$.defs.moved[1][1][0][1][1][2][1] 8->9",
     "$.defs.blown[1][1][0][1][5][4][2][1] 8->7",
     "$.defs.blown[1][2][5][4][2][1] 8->7",
-    "$.defs.sunned[1][2][5][1][2][1][2][3] 0->1",
 ];
 
 const CODE_EQUIVALENT: [&str; 0] = [];
