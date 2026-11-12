@@ -436,6 +436,9 @@ pub fn sizes3<R: Rule>(rule: &R, plan: &crate::compact::Plan) -> [usize; BINDING
     use crate::layout::TALLY;
 
     let mut sizes = plan.sizes();
+    if let Some(state) = sizes.get_mut(STATE as usize) {
+        *state = state3(rule, plan);
+    }
     if let Some(params) = sizes.get_mut(PARAMS as usize) {
         *params = (*params).max(crate::rule3::FIRST_PARAM) + rule.params();
     }
@@ -443,6 +446,19 @@ pub fn sizes3<R: Rule>(rule: &R, plan: &crate::compact::Plan) -> [usize; BINDING
         *tally = (*tally).max(rule.tally().words());
     }
     sizes
+}
+
+#[must_use]
+pub fn state3<R: Rule>(rule: &R, plan: &crate::compact::Plan) -> usize {
+    plan.state_words() * rule.planes().max(1)
+}
+
+#[must_use]
+pub fn windows3<R: Rule>(rule: &R, plan: &crate::compact::Plan) -> crate::layout::Windows {
+    if rule.planes() <= 1 {
+        return plan.windows();
+    }
+    crate::layout::Windows::at(state3(rule, plan), plan.windows().bits())
 }
 
 /// [`arranged3_by`] under the sand and water rule.
@@ -472,7 +488,7 @@ pub fn arranged3_by<R: Rule>(
     let mut stages: Stages = vec![
         opening3(rule, subgroup, plan, coarse)?,
         vec![(
-            settle3_in(rule, subgroup, grid, plan.windows())?,
+            settle3_in(rule, subgroup, grid, windows3(rule, plan))?,
             crate::compact::Plan::listed(),
         )],
     ];
@@ -571,11 +587,43 @@ pub fn put3(
     plan: &crate::compact::Plan,
     cells: &[(u32, u32)],
 ) -> Result<(), crate::Error> {
+    put3_in(held, grid, plan, Placed3::FIRST, cells)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed3 {
+    pub windows: Option<crate::layout::Windows>,
+    pub plane: u32,
+}
+
+impl Placed3 {
+    pub const FIRST: Self = Self {
+        windows: None,
+        plane: 0,
+    };
+}
+
+pub fn put3_in(
+    held: &mut crate::Resident<'_>,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+    placed: Placed3,
+    cells: &[(u32, u32)],
+) -> Result<(), crate::Error> {
     use crate::geometry::Solid;
     use crate::layout::INDIRECT;
 
     fits("live::put3", grid, plan).map_err(crate::Error::Lane)?;
     let past = grid.cells();
+    let windows = placed.windows.unwrap_or_else(|| plan.windows());
+    let lifted = placed.plane as usize * past;
+    if lifted + past > windows.words() {
+        return Err(crate::Error::Overrun {
+            index: STATE as usize,
+            needed: lifted + past,
+            held: windows.words(),
+        });
+    }
     if let Some(&(cell, _)) = cells.iter().find(|(cell, _)| *cell as usize >= past) {
         return Err(crate::Error::Overrun {
             index: STATE as usize,
@@ -590,9 +638,8 @@ pub fn put3(
         .into_iter()
         .collect();
     let mut woken = std::collections::BTreeSet::new();
-    let windows = plan.windows();
     for &(cell, word) in cells {
-        write_state(held, windows, cell as usize, &[word])?;
+        write_state(held, windows, lifted + cell as usize, &[word])?;
         for phase in 0..2 {
             woken.insert(Solid::held(grid, cell, phase).index);
         }
@@ -1338,12 +1385,53 @@ fn listed3<const LANES: u32, R: Rule>(
         placed::<LANES>(&mut lanes, grid, oct, frame)?
     };
 
-    let mut loaded = [frame; CORNERS];
-    for (word, place) in loaded.iter_mut().zip(&placing.places) {
-        *word = state_load(&mut kernel, windows, place.id())?;
-    }
+    let planes = rule.planes();
+    let (places, settled, counted, touched) = if planes > 1 {
+        let stride = crate::sand3::stride_of(rule, grid)?;
+        let mut places = vec![placing.places];
+        for plane in 1..planes {
+            let mut lanes = kernel.lanes()?;
+            let by = u32::try_from(plane).unwrap_or(0).wrapping_mul(stride);
+            let by = lanes.splat_bits::<U32, LANES>(by)?;
+            let mut lifted = placing.places;
+            for place in &mut lifted {
+                *place = lanes.add(*place, by)?;
+            }
+            places.push(lifted);
+        }
+        let mut loaded = Vec::with_capacity(planes);
+        for plane in &places {
+            let mut words = [frame; CORNERS];
+            for (word, place) in words.iter_mut().zip(plane) {
+                *word = state_load(&mut kernel, windows, place.id())?;
+            }
+            loaded.push(words);
+        }
+        let mut lanes = kernel.lanes()?;
+        let given = Given {
+            frame,
+            params: &params,
+        };
+        let step =
+            crate::sand3::ruled_planes::<LANES, R>(&mut lanes, rule, &placing, &loaded, given)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let mut settled = vec![step.ruled.out];
+        settled.extend(step.planes);
+        let mut touched = none;
+        for (before, after) in loaded.iter().flatten().zip(settled.iter().flatten()) {
+            let before = lanes.splat_id::<U32, LANES>(*before)?;
+            let same = lanes.equal(before, *after)?;
+            let differs = lanes.select(same, none, one)?;
+            touched = lanes.add(touched, differs)?;
+        }
+        (places, settled, step.ruled.counts, touched)
+    } else {
+        let mut loaded = [frame; CORNERS];
+        for (word, place) in loaded.iter_mut().zip(&placing.places) {
+            *word = state_load(&mut kernel, windows, place.id())?;
+        }
 
-    let (settled, counted, touched) = {
         let mut lanes = kernel.lanes()?;
         let given = Given {
             frame,
@@ -1360,7 +1448,7 @@ fn listed3<const LANES: u32, R: Rule>(
             let differs = lanes.select(same, none, one)?;
             touched = lanes.add(touched, differs)?;
         }
-        (step.out, step.counts, touched)
+        (vec![placing.places], vec![step.out], step.counts, touched)
     };
 
     let listed = {
@@ -1374,8 +1462,10 @@ fn listed3<const LANES: u32, R: Rule>(
             .ok_or(LaneError::NoOpenBlock { arm: "listed" })?
     };
     lane_if(&mut kernel, listed, |kernel| {
-        for (place, value) in placing.places.iter().zip(&settled) {
-            state_store(kernel, windows, place.id(), value.id())?;
+        for (plane, values) in places.iter().zip(&settled) {
+            for (place, value) in plane.iter().zip(values) {
+                state_store(kernel, windows, place.id(), value.id())?;
+            }
         }
         Ok(())
     })?;

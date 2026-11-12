@@ -267,6 +267,18 @@ pub trait Declared {
 
     /// The tally counts the rule gives, and whether the first is weighted.
     fn tally(&self) -> Tally;
+
+    fn planes(&self) -> usize {
+        1
+    }
+}
+
+pub const MOST_PLANES: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planed<W> {
+    pub ruled: Ruled<W>,
+    pub planes: Vec<[W; CORNERS]>,
 }
 
 /// A rule of the 3D engine.
@@ -285,6 +297,25 @@ pub trait Rule: Declared {
         lanes: &mut Lanes<'_>,
         oct: Oct<'_, Word<LANES>>,
     ) -> Result<Ruled<Word<LANES>>, LaneError>;
+
+    fn step_planes(&self, oct: Oct<'_, u32>, _planes: &[[u32; CORNERS]]) -> Planed<u32> {
+        Planed {
+            ruled: self.step(oct),
+            planes: Vec::new(),
+        }
+    }
+
+    fn emit_planes<const LANES: u32>(
+        &self,
+        lanes: &mut Lanes<'_>,
+        oct: Oct<'_, Word<LANES>>,
+        _planes: &[[Word<LANES>; CORNERS]],
+    ) -> Result<Planed<Word<LANES>>, LaneError> {
+        Ok(Planed {
+            ruled: self.emit::<LANES>(lanes, oct)?,
+            planes: Vec::new(),
+        })
+    }
 }
 
 /// A rule written once, over [`Ops`]: [`OneStep::one_step`] with [`Cpu`]
@@ -292,6 +323,18 @@ pub trait Rule: Declared {
 pub trait OneStep: Declared {
     /// One step of one oct.
     fn one_step<O: Ops>(&self, ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word>;
+
+    fn one_step_planes<O: Ops>(
+        &self,
+        ops: &mut O,
+        oct: Oct<'_, O::Word>,
+        _planes: &[[O::Word; CORNERS]],
+    ) -> Planed<O::Word> {
+        Planed {
+            ruled: self.one_step(ops, oct),
+            planes: Vec::new(),
+        }
+    }
 }
 
 impl<S: OneStep> Rule for S {
@@ -307,6 +350,21 @@ impl<S: OneStep> Rule for S {
         let mut device = Device::<LANES>::new(lanes)?;
         let ruled = self.one_step(&mut device, oct);
         device.finish(ruled)
+    }
+
+    fn step_planes(&self, oct: Oct<'_, u32>, planes: &[[u32; CORNERS]]) -> Planed<u32> {
+        self.one_step_planes(&mut Cpu, oct, planes)
+    }
+
+    fn emit_planes<const LANES: u32>(
+        &self,
+        lanes: &mut Lanes<'_>,
+        oct: Oct<'_, Word<LANES>>,
+        planes: &[[Word<LANES>; CORNERS]],
+    ) -> Result<Planed<Word<LANES>>, LaneError> {
+        let mut device = Device::<LANES>::new(lanes)?;
+        let planed = self.one_step_planes(&mut device, oct, planes);
+        device.finish(planed)
     }
 }
 

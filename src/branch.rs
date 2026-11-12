@@ -185,9 +185,123 @@ pub struct Made<'made> {
     pub slots: Option<u32>,
 }
 
+pub(crate) enum Stepper {
+    Named(Box<dyn Listed>),
+    Law(Box<crate::law::Law>),
+}
+
+impl Stepper {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Named(rule) => rule.name(),
+            Self::Law(law) => law.name(),
+        }
+    }
+
+    fn tally_words(&self) -> usize {
+        match self {
+            Self::Named(rule) => rule.tally_words(),
+            Self::Law(law) => crate::rule3::Declared::tally(&**law).words(),
+        }
+    }
+
+    pub(crate) fn planes(&self) -> u32 {
+        match self {
+            Self::Named(_) => 1,
+            Self::Law(law) => law.channels().max(1),
+        }
+    }
+
+    fn wired(&self, subgroup: u32, grid: Grid, plan: &Plan) -> Result<live::Loop, LaneError> {
+        match self {
+            Self::Named(rule) => rule.wired(subgroup, grid, plan),
+            Self::Law(law) => live::wired3_by(&**law, subgroup, grid, plan),
+        }
+    }
+
+    fn laid(&self, plan: &Plan) -> Vec<usize> {
+        match self {
+            Self::Named(rule) => plan.windows().laid(&rule.sizes(plan)),
+            Self::Law(law) => live::windows3(&**law, plan).laid(&live::sizes3(&**law, plan)),
+        }
+    }
+
+    pub(crate) fn windows(&self, plan: &Plan) -> Windows {
+        match self {
+            Self::Named(_) => plan.windows(),
+            Self::Law(law) => live::windows3(&**law, plan),
+        }
+    }
+
+    fn bricked(&self, bricks: &Bricks, plan: &Plan) -> Result<live::Loop, LaneError> {
+        match self {
+            Self::Named(rule) => rule.bricked(bricks, plan),
+            Self::Law(law) => bricks::arranged(&**law, bricks, plan, true),
+        }
+    }
+
+    fn bricked_sizes(&self, bricks: &Bricks, plan: &Plan) -> Vec<usize> {
+        match self {
+            Self::Named(rule) => rule.bricked_sizes(bricks, plan),
+            Self::Law(law) => bricks.sizes(&**law, plan),
+        }
+    }
+
+    pub(crate) fn again(&self, host: &Host, params: &[u32]) -> Result<Self, Refused> {
+        match self {
+            Self::Named(rule) => Ok(Self::Named(ruled(host, rule.name(), params)?)),
+            Self::Law(law) => Ok(Self::Law(law.clone())),
+        }
+    }
+
+    fn law(&self) -> Law {
+        match self {
+            Self::Named(rule) => Law::Rule {
+                name: rule.name().to_owned(),
+            },
+            Self::Law(law) => Law::Law {
+                name: law.name().to_owned(),
+                canonical: law.canonical().to_owned(),
+            },
+        }
+    }
+}
+
+fn lawful(law: &crate::law::Law, params: &[u32]) -> Result<Stepper, Refused> {
+    let wanted = crate::rule3::Declared::params(law);
+    if params.len() != wanted {
+        return Err(Refused::Params {
+            rule: law.name().to_owned(),
+            given: params.len(),
+            wanted,
+        });
+    }
+    Ok(Stepper::Law(Box::new(law.clone())))
+}
+
+fn stepper_of(host: &Host, law: &Law, params: &[u32]) -> Result<Stepper, Failed> {
+    match law {
+        Law::Rule { name } => Ok(Stepper::Named(ruled(host, name, params)?)),
+        Law::Law { canonical, .. } => {
+            let compiled = crate::law::Law::compile(canonical).map_err(|why| {
+                Box::new(Refused::Malformed {
+                    what: format!("the law: {why}"),
+                }) as Failed
+            })?;
+            Ok(lawful(&compiled, params)?)
+        }
+    }
+}
+
+fn pooled(bricks: Bricks, rule: &Stepper) -> Result<Bricks, Failed> {
+    bricks
+        .with_planes(rule.planes())
+        .map_err(|why| Box::new(unfit(why)) as Failed)
+}
+
 pub struct World<'host> {
     host: &'host Host,
-    rule: Box<dyn Listed>,
+    rule: Stepper,
     passes: Vec<Vec<u32>>,
     stages: Vec<Vec<Groups>>,
     sizes: Vec<usize>,
@@ -286,7 +400,7 @@ pub(crate) fn zeroed(
 impl<'host> World<'host> {
     fn built(
         host: &'host Host,
-        rule: Box<dyn Listed>,
+        rule: Stepper,
         params: Vec<u32>,
         (grid, plan): (Grid, Plan),
         pool: Option<Bricks>,
@@ -296,10 +410,7 @@ impl<'host> World<'host> {
                 rule.bricked(bricks, &plan)?,
                 rule.bricked_sizes(bricks, &plan),
             ),
-            None => (
-                rule.wired(host.width(), grid, &plan)?,
-                plan.windows().laid(&rule.sizes(&plan)),
-            ),
+            None => (rule.wired(host.width(), grid, &plan)?, rule.laid(&plan)),
         };
         host.limits()
             .admits_on(&sizes, None, host.heap())
@@ -322,7 +433,25 @@ impl<'host> World<'host> {
     }
 
     pub fn create(host: &'host Host, made: &Made<'_>) -> Result<Self, Failed> {
-        let rule = ruled(host, made.rule, made.params)?;
+        let rule = Stepper::Named(ruled(host, made.rule, made.params)?);
+        Self::made(host, rule, made)
+    }
+
+    pub fn create_law(
+        host: &'host Host,
+        law: &crate::law::Law,
+        made: &Made<'_>,
+    ) -> Result<Self, Failed> {
+        if made.rule != law.name() {
+            return Err(Box::new(Refused::Rule {
+                name: made.rule.to_owned(),
+            }));
+        }
+        let rule = lawful(law, made.params)?;
+        Self::made(host, rule, made)
+    }
+
+    fn made(host: &'host Host, rule: Stepper, made: &Made<'_>) -> Result<Self, Failed> {
         let shape = planned(host.width(), made.size, made.sparse)?;
         let plan = shape.1;
         let pool = if made.sparse {
@@ -332,7 +461,7 @@ impl<'host> World<'host> {
                 .slots
                 .unwrap_or((plan.blocks / 4).max(least))
                 .clamp(1, most_slots(&plan));
-            Some(Bricks::new(shape.0, &plan, capacity)?)
+            Some(pooled(Bricks::new(shape.0, &plan, capacity)?, &rule)?)
         } else {
             None
         };
@@ -360,7 +489,14 @@ impl<'host> World<'host> {
     }
 
     pub fn open(host: &'host Host, image: &Image) -> Result<Self, Failed> {
-        let rule = ruled(host, image.law.name(), &image.params)?;
+        let rule = stepper_of(host, &image.law, &image.params)?;
+        if rule.planes() != image.channels() {
+            return Err(Box::new(Refused::Sizes {
+                what: "channels",
+                header: u64::from(image.channels()),
+                found: u64::from(rule.planes()),
+            }));
+        }
         let sparse = matches!(image.state, State::Sparse { .. });
         let shape = planned(host.width(), image.size, sparse).map_err(|why| {
             if why.downcast_ref::<TooBig>().is_some()
@@ -380,7 +516,7 @@ impl<'host> World<'host> {
         let mut world = match &image.state {
             State::Dense(cells) => {
                 let mut world = Self::built(host, rule, image.params.clone(), shape, None)?;
-                let windows = world.plan.windows();
+                let windows = world.rule.windows(&world.plan);
                 zeroed(&mut world.live, &world.sizes, Some((windows, cells.len())))?;
                 live::write_state(&mut world.live, windows, 0, cells)?;
                 world.parameters()?;
@@ -392,8 +528,14 @@ impl<'host> World<'host> {
                 table,
                 pool,
             } => {
-                let (bricks, packed) =
-                    repacked(image, &plan, grid, *capacity, *sides, table, pool)?;
+                let (bricks, packed) = repacked(
+                    image,
+                    (&plan, grid, rule.planes()),
+                    *capacity,
+                    *sides,
+                    table,
+                    pool,
+                )?;
                 let mut world = Self::built(host, rule, image.params.clone(), shape, Some(bricks))?;
                 let reach = packed.pool.len();
                 zeroed(
@@ -449,6 +591,20 @@ impl<'host> World<'host> {
     }
 
     pub fn write(&mut self, cells: &[([u32; 3], u32)]) -> Result<(), Failed> {
+        self.write_plane(0, cells)
+    }
+
+    #[must_use]
+    pub fn planes(&self) -> u32 {
+        self.rule.planes()
+    }
+
+    pub fn write_plane(&mut self, plane: u32, cells: &[([u32; 3], u32)]) -> Result<(), Failed> {
+        if plane >= self.planes() {
+            return Err(Box::new(Refused::Malformed {
+                what: format!("plane {plane} is past the world's {} planes", self.planes()),
+            }));
+        }
         let size = self.size();
         if let Some(&(at, _)) = cells
             .iter()
@@ -457,7 +613,7 @@ impl<'host> World<'host> {
             return Err(Box::new(Refused::Outside { at, size }));
         }
         match self.pool {
-            Some(bricks) => bricks.put_at(&mut self.live, cells)?,
+            Some(bricks) => bricks.put_plane_at(&mut self.live, plane as usize, cells)?,
             None => {
                 let mut indexed = Vec::with_capacity(cells.len());
                 for &(at, word) in cells {
@@ -466,7 +622,11 @@ impl<'host> World<'host> {
                         + u64::from(at[0]);
                     indexed.push((u32::try_from(index)?, word));
                 }
-                live::put3(&mut self.live, self.grid, &self.plan, &indexed)?;
+                let placed = live::Placed3 {
+                    windows: Some(self.rule.windows(&self.plan)),
+                    plane,
+                };
+                live::put3_in(&mut self.live, self.grid, &self.plan, placed, &indexed)?;
             }
         }
         Ok(())
@@ -493,8 +653,8 @@ impl<'host> World<'host> {
             Some(bricks) => Ok(bricks.read(&mut self.live)?),
             None => Ok(live::read_state(
                 &mut self.live,
-                self.plan.windows(),
-                self.grid.cells(),
+                self.rule.windows(&self.plan),
+                self.grid.cells() * self.rule.planes() as usize,
             )?),
         }
     }
@@ -521,60 +681,71 @@ impl<'host> World<'host> {
         let table = self
             .live
             .read(bricks.table() as usize, bricks.table_words())?;
-        Ok(Some((bricks.windows(), reach_of(&bricks, &table))))
+        Ok(Some((bricks.windows(), planes_reach(&bricks, &table))))
     }
 
     pub fn image(&mut self) -> Result<Image, Failed> {
         let state = match self.pool {
             None => State::Dense(live::read_state(
                 &mut self.live,
-                self.plan.windows(),
-                self.grid.cells(),
+                self.rule.windows(&self.plan),
+                self.grid.cells() * self.rule.planes() as usize,
             )?),
             Some(bricks) => {
                 bricks.check(&mut self.live)?;
                 let table = self
                     .live
                     .read(bricks.table() as usize, bricks.table_words())?;
-                let reach = reach_of(&bricks, &table);
+                let reach = planes_reach(&bricks, &table);
                 let raw = live::read_state(&mut self.live, bricks.windows(), reach)?;
                 let per = bricks.cells();
-                let mut canonical = Vec::with_capacity(bricks.count() as usize * 2);
-                let mut pool = Vec::new();
+                let count = bricks.count() as usize;
+                let planes = bricks.planes();
+                let mut canonical = Vec::with_capacity(count * (planes + 1));
+                let mut values: Vec<Vec<u32>> = vec![Vec::with_capacity(count); planes - 1];
+                let mut pools: Vec<Vec<u32>> = vec![Vec::new(); planes];
                 let mut held = 0_u32;
-                for entry in table
-                    .as_chunks::<ENTRY>()
-                    .0
-                    .iter()
-                    .take(bricks.count() as usize)
+                for (brick, entry) in (0_u32..).zip(table.as_chunks::<ENTRY>().0.iter().take(count))
                 {
                     let slot = entry.first().copied().unwrap_or(UNIFORM);
                     if slot == UNIFORM {
                         canonical.extend([UNIFORM, entry.get(1).copied().unwrap_or_default()]);
+                        for (plane, plane_values) in (1..).zip(values.iter_mut()) {
+                            plane_values.push(
+                                table
+                                    .get(bricks.value_at(plane, brick))
+                                    .copied()
+                                    .unwrap_or_default(),
+                            );
+                        }
                         continue;
                     }
-                    let from = slot as usize * per;
-                    let words = raw
-                        .get(from..from + per)
-                        .ok_or_else(|| Refused::Malformed {
-                            what: format!("held slot {slot} lies past the pool read back"),
-                        })?;
-                    pool.extend_from_slice(words);
+                    for (plane, pool) in pools.iter_mut().enumerate() {
+                        let from = plane * bricks.plane_words() + slot as usize * per;
+                        let words =
+                            raw.get(from..from + per)
+                                .ok_or_else(|| Refused::Malformed {
+                                    what: format!("held slot {slot} lies past the pool read back"),
+                                })?;
+                        pool.extend_from_slice(words);
+                    }
+                    for plane_values in &mut values {
+                        plane_values.push(0);
+                    }
                     canonical.extend([held, 0]);
                     held += 1;
                 }
+                canonical.extend(values.concat());
                 State::Sparse {
                     capacity: bricks.capacity(),
                     sides: bricks.sides(),
                     table: canonical,
-                    pool,
+                    pool: pools.concat(),
                 }
             }
         };
         Ok(Image {
-            law: Law::Rule {
-                name: self.rule.name().to_owned(),
-            },
+            law: self.rule.law(),
             params: self.params.clone(),
             frame: self.frame,
             size: self.size(),
@@ -624,6 +795,14 @@ impl<'host> World<'host> {
     }
 }
 
+fn planes_reach(bricks: &Bricks, table: &[u32]) -> usize {
+    let reach = reach_of(bricks, table);
+    if bricks.planes() <= 1 || reach == 0 {
+        return reach;
+    }
+    (bricks.planes() - 1) * bricks.plane_words() + reach
+}
+
 fn reach_of(bricks: &Bricks, table: &[u32]) -> usize {
     table
         .as_chunks::<ENTRY>()
@@ -639,15 +818,16 @@ fn reach_of(bricks: &Bricks, table: &[u32]) -> usize {
 
 fn repacked(
     image: &Image,
-    plan: &Plan,
-    grid: Grid,
+    (plan, grid, planes): (&Plan, Grid, u32),
     capacity: u32,
     sides: [u32; 3],
     table: &[u32],
     pool: &[u32],
 ) -> Result<(Bricks, Packed), Failed> {
     let refused = |why: LaneError| Box::new(unfit(why)) as Failed;
-    let probe = Bricks::new(grid, plan, most_slots(plan).max(1)).map_err(refused)?;
+    let probe = Bricks::new(grid, plan, most_slots(plan).max(1))
+        .and_then(|probe| probe.with_planes(planes))
+        .map_err(refused)?;
     let same = probe.sides() == sides;
     let wanted = if same {
         u64::from(capacity)
@@ -656,9 +836,12 @@ fn repacked(
     };
     let fits = |wanted: u64| {
         let capacity = u32::try_from(wanted.clamp(1, u64::from(plan.blocks))).unwrap_or(u32::MAX);
-        Bricks::new(grid, plan, capacity).map_err(refused)
+        Bricks::new(grid, plan, capacity)
+            .and_then(|bricks| bricks.with_planes(planes))
+            .map_err(refused)
     };
     let bricks = fits(wanted)?;
+    let count = probe.count() as usize;
     let packed = if same {
         let mut entries = vec![0_u32; probe.table_words()];
         for (entry, pair) in entries
@@ -671,23 +854,37 @@ fn repacked(
                 head.copy_from_slice(pair);
             }
         }
+        for plane in 1..probe.planes() {
+            let from = 2 * count + (plane - 1) * count;
+            let base = probe.plane_values(plane) as usize;
+            if let (Some(into), Some(given)) = (
+                entries.get_mut(base..base + count),
+                table.get(from..from + count),
+            ) {
+                into.copy_from_slice(given);
+            }
+        }
         Packed {
             table: entries,
             pool: pool.to_vec(),
             slots: Vec::new(),
-            held: u32::try_from(pool.len() / probe.cells()).unwrap_or(u32::MAX),
+            held: u32::try_from(pool.len() / (probe.cells() * probe.planes())).unwrap_or(u32::MAX),
         }
     } else {
+        let lattice = format::lattice_of(image.size, sides);
+        let per = format::brick_cells(sides);
         let source = Source {
             size: image.size,
             sides,
-            lattice: format::lattice_of(image.size, sides),
-            per: format::brick_cells(sides),
+            lattice,
+            per,
+            bricks: lattice.iter().map(|&side| side as usize).product(),
+            held: pool.len() / (per * planes as usize).max(1),
             table,
             pool,
         };
         probe
-            .compose(|brick| source.content(&probe, brick))
+            .compose_planes(|brick| source.contents(&probe, brick))
             .map_err(fitted)?
     };
     let bricks = if packed.held > bricks.capacity() {
@@ -704,31 +901,39 @@ struct Source<'image> {
     sides: [u32; 3],
     lattice: [u32; 3],
     per: usize,
+    bricks: usize,
+    held: usize,
     table: &'image [u32],
     pool: &'image [u32],
 }
 
 impl Source<'_> {
-    fn entry(&self, brick: usize) -> (u32, u32) {
+    fn entry(&self, brick: usize, plane: usize) -> (u32, u32) {
+        let value = match plane {
+            0 => self.table.get(brick * 2 + 1),
+            _ => self
+                .table
+                .get(2 * self.bricks + (plane - 1) * self.bricks + brick),
+        };
         (
             self.table.get(brick * 2).copied().unwrap_or(UNIFORM),
-            self.table.get(brick * 2 + 1).copied().unwrap_or_default(),
+            value.copied().unwrap_or_default(),
         )
     }
 
-    fn word(&self, point: [u32; 3]) -> u32 {
+    fn word(&self, point: [u32; 3], plane: usize) -> u32 {
         let (brick, offset) = format::place(point, self.sides, self.lattice);
-        let (slot, value) = self.entry(brick);
+        let (slot, value) = self.entry(brick, plane);
         if slot == UNIFORM {
             return value;
         }
         self.pool
-            .get(slot as usize * self.per + offset)
+            .get(plane * self.held * self.per + slot as usize * self.per + offset)
             .copied()
             .unwrap_or_default()
     }
 
-    fn uniform(&self, from: [u32; 3], sides: [u32; 3]) -> Option<u32> {
+    fn uniform(&self, from: [u32; 3], sides: [u32; 3], plane: usize) -> Option<u32> {
         let mut low = [0_u32; 3];
         let mut high = [0_u32; 3];
         for axis in 0..3 {
@@ -748,7 +953,7 @@ impl Source<'_> {
                     let brick = ((z as usize * self.lattice[1] as usize) + y as usize)
                         * self.lattice[0] as usize
                         + x as usize;
-                    let (slot, value) = self.entry(brick);
+                    let (slot, value) = self.entry(brick, plane);
                     if slot != UNIFORM || found.is_some_and(|held| held != value) {
                         return None;
                     }
@@ -759,14 +964,18 @@ impl Source<'_> {
         found
     }
 
-    fn content(&self, target: &Bricks, brick: u32) -> Content {
+    fn contents(&self, target: &Bricks, brick: u32) -> Vec<Content> {
         let from = target.point_of(brick, 0);
-        if let Some(value) = self.uniform(from, target.sides()) {
-            return Content::Uniform(value);
-        }
-        let words = (0..u32::try_from(target.cells()).unwrap_or(u32::MAX))
-            .map(|offset| self.word(target.point_of(brick, offset)))
-            .collect();
-        Content::Mixed(words)
+        (0..target.planes())
+            .map(|plane| {
+                if let Some(value) = self.uniform(from, target.sides(), plane) {
+                    return Content::Uniform(value);
+                }
+                let words = (0..u32::try_from(target.cells()).unwrap_or(u32::MAX))
+                    .map(|offset| self.word(target.point_of(brick, offset), plane))
+                    .collect();
+                Content::Mixed(words)
+            })
+            .collect()
     }
 }

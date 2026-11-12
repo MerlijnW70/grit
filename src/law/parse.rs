@@ -452,14 +452,6 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
         u64::from(limits::CHANNELS),
         "a count of channels",
     )?;
-    if channels > 1 {
-        return Err(refused(
-            Code::Unsupported,
-            &root.key("channels"),
-            "1 channel: worlds of several planes are not built yet",
-            channels.to_string(),
-        ));
-    }
     let halo = whole(
         field(top, "halo"),
         &root.key("halo"),

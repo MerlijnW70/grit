@@ -121,6 +121,8 @@ pub fn reference<R: Rule>(
         .map(|which| crate::rule3::param(params, which))
         .collect();
     let mut out = cells.to_vec();
+    let planes = rule.planes();
+    let stride = grid.cells();
     'octs: for oct in 0..grid.octs() {
         let places = grid.corners(frame, oct);
         let mut words = [0; CORNERS];
@@ -130,15 +132,41 @@ pub fn reference<R: Rule>(
             };
             *slot = word;
         }
-        let ruled = rule.step(Oct {
+        let oct_of = Oct {
             words,
             frame,
             at: lattice(grid, oct),
             params: &held,
-        });
-        for (place, value) in places.into_iter().zip(ruled.out) {
+        };
+        if planes <= 1 {
+            let ruled = rule.step(oct_of);
+            for (place, value) in places.into_iter().zip(ruled.out) {
+                if let Some(slot) = out.get_mut(place) {
+                    *slot = value;
+                }
+            }
+            continue;
+        }
+        let mut upper = vec![[0_u32; CORNERS]; planes - 1];
+        for (plane, words) in (1..).zip(upper.iter_mut()) {
+            for (slot, place) in words.iter_mut().zip(places) {
+                let Some(&word) = out.get(plane * stride + place) else {
+                    continue 'octs;
+                };
+                *slot = word;
+            }
+        }
+        let planed = rule.step_planes(oct_of, &upper);
+        for (place, value) in places.into_iter().zip(planed.ruled.out) {
             if let Some(slot) = out.get_mut(place) {
                 *slot = value;
+            }
+        }
+        for (plane, words) in (1..).zip(planed.planes.iter().take(planes - 1)) {
+            for (place, &value) in places.into_iter().zip(words) {
+                if let Some(slot) = out.get_mut(plane * stride + place) {
+                    *slot = value;
+                }
             }
         }
     }
@@ -164,6 +192,11 @@ pub const FLAT: &str = "the grid is flat (tall 1), and the 3D kernel steps a sol
 /// count or more than [`crate::rule3::MOST_COUNTS`], or its step gives
 /// another number of counts than it declares.
 pub const MISCOUNTED: &str = "the rule declares no tally count, more than rule3::MOST_COUNTS, or another number than its step gives";
+
+pub const UNPLANED: &str = "the rule declares no plane, more than rule3::MOST_PLANES, or gives another number of planes than it declares";
+
+pub const PLANES_PAST: &str =
+    "the grid's cells times the rule's planes pass the u32 index a kernel addresses STATE with";
 
 /// Why [`settle`] or [`Spread::of`] refuses a device that dispatches no group.
 pub const NO_GROUPS: &str = "the device dispatches no workgroup at all";
@@ -270,6 +303,7 @@ pub fn settle_by<R: Rule>(
     most: u32,
 ) -> Result<Whole, LaneError> {
     let spread = Spread::of(grid, subgroup, most)?;
+    stride_of(rule, grid)?;
     let words = match subgroup {
         4 => whole::<4, R>(rule, subgroup, grid, spread),
         8 => whole::<8, R>(rule, subgroup, grid, spread),
@@ -282,6 +316,24 @@ pub fn settle_by<R: Rule>(
         }),
     }?;
     Ok(Whole { words, spread })
+}
+
+pub(crate) fn stride_of<R: Rule>(rule: &R, grid: Grid) -> Result<u32, LaneError> {
+    let planes = rule.planes();
+    if planes == 0 || planes > crate::rule3::MOST_PLANES {
+        return Err(LaneError::NoSuchForm {
+            operation: "sand3::planes",
+            because: UNPLANED,
+        });
+    }
+    let cells = u64::from(grid.wide) * u64::from(grid.deep) * u64::from(grid.tall);
+    if planes > 1 && cells * planes as u64 > 1 << 32 {
+        return Err(LaneError::NoSuchForm {
+            operation: "sand3::planes",
+            because: PLANES_PAST,
+        });
+    }
+    Ok(u32::try_from(cells).unwrap_or(u32::MAX))
 }
 
 /// Loads the frame, `PARAMS[0]`, and the rule's parameters.
@@ -359,6 +411,45 @@ fn step<const LANES: u32, R: Rule>(
         let mut lanes = kernel.lanes()?;
         placed::<LANES>(&mut lanes, grid, oct, given.frame)?
     };
+
+    let planes = rule.planes();
+    if planes > 1 {
+        let stride = stride_of(rule, grid)?;
+        let mut places = vec![placing.places];
+        for plane in 1..planes {
+            let lifted = {
+                let mut lanes = kernel.lanes()?;
+                let by = u32::try_from(plane).unwrap_or(0).wrapping_mul(stride);
+                let by = lanes.splat_bits::<U32, LANES>(by)?;
+                let mut lifted = placing.places;
+                for place in &mut lifted {
+                    *place = lanes.add(*place, by)?;
+                }
+                lifted
+            };
+            places.push(lifted);
+        }
+        let mut loaded = Vec::with_capacity(planes);
+        for plane in &places {
+            let mut words = [given.frame; CORNERS];
+            for (word, place) in words.iter_mut().zip(plane) {
+                *word = kernel.load_at(STATE, place.id())?;
+            }
+            loaded.push(words);
+        }
+        let out = {
+            let mut lanes = kernel.lanes()?;
+            ruled_planes::<LANES, R>(&mut lanes, rule, &placing, &loaded, given)?
+        };
+        let mut stored = vec![out.ruled.out];
+        stored.extend(out.planes);
+        for (plane, values) in places.iter().zip(&stored) {
+            for (place, value) in plane.iter().zip(values) {
+                kernel.store_at(STATE, place.id(), value.id())?;
+            }
+        }
+        return Ok(());
+    }
 
     let mut loaded = [given.frame; CORNERS];
     for (word, place) in loaded.iter_mut().zip(&placing.places) {
@@ -438,6 +529,56 @@ pub(crate) fn ruled<const LANES: u32, R: Rule>(
         return Err(LaneError::NoSuchForm {
             operation: "sand3::ruled",
             because: MISCOUNTED,
+        });
+    }
+    Ok(stepped)
+}
+
+pub(crate) fn ruled_planes<const LANES: u32, R: Rule>(
+    lanes: &mut Lanes<'_>,
+    rule: &R,
+    placing: &Placing<LANES>,
+    loaded: &[[Id; CORNERS]],
+    given: Given<'_>,
+) -> Result<crate::rule3::Planed<Word<LANES>>, LaneError> {
+    let frame = lanes.splat_id::<U32, LANES>(given.frame)?;
+    let mut splatted = Vec::with_capacity(loaded.len());
+    for plane in loaded {
+        let mut words = [frame; CORNERS];
+        for (word, &id) in words.iter_mut().zip(plane) {
+            *word = lanes.splat_id::<U32, LANES>(id)?;
+        }
+        splatted.push(words);
+    }
+    let mut params = Vec::with_capacity(given.params.len());
+    for &id in given.params {
+        params.push(lanes.splat_id::<U32, LANES>(id)?);
+    }
+    let (first, upper) = splatted.split_first().ok_or(LaneError::NoSuchForm {
+        operation: "sand3::ruled_planes",
+        because: UNPLANED,
+    })?;
+    let stepped = rule.emit_planes::<LANES>(
+        lanes,
+        Oct {
+            words: *first,
+            frame,
+            at: placing.block,
+            params: &params,
+        },
+        upper,
+    )?;
+    let tally = rule.tally();
+    if !tally.fits() || stepped.ruled.counts.len() != tally.counts {
+        return Err(LaneError::NoSuchForm {
+            operation: "sand3::ruled",
+            because: MISCOUNTED,
+        });
+    }
+    if stepped.planes.len() + 1 != rule.planes() || loaded.len() != rule.planes() {
+        return Err(LaneError::NoSuchForm {
+            operation: "sand3::ruled_planes",
+            because: UNPLANED,
         });
     }
     Ok(stepped)

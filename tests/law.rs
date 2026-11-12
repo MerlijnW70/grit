@@ -710,7 +710,10 @@ fn params_counts_channels_and_halo_are_admitted_at_their_limit_and_refused_past_
     let why = refused_at(&with("channels", 5), Code::Channels, "$.channels");
     assert_eq!(why.limit, Some(4));
     refused_at(&with("channels", 0), Code::Channels, "$.channels");
-    refused_at(&with("channels", 4), Code::Unsupported, "$.channels");
+    let planed = edited(&template("[\"vec\",\"cells\",[\"vec\",0]]"), |json| {
+        set(json, "channels", Json::Int(4));
+    });
+    assert_eq!(compiled(&planed).channels(), 4);
     let counted = |counts: i64| {
         let step = format!("[\"vec\",\"cells\",[\"rev\",[\"range\",{counts}]]]");
         template(&step).replace("\"counts\":1", &format!("\"counts\":{counts}"))

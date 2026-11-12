@@ -754,13 +754,51 @@ fn shaped(path: &Path<'_>, found: String) -> Refusal {
     )
 }
 
+fn shaped_planes(path: &Path<'_>, planes: u32, found: String) -> Refusal {
+    refused(
+        Code::Result,
+        path,
+        format!(
+            "[\"vec\", out, counts]: out 8 vecs of {planes} words, and as many count words as tally.counts"
+        ),
+        found,
+    )
+}
+
+fn first_plane(program: &Program<'_>) -> u32 {
+    FIRST_PARAM.saturating_add(u32::try_from(program.params).unwrap_or(u32::MAX))
+}
+
+fn cells_of(program: &Program<'_>) -> Value {
+    if program.channels <= 1 {
+        return Value::List((0..8).map(Value::Word).collect());
+    }
+    let first = first_plane(program);
+    let corners = u32::try_from(CORNERS).unwrap_or(8);
+    Value::List(
+        (0..corners)
+            .map(|corner| {
+                let words: Vec<Value> = (0..program.channels)
+                    .map(|plane| match plane {
+                        0 => Value::Word(corner),
+                        _ => Value::Word(first + (plane - 1) * corners + corner),
+                    })
+                    .collect();
+                Value::List(words.into())
+            })
+            .collect(),
+    )
+}
+
 pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
-    let tracer = Tracer::with_inputs(program.params);
+    let planes = program.channels.max(1);
+    let extra = usize::try_from(planes - 1).unwrap_or(0) * CORNERS;
+    let tracer = Tracer::with_inputs(program.params + extra);
     let mut globals: HashMap<&str, Value> = HashMap::new();
     globals.insert("X", Value::Int(1));
     globals.insert("Z", Value::Int(2));
     globals.insert("Y", Value::Int(4));
-    globals.insert("cells", Value::List((0..8).map(Value::Word).collect()));
+    globals.insert("cells", cells_of(program));
     globals.insert("frame", Value::Word(FRAME));
     globals.insert(
         "at",
@@ -792,16 +830,57 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
         return Err(shaped(&step, format!("[{}, {}]", kind(out), kind(counts))));
     };
     if out.len() != CORNERS || counts.len() != program.tally.counts {
-        return Err(shaped(
-            &step,
-            format!("{} out values and {} counts", out.len(), counts.len()),
-        ));
+        let found = format!("{} out values and {} counts", out.len(), counts.len());
+        return Err(if planes > 1 {
+            shaped_planes(&step, planes, found)
+        } else {
+            shaped(&step, found)
+        });
     }
     let mut ids = [0_u32; CORNERS];
-    for (slot, (index, one)) in ids.iter_mut().zip(out.iter().enumerate()) {
-        let made = operand(one, &step)
-            .map_err(|_| shaped(&step, format!("{} at out[{index}]", kind(one))))?;
-        *slot = expander.id(made, &step)?;
+    let mut upper = vec![[0_u32; CORNERS]; usize::try_from(planes - 1).unwrap_or(0)];
+    if planes > 1 {
+        for (index, one) in out.iter().enumerate() {
+            let Value::List(words) = one else {
+                return Err(shaped_planes(
+                    &step,
+                    planes,
+                    format!("{} at out[{index}]", kind(one)),
+                ));
+            };
+            if words.len() != usize::try_from(planes).unwrap_or(0) {
+                return Err(shaped_planes(
+                    &step,
+                    planes,
+                    format!("{} at out[{index}]", kind(one)),
+                ));
+            }
+            for (plane, word) in words.iter().enumerate() {
+                let made = operand(word, &step).map_err(|_| {
+                    shaped_planes(
+                        &step,
+                        planes,
+                        format!("{} at out[{index}][{plane}]", kind(word)),
+                    )
+                })?;
+                let id = expander.id(made, &step)?;
+                let slot = match plane {
+                    0 => ids.get_mut(index),
+                    _ => upper
+                        .get_mut(plane - 1)
+                        .and_then(|words| words.get_mut(index)),
+                };
+                if let Some(slot) = slot {
+                    *slot = id;
+                }
+            }
+        }
+    } else {
+        for (slot, (index, one)) in ids.iter_mut().zip(out.iter().enumerate()) {
+            let made = operand(one, &step)
+                .map_err(|_| shaped(&step, format!("{} at out[{index}]", kind(one))))?;
+            *slot = expander.id(made, &step)?;
+        }
     }
     let mut tallied = Vec::with_capacity(counts.len());
     for (index, one) in counts.iter().enumerate() {
@@ -816,7 +895,8 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
             tallied,
             program.params,
             program.tally,
-        ),
+        )
+        .with_planes(upper),
         work: expander.work,
         depth: expander.deepest,
     })

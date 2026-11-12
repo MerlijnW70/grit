@@ -43,6 +43,8 @@ pub const UNPLANNED: &str = "the plan's blocks are not the grid's bricks";
 pub const NO_SLOTS: &str = "a brick pool needs at least one slot";
 pub const TOO_MANY_SLOTS: &str =
     "the pool's words pass the u32 index a kernel addresses STATE with";
+pub const PLANES: &str = "a brick pool holds from 1 to rule3::MOST_PLANES planes";
+pub const UNLIKE_PLANES: &str = "the rule's planes are not the brick pool's planes";
 
 const OPERATION: &str = "bricks::Bricks::new";
 
@@ -63,6 +65,7 @@ pub struct Bricks {
     windows: Windows,
     most: u32,
     cold: u32,
+    planes: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +174,54 @@ impl Bricks {
             windows,
             most: MOST_GROUPS,
             cold: plan.padded(),
+            planes: 1,
         })
+    }
+
+    pub fn with_planes(self, planes: u32) -> Result<Self, LaneError> {
+        if planes == 0 || planes as usize > crate::rule3::MOST_PLANES {
+            return Err(refused(PLANES));
+        }
+        let words = u64::from(planes) * u64::from(self.capacity) * self.cells() as u64 + 1;
+        if words > Plan::MOST_WORDS {
+            return Err(refused(TOO_MANY_SLOTS));
+        }
+        let words = usize::try_from(words).map_err(|_| refused(TOO_MANY_SLOTS))?;
+        Ok(Self {
+            windows: Windows::at(words, self.windows.bits()),
+            planes,
+            ..self
+        })
+    }
+
+    #[must_use]
+    pub const fn planes(&self) -> usize {
+        self.planes as usize
+    }
+
+    #[must_use]
+    pub const fn plane_words(&self) -> usize {
+        self.capacity as usize * self.cells()
+    }
+
+    #[must_use]
+    pub const fn plane_start(&self, plane: usize) -> u32 {
+        (plane * self.plane_words()) as u32
+    }
+
+    #[must_use]
+    pub const fn plane_values(&self, plane: usize) -> u32 {
+        let count = self.count() as usize;
+        (count * ENTRY + ENTRY + (plane - 1) * (count + 1)) as u32
+    }
+
+    #[must_use]
+    pub const fn value_at(&self, plane: usize, brick: u32) -> usize {
+        if plane == 0 {
+            brick as usize * ENTRY + VALUE
+        } else {
+            self.plane_values(plane) as usize + brick as usize
+        }
     }
 
     #[cfg(feature = "faults")]
@@ -242,12 +292,12 @@ impl Bricks {
 
     #[must_use]
     pub const fn pool_words(&self) -> usize {
-        self.capacity as usize * self.cells() + 1
+        self.planes as usize * self.capacity as usize * self.cells() + 1
     }
 
     #[must_use]
     pub const fn scratch(&self) -> usize {
-        self.capacity as usize * self.cells()
+        self.planes as usize * self.capacity as usize * self.cells()
     }
 
     #[must_use]
@@ -317,7 +367,8 @@ impl Bricks {
 
     #[must_use]
     pub const fn table_words(&self) -> usize {
-        self.count() as usize * ENTRY + ENTRY
+        let count = self.count() as usize;
+        count * ENTRY + ENTRY + (self.planes as usize - 1) * (count + 1)
     }
 
     #[must_use]
@@ -506,22 +557,28 @@ impl Bricks {
 
     pub fn pack(&self, cells: &[u32]) -> Result<Packed, Error> {
         let grid = self.grid;
-        if cells.len() != grid.cells() {
+        let planes = self.planes();
+        let stride = grid.cells();
+        if cells.len() != stride * planes {
             return Err(Error::Overrun {
                 index: STATE as usize,
-                needed: grid.cells(),
+                needed: stride * planes,
                 held: cells.len(),
             });
         }
         let per = self.cells();
-        self.compose(|brick| {
-            let mut words = vec![0_u32; per];
-            for (offset, word) in (0_u32..).zip(words.iter_mut()) {
-                let point = self.point_of(brick, offset);
-                let at = Solid::cell(grid, point) as usize;
-                *word = cells.get(at).copied().unwrap_or_default();
-            }
-            Content::Mixed(words)
+        self.compose_planes(|brick| {
+            (0..planes)
+                .map(|plane| {
+                    let mut words = vec![0_u32; per];
+                    for (offset, word) in (0_u32..).zip(words.iter_mut()) {
+                        let point = self.point_of(brick, offset);
+                        let at = plane * stride + Solid::cell(grid, point) as usize;
+                        *word = cells.get(at).copied().unwrap_or_default();
+                    }
+                    Content::Mixed(words)
+                })
+                .collect()
         })
     }
 
@@ -529,32 +586,52 @@ impl Bricks {
     where
         F: FnMut(u32) -> Content,
     {
+        self.compose_planes(|brick| vec![content(brick)])
+    }
+
+    pub fn compose_planes<F>(&self, mut content: F) -> Result<Packed, Error>
+    where
+        F: FnMut(u32) -> Vec<Content>,
+    {
         let per = self.cells();
+        let planes = self.planes();
         let mut table = vec![0_u32; self.table_words()];
-        let mut pool = Vec::new();
+        let mut pools: Vec<Vec<u32>> = vec![Vec::new(); planes];
         let mut held = 0_u32;
         for brick in 0..self.count() {
             let entry = brick as usize * ENTRY;
-            let words = match content(brick) {
-                Content::Uniform(value) => {
-                    if let Some(slot) = table.get_mut(entry..entry + 2) {
-                        slot.copy_from_slice(&[UNIFORM, value]);
+            let mut given = content(brick).into_iter();
+            let mut words: Vec<Content> = Vec::with_capacity(planes);
+            for _ in 0..planes {
+                words.push(given.next().unwrap_or(Content::Uniform(0)));
+            }
+            let mut flat: Vec<Option<u32>> = Vec::with_capacity(planes);
+            for one in &words {
+                flat.push(match one {
+                    Content::Uniform(value) => Some(*value),
+                    Content::Mixed(words) => {
+                        if words.len() != per {
+                            return Err(Error::Overrun {
+                                index: STATE as usize,
+                                needed: per,
+                                held: words.len(),
+                            });
+                        }
+                        let first = words.first().copied().unwrap_or_default();
+                        words.iter().all(|&word| word == first).then_some(first)
                     }
-                    continue;
-                }
-                Content::Mixed(words) => words,
-            };
-            if words.len() != per {
-                return Err(Error::Overrun {
-                    index: STATE as usize,
-                    needed: per,
-                    held: words.len(),
                 });
             }
-            let first = words.first().copied().unwrap_or_default();
-            if words.iter().all(|&word| word == first) {
-                if let Some(slot) = table.get_mut(entry..entry + 2) {
-                    slot.copy_from_slice(&[UNIFORM, first]);
+            if flat.iter().all(Option::is_some) {
+                for (plane, value) in flat.iter().enumerate() {
+                    let value = value.unwrap_or_default();
+                    if plane == 0 {
+                        if let Some(slot) = table.get_mut(entry..entry + 2) {
+                            slot.copy_from_slice(&[UNIFORM, value]);
+                        }
+                    } else if let Some(slot) = table.get_mut(self.value_at(plane, brick)) {
+                        *slot = value;
+                    }
                 }
                 continue;
             }
@@ -566,9 +643,15 @@ impl Bricks {
             if let Some(slot) = table.get_mut(entry) {
                 *slot = held;
             }
-            pool.extend_from_slice(&words);
+            for (pool, one) in pools.iter_mut().zip(words) {
+                match one {
+                    Content::Uniform(value) => pool.extend(std::iter::repeat_n(value, per)),
+                    Content::Mixed(words) => pool.extend_from_slice(&words),
+                }
+            }
             held += 1;
         }
+        let pool = pools.concat();
         let top = self.capacity - held;
         let mut slots = vec![top, 0, 0, 0];
         slots.extend((0..top).map(|place| self.capacity - 1 - place));
@@ -590,6 +673,22 @@ impl Bricks {
         let mut slots = vec![top, 0, 0, 0];
         slots.extend((0..top).map(|place| self.capacity - 1 - place));
         Ok(Packed { slots, ..packed })
+    }
+
+    #[must_use]
+    pub fn brick_plane(&self, table: &[u32], pool: &[u32], brick: u32, plane: usize) -> Content {
+        let entry = brick as usize * ENTRY;
+        let slot = table.get(entry).copied().unwrap_or(UNIFORM);
+        let value = table
+            .get(self.value_at(plane, brick))
+            .copied()
+            .unwrap_or_default();
+        if slot == UNIFORM {
+            return Content::Uniform(value);
+        }
+        let per = self.cells();
+        let from = plane * self.plane_words() + slot as usize * per;
+        Content::Mixed(pool.get(from..from + per).unwrap_or_default().to_vec())
     }
 
     pub fn raw(&self, held: &mut Resident<'_>) -> Result<(Vec<u32>, Vec<u32>), Error> {
@@ -629,7 +728,14 @@ impl Bricks {
     ) -> Result<PoolUse, Error> {
         held.write(self.table() as usize, &packed.table)?;
         held.write(self.slots() as usize, &packed.slots)?;
-        live::write_state(held, self.windows, 0, &packed.pool)?;
+        let span = packed.held as usize * self.cells();
+        if self.planes() == 1 || span == 0 {
+            live::write_state(held, self.windows, 0, &packed.pool)?;
+        } else {
+            for (plane, words) in packed.pool.chunks(span).take(self.planes()).enumerate() {
+                live::write_state(held, self.windows, plane * self.plane_words(), words)?;
+            }
+        }
         let tier = self.tier();
         let hot_padded = plan.hot_tiles as usize * plan.per_block as usize;
         for (binding, words) in [
@@ -686,22 +792,30 @@ impl Bricks {
     pub fn unpack(&self, table: &[u32], pool: &[u32]) -> Vec<u32> {
         let grid = self.grid;
         let per = self.cells();
-        let mut cells = vec![0_u32; grid.cells()];
-        for brick in 0..self.count() {
-            let entry = brick as usize * ENTRY;
-            let slot = table.get(entry).copied().unwrap_or(UNIFORM);
-            let value = table.get(entry + VALUE).copied().unwrap_or_default();
-            for offset in 0..per {
-                let word = if slot == UNIFORM {
-                    value
-                } else {
-                    pool.get(slot as usize * per + offset)
-                        .copied()
-                        .unwrap_or_default()
-                };
-                let point = self.point_of(brick, u32::try_from(offset).unwrap_or(u32::MAX));
-                if let Some(cell) = cells.get_mut(Solid::cell(grid, point) as usize) {
-                    *cell = word;
+        let stride = grid.cells();
+        let mut cells = vec![0_u32; stride * self.planes()];
+        for plane in 0..self.planes() {
+            let from = plane * self.plane_words();
+            for brick in 0..self.count() {
+                let entry = brick as usize * ENTRY;
+                let slot = table.get(entry).copied().unwrap_or(UNIFORM);
+                let value = table
+                    .get(self.value_at(plane, brick))
+                    .copied()
+                    .unwrap_or_default();
+                for offset in 0..per {
+                    let word = if slot == UNIFORM {
+                        value
+                    } else {
+                        pool.get(from + slot as usize * per + offset)
+                            .copied()
+                            .unwrap_or_default()
+                    };
+                    let point = self.point_of(brick, u32::try_from(offset).unwrap_or(u32::MAX));
+                    let at = plane * stride + Solid::cell(grid, point) as usize;
+                    if let Some(cell) = cells.get_mut(at) {
+                        *cell = word;
+                    }
                 }
             }
         }
@@ -726,7 +840,24 @@ impl Bricks {
     }
 
     pub fn put_at(&self, held: &mut Resident<'_>, cells: &[([u32; 3], u32)]) -> Result<(), Error> {
+        self.put_plane_at(held, 0, cells)
+    }
+
+    pub fn put_plane_at(
+        &self,
+        held: &mut Resident<'_>,
+        plane: usize,
+        cells: &[([u32; 3], u32)],
+    ) -> Result<(), Error> {
         use std::collections::BTreeSet;
+
+        if plane >= self.planes() {
+            return Err(Error::Overrun {
+                index: STATE as usize,
+                needed: (plane + 1) * self.plane_words(),
+                held: self.scratch(),
+            });
+        }
 
         use crate::layout::{AWAKE, HOT};
 
@@ -761,7 +892,10 @@ impl Bricks {
             let Cell { brick, .. } = self.cell_of(point);
             let entry = brick as usize * ENTRY;
             let slot = table.get(entry).copied().unwrap_or(UNIFORM);
-            let value = table.get(entry + VALUE).copied().unwrap_or_default();
+            let value = table
+                .get(self.value_at(plane, brick))
+                .copied()
+                .unwrap_or_default();
             if slot == UNIFORM && word != value {
                 wanted.insert(brick);
             }
@@ -788,7 +922,10 @@ impl Bricks {
             let Cell { brick, offset } = self.cell_of(point);
             let entry = brick as usize * ENTRY;
             let slot = table.get(entry).copied().unwrap_or(UNIFORM);
-            let value = table.get(entry + VALUE).copied().unwrap_or_default();
+            let value = table
+                .get(self.value_at(plane, brick))
+                .copied()
+                .unwrap_or_default();
             let slot = if slot != UNIFORM {
                 Some(slot)
             } else if word == value {
@@ -800,7 +937,18 @@ impl Bricks {
                     });
                 };
                 top -= 1;
-                live::write_state(held, self.windows, taken as usize * per, &vec![value; per])?;
+                for filled in 0..self.planes() {
+                    let kept = table
+                        .get(self.value_at(filled, brick))
+                        .copied()
+                        .unwrap_or_default();
+                    live::write_state(
+                        held,
+                        self.windows,
+                        filled * self.plane_words() + taken as usize * per,
+                        &vec![kept; per],
+                    )?;
+                }
                 let level = levels.get(brick as usize).copied().unwrap_or_default();
                 held.write_at(
                     AWAKE as usize,
@@ -817,7 +965,7 @@ impl Bricks {
                 live::write_state(
                     held,
                     self.windows,
-                    slot as usize * per + offset as usize,
+                    plane * self.plane_words() + slot as usize * per + offset as usize,
                     &[word],
                 )?;
             }
@@ -974,6 +1122,12 @@ pub fn settle<R: Rule>(
     act: Act,
     listing: Listing,
 ) -> Result<Vec<u32>, LaneError> {
+    if rule.planes() != bricks.planes() {
+        return Err(LaneError::NoSuchForm {
+            operation: "bricks::settle",
+            because: UNLIKE_PLANES,
+        });
+    }
     let subgroup = bricks.subgroup;
     widths!(subgroup, settled, [R], (rule, bricks, act, listing))
 }
@@ -1117,7 +1271,7 @@ fn settled<const LANES: u32, R: Rule>(
     act: Act,
     listing: Listing,
 ) -> Result<Vec<u32>, LaneError> {
-    use crate::sand3::{Given, Placing, frame_and_params, ruled};
+    use crate::sand3::{Given, Placing, frame_and_params, ruled, ruled_planes};
 
     let subgroup = bricks.subgroup;
     let windows = bricks.windows();
@@ -1204,6 +1358,43 @@ fn settled<const LANES: u32, R: Rule>(
         holding.push(held);
     }
 
+    let planes = bricks.planes();
+    let mut plane_values: Vec<[Id; CORNERS]> = Vec::new();
+    let mut plane_words: Vec<[Id; CORNERS]> = Vec::new();
+    let mut plane_addresses: Vec<Vec<Vector<U32, LANES>>> = Vec::new();
+    for plane in 1..planes {
+        let mut values_of = [frame; CORNERS];
+        let mut words_of = [frame; CORNERS];
+        let mut addresses_of = Vec::with_capacity(CORNERS);
+        for (((value, word), cell), (address, held)) in values_of
+            .iter_mut()
+            .zip(words_of.iter_mut())
+            .zip(&placed.cells)
+            .zip(addresses.iter().zip(&holding))
+        {
+            let (value_at, lifted) = {
+                let mut lanes = kernel.lanes()?;
+                let base = lanes.splat_bits::<U32, LANES>(bricks.plane_values(plane))?;
+                let by = lanes.splat_bits::<U32, LANES>(bricks.plane_start(plane))?;
+                (lanes.add(cell.brick, base)?, lanes.add(*address, by)?)
+            };
+            *value = kernel.load_at(table, value_at.id())?;
+            let loaded = live::state_load(&mut kernel, windows, lifted.id())?;
+            *word = {
+                let mut lanes = kernel.lanes()?;
+                let loaded = lanes.splat_id::<U32, LANES>(loaded)?;
+                let value = lanes.splat_id::<U32, LANES>(*value)?;
+                let none = lanes.splat_bits::<U32, LANES>(0)?;
+                let kept = lanes.greater_than(*held, none)?;
+                lanes.select(kept, loaded, value)?.id()
+            };
+            addresses_of.push(lifted);
+        }
+        plane_values.push(values_of);
+        plane_words.push(words_of);
+        plane_addresses.push(addresses_of);
+    }
+
     let stepped = |kernel: &mut Kernel<U32>| {
         let mut lanes = kernel.lanes()?;
         let given = Given {
@@ -1214,7 +1405,16 @@ fn settled<const LANES: u32, R: Rule>(
             places: [placed.block[0]; CORNERS],
             block: placed.block,
         };
-        ruled::<LANES, R>(&mut lanes, rule, &placing, words, given)
+        if planes > 1 {
+            let mut loaded = vec![words];
+            loaded.extend(plane_words.iter().copied());
+            let planed = ruled_planes::<LANES, R>(&mut lanes, rule, &placing, &loaded, given)?;
+            return Ok((planed.ruled, planed.planes));
+        }
+        Ok::<_, LaneError>((
+            ruled::<LANES, R>(&mut lanes, rule, &placing, words, given)?,
+            Vec::new(),
+        ))
     };
 
     match act {
@@ -1258,12 +1458,13 @@ fn settled<const LANES: u32, R: Rule>(
                 lanes.mul(any, inside)?
             };
             crate::gate::if_any::<LANES, _>(&mut kernel, needs.id(), |kernel| {
-                let step = stepped(kernel)?;
-                for ((cell, &value), (&held, out)) in placed
+                let (step, upper) = stepped(kernel)?;
+                for (corner, ((cell, &value), (&held, out))) in placed
                     .cells
                     .iter()
                     .zip(&values)
                     .zip(holding.iter().zip(&step.out))
+                    .enumerate()
                 {
                     let (wanted, wants) = {
                         let mut lanes = kernel.lanes()?;
@@ -1273,7 +1474,17 @@ fn settled<const LANES: u32, R: Rule>(
                         let entry = lanes.mul(cell.brick, four)?;
                         let value = lanes.splat_id::<U32, LANES>(value)?;
                         let differs = lanes.not_equal(*out, value)?;
-                        let differs = ones(&mut lanes, differs)?;
+                        let mut differs = ones(&mut lanes, differs)?;
+                        for (outs, plane_value) in upper.iter().zip(&plane_values) {
+                            if let (Some(out), Some(&plane_value)) =
+                                (outs.get(corner), plane_value.get(corner))
+                            {
+                                let plane_value = lanes.splat_id::<U32, LANES>(plane_value)?;
+                                let other = lanes.not_equal(*out, plane_value)?;
+                                let other = ones(&mut lanes, other)?;
+                                differs = lanes.max(differs, other)?;
+                            }
+                        }
                         let uniform = lanes.equal(held, none)?;
                         let uniform = ones(&mut lanes, uniform)?;
                         let wants = lanes.mul(differs, uniform)?;
@@ -1286,7 +1497,7 @@ fn settled<const LANES: u32, R: Rule>(
             })?;
         }
         Act::Settle => {
-            let step = stepped(&mut kernel)?;
+            let (step, upper) = stepped(&mut kernel)?;
             let go = {
                 let mut lanes = kernel.lanes()?;
                 let none = lanes.splat_bits::<U32, LANES>(0)?;
@@ -1318,6 +1529,36 @@ fn settled<const LANES: u32, R: Rule>(
                 let one = kernel.module().constant_u32(1)?;
                 store_if::<LANES>(&mut kernel, lost, bricks.slots(), flagged, one)?;
             }
+            for ((outs, plane_value), plane_address) in
+                upper.iter().zip(&plane_values).zip(&plane_addresses)
+            {
+                for (((address, &held), &value), out) in plane_address
+                    .iter()
+                    .zip(&holding)
+                    .zip(plane_value)
+                    .zip(outs)
+                {
+                    let (kept, lost) = {
+                        let mut lanes = kernel.lanes()?;
+                        let none = lanes.splat_bits::<U32, LANES>(0)?;
+                        let kept = lanes.mul(go, held)?;
+                        let value = lanes.splat_id::<U32, LANES>(value)?;
+                        let differs = lanes.not_equal(*out, value)?;
+                        let differs = ones(&mut lanes, differs)?;
+                        let uniform = lanes.equal(held, none)?;
+                        let uniform = ones(&mut lanes, uniform)?;
+                        let lost = lanes.mul(differs, uniform)?;
+                        (kept, lanes.mul(lost, go)?)
+                    };
+                    let storing = truth::<LANES>(&mut kernel, kept)?;
+                    live::lane_if(&mut kernel, storing, |kernel| {
+                        live::state_store(kernel, windows, address.id(), out.id())
+                    })?;
+                    let flagged = kernel.module().constant_u32(LOST as u32)?;
+                    let one = kernel.module().constant_u32(1)?;
+                    store_if::<LANES>(&mut kernel, lost, bricks.slots(), flagged, one)?;
+                }
+            }
 
             if listing == Listing::Listed {
                 let (waking, counting) = {
@@ -1330,6 +1571,14 @@ fn settled<const LANES: u32, R: Rule>(
                         let same = lanes.equal(before, after)?;
                         let differs = lanes.select(same, none, one)?;
                         touched = lanes.add(touched, differs)?;
+                    }
+                    for (befores, afters) in plane_words.iter().zip(&upper) {
+                        for (&before, &after) in befores.iter().zip(afters) {
+                            let before = lanes.splat_id::<U32, LANES>(before)?;
+                            let same = lanes.equal(before, after)?;
+                            let differs = lanes.select(same, none, one)?;
+                            touched = lanes.add(touched, differs)?;
+                        }
                     }
                     (lanes.mul(touched, go)?, go)
                 };
@@ -1446,7 +1695,12 @@ fn quieted<const LANES: u32>(bricks: &Bricks, plan: &Plan) -> Result<Vec<u32>, L
                 };
                 Ok(vec![sum.id()])
             })?;
-        let differs = differs.first().copied().unwrap_or(zero);
+        let mut differs = differs.first().copied().unwrap_or(zero);
+        for plane in 1..bricks.planes() {
+            let by = kernel.module().constant_u32(bricks.plane_start(plane))?;
+            let lifted = kernel.module().i_add(uint, start.id(), by)?;
+            differs = uneven::<LANES>(kernel, windows, lifted, words, differs)?;
+        }
         let flag = {
             let mut lanes = kernel.lanes()?;
             let differs = lanes.splat_id::<U32, LANES>(differs)?;
@@ -1458,6 +1712,36 @@ fn quieted<const LANES: u32>(bricks: &Bricks, plan: &Plan) -> Result<Vec<u32>, L
         kernel.store_at(tier.flags, flag_at.id(), flag.id())
     })?;
     kernel.finish()
+}
+
+fn uneven<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    windows: Windows,
+    start: Id,
+    words: u32,
+    so_far: Id,
+) -> Result<Id, LaneError> {
+    let uint = kernel.index_type();
+    let first = live::state_load(kernel, windows, start)?;
+    let differs =
+        kernel.repeat_rolled_many(words - 1, uint, &[so_far], |kernel, carried, along| {
+            let one = kernel.module().constant_u32(1)?;
+            let next = kernel.module().i_add(uint, start, one)?;
+            let at = kernel.module().i_add(uint, next, along)?;
+            let word = live::state_load(kernel, windows, at)?;
+            let sum = {
+                let mut lanes = kernel.lanes()?;
+                let word = lanes.splat_id::<U32, LANES>(word)?;
+                let first = lanes.splat_id::<U32, LANES>(first)?;
+                let carried =
+                    lanes.splat_id::<U32, LANES>(carried.first().copied().unwrap_or(so_far))?;
+                let other = lanes.not_equal(word, first)?;
+                let other = ones(&mut lanes, other)?;
+                lanes.add(carried, other)?
+            };
+            Ok(vec![sum.id()])
+        })?;
+    Ok(differs.first().copied().unwrap_or(so_far))
 }
 
 pub fn wants(bricks: &Bricks, plan: &Plan) -> Result<Vec<u32>, LaneError> {
@@ -1529,7 +1813,7 @@ fn released<const LANES: u32>(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
     let listed = kernel.load_at(tier.dense, rank)?;
 
     let spare = u32::try_from(bricks.count() as usize * ENTRY).unwrap_or(u32::MAX);
-    let (at, inside) = {
+    let (at, inside, brick) = {
         let mut lanes = kernel.lanes()?;
         let here = lanes.splat_id::<U32, LANES>(rank)?;
         let count = lanes.splat_id::<U32, LANES>(grand)?;
@@ -1538,7 +1822,7 @@ fn released<const LANES: u32>(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
         let four = lanes.splat_bits::<U32, LANES>(ENTRY as u32)?;
         let inside = lanes.greater_than(count, here)?;
         let brick = lanes.select(inside, listed, bricks_held)?;
-        (lanes.mul(brick, four)?, ones(&mut lanes, inside)?)
+        (lanes.mul(brick, four)?, ones(&mut lanes, inside)?, brick)
     };
     let entry = kernel.load_at(table, at.id())?;
     let start = {
@@ -1574,6 +1858,20 @@ fn released<const LANES: u32>(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
     kernel.store_at(slots, push.id(), entry)?;
     kernel.store_at(table, entry_at.id(), uniform)?;
     kernel.store_at(table, value_at.id(), value)?;
+    for plane in 1..bricks.planes() {
+        let lifted = {
+            let mut lanes = kernel.lanes()?;
+            let by = lanes.splat_bits::<U32, LANES>(bricks.plane_start(plane))?;
+            lanes.add(start, by)?
+        };
+        let value = live::state_load(&mut kernel, windows, lifted.id())?;
+        let value_at = {
+            let mut lanes = kernel.lanes()?;
+            let base = lanes.splat_bits::<U32, LANES>(bricks.plane_values(plane))?;
+            lanes.add(brick, base)?
+        };
+        kernel.store_at(table, value_at.id(), value)?;
+    }
     kernel.finish()
 }
 
@@ -1675,6 +1973,12 @@ fn take_one<const LANES: u32>(
     };
     let slot = kernel.load_at(slots, pop.id())?;
     let value = kernel.load_at(table, value_at.id())?;
+    let mut plane_values = Vec::new();
+    for plane in 1..bricks.planes() {
+        let base = kernel.module().constant_u32(bricks.plane_values(plane))?;
+        let at = kernel.module().i_add(uint, brick, base)?;
+        plane_values.push((plane, kernel.load_at(table, at)?));
+    }
     let level = kernel.load_at(crate::layout::HOT, brick)?;
     let per_lane = u32::try_from(bricks.cells()).unwrap_or(u32::MAX) / subgroup;
     let flags_per_lane = bricks.per_block() / subgroup;
@@ -1713,6 +2017,17 @@ fn take_one<const LANES: u32>(
                 let one = kernel.module().constant_u32(1)?;
                 Ok(vec![kernel.module().i_add(uint, at, one)?])
             })?;
+        for &(plane, value) in &plane_values {
+            let by = kernel.module().constant_u32(bricks.plane_start(plane))?;
+            let lifted = kernel.module().i_add(uint, start.id(), by)?;
+            let _ =
+                kernel.repeat_rolled_many(per_lane, uint, &[lifted], |kernel, carried, _| {
+                    let at = carried.first().copied().unwrap_or(head);
+                    live::state_store(kernel, windows, at, value)?;
+                    let one = kernel.module().constant_u32(1)?;
+                    Ok(vec![kernel.module().i_add(uint, at, one)?])
+                })?;
+        }
         let _ = kernel.repeat_rolled_many(
             flags_per_lane,
             uint,

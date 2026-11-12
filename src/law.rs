@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::ops::Ops;
-use crate::rule3::{Declared, Oct, OneStep, Ruled, Tally};
+use crate::rule3::{CORNERS, Declared, Oct, OneStep, Planed, Ruled, Tally};
 use crate::wire::{self, Json};
 
 pub mod adjoint;
@@ -269,11 +269,24 @@ impl Declared for Law {
     fn tally(&self) -> Tally {
         self.dag.tally()
     }
+
+    fn planes(&self) -> usize {
+        usize::try_from(self.channels).unwrap_or(1).max(1)
+    }
 }
 
 impl OneStep for Law {
     fn one_step<O: Ops>(&self, ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word> {
         self.dag.replay(ops, oct)
+    }
+
+    fn one_step_planes<O: Ops>(
+        &self,
+        ops: &mut O,
+        oct: Oct<'_, O::Word>,
+        planes: &[[O::Word; CORNERS]],
+    ) -> Planed<O::Word> {
+        self.dag.replay_planes(ops, oct, planes)
     }
 }
 

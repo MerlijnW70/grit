@@ -1,5 +1,5 @@
 use crate::ops::{Flag, Ops};
-use crate::rule3::{CORNERS, Declared, Oct, OneStep, Ruled, Tally};
+use crate::rule3::{CORNERS, Declared, Oct, OneStep, Planed, Ruled, Tally};
 
 pub const FRAME: u32 = 8;
 
@@ -39,6 +39,7 @@ pub struct Dag {
     counts: Vec<u32>,
     params: usize,
     tally: Tally,
+    planes: Vec<[u32; CORNERS]>,
 }
 
 fn held<O: Ops>(ops: &mut O, values: &[O::Word], id: u32) -> O::Word {
@@ -48,8 +49,21 @@ fn held<O: Ops>(ops: &mut O, values: &[O::Word], id: u32) -> O::Word {
     }
 }
 
-fn input<O: Ops>(ops: &mut O, oct: &Oct<'_, O::Word>, which: u32) -> O::Word {
+fn input<O: Ops>(
+    ops: &mut O,
+    oct: &Oct<'_, O::Word>,
+    upper: (&[[O::Word; CORNERS]], u32),
+    which: u32,
+) -> O::Word {
+    let (planes, first_plane) = upper;
     let found = match which {
+        _ if which >= first_plane => {
+            let at = usize::try_from(which - first_plane).unwrap_or(usize::MAX);
+            planes
+                .get(at / CORNERS)
+                .and_then(|plane| plane.get(at % CORNERS))
+                .copied()
+        }
         0..FRAME => usize::try_from(which)
             .ok()
             .and_then(|at| oct.words.get(at))
@@ -84,7 +98,23 @@ impl Dag {
             counts,
             params,
             tally,
+            planes: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_planes(mut self, planes: Vec<[u32; CORNERS]>) -> Self {
+        self.planes = planes;
+        self
+    }
+
+    #[must_use]
+    pub fn planes(&self) -> &[[u32; CORNERS]] {
+        &self.planes
+    }
+
+    #[must_use]
+    pub fn first_plane(&self) -> u32 {
+        FIRST_PARAM.saturating_add(u32::try_from(self.params).unwrap_or(u32::MAX))
     }
 
     #[must_use]
@@ -113,10 +143,24 @@ impl Dag {
     }
 
     pub fn replay<O: Ops>(&self, ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word> {
+        self.replay_planes(ops, oct, &[]).ruled
+    }
+
+    pub fn replay_planes<O: Ops>(
+        &self,
+        ops: &mut O,
+        oct: Oct<'_, O::Word>,
+        planes: &[[O::Word; CORNERS]],
+    ) -> Planed<O::Word> {
+        let first_plane = if self.planes.is_empty() {
+            u32::MAX
+        } else {
+            self.first_plane()
+        };
         let mut values: Vec<O::Word> = Vec::with_capacity(self.nodes.len());
         for &node in &self.nodes {
             let made = match node {
-                Node::Input(which) => input(ops, &oct, which),
+                Node::Input(which) => input(ops, &oct, (planes, first_plane), which),
                 Node::Const(value) => ops.constant(value),
                 Node::Not(one) => {
                     let one = held(ops, &values, one);
@@ -164,7 +208,15 @@ impl Dag {
             .iter()
             .map(|&id| held(ops, &values, id))
             .collect();
-        Ruled { out, counts }
+        let planes = self
+            .planes
+            .iter()
+            .map(|plane| plane.map(|id| held(ops, &values, id)))
+            .collect();
+        Planed {
+            ruled: Ruled { out, counts },
+            planes,
+        }
     }
 }
 
@@ -202,10 +254,23 @@ impl Declared for Dag {
     fn tally(&self) -> Tally {
         self.tally
     }
+
+    fn planes(&self) -> usize {
+        self.planes.len() + 1
+    }
 }
 
 impl OneStep for Dag {
     fn one_step<O: Ops>(&self, ops: &mut O, oct: Oct<'_, O::Word>) -> Ruled<O::Word> {
         self.replay(ops, oct)
+    }
+
+    fn one_step_planes<O: Ops>(
+        &self,
+        ops: &mut O,
+        oct: Oct<'_, O::Word>,
+        planes: &[[O::Word; CORNERS]],
+    ) -> Planed<O::Word> {
+        self.replay_planes(ops, oct, planes)
     }
 }
