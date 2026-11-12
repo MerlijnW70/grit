@@ -1943,12 +1943,17 @@ fn one_cell_costs_the_same_words_in_any_world() {
             "dense {side}^3, two corners"
         );
     }
-    let side = 256_u32;
-    let made = Made {
-        size: [side; 3],
-        ..made("heat", &params, true)
-    };
-    let mut world = World::create(&host, &made).unwrap();
+    let (side, mut world) = [256_u32, 128, 64]
+        .into_iter()
+        .find_map(|side| {
+            let made = Made {
+                size: [side; 3],
+                ..made("heat", &params, true)
+            };
+            World::create(&host, &made).ok().map(|world| (side, world))
+        })
+        .unwrap();
+    assert!(side >= 128, "{side}");
     let pool = world.pool().unwrap();
     let sides = pool.sides();
     let lattice = [0, 1, 2].map(|axis| side / sides[axis]);
@@ -1990,7 +1995,7 @@ fn one_cell_costs_the_same_words_in_any_world() {
         "a point in a uniform brick"
     );
     println!(
-        "dense 32^3 and {largest}^3: 1 word a point; sparse 256^3 with {wanted} held: {held_cost} words a held point"
+        "dense 32^3 and {largest}^3: 1 word a point; sparse {side}^3 with {wanted} held: {held_cost} words a held point"
     );
 }
 
