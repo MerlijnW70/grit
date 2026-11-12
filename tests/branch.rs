@@ -1784,3 +1784,28 @@ fn temporary_names_held_by_folders_never_block_a_save() {
     assert_eq!(leftovers(&folder).len(), stale as usize + 1);
     let _ = fs::remove_dir_all(&folder);
 }
+
+#[test]
+fn bricked_never_asks_more_slots_than_bricks() {
+    let cells: Vec<u32> = (0..64).collect();
+    for asked in [0, 1, 7, 8, 9, 100, u32::MAX] {
+        let state = format::bricked(&cells, [4, 4, 4], [2, 2, 2], Some(asked));
+        let State::Sparse { capacity, .. } = &state else {
+            panic!("bricked gave a dense state");
+        };
+        assert_eq!(*capacity, 8, "{asked}");
+        let image = heat_image([4, 4, 4], state);
+        assert_eq!(decoded(&format::encoded(&image)), Ok(image), "{asked}");
+    }
+    let mut cells = vec![3; 64];
+    cells[0] = 4;
+    for (asked, want) in [(None, 1), (Some(0), 1), (Some(5), 5), (Some(9), 8)] {
+        let state = format::bricked(&cells, [4, 4, 4], [2, 2, 2], asked);
+        let State::Sparse { capacity, .. } = &state else {
+            panic!("bricked gave a dense state");
+        };
+        assert_eq!(*capacity, want, "{asked:?}");
+        let image = heat_image([4, 4, 4], state);
+        assert_eq!(decoded(&format::encoded(&image)), Ok(image), "{asked:?}");
+    }
+}

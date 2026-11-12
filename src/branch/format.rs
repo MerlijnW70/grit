@@ -486,7 +486,11 @@ pub fn bricked_planes(
     }
     table.extend(values.concat());
     State::Sparse {
-        capacity: capacity.unwrap_or(held).max(held).max(1),
+        capacity: capacity
+            .unwrap_or(held)
+            .max(held)
+            .min(u32::try_from(count).unwrap_or(u32::MAX))
+            .max(1),
         sides,
         table,
         pool: pools.concat(),
@@ -1066,10 +1070,6 @@ fn fresh(path: &Path) -> io::Result<(PathBuf, File)> {
         {
             Ok(file) => return Ok((temporary, file)),
             Err(why) if why.kind() == io::ErrorKind::AlreadyExists => last = why,
-            Err(why) => return Err(why),
-        }
-    }
-    Err(last)
             Err(why)
                 if why.kind() == io::ErrorKind::PermissionDenied
                     && !fs::symlink_metadata(&temporary)
@@ -1077,6 +1077,10 @@ fn fresh(path: &Path) -> io::Result<(PathBuf, File)> {
             {
                 last = why;
             }
+            Err(why) => return Err(why),
+        }
+    }
+    Err(last)
 }
 
 pub fn store(path: &Path, image: &Image) -> Result<u64, Refused> {
