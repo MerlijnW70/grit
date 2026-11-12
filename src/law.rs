@@ -44,10 +44,11 @@ pub enum Code {
     Recursion,
     Result,
     Unsupported,
+    Lifting,
 }
 
 impl Code {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Json,
         Self::Size,
         Self::Trailing,
@@ -74,6 +75,7 @@ impl Code {
         Self::Recursion,
         Self::Result,
         Self::Unsupported,
+        Self::Lifting,
     ];
 
     #[must_use]
@@ -105,6 +107,7 @@ impl Code {
             Self::Recursion => "recursion",
             Self::Result => "result",
             Self::Unsupported => "unsupported",
+            Self::Lifting => "lifting",
         }
     }
 }
@@ -158,6 +161,7 @@ pub struct Law {
     name: String,
     channels: u32,
     halo: u32,
+    reversible: bool,
     dag: Dag,
     canonical: String,
     hash: [u8; 32],
@@ -184,11 +188,15 @@ impl Law {
             });
         }
         let expanded = expand::expand(&program)?;
+        if program.reversible {
+            adjoint::lifted(&expanded.dag).map_err(|broken| broken.refusal(&expanded.dag, json))?;
+        }
         let hash = crate::branch::sha256(canonical.as_bytes());
         Ok(Self {
             name: program.name.to_owned(),
             channels: program.channels,
             halo: program.halo,
+            reversible: program.reversible,
             dag: expanded.dag,
             canonical,
             hash,
@@ -210,6 +218,11 @@ impl Law {
     #[must_use]
     pub const fn halo(&self) -> u32 {
         self.halo
+    }
+
+    #[must_use]
+    pub const fn reversible(&self) -> bool {
+        self.reversible
     }
 
     #[must_use]
