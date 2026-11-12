@@ -328,32 +328,101 @@ enum Stride {
     Broken(Broken),
 }
 
-fn carrying(dag: &Dag, claimed: &HashMap<u32, usize>) -> Vec<u32> {
-    let nodes = dag.nodes();
-    let mut carries = vec![0_u32; nodes.len()];
-    for (index, &node) in nodes.iter().enumerate() {
-        let id = word_of(index);
-        let carried = match (claimed.get(&id), node) {
-            (Some(&word), _) => bit(word),
-            (None, Node::Input(which)) => input_word(dag, which).map_or(0, bit),
-            (None, other) => match lifting(other) {
-                Some((Lifting::Sub, left, _)) => at(&carries, left),
-                Some((_, left, right)) => at(&carries, left) | at(&carries, right),
-                None => 0,
-            },
-        };
-        if let Some(slot) = carries.get_mut(index) {
-            *slot = carried;
+struct Carrying {
+    carries: Vec<u32>,
+    users: Vec<Vec<u32>>,
+    claimed: HashMap<u32, usize>,
+}
+
+fn derived(dag: &Dag, carries: &[u32], node: Node) -> u32 {
+    match node {
+        Node::Input(which) => input_word(dag, which).map_or(0, bit),
+        other => match lifting(other) {
+            Some((Lifting::Sub, left, _)) => at(carries, left),
+            Some((_, left, right)) => at(carries, left) | at(carries, right),
+            None => 0,
+        },
+    }
+}
+
+impl Carrying {
+    fn new(dag: &Dag) -> Self {
+        let nodes = dag.nodes();
+        let mut carries = vec![0_u32; nodes.len()];
+        let mut users: Vec<Vec<u32>> = vec![Vec::new(); nodes.len()];
+        for (index, &node) in nodes.iter().enumerate() {
+            let made = derived(dag, &carries, node);
+            if let Some(slot) = carries.get_mut(index) {
+                *slot = made;
+            }
+            if let Some((how, left, right)) = lifting(node) {
+                let feeding = if how == Lifting::Sub {
+                    [Some(left), None]
+                } else {
+                    [Some(left), Some(right)]
+                };
+                for id in feeding.into_iter().flatten() {
+                    if let Some(list) = usize::try_from(id).ok().and_then(|at| users.get_mut(at)) {
+                        list.push(word_of(index));
+                    }
+                }
+            }
+        }
+        Self {
+            carries,
+            users,
+            claimed: HashMap::new(),
         }
     }
-    carries
+
+    fn owner(&self, id: u32) -> Option<usize> {
+        self.claimed.get(&id).copied()
+    }
+
+    fn claim(&mut self, dag: &Dag, id: u32, word: usize) {
+        if self.claimed.contains_key(&id) {
+            return;
+        }
+        self.claimed.insert(id, word);
+        let Some(slot) = usize::try_from(id)
+            .ok()
+            .and_then(|at| self.carries.get_mut(at))
+        else {
+            return;
+        };
+        if *slot == bit(word) {
+            return;
+        }
+        *slot = bit(word);
+        let mut pending = vec![id];
+        while let Some(changed) = pending.pop() {
+            let users = usize::try_from(changed)
+                .ok()
+                .and_then(|at| self.users.get(at))
+                .cloned()
+                .unwrap_or_default();
+            for user in users {
+                if self.claimed.contains_key(&user) {
+                    continue;
+                }
+                let made = derived(dag, &self.carries, node_at(dag, user));
+                if let Some(slot) = usize::try_from(user)
+                    .ok()
+                    .and_then(|at| self.carries.get_mut(at))
+                    && *slot != made
+                {
+                    *slot = made;
+                    pending.push(user);
+                }
+            }
+        }
+    }
 }
 
 fn strode(
     dag: &Dag,
     masks: &Masks,
-    carries: &[u32],
-    claimed: &HashMap<u32, usize>,
+    carrying: &Carrying,
     forced: &HashMap<(usize, u32), bool>,
     word: usize,
     here: u32,
@@ -365,9 +434,9 @@ fn strode(
     let Some((how, left, right)) = lifting(node) else {
         return Stride::Broken(offender(dag, masks, word, here));
     };
-    let on_left = at(carries, left) & bit(word) != 0;
-    let on_right = how != Lifting::Sub && at(carries, right) & bit(word) != 0;
-    let elsewhere = |id: u32| claimed.get(&id).is_some_and(|&other| other != word);
+    let on_left = at(&carrying.carries, left) & bit(word) != 0;
+    let on_right = how != Lifting::Sub && at(&carrying.carries, right) & bit(word) != 0;
+    let elsewhere = |id: u32| carrying.owner(id).is_some_and(|other| other != word);
     let (before, by) = match (on_left, on_right) {
         (true, false) => (left, right),
         (false, true) => (right, left),
@@ -397,19 +466,17 @@ fn chains(
     let words = spread(dag);
     let mut forced = given.clone();
     let mut guesses = Vec::new();
-    let mut claimed: HashMap<u32, usize> = HashMap::new();
+    let mut carrying = Carrying::new(dag);
     for word in 0..words {
-        claimed.insert(word_input(dag, word), word);
+        carrying.claim(dag, word_input(dag, word), word);
     }
     for word in 0..words {
-        claimed.entry(word_out(dag, word)).or_insert(word);
+        carrying.claim(dag, word_out(dag, word), word);
     }
     let mut here: Vec<u32> = (0..words).map(|word| word_out(dag, word)).collect();
     let mut lifts: Vec<Vec<Lift>> = vec![Vec::new(); words];
     let mut open: Vec<bool> = vec![true; words];
     let mut broken = Vec::new();
-    let mut carries = carrying(dag, &claimed);
-    let mut fresh = true;
     loop {
         let mut moved = false;
         let mut waiting = Vec::new();
@@ -419,7 +486,7 @@ fn chains(
             }
             loop {
                 let from = here.get(word).copied().unwrap_or(u32::MAX);
-                match strode(dag, masks, &carries, &claimed, &forced, word, from) {
+                match strode(dag, masks, &carrying, &forced, word, from) {
                     Stride::Home => {
                         if let Some(slot) = open.get_mut(word) {
                             *slot = false;
@@ -427,7 +494,7 @@ fn chains(
                         break;
                     }
                     Stride::Next(lift) => {
-                        claimed.entry(lift.before).or_insert(word);
+                        carrying.claim(dag, lift.before, word);
                         if let Some(slot) = here.get_mut(word) {
                             *slot = lift.before;
                         }
@@ -453,16 +520,7 @@ fn chains(
         if waiting.is_empty() {
             break;
         }
-        if moved {
-            fresh = false;
-            continue;
-        }
-        if !fresh {
-            carries = carrying(dag, &claimed);
-            fresh = true;
-            continue;
-        }
-        {
+        if !moved {
             let Some(&guess) = waiting.iter().min_by_key(|(_, node)| *node) else {
                 break;
             };
