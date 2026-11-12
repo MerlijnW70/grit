@@ -107,6 +107,18 @@ fn a_value_of_the_wrong_type_or_range_is_refused_at_its_field_before_any_device(
         ("grit_machine", "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":4}".into(), "$.traces"),
         ("grit_machine", "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":4,\"steps\":-1,\"traces\":[{\"feed\":[1],\"want\":[1]}]}".into(), "$.steps"),
         ("grit_machine", "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":4,\"crowd\":70000,\"traces\":[{\"feed\":[1],\"want\":[1]}]}".into(), "$.crowd"),
+        ("grit_check", "{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,1,1,2],\"chip\":[{\"kind\":6,\"left\":0,\"right\":1}]}".into(), "$.table[3]"),
+        ("grit_check", "{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,1,1],\"chip\":[{\"kind\":6,\"left\":0,\"right\":1}]}".into(), "$.table"),
+        ("grit_synthesise", "{\"inputs\":2,\"outputs\":2,\"gates\":2,\"table\":[0,1,4,0]}".into(), "$.table[2]"),
+        ("grit_machine", "{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1,\"traces\":[{\"feed\":[0,1],\"want\":[2,3]}],\"chip\":[{\"kind\":10,\"left\":0,\"right\":0}]}".into(), "$.traces[0].want[0]"),
+        ("grit_machine", "{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1,\"traces\":[{\"feed\":[0,2],\"want\":[0,1]}],\"chip\":[{\"kind\":10,\"left\":0,\"right\":0}]}".into(), "$.traces[0].feed[1]"),
+        ("grit_machine", "{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1,\"traces\":[{\"feed\":[],\"want\":[0,1]}],\"chip\":[{\"kind\":10,\"left\":0,\"right\":0}]}".into(), "$.traces[0].feed"),
+        ("grit_machine", "{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1,\"traces\":[{\"feed\":[0,1,1],\"want\":[0,1]}],\"chip\":[{\"kind\":10,\"left\":0,\"right\":0}]}".into(), "$.traces[0].feed"),
+        ("grit_machine", "{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1,\"steps\":3,\"traces\":[{\"feed\":[0,1],\"want\":[0,1]}],\"chip\":[{\"kind\":10,\"left\":0,\"right\":0}]}".into(), "$.traces[0].want"),
+        ("grit_machine", "{\"inputs\":1,\"outputs\":1,\"gates\":4,\"traces\":[{\"feed\":[1],\"want\":[1]}]}".into(), "$.state"),
+        ("grit_machine", "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":4}".into(), "$.traces"),
+        ("grit_machine", "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":4,\"steps\":-1,\"traces\":[{\"feed\":[1],\"want\":[1]}]}".into(), "$.steps"),
+        ("grit_machine", "{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":4,\"crowd\":70000,\"traces\":[{\"feed\":[1],\"want\":[1]}]}".into(), "$.crowd"),
     ];
     for (name, arguments, field) in &cases {
         let (code, at) = refused(name, arguments);
@@ -421,5 +433,24 @@ fn settle_takes_the_widest_cells_without_wrapping() {
         Some(wanted),
         "the distance is counted on whole numbers: {}",
         written(&held)
+    );
+}
+
+#[test]
+fn a_machine_that_passes_its_input_through_is_marked_on_whole_words() {
+    let held = structured(
+        None,
+        "grit_machine",
+        "{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1,\"traces\":[{\"feed\":[0,1],\"want\":[0,1]}],\"chip\":[{\"kind\":10,\"left\":0,\"right\":0}]}",
+    );
+    assert_eq!(
+        held.get("solved"),
+        Some(&Json::Bool(true)),
+        "{}",
+        written(&held)
+    );
+    assert_eq!(
+        held.get("wrong").and_then(Json::list).map(<[Json]>::len),
+        Some(0)
     );
 }

@@ -674,6 +674,40 @@ fn numbers(held: &Json, place: &str, key: &str) -> Result<Vec<u32>, Box<dyn std:
         .collect()
 }
 
+fn widest(bits: u32) -> u32 {
+    u32::try_from((1_u64 << bits.min(32)) - 1).unwrap_or(u32::MAX)
+}
+
+fn fitting(
+    words: &[u32],
+    place: &str,
+    steps: u32,
+    bits: u32,
+    what: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if words.len() != steps as usize {
+        return Err(beyond(
+            place.to_owned(),
+            format!(
+                "{what} holds {} steps where the machine runs {steps}; every run must give one word a step for its feed and its want",
+                words.len()
+            ),
+            steps,
+        ));
+    }
+    let most = widest(bits);
+    for (at, word) in words.iter().enumerate() {
+        if *word > most {
+            return Err(beyond(
+                format!("{place}[{at}]"),
+                format!("{what} step {at} is {word}, which sets a bit past the {bits} it has"),
+                most,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn present(held: &Json, key: &str) -> Result<(), Box<dyn std::error::Error>> {
     if held.get(key).is_none() {
         return Err(malformed(
@@ -691,6 +725,27 @@ fn asked(held: &Json) -> Result<(Netlist, Exam), Box<dyn std::error::Error>> {
     let shape = Netlist::over(inputs, outputs, gates, 16)?;
     present(held, "table")?;
     let table = numbers(held, "$", "table")?;
+    let rows = shape.words();
+    if table.len() != rows as usize {
+        return Err(beyond(
+            "$.table".to_owned(),
+            format!(
+                "the table holds {} rows, and {inputs} inputs need exactly {rows}, one for every combination of the inputs",
+                table.len()
+            ),
+            rows,
+        ));
+    }
+    let most = widest(outputs);
+    for (at, row) in table.iter().enumerate() {
+        if *row > most {
+            return Err(beyond(
+                format!("$.table[{at}]"),
+                format!("row {at} is {row}, which sets a bit past the {outputs} outputs"),
+                most,
+            ));
+        }
+    }
     Ok((shape, Exam::of(shape, table)?))
 }
 
@@ -1108,6 +1163,14 @@ const POURING: Whole = Whole {
     said: "how many frames the spout pours before it shuts off; half the frames of the run when left out, and never more than they are",
 };
 
+fn whole_item() -> Json {
+    map(vec![
+        ("type", text("integer")),
+        ("minimum", Json::Int(0)),
+        ("maximum", Json::Int(WORD)),
+    ])
+}
+
 fn gate() -> Json {
     object(
         vec![
@@ -1143,8 +1206,8 @@ pub(crate) fn tools() -> Json {
     let table = (
         "table",
         array(
-            map(vec![("type", text("integer"))]),
-            "one word a row, the wanted output bits, lowest output in bit zero",
+            whole_item(),
+            "one word a row, the wanted output bits, lowest output in bit zero, below two to the outputs; exactly two to the inputs rows",
         ),
     );
     let shape = vec![
@@ -1180,15 +1243,15 @@ pub(crate) fn tools() -> Json {
                 (
                     "feed",
                     array(
-                        map(vec![("type", text("integer"))]),
-                        "one word a step, the input bits for that step",
+                        whole_item(),
+                        "one word a step, the input bits for that step, below two to the inputs; exactly steps of them",
                     ),
                 ),
                 (
                     "want",
                     array(
-                        map(vec![("type", text("integer"))]),
-                        "one word a step, the output bits wanted at that step",
+                        whole_item(),
+                        "one word a step, the output bits wanted at that step, below two to the outputs; exactly steps of them",
                     ),
                 ),
             ],
@@ -1398,19 +1461,26 @@ fn asked_machine(held: &Json) -> Result<(Machine, Runs), Box<dyn std::error::Err
         steps,
     )?;
     if traces.is_empty() || machine.steps == 0 {
-        return Err(
-            "a machine is marked on its runs, and no run with a step in it was given".into(),
-        );
+        return Err(malformed(
+            "$.traces".to_owned(),
+            "a machine is marked on its runs, and no run with a step in it was given".to_owned(),
+        ));
     }
-    for (at, (_, want)) in traces.iter().enumerate() {
-        if want.len() != machine.steps as usize {
-            return Err(format!(
-                "run {at} wants {} steps where the machine runs {}; every run must want the same number of steps",
-                want.len(),
-                machine.steps
-            )
-            .into());
-        }
+    for (at, (feed, want)) in traces.iter().enumerate() {
+        fitting(
+            want,
+            &format!("$.traces[{at}].want"),
+            machine.steps,
+            machine.outputs,
+            "want",
+        )?;
+        fitting(
+            feed,
+            &format!("$.traces[{at}].feed"),
+            machine.steps,
+            machine.inputs,
+            "feed",
+        )?;
     }
     Ok((machine, traces))
 }
