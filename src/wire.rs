@@ -192,6 +192,13 @@ fn numbered(reading: &mut Reading<'_>) -> Result<Json, Torn> {
         .get(from..reading.at)
         .map(String::from_utf8_lossy)
         .ok_or(Torn::NotANumber { at: from })?;
+    let digits = held.strip_prefix('-').unwrap_or(&held);
+    let plain = digits.bytes().all(|one| one.is_ascii_digit())
+        && !digits.is_empty()
+        && (digits == "0" || !digits.starts_with('0'));
+    if !plain {
+        return Err(Torn::NotANumber { at: from });
+    }
     held.parse::<i64>()
         .map(Json::Int)
         .map_err(|_| Torn::NotANumber { at: from })
@@ -238,6 +245,7 @@ fn valued(reading: &mut Reading<'_>, deep: usize) -> Result<Json, Torn> {
         Some(b'{') => {
             reading.at += 1;
             let mut held = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             reading.skip();
             if reading.peek() == Some(b'}') {
                 reading.at += 1;
@@ -245,7 +253,11 @@ fn valued(reading: &mut Reading<'_>, deep: usize) -> Result<Json, Torn> {
             }
             loop {
                 reading.skip();
+                let at = reading.at;
                 let name = stringed(reading)?;
+                if !seen.insert(name.clone()) {
+                    return Err(Torn::Stray { at, saw: '"' });
+                }
                 reading.skip();
                 reading.take(b':')?;
                 held.push((name, valued(reading, deep + 1)?));
@@ -277,7 +289,13 @@ pub fn read(held: &str) -> Result<Json, Torn> {
     };
     let one = valued(&mut reading, 0)?;
     reading.skip();
-    Ok(one)
+    match reading.peek() {
+        None => Ok(one),
+        Some(saw) => Err(Torn::Stray {
+            at: reading.at,
+            saw: char::from(saw),
+        }),
+    }
 }
 
 fn quoted(held: &str, out: &mut String) {

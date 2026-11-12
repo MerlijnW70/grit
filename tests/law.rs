@@ -406,8 +406,11 @@ fn the_canonical_form_and_hash_of_the_shipped_laws_are_pinned() {
     }
     let spaced = wire::written(&json)
         .replace(',', " ,\n\t")
-        .replace(':', " : ")
-        .replace("\"law\" : 1", "\"law\" : 0001");
+        .replace(':', " : ");
+    assert_eq!(
+        refusal(&spaced.replace("\"law\" : 1", "\"law\" : 0001")).code,
+        Code::Json
+    );
     assert_ne!(spaced, SAND);
     assert_eq!(compiled(&spaced).hex(), SAND_HASH);
     assert_eq!(compiled(&spaced).canonical(), sand.canonical());
@@ -537,8 +540,8 @@ fn refused_at(text: &str, code: Code, path: &str) -> Refusal {
 #[test]
 fn a_refusal_names_the_path_the_code_what_was_expected_and_what_was_found() {
     refused_at("{\"law\":1,", Code::Json, "$");
-    refused_at(&format!("{SAND} x"), Code::Trailing, "$");
-    refused_at(&format!("{SAND}}}"), Code::Trailing, "$");
+    refused_at(&format!("{SAND} x"), Code::Json, "$");
+    refused_at(&format!("{SAND}}}"), Code::Json, "$");
     refused_at("[1]", Code::Shape, "$");
     let missing = edited(SAND, |json| {
         if let Json::Map(fields) = json {
@@ -550,7 +553,7 @@ fn a_refusal_names_the_path_the_code_what_was_expected_and_what_was_found() {
     let why = refused_at(&unknown, Code::UnknownKey, "$.frames");
     assert_eq!(why.found, "the key \"frames\"");
     let duplicated = SAND.replacen("\"name\"", "\"name\": \"heat\", \"name\"", 1);
-    refused_at(&duplicated, Code::DuplicateKey, "$.name");
+    refused_at(&duplicated, Code::Json, "$");
     let version = edited(SAND, |json| set(json, "law", Json::Int(2)));
     refused_at(&version, Code::Version, "$.law");
     let negative = edited(SAND, |json| {

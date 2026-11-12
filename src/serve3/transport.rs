@@ -124,63 +124,6 @@ fn blank(line: &str) -> bool {
         .all(|one| matches!(one, b' ' | b'\t' | b'\n' | b'\r'))
 }
 
-fn end_of_value(held: &[u8]) -> usize {
-    let space = |one: &u8| matches!(one, b' ' | b'\t' | b'\n' | b'\r');
-    let mut at = 0;
-    while held.get(at).is_some_and(space) {
-        at += 1;
-    }
-    match held.get(at) {
-        Some(b'{' | b'[') => {
-            let mut deep = 0_usize;
-            let mut quoted = false;
-            while let Some(&one) = held.get(at) {
-                at += 1;
-                if quoted {
-                    match one {
-                        b'\\' => at += 1,
-                        b'"' => quoted = false,
-                        _ => {}
-                    }
-                    continue;
-                }
-                match one {
-                    b'"' => quoted = true,
-                    b'[' | b'{' => deep += 1,
-                    b']' | b'}' => {
-                        deep = deep.saturating_sub(1);
-                        if deep == 0 {
-                            return at;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            at
-        }
-        Some(b'"') => {
-            at += 1;
-            while let Some(&one) = held.get(at) {
-                at += 1;
-                match one {
-                    b'\\' => at += 1,
-                    b'"' => return at,
-                    _ => {}
-                }
-            }
-            at
-        }
-        _ => {
-            while held.get(at).is_some_and(|one| {
-                !space(one) && !matches!(one, b'[' | b']' | b'{' | b'}' | b'"' | b',' | b':')
-            }) {
-                at += 1;
-            }
-            at
-        }
-    }
-}
-
 fn parse_failed(message: String) -> Json {
     failed(Json::Null, &Refusal::new(Code::Parse, "$", message))
 }
@@ -200,13 +143,6 @@ pub fn heard(served: &mut dyn Served, line: &str) -> Option<Json> {
             )));
         }
     };
-    let rest = line.get(end_of_value(line.as_bytes())..).unwrap_or("");
-    if !blank(rest) {
-        return Some(parse_failed(format!(
-            "the line goes on past its first JSON value with {}",
-            shown(rest)
-        )));
-    }
     handle(served, &request)
 }
 

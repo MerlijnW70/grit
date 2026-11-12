@@ -231,15 +231,68 @@ fn a_misspelt_argument_to_a_2d_tool_is_refused_by_name() {
 #[test]
 fn a_key_given_twice_is_refused_rather_than_read_once() {
     let mut server = Server::new(None);
-    let told = refused(&call(
-        &mut server,
-        "grit_world_step",
-        "{\"world\":1,\"frames\":1,\"frames\":100}",
-    ));
-    assert_eq!(
-        (told.code.as_str(), told.field.as_str()),
-        ("duplicate_key", "$.frames")
-    );
+    for line in [
+        calling(
+            "grit_world_step",
+            "{\"world\":1,\"frames\":1,\"frames\":100}",
+        ),
+        calling(
+            "grit_pour",
+            "{\"cells\":[{\"at\":1,\"is\":\"sand\",\"is\":\"water\"}]}",
+        ),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"id\":2,\"method\":\"ping\"}".to_owned(),
+    ] {
+        let got = server.heard(&line).unwrap();
+        let (code, named, id) = failed(&got);
+        assert_eq!(
+            (code, named.as_str(), id),
+            (-32700, "parse", Json::Null),
+            "{line}"
+        );
+        let message = got
+            .get("error")
+            .and_then(|one| one.get("message"))
+            .and_then(Json::text)
+            .unwrap();
+        let at = line
+            .rfind("\"frames\"")
+            .or_else(|| line.rfind("\"is\""))
+            .or_else(|| line.rfind("\"id\""))
+            .unwrap();
+        assert!(message.ends_with(&format!("{at} '\"'")), "{message}");
+    }
+}
+
+#[test]
+fn the_reader_takes_one_value_once_keyed_with_json_numbers() {
+    for (held, whole) in [
+        ("{\"a\":1} junk", false),
+        ("{\"a\":1}}", false),
+        ("{\"a\":1} {\"a\":1}", false),
+        ("[1] ,", false),
+        ("{\"a\":1} \t\r\n", true),
+        ("{\"a\":1,\"a\":2}", false),
+        ("{\"a\":{\"b\":1,\"b\":1}}", false),
+        ("[{\"a\":1},{\"a\":1}]", true),
+        ("{\"a\":1,\"A\":2}", true),
+        ("+5", false),
+        ("007", false),
+        ("-01", false),
+        ("00", false),
+        ("-", false),
+        ("1.5", false),
+        ("1e3", false),
+        ("5-", false),
+        ("0", true),
+        ("-0", true),
+        ("-7", true),
+        ("9223372036854775807", true),
+        ("-9223372036854775808", true),
+        ("9223372036854775808", false),
+    ] {
+        assert_eq!(read(held).is_ok(), whole, "{held}");
+    }
+    assert_eq!(read("[0,-0,10,-7]").unwrap(), read("[0,0,10,-7]").unwrap());
 }
 
 #[test]
@@ -305,7 +358,6 @@ fn a_line_that_is_not_a_request_is_answered_once_with_a_null_id() {
         "{\"jsonrpc\":\"2.0\",\"id\":true,\"method\":\"ping\"}".to_owned(),
         "{\"jsonrpc\":\"2.0\",\"method\":7}".to_owned(),
         "{}".to_owned(),
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"id\":2,\"method\":\"ping\"}".to_owned(),
     ] {
         let got = server
             .heard(&line)
@@ -685,9 +737,7 @@ fn faults(schema: &Json, value: &Json, path: &str, whole: bool, out: &mut Vec<(S
             for (name, one) in held {
                 let here = path_of(path, name);
                 if seen.contains(&name.as_str()) {
-                    if whole {
-                        out.push((here, Wrong::Duplicate));
-                    }
+                    out.push((here, Wrong::Duplicate));
                     continue;
                 }
                 seen.push(name);
@@ -1013,6 +1063,18 @@ fn every_published_schema_and_its_validator_agree_on_a_thousand_argument_sets() 
             let told = result.and_then(|one| one.get("structuredContent"));
             let code = told.and_then(|one| one.get("code")).and_then(Json::text);
             let field = told.and_then(|one| one.get("field")).and_then(Json::text);
+            if wrong.iter().any(|(_, kind)| *kind == Wrong::Duplicate) {
+                refused_sets += 1;
+                assert_eq!(
+                    got.get("error")
+                        .and_then(|one| one.get("code"))
+                        .and_then(Json::int),
+                    Some(-32700),
+                    "{name} set {set}: a key given twice reads as no JSON: {}",
+                    written(&got)
+                );
+                continue;
+            }
             if wrong.is_empty() {
                 passed_sets += 1;
                 let schema_codes: &[&str] = if flat {
