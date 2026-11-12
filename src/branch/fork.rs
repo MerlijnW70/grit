@@ -49,6 +49,7 @@ impl<'host> World<'host> {
             params: self.params.clone(),
             frame: self.frame,
             live,
+            words_read: 0,
         })
     }
 

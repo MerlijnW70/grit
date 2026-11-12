@@ -1672,12 +1672,30 @@ fn edge_points(size: [u32; 3], seed: u64) -> Vec<[u32; 3]> {
 fn cells_at_match(world: &mut World<'_>, label: &str) {
     let size = world.size();
     let whole = world.cells().unwrap();
+    let cells = whole.len() / world.planes() as usize;
     let points = edge_points(size, 0xCE11);
-    let got = world.cells_at(&points).unwrap();
-    for (point, word) in points.iter().zip(&got) {
-        let index = ((point[2] as usize * size[1] as usize) + point[1] as usize) * size[0] as usize
-            + point[0] as usize;
-        assert_eq!(*word, whole[index], "{label} at {point:?}");
+    for plane in 0..world.planes() {
+        let before = world.words_read();
+        let got = world.cells_at_plane(&points, plane).unwrap();
+        let read = world.words_read() - before;
+        assert!(
+            read <= 4 + 3 * 17 * points.len() as u64,
+            "{label}: {read} words for {} points",
+            points.len()
+        );
+        for (point, word) in points.iter().zip(&got) {
+            let index = ((point[2] as usize * size[1] as usize) + point[1] as usize)
+                * size[0] as usize
+                + point[0] as usize;
+            assert_eq!(
+                *word,
+                whole[plane as usize * cells + index],
+                "{label} plane {plane} at {point:?}"
+            );
+        }
+        if plane == 0 {
+            assert_eq!(world.cells_at(&points).unwrap(), got, "{label}");
+        }
     }
     assert!(world.cells_at(&[]).unwrap().is_empty());
     for outside in [
@@ -1689,6 +1707,9 @@ fn cells_at_match(world: &mut World<'_>, label: &str) {
         let why = world.cells_at(&[[0, 0, 0], outside]).unwrap_err();
         assert_eq!(refused(why.as_ref()), "outside", "{label} {outside:?}");
     }
+    let past = world.planes();
+    let why = world.cells_at_plane(&[[0, 0, 0]], past).unwrap_err();
+    assert_eq!(refused(why.as_ref()), "malformed", "{label}");
 }
 
 #[test]
@@ -1807,5 +1828,203 @@ fn bricked_never_asks_more_slots_than_bricks() {
         assert_eq!(*capacity, want, "{asked:?}");
         let image = heat_image([4, 4, 4], state);
         assert_eq!(decoded(&format::encoded(&image)), Ok(image), "{asked:?}");
+    }
+}
+
+#[test]
+fn read_at_gives_the_slice_a_full_read_gives() {
+    use grit::Error;
+    use grit::layout::{BINDINGS, STATE};
+    use grit::resident::STAGING;
+
+    let Some(host) = device("branch read at") else {
+        return;
+    };
+    let cap = usize::try_from(STAGING / 4).unwrap();
+    let range = usize::try_from(host.limits().storage_range / 4).unwrap();
+    let words = (cap * 2 + 3).min(range);
+    assert!(
+        words > cap + 2,
+        "{} holds no more than one piece",
+        host.name()
+    );
+    let tick = grit::live::tick(host.width()).unwrap();
+    let modules: Vec<&[u32]> = vec![&tick];
+    let mut sizes = [1_usize; BINDINGS as usize];
+    sizes[STATE as usize] = words;
+    let mut held = host.resident(&sizes, &modules).unwrap();
+    let pattern: Vec<u32> = (0..words as u32)
+        .map(|at| at.wrapping_mul(0x9E37_79B1) ^ 0x5A5A)
+        .collect();
+    held.write(STATE as usize, &pattern).unwrap();
+    let state = STATE as usize;
+    for (at, count) in [
+        (0, 1),
+        (0, 7),
+        (1, 1),
+        (1, 9),
+        (words - 1, 1),
+        (words - 3, 3),
+        (cap - 1, 2),
+        (cap - 5, 11),
+        (cap, 1),
+        (cap + 1, cap + 2),
+        (3, cap + 4),
+        (0, words),
+        (17, 0),
+    ] {
+        assert_eq!(
+            held.read_at(state, at, count).unwrap(),
+            &pattern[at..at + count],
+            "at {at}, {count} words"
+        );
+    }
+    let overrun = |found: Result<Vec<u32>, Error>| matches!(found, Err(Error::Overrun { .. }));
+    assert!(overrun(held.read(state, words + 1)));
+    for (at, count) in [
+        (words, 1),
+        (words - 1, 2),
+        (0, words + 1),
+        (usize::MAX, 1),
+        (1, usize::MAX),
+        (usize::MAX, usize::MAX),
+        (words / 2, usize::MAX - words / 4),
+    ] {
+        assert!(
+            overrun(held.read_at(state, at, count)),
+            "at {at}, {count} words"
+        );
+    }
+    let missing = BINDINGS as usize + 3;
+    assert!(matches!(
+        held.read(missing, 1),
+        Err(Error::NoSuchBinding { .. })
+    ));
+    assert!(matches!(
+        held.read_at(missing, 0, 1),
+        Err(Error::NoSuchBinding { .. })
+    ));
+    assert_eq!(held.read(state, words).unwrap(), pattern);
+}
+
+#[test]
+fn one_cell_costs_the_same_words_in_any_world() {
+    let Some(host) = device("branch cells at cost") else {
+        return;
+    };
+    let params = params_of("heat", 3);
+    for side in [32_u32, 256] {
+        let made = Made {
+            size: [side; 3],
+            ..made("heat", &params, false)
+        };
+        let mut world = World::create(&host, &made).unwrap();
+        let far = [side - 1; 3];
+        world.write(&[(far, 77)]).unwrap();
+        let before = world.words_read();
+        assert_eq!(world.cells_at(&[far]).unwrap(), [77]);
+        assert_eq!(world.words_read() - before, 1, "dense {side}^3, far corner");
+        let before = world.words_read();
+        assert_eq!(world.cells_at(&[[0, 0, 0], far]).unwrap(), [0, 77]);
+        assert_eq!(
+            world.words_read() - before,
+            2,
+            "dense {side}^3, two corners"
+        );
+    }
+    let side = 256_u32;
+    let made = Made {
+        size: [side; 3],
+        ..made("heat", &params, true)
+    };
+    let mut world = World::create(&host, &made).unwrap();
+    let pool = world.pool().unwrap();
+    let sides = pool.sides();
+    let lattice = [0, 1, 2].map(|axis| side / sides[axis]);
+    let wanted = pool.capacity().min(lattice[0] * lattice[1] * lattice[2]) - 1;
+    let marks: Vec<([u32; 3], u32)> = (0..wanted)
+        .map(|brick| {
+            let at = [
+                brick % lattice[0] * sides[0],
+                brick / lattice[0] % lattice[1] * sides[1],
+                brick / lattice[0] / lattice[1] * sides[2],
+            ];
+            (at, brick + 1)
+        })
+        .collect();
+    world.write(&marks).unwrap();
+    let used = world.pool_use().unwrap().unwrap();
+    assert_eq!(used.held, wanted, "{used:?}");
+    assert!(wanted > 100, "{wanted} slots");
+    let (last, word) = marks[marks.len() - 1];
+    let before = world.words_read();
+    assert_eq!(world.cells_at(&[last]).unwrap(), [word]);
+    let held_cost = world.words_read() - before;
+    assert_eq!(
+        held_cost,
+        4 + 1 + 1 + 1,
+        "a point in held slot {}",
+        wanted - 1
+    );
+    let (first, word) = marks[0];
+    let before = world.words_read();
+    assert_eq!(world.cells_at(&[first]).unwrap(), [word]);
+    assert_eq!(world.words_read() - before, held_cost, "a point in slot 0");
+    let empty = [side - 1; 3];
+    let before = world.words_read();
+    assert_eq!(world.cells_at(&[empty]).unwrap(), [0]);
+    assert_eq!(
+        world.words_read() - before,
+        4 + 1 + 1,
+        "a point in a uniform brick"
+    );
+    println!(
+        "dense 32^3 and 256^3: 1 word a point; sparse 256^3 with {wanted} held: {held_cost} words a held point"
+    );
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn cells_at_reads_across_split_windows() {
+    let Some(host) = device("branch cells at windows") else {
+        return;
+    };
+    let params = params_of("heat", 3);
+    for sparse in [false, true] {
+        let made = made("heat", &params, sparse);
+        let mut world = World::create_split(&host, &made, 12).unwrap();
+        assert!(
+            world.sizes().len() > grit::layout::BINDINGS as usize + 1,
+            "sparse {sparse}: {} bindings",
+            world.sizes().len()
+        );
+        let seams: Vec<([u32; 3], u32)> = (4090_u32..4102)
+            .chain(8188..8196)
+            .map(|index| {
+                (
+                    [
+                        index % SIZE[0],
+                        index / SIZE[0] % SIZE[1],
+                        index / SIZE[0] / SIZE[1],
+                    ],
+                    heat::cell(heat::FIRE, 500 + index % 100),
+                )
+            })
+            .collect();
+        world.write(&seams).unwrap();
+        world.write(&scattered("heat", 0x51, 400, SIZE)).unwrap();
+        cells_at_match(&mut world, &format!("split windows, sparse {sparse}"));
+        let points: Vec<[u32; 3]> = seams.iter().map(|&(at, _)| at).collect();
+        let whole = world.cells().unwrap();
+        let got = world.cells_at(&points).unwrap();
+        for (point, word) in points.iter().zip(got) {
+            let index = ((point[2] * SIZE[1] + point[1]) * SIZE[0] + point[0]) as usize;
+            assert_eq!(word, whole[index], "sparse {sparse} at {point:?}");
+        }
+        world.step(3).unwrap();
+        cells_at_match(
+            &mut world,
+            &format!("split windows stepped, sparse {sparse}"),
+        );
     }
 }

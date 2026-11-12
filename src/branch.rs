@@ -26,6 +26,8 @@ const BATCH: u32 = 64;
 
 const ZEROS: usize = 1 << 22;
 
+const GATHER_GAP: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
     Magic,
@@ -337,6 +339,7 @@ pub struct World<'host> {
     params: Vec<u32>,
     frame: u32,
     live: Resident<'host>,
+    words_read: u64,
 }
 
 pub(crate) fn ruled(host: &Host, name: &str, params: &[u32]) -> Result<Box<dyn Listed>, Refused> {
@@ -455,6 +458,7 @@ impl<'host> World<'host> {
             params,
             frame: 0,
             live,
+            words_read: 0,
         })
     }
 
@@ -477,9 +481,34 @@ impl<'host> World<'host> {
         Self::made(host, rule, made)
     }
 
+    #[cfg(feature = "faults")]
+    pub fn create_split(host: &'host Host, made: &Made<'_>, bits: u32) -> Result<Self, Failed> {
+        let rule = Stepper::Named(ruled(host, made.rule, made.params)?);
+        let (grid, plan) = planned(host.width(), made.size, made.sparse)?;
+        let plan = plan.split_at(bits);
+        let pool = match pool_for(&(grid, plan), made, &rule)? {
+            Some(bricks) => Some(pooled(
+                Bricks::split_at(grid, &plan, bricks.capacity(), bits)?,
+                &rule,
+            )?),
+            None => None,
+        };
+        Self::made_from(host, rule, made, (grid, plan), pool)
+    }
+
     fn made(host: &'host Host, rule: Stepper, made: &Made<'_>) -> Result<Self, Failed> {
         let shape = planned(host.width(), made.size, made.sparse)?;
         let pool = pool_for(&shape, made, &rule)?;
+        Self::made_from(host, rule, made, shape, pool)
+    }
+
+    fn made_from(
+        host: &'host Host,
+        rule: Stepper,
+        made: &Made<'_>,
+        shape: (Grid, Plan),
+        pool: Option<Bricks>,
+    ) -> Result<Self, Failed> {
         let mut world = Self::built(host, rule, made.params.to_vec(), shape, pool)?;
         zeroed(&mut world.live, &world.sizes, None)?;
         world.parameters()?;
@@ -677,6 +706,60 @@ impl<'host> World<'host> {
     }
 
     pub fn cells_at(&mut self, points: &[[u32; 3]]) -> Result<Vec<u32>, Failed> {
+        self.cells_at_plane(points, 0)
+    }
+
+    #[must_use]
+    pub const fn words_read(&self) -> u64 {
+        self.words_read
+    }
+
+    fn read_at(&mut self, binding: u32, at: usize, count: usize) -> Result<Vec<u32>, Failed> {
+        let words = self.live.read_at(binding as usize, at, count)?;
+        self.words_read = self.words_read.saturating_add(words.len() as u64);
+        Ok(words)
+    }
+
+    fn gathered(&mut self, wanted: &[(u32, usize)]) -> Result<Vec<u32>, Failed> {
+        let mut order: Vec<usize> = (0..wanted.len()).collect();
+        order.sort_unstable_by_key(|&at| wanted.get(at).copied());
+        let mut out = vec![0_u32; wanted.len()];
+        let mut start = 0;
+        while let Some(&first) = order.get(start) {
+            let Some(&(binding, from)) = wanted.get(first) else {
+                break;
+            };
+            let mut end = start + 1;
+            let mut last = from;
+            while let Some(&(next_binding, next)) = order.get(end).and_then(|&at| wanted.get(at)) {
+                if next_binding != binding || next > last.saturating_add(GATHER_GAP) {
+                    break;
+                }
+                last = next;
+                end += 1;
+            }
+            let words = self.read_at(binding, from, last - from + 1)?;
+            for &at in order.get(start..end).unwrap_or_default() {
+                let word = wanted
+                    .get(at)
+                    .and_then(|&(_, index)| words.get(index - from))
+                    .copied()
+                    .ok_or("the world read back short")?;
+                if let Some(slot) = out.get_mut(at) {
+                    *slot = word;
+                }
+            }
+            start = end;
+        }
+        Ok(out)
+    }
+
+    pub fn cells_at_plane(&mut self, points: &[[u32; 3]], plane: u32) -> Result<Vec<u32>, Failed> {
+        if plane >= self.planes() {
+            return Err(Box::new(Refused::Malformed {
+                what: format!("plane {plane} is past the world's {} planes", self.planes()),
+            }));
+        }
         let size = self.size();
         if let Some(&at) = points
             .iter()
@@ -687,52 +770,62 @@ impl<'host> World<'host> {
         if points.is_empty() {
             return Ok(Vec::new());
         }
-        let index = |at: &[u32; 3]| {
-            (u64::from(at[2]) * u64::from(size[1]) + u64::from(at[1])) * u64::from(size[0])
-                + u64::from(at[0])
-        };
         let Some(bricks) = self.pool else {
-            let reach = points.iter().map(index).max().map_or(0, |last| last + 1);
             let windows = self.rule.windows(&self.plan);
-            let state = live::read_state(&mut self.live, windows, usize::try_from(reach)?)?;
-            return points
+            let cells = self.grid.cells();
+            let wanted: Vec<(u32, usize)> = points
                 .iter()
                 .map(|at| {
-                    usize::try_from(index(at))
-                        .ok()
-                        .and_then(|at| state.get(at).copied())
-                        .ok_or_else(|| "the world read back short".into())
+                    let index = (at[2] as usize * size[1] as usize + at[1] as usize)
+                        * size[0] as usize
+                        + at[0] as usize;
+                    windows.place(plane as usize * cells + index)
                 })
                 .collect();
+            return self.gathered(&wanted);
         };
-        bricks.check(&mut self.live)?;
-        let table = self
-            .live
-            .read(bricks.table() as usize, bricks.table_words())?;
+        let head = self.read_at(bricks.slots(), 0, bricks::HEAD)?;
+        if head.get(bricks::OVERFLOW).copied().unwrap_or_default() != 0 {
+            return Err(Box::new(host::Error::PoolFull {
+                slots: bricks.capacity(),
+            }));
+        }
+        if head.get(bricks::LOST).copied().unwrap_or_default() != 0 {
+            return Err(Box::new(host::Error::LostWrite));
+        }
         let places: Vec<bricks::Cell<u32>> = points.iter().map(|&at| bricks.cell_of(at)).collect();
-        let slot_of = |brick: u32| {
-            table
-                .get(brick as usize * ENTRY)
-                .copied()
-                .unwrap_or(UNIFORM)
-        };
-        let reach = places
+        let table = bricks.table();
+        let slots: Vec<(u32, usize)> = places
             .iter()
-            .map(|place| slot_of(place.brick))
-            .filter(|&slot| slot != UNIFORM)
-            .map(|slot| (slot as usize + 1) * bricks.cells())
-            .max()
-            .unwrap_or(0);
-        let pool = live::read_state(&mut self.live, bricks.windows(), reach)?;
-        Ok(places
+            .map(|place| (table, place.brick as usize * ENTRY))
+            .collect();
+        let slots = self.gathered(&slots)?;
+        let values: Vec<(u32, usize)> = places
             .iter()
-            .map(
-                |place| match bricks.brick_words(&table, &pool, place.brick) {
-                    Content::Uniform(value) => value,
-                    Content::Mixed(words) => words.get(place.offset as usize).copied().unwrap_or(0),
-                },
-            )
-            .collect())
+            .map(|place| (table, bricks.value_at(plane as usize, place.brick)))
+            .collect();
+        let values = self.gathered(&values)?;
+        let windows = bricks.windows();
+        let start = bricks.plane_start(plane as usize) as usize;
+        let held: Vec<(usize, (u32, usize))> = places
+            .iter()
+            .zip(&slots)
+            .enumerate()
+            .filter(|&(_, (_, &slot))| slot != UNIFORM)
+            .map(|(at, (place, &slot))| {
+                let index = start + slot as usize * bricks.cells() + place.offset as usize;
+                (at, windows.place(index))
+            })
+            .collect();
+        let wanted: Vec<(u32, usize)> = held.iter().map(|&(_, place)| place).collect();
+        let words = self.gathered(&wanted)?;
+        let mut out = values;
+        for (&(at, _), word) in held.iter().zip(words) {
+            if let Some(slot) = out.get_mut(at) {
+                *slot = word;
+            }
+        }
+        Ok(out)
     }
 
     pub fn cells(&mut self) -> Result<Vec<u32>, Failed> {

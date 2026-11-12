@@ -1499,8 +1499,12 @@ impl Resident<'_> {
     }
 
     pub fn read(&mut self, index: usize, count: usize) -> Result<Vec<u32>, Error> {
+        self.read_at(index, 0, count)
+    }
+
+    pub fn read_at(&mut self, index: usize, at: usize, count: usize) -> Result<Vec<u32>, Error> {
         self.live()?;
-        let (held, from) = self.within(index, 0, count)?;
+        let (held, from) = self.within(index, at, count)?;
         let handle = held.handle;
         if self.sparse(index) {
             staged(0, count, self.room)?;
