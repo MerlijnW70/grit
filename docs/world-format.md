@@ -41,7 +41,7 @@ Each section is a 4-byte ASCII tag, a `u64` count of payload words, then the pay
 
 `c` is the cells per brick, `bricks` is x·y·z / c, `held` the held bricks.
 
-A brick is uniform when each of its planes holds one word in all its cells: its slot is `0xFFFFFFFF`, and its value in each plane is that word. Otherwise it is held: its slot is `h` when it is the `h`-th held brick, counted from 0, and its value in every plane is 0. A held brick that is uniform in every plane is not canonical and is refused, so one world has one file.
+A brick is uniform when each of its planes holds one word in all its cells: its slot is `0xFFFFFFFF`, and its value in each plane is that word. Otherwise it is held: its slot is `h` when it is the `h`-th held brick, counted from 0, and its value in every plane is 0. A held brick that is uniform in every plane is not canonical and is refused, so one world has one file. Files written by `World::save` before this rule (main up to `b70aeec`) could hold such a brick; by decision they are refused too, since the format is unreleased and none exist outside tests.
 
 Bricks tile the world: brick `(i, j, l)` holds the cells from `(i·sx, j·sy, l·sz)` on. Bricks are numbered x fastest, then y, then z; so are the cells inside a brick.
 
