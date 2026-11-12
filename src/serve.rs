@@ -1610,7 +1610,7 @@ fn apart(ended: &[u32], want: &[u32]) -> i64 {
     ended
         .iter()
         .zip(want)
-        .map(|(one, other)| i64::from(*one as i32 - *other as i32).abs())
+        .map(|(one, other)| (i64::from(*one as i32) - i64::from(*other as i32)).abs())
         .sum()
 }
 
@@ -1626,7 +1626,7 @@ fn pushed(ended: &[u32], want: &[u32]) -> Vec<u32> {
         .iter()
         .zip(want)
         .map(|(one, other)| {
-            let gap = *one as i32 - *other as i32;
+            let gap = i64::from(*one as i32) - i64::from(*other as i32);
             (match gap.signum() {
                 1 => PUSH,
                 -1 => -PUSH,

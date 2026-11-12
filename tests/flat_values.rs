@@ -380,3 +380,46 @@ fn a_step_of_one_tries_the_neighbours_before_it_stops() {
         secret
     );
 }
+
+#[test]
+fn settle_takes_the_widest_cells_without_wrapping() {
+    let Some(host) = device("settle_takes_the_widest_cells_without_wrapping") else {
+        return;
+    };
+    let made = structured(
+        Some(&host),
+        "grit_slope",
+        "{\"wide\":2,\"deep\":2,\"depth\":1,\"kind\":\"sum\",\"fill\":2147483647,\"carry\":false,\"most\":4}",
+    );
+    let ended: Vec<i64> = (0..4_u32)
+        .map(|at| {
+            made.get("ended")
+                .and_then(Json::list)
+                .unwrap()
+                .iter()
+                .find(|one| one.counted("at") == Some(at))
+                .map_or(2_147_483_647, |one| {
+                    one.get("is").and_then(Json::int).unwrap()
+                })
+        })
+        .collect();
+    let wanted: i64 = ended.iter().map(|one| (one + 2_147_483_648).abs()).sum();
+    let want: Vec<String> = (0..4)
+        .map(|at| format!("{{\"at\":{at},\"is\":-2147483648}}"))
+        .collect();
+    let held = structured(
+        Some(&host),
+        "grit_settle",
+        &format!(
+            "{{\"wide\":2,\"deep\":2,\"depth\":1,\"rounds\":1,\"kind\":\"sum\",\"fill\":2147483647,\"want\":[{}]}}",
+            want.join(",")
+        ),
+    );
+    eprintln!("ended {ended:?}, apart {:?}", held.get("apart"));
+    assert_eq!(
+        held.get("apart").and_then(Json::int),
+        Some(wanted),
+        "the distance is counted on whole numbers: {}",
+        written(&held)
+    );
+}
