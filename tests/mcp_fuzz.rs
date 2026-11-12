@@ -1263,3 +1263,462 @@ fn a_line_that_is_not_utf8_is_refused_with_the_bytes_that_came() {
         "{shown:?}"
     );
 }
+
+const FILE_TOOLS: [&str; 7] = [
+    "grit_world_save",
+    "grit_world_open",
+    "grit_world_list",
+    "grit_world_fork",
+    "grit_world_restore",
+    "grit_world_close",
+    "grit_world_step",
+];
+
+const ESCAPES: [&str; 22] = [
+    "..",
+    "../..",
+    "..\\\\..",
+    "/etc/passwd",
+    "C:\\\\Windows",
+    "C:",
+    "\\\\\\\\server\\\\share",
+    "//server/share",
+    "\\\\\\\\?\\\\C:\\\\x",
+    "CON",
+    "nul",
+    "com1",
+    "lpt3",
+    "aux",
+    "prn",
+    "kept",
+    "kept/world-1",
+    "world-1",
+    "world-01",
+    "a\\u0000b",
+    "x.grit",
+    "~",
+];
+
+fn fuzz_name(rng: &mut Rng) -> String {
+    let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789_-";
+    let wild = b"./\\:*?\"<>| $%~\t";
+    match rng.below(6) {
+        0 => (*rng.pick(&ESCAPES)).to_owned(),
+        1 => {
+            let many = rng.below(72) as usize;
+            (0..many).map(|_| char::from(*rng.pick(alphabet))).collect()
+        }
+        2 => {
+            let many = 1 + rng.below(12) as usize;
+            (0..many)
+                .map(|_| {
+                    if rng.chance(3) {
+                        char::from(*rng.pick(wild))
+                    } else {
+                        char::from(*rng.pick(alphabet))
+                    }
+                })
+                .map(|one| match one {
+                    '"' => "\\\"".to_owned(),
+                    '\\' => "\\\\".to_owned(),
+                    '\t' => "\\t".to_owned(),
+                    other => other.to_string(),
+                })
+                .collect()
+        }
+        3 => format!(
+            "{}{}",
+            rng.pick(&ESCAPES),
+            rng.pick(&["", "/x", "\\\\x", ".grit", "-1"])
+        ),
+        4 => (*rng.pick(&["caf\u{e9}", "\u{1f600}", "\u{202e}gnp", "a\u{301}"])).to_owned(),
+        _ => (*rng.pick(&["a", "b", "c", "saved-1", "z9"])).to_owned(),
+    }
+}
+
+fn file_arguments(rng: &mut Rng, tool: &str, world: u32) -> String {
+    let budget = if rng.chance(6) {
+        format!(
+            ",\"budget_ms\":{}",
+            rng.pick(&["1", "600000", "30000", "0", "600001"])
+        )
+    } else {
+        String::new()
+    };
+    let name = fuzz_name(rng);
+    match tool {
+        "grit_world_save" => format!(
+            "{{\"world\":{world},\"name\":\"{name}\"{}{budget}}}",
+            if rng.chance(2) {
+                ",\"replace\":true"
+            } else {
+                ""
+            }
+        ),
+        "grit_world_open" => format!("{{\"name\":\"{name}\"{budget}}}"),
+        "grit_world_list" => {
+            if rng.chance(2) {
+                format!("{{\"cursor\":{}{budget}}}", rng.below(40))
+            } else {
+                "{}".to_owned()
+            }
+        }
+        "grit_world_restore" => format!(
+            "{{\"world\":{world},\"from\":{}{budget}}}",
+            1 + rng.below(8)
+        ),
+        "grit_world_step" => format!(
+            "{{\"world\":{world},\"frames\":{}{budget}}}",
+            1 + rng.below(3)
+        ),
+        _ => format!("{{\"world\":{world}{budget}}}"),
+    }
+}
+
+fn file_line(seed: u64, index: u64, world: u32) -> String {
+    let mut rng = Rng::of(seed ^ 0xF11E, index);
+    let tool = *rng.pick(&FILE_TOOLS);
+    let given = file_arguments(&mut rng, tool, world);
+    let line = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"tools/call\",\"params\":{{\"name\":\"{tool}\",\"arguments\":{given}}}}}",
+        id(&mut rng)
+    );
+    if rng.chance(4) {
+        mutated(&mut rng, line)
+    } else {
+        line
+    }
+}
+
+fn tree(path: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        out.push(entry.path().to_string_lossy().into_owned());
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            tree(&entry.path(), out);
+        }
+    }
+    out.sort();
+}
+
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(label: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("grit-fuzz-{label}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(path.join("worlds")).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn the_device_free_fuzz_of_files_and_names_stays_in_its_directory() {
+    hooked();
+    let seed = seed();
+    let scratch = Scratch::new("free");
+    let options = grit::serve3::Options {
+        dir: Some(scratch.0.join("worlds")),
+        memory: None,
+    };
+    let mut server = Server::with(None, &options).unwrap();
+    let codes = codes_of(&mut server);
+    for name in ["a", "b", "saved-1"] {
+        std::fs::write(
+            scratch.0.join("worlds").join(format!("{name}.grit")),
+            b"GRITWLD1",
+        )
+        .unwrap();
+    }
+    let mut before = Vec::new();
+    tree(&scratch.0, &mut before);
+    let lines: u64 = std::env::var("GRIT_FUZZ_FILE_LINES")
+        .ok()
+        .map_or(20_000, |held| held.parse().unwrap());
+    let started = Instant::now();
+    let mut slowest = 0.0_f64;
+    let mut kinds: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for index in 0..lines {
+        let line = file_line(seed, index, 1 + (index % 3) as u32);
+        let began = Instant::now();
+        let got = heard(&mut server, &line);
+        slowest = slowest.max(began.elapsed().as_secs_f64());
+        if let Err(why) = checked(&line, got.as_ref(), &codes) {
+            panic!(
+                "seed {seed:#x} file line {index}: {why}\nline: {}",
+                short(&line)
+            );
+        }
+        assert_eq!(
+            FAULTS.load(Ordering::SeqCst),
+            0,
+            "seed {seed:#x} file line {index}: the server panicked"
+        );
+        let code = got
+            .as_ref()
+            .and_then(|one| one.get("result"))
+            .and_then(|one| one.get("structuredContent"))
+            .and_then(|one| one.get("code"))
+            .and_then(Json::text)
+            .unwrap_or("none")
+            .to_owned();
+        *kinds.entry(code).or_insert(0) += 1;
+    }
+    let mut after = Vec::new();
+    tree(&scratch.0, &mut after);
+    assert_eq!(after, before);
+    assert_eq!(caught(&mut server), Some(0));
+    println!(
+        "file fuzz seed {seed:#x}: {lines} lines in {:.1} s, slowest {:.4} s, codes {kinds:?}",
+        started.elapsed().as_secs_f64(),
+        slowest
+    );
+    assert!(kinds.get("path").is_some_and(|many| *many > lines / 20));
+    assert!(slowest < 1.0, "{slowest}");
+}
+
+#[derive(Clone)]
+struct Copy3 {
+    rule: String,
+    params: Vec<u32>,
+    grid: Grid3,
+    cells: Vec<u32>,
+    frame: u32,
+}
+
+fn told_of(got: Option<&Json>) -> Option<&Json> {
+    let result = got?.get("result")?;
+    if result.get("isError") != Some(&Json::Bool(false)) {
+        return None;
+    }
+    result.get("structuredContent")
+}
+
+fn replayed(rules: &[Box<dyn grit::serve3::Listed>], one: &mut Copy3, frames: u32) {
+    let rule = rules.iter().find(|rule| rule.name() == one.rule).unwrap();
+    for _ in 0..frames {
+        one.cells = rule.reference(one.grid, one.frame, &one.cells, &one.params);
+        one.frame += 1;
+    }
+}
+
+fn file_device_line(
+    seed: u64,
+    index: u64,
+    worlds: &std::collections::BTreeMap<u32, Copy3>,
+) -> String {
+    let mut rng = Rng::of(seed ^ 0xF0F1, index);
+    let open: Vec<u32> = worlds.keys().copied().collect();
+    let world = if open.is_empty() || rng.chance(15) {
+        1 + rng.below(12) as u32
+    } else {
+        *rng.pick(&open)
+    };
+    let heat_world = worlds.get(&world).is_some_and(|one| one.rule == "heat");
+    let mut word = |rng: &mut Rng| {
+        if heat_world {
+            heat_word(rng)
+        } else {
+            rng.next() as u32
+        }
+    };
+    match rng.below(12) {
+        0..4 => {
+            let tool = *rng.pick(&["grit_world_write", "grit_world_step", "grit_world_read"]);
+            valid(&mut rng, world, &mut word, &[tool])
+        }
+        4 => file_line(seed ^ 0xD, index, world),
+        _ => {
+            let tool = *rng.pick(&[
+                "grit_world_save",
+                "grit_world_open",
+                "grit_world_fork",
+                "grit_world_restore",
+                "grit_world_list",
+                "grit_world_close",
+            ]);
+            let budget = if rng.chance(20) {
+                ",\"budget_ms\":1"
+            } else {
+                ""
+            };
+            let name = *rng.pick(&["a", "b", "c"]);
+            let from = if open.is_empty() { 1 } else { *rng.pick(&open) };
+            let (tool, given) = match tool {
+                "grit_world_save" => (
+                    tool,
+                    format!(
+                        "{{\"world\":{world},\"name\":\"{name}\",\"replace\":{}{budget}}}",
+                        rng.chance(2)
+                    ),
+                ),
+                "grit_world_open" => (tool, format!("{{\"name\":\"{name}\"{budget}}}")),
+                "grit_world_restore" => (
+                    tool,
+                    format!("{{\"world\":{world},\"from\":{from}{budget}}}"),
+                ),
+                "grit_world_close" if !rng.chance(6) => ("grit_world_list", "{}".to_owned()),
+                "grit_world_list" => (tool, "{}".to_owned()),
+                _ => (tool, format!("{{\"world\":{world}{budget}}}")),
+            };
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"tools/call\",\"params\":{{\"name\":\"{tool}\",\"arguments\":{given}}}}}",
+                1 + index
+            )
+        }
+    }
+}
+
+#[test]
+fn the_device_fuzz_of_forks_and_files_keeps_every_world_equal_to_its_replay() {
+    let Some(host) = device("file fuzz") else {
+        return;
+    };
+    hooked();
+    let seed = seed();
+    let rules = rules_on(Some(&host));
+    let scratch = Scratch::new("device");
+    let options = grit::serve3::Options {
+        dir: Some(scratch.0.join("worlds")),
+        memory: None,
+    };
+    let mut server = Server::with(Some(&host), &options).unwrap();
+    let codes = codes_of(&mut server);
+    let mut worlds: std::collections::BTreeMap<u32, Copy3> = std::collections::BTreeMap::new();
+    let mut saved: std::collections::BTreeMap<String, Copy3> = std::collections::BTreeMap::new();
+    for (rule, params, sparse) in [("sand", "[]", false), ("heat", "[600,4,4096]", true)] {
+        let line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"grit_world_create\",\"arguments\":{{\"wide\":16,\"deep\":16,\"tall\":16,\"rule\":\"{rule}\",\"params\":{params},\"sparse\":{sparse}}}}}}}"
+        );
+        let got = server.heard(&line);
+        let told = told_of(got.as_ref()).unwrap();
+        worlds.insert(
+            told.counted("world").unwrap(),
+            Copy3 {
+                rule: rule.to_owned(),
+                params: whole(&read(params).unwrap()),
+                grid: Grid3::new(16, 16, 16).unwrap(),
+                cells: vec![0; 4096],
+                frame: 0,
+            },
+        );
+    }
+    let lines: u64 = std::env::var("GRIT_FUZZ_DEVICE_LINES")
+        .ok()
+        .map_or(2000, |held| held.parse().unwrap());
+    let started = Instant::now();
+    let mut changed = 0;
+    let mut stopped = 0;
+    for index in 0..lines {
+        let line = file_device_line(seed, index, &worlds);
+        let got = heard(&mut server, &line);
+        if let Err(why) = checked(&line, got.as_ref(), &codes) {
+            panic!(
+                "seed {seed:#x} file device line {index}: {why}\nline: {}",
+                short(&line)
+            );
+        }
+        assert_eq!(FAULTS.load(Ordering::SeqCst), 0, "line {index}");
+        let Some(told) = told_of(got.as_ref()) else {
+            continue;
+        };
+        let request = read(&line).unwrap();
+        let params = request.get("params").unwrap();
+        let name = params.get("name").and_then(Json::text).unwrap();
+        let empty = Json::Map(Vec::new());
+        let arguments = params.get("arguments").unwrap_or(&empty);
+        let target = arguments.counted("world");
+        match name {
+            "grit_world_write" => {
+                let one = worlds.get_mut(&target.unwrap()).unwrap();
+                for cell in arguments.get("cells").and_then(Json::list).unwrap() {
+                    let cell = whole(cell);
+                    let place = one.grid.index(cell[0], cell[1], cell[2]);
+                    one.cells[place] = cell[3];
+                }
+                changed += 1;
+            }
+            "grit_world_step" => {
+                let one = worlds.get_mut(&target.unwrap()).unwrap();
+                let frames = match told.counted("ran") {
+                    Some(ran) => {
+                        stopped += 1;
+                        ran
+                    }
+                    None => arguments.counted("frames").unwrap_or(1),
+                };
+                replayed(&rules, one, frames);
+                assert_eq!(told.counted("frame"), Some(one.frame), "line {index}");
+                changed += 1;
+            }
+            "grit_world_save" => {
+                let file = arguments
+                    .get("name")
+                    .and_then(Json::text)
+                    .unwrap()
+                    .to_owned();
+                saved.insert(file, worlds[&target.unwrap()].clone());
+            }
+            "grit_world_open" => {
+                let file = arguments.get("name").and_then(Json::text).unwrap();
+                let copy = saved[file].clone();
+                assert_eq!(told.counted("frame"), Some(copy.frame));
+                worlds.insert(told.counted("world").unwrap(), copy);
+                changed += 1;
+            }
+            "grit_world_fork" => {
+                let copy = worlds[&target.unwrap()].clone();
+                worlds.insert(told.counted("world").unwrap(), copy);
+                changed += 1;
+            }
+            "grit_world_restore" => {
+                let copy = worlds[&arguments.counted("from").unwrap()].clone();
+                worlds.insert(target.unwrap(), copy);
+                changed += 1;
+            }
+            "grit_world_close" => {
+                worlds.remove(&target.unwrap());
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(caught(&mut server), Some(0));
+    let mut compared = 0;
+    for (world, one) in &worlds {
+        let got = server.heard(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"grit_world_read\",\"arguments\":{{\"world\":{world},\"from\":[0,0,0],\"to\":[15,15,15]}}}}}}"
+        ));
+        let told = told_of(got.as_ref()).unwrap();
+        assert_eq!(told.counted("frame"), Some(one.frame), "world {world}");
+        assert_eq!(
+            whole(told.get("cells").unwrap()),
+            one.cells,
+            "seed {seed:#x}: world {world} under {} left its replay",
+            one.rule
+        );
+        compared += 1;
+    }
+    println!(
+        "file device fuzz seed {seed:#x} on {} width {}: {lines} lines, {changed} changes, {stopped} stopped by budget, {compared} worlds equal to their replay, {} saved, {:.1} s",
+        host.name(),
+        host.width(),
+        saved.len(),
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        compared >= 2 && changed > lines / 10,
+        "{compared} {changed}"
+    );
+}
