@@ -587,7 +587,7 @@ fn the_budget_that_fooled_a_reader_is_reached_by_raising_the_crowd() {
         .map(|row| u32::from(row.count_ones() >= 3).to_string())
         .collect();
     let arguments = format!(
-        "{{\"inputs\":5,\"outputs\":1,\"gates\":12,\"table\":[{}],\"crowd\":8000,\"rounds\":4000}}",
+        "{{\"inputs\":5,\"outputs\":1,\"gates\":12,\"table\":[{}],\"crowd\":64,\"rounds\":4000}}",
         table.join(",")
     );
     let held = structured(&call(Some(&host), "grit_synthesise", &arguments));
@@ -600,10 +600,10 @@ fn the_budget_that_fooled_a_reader_is_reached_by_raising_the_crowd() {
     assert_eq!(
         held.get("solved"),
         Some(&Json::Bool(true)),
-        "twelve gates holds a majority of five, and a crowd of 8000 over 4000 rounds says it does not: {}",
+        "twelve gates holds a majority of five, and a crowd of 64 over 4000 rounds says it does not: {}",
         written(&held)
     );
-    assert!(held.counted("crowd").unwrap() > 8000);
+    assert!(held.counted("crowd").unwrap() > 64);
     assert_eq!(
         held.get("wrong_rows").and_then(Json::list).unwrap().len(),
         0
@@ -659,7 +659,7 @@ fn the_ladder_steps_over_a_budget_that_fails_to_reach_one_below_it_that_does_not
         .map(|row| row.count_ones().to_string())
         .collect();
     let arguments = format!(
-        "{{\"inputs\":5,\"outputs\":3,\"gates\":14,\"table\":[{}],\"crowd\":65536,\"rounds\":4000}}",
+        "{{\"inputs\":5,\"outputs\":3,\"gates\":14,\"table\":[{}],\"crowd\":65536,\"rounds\":400,\"seed\":7}}",
         table.join(",")
     );
     let held = structured(&call(Some(&host), "grit_least", &arguments));
@@ -674,19 +674,19 @@ fn the_ladder_steps_over_a_budget_that_fails_to_reach_one_below_it_that_does_not
     }
     assert_eq!(
         held.counted("smallest_that_solved"),
-        Some(11),
-        "popcount of five is not found at twelve gates and is found at eleven, so a ladder that stops at the first failure answers thirteen: {}",
+        Some(13),
+        "popcount of five over 400 rounds from seed 7 is not found at fourteen gates and is found at thirteen, so a ladder that stops at the first failure answers nothing: {}",
         written(&held)
     );
-    let twelve = held
+    let fourteen = held
         .get("ladder")
         .and_then(Json::list)
         .unwrap()
         .iter()
-        .find(|rung| rung.counted("gates") == Some(12))
+        .find(|rung| rung.counted("gates") == Some(14))
         .unwrap();
     assert_eq!(
-        twelve.get("solved"),
+        fourteen.get("solved"),
         Some(&Json::Bool(false)),
         "the hole is on the ladder for the caller to see"
     );

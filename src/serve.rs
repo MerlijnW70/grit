@@ -7,8 +7,8 @@ use crate::marking::{
     BEST, BINDINGS, FEED, HELD, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked, stepped,
     turned_on, words_of,
 };
-use crate::netlist::{Chip, Exam, Gate, Netlist, drawn};
-use crate::resident::Groups;
+use crate::netlist::{Chip, Exam, Gate, Netlist, drawn, turned};
+use crate::resident::{Groups, Resident};
 use crate::rule::{KNOB, Kind, POINT};
 use crate::sand::{AIR, Grid, SAND, WALL, WATER, material_of};
 use crate::serve3::errors::{Code, Refusal, shown, shown_value};
@@ -189,17 +189,138 @@ pub fn checked(
     judged(shape, exam, gates)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Effort {
+    pub crowd: u32,
+    pub rounds: u32,
+    pub seed: u32,
+    pub stall: u32,
+    pub shake: u32,
+}
+
+pub const STALL: u32 = 300;
+
+pub const SHAKE: u32 = 6;
+
+impl Effort {
+    #[must_use]
+    pub const fn of(crowd: u32, rounds: u32) -> Self {
+        Self {
+            crowd,
+            rounds,
+            seed: SEEDING,
+            stall: STALL,
+            shake: SHAKE,
+        }
+    }
+}
+
+#[must_use]
+pub fn shaken(shape: Netlist, held: &[u32], shake: u32, seed: u32) -> Vec<u32> {
+    let mut state = seed | 1;
+    let mut roll = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let gates = shape.gates.max(1) as usize;
+    let mut held = held.to_vec();
+    for one in held.chunks_mut(gates) {
+        for _ in 0..shake {
+            let at = roll() % shape.gates.max(1);
+            let place = roll();
+            if let Some(word) = one.get_mut(at as usize) {
+                *word = turned(&shape, at, Gate::unpack(*word), place).pack();
+            }
+        }
+    }
+    held
+}
+
+struct Climb {
+    shape: Netlist,
+    many: u32,
+    full: u32,
+    batch: u32,
+}
+
+fn leader(best: &[u32]) -> (usize, u32) {
+    best.iter()
+        .copied()
+        .enumerate()
+        .max_by_key(|(_, one)| *one)
+        .unwrap_or((0, 0))
+}
+
+fn climbed(
+    resident: &mut Resident<'_>,
+    stages: &[&[Groups]],
+    climb: &Climb,
+    effort: Effort,
+    restart: u32,
+) -> Result<(u32, Vec<u32>), Box<dyn std::error::Error>> {
+    let gates = climb.shape.gates as usize;
+    let room = climb.many as usize * gates;
+    let mut done = 0_u32;
+    let mut top = 0_u32;
+    let mut since = 0_u32;
+    let mut shakes = 0_u32;
+    let mut kept: Option<(u32, Vec<u32>)> = None;
+    let mut best = Vec::new();
+    while done < effort.rounds {
+        let step = climb.batch.min(effort.rounds - done);
+        resident.staged_frames(stages, step)?;
+        done += step;
+        best = resident.read(BEST as usize, climb.many as usize)?;
+        let (who, now) = leader(&best);
+        if now >= climb.full {
+            break;
+        }
+        let taken = best.iter().all(|one| *one == now);
+        if now > top || !taken {
+            top = top.max(now);
+            since = 0;
+        } else {
+            since = since.saturating_add(step);
+        }
+        if effort.stall > 0 && since >= effort.stall && done < effort.rounds {
+            let held = resident.read(HELD as usize, room)?;
+            if kept.as_ref().is_none_or(|(score, _)| now > *score) {
+                let from = who * gates;
+                kept = Some((now, held.get(from..from + gates).unwrap_or(&[]).to_vec()));
+            }
+            shakes += 1;
+            let seed = mixed(restarted(effort.seed, restart) ^ mixed(shakes));
+            resident.write(
+                HELD as usize,
+                &shaken(climb.shape, &held, effort.shake, seed),
+            )?;
+            resident.write(BEST as usize, &vec![0_u32; climb.many as usize])?;
+            top = 0;
+            since = 0;
+        }
+    }
+    let (who, now) = leader(&best);
+    if let Some((score, gates)) = kept
+        && score > now
+    {
+        return Ok((done, gates));
+    }
+    let held = resident.read(HELD as usize, room)?;
+    let from = who * gates;
+    Ok((done, held.get(from..from + gates).unwrap_or(&[]).to_vec()))
+}
+
 pub fn sought(
     host: &Host,
     shape: Netlist,
     exam: &Exam,
-    many: u32,
-    rounds: u32,
-    seed: u32,
+    effort: Effort,
     restart: u32,
 ) -> Result<Found, Box<dyn std::error::Error>> {
     let width = host.width();
-    let many = whole(many, width);
+    let many = whole(effort.crowd, width);
     let turn = turned_on(width, shape)?;
     let mark = marked(width, shape)?;
     let pick = chosen(width, shape, SIDE, many)?;
@@ -207,7 +328,7 @@ pub fn sought(
     let sizes = room(shape, many)?;
     let mut resident = host.resident(&sizes, &modules)?;
 
-    let (crowd, seeds) = opening(shape, seed, restart, many);
+    let (crowd, seeds) = opening(shape, effort.seed, restart, many);
     resident.write(HELD as usize, &crowd)?;
     for binding in [TRIAL, VALUES, SCORE, BEST] {
         let held = sizes.get(binding as usize).copied().unwrap_or(0);
@@ -222,29 +343,14 @@ pub fn sought(
     let choosing = [over];
     let stages: Vec<&[Groups]> = vec![&turning, &marking, &choosing];
 
-    let full = exam.marks();
-    let batch = 100_u32;
-    let mut done = 0_u32;
-    let mut best = Vec::new();
-    while done < rounds {
-        let step = batch.min(rounds - done);
-        resident.staged_frames(&stages, step)?;
-        done += step;
-        best = resident.read(BEST as usize, many as usize)?;
-        if best.iter().any(|one| *one >= full) {
-            break;
-        }
-    }
-    let held = resident.read(HELD as usize, sizes.first().copied().unwrap_or(0))?;
-    let who = best
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, one)| **one)
-        .map_or(0, |(who, _)| who);
-    let from = who * shape.gates as usize;
-    let to = from + shape.gates as usize;
-    let gates = held.get(from..to).unwrap_or(&[]);
-    let mut found = judged(shape, exam, gates)?;
+    let climb = Climb {
+        shape,
+        many,
+        full: exam.marks(),
+        batch: 100,
+    };
+    let (done, gates) = climbed(&mut resident, &stages, &climb, effort, restart)?;
+    let mut found = judged(shape, exam, &gates)?;
     found.rounds = done;
     found.crowd = many;
     Ok(found)
@@ -254,18 +360,16 @@ pub fn pressed(
     host: &Host,
     shape: Netlist,
     exam: &Exam,
-    many: u32,
-    rounds: u32,
-    seed: u32,
+    effort: Effort,
 ) -> Result<Found, Box<dyn std::error::Error>> {
-    let mut crowd = many;
+    let mut effort = effort;
     let mut restart = 0_u32;
     loop {
-        let found = sought(host, shape, exam, crowd, rounds, seed, restart)?;
-        if found.marks >= found.full || crowd >= CROWD {
+        let found = sought(host, shape, exam, effort, restart)?;
+        if found.marks >= found.full || effort.crowd >= CROWD {
             return Ok(found);
         }
-        crowd = crowd.saturating_mul(2).min(CROWD);
+        effort.crowd = effort.crowd.saturating_mul(2).min(CROWD);
         restart += 1;
     }
 }
@@ -281,9 +385,7 @@ pub fn least(
     host: &Host,
     shape: Netlist,
     table: &[u32],
-    many: u32,
-    rounds: u32,
-    seed: u32,
+    effort: Effort,
 ) -> Result<Vec<Rung>, Box<dyn std::error::Error>> {
     let mut rungs = Vec::new();
     let mut gates = shape.gates;
@@ -291,7 +393,7 @@ pub fn least(
     while gates >= shape.outputs.max(1) && missed < PATIENCE && rungs.len() < RUNGS {
         let narrowed = Netlist::over(shape.inputs, shape.outputs, gates, shape.kinds)?;
         let exam = Exam::of(narrowed, table.to_vec())?;
-        let found = pressed(host, narrowed, &exam, many, rounds, seed)?;
+        let found = pressed(host, narrowed, &exam, effort)?;
         let solved = found.marks >= found.full;
         rungs.push(Rung { gates, found });
         if solved {
@@ -394,14 +496,12 @@ pub fn machined(
     host: &Host,
     held: Machine,
     traces: &[(Vec<u32>, Vec<u32>)],
-    many: u32,
-    rounds: u32,
-    seed: u32,
+    effort: Effort,
     restart: u32,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
     let shape = held.shape()?;
     let width = host.width();
-    let many = whole(many, width);
+    let many = whole(effort.crowd, width);
     let wide = u32::try_from(traces.len())?.div_ceil(32).max(1);
     unrolled(held, wide)?;
     let (feed, want) = laid(held, traces, wide);
@@ -421,7 +521,7 @@ pub fn machined(
         feed.len().max(1),
     ];
     let mut resident = host.resident(&sizes, &modules)?;
-    let (crowd, seeds) = opening(shape, seed, restart, many);
+    let (crowd, seeds) = opening(shape, effort.seed, restart, many);
     resident.write(HELD as usize, &crowd)?;
     for binding in [TRIAL, VALUES, SCORE, BEST] {
         let room = sizes.get(binding as usize).copied().unwrap_or(0);
@@ -439,29 +539,13 @@ pub fn machined(
     let choosing = [over];
     let stages: Vec<&[Groups]> = vec![&turning, &marking, &choosing];
 
-    let full = held.marks() * wide * 32;
-    let batch = 50_u32;
-    let mut done = 0_u32;
-    let mut best = Vec::new();
-    while done < rounds {
-        let step = batch.min(rounds - done);
-        resident.staged_frames(&stages, step)?;
-        done += step;
-        best = resident.read(BEST as usize, many as usize)?;
-        if best.iter().any(|one| *one >= full) {
-            break;
-        }
-    }
-
-    let chips = resident.read(HELD as usize, sizes.first().copied().unwrap_or(0))?;
-    let who = best
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, one)| **one)
-        .map_or(0, |(who, _)| who);
-    let from = who * shape.gates as usize;
-    let to = from + shape.gates as usize;
-    let gates = chips.get(from..to).unwrap_or(&[]).to_vec();
+    let climb = Climb {
+        shape,
+        many,
+        full: held.marks() * wide * 32,
+        batch: 50,
+    };
+    let (done, gates) = climbed(&mut resident, &stages, &climb, effort, restart)?;
     let chip = Chip::of(shape, gates.clone(), held.named())?;
     told_of(held, traces, &chip, &gates, done, many)
 }
@@ -470,18 +554,16 @@ pub fn pressed_machine(
     host: &Host,
     held: Machine,
     traces: &[(Vec<u32>, Vec<u32>)],
-    many: u32,
-    rounds: u32,
-    seed: u32,
+    effort: Effort,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
-    let mut crowd = many;
+    let mut effort = effort;
     let mut restart = 0_u32;
     loop {
-        let ran = machined(host, held, traces, crowd, rounds, seed, restart)?;
-        if ran.marks >= ran.full || crowd >= CROWD {
+        let ran = machined(host, held, traces, effort, restart)?;
+        if ran.marks >= ran.full || effort.crowd >= CROWD {
             return Ok(ran);
         }
-        crowd = crowd.saturating_mul(2).min(CROWD);
+        effort.crowd = effort.crowd.saturating_mul(2).min(CROWD);
         restart += 1;
     }
 }
@@ -656,6 +738,10 @@ fn gate() -> Json {
 
 const SEED_SAID: &str = "where the search starts, 305419896 when left out; the same seed and arguments give the same answer, and each time the search raises its own crowd it starts again from a fresh seed drawn from this one";
 
+const STALL_SAID: &str = "how many rounds the whole crowd may stand on one score before every candidate is shaken out of where it stands, the best so far kept aside; 300 when left out, 0 never shakes";
+
+const SHAKE_SAID: &str = "how many changes each candidate takes at once when the crowd is shaken, so it can cross a ridge that one change at a time cannot; 6 when left out, at most 64";
+
 pub(crate) fn tools() -> Json {
     let table = map(vec![
         ("type", text("array")),
@@ -681,6 +767,8 @@ pub(crate) fn tools() -> Json {
     seeking.push(("crowd", counting("how many candidates to start the search with; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent")));
     seeking.push(("rounds", counting("how many generations to allow")));
     seeking.push(("seed", counting(SEED_SAID)));
+    seeking.push(("stall", counting(STALL_SAID)));
+    seeking.push(("shake", counting(SHAKE_SAID)));
     let mut checking = shape;
     checking.push((
         "chip",
@@ -713,6 +801,8 @@ pub(crate) fn tools() -> Json {
         counting("how many generations to allow at each rung"),
     ));
     laddering.push(("seed", counting(SEED_SAID)));
+    laddering.push(("stall", counting(STALL_SAID)));
+    laddering.push(("shake", counting(SHAKE_SAID)));
     let trace = map(vec![
         ("type", text("array")),
         (
@@ -771,6 +861,8 @@ pub(crate) fn tools() -> Json {
         ),
         ("rounds", counting("how many generations to allow")),
         ("seed", counting(SEED_SAID)),
+        ("stall", counting(STALL_SAID)),
+        ("shake", counting(SHAKE_SAID)),
         (
             "chip",
             map(vec![
@@ -1895,6 +1987,18 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
     ]))
 }
 
+pub const SHAKES: u32 = 64;
+
+fn effort(held: &Json) -> Result<Effort, Box<dyn std::error::Error>> {
+    Ok(Effort {
+        crowd: number(held, "crowd", CROWD)?.clamp(64, CROWD),
+        rounds: number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20),
+        seed: number(held, "seed", SEEDING)?,
+        stall: number(held, "stall", STALL)?.min(1 << 20),
+        shake: number(held, "shake", SHAKE)?.min(SHAKES),
+    })
+}
+
 pub(crate) fn ran(
     host: Option<&Host>,
     name: &str,
@@ -1928,10 +2032,7 @@ pub(crate) fn ran(
             let Some(host) = host else {
                 return Err(Box::new(crate::host::Error::NoComputeDevice));
             };
-            let many = number(held, "crowd", CROWD)?.clamp(64, CROWD);
-            let rounds = number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20);
-            let seed = number(held, "seed", SEEDING)?;
-            pressed_machine(host, machine, &traces, many, rounds, seed)?
+            pressed_machine(host, machine, &traces, effort(held)?)?
         };
         return Ok(map(vec![
             ("solved", Json::Bool(told.marks >= told.full)),
@@ -1995,23 +2096,17 @@ pub(crate) fn ran(
             let Some(host) = host else {
                 return Err(Box::new(crate::host::Error::NoComputeDevice));
             };
-            let many = number(held, "crowd", CROWD)?.clamp(64, CROWD);
-            let rounds = number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20);
-            let seed = number(held, "seed", SEEDING)?;
-            Ok(told(
-                &pressed(host, shape, &exam, many, rounds, seed)?,
-                true,
-            ))
+            Ok(told(&pressed(host, shape, &exam, effort(held)?)?, true))
         }
         "grit_least" => {
             let Some(host) = host else {
                 return Err(Box::new(crate::host::Error::NoComputeDevice));
             };
-            let many = number(held, "crowd", CROWD)?.clamp(64, CROWD);
-            let rounds = number(held, "rounds", ROUNDS)?.clamp(1, 1 << 20);
+            let effort = effort(held)?;
+            let many = effort.crowd;
+            let rounds = effort.rounds;
             let table: Vec<u32> = (0..shape.words()).map(|row| exam.asked(row)).collect();
-            let seed = number(held, "seed", SEEDING)?;
-            let rungs = least(host, shape, &table, many, rounds, seed)?;
+            let rungs = least(host, shape, &table, effort)?;
             let smallest = rungs
                 .iter()
                 .filter(|rung| rung.found.marks >= rung.found.full)
