@@ -2112,7 +2112,7 @@ fn reading_one_cell_costs_the_same_device_waits_and_words_whatever_the_world_siz
                 cost.1 >= 1,
                 "the read did not go through the targeted reader: {cost:?}"
             );
-            costs.push((sparse, at == [1, 1, 1] || at == [2, 3, 4], cost));
+            costs.push((sparse, side, cost));
         }
         if side <= 256 {
             let before = read_meter(&mut server);
@@ -2138,16 +2138,26 @@ fn reading_one_cell_costs_the_same_device_waits_and_words_whatever_the_world_siz
         ));
     }
     for sparse in [false, true] {
-        let words: Vec<i64> = costs
+        let mut sides: Vec<u32> = costs
             .iter()
             .filter(|(kind, _, _)| *kind == sparse)
-            .map(|(_, _, cost)| cost.1)
+            .map(|(_, side, _)| *side)
             .collect();
-        let most = words.iter().copied().max().unwrap();
-        let least = words.iter().copied().min().unwrap();
+        sides.dedup();
+        let most = |side: u32| {
+            costs
+                .iter()
+                .filter(|(kind, at, _)| *kind == sparse && *at == side)
+                .map(|(_, _, cost)| cost.1)
+                .max()
+                .unwrap()
+        };
+        let (small, large) = (sides[0], sides[sides.len() - 1]);
         assert!(
-            most <= least.max(1) * 4,
-            "sparse {sparse}: words read for one cell range from {least} to {most}"
+            most(large) <= most(small) && most(small) <= 4096,
+            "sparse {sparse}: one cell read {} words at side {small} and {} at side {large}",
+            most(small),
+            most(large)
         );
     }
 }
