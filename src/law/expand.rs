@@ -9,10 +9,17 @@ use crate::ops::{Cpu, Ops};
 use crate::rule3::{CORNERS, noise_by};
 use crate::wire::Json;
 
+const KNOWN_INT: &str = "an int, known when the law compiles";
+
+const KNOWN_CHOICE: &str = "an int or a flag, known when the law compiles";
+
+const LIVE: &str = "known only when the law runs";
+
 #[derive(Clone, Debug)]
 enum Value {
     Int(u32),
     Word(u32),
+    Truth(bool),
     Flag(u32),
     List(Rc<[Value]>),
 }
@@ -33,9 +40,13 @@ fn kind(value: &Value) -> String {
     match value {
         Value::Int(held) => format!("the int {held}"),
         Value::Word(_) => String::from("a word"),
-        Value::Flag(_) => String::from("a flag"),
+        Value::Truth(_) | Value::Flag(_) => String::from("a flag"),
         Value::List(items) => format!("a vec of {}", items.len()),
     }
+}
+
+fn live(value: &Value) -> String {
+    format!("{}, {LIVE}", kind(value))
 }
 
 pub struct Expanded {
@@ -58,12 +69,19 @@ struct Expander<'c, 'p> {
 fn int(value: &Value, path: &Path<'_>) -> Result<u32, Refusal> {
     match value {
         Value::Int(held) => Ok(*held),
-        other => Err(refused(
-            Code::Type,
-            path,
-            "an int, known when the law compiles",
-            kind(other),
-        )),
+        Value::Word(_) => Err(refused(Code::Type, path, KNOWN_INT, live(value))),
+        other => Err(refused(Code::Type, path, KNOWN_INT, kind(other))),
+    }
+}
+
+fn chooser(value: &Value, path: &Path<'_>) -> Result<bool, Refusal> {
+    match value {
+        Value::Int(held) => Ok(*held != 0),
+        Value::Truth(holds) => Ok(*holds),
+        Value::Word(_) | Value::Flag(_) => {
+            Err(refused(Code::Type, path, KNOWN_CHOICE, live(value)))
+        }
+        Value::List(_) => Err(refused(Code::Type, path, KNOWN_CHOICE, kind(value))),
     }
 }
 
@@ -77,9 +95,21 @@ fn operand(value: &Value, path: &Path<'_>) -> Result<Operand, Refusal> {
 
 fn truth(value: &Value, path: &Path<'_>) -> Result<Truth, Refusal> {
     match value {
-        Value::Int(held) => Ok(Truth::Known(*held != 0)),
+        Value::Truth(holds) => Ok(Truth::Known(*holds)),
         Value::Flag(id) => Ok(Truth::Flag(*id)),
-        other => Err(refused(Code::Type, path, "a flag or an int", kind(other))),
+        other => Err(refused(
+            Code::Type,
+            path,
+            "a flag, made by a compare, both, either or denied",
+            kind(other),
+        )),
+    }
+}
+
+const fn spoken(operand: Operand) -> Value {
+    match operand {
+        Operand::Int(held) => Value::Int(held),
+        Operand::Word(id) => Value::Word(id),
     }
 }
 
@@ -402,8 +432,9 @@ impl<'p> Expander<'_, 'p> {
         path: &Path<'_>,
         depth: usize,
     ) -> Result<Value, Refusal> {
-        let condition = self.int_at(args, 0, path, depth)?;
-        let chosen = if condition != 0 { 1 } else { 2 };
+        let here = path.index(1);
+        let condition = self.eval(arg(args, 0), &here, depth)?;
+        let chosen = if chooser(&condition, &here)? { 1 } else { 2 };
         self.eval(arg(args, chosen), &path.index(chosen + 1), depth)
     }
 
@@ -476,7 +507,7 @@ impl<'p> Expander<'_, 'p> {
             let value = self.bound(&[(name, one.clone())], arg(args, 2), &path.index(3), depth)?;
             if mapping {
                 made.push(value);
-            } else if int(&value, &path.index(3))? != 0 {
+            } else if chooser(&value, &path.index(3))? {
                 made.push(one.clone());
             }
         }
@@ -633,8 +664,14 @@ impl<'p> Expander<'_, 'p> {
             | "ne" | "lt" | "le" | "gt" | "ge" => {
                 let left = operand(&value(0), &at(0))?;
                 let right = operand(&value(1), &at(1))?;
+                let compare = matches!(op, "eq" | "ne" | "lt" | "le" | "gt" | "ge");
                 if let (Operand::Int(left), Operand::Int(right)) = (left, right) {
-                    return Ok(Value::Int(folded(op, left, right)));
+                    let held = folded(op, left, right);
+                    return Ok(if compare {
+                        Value::Truth(held != 0)
+                    } else {
+                        Value::Int(held)
+                    });
                 }
                 let left = self.id(left, path)?;
                 let right = self.id(right, path)?;
@@ -675,7 +712,7 @@ impl<'p> Expander<'_, 'p> {
                     } else {
                         left || right
                     };
-                    return Ok(Value::Int(u32::from(holds)));
+                    return Ok(Value::Truth(holds));
                 }
                 let left = self.truth_id(left, path)?;
                 let right = self.truth_id(right, path)?;
@@ -688,7 +725,7 @@ impl<'p> Expander<'_, 'p> {
                 Ok(Value::Flag(made))
             }
             "denied" => match truth(&value(0), &at(0))? {
-                Truth::Known(holds) => Ok(Value::Int(u32::from(!holds))),
+                Truth::Known(holds) => Ok(Value::Truth(!holds)),
                 Truth::Flag(id) => {
                     let one = self.tracer.constant(1);
                     let made = self.tracer.xor(id, one);
@@ -721,20 +758,23 @@ impl<'p> Expander<'_, 'p> {
                 }
                 Ok(Value::Word(total))
             }
-            "sel" => match truth(&value(0), &at(0))? {
-                Truth::Known(holds) => Ok(value(if holds { 1 } else { 2 })),
-                Truth::Flag(flag) => {
-                    let then = operand(&value(1), &at(1))?;
-                    let otherwise = operand(&value(2), &at(2))?;
-                    let then = self.id(then, path)?;
-                    let otherwise = self.id(otherwise, path)?;
-                    let made = self
-                        .tracer
-                        .select(crate::ops::Flag::raised(flag), then, otherwise);
-                    self.grown(path)?;
-                    Ok(Value::Word(made))
+            "sel" => {
+                let chosen = truth(&value(0), &at(0))?;
+                let then = operand(&value(1), &at(1))?;
+                let otherwise = operand(&value(2), &at(2))?;
+                match chosen {
+                    Truth::Known(holds) => Ok(spoken(if holds { then } else { otherwise })),
+                    Truth::Flag(flag) => {
+                        let then = self.id(then, path)?;
+                        let otherwise = self.id(otherwise, path)?;
+                        let made =
+                            self.tracer
+                                .select(crate::ops::Flag::raised(flag), then, otherwise);
+                        self.grown(path)?;
+                        Ok(Value::Word(made))
+                    }
                 }
-            },
+            }
             _ => Err(refused(
                 Code::UnknownOp,
                 &path.index(0),

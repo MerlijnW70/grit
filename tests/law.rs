@@ -25,7 +25,7 @@ const SAND: &str = include_str!("law/sand.law.json");
 
 const HEAT: &str = include_str!("law/heat.law.json");
 
-const SAND_HASH: &str = "683fc2bd05e5df19c89b06fdc94419170c0e6273f7174bacca911cfd4704c344";
+const SAND_HASH: &str = "494773ea9940abbadfc496844a8e7cda99466041e7a02459a279dbc77415509a";
 
 const HEAT_HASH: &str = "93086d203206c5fd3bb185f610335a7cf7787dd1b33c634121044fb8f03a7011";
 
@@ -1146,7 +1146,7 @@ fn flag(value: u32, runtime: bool) -> String {
     if runtime {
         format!("[\"ne\",{},0]", unknown(value))
     } else {
-        known(value)
+        format!("[\"ne\",{},0]", known(value))
     }
 }
 
@@ -1178,7 +1178,11 @@ fn a_folded_constant_means_what_the_runtime_operation_computes() {
                 checked += 1;
             }
             for op in ["both", "either"] {
-                let folded = first_word(&format!("[\"word\",[\"{op}\",{left},{right}]]"));
+                let folded = first_word(&format!(
+                    "[\"word\",[\"{op}\",{},{}]]",
+                    flag(left, false),
+                    flag(right, false)
+                ));
                 for (one, other) in [(true, false), (false, true), (true, true)] {
                     let ran = first_word(&format!(
                         "[\"word\",[\"{op}\",{},{}]]",
@@ -1189,13 +1193,19 @@ fn a_folded_constant_means_what_the_runtime_operation_computes() {
                     checked += 1;
                 }
             }
-            let folded = first_word(&format!("[\"sel\",{left},{right},{left}]"));
+            let folded = first_word(&format!("[\"sel\",{},{right},{left}]", flag(left, false)));
             let ran = first_word(&format!("[\"sel\",{},{right},{left}]", flag(left, true)));
             assert_eq!(folded, ran, "sel {left} {right}");
-            let folded = first_word(&format!("[\"count\",[\"vec\",{left},{right},{left}]]"));
+            let folded = first_word(&format!(
+                "[\"count\",[\"vec\",{},{},{}]]",
+                flag(left, false),
+                flag(right, false),
+                flag(left, false)
+            ));
             let ran = first_word(&format!(
-                "[\"count\",[\"vec\",{},{right},{}]]",
+                "[\"count\",[\"vec\",{},{},{}]]",
                 flag(left, true),
+                flag(right, false),
                 flag(left, false)
             ));
             assert_eq!(folded, ran, "count {left} {right}");
@@ -1217,15 +1227,20 @@ fn a_folded_constant_means_what_the_runtime_operation_computes() {
                     format!("[\"not\",{inner}]")
                 }
             };
+            let folded = if op == "denied" {
+                flag(left, false)
+            } else {
+                known(left)
+            };
             assert_eq!(
-                first_word(&wrap(known(left))),
+                first_word(&wrap(folded)),
                 first_word(&wrap(runtime)),
                 "{op} {left}"
             );
             checked += 1;
         }
         assert_eq!(
-            first_word(&format!("[\"word\",{left}]")),
+            first_word(&format!("[\"word\",{}]", flag(left, false))),
             first_word(&format!("[\"word\",{}]", flag(left, true))),
             "word {left}"
         );
@@ -1369,6 +1384,224 @@ fn the_trace_of_embed_replays_with_identical_kernels() {
         );
         assert_eq!(one, other, "embed width {width}");
     }
+}
+
+const SHIPPED: [(&str, &str); 7] = [
+    ("sand", SAND),
+    ("heat", HEAT),
+    ("code", include_str!("law/code.law.json")),
+    ("nature", include_str!("law/nature.law.json")),
+    ("embed", include_str!("law/embed.law.json")),
+    ("mix", include_str!("law/mix.law.json")),
+    ("stir", include_str!("law/stir.law.json")),
+];
+
+fn sites_of(
+    json: &Json,
+    path: &mut Vec<usize>,
+    names: &BTreeSet<String>,
+    out: &mut Vec<Vec<usize>>,
+) {
+    match json {
+        Json::Int(_) => out.push(path.clone()),
+        Json::Text(name) if names.contains(name) => out.push(path.clone()),
+        Json::List(items) => {
+            let op = items.first().and_then(Json::text).unwrap_or("");
+            let skipped: &[usize] = match op {
+                "map" | "filter" => &[0, 1],
+                "fold" => &[0, 1, 3],
+                "let" => &[0, 1],
+                _ => &[0],
+            };
+            for (at, one) in items.iter().enumerate() {
+                if skipped.contains(&at) {
+                    continue;
+                }
+                path.push(at);
+                sites_of(one, path, names, out);
+                path.pop();
+            }
+            if op == "let"
+                && let Some(Json::List(bindings)) = items.get(1)
+            {
+                for (at, binding) in bindings.iter().enumerate() {
+                    path.extend([1, at, 1]);
+                    if let Some(value) = binding.list().and_then(|pair| pair.get(1)) {
+                        sites_of(value, path, names, out);
+                    }
+                    path.truncate(path.len() - 3);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn constant_sites(json: &Json) -> Vec<Vec<usize>> {
+    let Json::Map(fields) = json else {
+        panic!("a law is an object");
+    };
+    let mut names: BTreeSet<String> = ["X", "Y", "Z"]
+        .iter()
+        .map(|one| (*one).to_owned())
+        .collect();
+    if let Some(Json::Map(consts)) = json.get("consts") {
+        names.extend(consts.iter().map(|(name, _)| name.clone()));
+    }
+    let mut out = Vec::new();
+    for (at, (key, value)) in fields.iter().enumerate() {
+        if key == "step" {
+            sites_of(value, &mut vec![at], &names, &mut out);
+        }
+        if let (true, Json::Map(defs)) = (key == "defs", value) {
+            for (index, (_, def)) in defs.iter().enumerate() {
+                if let Some(body) = def.list().and_then(|pair| pair.get(1)) {
+                    sites_of(body, &mut vec![at, index, 1], &names, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn known_only_when_compiled(why: &Refusal) -> bool {
+    why.code == Code::Type && why.found.ends_with("known only when the law runs")
+}
+
+#[test]
+fn the_type_verdict_of_a_shipped_law_does_not_change_when_a_constant_becomes_a_param() {
+    let mut outcomes = std::collections::BTreeMap::new();
+    for (name, text) in SHIPPED {
+        let json = wire::read(text).unwrap();
+        let params = json.counted("params").unwrap();
+        let sites = constant_sites(&json);
+        assert!(!sites.is_empty(), "{name}");
+        for site in &sites {
+            let mut moved = json.clone();
+            set(&mut moved, "params", Json::Int(i64::from(params) + 1));
+            *walk_mut(&mut moved, site) = Json::List(vec![
+                Json::Text("param".into()),
+                Json::Int(i64::from(params)),
+            ]);
+            let outcome = match Law::from_json(&moved) {
+                Ok(_) => "compiles",
+                Err(why) if known_only_when_compiled(&why) => "needs a known int there",
+                Err(why) => {
+                    assert_ne!(why.code, Code::Type, "{name} {site:?}: {why}");
+                    why.code.name()
+                }
+            };
+            *outcomes.entry(outcome).or_insert(0_u32) += 1;
+        }
+        let mut params_used = Vec::new();
+        collect(&json, &mut Vec::new(), &mut params_used);
+        let mut fixed = 0;
+        for site in params_used {
+            let held = walk(&json, &site);
+            if held
+                .list()
+                .and_then(|items| items.first())
+                .and_then(Json::text)
+                != Some("param")
+            {
+                continue;
+            }
+            let mut moved = json.clone();
+            *walk_mut(&mut moved, &site) = Json::Int(1);
+            if let Err(why) = Law::from_json(&moved) {
+                assert_ne!(why.code, Code::Type, "{name} {site:?} as a constant: {why}");
+            }
+            fixed += 1;
+        }
+        println!(
+            "{name}: {} constants made params, {fixed} params made constants",
+            sites.len()
+        );
+    }
+    println!("{outcomes:?}");
+    assert!(
+        outcomes.get("compiles").copied().unwrap_or(0) > 250,
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .get("needs a known int there")
+            .copied()
+            .unwrap_or(0)
+            > 100,
+        "{outcomes:?}"
+    );
+}
+
+#[test]
+fn a_folded_compare_is_a_flag_and_sel_picks_one_type_whether_or_not_its_flag_is_known() {
+    let pairs = [
+        (
+            "[\"vec\",\"cells\",[\"vec\",[\"add\",[\"eq\",1,1],1]]]",
+            "[\"vec\",\"cells\",[\"vec\",[\"add\",[\"eq\",[\"param\",0],1],1]]]",
+            "$.step[2][1][1]",
+        ),
+        (
+            "[\"vec\",[\"sel\",[\"eq\",1,1],\"cells\",0],[\"vec\",0]]",
+            "[\"vec\",[\"sel\",[\"eq\",[\"param\",0],1],\"cells\",0],[\"vec\",0]]",
+            "$.step[1][2]",
+        ),
+        (
+            "[\"vec\",\"cells\",[\"vec\",[\"sel\",[\"eq\",1,1],0,[\"eq\",1,0]]]]",
+            "[\"vec\",\"cells\",[\"vec\",[\"sel\",[\"eq\",[\"param\",0],1],0,[\"eq\",1,0]]]]",
+            "$.step[2][1][3]",
+        ),
+        (
+            "[\"vec\",\"cells\",[\"vec\",[\"word\",[\"both\",1,[\"eq\",1,1]]]]]",
+            "[\"vec\",\"cells\",[\"vec\",[\"word\",[\"both\",[\"param\",0],[\"eq\",1,1]]]]]",
+            "$.step[2][1][1][1]",
+        ),
+        (
+            "[\"vec\",\"cells\",[\"vec\",[\"count\",[\"vec\",[\"eq\",1,1],1]]]]",
+            "[\"vec\",\"cells\",[\"vec\",[\"count\",[\"vec\",[\"eq\",1,1],[\"param\",0]]]]]",
+            "$.step[2][1][1]",
+        ),
+        (
+            "[\"vec\",\"cells\",[\"vec\",[\"eq\",1,1]]]",
+            "[\"vec\",\"cells\",[\"vec\",[\"eq\",[\"param\",0],1]]]",
+            "$.step",
+        ),
+    ];
+    for (folded, live, path) in pairs {
+        let with = |step: &str| edited(&template(step), |json| set(json, "params", Json::Int(1)));
+        let one = refusal(&with(folded));
+        let other = refusal(&with(live));
+        assert_eq!(
+            (one.code, one.path.as_str()),
+            (other.code, other.path.as_str()),
+            "{one} | {other}"
+        );
+        assert_eq!(one.path, path, "{one}");
+    }
+    let picked = edited(
+        &template("[\"vec\",\"cells\",[\"vec\",[\"sel\",[\"eq\",1,1],[\"param\",0],7]]]"),
+        |json| set(json, "params", Json::Int(1)),
+    );
+    assert_eq!(
+        compiled(&picked)
+            .step(Oct {
+                words: [0; CORNERS],
+                frame: 0,
+                at: [0; 3],
+                params: &[5],
+            })
+            .counts,
+        vec![5]
+    );
+    let why = refusal(&template(
+        "[\"vec\",\"cells\",[\"vec\",[\"if\",[\"ne\",\"frame\",0],1,2]]]",
+    ));
+    assert_eq!(
+        (why.code, why.path.as_str()),
+        (Code::Type, "$.step[2][1][1]"),
+        "{why}"
+    );
+    assert_eq!(why.found, "a flag, known only when the law runs");
 }
 
 #[test]
