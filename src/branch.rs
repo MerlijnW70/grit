@@ -299,6 +299,32 @@ fn pooled(bricks: Bricks, rule: &Stepper) -> Result<Bricks, Failed> {
         .map_err(|why| Box::new(unfit(why)) as Failed)
 }
 
+fn pool_for(
+    (grid, plan): &(Grid, Plan),
+    made: &Made<'_>,
+    rule: &Stepper,
+) -> Result<Option<Bricks>, Failed> {
+    if !made.sparse {
+        return Ok(None);
+    }
+    let brick_cells = u64::from(plan.per_block) * 8;
+    let least = u32::try_from(POOL_LEAST_CELLS.div_ceil(brick_cells)).unwrap_or(u32::MAX);
+    let capacity = made
+        .slots
+        .unwrap_or((plan.blocks / 4).max(least))
+        .clamp(1, most_slots(plan));
+    Ok(Some(pooled(Bricks::new(*grid, plan, capacity)?, rule)?))
+}
+
+pub fn sizes_of(host: &Host, made: &Made<'_>) -> Result<Vec<usize>, Failed> {
+    let rule = Stepper::Named(ruled(host, made.rule, made.params)?);
+    let shape = planned(host.width(), made.size, made.sparse)?;
+    Ok(match pool_for(&shape, made, &rule)? {
+        Some(bricks) => rule.bricked_sizes(&bricks, &shape.1),
+        None => rule.laid(&shape.1),
+    })
+}
+
 pub struct World<'host> {
     host: &'host Host,
     rule: Stepper,
@@ -453,18 +479,7 @@ impl<'host> World<'host> {
 
     fn made(host: &'host Host, rule: Stepper, made: &Made<'_>) -> Result<Self, Failed> {
         let shape = planned(host.width(), made.size, made.sparse)?;
-        let plan = shape.1;
-        let pool = if made.sparse {
-            let brick_cells = u64::from(plan.per_block) * 8;
-            let least = u32::try_from(POOL_LEAST_CELLS.div_ceil(brick_cells)).unwrap_or(u32::MAX);
-            let capacity = made
-                .slots
-                .unwrap_or((plan.blocks / 4).max(least))
-                .clamp(1, most_slots(&plan));
-            Some(pooled(Bricks::new(shape.0, &plan, capacity)?, &rule)?)
-        } else {
-            None
-        };
+        let pool = pool_for(&shape, made, &rule)?;
         let mut world = Self::built(host, rule, made.params.to_vec(), shape, pool)?;
         zeroed(&mut world.live, &world.sizes, None)?;
         world.parameters()?;
@@ -644,8 +659,80 @@ impl<'host> World<'host> {
         Ok(())
     }
 
-    pub fn tally(&mut self) -> Result<Vec<u128>, Failed> {
+    #[must_use]
+    pub fn sizes(&self) -> &[usize] {
+        &self.sizes
+    }
+
+    pub fn set_patience(&mut self, patience: std::time::Duration) {
+        self.live.set_patience(patience);
+    }
+
+    pub fn exact_tally(&mut self) -> Result<Vec<u128>, Failed> {
         Ok(live::read_tally(&mut self.live, self.rule.tally_words())?)
+    }
+
+    pub fn tally(&mut self) -> Result<Vec<u128>, Failed> {
+        self.exact_tally()
+    }
+
+    pub fn cells_at(&mut self, points: &[[u32; 3]]) -> Result<Vec<u32>, Failed> {
+        let size = self.size();
+        if let Some(&at) = points
+            .iter()
+            .find(|at| at.iter().zip(size).any(|(one, side)| *one >= side))
+        {
+            return Err(Box::new(Refused::Outside { at, size }));
+        }
+        if points.is_empty() {
+            return Ok(Vec::new());
+        }
+        let index = |at: &[u32; 3]| {
+            (u64::from(at[2]) * u64::from(size[1]) + u64::from(at[1])) * u64::from(size[0])
+                + u64::from(at[0])
+        };
+        let Some(bricks) = self.pool else {
+            let reach = points.iter().map(index).max().map_or(0, |last| last + 1);
+            let windows = self.rule.windows(&self.plan);
+            let state = live::read_state(&mut self.live, windows, usize::try_from(reach)?)?;
+            return points
+                .iter()
+                .map(|at| {
+                    usize::try_from(index(at))
+                        .ok()
+                        .and_then(|at| state.get(at).copied())
+                        .ok_or_else(|| "the world read back short".into())
+                })
+                .collect();
+        };
+        bricks.check(&mut self.live)?;
+        let table = self
+            .live
+            .read(bricks.table() as usize, bricks.table_words())?;
+        let places: Vec<bricks::Cell<u32>> = points.iter().map(|&at| bricks.cell_of(at)).collect();
+        let slot_of = |brick: u32| {
+            table
+                .get(brick as usize * ENTRY)
+                .copied()
+                .unwrap_or(UNIFORM)
+        };
+        let reach = places
+            .iter()
+            .map(|place| slot_of(place.brick))
+            .filter(|&slot| slot != UNIFORM)
+            .map(|slot| (slot as usize + 1) * bricks.cells())
+            .max()
+            .unwrap_or(0);
+        let pool = live::read_state(&mut self.live, bricks.windows(), reach)?;
+        Ok(places
+            .iter()
+            .map(
+                |place| match bricks.brick_words(&table, &pool, place.brick) {
+                    Content::Uniform(value) => value,
+                    Content::Mixed(words) => words.get(place.offset as usize).copied().unwrap_or(0),
+                },
+            )
+            .collect())
     }
 
     pub fn cells(&mut self) -> Result<Vec<u32>, Failed> {

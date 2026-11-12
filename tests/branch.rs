@@ -1352,6 +1352,7 @@ fn a_world_tally_past_four_billion_is_exact() {
         let mut world = World::create_law(&host, &law, &made).unwrap();
         world.step(1).unwrap();
         assert_eq!(world.tally().unwrap(), want, "sparse {sparse}");
+        assert_eq!(world.exact_tally().unwrap(), want, "sparse {sparse}");
     }
 }
 
@@ -1642,4 +1643,122 @@ fn a_file_past_what_the_engine_holds_opens_as_unfit() {
         let why = World::open(&host, &image).err().unwrap();
         assert_eq!(refused(why.as_ref()), "unfit", "{size:?}: {why}");
     }
+}
+
+fn edge_points(size: [u32; 3], seed: u64) -> Vec<[u32; 3]> {
+    let mut points = Vec::new();
+    let ends = |side: u32| [0, 1, side / 2 - 1, side / 2, side - 2, side - 1];
+    for x in ends(size[0]) {
+        for y in ends(size[1]) {
+            for z in ends(size[2]) {
+                points.push([x, y, z]);
+            }
+        }
+    }
+    let mut state = seed;
+    for _ in 0..200 {
+        let at = next(&mut state);
+        points.push([
+            (at % u64::from(size[0])) as u32,
+            ((at >> 16) % u64::from(size[1])) as u32,
+            ((at >> 32) % u64::from(size[2])) as u32,
+        ]);
+    }
+    points.push([size[0] - 1, size[1] - 1, size[2] - 1]);
+    points.push([0, 0, 0]);
+    points
+}
+
+fn cells_at_match(world: &mut World<'_>, label: &str) {
+    let size = world.size();
+    let whole = world.cells().unwrap();
+    let points = edge_points(size, 0xCE11);
+    let got = world.cells_at(&points).unwrap();
+    for (point, word) in points.iter().zip(&got) {
+        let index = ((point[2] as usize * size[1] as usize) + point[1] as usize) * size[0] as usize
+            + point[0] as usize;
+        assert_eq!(*word, whole[index], "{label} at {point:?}");
+    }
+    assert!(world.cells_at(&[]).unwrap().is_empty());
+    for outside in [
+        [size[0], 0, 0],
+        [0, size[1], 0],
+        [0, 0, size[2]],
+        [u32::MAX; 3],
+    ] {
+        let why = world.cells_at(&[[0, 0, 0], outside]).unwrap_err();
+        assert_eq!(refused(why.as_ref()), "outside", "{label} {outside:?}");
+    }
+}
+
+#[test]
+fn cells_at_reads_the_cells_a_full_read_gives_at_every_edge() {
+    let Some(host) = device("branch cells at") else {
+        return;
+    };
+    let params = params_of("heat", 3);
+    for sparse in [false, true] {
+        let mut world = filled(&host, "heat", &params, sparse, 0xA7);
+        world.step(3).unwrap();
+        let corners: Vec<([u32; 3], u32)> = edge_points(SIZE, 0x5EA)
+            .into_iter()
+            .take(216)
+            .map(|at| (at, heat::cell(heat::FIRE, 700)))
+            .collect();
+        world.write(&corners).unwrap();
+        cells_at_match(&mut world, &format!("heat sparse {sparse}"));
+        world.step(2).unwrap();
+        cells_at_match(&mut world, &format!("heat sparse {sparse}, stepped"));
+    }
+    for sparse in [false, true] {
+        let mut world = World::create(&host, &made("heat", &params, sparse)).unwrap();
+        world
+            .write(&[([17, 3, 9], heat::cell(heat::FIRE, 900))])
+            .unwrap();
+        if sparse {
+            let pool = world.pool_use().unwrap().unwrap();
+            assert!(pool.held >= 1 && pool.held < 16, "{pool:?}");
+        }
+        cells_at_match(&mut world, &format!("one hot cell, sparse {sparse}"));
+    }
+    let planes = decoded(TWO_PLANES_FIXTURE).unwrap();
+    let dense = Image {
+        state: State::Dense(planes.unpacked()),
+        ..planes.clone()
+    };
+    for image in [planes, dense] {
+        let mut world = World::open(&host, &image).unwrap();
+        assert_eq!(world.planes(), 2);
+        cells_at_match(&mut world, "two planes");
+        world.step(4).unwrap();
+        cells_at_match(&mut world, "two planes, stepped");
+    }
+}
+
+#[test]
+fn sizes_of_gives_the_bindings_a_created_world_has() {
+    let Some(host) = device("branch sizes of") else {
+        return;
+    };
+    for (rule, params) in every_rule() {
+        for sparse in [false, true] {
+            for slots in [None, Some(1), Some(3)] {
+                let made = Made {
+                    slots,
+                    ..made(&rule, &params, sparse)
+                };
+                let mut world = World::create(&host, &made).unwrap();
+                assert_eq!(
+                    grit::branch::sizes_of(&host, &made).unwrap(),
+                    world.sizes(),
+                    "{rule} sparse {sparse} {slots:?}"
+                );
+                world.set_patience(std::time::Duration::from_secs(30));
+                world.step(2).unwrap();
+            }
+        }
+    }
+    let unknown = made("no such rule", &[], false);
+    let why = grit::branch::sizes_of(&host, &unknown).unwrap_err();
+    assert_eq!(refused(why.as_ref()), "unknown_rule");
 }
