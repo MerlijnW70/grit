@@ -553,7 +553,8 @@ fn a_refusal_names_the_path_the_code_what_was_expected_and_what_was_found() {
     let why = refused_at(&unknown, Code::UnknownKey, "$.frames");
     assert_eq!(why.found, "the key \"frames\"");
     let duplicated = SAND.replacen("\"name\"", "\"name\": \"heat\", \"name\"", 1);
-    refused_at(&duplicated, Code::Json, "$");
+    let why = refused_at(&duplicated, Code::DuplicateKey, "$.name");
+    assert_eq!(why.found, "the key \"name\" again");
     let version = edited(SAND, |json| set(json, "law", Json::Int(2)));
     refused_at(&version, Code::Version, "$.law");
     let negative = edited(SAND, |json| {
@@ -1367,5 +1368,81 @@ fn the_trace_of_embed_replays_with_identical_kernels() {
             one == other
         );
         assert_eq!(one, other, "embed width {width}");
+    }
+}
+
+#[test]
+fn a_repeated_key_is_refused_at_its_json_path() {
+    assert_eq!(
+        wire::read("{\"a\":1,\"a\":2}"),
+        Err(wire::Torn::Twice { at: 7 })
+    );
+    assert_eq!(wire::Torn::Twice { at: 7 }.to_string(), "7 '\"'");
+    let cases = [
+        (
+            SAND.replacen("\"counts\": 3", "\"counts\": 3, \"counts\": 4", 1),
+            "$.tally.counts",
+            "counts",
+        ),
+        (
+            SAND.replacen("\"AIR\": 0", "\"AIR\": 0, \"AIR\": 1", 1),
+            "$.consts.AIR",
+            "AIR",
+        ),
+        (
+            SAND.replacen("\"AIR\": 0", "\"A\\u0042\": 0, \"AB\": 1", 1),
+            "$.consts.AB",
+            "AB",
+        ),
+        (
+            SAND.replacen(
+                "\"mat\": [[\"w\"], [\"and\", \"w\", 3]],",
+                "\"mat\": [[\"w\"], [\"and\", \"w\", 3]], \"mat\": [[\"w\"], 0],",
+                1,
+            ),
+            "$.defs.mat",
+            "mat",
+        ),
+        (
+            template("[\"vec\",\"cells\",[\"vec\",{\"k\":1,\"k\":2}]]"),
+            "$.step[2][1].k",
+            "k",
+        ),
+        (
+            template(
+                "[\"vec\",\"cells\",[\"vec\",[\"a,]}\\\"[{\",{\"b\":[1,{\"c\":2}],\"b\":3}]]]",
+            ),
+            "$.step[2][1][1].b",
+            "b",
+        ),
+        (
+            SAND.replacen("\"name\": \"sand\"", "\"name\": \"s\\\"],{\"", 1)
+                .replacen(
+                    "\"weighted\": true",
+                    "\"weighted\": true, \"weighted\": false",
+                    1,
+                ),
+            "$.tally.weighted",
+            "weighted",
+        ),
+        (
+            SAND.replacen(
+                "\"AIR\": 0",
+                &format!("\"{0}\": 0, \"{0}\": 1", "N".repeat(100)),
+                1,
+            ),
+            &format!("$.consts[\"{}...\"]", "N".repeat(limits::SHOWN)),
+            &format!("{}...", "N".repeat(limits::SHOWN)),
+        ),
+        (
+            SAND.replacen("\"AIR\": 0", "\"é\": 0, \"é\": 1", 1),
+            "$.consts[\"é\"]",
+            "é",
+        ),
+    ];
+    for (text, path, key) in &cases {
+        let why = refused_at(text, Code::DuplicateKey, path);
+        assert_eq!(why.found, format!("the key \"{key}\" again"), "{why}");
+        assert_eq!(why.expected, "each key once");
     }
 }
