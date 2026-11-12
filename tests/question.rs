@@ -5,7 +5,7 @@ use common::device;
 
 use grit::bricks::{Bricks, ENTRY, UNIFORM};
 use grit::compact::Plan;
-use grit::layout::{Dimension, PARAMS, STATE};
+use grit::layout::{Dimension, PARAMS};
 use grit::ops::{Helpers, Ops};
 use grit::question::cpu::{self, World as Cells};
 use grit::question::{
@@ -73,27 +73,54 @@ struct World<'host> {
     bricks: Option<Bricks>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct Made {
+    sparse: bool,
+    target: usize,
+    counting: bool,
+    split: Option<u32>,
+}
+
+impl Made {
+    fn of(sparse: bool, target: usize) -> Self {
+        Self {
+            sparse,
+            target,
+            ..Self::default()
+        }
+    }
+}
+
 fn opened<'host>(
     host: &'host Host,
     size: [u32; 3],
     cells: &[u32],
-    sparse: bool,
     asks: &[(Probe, Reduce)],
-    target: usize,
-    counting: bool,
+    made: Made,
 ) -> World<'host> {
+    let Made {
+        sparse,
+        target,
+        counting,
+        split,
+    } = made;
     let width = host.width();
     let grid = shaped(size);
     let blocks = grid.blocks().div_ceil(sweep::cells(width));
     let (plan, bricks) = if sparse {
         let plan = Plan::bricked(width, blocks).unwrap();
-        let bricks = Bricks::new(grid, &plan, plan.blocks).unwrap();
+        let bricks = match split {
+            Some(bits) => split_pool(grid, &plan, bits),
+            None => Bricks::new(grid, &plan, plan.blocks).unwrap(),
+        };
         (plan, Some(bricks))
     } else {
-        (
-            Plan::over_in(width, blocks, Dimension::Three).unwrap(),
-            None,
-        )
+        let plan = Plan::over_in(width, blocks, Dimension::Three).unwrap();
+        let plan = match split {
+            Some(bits) => split_plan(plan, bits),
+            None => plan,
+        };
+        (plan, None)
     };
     let ((passes, stages), bindings) = match bricks.as_ref() {
         Some(bricks) => (
@@ -102,7 +129,7 @@ fn opened<'host>(
         ),
         None => (
             grit::live::wired3_by(&Sand, width, grid, &plan).unwrap(),
-            grit::live::sizes3(&Sand, &plan).to_vec(),
+            plan.windows().laid(&grit::live::sizes3(&Sand, &plan)),
         ),
     };
     let layout = match bricks {
@@ -141,7 +168,7 @@ fn opened<'host>(
         None => {
             live.write(PARAMS as usize, &[u32::MAX, plan.dump()])
                 .unwrap();
-            live.write(STATE as usize, cells).unwrap();
+            grit::live::write_state(&mut live, plan.windows(), 0, cells).unwrap();
             grit::live::seed(&mut live, grid, &plan).unwrap();
         }
     }
@@ -166,6 +193,26 @@ fn counted(questions: Questions) -> Questions {
 #[cfg(not(feature = "faults"))]
 fn counted(questions: Questions) -> Questions {
     questions
+}
+
+#[cfg(feature = "faults")]
+fn split_pool(grid: Grid, plan: &Plan, bits: u32) -> Bricks {
+    Bricks::split_at(grid, plan, plan.blocks, bits).unwrap()
+}
+
+#[cfg(not(feature = "faults"))]
+fn split_pool(grid: Grid, plan: &Plan, _: u32) -> Bricks {
+    Bricks::new(grid, plan, plan.blocks).unwrap()
+}
+
+#[cfg(feature = "faults")]
+fn split_plan(plan: Plan, bits: u32) -> Plan {
+    plan.split_at(bits)
+}
+
+#[cfg(not(feature = "faults"))]
+fn split_plan(plan: Plan, _: u32) -> Plan {
+    plan
 }
 
 impl World<'_> {
@@ -194,11 +241,9 @@ impl World<'_> {
         match self.bricks {
             Some(bricks) => bricks.read(&mut self.live).unwrap(),
             None => {
-                let words = self.bindings[STATE as usize];
-                let grid = self.questions.layout().grid();
-                let mut read = self.live.read(STATE as usize, words).unwrap();
-                read.truncate(grid.cells());
-                read
+                let layout = self.questions.layout();
+                grit::live::read_state(&mut self.live, layout.windows(), layout.grid().cells())
+                    .unwrap()
             }
         }
     }
@@ -346,8 +391,8 @@ fn every_primitive_answers_as_the_cpu_on_dense_and_sparse_worlds() {
 fn answered_alike(host: &Host, size: [u32; 3], cells: &[u32]) {
     let asks = every_question();
     let whole = size.iter().map(|&side| side as usize).product();
-    let mut dense = opened(host, size, cells, false, &asks, whole, false);
-    let mut sparse = opened(host, size, cells, true, &asks, whole, false);
+    let mut dense = opened(host, size, cells, &asks, Made::of(false, whole));
+    let mut sparse = opened(host, size, cells, &asks, Made::of(true, whole));
     for frames in [0, 3, 8] {
         dense.step(frames);
         sparse.step(frames);
@@ -411,7 +456,7 @@ fn a_uniform_brick_counts_every_cell() {
         (Probe::Word, Reduce::Min),
         (Probe::Word, Reduce::Max),
     ];
-    let mut sparse = opened(&host, size, &cells, true, &asks, 0, false);
+    let mut sparse = opened(&host, size, &cells, &asks, Made::of(true, 0));
     let world = Cells {
         size,
         cells: &cells,
@@ -454,7 +499,7 @@ fn a_sum_past_four_billion_is_exact() {
     ];
     let whole = cells.len();
     for sparse in [false, true] {
-        let mut world = opened(&host, size, &cells, sparse, &asks, whole, false);
+        let mut world = opened(&host, size, &cells, &asks, Made::of(sparse, whole));
         world.aim(&vec![0; whole]);
         let region = Region::whole(size);
         let many = whole as u64;
@@ -495,7 +540,16 @@ fn a_uniform_brick_is_answered_without_reading_the_pool() {
         (Probe::Placed, Reduce::Sum),
         (Probe::Word, Reduce::Histogram { bins: 4 }),
     ];
-    let mut sparse = opened(&host, size, &cells, true, &asks, 0, true);
+    let mut sparse = opened(
+        &host,
+        size,
+        &cells,
+        &asks,
+        Made {
+            counting: true,
+            ..Made::of(true, 0)
+        },
+    );
     let bricks = sparse.bricks.unwrap();
     let (table, _) = bricks.raw(&mut sparse.live).unwrap();
     let per = bricks.cells() as u64;
@@ -559,7 +613,7 @@ fn the_answer_does_not_depend_on_how_the_work_is_spread() {
     let asks = every_question();
     let whole = cells.len();
     for sparse in [false, true] {
-        let mut world = opened(&host, size, &cells, sparse, &asks, whole, false);
+        let mut world = opened(&host, size, &cells, &asks, Made::of(sparse, whole));
         world.step(5);
         let region = Region::new([1, 1, 1], [size[0] - 1, size[1], size[2] - 2]);
         world.aim(&aimed(size, region, 9));
@@ -597,8 +651,8 @@ fn a_question_leaves_the_world_stepping_as_before() {
     let asks = every_question();
     let whole = cells.len();
     for sparse in [false, true] {
-        let mut asking = opened(&host, size, &cells, sparse, &asks, whole, false);
-        let mut quiet = opened(&host, size, &cells, sparse, &asks, whole, false);
+        let mut asking = opened(&host, size, &cells, &asks, Made::of(sparse, whole));
+        let mut quiet = opened(&host, size, &cells, &asks, Made::of(sparse, whole));
         asking.aim(&vec![1; whole]);
         for round in 0..4 {
             for which in 0..asks.len() {
@@ -759,4 +813,54 @@ fn a_map_reads_the_point_only_when_it_does() {
     assert!(!grit::question::reads_point(&Probe::Sand));
     assert!(!grit::question::reads_point(&Probe::Spread));
     assert!(grit::question::reads_point(&Probe::Placed));
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_world_split_over_windows_answers_as_one_binding_does() {
+    let Some(host) = device("question") else {
+        return;
+    };
+    let size = sparse_size(&host);
+    let cells = sandy(size, 0x5917);
+    let asks = every_question();
+    let whole = cells.len();
+    for sparse in [false, true] {
+        let mut plain = opened(&host, size, &cells, &asks, Made::of(sparse, whole));
+        let bits = match plain.bricks {
+            Some(bricks) => bricks.cell_bits() + 2,
+            None => whole.trailing_zeros() - 2,
+        };
+        let made = Made {
+            split: Some(bits),
+            ..Made::of(sparse, whole)
+        };
+        let mut split = opened(&host, size, &cells, &asks, made);
+        let windows = split.questions.layout().windows();
+        assert!(windows.is_split(), "sparse {sparse}: {bits} bits");
+        plain.step(3);
+        split.step(3);
+        let now = plain.cells();
+        assert_eq!(
+            now,
+            split.cells(),
+            "sparse {sparse}: the split world stepped apart"
+        );
+        for (number, region) in regions(size).into_iter().enumerate() {
+            let target = aimed(size, region, number as u64);
+            plain.aim(&target);
+            split.aim(&target);
+            for (which, &(probe, reduce)) in asks.iter().enumerate() {
+                let world = Cells { size, cells: &now };
+                let wanted = cpu::answer(&probe, reduce, world, region, &target);
+                assert_eq!(plain.ask(which, region).unwrap(), wanted);
+                assert_eq!(
+                    split.ask(which, region).unwrap(),
+                    wanted,
+                    "{} windows, sparse {sparse}: {probe:?} {reduce:?} {region:?}",
+                    windows.count()
+                );
+            }
+        }
+    }
 }
