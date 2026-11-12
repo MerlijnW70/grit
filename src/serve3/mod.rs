@@ -628,18 +628,7 @@ impl<'host> Server<'host> {
         if !was_lost {
             return (server, restored);
         }
-        for (number, held) in &mut server.book.held {
-            if held.broken.is_some() {
-                continue;
-            }
-            let note = map(vec![
-                ("world", counted(*number)),
-                ("frame", counted(held.ledger.frame)),
-                ("pending", Json::Bool(true)),
-            ]);
-            restored.push(note);
-        }
-        server.book.restorations = server.book.restorations.saturating_add(1);
+        restored = server.pending();
         if server.wedged() {
             server.lose();
         }
@@ -805,8 +794,27 @@ impl<'host> Server<'host> {
     }
 
     fn lose(&mut self) {
+        if !self.book.lost {
+            self.book.restorations = self.book.restorations.saturating_add(1);
+        }
         self.live.clear();
         self.book.lost = true;
+    }
+
+    #[must_use]
+    pub fn pending(&self) -> Vec<Json> {
+        self.book
+            .held
+            .iter()
+            .filter(|(number, held)| held.broken.is_none() && !self.live.contains_key(number))
+            .map(|(number, held)| {
+                map(vec![
+                    ("world", counted(*number)),
+                    ("frame", counted(held.ledger.frame)),
+                    ("pending", Json::Bool(true)),
+                ])
+            })
+            .collect()
     }
 
     fn wedged(&self) -> bool {

@@ -170,7 +170,6 @@ fn patched(answer: Json, restored: &[Json]) -> Json {
 }
 
 enum Waiting {
-    Answered(Job, Json),
     Unrun(Job),
 }
 
@@ -185,29 +184,18 @@ fn work(
     let mut waiting: Option<Waiting> = None;
     loop {
         let host = opener().ok().flatten();
-        let (mut server, restored) = Server::resumed(host.as_ref(), book);
+        let (mut server, _) = Server::resumed(host.as_ref(), book);
         shared.publish(&server);
         let _ = ready.send(());
         let mut retried = false;
-        match waiting.take() {
-            Some(Waiting::Answered(job, answer)) => {
-                let _ = answers.send(patched(answer, &restored));
-                shared.landed(&job.cancel);
-            }
-            Some(Waiting::Unrun(job)) => {
-                retried = true;
-                waiting = Some(Waiting::Unrun(job));
-            }
-            None => {}
+        if let Some(Waiting::Unrun(job)) = waiting.take() {
+            retried = true;
+            waiting = Some(Waiting::Unrun(job));
         }
         let mut reopen = false;
         loop {
             let job = match waiting.take() {
                 Some(Waiting::Unrun(job)) => job,
-                Some(answered) => {
-                    waiting = Some(answered);
-                    break;
-                }
                 None => match jobs.recv() {
                     Ok(job) => job,
                     Err(_) => break,
@@ -224,7 +212,8 @@ fn work(
             server.arriving(None, None);
             shared.publish(&server);
             if server.lost() {
-                waiting = Some(Waiting::Answered(job, answer));
+                let _ = answers.send(patched(answer, &server.pending()));
+                shared.landed(&job.cancel);
                 reopen = true;
                 break;
             }
