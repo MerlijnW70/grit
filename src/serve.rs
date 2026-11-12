@@ -35,6 +35,7 @@ pub struct Found {
     pub gates: Vec<Gate>,
     pub table: Vec<u32>,
     pub wrong: Vec<u32>,
+    pub most: u32,
 }
 
 fn columns(exam: &Exam) -> Vec<u32> {
@@ -238,6 +239,7 @@ fn judged(shape: Netlist, exam: &Exam, gates: &[u32]) -> Result<Found, Box<dyn s
         gates: gates.iter().map(|one| Gate::unpack(*one)).collect(),
         table,
         wrong,
+        most: CROWD,
     })
 }
 
@@ -256,6 +258,7 @@ pub struct Effort {
     pub seed: u32,
     pub stall: u32,
     pub shake: u32,
+    pub submitted: u32,
 }
 
 pub const STALL: u32 = 300;
@@ -271,6 +274,7 @@ impl Effort {
             seed: SEEDING,
             stall: STALL,
             shake: SHAKE,
+            submitted: u32::MAX,
         }
     }
 }
@@ -293,11 +297,157 @@ pub fn shaken(shape: Netlist, held: &[u32], shake: u32, seed: u32) -> Vec<u32> {
     held
 }
 
+pub const LOOK: u32 = 100;
+
+pub const MACHINE_LOOK: u32 = 50;
+
+pub const SUBMISSION: std::time::Duration = std::time::Duration::from_millis(100);
+
+pub const ROUND_MOST: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub const GROWN: u32 = 4;
+
 struct Climb {
     shape: Netlist,
     many: u32,
     full: u32,
-    batch: u32,
+    look: u32,
+    work: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pace {
+    work: u64,
+    most: u32,
+    each: Option<f64>,
+}
+
+impl Pace {
+    #[must_use]
+    pub const fn over(work: u64, most: u32) -> Self {
+        Self {
+            work: if work == 0 { 1 } else { work },
+            most: if most == 0 { 1 } else { most },
+            each: None,
+        }
+    }
+
+    #[must_use]
+    pub fn next(&self, left: u32) -> u32 {
+        let Some(each) = self.each else {
+            return 1.min(left);
+        };
+        let round = each * self.work as f64;
+        let fits = if round > 0.0 {
+            (SUBMISSION.as_secs_f64() / round).floor()
+        } else {
+            f64::from(u32::MAX)
+        };
+        let fits = if fits >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            fits as u32
+        };
+        fits.min(self.most).min(left).max(1.min(left))
+    }
+
+    pub fn learn(
+        &mut self,
+        rounds: u32,
+        wall: std::time::Duration,
+        device: Option<std::time::Duration>,
+    ) {
+        let spent = device.map_or(wall, |device| device.max(wall));
+        let units = self.work as f64 * f64::from(rounds.max(1));
+        self.each = Some(spent.as_secs_f64() / units);
+    }
+
+    #[must_use]
+    pub const fn measured(&self) -> Option<f64> {
+        self.each
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gauge {
+    pub round: std::time::Duration,
+    pub most: u32,
+    pub probes: u32,
+}
+
+fn spent_on(resident: &Resident<'_>, wall: std::time::Duration) -> std::time::Duration {
+    resident.on_device().map_or(wall, |device| device.max(wall))
+}
+
+fn gauged(
+    resident: &mut Resident<'_>,
+    width: u32,
+    many: u32,
+) -> Result<Gauge, Box<dyn std::error::Error>> {
+    let total = many.div_ceil(width).max(1);
+    let quarter = ROUND_MOST.as_secs_f64() / 4.0;
+    let mut groups = 1_u32;
+    let mut probes = 0_u32;
+    loop {
+        let part = [Groups::Fixed(groups)];
+        let stages: Vec<&[Groups]> = vec![&part, &part, &part];
+        let wall = resident.staged_frames(&stages, 1)?;
+        probes += 1;
+        let spent = resident.on_device().unwrap_or(wall).as_secs_f64();
+        let each = spent / f64::from(groups);
+        let grown = f64::from(groups.saturating_mul(GROWN).min(total));
+        let next = if each > 0.0 {
+            (quarter / each).floor().min(grown)
+        } else {
+            grown
+        };
+        if groups < total && next > f64::from(groups) {
+            groups = next as u32;
+            continue;
+        }
+        let round = each * f64::from(total);
+        let fits = if each > 0.0 {
+            (ROUND_MOST.as_secs_f64() / each).floor()
+        } else {
+            f64::INFINITY
+        };
+        let most = if fits >= f64::from(u32::MAX / width) {
+            u32::MAX / width * width
+        } else {
+            fits as u32 * width
+        };
+        return Ok(Gauge {
+            round: std::time::Duration::from_secs_f64(round),
+            most,
+            probes,
+        });
+    }
+}
+
+#[derive(Debug)]
+pub struct Overlong {
+    pub crowd: u32,
+    pub most: u32,
+    pub round: std::time::Duration,
+}
+
+impl std::fmt::Display for Overlong {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "one round over a crowd of {} would keep this device busy for {:.0} ms in one go, measured on it, over the {} ms a submission may take before a driver resets the device; this device holds a crowd of at most {} at this shape",
+            self.crowd,
+            self.round.as_secs_f64() * 1e3,
+            ROUND_MOST.as_millis(),
+            self.most
+        )
+    }
+}
+
+impl std::error::Error for Overlong {}
+
+fn refused_overlong(held: &Overlong) -> Box<dyn std::error::Error> {
+    Box::new(Refusal::new(Code::TooMany, "$.crowd", held.to_string()).limited(counted(held.most)))
 }
 
 fn leader(best: &[u32]) -> (usize, u32) {
@@ -308,15 +458,34 @@ fn leader(best: &[u32]) -> (usize, u32) {
         .unwrap_or((0, 0))
 }
 
+fn walked(
+    resident: &mut Resident<'_>,
+    stages: &[&[Groups]],
+    pace: &mut Pace,
+    rounds: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut gone = 0_u32;
+    while gone < rounds {
+        let step = pace.next(rounds - gone);
+        let wall = resident.staged_frames(stages, step)?;
+        pace.learn(step, spent_on(resident, wall), None);
+        gone += step;
+    }
+    Ok(())
+}
+
 fn climbed(
     resident: &mut Resident<'_>,
     stages: &[&[Groups]],
     climb: &Climb,
     effort: Effort,
     restart: u32,
+    gauge: Gauge,
 ) -> Result<(u32, Vec<u32>), Box<dyn std::error::Error>> {
     let gates = climb.shape.gates as usize;
     let room = climb.many as usize * gates;
+    let mut pace = Pace::over(climb.work, effort.submitted);
+    pace.learn(1, gauge.round, None);
     let mut done = 0_u32;
     let mut top = 0_u32;
     let mut since = 0_u32;
@@ -324,8 +493,8 @@ fn climbed(
     let mut kept: Option<(u32, Vec<u32>)> = None;
     let mut best = Vec::new();
     while done < effort.rounds {
-        let step = climb.batch.min(effort.rounds - done);
-        resident.staged_frames(stages, step)?;
+        let step = climb.look.min(effort.rounds - done);
+        walked(resident, stages, &mut pace, step)?;
         done += step;
         best = resident.read(BEST as usize, climb.many as usize)?;
         let (who, now) = leader(&best);
@@ -374,6 +543,16 @@ pub fn sought(
     effort: Effort,
     restart: u32,
 ) -> Result<Found, Box<dyn std::error::Error>> {
+    sought_within(host, shape, exam, effort, restart)?.map_err(|held| refused_overlong(&held))
+}
+
+fn sought_within(
+    host: &Host,
+    shape: Netlist,
+    exam: &Exam,
+    effort: Effort,
+    restart: u32,
+) -> Result<Result<Found, Overlong>, Box<dyn std::error::Error>> {
     let width = host.width();
     let many = whole(effort.crowd, width);
     let turn = turned_on(width, shape)?;
@@ -391,6 +570,17 @@ pub fn sought(
     }
     resident.write(WANTED as usize, &columns(exam))?;
     resident.write(SEED as usize, &seeds)?;
+    let gauge = gauged(&mut resident, width, many)?;
+    if gauge.round > ROUND_MOST {
+        return Ok(Err(Overlong {
+            crowd: many,
+            most: gauge.most,
+            round: gauge.round,
+        }));
+    }
+    resident.write(HELD as usize, &crowd)?;
+    resident.write(SEED as usize, &seeds)?;
+    resident.write(BEST as usize, &vec![0_u32; many as usize])?;
 
     let over = Groups::Fixed(many.div_ceil(width));
     let turning = [over];
@@ -402,13 +592,15 @@ pub fn sought(
         shape,
         many,
         full: exam.marks(),
-        batch: 100,
+        look: LOOK,
+        work: u64::from(many) * u64::from(shape.gates) * u64::from(words_of(shape)),
     };
-    let (done, gates) = climbed(&mut resident, &stages, &climb, effort, restart)?;
+    let (done, gates) = climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
     let mut found = judged(shape, exam, &gates)?;
     found.rounds = done;
     found.crowd = many;
-    Ok(found)
+    found.most = gauge.most;
+    Ok(Ok(found))
 }
 
 pub fn pressed(
@@ -419,13 +611,19 @@ pub fn pressed(
 ) -> Result<Found, Box<dyn std::error::Error>> {
     let mut effort = effort;
     let mut restart = 0_u32;
+    let mut before: Option<Found> = None;
     loop {
-        let found = sought(host, shape, exam, effort, restart)?;
-        if found.marks >= found.full || effort.crowd >= CROWD {
+        let found = match sought_within(host, shape, exam, effort, restart)? {
+            Ok(found) => found,
+            Err(held) => return before.ok_or_else(|| refused_overlong(&held)),
+        };
+        let most = CROWD.min(found.most);
+        if found.marks >= found.full || effort.crowd >= most {
             return Ok(found);
         }
-        effort.crowd = effort.crowd.saturating_mul(2).min(CROWD);
+        effort.crowd = effort.crowd.saturating_mul(2).min(most);
         restart += 1;
+        before = Some(found);
     }
 }
 
@@ -472,6 +670,7 @@ pub struct Ran {
     pub gates: Vec<Gate>,
     pub said: Vec<Vec<u32>>,
     pub wrong: Vec<(u32, u32)>,
+    pub most: u32,
 }
 
 fn laid(held: Machine, traces: &[(Vec<u32>, Vec<u32>)], wide: u32) -> (Vec<u32>, Vec<u32>) {
@@ -544,6 +743,7 @@ fn told_of(
         gates: gates.iter().map(|one| Gate::unpack(*one)).collect(),
         said,
         wrong,
+        most: CROWD,
     })
 }
 
@@ -554,6 +754,16 @@ pub fn machined(
     effort: Effort,
     restart: u32,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
+    machined_within(host, held, traces, effort, restart)?.map_err(|held| refused_overlong(&held))
+}
+
+fn machined_within(
+    host: &Host,
+    held: Machine,
+    traces: &[(Vec<u32>, Vec<u32>)],
+    effort: Effort,
+    restart: u32,
+) -> Result<Result<Ran, Overlong>, Box<dyn std::error::Error>> {
     let shape = held.shape()?;
     let width = host.width();
     let many = whole(effort.crowd, width);
@@ -587,6 +797,17 @@ pub fn machined(
         resident.write(FEED as usize, &feed)?;
     }
     resident.write(SEED as usize, &seeds)?;
+    let gauge = gauged(&mut resident, width, many)?;
+    if gauge.round > ROUND_MOST {
+        return Ok(Err(Overlong {
+            crowd: many,
+            most: gauge.most,
+            round: gauge.round,
+        }));
+    }
+    resident.write(HELD as usize, &crowd)?;
+    resident.write(SEED as usize, &seeds)?;
+    resident.write(BEST as usize, &vec![0_u32; many as usize])?;
 
     let over = Groups::Fixed(many.div_ceil(width));
     let turning = [over];
@@ -598,11 +819,20 @@ pub fn machined(
         shape,
         many,
         full: held.marks() * wide * 32,
-        batch: 50,
+        look: MACHINE_LOOK,
+        work: u64::from(many)
+            * u64::from(held.steps)
+            * (u64::from(held.gates)
+                + u64::from(held.state)
+                + u64::from(held.inputs)
+                + u64::from(held.outputs))
+            * u64::from(wide),
     };
-    let (done, gates) = climbed(&mut resident, &stages, &climb, effort, restart)?;
+    let (done, gates) = climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
     let chip = Chip::of(shape, gates.clone(), held.named())?;
-    told_of(held, traces, &chip, &gates, done, many)
+    let mut ran = told_of(held, traces, &chip, &gates, done, many)?;
+    ran.most = gauge.most;
+    Ok(Ok(ran))
 }
 
 pub fn pressed_machine(
@@ -613,13 +843,19 @@ pub fn pressed_machine(
 ) -> Result<Ran, Box<dyn std::error::Error>> {
     let mut effort = effort;
     let mut restart = 0_u32;
+    let mut before: Option<Ran> = None;
     loop {
-        let ran = machined(host, held, traces, effort, restart)?;
-        if ran.marks >= ran.full || effort.crowd >= CROWD {
+        let ran = match machined_within(host, held, traces, effort, restart)? {
+            Ok(ran) => ran,
+            Err(over) => return before.ok_or_else(|| refused_overlong(&over)),
+        };
+        let most = CROWD.min(ran.most);
+        if ran.marks >= ran.full || effort.crowd >= most {
             return Ok(ran);
         }
-        effort.crowd = effort.crowd.saturating_mul(2).min(CROWD);
+        effort.crowd = effort.crowd.saturating_mul(2).min(most);
         restart += 1;
+        before = Some(ran);
     }
 }
 
@@ -1023,7 +1259,7 @@ const CROWDED: Whole = Whole {
     least: 64,
     most: CROWD as i64,
     or: Some(CROWD as i64),
-    said: "how many candidates to start the search with, rounded up to whole subgroups of the device; while it has not solved, the search doubles this on its own up to 65536, and the crowd in the answer is what it actually spent",
+    said: "how many candidates to start the search with, rounded up to whole subgroups of the device; while it has not solved, the search doubles this on its own up to 65536, or up to the largest crowd whose round this device runs within a second, measured on it, and the crowd in the answer is what it actually spent; a starting crowd whose round would run longer is refused with that largest crowd as its limit",
 };
 
 const GENERATIONS: Whole = Whole {
@@ -2392,6 +2628,7 @@ fn effort(held: &Json) -> Result<Effort, Box<dyn std::error::Error>> {
         seed: SEEDED.count(held, "$")?,
         stall: STALLED.count(held, "$")?,
         shake: SHAKEN.count(held, "$")?,
+        submitted: u32::MAX,
     })
 }
 
