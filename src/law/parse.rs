@@ -180,6 +180,9 @@ fn torn(why: Torn) -> String {
         Torn::Ended { at } => format!("the text ending at byte {at}"),
         Torn::Stray { at, saw } => format!("{saw:?} at byte {at}"),
         Torn::Twice { at } => format!("a key again at byte {at}"),
+        Torn::Control { at, byte } => format!(
+            "the control byte 0x{byte:02x} raw inside a string at byte {at}, which JSON writes escaped"
+        ),
         Torn::TooDeep { at } => format!("nesting deeper than 64 at byte {at}"),
         Torn::NotANumber { at } => {
             format!("a number at byte {at} that is not a whole number of at most 19 digits")

@@ -33,7 +33,7 @@ fn structured(answer: &Json) -> Json {
 
 #[test]
 fn a_torn_line_is_read_back_as_it_was_written() {
-    let held = "{\"a\":[1,-2,true,null,\"one\ntwo\"],\"b\":{\"c\":9}}";
+    let held = "{\"a\":[1,-2,true,null,\"one\\ntwo\"],\"b\":{\"c\":9}}";
     let one = read(held).unwrap();
     let again = read(&written(&one)).unwrap();
     assert_eq!(one, again);
