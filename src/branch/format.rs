@@ -288,17 +288,20 @@ impl Image {
     }
 
     #[must_use]
-    pub fn cells(&self) -> u64 {
-        self.size.iter().map(|&side| u64::from(side)).product()
+    pub fn cells(&self) -> Option<u64> {
+        product(self.size)
     }
 
     #[must_use]
     pub fn channels(&self) -> u32 {
-        let cells = self.cells().max(1);
+        let Some(cells) = self.cells().filter(|&cells| cells > 0) else {
+            return 1;
+        };
         let planes = match &self.state {
             State::Dense(words) => words.len() as u64 / cells,
             State::Sparse { sides, table, .. } => {
-                let bricks = (cells / brick_cells(*sides).max(1) as u64).max(1);
+                let per = product(*sides).unwrap_or(u64::MAX).max(1);
+                let bricks = (cells / per).max(1);
                 (table.len() as u64 / bricks).saturating_sub(1)
             }
         };
@@ -307,43 +310,66 @@ impl Image {
 
     #[must_use]
     pub fn unpacked(&self) -> Vec<u32> {
+        self.try_unpacked().unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn try_unpacked(&self) -> Option<Vec<u32>> {
         match &self.state {
-            State::Dense(cells) => cells.clone(),
+            State::Dense(cells) => Some(cells.clone()),
             State::Sparse {
                 sides, table, pool, ..
             } => {
                 let size = self.size;
                 let lattice = lattice_of(size, *sides);
-                let per = brick_cells(*sides);
-                let total = usize::try_from(self.cells()).unwrap_or(0);
+                let per = usize::try_from(product(*sides)?).ok()?;
+                let total = usize::try_from(self.cells()?).ok()?;
                 let planes = self.channels() as usize;
-                let bricks = lattice.iter().map(|&side| side as usize).product::<usize>();
-                let held = pool.len() / (per * planes).max(1);
-                let mut cells = vec![0_u32; total * planes];
-                for (index, cell) in cells.iter_mut().enumerate() {
+                let bricks = usize::try_from(product(lattice)?).ok()?;
+                let held = pool.len() / per.checked_mul(planes)?.max(1);
+                let words = total.checked_mul(planes)?;
+                let mut cells = Vec::new();
+                cells.try_reserve_exact(words).ok()?;
+                for index in 0..words {
                     let plane = index / total.max(1);
                     let at = index % total.max(1);
                     let point = point_of(size, at as u64);
                     let (brick, offset) = place(point, *sides, lattice);
-                    let slot = table.get(brick * 2).copied().unwrap_or(UNIFORM);
+                    let entry = |at: Option<usize>| at.and_then(|at| table.get(at)).copied();
+                    let slot = entry(brick.checked_mul(2)).unwrap_or(UNIFORM);
                     let value = match plane {
-                        0 => table.get(brick * 2 + 1),
-                        _ => table.get(2 * bricks + (plane - 1) * bricks + brick),
+                        0 => entry(brick.checked_mul(2).and_then(|at| at.checked_add(1))),
+                        _ => entry(
+                            bricks
+                                .checked_mul(plane + 1)
+                                .and_then(|at| at.checked_add(brick)),
+                        ),
                     }
-                    .copied()
                     .unwrap_or_default();
-                    *cell = if slot == UNIFORM {
+                    cells.push(if slot == UNIFORM {
                         value
                     } else {
-                        pool.get(plane * held * per + slot as usize * per + offset)
+                        plane
+                            .checked_mul(held)
+                            .and_then(|at| at.checked_add(slot as usize))
+                            .and_then(|at| at.checked_mul(per))
+                            .and_then(|at| at.checked_add(offset))
+                            .and_then(|at| pool.get(at))
                             .copied()
                             .unwrap_or_default()
-                    };
+                    });
                 }
-                cells
+                Some(cells)
             }
         }
     }
+}
+
+#[must_use]
+pub fn product(sides: [u32; 3]) -> Option<u64> {
+    sides
+        .iter()
+        .try_fold(1_u64, |total, &side| total.checked_mul(u64::from(side)))
 }
 
 #[must_use]
@@ -357,7 +383,9 @@ pub fn lattice_of(size: [u32; 3], sides: [u32; 3]) -> [u32; 3] {
 
 #[must_use]
 pub fn brick_cells(sides: [u32; 3]) -> usize {
-    sides.iter().map(|&side| side as usize).product()
+    product(sides)
+        .and_then(|cells| usize::try_from(cells).ok())
+        .unwrap_or(usize::MAX)
 }
 
 #[must_use]
@@ -379,8 +407,8 @@ pub fn place(point: [u32; 3], sides: [u32; 3], lattice: [u32; 3]) -> (usize, usi
         let side = sides.get(axis).copied().unwrap_or(1).max(1) as usize;
         let across = lattice.get(axis).copied().unwrap_or(1) as usize;
         let at = point.get(axis).copied().unwrap_or_default() as usize;
-        brick = brick * across + at / side;
-        offset = offset * side + at % side;
+        brick = brick.saturating_mul(across).saturating_add(at / side);
+        offset = offset.saturating_mul(side).saturating_add(at % side);
     }
     (brick, offset)
 }
@@ -821,11 +849,20 @@ fn judged(header: Header, sections: Vec<([u8; 4], Vec<u32>)>) -> Result<Image, R
             )));
         }
     }
-    let cells = header
-        .size
-        .iter()
-        .map(|&side| u64::from(side))
-        .product::<u64>();
+    let cells = product(header.size).ok_or_else(|| {
+        malformed(format!(
+            "a world of {} by {} by {} cells has more cells than 64 bits count",
+            header.size[0], header.size[1], header.size[2]
+        ))
+    })?;
+    let words = cells
+        .checked_mul(u64::from(header.channels))
+        .ok_or_else(|| {
+            malformed(format!(
+                "a world of {cells} cells in {} planes has more words than 64 bits count",
+                header.channels
+            ))
+        })?;
     let state = if header.sparse == 0 {
         if header.capacity != 0 || header.sides != [0; 3] {
             return Err(malformed(
@@ -833,9 +870,8 @@ fn judged(header: Header, sections: Vec<([u8; 4], Vec<u32>)>) -> Result<Image, R
             ));
         }
         let dense = payloads.next().unwrap_or_default();
-        let planes = cells * u64::from(header.channels);
-        if dense.len() as u64 != planes {
-            return Err(sized("dense", planes, dense.len() as u64));
+        if dense.len() as u64 != words {
+            return Err(sized("dense", words, dense.len() as u64));
         }
         State::Dense(dense)
     } else {
@@ -848,6 +884,10 @@ fn judged(header: Header, sections: Vec<([u8; 4], Vec<u32>)>) -> Result<Image, R
         size: header.size,
         state,
     })
+}
+
+fn too_many(what: &str) -> Refused {
+    malformed(format!("the {what} has more words than 64 bits count"))
 }
 
 fn sparse_state(
@@ -865,25 +905,25 @@ fn sparse_state(
             )));
         }
     }
-    let per = header
-        .sides
-        .iter()
-        .map(|&side| u64::from(side))
-        .product::<u64>();
-    let bricks = cells / per;
+    let per = product(header.sides).ok_or_else(|| too_many("brick"))?;
+    let bricks = cells.checked_div(per).ok_or_else(|| too_many("brick"))?;
     let planes = u64::from(header.channels);
-    if table.len() as u64 != bricks * (planes + 1) {
-        return Err(sized("table", bricks * (planes + 1), table.len() as u64));
+    let entries = planes
+        .checked_add(1)
+        .and_then(|words| bricks.checked_mul(words))
+        .ok_or_else(|| too_many("table"))?;
+    if table.len() as u64 != entries {
+        return Err(sized("table", entries, table.len() as u64));
     }
-    let heads = usize::try_from(bricks * 2).unwrap_or(usize::MAX);
-    let (entries, upper) = table.split_at(heads.min(table.len()));
+    let across = usize::try_from(bricks).unwrap_or(usize::MAX);
+    let (entries, upper) = table.split_at(across.saturating_mul(2).min(table.len()));
     let mut held = 0_u32;
     for (index, &[slot, value]) in entries.as_chunks::<2>().0.iter().enumerate() {
         if slot != UNIFORM
             && upper
                 .iter()
                 .skip(index)
-                .step_by(usize::try_from(bricks).unwrap_or(1).max(1))
+                .step_by(across.max(1))
                 .any(|&value| value != 0)
         {
             return Err(malformed(format!(
@@ -907,12 +947,12 @@ fn sparse_state(
             u64::from(held),
         ));
     }
-    if pool.len() as u64 != u64::from(held) * per * planes {
-        return Err(sized(
-            "pool",
-            u64::from(held) * per * planes,
-            pool.len() as u64,
-        ));
+    let pooled = per
+        .checked_mul(planes)
+        .and_then(|words| words.checked_mul(u64::from(held)))
+        .ok_or_else(|| too_many("pool"))?;
+    if pool.len() as u64 != pooled {
+        return Err(sized("pool", pooled, pool.len() as u64));
     }
     Ok(State::Sparse {
         capacity: header.capacity,

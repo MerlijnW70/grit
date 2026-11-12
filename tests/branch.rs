@@ -1015,3 +1015,147 @@ fn a_pool_that_does_not_fit_the_device_is_refused_by_name() {
     assert_eq!(refused(why.as_ref()), "unfit", "{why}");
     println!("{why}");
 }
+
+const TWO_PLANES_FIXTURE: &[u8] = include_bytes!("branch/two-planes.world");
+
+fn heat_image(size: [u32; 3], state: State) -> Image {
+    Image {
+        law: Law::Rule {
+            name: "heat".into(),
+        },
+        params: params_of("heat", 3),
+        frame: 0,
+        size,
+        state,
+    }
+}
+
+fn two_plane_image(size: [u32; 3], state: State) -> Image {
+    let fixture = decoded(TWO_PLANES_FIXTURE).unwrap();
+    Image {
+        size,
+        state,
+        frame: 0,
+        ..fixture
+    }
+}
+
+fn past_64_bits(file: &[u8]) {
+    let why = decoded(file).unwrap_err();
+    assert_eq!(why.name(), "malformed", "{why}");
+    assert!(why.to_string().contains("64 bits"), "{why}");
+}
+
+#[test]
+fn a_sparse_header_whose_cells_pass_64_bits_is_refused_by_name() {
+    let big = 1_u32 << 31;
+    let file = format::encoded(&heat_image(
+        [big; 3],
+        State::Sparse {
+            capacity: 1,
+            sides: [big; 3],
+            table: vec![format::UNIFORM, 7],
+            pool: Vec::new(),
+        },
+    ));
+    past_64_bits(&file);
+    for sides in [[2, 2, 2], [big, big, 2], [big, 2, big], [2, big, big]] {
+        let image = heat_image(
+            [big; 3],
+            State::Sparse {
+                capacity: 1,
+                sides,
+                table: vec![format::UNIFORM, 7],
+                pool: Vec::new(),
+            },
+        );
+        assert_eq!(image.cells(), None);
+        past_64_bits(&format::encoded(&image));
+    }
+    let edge = [big, big, 2];
+    let uniform = heat_image(
+        edge,
+        State::Sparse {
+            capacity: 1,
+            sides: edge,
+            table: vec![format::UNIFORM, 7],
+            pool: Vec::new(),
+        },
+    );
+    assert_eq!(uniform.cells(), Some(1 << 63));
+    assert_eq!(decoded(&format::encoded(&uniform)), Ok(uniform));
+    let held = heat_image(
+        edge,
+        State::Sparse {
+            capacity: 1,
+            sides: edge,
+            table: vec![0, 0],
+            pool: Vec::new(),
+        },
+    );
+    assert_eq!(
+        decoded(&format::encoded(&held)),
+        Err(Refused::Sizes {
+            what: "pool",
+            header: 1 << 63,
+            found: 0
+        })
+    );
+    let planes = two_plane_image(
+        edge,
+        State::Sparse {
+            capacity: 1,
+            sides: edge,
+            table: vec![format::UNIFORM, 7, 9],
+            pool: Vec::new(),
+        },
+    );
+    assert_eq!(planes.channels(), 2);
+    past_64_bits(&format::encoded(&planes));
+}
+
+#[test]
+fn a_dense_header_of_two_to_the_64_cells_is_refused_by_name() {
+    let big = 1_u32 << 31;
+    let wrapping = heat_image([big, big, 4], State::Dense(Vec::new()));
+    assert_eq!(wrapping.cells(), None);
+    past_64_bits(&format::encoded(&wrapping));
+    let edge = heat_image([big, big, 2], State::Dense(Vec::new()));
+    assert_eq!(edge.cells(), Some(1 << 63));
+    assert_eq!(
+        decoded(&format::encoded(&edge)),
+        Err(Refused::Sizes {
+            what: "dense",
+            header: 1 << 63,
+            found: 0
+        })
+    );
+    let planes = two_plane_image([big, big, 2], State::Dense(Vec::new()));
+    let mut file = format::encoded(&planes);
+    let channels = 64 + 4 * planes.params.len();
+    assert_eq!(word_at(&file, channels), 1);
+    put_word(&mut file, channels, 2);
+    past_64_bits(&resealed(file));
+}
+
+#[test]
+fn a_file_past_what_the_engine_holds_opens_as_unfit() {
+    let Some(host) = device("branch past the engine") else {
+        return;
+    };
+    let big = 1_u32 << 31;
+    for size in [[big, big, 2], [1 << 16, 1 << 16, 1 << 16], [2, 2, big]] {
+        let image = heat_image(
+            size,
+            State::Sparse {
+                capacity: 1,
+                sides: size,
+                table: vec![format::UNIFORM, 7],
+                pool: Vec::new(),
+            },
+        );
+        let image = decoded(&format::encoded(&image)).unwrap();
+        let why = World::open(&host, &image).err().unwrap();
+        assert_eq!(refused(why.as_ref()), "unfit", "{size:?}: {why}");
+    }
+}
