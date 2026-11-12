@@ -1035,6 +1035,25 @@ pub fn temporary(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{}.{count}.tmp", std::process::id()))
 }
 
+pub const ATTEMPTS: u32 = 1 << 12;
+
+fn fresh(path: &Path) -> io::Result<(PathBuf, File)> {
+    let mut last = io::Error::from(io::ErrorKind::AlreadyExists);
+    for _ in 0..ATTEMPTS {
+        let temporary = temporary(path);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(why) if why.kind() == io::ErrorKind::AlreadyExists => last = why,
+            Err(why) => return Err(why),
+        }
+    }
+    Err(last)
+}
+
 pub fn store(path: &Path, image: &Image) -> Result<u64, Refused> {
     store_with(path, image, |file| file)
 }
@@ -1044,12 +1063,7 @@ where
     W: Write,
     F: FnOnce(File) -> W,
 {
-    let temporary = temporary(path);
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|why| failed(&why))?;
+    let (temporary, file) = fresh(path).map_err(|why| failed(&why))?;
     let written = (|| -> io::Result<u64> {
         let out = BufWriter::with_capacity(1 << 20, wrap(file));
         let (out, written) = encode(image, out)?;

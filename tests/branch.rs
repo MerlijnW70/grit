@@ -1139,6 +1139,33 @@ fn a_dense_header_of_two_to_the_64_cells_is_refused_by_name() {
 }
 
 #[test]
+fn stale_temporary_files_never_block_a_save() {
+    let folder = folder("stale");
+    let path = folder.join("w.world");
+    let probe = format::temporary(&path);
+    let name = probe.file_name().unwrap().to_string_lossy().into_owned();
+    let parts: Vec<&str> = name.split('.').collect();
+    let pid = parts[parts.len() - 3];
+    let count: u64 = parts[parts.len() - 2].parse().unwrap();
+    assert_eq!(pid, std::process::id().to_string());
+    let stale = 64;
+    for at in count + 1..=count + stale {
+        fs::write(
+            folder.join(format!(".w.world.{pid}.{at}.tmp")),
+            b"left by a crashed process with this pid",
+        )
+        .unwrap();
+    }
+    let image = decoded(DENSE_FIXTURE).unwrap();
+    for _ in 0..5 {
+        format::store(&path, &image).unwrap();
+        assert_eq!(format::fetch(&path).unwrap(), image);
+    }
+    assert_eq!(leftovers(&folder).len(), stale as usize + 1);
+    let _ = fs::remove_dir_all(&folder);
+}
+
+#[test]
 fn a_file_past_what_the_engine_holds_opens_as_unfit() {
     let Some(host) = device("branch past the engine") else {
         return;
