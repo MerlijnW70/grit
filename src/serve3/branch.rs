@@ -303,9 +303,14 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
     let (_, sizes) = shaped(host, rule.as_ref(), ledger.made())?;
     admitted(server, host, &sizes, "the world")?;
     let mut pace = super::budget::Pace::first(0);
-    let world = journal::rebuilt(host, &ledger, server.book.keep.as_ref(), |world, frames| {
-        paced(world, frames, &mut pace)
-    })?;
+    let guard = server.guard();
+    let world = journal::rebuilt(
+        host,
+        &ledger,
+        server.book.keep.as_ref(),
+        &guard,
+        |world, frames| paced(world, frames, &mut pace, &guard),
+    )?;
     let mut live = Live { world, rule };
     let bytes = super::world_bytes(host, &live);
     let replayed = u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX);
@@ -345,6 +350,8 @@ fn listed(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     for (number, one) in &server.book.held {
         let state = if server.live.contains_key(number) {
             "open"
+        } else if one.broken.is_some() {
+            "broken"
         } else {
             "lost"
         };

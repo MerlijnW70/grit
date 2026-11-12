@@ -545,11 +545,15 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         )?;
         points.push(([x, y, z], word));
     }
+    let owed = server.owed(number)?;
+    let live = server.world(held)?;
     let began = Instant::now();
     live.world.write(&points)?;
     let spent = began.elapsed();
     let written = u32::try_from(points.len())?;
-    let journal = server.journaled(number, Entry::Write(points), spent);
+    let journal = server
+        .journaled(number, Entry::Write(points), spent)
+        .or(owed);
     let snapshot = server.settle(number);
     let live = server.world(held)?;
     let listed = live.world.listed()?;
@@ -600,6 +604,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
     let frames = int(held, "frames")?;
     server.world(held)?;
+    let owed = server.owed(number)?;
     let mut pace = server
         .book
         .held
@@ -607,9 +612,11 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .map(|held| held.pace)
         .ok_or("the world has no journal")?;
     let mut done = 0_u32;
+    let mut pending = 0_u32;
     let mut spent = Duration::ZERO;
     let mut stopped = None;
     let mut failure: Option<Failed> = None;
+    let mut journal = owed;
     let mut batch = 0_u32;
     while done < frames {
         if let Some(stop) = server.stop() {
@@ -647,16 +654,35 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         }
         spent = spent.saturating_add(took);
         done += step;
+        pending += step;
         batch += 1;
+        if done < frames && server.overdue(number, spent) {
+            journal = server
+                .journaled(number, Entry::Step(pending), spent)
+                .or(journal);
+            pending = 0;
+            spent = Duration::ZERO;
+            if server.clock.left() < server.snapping(number) {
+                stopped = Some(Stop::Budget);
+                break;
+            }
+            match server.snap_now(number) {
+                Ok(note) => journal = note.or(journal),
+                Err(why) => {
+                    failure = Some(why);
+                    break;
+                }
+            }
+        }
     }
     if let Some(held) = server.book.held.get_mut(&number) {
         held.pace = pace;
     }
-    let journal = if done > 0 {
-        server.journaled(number, Entry::Step(done), spent)
-    } else {
-        None
-    };
+    if pending > 0 {
+        journal = server
+            .journaled(number, Entry::Step(pending), spent)
+            .or(journal);
+    }
     let frame = server
         .book
         .held
@@ -987,6 +1013,7 @@ pub fn describe(status: &Status) -> Json {
                 ("batch_frames", number(BATCH_MOST)),
                 ("name_bytes", number(journal::NAME_MOST)),
                 ("world_least_bytes", number(budget::WORLD_LEAST)),
+                ("world_number_most", number(journal::NUMBER_MOST)),
                 (
                     "tally_words",
                     text(
