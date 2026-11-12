@@ -2359,10 +2359,13 @@ fn after_a_lost_device_only_the_worlds_a_call_touches_are_rebuilt_inside_its_bud
     };
     armed(&run, None, true);
     let first = models[0].0;
+    let began = Instant::now();
     let told = refused(&run.ask(
         "grit_world_read",
         &format!("{{\"world\":{first},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":1000}}"),
     ));
+    let lost_took = began.elapsed();
+    assert!(lost_took < Duration::from_millis(1000), "{lost_took:?}");
     assert_eq!(told.code, "device_lost", "{}", told.message);
     let restored = told
         .all
