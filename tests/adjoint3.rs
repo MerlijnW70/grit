@@ -1293,3 +1293,52 @@ fn every_node_a_law_emits_knows_the_expression_that_emitted_it() {
         println!("{name}: {} nodes, emitted by {ops:?}", law.nodes());
     }
 }
+
+fn shared(lifts: u32, chain: u32) -> String {
+    let words: Vec<String> = (0..8)
+        .map(|k| match k {
+            0 => format!(
+                "[\"fold\",\"w\",[\"at\",\"cells\",0],\"i\",[\"range\",{lifts}],[\"add\",\"w\",\"b\"]]"
+            ),
+            _ => cell(k),
+        })
+        .collect();
+    lifting_law(
+        "",
+        &format!(
+            "[\"let\",[[\"b\",[\"fold\",\"a\",[\"at\",\"cells\",1],\"i\",[\"range\",{chain}],[\"not\",\"a\"]]]],[\"vec\",[\"vec\",{}],[\"vec\",0]]]",
+            words.join(",")
+        ),
+    )
+}
+
+#[test]
+fn a_derived_inverse_is_no_larger_than_its_law() {
+    for (lifts, chain) in [(500, 4_000), (2_000, 4_000), (8_000, 8_000)] {
+        let text = shared(lifts, chain);
+        let law = reversible(&text);
+        println!(
+            "{lifts} lifts reading a chain of {chain} on another word: forward {} nodes, inverse {} nodes",
+            law.forward().len(),
+            law.inverse().len()
+        );
+        assert!(
+            law.inverse().len() <= law.forward().len() + law.steps().len(),
+            "{lifts} lifts: inverse {} nodes for a forward of {}",
+            law.inverse().len(),
+            law.forward().len()
+        );
+        let mut state = 0xC1F_u64 + u64::from(lifts);
+        for _ in 0..1_000 {
+            let words: [u32; CORNERS] = core::array::from_fn(|_| word(&mut state));
+            let oct = |words| Oct {
+                words,
+                frame: 3,
+                at: [1, 2, 3],
+                params: &[],
+            };
+            let out = law.forward().step(oct(words)).out;
+            assert_eq!(law.inverse().step(oct(out)).out, words, "{lifts} lifts");
+        }
+    }
+}
