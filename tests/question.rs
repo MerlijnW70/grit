@@ -3,7 +3,7 @@
 mod common;
 use common::device;
 
-use grit::bricks::{Bricks, ENTRY, UNIFORM};
+use grit::bricks::Bricks;
 use grit::compact::Plan;
 use grit::layout::{Dimension, PARAMS};
 use grit::ops::{Helpers, Ops};
@@ -258,6 +258,23 @@ impl World<'_> {
         answer
     }
 
+    #[cfg(feature = "faults")]
+    fn spread(
+        &mut self,
+        which: usize,
+        region: Region,
+        most: u32,
+    ) -> (Answer, Option<grit::question::reduce::Reads>) {
+        let before = self.hash();
+        let (_, _, asked) = self.asked[which];
+        let answer = self
+            .questions
+            .ask_spread(&mut self.live, self.first_pass, asked, region, most)
+            .unwrap();
+        assert_eq!(before, self.hash(), "question {which} changed the world");
+        answer
+    }
+
     fn aim(&mut self, words: &[u32]) {
         self.questions.aim(&mut self.live, words).unwrap();
     }
@@ -289,7 +306,7 @@ fn sandy(size: [u32; 3], seed: u64) -> Vec<u32> {
                     3
                 } else if (x / 8 + z / 8) % 3 == 0 && roll % 5 < 2 {
                     2
-                } else if y < size[1] / 3 && roll % 7 == 0 {
+                } else if y < size[1] / 3 && roll.is_multiple_of(7) {
                     1 | (roll & 0xFFFF_FFFC)
                 } else {
                     0
@@ -365,7 +382,7 @@ fn aimed(size: [u32; 3], region: Region, seed: u64) -> Vec<u32> {
             for x in 0..wide {
                 let at = [region.from[0] + x, region.from[1] + y, region.from[2] + z];
                 let word = cells[index(size, at)];
-                target.push(if stir.next() % 3 == 0 {
+                target.push(if stir.next().is_multiple_of(3) {
                     word
                 } else {
                     stir.next()
@@ -564,22 +581,13 @@ fn a_uniform_brick_is_answered_without_reading_the_pool() {
             });
             if meets {
                 touched += 1;
-                if table[brick as usize * ENTRY] != UNIFORM {
+                if table[brick as usize * grit::bricks::ENTRY] != grit::bricks::UNIFORM {
                     held += 1;
                 }
             }
         }
         for (which, &(probe, reduce)) in asks.iter().enumerate() {
-            let (answer, reads) = sparse
-                .questions
-                .ask_spread(
-                    &mut sparse.live,
-                    sparse.first_pass,
-                    sparse.asked[which].2,
-                    region,
-                    65535,
-                )
-                .unwrap();
+            let (answer, reads) = sparse.spread(which, region, 65535);
             let reads = reads.unwrap();
             let wanted = cpu::answer(
                 &probe,
@@ -617,25 +625,15 @@ fn the_answer_does_not_depend_on_how_the_work_is_spread() {
         world.step(5);
         let region = Region::new([1, 1, 1], [size[0] - 1, size[1], size[2] - 2]);
         world.aim(&aimed(size, region, 9));
-        for which in 0..asks.len() {
+        for (which, ask) in asks.iter().enumerate() {
             let mut seen = Vec::new();
             for most in [1, 2, 7, 64, 65535] {
-                let (answer, _) = world
-                    .questions
-                    .ask_spread(
-                        &mut world.live,
-                        world.first_pass,
-                        world.asked[which].2,
-                        region,
-                        most,
-                    )
-                    .unwrap();
+                let (answer, _) = world.spread(which, region, most);
                 seen.push(answer);
             }
             assert!(
                 seen.windows(2).all(|two| two[0] == two[1]),
-                "{:?} on sparse {sparse}: {seen:?}",
-                asks[which]
+                "{ask:?} on sparse {sparse}: {seen:?}"
             );
         }
     }
