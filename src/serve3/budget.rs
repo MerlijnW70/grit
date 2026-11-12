@@ -331,6 +331,163 @@ impl Memory {
 
 pub const WORLD_LEAST: u64 = 1 << 20;
 
+const FIXED_BYTES: f64 = 4_194_304.0;
+
+const EASING: f64 = 0.75;
+
+const RATIO_LEAST_RECORDED: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Work {
+    Build,
+    Fork,
+    Save,
+    File,
+}
+
+impl Work {
+    const fn index(self) -> usize {
+        match self {
+            Self::Build => 0,
+            Self::Fork => 1,
+            Self::Save => 2,
+            Self::File => 3,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Build => "building a world",
+            Self::Fork => "copying a world",
+            Self::Save => "writing a world to a file",
+            Self::File => "reading a world file",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Rates {
+    seconds_per_byte: [f64; 4],
+    measured: [bool; 4],
+    replay: f64,
+    replay_measured: bool,
+}
+
+impl Default for Rates {
+    fn default() -> Self {
+        Self {
+            seconds_per_byte: [2e-9, 2e-9, 4e-9, 4e-9],
+            measured: [false; 4],
+            replay: 2.0,
+            replay_measured: false,
+        }
+    }
+}
+
+fn eased(old: f64, sample: f64) -> f64 {
+    if !sample.is_finite() || sample <= 0.0 {
+        return old;
+    }
+    sample.max(old * EASING)
+}
+
+impl Rates {
+    #[must_use]
+    pub fn estimate(&self, work: Work, bytes: u64) -> Duration {
+        let rate = self
+            .seconds_per_byte
+            .get(work.index())
+            .copied()
+            .unwrap_or(1e-8);
+        Duration::try_from_secs_f64((bytes as f64 + FIXED_BYTES) * rate).unwrap_or(Duration::MAX)
+    }
+
+    pub fn measure(&mut self, work: Work, bytes: u64, spent: Duration) {
+        let index = work.index();
+        let sample = spent.as_secs_f64() / (bytes as f64 + FIXED_BYTES);
+        if let (Some(rate), Some(measured)) = (
+            self.seconds_per_byte.get_mut(index),
+            self.measured.get_mut(index),
+        ) {
+            *rate = if *measured {
+                eased(*rate, sample)
+            } else {
+                sample
+            };
+            *measured = true;
+        }
+    }
+
+    #[must_use]
+    pub const fn replay(&self) -> f64 {
+        self.replay
+    }
+
+    #[must_use]
+    pub fn replaying(&self, recorded: Duration) -> Duration {
+        recorded.mul_f64(self.replay.max(1.0))
+    }
+
+    pub fn measure_replay(&mut self, recorded: Duration, spent: Duration) {
+        if recorded < RATIO_LEAST_RECORDED {
+            return;
+        }
+        let sample = spent.as_secs_f64() / recorded.as_secs_f64();
+        self.replay = if self.replay_measured {
+            eased(self.replay, sample)
+        } else {
+            sample.max(1.0)
+        };
+        self.replay_measured = true;
+    }
+
+    #[must_use]
+    pub fn shown(&self) -> Json {
+        let one = |work: Work| {
+            let index = work.index();
+            let rate = self.seconds_per_byte.get(index).copied().unwrap_or(0.0);
+            map(vec![
+                (
+                    "bytes_per_second",
+                    counted64(if rate > 0.0 { (1.0 / rate) as u64 } else { 0 }),
+                ),
+                (
+                    "measured",
+                    Json::Bool(self.measured.get(index).copied().unwrap_or(false)),
+                ),
+            ])
+        };
+        map(vec![
+            ("build", one(Work::Build)),
+            ("fork", one(Work::Fork)),
+            ("save", one(Work::Save)),
+            ("file", one(Work::File)),
+            (
+                "replay_per_recorded_percent",
+                counted64((self.replay * 100.0) as u64),
+            ),
+            ("replay_measured", Json::Bool(self.replay_measured)),
+        ])
+    }
+}
+
+#[must_use]
+pub fn too_slow(needs: Duration, left: Duration, what: &str) -> Refusal {
+    Refusal::new(
+        Code::Budget,
+        "$.budget_ms",
+        format!(
+            "{what} needs about {} ms on this device, by the rates the server has measured, and the call has {} ms left; nothing ran",
+            needs.as_millis(),
+            left.as_millis()
+        ),
+    )
+    .limited(counted64(
+        u64::try_from(needs.as_millis().saturating_add(1)).unwrap_or(u64::MAX),
+    ))
+}
+
 #[must_use]
 pub fn world_cost(sizes: &[usize]) -> u64 {
     bytes_of(sizes).max(WORLD_LEAST)

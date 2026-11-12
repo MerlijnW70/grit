@@ -111,6 +111,7 @@ pub struct Ledger {
     pub base: Base,
     pub entries: Vec<Entry>,
     pub frame: u32,
+    recorded: Vec<Duration>,
     bytes: usize,
     replay: Duration,
     snapping: Duration,
@@ -123,6 +124,7 @@ impl Ledger {
             base: Base::Created(made),
             entries: Vec::new(),
             frame: 0,
+            recorded: Vec::new(),
             bytes: 0,
             replay: Duration::ZERO,
             snapping: Duration::ZERO,
@@ -135,6 +137,7 @@ impl Ledger {
             frame: snap.frame,
             base: Base::Snapshot(snap),
             entries: Vec::new(),
+            recorded: Vec::new(),
             bytes: 0,
             replay: Duration::ZERO,
             snapping: Duration::ZERO,
@@ -163,20 +166,22 @@ impl Ledger {
         }
         self.bytes = self.bytes.saturating_add(entry.bytes());
         self.replay = self.replay.saturating_add(spent);
+        self.recorded.push(spent);
         self.entries.push(entry);
     }
 
     #[must_use]
-    pub fn due(&self, world_bytes: u64) -> bool {
-        self.over(Duration::ZERO, world_bytes)
+    pub fn due(&self, world_bytes: u64, ratio: f64) -> bool {
+        self.over(Duration::ZERO, world_bytes, ratio)
     }
 
     #[must_use]
-    pub fn over(&self, extra: Duration, world_bytes: u64) -> bool {
+    pub fn over(&self, extra: Duration, world_bytes: u64, ratio: f64) -> bool {
         let bytes = usize::try_from(world_bytes)
             .unwrap_or(usize::MAX)
             .max(JOURNAL_LEAST);
-        self.bytes > bytes || self.replay.saturating_add(extra) > self.replay_most()
+        let replaying = self.replay.saturating_add(extra).mul_f64(ratio.max(1.0));
+        self.bytes > bytes || replaying > self.replay_most()
     }
 
     #[must_use]
@@ -460,8 +465,9 @@ impl Keep {
     pub fn begin(&self, world: u32, ledger: &Ledger) -> io::Result<()> {
         let mut words = Vec::new();
         record(&mut words, base_record(&ledger.base));
-        for entry in &ledger.entries {
-            record(&mut words, entry_record(entry));
+        for (at, entry) in ledger.entries.iter().enumerate() {
+            let spent = ledger.recorded.get(at).copied().unwrap_or_default();
+            record(&mut words, entry_record(entry, spent));
         }
         let path = self.journal(world);
         let temporary = self.kept.join(format!(".world-{world}.journal.tmp"));
@@ -473,9 +479,9 @@ impl Keep {
         fs::rename(&temporary, &path)
     }
 
-    pub fn append(&self, world: u32, entry: &Entry) -> io::Result<()> {
+    pub fn append(&self, world: u32, entry: &Entry, spent: Duration) -> io::Result<()> {
         let mut words = Vec::new();
-        record(&mut words, entry_record(entry));
+        record(&mut words, entry_record(entry, spent));
         let mut file = OpenOptions::new().append(true).open(self.journal(world))?;
         file.write_all(&bytes_of(&words))
     }
@@ -608,10 +614,10 @@ impl Keep {
             Base::Snapshot(snap) => Ledger::snapped(snap),
         };
         while let Some((tag, payload)) = records.next() {
-            let Some(entry) = entry_of(tag, payload) else {
+            let Some((entry, spent)) = entry_of(tag, payload) else {
                 break;
             };
-            ledger.push(entry, Duration::ZERO);
+            ledger.push(entry, spent);
         }
         Some(ledger)
     }
@@ -764,7 +770,8 @@ fn base_of(tag: u32, payload: &[u32]) -> Option<Base> {
     }
 }
 
-fn entry_record(entry: &Entry) -> (u32, Vec<u32>) {
+fn entry_record(entry: &Entry, spent: Duration) -> (u32, Vec<u32>) {
+    let micros = u32::try_from(spent.as_micros()).unwrap_or(u32::MAX);
     match entry {
         Entry::Write(cells) => {
             let mut words = Vec::with_capacity(cells.len() * 4);
@@ -772,27 +779,33 @@ fn entry_record(entry: &Entry) -> (u32, Vec<u32>) {
                 words.extend_from_slice(at);
                 words.push(*word);
             }
+            words.push(micros);
             (WRITE, words)
         }
-        Entry::Step(frames) => (STEP, vec![*frames]),
+        Entry::Step(frames) => (STEP, vec![*frames, micros]),
     }
 }
 
-fn entry_of(tag: u32, payload: &[u32]) -> Option<Entry> {
+fn entry_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration)> {
+    let (&micros, payload) = payload.split_last()?;
+    let spent = Duration::from_micros(u64::from(micros));
     match tag {
         WRITE => {
             let (cells, rest) = payload.as_chunks::<4>();
             rest.is_empty().then(|| {
-                Entry::Write(
-                    cells
-                        .iter()
-                        .map(|[x, y, z, word]| ([*x, *y, *z], *word))
-                        .collect(),
+                (
+                    Entry::Write(
+                        cells
+                            .iter()
+                            .map(|[x, y, z, word]| ([*x, *y, *z], *word))
+                            .collect(),
+                    ),
+                    spent,
                 )
             })
         }
         STEP => match payload {
-            [frames] => Some(Entry::Step(*frames)),
+            [frames] => Some((Entry::Step(*frames), spent)),
             _ => None,
         },
         _ => None,
