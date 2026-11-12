@@ -232,8 +232,8 @@ pub const fn drawn(netlist: &Netlist, at: u32, roll: u32) -> Gate {
 #[must_use]
 pub const fn turned(netlist: &Netlist, at: u32, gate: Gate, roll: u32) -> Gate {
     let below = netlist.below(at);
-    let rest = roll >> 2;
-    match roll & 3 {
+    let rest = roll / 3;
+    match roll % 3 {
         0 => Gate {
             kind: rest % netlist.kinds,
             ..gate

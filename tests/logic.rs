@@ -765,7 +765,7 @@ fn constants(words: &[u32]) -> Vec<u32> {
 }
 
 #[test]
-fn turning_picks_a_field_from_the_low_two_bits_and_its_value_from_the_rest() {
+fn turning_picks_a_field_from_the_roll_by_three_and_its_value_from_the_rest() {
     let one = Netlist::over(4, 2, 8, KINDS).unwrap();
     let start = drawn(&one, 5, 99);
     assert_eq!((start.kind, start.left, start.right), (99, 0, 0));
@@ -774,11 +774,12 @@ fn turning_picks_a_field_from_the_low_two_bits_and_its_value_from_the_rest() {
         (0, 0, 0),
         (99, 0, 0),
         (99, 0, 0),
-        (99, 0, 0),
         (1, 0, 0),
         (99, 1, 0),
         (99, 0, 1),
-        (99, 0, 1),
+        (2, 0, 0),
+        (99, 2, 0),
+        (99, 0, 2),
     ];
     for (roll, want) in wanted.iter().enumerate() {
         let after = turned(&one, 5, start, roll as u32);

@@ -301,8 +301,8 @@ pub fn turning<const LANES: u32>(
         let kind_mask = lanes.splat_bits::<U32, LANES>((1 << KIND_BITS) - 1)?;
 
         let below = lanes.add(inputs, at)?;
-        let rest = lanes.shift_right_logical(roll, two)?;
-        let which = lanes.and(roll, three)?;
+        let rest = lanes.div(roll, three)?;
+        let which = modulo::<LANES>(&mut lanes, roll, three)?;
         let kind = modulo::<LANES>(&mut lanes, rest, kinds)?;
         let side = modulo::<LANES>(&mut lanes, rest, below)?;
 
@@ -314,7 +314,7 @@ pub fn turning<const LANES: u32>(
 
         let turns_kind = lanes.equal(which, none)?;
         let turns_left = lanes.equal(which, one)?;
-        let turns_right = lanes.greater_equal(which, two)?;
+        let turns_right = lanes.equal(which, two)?;
         let kind = lanes.select(turns_kind, kind, was_kind)?;
         let left = lanes.select(turns_left, side, was_left)?;
         let right = lanes.select(turns_right, side, was_right)?;
