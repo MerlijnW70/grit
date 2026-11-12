@@ -173,7 +173,7 @@ fn mutated(seed: &[u8], state: &mut u64) -> (Vec<u8>, &'static str) {
     let rounds = 1 + below(state, 3);
     let mut kind = "";
     for _ in 0..rounds {
-        let choice = below(state, 14);
+        let choice = below(state, 16);
         match choice {
             0 => {
                 kind = "bit flip in a section";
@@ -306,6 +306,10 @@ fn mutated(seed: &[u8], state: &mut u64) -> (Vec<u8>, &'static str) {
                     }
                 }
             }
+            14 | 15 => {
+                kind = "sizes at the edges, sections fitted by wrapping";
+                fitted(&mut file, params, state);
+            }
             _ => {
                 kind = "capacity at a neighbour";
                 let at = 72 + 4 * params;
@@ -336,6 +340,72 @@ fn mutated(seed: &[u8], state: &mut u64) -> (Vec<u8>, &'static str) {
     (bytes, kind)
 }
 
+fn large_power(state: &mut u64) -> u32 {
+    1 << (1 + below(state, 31))
+}
+
+fn fitted(file: &mut Parsed, params: usize, state: &mut u64) {
+    let size: [u32; 3] = [0; 3].map(|_| large_power(state));
+    let sparse = word_at(&file.header, 68 + 4 * params) == 1;
+    let sides = if sparse {
+        size.map(|side| {
+            if below(state, 2) == 0 {
+                side
+            } else {
+                1 << (1 + below(state, u64::from(side.trailing_zeros())))
+            }
+        })
+    } else {
+        [0; 3]
+    };
+    for (axis, word) in size.iter().chain(sides.iter()).enumerate() {
+        let at = if axis < 3 {
+            52 + 4 * params + 4 * axis
+        } else {
+            76 + 4 * params + 4 * (axis - 3)
+        };
+        file.header[at..at + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    let planes = u64::from(word_at(&file.header, 64 + 4 * params));
+    let wrapped = |sides: [u32; 3]| {
+        sides
+            .iter()
+            .fold(1_u64, |total, &side| total.wrapping_mul(u64::from(side)))
+    };
+    let cells = wrapped(size);
+    let per = wrapped(sides);
+    let bricks = cells.checked_div(per).unwrap_or(0);
+    if sparse {
+        let capacity = u32::try_from(bricks.clamp(1, 1 << 20)).unwrap_or(1);
+        let at = 72 + 4 * params;
+        file.header[at..at + 4].copy_from_slice(&capacity.to_le_bytes());
+    }
+    for section in &mut file.sections {
+        let words = match &section.0 {
+            b"DENS" => cells.wrapping_mul(planes),
+            b"TABL" => bricks.wrapping_mul(planes.wrapping_add(1)),
+            b"POOL" => 0,
+            _ => continue,
+        };
+        let length = if words <= MOST_WORDS {
+            words
+        } else {
+            words % MOST_WORDS
+        };
+        let mut payload = Vec::with_capacity(length as usize);
+        for at in 0..length {
+            let word = match &section.0 {
+                b"TABL" if at < bricks.wrapping_mul(2) && at % 2 == 0 => format::UNIFORM,
+                b"TABL" if at < bricks.wrapping_mul(2) => 5,
+                _ => 0,
+            };
+            payload.push(word);
+        }
+        section.1 = length;
+        section.2 = to_bytes(&payload);
+    }
+}
+
 fn pick<'a, T>(items: &'a mut [T], state: &mut u64) -> Option<&'a mut T> {
     if items.is_empty() {
         return None;
@@ -355,10 +425,12 @@ fn judged(bytes: &[u8], case: &str) -> Result<(), &'static str> {
         }
         Ok(Ok(image)) => image,
     };
-    assert_eq!(
-        format::encoded(&image),
-        bytes,
-        "{case}: accepted a file that writes back otherwise"
+    assert!(
+        format::encoded(&image) == bytes,
+        "{case}: accepted a file of {} bytes that writes back otherwise, as {:?} of {:?} cells",
+        bytes.len(),
+        image.size,
+        image.cells()
     );
     let cells = image
         .cells()
@@ -550,13 +622,25 @@ fn headers_at_the_edges(cases: u64, seed: u64) {
     let channels = [0, 1, 2, 3, 4, 5, u32::MAX];
     for _ in 0..cases {
         let pick = |state: &mut u64| edges[below(state, edges.len() as u64) as usize];
-        let header = Header {
-            size: [pick(&mut state), pick(&mut state), pick(&mut state)],
+        let size = if below(&mut state, 2) == 0 {
+            [0; 3].map(|_| large_power(&mut state))
+        } else {
+            [pick(&mut state), pick(&mut state), pick(&mut state)]
+        };
+        let mut header = Header {
+            size,
             channels: channels[below(&mut state, channels.len() as u64) as usize],
             sparse: [0, 1, 1, 2][below(&mut state, 4) as usize],
             capacity: pick(&mut state),
             sides: [pick(&mut state), pick(&mut state), pick(&mut state)],
         };
+        if header.sparse == 0 && below(&mut state, 4) != 0 {
+            header.capacity = 0;
+            header.sides = [0; 3];
+        }
+        if header.sparse == 1 && below(&mut state, 2) == 0 {
+            header.sides = header.size;
+        }
         run(header, &mut state, &mut names);
     }
     println!(
