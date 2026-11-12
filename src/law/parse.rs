@@ -5,7 +5,7 @@ use crate::rule3::Tally;
 use crate::wire::{self, Json, Torn};
 
 #[derive(Clone, Copy, Debug)]
-enum Step<'a> {
+pub(crate) enum Step<'a> {
     Root,
     Key(&'a str),
     Index(usize),
@@ -56,28 +56,33 @@ impl<'a> Path<'a> {
             steps.push(path.step);
             here = path.parent;
         }
-        let mut out = String::from("$");
-        for step in steps.into_iter().rev() {
-            match step {
-                Step::Root => {}
-                Step::Key(key) if plain(key) && key.len() <= limits::NAME => {
-                    out.push('.');
-                    out.push_str(key);
-                }
-                Step::Key(key) => {
-                    out.push('[');
-                    out.push_str(&wire::written(&Json::Text(clipped(key))));
-                    out.push(']');
-                }
-                Step::Index(index) => {
-                    out.push('[');
-                    out.push_str(&index.to_string());
-                    out.push(']');
-                }
+        steps.reverse();
+        shown(&steps)
+    }
+}
+
+pub(crate) fn shown(steps: &[Step<'_>]) -> String {
+    let mut out = String::from("$");
+    for step in steps {
+        match *step {
+            Step::Root => {}
+            Step::Key(key) if plain(key) && key.len() <= limits::NAME => {
+                out.push('.');
+                out.push_str(key);
+            }
+            Step::Key(key) => {
+                out.push('[');
+                out.push_str(&wire::written(&Json::Text(clipped(key))));
+                out.push(']');
+            }
+            Step::Index(index) => {
+                out.push('[');
+                out.push_str(&index.to_string());
+                out.push(']');
             }
         }
-        out
     }
+    out
 }
 
 fn plain(key: &str) -> bool {
@@ -173,6 +178,7 @@ fn torn(why: Torn) -> String {
     match why {
         Torn::Ended { at } => format!("the text ending at byte {at}"),
         Torn::Stray { at, saw } => format!("{saw:?} at byte {at}"),
+        Torn::Twice { at } => format!("a key again at byte {at}"),
         Torn::TooDeep { at } => format!("nesting deeper than 64 at byte {at}"),
         Torn::NotANumber { at } => {
             format!("a number at byte {at} that is not a whole number of at most 19 digits")
@@ -191,8 +197,10 @@ pub fn read(text: &str) -> Result<Json, Refusal> {
             limits::BODY as u64,
         ));
     }
-    let json =
-        wire::read(text).map_err(|why| refused(Code::Json, &root, "one JSON object", torn(why)))?;
+    let json = wire::read(text).map_err(|why| match why {
+        Torn::Twice { at } => twice(text, at),
+        other => refused(Code::Json, &root, "one JSON object", torn(other)),
+    })?;
     if !matches!(json, Json::Map(_)) {
         return Err(refused(
             Code::Shape,
@@ -215,6 +223,88 @@ pub fn read(text: &str) -> Result<Json, Refusal> {
         ));
     }
     Ok(json)
+}
+
+enum Frame {
+    List(usize),
+    Map(Option<String>, bool),
+}
+
+fn quoted_end(bytes: &[u8], from: usize) -> usize {
+    let mut at = from + 1;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'\\' => at += 2,
+            b'"' => return at + 1,
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn key_at(text: &str, from: usize) -> String {
+    let end = quoted_end(text.as_bytes(), from);
+    match text.get(from..end).map(wire::read) {
+        Some(Ok(Json::Text(key))) => key,
+        _ => String::new(),
+    }
+}
+
+fn twice(text: &str, at: usize) -> Refusal {
+    let bytes = text.as_bytes();
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut here = 0;
+    while here < at {
+        let Some(&byte) = bytes.get(here) else {
+            break;
+        };
+        match byte {
+            b'"' => {
+                let end = quoted_end(bytes, here);
+                if let Some(Frame::Map(key, expecting)) = frames.last_mut()
+                    && *expecting
+                {
+                    *key = Some(key_at(text, here));
+                    *expecting = false;
+                }
+                here = end;
+                continue;
+            }
+            b'{' => frames.push(Frame::Map(None, true)),
+            b'[' => frames.push(Frame::List(0)),
+            b'}' | b']' => {
+                frames.pop();
+            }
+            b',' => match frames.last_mut() {
+                Some(Frame::List(index)) => *index += 1,
+                Some(Frame::Map(_, expecting)) => *expecting = true,
+                None => {}
+            },
+            _ => {}
+        }
+        here += 1;
+    }
+    let again = key_at(text, at);
+    let mut steps: Vec<Step<'_>> = Vec::with_capacity(frames.len());
+    let last = frames.len().saturating_sub(1);
+    for (depth, frame) in frames.iter().enumerate() {
+        match frame {
+            Frame::List(index) => steps.push(Step::Index(*index)),
+            Frame::Map(_, _) if depth == last => steps.push(Step::Key(&again)),
+            Frame::Map(Some(key), _) => steps.push(Step::Key(key)),
+            Frame::Map(None, _) => {}
+        }
+    }
+    Refusal {
+        code: Code::DuplicateKey,
+        path: shown(&steps),
+        expected: String::from("each key once"),
+        found: format!(
+            "the key {} again",
+            wire::written(&Json::Text(clipped(&again)))
+        ),
+        limit: None,
+    }
 }
 
 pub const SPECIAL: [&str; 14] = [

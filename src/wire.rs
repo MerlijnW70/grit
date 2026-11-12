@@ -54,6 +54,7 @@ impl Json {
 pub enum Torn {
     Ended { at: usize },
     Stray { at: usize, saw: char },
+    Twice { at: usize },
     TooDeep { at: usize },
     NotANumber { at: usize },
 }
@@ -63,6 +64,7 @@ impl std::fmt::Display for Torn {
         match self {
             Self::Ended { at } => write!(out, "{at}"),
             Self::Stray { at, saw } => write!(out, "{at} {saw:?}"),
+            Self::Twice { at } => write!(out, "{at} '\"'"),
             Self::TooDeep { at } => write!(out, "{at}"),
             Self::NotANumber { at } => write!(out, "{at}"),
         }
@@ -282,7 +284,7 @@ fn valued(reading: &mut Reading<'_>, deep: usize) -> Result<Json, Torn> {
                 let at = reading.at;
                 let name = stringed(reading)?;
                 if !seen.insert(name.clone()) {
-                    return Err(Torn::Stray { at, saw: '"' });
+                    return Err(Torn::Twice { at });
                 }
                 reading.skip();
                 reading.take(b':')?;
