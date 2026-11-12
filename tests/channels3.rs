@@ -598,6 +598,38 @@ fn seeding_marks_every_held_slot_and_nothing_else() {
     assert_eq!(held_slots as usize, owners.len());
 }
 
+struct Unplaned;
+
+impl Declared for Unplaned {
+    fn params(&self) -> usize {
+        0
+    }
+
+    fn tally(&self) -> grit::rule3::Tally {
+        grit::rule3::Tally {
+            counts: 1,
+            weighted: false,
+        }
+    }
+
+    fn planes(&self) -> usize {
+        2
+    }
+}
+
+impl grit::rule3::OneStep for Unplaned {
+    fn one_step<O: grit::ops::Ops>(
+        &self,
+        ops: &mut O,
+        oct: grit::rule3::Oct<'_, O::Word>,
+    ) -> grit::rule3::Ruled<O::Word> {
+        grit::rule3::Ruled {
+            out: oct.words,
+            counts: vec![ops.constant(0)],
+        }
+    }
+}
+
 #[test]
 fn planes_past_their_limits_are_refused_by_name() {
     let why = Law::compile(
@@ -634,6 +666,11 @@ fn planes_past_their_limits_are_refused_by_name() {
         format!("{why:?}").contains(bricks::UNLIKE_PLANES),
         "{why:?}"
     );
+
+    let why = sand3::settle_by(&Unplaned, 32, grid, 65_535).unwrap_err();
+    assert!(format!("{why:?}").contains(sand3::UNPLANED), "{why:?}");
+    let why = live::wired3_by(&Unplaned, 32, grid, &plan).unwrap_err();
+    assert!(format!("{why:?}").contains(sand3::UNPLANED), "{why:?}");
 
     let huge = Grid::solid(2048, 1024, 2048).unwrap();
     let why = sand3::settle_by(&still_law(2), 32, huge, 65_535).unwrap_err();
