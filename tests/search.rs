@@ -2,11 +2,17 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::device;
 
+use grit::machine::Machine;
 use grit::marking::{BINDINGS, HELD, SEED, TRIAL, turned_on, words_of};
-use grit::netlist::{Gate, Netlist, drawn, turned};
-use grit::serve::{ASIDE, Rolls, SEEDING, handle, mixed, opening, shaken};
+use grit::netlist::{Exam, Gate, Netlist, drawn, turned};
+use grit::serve::{
+    ASIDE, Effort, Pace, Rolls, SEEDING, SUBMISSION, handle, machined, mixed, opening, pressed,
+    shaken,
+};
 use grit::wire::{Json, read, written};
 use grit::{Groups, Host};
 
@@ -554,4 +560,175 @@ fn a_device_seed_that_would_be_zero_is_one_no_other_candidate_holds() {
             "seed {seed} shares more than the one candidate a 32-bit seed must share with some other seed"
         );
     }
+}
+
+fn found_of(found: &grit::serve::Found) -> String {
+    format!(
+        "{} {} {} {} {:?} {:?}",
+        found.marks, found.full, found.rounds, found.crowd, found.gates, found.table
+    )
+}
+
+#[test]
+fn a_search_answers_alike_however_its_rounds_are_split_into_submissions() {
+    let Some(host) = device("a_search_answers_alike_however_its_rounds_are_split_into_submissions")
+    else {
+        return;
+    };
+    let table: Vec<u32> = (0..32_u32).map(u32::count_ones).collect();
+    for (gates, crowd, rounds, stall) in [(9, 256, 750, 100), (12, 2048, 1000, 300)] {
+        let shape = Netlist::over(5, 3, gates, 16).unwrap();
+        let exam = Exam::of(shape, table.clone()).unwrap();
+        let ran = |submitted: u32| {
+            let effort = Effort {
+                crowd,
+                rounds,
+                seed: 41,
+                stall,
+                shake: 6,
+                submitted,
+            };
+            found_of(&pressed(&host, shape, &exam, effort).unwrap())
+        };
+        let whole = ran(u32::MAX);
+        eprintln!("popcount of five at {gates} gates, crowd {crowd}: {whole}");
+        for submitted in [1, 3, 7, 64, 100] {
+            assert_eq!(
+                ran(submitted),
+                whole,
+                "at most {submitted} rounds a submission answers otherwise"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_machine_search_answers_alike_however_its_rounds_are_split_into_submissions() {
+    let Some(host) =
+        device("a_machine_search_answers_alike_however_its_rounds_are_split_into_submissions")
+    else {
+        return;
+    };
+    let held = Machine::over(2, 1, 1, 6, 16, 12).unwrap();
+    let traces: Vec<(Vec<u32>, Vec<u32>)> = (0..40_u32)
+        .map(|run| {
+            let feed: Vec<u32> = (0..12).map(|step| (run >> (step % 6)) & 1).collect();
+            let mut count = 0_u32;
+            let want = feed
+                .iter()
+                .map(|one| {
+                    count = (count + one) % 3;
+                    u32::from(count == 0)
+                })
+                .collect();
+            (feed, want)
+        })
+        .collect();
+    let ran = |submitted: u32| {
+        let effort = Effort {
+            crowd: 512,
+            rounds: 420,
+            seed: 5,
+            stall: 100,
+            shake: 6,
+            submitted,
+        };
+        let told = machined(&host, held, &traces, effort, 0).unwrap();
+        format!(
+            "{} {} {} {:?} {:?}",
+            told.marks, told.full, told.rounds, told.gates, told.said
+        )
+    };
+    let whole = ran(u32::MAX);
+    eprintln!("count of ones by three: {whole}");
+    for submitted in [1, 4, 13, 50] {
+        assert_eq!(
+            ran(submitted),
+            whole,
+            "at most {submitted} rounds a submission answers otherwise"
+        );
+    }
+}
+
+#[test]
+fn a_submission_is_sized_to_the_measured_cost_of_its_work() {
+    let mut pace = Pace::over(1_000_000, u32::MAX);
+    assert_eq!(
+        pace.next(100),
+        1,
+        "before anything is measured one round goes alone"
+    );
+    pace.learn(1, Duration::from_millis(30), None);
+    let planned = pace.next(100);
+    assert_eq!(planned, (SUBMISSION.as_secs_f64() / 0.030).floor() as u32);
+    pace.learn(1, Duration::from_millis(2), Some(Duration::from_millis(40)));
+    assert_eq!(
+        pace.next(100),
+        (SUBMISSION.as_secs_f64() / 0.040).floor() as u32,
+        "the slower of the wall and the device clock sizes the next"
+    );
+    pace.learn(5, Duration::from_micros(50), None);
+    assert_eq!(pace.next(100), 100, "a cheap round fills the look");
+    assert_eq!(pace.next(7), 7, "never past the look");
+    pace.learn(1, SUBMISSION * 3, None);
+    assert_eq!(pace.next(100), 1, "a round over the span goes alone");
+    let mut capped = Pace::over(10, 4);
+    capped.learn(10, Duration::from_nanos(10), None);
+    assert_eq!(capped.next(100), 4, "never past what the caller allows");
+    let mut light = Pace::over(1, u32::MAX);
+    light.learn(10, Duration::from_micros(10), None);
+    let each = light.measured().unwrap();
+    assert!(
+        (each - 1e-6).abs() < 1e-12,
+        "a unit of work costs the time over the work"
+    );
+    for (work, nanos) in [
+        (1_u64, 1_u64),
+        (1 << 20, 3),
+        (1 << 26, 40),
+        (12_345, 99_999),
+    ] {
+        let mut pace = Pace::over(work, u32::MAX);
+        pace.learn(1, Duration::from_nanos(nanos * work), None);
+        let rounds = pace.next(u32::MAX);
+        let planned = Duration::from_nanos(nanos * work * u64::from(rounds));
+        assert!(
+            rounds == 1 || planned <= SUBMISSION,
+            "work {work} at {nanos} ns a unit plans {rounds} rounds, {planned:?}"
+        );
+    }
+}
+
+const ALU_SEARCH: &str = r#"472 512 300 65536 [{"kind":2,"left":5,"right":4},{"kind":9,"left":4,"right":1},{"kind":5,"left":2,"right":5},{"kind":6,"left":3,"right":7},{"kind":1,"left":0,"right":7},{"kind":4,"left":0,"right":11},{"kind":5,"left":7,"right":10},{"kind":9,"left":10,"right":9},{"kind":7,"left":8,"right":5},{"kind":8,"left":4,"right":5},{"kind":9,"left":11,"right":0},{"kind":14,"left":16,"right":8},{"kind":9,"left":3,"right":3},{"kind":7,"left":16,"right":14},{"kind":6,"left":0,"right":18},{"kind":11,"left":20,"right":4},{"kind":7,"left":22,"right":14},{"kind":3,"left":13,"right":0},{"kind":4,"left":16,"right":24},{"kind":9,"left":17,"right":21},{"kind":9,"left":5,"right":9},{"kind":9,"left":23,"right":2}]"#;
+
+#[test]
+fn an_alu_search_over_the_whole_crowd_completes_and_answers_alike_on_every_device() {
+    let Some(host) =
+        device("an_alu_search_over_the_whole_crowd_completes_and_answers_alike_on_every_device")
+    else {
+        return;
+    };
+    let held = call(
+        Some(&host),
+        "grit_synthesise",
+        &format!(
+            "{{\"inputs\":7,\"outputs\":4,\"gates\":22,\"table\":[{}],\"crowd\":65536,\"rounds\":300,\"stall\":100}}",
+            rows()
+        ),
+    );
+    let answer = format!(
+        "{} {} {} {} {}",
+        held.counted("marks").unwrap(),
+        held.counted("of").unwrap(),
+        held.counted("rounds").unwrap(),
+        held.counted("crowd").unwrap(),
+        written(held.get("gates").unwrap())
+    );
+    eprintln!("ALU at 22 gates on {}: {answer}", host.name());
+    assert_eq!(
+        answer,
+        ALU_SEARCH,
+        "the same seed answers otherwise on {}",
+        host.name()
+    );
 }
