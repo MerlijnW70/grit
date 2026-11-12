@@ -1,27 +1,24 @@
-use std::io::{BufRead, Write};
+use std::io::Write;
 
 use grit::Host;
 use grit::serve3::Server;
+use grit::serve3::transport::{Line, Lines, too_long};
 use grit::wire::written;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::open()?;
     let mut server = Server::new(host.as_ref());
-    let mut stdin = std::io::stdin().lock();
+    let mut lines = Lines::new(std::io::stdin().lock());
     let mut out = std::io::stdout();
-    let mut bytes = Vec::new();
-    loop {
-        bytes.clear();
-        if stdin.read_until(b'\n', &mut bytes)? == 0 {
-            return Ok(());
-        }
-        let line = String::from_utf8_lossy(&bytes);
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(answer) = server.heard(&line) {
+    while let Some(line) = lines.next_line()? {
+        let answer = match line {
+            Line::Long { bytes } => Some(too_long(bytes)),
+            Line::Held(bytes) => server.heard(&String::from_utf8_lossy(&bytes)),
+        };
+        if let Some(answer) = answer {
             writeln!(out, "{}", written(&answer))?;
             out.flush()?;
         }
     }
+    Ok(())
 }
