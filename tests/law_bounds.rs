@@ -547,6 +547,79 @@ fn a_reversible_law_is_checked_in_time_bounded_per_unit() {
     }
 }
 
+fn mixed(steps: u32, seed: u64) -> String {
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut current: Vec<String> = (0..8).map(|k| format!("[\"at\",\"cells\",{k}]")).collect();
+    let mut binds = Vec::new();
+    for step in 0..steps {
+        let word = (next() % 8) as usize;
+        let others: Vec<&String> = (0..8)
+            .filter(|&other| other != word)
+            .map(|other| &current[other])
+            .collect();
+        let one = others[(next() % 7) as usize];
+        let two = others[(next() % 7) as usize];
+        let by = format!("[\"add\",{one},{two}]");
+        let made = if next() % 2 == 0 {
+            format!(
+                "[\"{}\",{by},{}]",
+                ["add", "xor"][(next() % 2) as usize],
+                current[word]
+            )
+        } else {
+            format!(
+                "[\"{}\",{},{by}]",
+                ["add", "sub", "xor"][(next() % 3) as usize],
+                current[word]
+            )
+        };
+        binds.push(format!("[\"w{step}\",{made}]"));
+        current[word] = format!("\"w{step}\"");
+    }
+    law(
+        0,
+        "",
+        &format!(
+            "[\"let\",[{}],[\"vec\",[\"vec\",{}],[\"vec\",0]]]",
+            binds.join(","),
+            current.join(",")
+        ),
+    )
+    .replacen("\"halo\":0,", "\"halo\":0,\"reversible\":true,", 1)
+}
+
+#[test]
+fn a_reversible_law_of_words_read_through_each_other_is_checked_in_bounded_time() {
+    for (steps, seed) in [(2_000_u32, 1_u64), (8_100, 2)] {
+        let text = mixed(steps, seed);
+        let law = Law::compile(&text).unwrap();
+        assert!(law.reversible());
+        let units = law.work() + law.nodes() as u64 + text.len() as u64;
+        let took = (0..3)
+            .map(|_| timed(&text).1)
+            .min()
+            .unwrap_or(Duration::ZERO);
+        let nanos = took.as_secs_f64() * 1e9 / units as f64;
+        println!(
+            "{steps} steps whose added words read every other word: {} nodes, work {}, {} bytes, {:.2} ms, {nanos:.1} ns a unit",
+            law.nodes(),
+            law.work(),
+            text.len(),
+            took.as_secs_f64() * 1e3
+        );
+        assert!(
+            nanos <= NANOS_PER_UNIT,
+            "{steps} steps: {nanos:.1} ns a unit"
+        );
+    }
+}
+
 struct Gen {
     state: u64,
     ints: Vec<String>,
