@@ -10,7 +10,7 @@ use crate::layout::{DENSE, Dimension, GRAND, PARAMS, STATE, Windows};
 use crate::live::{self, Loop, Stages};
 use crate::rule3::{CORNERS, Rule};
 use crate::sand::Grid;
-use crate::{Error, Groups, Resident};
+use crate::{Error, Groups, Resident, Run};
 
 pub const UNIFORM: u32 = u32::MAX;
 
@@ -907,13 +907,18 @@ impl Bricks {
         held.write(PARAMS as usize, &[frame, self.dump()])?;
         let table = held.read(self.table() as usize, self.table_words())?;
         let per_block = self.per_block() as usize;
-        let marked = vec![AWAKE_LEVEL; per_block];
-        for brick in 0..self.count() as usize {
-            let slot = table.get(brick * ENTRY).copied().unwrap_or(UNIFORM);
-            if slot != UNIFORM {
-                held.write_at(AWAKE as usize, slot as usize * per_block, &marked)?;
-            }
-        }
+        let runs = self.held_runs(&table);
+        let longest = runs.iter().map(|&(_, slots)| slots).max().unwrap_or(0);
+        let marked = vec![AWAKE_LEVEL; per_block * longest as usize];
+        let writes: Vec<Run<'_>> = runs
+            .iter()
+            .map(|&(first, slots)| Run {
+                index: AWAKE as usize,
+                at: first as usize * per_block,
+                words: marked.get(..slots as usize * per_block).unwrap_or_default(),
+            })
+            .collect();
+        held.write_many(&writes)?;
         let count = self.count();
         held.write(HOT as usize, &vec![AWAKE_LEVEL; count as usize])?;
         held.write_at(HOT as usize, self.cold as usize, &[0])?;
@@ -924,6 +929,26 @@ impl Bricks {
         held.write(HOT_COUNTS as usize, &vec![0; hot_counts.max(1)])?;
         held.write(TALLY as usize, &vec![0; Dimension::Three.tally_words()])?;
         self.list(held, &[], &(0..count).collect::<Vec<u32>>())
+    }
+
+    #[must_use]
+    pub fn held_runs(&self, table: &[u32]) -> Vec<(u32, u32)> {
+        let mut slots: Vec<u32> = table
+            .chunks(ENTRY)
+            .take(self.count() as usize)
+            .filter_map(|entry| entry.first().copied())
+            .filter(|&slot| slot != UNIFORM)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for slot in slots {
+            match runs.last_mut() {
+                Some((first, length)) if *first + *length == slot => *length += 1,
+                _ => runs.push((slot, 1)),
+            }
+        }
+        runs
     }
 }
 
