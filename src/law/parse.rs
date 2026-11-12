@@ -573,6 +573,7 @@ struct Checking<'c, 'p> {
     program: &'c Program<'p>,
     globals: HashSet<&'p str>,
     locals: Vec<&'p str>,
+    bound: HashMap<&'p str, usize>,
     calls: Vec<(usize, String)>,
 }
 
@@ -605,6 +606,21 @@ fn arguments(count: usize) -> String {
 }
 
 impl<'p> Checking<'_, 'p> {
+    fn bind(&mut self, name: &'p str) {
+        *self.bound.entry(name).or_insert(0) += 1;
+        self.locals.push(name);
+    }
+
+    fn unbind(&mut self, mark: usize) {
+        while self.locals.len() > mark {
+            if let Some(name) = self.locals.pop()
+                && let Some(many) = self.bound.get_mut(name)
+            {
+                *many = many.saturating_sub(1);
+            }
+        }
+    }
+
     fn binder(&self, json: &'p Json, path: &Path<'_>) -> Result<&'p str, Refusal> {
         named(json, path, "a name to bind")
     }
@@ -613,7 +629,7 @@ impl<'p> Checking<'_, 'p> {
         match json {
             Json::Int(_) => literal(json, path).map(|_| ()),
             Json::Text(name) => {
-                if self.locals.iter().rev().any(|held| held == name)
+                if self.bound.get(name.as_str()).is_some_and(|&many| many > 0)
                     || self.globals.contains(name.as_str())
                 {
                     Ok(())
@@ -725,28 +741,29 @@ impl<'p> Checking<'_, 'p> {
                     };
                     let name = self.binder(name, &here.index(0))?;
                     self.expression(value, &here.index(1))?;
-                    self.locals.push(name);
+                    self.bind(name);
                 }
                 self.expression(arg(1), &at(1))?;
-                self.locals.truncate(mark);
+                self.unbind(mark);
             }
             "map" | "filter" => {
                 let name = self.binder(arg(0), &at(0))?;
                 self.expression(arg(1), &at(1))?;
-                self.locals.push(name);
+                let mark = self.locals.len();
+                self.bind(name);
                 self.expression(arg(2), &at(2))?;
-                self.locals.pop();
+                self.unbind(mark);
             }
             "fold" => {
                 let acc = self.binder(arg(0), &at(0))?;
                 self.expression(arg(1), &at(1))?;
                 let name = self.binder(arg(2), &at(2))?;
                 self.expression(arg(3), &at(3))?;
-                self.locals.push(acc);
-                self.locals.push(name);
+                let mark = self.locals.len();
+                self.bind(acc);
+                self.bind(name);
                 self.expression(arg(4), &at(4))?;
-                self.locals.pop();
-                self.locals.pop();
+                self.unbind(mark);
             }
             _ => {
                 for (index, one) in args.iter().enumerate() {
@@ -766,18 +783,22 @@ fn checked(program: &Program<'_>) -> Result<(), Refusal> {
         program,
         globals,
         locals: Vec::new(),
+        bound: HashMap::new(),
         calls: Vec::new(),
     };
     let defs_path = root.key("defs");
     let mut calls = Vec::with_capacity(program.defs.len());
     for def in &program.defs {
-        checking.locals = def.args.clone();
+        checking.unbind(0);
+        for &arg in &def.args {
+            checking.bind(arg);
+        }
         checking.calls.clear();
         let body_path = defs_path.key(def.name);
         checking.expression(def.body, &body_path.index(1))?;
         calls.push(std::mem::take(&mut checking.calls));
     }
-    checking.locals.clear();
+    checking.unbind(0);
     checking.expression(program.step, &root.key("step"))?;
     unlooped(program, &calls)
 }

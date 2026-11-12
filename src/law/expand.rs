@@ -49,6 +49,7 @@ struct Expander<'c, 'p> {
     tracer: Tracer,
     globals: HashMap<&'p str, Value>,
     locals: Vec<(&'p str, Value)>,
+    places: HashMap<&'p str, Vec<usize>>,
     base: usize,
     work: u64,
     deepest: usize,
@@ -258,11 +259,28 @@ impl<'p> Expander<'_, 'p> {
         }
     }
 
+    fn bind(&mut self, name: &'p str, value: Value) {
+        self.places.entry(name).or_default().push(self.locals.len());
+        self.locals.push((name, value));
+    }
+
+    fn unbind(&mut self, mark: usize) {
+        while self.locals.len() > mark {
+            if let Some((name, _)) = self.locals.pop()
+                && let Some(places) = self.places.get_mut(name)
+            {
+                places.pop();
+            }
+        }
+    }
+
     fn lookup(&self, name: &str, path: &Path<'_>) -> Result<Value, Refusal> {
         let local = self
-            .locals
-            .get(self.base..)
-            .and_then(|frame| frame.iter().rev().find(|(held, _)| *held == name));
+            .places
+            .get(name)
+            .and_then(|places| places.last())
+            .filter(|&&place| place >= self.base)
+            .and_then(|&place| self.locals.get(place));
         match local
             .map(|(_, value)| value)
             .or_else(|| self.globals.get(name))
@@ -301,9 +319,11 @@ impl<'p> Expander<'_, 'p> {
         depth: usize,
     ) -> Result<Value, Refusal> {
         let mark = self.locals.len();
-        self.locals.extend(names.iter().cloned());
+        for (name, value) in names {
+            self.bind(name, value.clone());
+        }
         let result = self.eval(body, path, depth);
-        self.locals.truncate(mark);
+        self.unbind(mark);
         result
     }
 
@@ -364,7 +384,7 @@ impl<'p> Expander<'_, 'p> {
                 break;
             };
             match self.eval(value, &here.index(1), depth) {
-                Ok(made) => self.locals.push((name.as_str(), made)),
+                Ok(made) => self.bind(name.as_str(), made),
                 Err(why) => {
                     result = Err(why);
                     break;
@@ -372,7 +392,7 @@ impl<'p> Expander<'_, 'p> {
             }
         }
         let value = result.and_then(|()| self.eval(arg(args, 1), &path.index(2), depth));
-        self.locals.truncate(mark);
+        self.unbind(mark);
         value
     }
 
@@ -754,6 +774,7 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
         tracer,
         globals,
         locals: Vec::new(),
+        places: HashMap::new(),
         base: 0,
         work: 0,
         deepest: 0,

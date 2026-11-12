@@ -1275,3 +1275,23 @@ fn copying_a_vec_costs_work_for_every_item() {
         assert_eq!(why.code, Code::Work, "{name}: {why}");
     }
 }
+
+#[test]
+fn a_name_is_found_without_scanning_every_binding_before_it() {
+    let bindings: Vec<String> = (0..60_000).map(|at| format!("[\"b{at}\",0]")).collect();
+    let text = template(&format!(
+        "[\"let\",[{}],[\"vec\",\"cells\",[\"vec\",[\"fold\",\"a\",\"b0\",\"i\",[\"range\",450000],\"X\"]]]]",
+        bindings.join(",")
+    ));
+    assert!(text.len() < limits::BODY);
+    let start = std::time::Instant::now();
+    let law = compiled(&text);
+    let took = start.elapsed();
+    println!(
+        "{} bytes, work {}: compiled in {:.1} ms",
+        text.len(),
+        law.work(),
+        took.as_secs_f64() * 1e3
+    );
+    assert!(took.as_secs() < 3, "{took:?}");
+}
