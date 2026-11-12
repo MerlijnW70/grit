@@ -357,39 +357,38 @@ fn versions(dag: &Dag, chains: &[Vec<Lift>]) -> Result<Vec<Option<Version>>, Bro
     }
 }
 
-fn reads(
-    dag: &Dag,
-    held: &[Option<Version>],
-    lift: &Lift,
-    stamp: &mut [u32],
-    mark: u32,
-) -> Result<Vec<Version>, Broken> {
-    let mut found = Vec::new();
-    let mut stack = vec![lift.by];
-    while let Some(id) = stack.pop() {
-        let Some(slot) = usize::try_from(id)
-            .ok()
-            .and_then(|index| stamp.get_mut(index))
-        else {
-            continue;
-        };
-        if *slot == mark {
-            continue;
-        }
-        *slot = mark;
-        if let Some(version) = at(held, id) {
-            if version.word == lift.word {
-                return Err(Broken::ReadsItself {
-                    word: lift.word,
-                    node: lift.node,
-                });
+const UNREAD: u32 = u32::MAX;
+
+type Span = [(u32, u32); CORNERS];
+
+fn spans(dag: &Dag, held: &[Option<Version>]) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::with_capacity(dag.len());
+    for (index, &node) in dag.nodes().iter().enumerate() {
+        let mut span = [(UNREAD, 0); CORNERS];
+        match held.get(index).copied().flatten() {
+            Some(version) => {
+                let place = u32::try_from(version.index).unwrap_or(UNREAD - 1);
+                if let Some(slot) = span.get_mut(version.word) {
+                    *slot = (place, place);
+                }
             }
-            found.push(version);
-            continue;
+            None => {
+                for id in operands(node).into_iter().flatten() {
+                    let Some(other) = usize::try_from(id).ok().and_then(|at| out.get(at)) else {
+                        continue;
+                    };
+                    for (mine, theirs) in span.iter_mut().zip(other) {
+                        if theirs.0 != UNREAD {
+                            mine.0 = mine.0.min(theirs.0);
+                            mine.1 = mine.1.max(theirs.1);
+                        }
+                    }
+                }
+            }
         }
-        stack.extend(operands(node_at(dag, id)).iter().flatten());
+        out.push(span);
     }
-    Ok(found)
+    out
 }
 
 struct Order {
@@ -424,20 +423,31 @@ fn ordered(dag: &Dag, chains: &[Vec<Lift>]) -> Result<Vec<Lift>, Broken> {
         after: vec![Vec::new(); all.len()],
         waiting: vec![0; all.len()],
     };
-    let mut stamp = vec![u32::MAX; dag.len()];
+    let spans = spans(dag, &held);
     let mut broken = Vec::new();
     for (index, lift) in all.iter().enumerate() {
         let version = at(&held, lift.node).map_or(0, |one| one.index);
         order.edge(lift_at(lift.word, version.saturating_sub(1)), Some(index));
-        let mark = u32::try_from(index).unwrap_or(u32::MAX - 1);
-        match reads(dag, &held, lift, &mut stamp, mark) {
-            Ok(found) => {
-                for read in found {
-                    order.edge(lift_at(read.word, read.index), Some(index));
-                    order.edge(Some(index), lift_at(read.word, read.index + 1));
-                }
+        let span = usize::try_from(lift.by)
+            .ok()
+            .and_then(|at| spans.get(at))
+            .copied()
+            .unwrap_or([(UNREAD, 0); CORNERS]);
+        if span.get(lift.word).is_some_and(|read| read.0 != UNREAD) {
+            broken.push(Broken::ReadsItself {
+                word: lift.word,
+                node: lift.node,
+            });
+            continue;
+        }
+        for (word, &(least, most)) in span.iter().enumerate() {
+            if least == UNREAD {
+                continue;
             }
-            Err(why) => broken.push(why),
+            let least = usize::try_from(least).unwrap_or(usize::MAX);
+            let most = usize::try_from(most).unwrap_or(usize::MAX);
+            order.edge(lift_at(word, most), Some(index));
+            order.edge(Some(index), lift_at(word, least.saturating_add(1)));
         }
     }
     if let Some(why) = broken.into_iter().min_by_key(|why| why.node()) {
