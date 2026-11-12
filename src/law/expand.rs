@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::dag::{AT, Dag, FIRST_PARAM, FRAME};
-use super::parse::{Path, Program, clipped, described, limited, refused};
+use super::parse::{Path, Program, Step, clipped, described, limited, refused, shown};
 use super::trace::Tracer;
 use super::value::{Items, Value};
 use super::{Code, Refusal, limits};
@@ -44,6 +44,7 @@ pub struct Expanded {
     pub dag: Dag,
     pub work: u64,
     pub depth: usize,
+    pub sites: Vec<usize>,
 }
 
 struct Expander<'c, 'p> {
@@ -55,6 +56,12 @@ struct Expander<'c, 'p> {
     base: usize,
     work: u64,
     deepest: usize,
+    site: usize,
+    sites: Vec<usize>,
+}
+
+fn address(json: &Json) -> usize {
+    std::ptr::from_ref(json).addr()
 }
 
 fn int(value: &Value, path: &Path<'_>) -> Result<u32, Refusal> {
@@ -266,8 +273,12 @@ impl<'p> Expander<'_, 'p> {
         Ok(())
     }
 
-    fn grown(&self, path: &Path<'_>) -> Result<(), Refusal> {
-        if self.tracer.nodes.len() > limits::NODES {
+    fn grown(&mut self, path: &Path<'_>) -> Result<(), Refusal> {
+        let made = self.tracer.nodes.len();
+        if self.sites.len() < made {
+            self.sites.resize(made, self.site);
+        }
+        if made > limits::NODES {
             return Err(limited(
                 Code::Nodes,
                 path,
@@ -344,7 +355,12 @@ impl<'p> Expander<'_, 'p> {
                 .map(Value::Int)
                 .map_err(|_| too_large(*held, path)),
             Json::Text(name) => self.lookup(name, path),
-            Json::List(items) => self.operation(items, path, depth + 1),
+            Json::List(items) => {
+                let outer = std::mem::replace(&mut self.site, address(json));
+                let made = self.operation(items, path, depth + 1);
+                self.site = outer;
+                made
+            }
             other => Err(not_an_expression(other, path)),
         }
     }
@@ -848,6 +864,7 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
     let planes = program.channels.max(1);
     let extra = usize::try_from(planes - 1).unwrap_or(0) * CORNERS;
     let tracer = Tracer::with_inputs(program.params + extra);
+    let inputs = tracer.nodes.len();
     let mut globals: HashMap<&str, Value> = HashMap::new();
     globals.insert("X", Value::Int(1));
     globals.insert("Z", Value::Int(2));
@@ -870,10 +887,13 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
         base: 0,
         work: 0,
         deepest: 0,
+        site: 0,
+        sites: vec![0; inputs],
     };
     let root = Path::root();
     let step = root.key("step");
     let result = expander.eval(program.step, &step, 0)?;
+    expander.site = address(program.step);
     let Value::List(halves) = &result else {
         return Err(shaped(&step, kind(&result)));
     };
@@ -942,7 +962,10 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
             .map_err(|_| shaped(&step, format!("{} at counts[{index}]", kind(one))))?;
         tallied.push(expander.id(made, &step)?);
     }
+    let mut sites = std::mem::take(&mut expander.sites);
+    sites.resize(expander.tracer.nodes.len(), address(program.step));
     Ok(Expanded {
+        sites,
         dag: Dag::new(
             expander.tracer.nodes,
             ids,
@@ -954,4 +977,115 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
         work: expander.work,
         depth: expander.deepest,
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Place {
+    Root,
+    Key(Box<str>),
+    Index(usize),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Places {
+    steps: Vec<(usize, Place)>,
+    nodes: Vec<usize>,
+}
+
+const NOWHERE: usize = usize::MAX;
+
+struct Locating<'j> {
+    wanted: HashMap<usize, usize>,
+    steps: Vec<(usize, Place)>,
+    trail: Vec<(Step<'j>, usize)>,
+}
+
+impl<'j> Locating<'j> {
+    fn interned(&mut self) -> usize {
+        let mut parent = 0;
+        for (step, id) in &mut self.trail {
+            if *id == NOWHERE {
+                let place = match *step {
+                    Step::Key(key) => Place::Key(key.into()),
+                    Step::Index(index) => Place::Index(index),
+                    Step::Root => Place::Root,
+                };
+                *id = self.steps.len();
+                self.steps.push((parent, place));
+            }
+            parent = *id;
+        }
+        parent
+    }
+
+    fn visit(&mut self, json: &'j Json) {
+        if let Some(slot) = self.wanted.get(&address(json)).copied()
+            && slot == NOWHERE
+        {
+            let id = self.interned();
+            self.wanted.insert(address(json), id);
+        }
+        match json {
+            Json::List(items) => {
+                for (index, one) in items.iter().enumerate() {
+                    self.trail.push((Step::Index(index), NOWHERE));
+                    self.visit(one);
+                    self.trail.pop();
+                }
+            }
+            Json::Map(fields) => {
+                for (key, one) in fields {
+                    self.trail.push((Step::Key(key), NOWHERE));
+                    self.visit(one);
+                    self.trail.pop();
+                }
+            }
+            Json::Null | Json::Bool(_) | Json::Int(_) | Json::Text(_) => {}
+        }
+    }
+}
+
+impl Places {
+    #[must_use]
+    pub(crate) fn of(json: &Json, sites: &[usize]) -> Self {
+        let wanted: HashMap<usize, usize> = sites
+            .iter()
+            .filter(|&&site| site != 0)
+            .map(|&site| (site, NOWHERE))
+            .collect();
+        let mut locating = Locating {
+            wanted,
+            steps: vec![(NOWHERE, Place::Root)],
+            trail: Vec::new(),
+        };
+        locating.visit(json);
+        let nodes = sites
+            .iter()
+            .map(|site| locating.wanted.get(site).copied().unwrap_or(NOWHERE))
+            .collect();
+        Self {
+            steps: locating.steps,
+            nodes,
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self, node: u32) -> Option<String> {
+        let mut here = usize::try_from(node)
+            .ok()
+            .and_then(|index| self.nodes.get(index))
+            .copied()
+            .filter(|&id| id != NOWHERE)?;
+        let mut trail = Vec::new();
+        while let Some((parent, place)) = self.steps.get(here) {
+            trail.push(match place {
+                Place::Root => Step::Root,
+                Place::Key(key) => Step::Key(key),
+                Place::Index(index) => Step::Index(*index),
+            });
+            here = *parent;
+        }
+        trail.reverse();
+        Some(shown(&trail))
+    }
 }

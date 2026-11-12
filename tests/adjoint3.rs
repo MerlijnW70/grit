@@ -1139,3 +1139,157 @@ fn every_law_the_check_admits_is_undone_by_its_inverse_on_a_seeded_fuzz() {
     assert!(admitted > 0);
     assert!(codes.contains("lifting"));
 }
+
+fn lifting_law(defs: &str, step: &str) -> String {
+    format!(
+        "{{\"law\":1,\"name\":\"probe\",\"params\":0,\"channels\":1,\"halo\":0,\"reversible\":true,\"tally\":{{\"counts\":1,\"weighted\":false}},\"consts\":{{}},\"defs\":{{{defs}}},\"step\":{step}}}"
+    )
+}
+
+fn third(word: &str) -> String {
+    let cells: Vec<String> = (0..8)
+        .map(|k| if k == 3 { word.to_owned() } else { cell(k) })
+        .collect();
+    format!("[\"vec\",[\"vec\",{}],[\"vec\",0]]", cells.join(","))
+}
+
+fn padded(items: u64) -> String {
+    format!(
+        "[\"let\",[[\"junk\",[\"range\",{items}]]],{}]",
+        third("[\"mul\",[\"at\",\"cells\",3],2]")
+    )
+}
+
+fn chain(defs: usize) -> String {
+    let mut all: Vec<String> = (0..defs)
+        .map(|at| format!("\"d{at}\":[[\"v\"],[\"d{}\",\"v\"]]", at + 1))
+        .collect();
+    all.push(format!("\"d{defs}\":[[\"v\"],[\"mul\",\"v\",2]]"));
+    all.join(",")
+}
+
+fn lifting_refused(text: &str) -> Refusal {
+    let why = refused(text);
+    assert_eq!(why.code, Code::Lifting, "{why}");
+    assert_eq!(
+        why.found,
+        "word 3 is made by mul, which is not add, sub or xor of the word"
+    );
+    why
+}
+
+#[test]
+fn a_lifting_refusal_names_its_step_exactly_at_the_work_and_depth_limits() {
+    let plain = lifting_refused(&lifting_law("", &third("[\"mul\",[\"at\",\"cells\",3],2]")));
+    assert_eq!(plain.path, "$.step[1][4]");
+    let fixed = compiled(&unmarked(&lifting_law("", &padded(0)))).work();
+    let most = grit::law::limits::WORK - fixed;
+    assert_eq!(
+        compiled(&unmarked(&lifting_law("", &padded(most)))).work(),
+        grit::law::limits::WORK
+    );
+    let at_work = lifting_refused(&lifting_law("", &padded(most)));
+    assert_eq!(at_work.path, "$.step[2][1][4]");
+    let past = refused(&lifting_law("", &padded(most + 1)));
+    assert_eq!(past.code, Code::Work, "{past}");
+    let called = third("[\"d0\",[\"at\",\"cells\",3]]");
+    let depth_of = |defs: usize| {
+        let text = unmarked(&lifting_law(&chain(defs), &called));
+        Law::compile(&text).map(|law| law.depth())
+    };
+    let mut defs = 1;
+    while depth_of(defs + 1).is_ok() {
+        defs += 1;
+    }
+    assert_eq!(depth_of(defs).unwrap(), grit::law::limits::DEPTH);
+    let at_depth = lifting_refused(&lifting_law(&chain(defs), &called));
+    assert_eq!(at_depth.path, format!("$.defs.d{defs}[1]"));
+    let law = compiled(&unmarked(&lifting_law(&chain(defs), &called)));
+    assert_eq!(Reversible::of(&law).unwrap_err(), at_depth);
+    assert_eq!(depth_of(defs + 1).unwrap_err().code, Code::Depth);
+}
+
+fn located(json: &Json, path: &str) -> Option<Json> {
+    let mut here = json.clone();
+    let mut rest = path.strip_prefix('$')?;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('.') {
+            let end = after.find(['.', '[']).unwrap_or(after.len());
+            here = here.get(&after[..end])?.clone();
+            rest = &after[end..];
+        } else {
+            let after = rest.strip_prefix('[')?;
+            let end = after.find(']')?;
+            let index: usize = after[..end].parse().ok()?;
+            here = here.list()?.get(index)?.clone();
+            rest = &after[end + 1..];
+        }
+    }
+    Some(here)
+}
+
+#[test]
+fn every_node_a_law_emits_knows_the_expression_that_emitted_it() {
+    for (name, text) in [
+        ("sand", SAND),
+        ("heat", HEAT),
+        ("code", CODE),
+        ("nature", NATURE),
+        ("embed", EMBED),
+        ("mix", MIX),
+        ("stir", STIR),
+    ] {
+        let law = compiled(text);
+        let json = wire::read(text).unwrap();
+        let first = law.dag().first_plane() as usize;
+        let mut ops = BTreeSet::new();
+        for (index, node) in law.dag().nodes().iter().enumerate() {
+            let path = law.places().path(index as u32);
+            if matches!(node, grit::law::Node::Input(_)) {
+                assert_eq!(path, None, "{name} input {index}");
+                assert!(
+                    index < first + CORNERS * law.dag().planes().len(),
+                    "{name} input {index}"
+                );
+                continue;
+            }
+            let path = path.unwrap_or_else(|| panic!("{name}: node {index} has no path"));
+            let expression = located(&json, &path)
+                .unwrap_or_else(|| panic!("{name}: node {index} at {path} is not in the law"));
+            let Some(Json::Text(op)) = expression.list().and_then(|items| items.first()) else {
+                panic!("{name}: node {index} at {path} is not an operation");
+            };
+            ops.insert(op.clone());
+            let emits: &[&str] = match node {
+                grit::law::Node::Input(_) => &[],
+                grit::law::Node::Const(_) => &[],
+                grit::law::Node::Select(..) => &["sel", "noise"],
+                grit::law::Node::Eq(..) => &["eq"],
+                grit::law::Node::Ne(..) => &["ne"],
+                grit::law::Node::Lt(..) => &["lt"],
+                grit::law::Node::Le(..) => &["le"],
+                grit::law::Node::Gt(..) => &["gt"],
+                grit::law::Node::Ge(..) => &["ge"],
+                grit::law::Node::And(..) => &["and", "both", "noise"],
+                grit::law::Node::Or(..) => &["or", "either", "noise"],
+                grit::law::Node::Xor(..) => &["xor", "denied", "noise"],
+                grit::law::Node::Add(..) => &["add", "count", "noise"],
+                grit::law::Node::Not(..) => &["not", "noise"],
+                grit::law::Node::Shl(..) => &["shl", "noise"],
+                grit::law::Node::Shr(..) => &["shr", "noise"],
+                grit::law::Node::Sub(..) => &["sub", "noise"],
+                grit::law::Node::Mul(..) => &["mul", "noise"],
+                grit::law::Node::Div(..) => &["div", "noise"],
+                grit::law::Node::DotS(..) => &["dot_s"],
+                grit::law::Node::DotU(..) => &["dot_u"],
+            };
+            if !emits.is_empty() {
+                assert!(
+                    emits.contains(&op.as_str()),
+                    "{name}: node {index} {node:?} at {path} is a {op}"
+                );
+            }
+        }
+        println!("{name}: {} nodes, emitted by {ops:?}", law.nodes());
+    }
+}

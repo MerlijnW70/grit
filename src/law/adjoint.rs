@@ -1,15 +1,14 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 
 use super::dag::{AT, Dag, FIRST_PARAM, FRAME, Node};
-use super::{Code, Law, Refusal, limits, parse};
+use super::{Code, Law, Places, Refusal};
 use crate::ops::{Cpu, Flag, Ops};
 use crate::question::cpu::{self, World};
 use crate::question::{Answer, Map, Measure, Reduce, Region, Seen};
 use crate::rule3::{CORNERS, Declared, Oct};
 use crate::sand3::{Grid3, lattice, reference};
-use crate::wire::Json;
 
 pub const FRACTION: u32 = 64;
 
@@ -122,14 +121,12 @@ impl Broken {
     }
 
     #[must_use]
-    pub fn refusal(self, dag: &Dag, json: &Json) -> Refusal {
+    pub fn refusal(self, dag: &Dag, places: &Places) -> Refusal {
         Refusal {
             code: Code::Lifting,
-            path: match node_at(dag, self.node()) {
-                Node::Input(_) => None,
-                _ => located(json, self.node()),
-            }
-            .unwrap_or_else(|| String::from("$.step")),
+            path: places
+                .path(self.node())
+                .unwrap_or_else(|| String::from("$.step")),
             expected: String::from(EXPECTED),
             found: self.found(dag),
             limit: None,
@@ -168,90 +165,6 @@ fn named(dag: &Dag, node: u32) -> String {
         None => return format!("node {node}"),
     };
     String::from(op)
-}
-
-fn texts(json: &Json, out: &mut BTreeSet<String>) {
-    match json {
-        Json::Text(held) => {
-            out.insert(held.clone());
-        }
-        Json::List(items) => items.iter().for_each(|item| texts(item, out)),
-        Json::Map(fields) => {
-            for (name, item) in fields {
-                out.insert(name.clone());
-                texts(item, out);
-            }
-        }
-        Json::Null | Json::Bool(_) | Json::Int(_) => {}
-    }
-}
-
-fn fresh(stem: &str, used: &BTreeSet<String>) -> String {
-    let mut made = String::from(stem);
-    while used.contains(&made) {
-        made.push('_');
-    }
-    made
-}
-
-fn text(held: &str) -> Json {
-    Json::Text(held.to_owned())
-}
-
-#[must_use]
-pub fn located(json: &Json, node: u32) -> Option<String> {
-    let Json::Map(fields) = json else {
-        return None;
-    };
-    let index = usize::try_from(node).ok()?;
-    let count = limits::NODES
-        .checked_sub(index)
-        .filter(|&count| count > 0)?;
-    let mut used = BTreeSet::new();
-    texts(json, &mut used);
-    let pad = fresh("pad", &used);
-    let acc = fresh("acc", &used);
-    let each = fresh("each", &used);
-    let step = fields
-        .iter()
-        .find(|(name, _)| name == "step")
-        .map(|(_, held)| held.clone())?;
-    let padding = Json::List(vec![
-        text("fold"),
-        text(&acc),
-        text("frame"),
-        text(&each),
-        Json::List(vec![text("range"), Json::Int(i64::try_from(count).ok()?)]),
-        Json::List(vec![text("not"), text(&acc)]),
-    ]);
-    let padded = Json::List(vec![
-        text("let"),
-        Json::List(vec![Json::List(vec![text(&pad), padding])]),
-        step,
-    ]);
-    let moved: Vec<(String, Json)> = fields
-        .iter()
-        .filter(|(name, _)| name != "reversible")
-        .map(|(name, held)| {
-            if name == "step" {
-                (name.clone(), padded.clone())
-            } else {
-                (name.clone(), held.clone())
-            }
-        })
-        .collect();
-    let Err(why) = Law::from_json(&Json::Map(moved)) else {
-        return None;
-    };
-    if why.code != Code::Nodes {
-        return None;
-    }
-    if why.path.starts_with("$.defs") {
-        return Some(why.path);
-    }
-    why.path
-        .strip_prefix("$.step[2]")
-        .map(|rest| format!("$.step{rest}"))
 }
 
 const fn lifting(node: Node) -> Option<(Lifting, u32, u32)> {
@@ -705,10 +618,7 @@ pub struct Reversible {
 impl Reversible {
     pub fn of(law: &Law) -> Result<Self, Refusal> {
         let dag = law.dag();
-        let steps = lifted(dag).map_err(|broken| {
-            let json = parse::read(law.canonical()).unwrap_or(Json::Null);
-            broken.refusal(dag, &json)
-        })?;
+        let steps = lifted(dag).map_err(|broken| broken.refusal(dag, law.places()))?;
         if !law.reversible() {
             return Err(Refusal {
                 code: Code::Missing,

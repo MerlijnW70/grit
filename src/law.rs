@@ -15,6 +15,7 @@ pub mod trace;
 pub mod value;
 
 pub use dag::{Dag, Node};
+pub use expand::Places;
 pub use trace::trace;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -167,6 +168,7 @@ pub struct Law {
     halo: u32,
     reversible: bool,
     dag: Dag,
+    places: Places,
     canonical: String,
     hash: [u8; 32],
     work: u64,
@@ -192,8 +194,10 @@ impl Law {
             });
         }
         let expanded = expand::expand(&program)?;
+        let places = Places::of(json, &expanded.sites);
         if program.reversible {
-            adjoint::lifted(&expanded.dag).map_err(|broken| broken.refusal(&expanded.dag, json))?;
+            adjoint::lifted(&expanded.dag)
+                .map_err(|broken| broken.refusal(&expanded.dag, &places))?;
         }
         let hash = crate::branch::sha256(canonical.as_bytes());
         Ok(Self {
@@ -202,6 +206,7 @@ impl Law {
             halo: program.halo,
             reversible: program.reversible,
             dag: expanded.dag,
+            places,
             canonical,
             hash,
             work: expanded.work,
@@ -232,6 +237,11 @@ impl Law {
     #[must_use]
     pub const fn dag(&self) -> &Dag {
         &self.dag
+    }
+
+    #[must_use]
+    pub const fn places(&self) -> &Places {
+        &self.places
     }
 
     #[must_use]
