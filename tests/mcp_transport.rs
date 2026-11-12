@@ -1384,11 +1384,21 @@ fn a_sparse_world_past_four_billion_cells_opens_and_keeps_a_far_cell() {
         return;
     };
     let mut server = Server::new(Some(&host));
-    let made = answer(&call(
-        &mut server,
-        "grit_world_create",
-        "{\"wide\":4096,\"deep\":256,\"tall\":4096,\"rule\":\"sand\",\"sparse\":true,\"slots\":64}",
-    ));
+    let asked =
+        "{\"wide\":4096,\"deep\":256,\"tall\":4096,\"rule\":\"sand\",\"sparse\":true,\"slots\":64}";
+    let grid = grit::sand::Grid::solid(4096, 256, 4096).unwrap();
+    let blocks = grid.blocks().div_ceil(grit::sweep::cells(host.width()));
+    if grit::compact::Plan::bricked(host.width(), blocks).is_err() {
+        let told = refused(&call(&mut server, "grit_world_create", asked));
+        println!(
+            "width {}: the engine plans no 2^32-cell sparse world, refused as {}",
+            host.width(),
+            told.code
+        );
+        assert_eq!(told.code, "too_big");
+        return;
+    }
+    let made = answer(&call(&mut server, "grit_world_create", asked));
     assert_eq!(made.get("cells"), Some(&Json::Int(1 << 32)));
     let world = made.counted("world").unwrap();
     answer(&call(
