@@ -4,10 +4,10 @@ use crate::host::Host;
 use crate::layout::{BRUSH, GRAND, PARAMS, STATE};
 use crate::machine::Machine;
 use crate::marking::{
-    BEST, BINDINGS, FEED, HELD, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked, stepped,
-    turned_on, words_of,
+    BEST, BINDINGS, FEED, HELD, MARKED_INPUTS, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked,
+    stepped, turned_on, words_of,
 };
-use crate::netlist::{Chip, Exam, Gate, Netlist, drawn, turned};
+use crate::netlist::{Chip, Exam, Gate, INPUTS, Netlist, OUTPUTS, SOURCES, drawn, turned};
 use crate::resident::{Groups, Resident};
 use crate::rule::{KNOB, Kind, POINT};
 use crate::sand::{AIR, Grid, SAND, WALL, WATER, material_of};
@@ -188,6 +188,36 @@ fn unrolled(held: Machine, wide: u32) -> Result<(), Box<dyn std::error::Error>> 
         .into());
     }
     Ok(())
+}
+
+fn fits_unrolled(machine: Machine, runs: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let wide = runs.div_ceil(32).max(1);
+    if unrolled(machine, wide).is_ok() {
+        return Ok(());
+    }
+    let each = u64::from(machine.gates)
+        + u64::from(machine.state)
+        + u64::from(machine.inputs)
+        + u64::from(machine.outputs);
+    let said = format!(
+        "{runs} runs of {} steps of {each} gates and wires would unroll past the {WORK} operations one kernel is allowed",
+        machine.steps
+    );
+    let steps = WORK / (each * u64::from(wide));
+    let words = WORK / (each * u64::from(machine.steps.max(1)));
+    let (field, limit, what) = if steps >= 1 {
+        ("$.steps", steps, "steps fit with these runs")
+    } else if words >= 1 {
+        ("$.traces", words * 32, "runs fit with these steps")
+    } else {
+        ("$.steps", WORK / each, "steps fit with one word of runs")
+    };
+    let limit = u32::try_from(limit).unwrap_or(u32::MAX);
+    Err(beyond(
+        field.to_owned(),
+        format!("{said}; at most {limit} {what}"),
+        limit,
+    ))
 }
 
 fn named(shape: Netlist) -> Vec<u32> {
@@ -633,39 +663,6 @@ fn malformed(field: String, what: String) -> Box<dyn std::error::Error> {
     Box::new(Refusal::new(Code::Malformed, &field, what))
 }
 
-fn number_at(
-    held: &Json,
-    place: &str,
-    key: &str,
-    or: u32,
-) -> Result<u32, Box<dyn std::error::Error>> {
-    let Some(one) = held.get(key) else {
-        return Ok(or);
-    };
-    one.int()
-        .and_then(|one| u32::try_from(one).ok())
-        .ok_or_else(|| {
-            malformed(
-                format!("{place}.{key}"),
-                format!(
-                    "{key} is {}, which is not a whole number from 0 to {}",
-                    shown_value(one),
-                    u32::MAX
-                ),
-            )
-        })
-}
-
-fn needed(held: &Json, place: &str, key: &str) -> Result<u32, Box<dyn std::error::Error>> {
-    if held.get(key).is_none() {
-        return Err(malformed(
-            format!("{place}.{key}"),
-            format!("{key} is missing from {}", shown_value(held)),
-        ));
-    }
-    number_at(held, place, key, 0)
-}
-
 fn numbers(held: &Json, place: &str, key: &str) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     let Some(one) = held.get(key) else {
         return Ok(Vec::new());
@@ -739,11 +736,41 @@ fn present(held: &Json, key: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn asked(held: &Json) -> Result<(Netlist, Exam), Box<dyn std::error::Error>> {
-    let inputs = needed(held, "$", "inputs")?;
-    let outputs = needed(held, "$", "outputs")?;
-    let gates = needed(held, "$", "gates")?;
-    let shape = Netlist::over(inputs, outputs, gates, 16)?;
+fn gated(
+    held: &Json,
+    gates: &Whole,
+    least: u32,
+    reads: u32,
+    written_by: &str,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let gates = Whole { least: 0, ..*gates }.count(held, "$")?;
+    if gates < least {
+        return Err(beyond(
+            "$.gates".to_owned(),
+            format!(
+                "gates is {gates}, and the last {least} gates are its {written_by}, so gates must be at least {least}"
+            ),
+            least,
+        ));
+    }
+    let most = SOURCES - reads;
+    if gates > most {
+        return Err(beyond(
+            "$.gates".to_owned(),
+            format!(
+                "gates is {gates}, and the {reads} inputs plus the gates must fit the {SOURCES} sources a gate can name, so gates may be at most {most}"
+            ),
+            most,
+        ));
+    }
+    Ok(gates)
+}
+
+fn asked(held: &Json, inputs: &Whole) -> Result<(Netlist, Exam), Box<dyn std::error::Error>> {
+    let inputs = inputs.count(held, "$")?;
+    let outputs = OUTPUTS_WHOLE.count(held, "$")?;
+    let gates = gated(held, &GATES_WHOLE, outputs, inputs, "outputs")?;
+    let shape = Netlist::over(inputs, outputs, gates, KINDS_HELD)?;
     present(held, "table")?;
     let table = numbers(held, "$", "table")?;
     let rows = shape.words();
@@ -781,23 +808,39 @@ fn given(held: &Json, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Er
             )
         })?,
     };
+    if chip.len() != shape.gates as usize {
+        return Err(beyond(
+            "$.chip".to_owned(),
+            format!(
+                "chip holds {} gates where the circuit has {}; give exactly one gate for each",
+                chip.len(),
+                shape.gates
+            ),
+            shape.gates,
+        ));
+    }
     for (at, one) in chip.iter().enumerate() {
         let place = format!("$.chip[{at}]");
-        let gate = Gate {
-            kind: needed(one, &place, "kind")?,
-            left: needed(one, &place, "left")?,
-            right: needed(one, &place, "right")?,
-        };
-        shape
-            .checked(u32::try_from(at)?, gate)
-            .map_err(|fault| format!("gate {at}: {fault}"))?;
-        gates.push(gate.pack());
-    }
-    if gates.len() != shape.gates as usize {
-        return Err(Box::new(crate::netlist::NotAChip::Gates {
-            given: gates.len(),
-            wanted: shape.gates as usize,
-        }));
+        let below = shape.below(u32::try_from(at)?);
+        let kind = KIND_WHOLE.count(one, &place)?;
+        let mut sides = [0_u32; 2];
+        for (side, knob) in sides.iter_mut().zip([&LEFT_WHOLE, &RIGHT_WHOLE]) {
+            let named = knob.count(one, &place)?;
+            if named >= below {
+                return Err(beyond(
+                    format!("{place}.{}", knob.key),
+                    format!(
+                        "gate {at} reads source {named} on its {}, and a gate may only read an input or a gate before it, the sources 0 to {}",
+                        knob.key,
+                        below - 1
+                    ),
+                    below - 1,
+                ));
+            }
+            *side = named;
+        }
+        let [left, right] = sides;
+        gates.push(Gate { kind, left, right }.pack());
     }
     Ok(gates)
 }
@@ -1015,10 +1058,100 @@ const SHAKEN: Whole = Whole {
     said: "how many changes each candidate takes at once when the crowd is shaken, so it can cross a ridge that one change at a time cannot",
 };
 
+const KINDS_HELD: u32 = 16;
+
+const SYNTH_INPUTS: Whole = Whole {
+    key: "inputs",
+    least: 1,
+    most: MARKED_INPUTS as i64,
+    or: None,
+    said: "how many inputs; the table grows as two to this power, so every added input doubles the rows to mark, and the device marks at most 4096 rows",
+};
+
+const CHECK_INPUTS: Whole = Whole {
+    key: "inputs",
+    least: 1,
+    most: INPUTS as i64,
+    or: None,
+    said: "how many inputs; the table grows as two to this power, so every added input doubles the rows to mark",
+};
+
+const OUTPUTS_WHOLE: Whole = Whole {
+    key: "outputs",
+    least: 1,
+    most: OUTPUTS as i64,
+    or: None,
+    said: "how many outputs; each is one of the last gates, so gates must be at least this",
+};
+
+const GATES_WHOLE: Whole = Whole {
+    key: "gates",
+    least: 1,
+    most: SOURCES as i64 - 1,
+    or: None,
+    said: "how many two-input gates it may use; at least the outputs, and the inputs plus the gates at most 4096",
+};
+
+const STATE_WHOLE: Whole = Whole {
+    key: "state",
+    least: 0,
+    most: INPUTS as i64,
+    or: None,
+    said: "how many bits it may remember; the state plus the inputs at most 31, and the state plus the outputs at most 32",
+};
+
+const MACHINE_INPUTS: Whole = Whole {
+    key: "inputs",
+    least: 0,
+    most: INPUTS as i64,
+    or: None,
+    said: "how many inputs it reads each step; the state plus the inputs from 1 to 31",
+};
+
+const MACHINE_OUTPUTS: Whole = Whole {
+    key: "outputs",
+    least: 1,
+    most: OUTPUTS as i64,
+    or: None,
+    said: "how many outputs it writes each step; the state plus the outputs at most 32",
+};
+
+const MACHINE_GATES: Whole = Whole {
+    key: "gates",
+    least: 1,
+    most: SOURCES as i64 - 1,
+    or: None,
+    said: "how many two-input gates it may use; at least the state plus the outputs, and the state, the inputs and the gates together at most 4096",
+};
+
+const KIND_WHOLE: Whole = Whole {
+    key: "kind",
+    least: 0,
+    most: KINDS_HELD as i64 - 1,
+    or: None,
+    said: "which of the sixteen two-input functions, as its truth table",
+};
+
+const LEFT_WHOLE: Whole = Whole {
+    key: "left",
+    least: 0,
+    most: SOURCES as i64 - 2,
+    or: None,
+    said: "the source it reads first: an input, then the gates before it, so below the inputs plus its own place",
+};
+
+const RIGHT_WHOLE: Whole = Whole {
+    key: "right",
+    least: 0,
+    most: SOURCES as i64 - 2,
+    or: None,
+    said: "the source it reads second, below the inputs plus its own place",
+};
+
 const STEPS: Whole = Whole {
     key: "steps",
-    least: 0,
-    most: WORD,
+    least: 1,
+    most: crate::machine::STEPS as i64,
     or: None,
     said: "how many steps a run lasts; taken from the longest run given when it is left out. Steps are worth more than runs: the same count of marks spread over longer runs holds on unseen runs where short ones do not",
 };
@@ -1194,19 +1327,7 @@ fn whole_item() -> Json {
 
 fn gate() -> Json {
     object(
-        vec![
-            needed_whole(
-                "kind",
-                "which of the sixteen two-input functions, as its truth table",
-            )
-            .shown(),
-            needed_whole(
-                "left",
-                "the source it reads first: an input, then the gates before it",
-            )
-            .shown(),
-            needed_whole("right", "the source it reads second").shown(),
-        ],
+        vec![KIND_WHOLE.shown(), LEFT_WHOLE.shown(), RIGHT_WHOLE.shown()],
         &["kind", "left", "right"],
     )
 }
@@ -1232,13 +1353,9 @@ pub(crate) fn tools() -> Json {
         ),
     );
     let shape = vec![
-        needed_whole(
-            "inputs",
-            "how many inputs; the table grows as two to this power, so every added input doubles the rows to mark",
-        )
-        .shown(),
-        needed_whole("outputs", "how many outputs").shown(),
-        needed_whole("gates", "how many two-input gates it may use").shown(),
+        SYNTH_INPUTS.shown(),
+        OUTPUTS_WHOLE.shown(),
+        GATES_WHOLE.shown(),
         table,
     ];
     let search = [
@@ -1251,6 +1368,9 @@ pub(crate) fn tools() -> Json {
     let mut seeking = shape.clone();
     seeking.extend(search.iter().cloned());
     let mut checking = shape.clone();
+    if let Some(first) = checking.first_mut() {
+        *first = CHECK_INPUTS.shown();
+    }
     checking.push((
         "chip",
         array(
@@ -1281,10 +1401,10 @@ pub(crate) fn tools() -> Json {
         "the runs it must get right, each a feed and the answer wanted",
     );
     let mut running = vec![
-        needed_whole("state", "how many bits it may remember").shown(),
-        needed_whole("inputs", "how many inputs it reads each step").shown(),
-        needed_whole("outputs", "how many outputs it writes each step").shown(),
-        needed_whole("gates", "how many two-input gates it may use").shown(),
+        STATE_WHOLE.shown(),
+        MACHINE_INPUTS.shown(),
+        MACHINE_OUTPUTS.shown(),
+        MACHINE_GATES.shown(),
         STEPS.shown(),
         ("traces", trace),
     ];
@@ -1473,14 +1593,47 @@ fn asked_machine(held: &Json) -> Result<(Machine, Runs), Box<dyn std::error::Err
         None => longest,
         Some(_) => STEPS.count(held, "$")?,
     };
-    let machine = Machine::over(
-        needed(held, "$", "state")?,
-        needed(held, "$", "inputs")?,
-        needed(held, "$", "outputs")?,
-        needed(held, "$", "gates")?,
-        16,
-        steps,
+    let state = STATE_WHOLE.count(held, "$")?;
+    let inputs = MACHINE_INPUTS.count(held, "$")?;
+    let reads = state + inputs;
+    if reads == 0 || reads > INPUTS {
+        let limit = if reads == 0 { 1 } else { INPUTS - state };
+        return Err(beyond(
+            "$.inputs".to_owned(),
+            format!(
+                "inputs is {inputs} with {state} bits of state, and a machine reads its state and its inputs together, from 1 to {INPUTS} bits"
+            ),
+            limit,
+        ));
+    }
+    let outputs = MACHINE_OUTPUTS.count(held, "$")?;
+    if state + outputs > OUTPUTS {
+        return Err(beyond(
+            "$.outputs".to_owned(),
+            format!(
+                "outputs is {outputs} with {state} bits of state, and a machine writes its state and its outputs together, at most {OUTPUTS} bits"
+            ),
+            OUTPUTS - state,
+        ));
+    }
+    let gates = gated(
+        held,
+        &MACHINE_GATES,
+        state + outputs,
+        reads,
+        "state bits and outputs",
     )?;
+    if steps > crate::machine::STEPS {
+        return Err(beyond(
+            "$.traces".to_owned(),
+            format!(
+                "the longest run holds {steps} steps, over the {} one run may hold",
+                crate::machine::STEPS
+            ),
+            crate::machine::STEPS,
+        ));
+    }
+    let machine = Machine::over(state, inputs, outputs, gates, KINDS_HELD, steps)?;
     if traces.is_empty() || machine.steps == 0 {
         return Err(malformed(
             "$.traces".to_owned(),
@@ -2264,6 +2417,7 @@ pub(crate) fn ran(
             let shape = machine.shape()?;
             marked_machine(machine, &traces, &given(held, shape)?)?
         } else {
+            fits_unrolled(machine, u32::try_from(traces.len())?)?;
             pressed_machine(device(host)?, machine, &traces, effort)?
         };
         return Ok(map(vec![
@@ -2318,9 +2472,15 @@ pub(crate) fn ran(
             ("checked_on_the_host", Json::Bool(true)),
         ]));
     }
-    let (shape, exam) = asked(held)?;
+    let inputs = if name == "grit_check" {
+        &CHECK_INPUTS
+    } else {
+        &SYNTH_INPUTS
+    };
+    let (shape, exam) = asked(held, inputs)?;
     match name {
         "grit_check" => {
+            present(held, "chip")?;
             let gates = given(held, shape)?;
             Ok(told(&checked(shape, &exam, &gates)?, false))
         }

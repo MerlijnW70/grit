@@ -683,3 +683,312 @@ fn probed_counts_the_neighbours_walked_and_no_more() {
         );
     }
 }
+
+fn told(name: &str, arguments: &str) -> Json {
+    let answer = answered(None, name, arguments);
+    answer
+        .get("result")
+        .and_then(|one| one.get("structuredContent"))
+        .cloned()
+        .unwrap_or_else(|| panic!("{name} {arguments}: {}", written(&answer)))
+}
+
+fn published(name: &str, key: &str) -> (i64, i64) {
+    let all = properties(name);
+    let one = &all.iter().find(|(held, _)| held == key).unwrap().1;
+    (
+        one.get("minimum").and_then(Json::int).unwrap(),
+        one.get("maximum").and_then(Json::int).unwrap(),
+    )
+}
+
+fn gate_published(name: &str, key: &str) -> (i64, i64) {
+    let all = properties(name);
+    let one = all
+        .iter()
+        .find(|(held, _)| held == "chip")
+        .and_then(|(_, one)| one.get("items"))
+        .and_then(|one| one.get("properties"))
+        .and_then(|one| one.get(key))
+        .unwrap();
+    (
+        one.get("minimum").and_then(Json::int).unwrap(),
+        one.get("maximum").and_then(Json::int).unwrap(),
+    )
+}
+
+fn refused_with(name: &str, arguments: &str, field: &str, limit: i64) {
+    let held = told(name, arguments);
+    assert_eq!(
+        (
+            held.get("code").and_then(Json::text),
+            held.get("field").and_then(Json::text),
+            held.get("limit").and_then(Json::int)
+        ),
+        (Some("malformed"), Some(field), Some(limit)),
+        "{name} {arguments}: {}",
+        written(&held)
+    );
+}
+
+const PASS: &str = "\"traces\":[{\"feed\":[0,1],\"want\":[0,1]}]";
+
+fn rows_of(inputs: u32) -> String {
+    let all: Vec<String> = (0..1_u32 << inputs)
+        .map(|one| (one & 1).to_string())
+        .collect();
+    all.join(",")
+}
+
+#[test]
+fn every_shape_field_publishes_the_range_its_handler_takes() {
+    for name in ["grit_synthesise", "grit_least"] {
+        assert_eq!(published(name, "inputs"), (1, 12));
+    }
+    assert_eq!(published("grit_check", "inputs"), (1, 31));
+    for name in ["grit_synthesise", "grit_least", "grit_check"] {
+        assert_eq!(published(name, "outputs"), (1, 32));
+        assert_eq!(published(name, "gates"), (1, 4095));
+    }
+    assert_eq!(published("grit_machine", "state"), (0, 31));
+    assert_eq!(published("grit_machine", "inputs"), (0, 31));
+    assert_eq!(published("grit_machine", "outputs"), (1, 32));
+    assert_eq!(published("grit_machine", "gates"), (1, 4095));
+    assert_eq!(published("grit_machine", "steps"), (1, 65536));
+    for name in ["grit_check", "grit_machine"] {
+        assert_eq!(gate_published(name, "kind"), (0, 15));
+        assert_eq!(gate_published(name, "left"), (0, 4094));
+        assert_eq!(gate_published(name, "right"), (0, 4094));
+    }
+}
+
+#[test]
+fn a_shape_field_outside_its_range_is_refused_at_the_field_with_its_limit() {
+    for name in ["grit_synthesise", "grit_least", "grit_check"] {
+        let most = if name == "grit_check" { 31 } else { 12 };
+        for (arguments, field, limit) in [
+            (
+                "{\"inputs\":0,\"outputs\":1,\"gates\":1,\"table\":[]}".to_owned(),
+                "$.inputs",
+                1,
+            ),
+            (
+                format!(
+                    "{{\"inputs\":{},\"outputs\":1,\"gates\":1,\"table\":[]}}",
+                    most + 1
+                ),
+                "$.inputs",
+                most,
+            ),
+            (
+                "{\"inputs\":2,\"outputs\":0,\"gates\":1,\"table\":[0,0,0,0]}".to_owned(),
+                "$.outputs",
+                1,
+            ),
+            (
+                "{\"inputs\":2,\"outputs\":33,\"gates\":40,\"table\":[0,0,0,0]}".to_owned(),
+                "$.outputs",
+                32,
+            ),
+            (
+                "{\"inputs\":2,\"outputs\":1,\"gates\":0,\"table\":[0,0,0,0]}".to_owned(),
+                "$.gates",
+                1,
+            ),
+            (
+                "{\"inputs\":2,\"outputs\":1,\"gates\":4096,\"table\":[0,0,0,0]}".to_owned(),
+                "$.gates",
+                4095,
+            ),
+            (
+                "{\"inputs\":2,\"outputs\":3,\"gates\":2,\"table\":[0,0,0,0]}".to_owned(),
+                "$.gates",
+                3,
+            ),
+            (
+                format!(
+                    "{{\"inputs\":12,\"outputs\":1,\"gates\":4085,\"table\":[{}]}}",
+                    rows_of(12)
+                ),
+                "$.gates",
+                4084,
+            ),
+        ] {
+            refused_with(name, &arguments, field, limit);
+        }
+    }
+    refused_with(
+        "grit_check",
+        &format!(
+            "{{\"inputs\":12,\"outputs\":1,\"gates\":4084,\"table\":[{}],\"chip\":[]}}",
+            rows_of(12)
+        ),
+        "$.chip",
+        4084,
+    );
+    for (chip, field, limit) in [
+        (
+            "[{\"kind\":16,\"left\":0,\"right\":1}]",
+            "$.chip[0].kind",
+            15,
+        ),
+        ("[{\"kind\":6,\"left\":2,\"right\":1}]", "$.chip[0].left", 1),
+        (
+            "[{\"kind\":6,\"left\":0,\"right\":4095}]",
+            "$.chip[0].right",
+            4094,
+        ),
+        (
+            "[{\"kind\":6,\"left\":0,\"right\":4094}]",
+            "$.chip[0].right",
+            1,
+        ),
+        (
+            "[{\"kind\":6,\"left\":0,\"right\":1},{\"kind\":6,\"left\":0,\"right\":1}]",
+            "$.chip",
+            1,
+        ),
+    ] {
+        refused_with(
+            "grit_check",
+            &format!(
+                "{{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,1,1,0],\"chip\":{chip}}}"
+            ),
+            field,
+            limit,
+        );
+    }
+    let machine = |shape: &str, rest: &str| format!("{{{shape},{PASS}{rest}}}");
+    for (shape, rest, field, limit) in [
+        (
+            "\"state\":32,\"inputs\":1,\"outputs\":1,\"gates\":1",
+            "",
+            "$.state",
+            31,
+        ),
+        (
+            "\"state\":0,\"inputs\":0,\"outputs\":1,\"gates\":1",
+            "",
+            "$.inputs",
+            1,
+        ),
+        (
+            "\"state\":0,\"inputs\":32,\"outputs\":1,\"gates\":1",
+            "",
+            "$.inputs",
+            31,
+        ),
+        (
+            "\"state\":30,\"inputs\":2,\"outputs\":1,\"gates\":40",
+            "",
+            "$.inputs",
+            1,
+        ),
+        (
+            "\"state\":0,\"inputs\":1,\"outputs\":0,\"gates\":1",
+            "",
+            "$.outputs",
+            1,
+        ),
+        (
+            "\"state\":1,\"inputs\":1,\"outputs\":32,\"gates\":40",
+            "",
+            "$.outputs",
+            31,
+        ),
+        (
+            "\"state\":2,\"inputs\":1,\"outputs\":1,\"gates\":2",
+            "",
+            "$.gates",
+            3,
+        ),
+        (
+            "\"state\":2,\"inputs\":1,\"outputs\":1,\"gates\":4094",
+            "",
+            "$.gates",
+            4093,
+        ),
+        (
+            "\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1",
+            ",\"steps\":0",
+            "$.steps",
+            1,
+        ),
+        (
+            "\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1",
+            ",\"steps\":65537",
+            "$.steps",
+            65536,
+        ),
+        (
+            "\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1",
+            ",\"chip\":[{\"kind\":10,\"left\":1,\"right\":0}]",
+            "$.chip[0].left",
+            0,
+        ),
+        (
+            "\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1",
+            ",\"chip\":[]",
+            "$.chip",
+            1,
+        ),
+    ] {
+        refused_with("grit_machine", &machine(shape, rest), field, limit);
+    }
+    let long: Vec<String> = (0..4000).map(|one| (one % 2).to_string()).collect();
+    let long = long.join(",");
+    refused_with(
+        "grit_machine",
+        &format!(
+            "{{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":4000,\"traces\":[{{\"feed\":[{long}],\"want\":[{long}]}}]}}"
+        ),
+        "$.steps",
+        262,
+    );
+}
+
+#[test]
+fn a_shape_at_the_edge_of_its_range_is_taken() {
+    let checked = told(
+        "grit_check",
+        "{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,1,1,0],\"chip\":[{\"kind\":6,\"left\":0,\"right\":1}]}",
+    );
+    assert_eq!(
+        checked.get("solved"),
+        Some(&Json::Bool(true)),
+        "{}",
+        written(&checked)
+    );
+    let wide = told(
+        "grit_check",
+        "{\"inputs\":1,\"outputs\":32,\"gates\":32,\"table\":[0,4294967295],\"chip\":[{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0},{\"kind\":10,\"left\":0,\"right\":0}]}",
+    );
+    assert_eq!(
+        (wide.get("solved"), wide.counted("of")),
+        (Some(&Json::Bool(true)), Some(64)),
+        "{}",
+        written(&wide)
+    );
+    let marked = told(
+        "grit_machine",
+        &format!(
+            "{{\"state\":0,\"inputs\":1,\"outputs\":1,\"gates\":1,{PASS},\"chip\":[{{\"kind\":10,\"left\":0,\"right\":0}}]}}"
+        ),
+    );
+    assert_eq!(
+        (marked.get("solved"), marked.counted("of")),
+        (Some(&Json::Bool(true)), Some(2)),
+        "{}",
+        written(&marked)
+    );
+    let counter = told(
+        "grit_machine",
+        "{\"state\":1,\"inputs\":0,\"outputs\":1,\"gates\":2,\"traces\":[{\"feed\":[0,0,0,0],\"want\":[1,0,1,0]}],\"chip\":[{\"kind\":5,\"left\":0,\"right\":0},{\"kind\":5,\"left\":0,\"right\":0}]}",
+    );
+    assert_eq!(
+        counter.get("code"),
+        None,
+        "a machine with state and no inputs is a shape the tool publishes: {}",
+        written(&counter)
+    );
+}
