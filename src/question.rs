@@ -133,8 +133,13 @@ pub enum Refused {
         asked: usize,
         held: usize,
     },
-    Planes {
+    AimSize {
+        cells: u128,
         given: usize,
+    },
+    Unaimed {
+        region: Region,
+        aimed: Option<Region>,
     },
     Width {
         subgroup: u32,
@@ -153,7 +158,8 @@ impl Refused {
             Self::NoTarget => "no_target",
             Self::TargetShort { .. } => "target_short",
             Self::Unasked { .. } => "unasked",
-            Self::Planes { .. } => "planes",
+            Self::AimSize { .. } => "aim_size",
+            Self::Unaimed { .. } => "unaimed",
             Self::Width { .. } => "width",
             Self::Flat => "flat",
         }
@@ -187,9 +193,13 @@ impl std::fmt::Display for Refused {
                 out,
                 "question {asked} was never built; {held} questions are"
             ),
-            Self::Planes { given } => write!(
+            Self::AimSize { cells, given } => write!(
                 out,
-                "a world of {given} planes is asked, and questions read {PLANES}"
+                "the box holds {cells} cells and {given} target words were given"
+            ),
+            Self::Unaimed { region, aimed } => write!(
+                out,
+                "a difference over {region:?} needs a target uploaded for that box; the target holds {aimed:?}"
             ),
             Self::Width { subgroup } => write!(
                 out,
@@ -381,6 +391,7 @@ pub struct Questions {
     target: usize,
     counting: bool,
     built: Vec<Built>,
+    aimed: Option<Region>,
 }
 
 pub const ASK: usize = 0;
@@ -408,6 +419,7 @@ impl Questions {
             target,
             counting: false,
             built: Vec::new(),
+            aimed: None,
         })
     }
 
@@ -483,19 +495,46 @@ impl Questions {
         self.built.get(asked.0).map(|one| one.reduce)
     }
 
-    pub fn aim(&self, held: &mut Resident<'_>, words: &[u32]) -> Result<(), Failure> {
+    pub fn aim(
+        &mut self,
+        held: &mut Resident<'_>,
+        region: Region,
+        words: &[u32],
+    ) -> Result<(), Failure> {
         if self.target == 0 {
             return Err(Refused::NoTarget.into());
         }
-        if words.len() > self.target {
+        let cells = self.placed(region)?;
+        if cells > self.target as u128 {
             return Err(Refused::TargetShort {
-                cells: words.len() as u128,
+                cells,
                 held: self.target,
             }
             .into());
         }
+        if words.len() as u128 != cells {
+            return Err(Refused::AimSize {
+                cells,
+                given: words.len(),
+            }
+            .into());
+        }
+        self.aimed = None;
         held.write((self.first as usize) + TARGET, words)?;
+        self.aimed = Some(region);
         Ok(())
+    }
+
+    fn placed(&self, region: Region) -> Result<u128, Refused> {
+        let size = self.layout.size();
+        let Region { from, to } = region;
+        if to.iter().zip(size).any(|(&high, side)| high > side) {
+            return Err(Refused::Outside { from, to, size });
+        }
+        if from.iter().zip(to).any(|(&low, high)| high <= low) {
+            return Err(Refused::Empty { from, to });
+        }
+        Ok(region.cells())
     }
 
     pub fn check(&self, asked: Asked, region: Region) -> Result<Reduce, Refused> {
@@ -503,29 +542,24 @@ impl Questions {
             asked: asked.0,
             held: self.built.len(),
         })?;
-        let size = self.layout.size();
-        let Region { from, to } = region;
-        if from.iter().zip(to).any(|(&low, high)| high <= low) {
-            if to.iter().zip(size).any(|(&high, side)| high > side) {
-                return Err(Refused::Outside { from, to, size });
-            }
-            return Err(Refused::Empty { from, to });
-        }
-        if to.iter().zip(size).any(|(&high, side)| high > side) {
-            return Err(Refused::Outside { from, to, size });
-        }
-        let cells = region.cells();
+        let cells = self.placed(region)?;
         let (most, what) = reduce.most_cells(region);
         if cells > most {
             return Err(Refused::TooLarge { cells, most, what });
         }
-        if let Reduce::Differ(_) = reduce
-            && cells > self.target as u128
-        {
-            return Err(Refused::TargetShort {
-                cells,
-                held: self.target,
-            });
+        if let Reduce::Differ(_) = reduce {
+            if cells > self.target as u128 {
+                return Err(Refused::TargetShort {
+                    cells,
+                    held: self.target,
+                });
+            }
+            if self.aimed != Some(region) {
+                return Err(Refused::Unaimed {
+                    region,
+                    aimed: self.aimed,
+                });
+            }
         }
         Ok(reduce)
     }

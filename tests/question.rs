@@ -275,8 +275,8 @@ impl World<'_> {
         answer
     }
 
-    fn aim(&mut self, words: &[u32]) {
-        self.questions.aim(&mut self.live, words).unwrap();
+    fn aim(&mut self, region: Region, words: &[u32]) {
+        self.questions.aim(&mut self.live, region, words).unwrap();
     }
 }
 
@@ -417,8 +417,8 @@ fn answered_alike(host: &Host, size: [u32; 3], cells: &[u32]) {
         assert_eq!(now, sparse.cells(), "the two tiers stepped apart");
         for (number, region) in regions(size).into_iter().enumerate() {
             let target = aimed(size, region, number as u64 + u64::from(frames));
-            dense.aim(&target);
-            sparse.aim(&target);
+            dense.aim(region, &target);
+            sparse.aim(region, &target);
             for (which, &(probe, reduce)) in asks.iter().enumerate() {
                 let world = Cells { size, cells: &now };
                 let wanted = cpu::answer(&probe, reduce, world, region, &target);
@@ -517,7 +517,15 @@ fn a_sum_past_four_billion_is_exact() {
     let whole = cells.len();
     for sparse in [false, true] {
         let mut world = opened(&host, size, &cells, &asks, Made::of(sparse, whole));
-        world.aim(&vec![0; whole]);
+        world.aim(Region::whole(size), &vec![0; whole]);
+        let small = Region::new([0, 0, 0], [2, 2, 2]);
+        let refused = world
+            .questions
+            .aim(&mut world.live, small, &[0; 7])
+            .unwrap_err();
+        assert_eq!(refused.refused().map(Refused::name), Some("aim_size"));
+        let refused = world.ask(3, small).unwrap_err();
+        assert_eq!(refused.refused().map(Refused::name), Some("unaimed"));
         let region = Region::whole(size);
         let many = whole as u64;
         let wanted = (many - 1) * u64::from(u32::MAX) + 7;
@@ -624,7 +632,7 @@ fn the_answer_does_not_depend_on_how_the_work_is_spread() {
         let mut world = opened(&host, size, &cells, &asks, Made::of(sparse, whole));
         world.step(5);
         let region = Region::new([1, 1, 1], [size[0] - 1, size[1], size[2] - 2]);
-        world.aim(&aimed(size, region, 9));
+        world.aim(region, &aimed(size, region, 9));
         for (which, ask) in asks.iter().enumerate() {
             let mut seen = Vec::new();
             for most in [1, 2, 7, 64, 65535] {
@@ -651,7 +659,7 @@ fn a_question_leaves_the_world_stepping_as_before() {
     for sparse in [false, true] {
         let mut asking = opened(&host, size, &cells, &asks, Made::of(sparse, whole));
         let mut quiet = opened(&host, size, &cells, &asks, Made::of(sparse, whole));
-        asking.aim(&vec![1; whole]);
+        asking.aim(Region::whole(size), &vec![1; whole]);
         for round in 0..4 {
             for which in 0..asks.len() {
                 asking.ask(which, Region::whole(size)).unwrap();
@@ -735,10 +743,9 @@ fn a_box_that_leaves_the_world_is_empty_or_too_large_is_refused_by_name() {
         refusal(&questions, differ, Region::new([0, 0, 0], [11, 10, 1])),
         "target_short"
     );
-    assert!(
-        questions
-            .check(differ, Region::new([0, 0, 0], [10, 10, 1]))
-            .is_ok()
+    assert_eq!(
+        refusal(&questions, differ, Region::new([0, 0, 0], [10, 10, 1])),
+        "unaimed"
     );
     let mut more = questions.clone();
     more.add(&Probe::Word, Reduce::Max).unwrap();
@@ -846,8 +853,8 @@ fn a_world_split_over_windows_answers_as_one_binding_does() {
         );
         for (number, region) in regions(size).into_iter().enumerate() {
             let target = aimed(size, region, number as u64);
-            plain.aim(&target);
-            split.aim(&target);
+            plain.aim(region, &target);
+            split.aim(region, &target);
             for (which, &(probe, reduce)) in asks.iter().enumerate() {
                 let world = Cells { size, cells: &now };
                 let wanted = cpu::answer(&probe, reduce, world, region, &target);
