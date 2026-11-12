@@ -566,6 +566,27 @@ fn given(held: &Json, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Er
     Ok(gates)
 }
 
+fn fields(named: &[(&str, &str)]) -> Json {
+    map(vec![
+        ("type", text("object")),
+        (
+            "properties",
+            map(named
+                .iter()
+                .map(|(name, kind)| (*name, map(vec![("type", text(kind))])))
+                .collect()),
+        ),
+    ])
+}
+
+fn gate() -> Json {
+    fields(&[
+        ("kind", "integer"),
+        ("left", "integer"),
+        ("right", "integer"),
+    ])
+}
+
 pub(crate) fn tools() -> Json {
     let table = map(vec![
         ("type", text("array")),
@@ -599,6 +620,7 @@ pub(crate) fn tools() -> Json {
                 "description",
                 text("the gates to check, each an object of kind, left and right"),
             ),
+            ("items", gate()),
         ]),
     ));
     let held = |what: Vec<(&str, Json)>| {
@@ -687,6 +709,7 @@ pub(crate) fn tools() -> Json {
                         "the gates of a machine to mark, each an object of kind, left and right; give this and nothing is searched, the machine is only run on the traces and marked, which is how a machine found on one set of runs is tried on runs it has never seen",
                     ),
                 ),
+                ("items", gate()),
             ]),
         ),
     ];
@@ -843,7 +866,7 @@ pub(crate) fn tools() -> Json {
                                             "the cells to set before the walk, each an object of at and is; everything else takes fill",
                                         ),
                                     ),
-                                    ("items", map(vec![("type", text("object"))])),
+                                    ("items", fields(&[("at", "integer"), ("is", "integer")])),
                                 ]),
                             ),
                             (
@@ -993,7 +1016,7 @@ pub(crate) fn tools() -> Json {
                                         "description",
                                         text("the grid to start from, each an object of at and is"),
                                     ),
-                                    ("items", map(vec![("type", text("object"))])),
+                                    ("items", fields(&[("at", "integer"), ("is", "integer")])),
                                 ]),
                             ),
                             (
@@ -1006,7 +1029,7 @@ pub(crate) fn tools() -> Json {
                                             "the grid to land on, each an object of at and is; this is what the rounds walk towards",
                                         ),
                                     ),
-                                    ("items", map(vec![("type", text("object"))])),
+                                    ("items", fields(&[("at", "integer"), ("is", "integer")])),
                                 ]),
                             ),
                         ]),
@@ -1079,7 +1102,7 @@ pub(crate) fn tools() -> Json {
                                             "what to place before the first frame, each an object of at and is, where is names one of air, water, sand, wall",
                                         ),
                                     ),
-                                    ("items", map(vec![("type", text("object"))])),
+                                    ("items", fields(&[("at", "integer"), ("is", "string")])),
                                 ]),
                             ),
                             (
@@ -1091,6 +1114,15 @@ pub(crate) fn tools() -> Json {
                                         text(
                                             "a spout that pours: at names the cell it pours from, is what it pours, span how wide, frames how long it keeps pouring before it shuts off",
                                         ),
+                                    ),
+                                    (
+                                        "properties",
+                                        map(vec![
+                                            ("at", map(vec![("type", text("integer"))])),
+                                            ("is", map(vec![("type", text("string"))])),
+                                            ("span", map(vec![("type", text("integer"))])),
+                                            ("frames", map(vec![("type", text("integer"))])),
+                                        ]),
                                     ),
                                 ]),
                             ),
@@ -1129,38 +1161,6 @@ pub(crate) fn tools() -> Json {
             ),
             ("inputSchema", held(checking)),
         ]),
-    ])
-}
-
-pub(crate) fn said(what: &str, wrong: bool) -> Json {
-    map(vec![
-        (
-            "content",
-            Json::List(vec![map(vec![
-                ("type", text("text")),
-                ("text", text(what)),
-            ])]),
-        ),
-        ("isError", Json::Bool(wrong)),
-    ])
-}
-
-pub(crate) fn answered(id: Json, result: Json) -> Json {
-    map(vec![
-        ("jsonrpc", text("2.0")),
-        ("id", id),
-        ("result", result),
-    ])
-}
-
-pub(crate) fn refused(id: Json, code: i64, what: &str) -> Json {
-    map(vec![
-        ("jsonrpc", text("2.0")),
-        ("id", id),
-        (
-            "error",
-            map(vec![("code", Json::Int(code)), ("message", text(what))]),
-        ),
     ])
 }
 
@@ -1786,7 +1786,11 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
     ]))
 }
 
-fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+pub(crate) fn ran(
+    host: Option<&Host>,
+    name: &str,
+    held: &Json,
+) -> Result<Json, Box<dyn std::error::Error>> {
     if name == "grit_slope" {
         let Some(host) = host else {
             return Err(Box::new(crate::host::Error::NoComputeDevice));
@@ -1966,80 +1970,12 @@ fn ran(host: Option<&Host>, name: &str, held: &Json) -> Result<Json, Box<dyn std
     }
 }
 
-pub(crate) fn delivered(id: Json, result: Json) -> Json {
-    answered(
-        id,
-        map(vec![
-            (
-                "content",
-                Json::List(vec![map(vec![
-                    ("type", text("text")),
-                    ("text", text(&crate::wire::written(&result))),
-                ])]),
-            ),
-            ("isError", Json::Bool(false)),
-            ("structuredContent", result),
-        ]),
-    )
-}
-
 #[must_use]
 pub fn handle(host: Option<&Host>, request: &Json) -> Option<Json> {
-    let way = request.get("method").and_then(Json::text).unwrap_or("");
-    let id = request.get("id").cloned()?;
-    match way {
-        "initialize" => Some(answered(
-            id,
-            map(vec![
-                ("protocolVersion", text("2024-11-05")),
-                ("capabilities", map(vec![("tools", map(vec![]))])),
-                (
-                    "serverInfo",
-                    map(vec![("name", text("grit")), ("version", text("0.0.0"))]),
-                ),
-            ]),
-        )),
-        "tools/list" => Some(answered(id, map(vec![("tools", tools())]))),
-        "tools/call" => {
-            let held = request.get("params");
-            let name = held
-                .and_then(|one| one.get("name"))
-                .and_then(Json::text)
-                .unwrap_or("");
-            let arguments = held
-                .and_then(|one| one.get("arguments"))
-                .cloned()
-                .unwrap_or(Json::Map(Vec::new()));
-            match ran(host, name, &arguments) {
-                Ok(result) => Some(delivered(id, result)),
-                Err(why) => Some(answered(id, said(&why.to_string(), true))),
-            }
-        }
-        other => Some(refused(id, -32601, other)),
-    }
+    crate::serve3::transport::handle(&mut crate::serve3::Flat { host }, request)
 }
 
 #[must_use]
 pub fn heard(host: Option<&Host>, line: &str) -> Option<Json> {
-    let request = match crate::wire::read(line) {
-        Ok(request) => request,
-        Err(why) => {
-            return Some(refused(
-                Json::Null,
-                -32700,
-                &format!("the line is not JSON this server reads: {why}"),
-            ));
-        }
-    };
-    let answered =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(host, &request)));
-    answered.unwrap_or_else(|_| {
-        request.get("id").cloned().map(|id| {
-            refused(
-                id,
-                -32603,
-                "the server hit a fault while answering this request and has no answer for it",
-            )
-        })
-    })
+    crate::serve3::transport::heard(&mut crate::serve3::Flat { host }, line)
 }
