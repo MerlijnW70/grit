@@ -720,13 +720,31 @@ impl<'host> World<'host> {
                         }
                         continue;
                     }
-                    for (plane, pool) in pools.iter_mut().enumerate() {
+                    let mut planes_words = Vec::with_capacity(planes);
+                    for plane in 0..planes {
                         let from = plane * bricks.plane_words() + slot as usize * per;
-                        let words =
-                            raw.get(from..from + per)
-                                .ok_or_else(|| Refused::Malformed {
-                                    what: format!("held slot {slot} lies past the pool read back"),
-                                })?;
+                        planes_words.push(raw.get(from..from + per).ok_or_else(|| {
+                            Refused::Malformed {
+                                what: format!("held slot {slot} lies past the pool read back"),
+                            }
+                        })?);
+                    }
+                    let uniform: Option<Vec<u32>> = planes_words
+                        .iter()
+                        .map(|words| {
+                            let first = words.first().copied().unwrap_or_default();
+                            words.iter().all(|&word| word == first).then_some(first)
+                        })
+                        .collect();
+                    if let Some(uniform) = uniform {
+                        canonical.extend([UNIFORM, uniform.first().copied().unwrap_or_default()]);
+                        for (plane_values, &value) in values.iter_mut().zip(uniform.iter().skip(1))
+                        {
+                            plane_values.push(value);
+                        }
+                        continue;
+                    }
+                    for (pool, words) in pools.iter_mut().zip(planes_words) {
                         pool.extend_from_slice(words);
                     }
                     for plane_values in &mut values {

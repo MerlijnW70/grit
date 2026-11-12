@@ -954,11 +954,29 @@ fn sparse_state(
     if pool.len() as u64 != pooled {
         return Err(sized("pool", pooled, pool.len() as u64));
     }
+    if let Some(slot) = uniform_held(&pool, per, held) {
+        return Err(malformed(format!(
+            "held slot {slot} is uniform in every plane, where a uniform brick is canonical"
+        )));
+    }
     Ok(State::Sparse {
         capacity: header.capacity,
         sides: header.sides,
         table,
         pool,
+    })
+}
+
+fn uniform_held(pool: &[u32], per: u64, held: u32) -> Option<u32> {
+    let per = usize::try_from(per).ok()?.max(1);
+    let held_slots = held as usize;
+    let bricks: Vec<&[u32]> = pool.chunks(per).collect();
+    (0..held).find(|&slot| {
+        bricks
+            .iter()
+            .skip(slot as usize)
+            .step_by(held_slots.max(1))
+            .all(|brick| brick.iter().all(|&word| Some(&word) == brick.first()))
     })
 }
 

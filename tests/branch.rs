@@ -1046,6 +1046,13 @@ fn past_64_bits(file: &[u8]) {
     assert!(why.to_string().contains("64 bits"), "{why}");
 }
 
+fn refusal_of(image: &Image) -> &'static str {
+    match decoded(&format::encoded(image)) {
+        Ok(_) => "accepted",
+        Err(why) => why.name(),
+    }
+}
+
 #[test]
 fn a_sparse_header_whose_cells_pass_64_bits_is_refused_by_name() {
     let big = 1_u32 << 31;
@@ -1162,6 +1169,124 @@ fn stale_temporary_files_never_block_a_save() {
         assert_eq!(format::fetch(&path).unwrap(), image);
     }
     assert_eq!(leftovers(&folder).len(), stale as usize + 1);
+    let _ = fs::remove_dir_all(&folder);
+}
+
+#[test]
+fn a_held_brick_uniform_in_every_plane_is_refused_by_name() {
+    let mut table = vec![0, 0];
+    table.extend([format::UNIFORM, 0].repeat(7));
+    let held = heat_image(
+        [4, 4, 4],
+        State::Sparse {
+            capacity: 1,
+            sides: [2, 2, 2],
+            table: table.clone(),
+            pool: vec![0; 8],
+        },
+    );
+    let why = decoded(&format::encoded(&held)).unwrap_err();
+    assert_eq!(why.name(), "malformed");
+    assert!(why.to_string().contains("uniform"), "{why}");
+    let canonical = format::bricked(&held.unpacked(), [4, 4, 4], [2, 2, 2], Some(1));
+    assert_eq!(
+        canonical,
+        State::Sparse {
+            capacity: 1,
+            sides: [2, 2, 2],
+            table: [format::UNIFORM, 0].repeat(8),
+            pool: Vec::new(),
+        }
+    );
+    let mut mixed = vec![0; 8];
+    mixed[7] = 1;
+    let accepted = heat_image(
+        [4, 4, 4],
+        State::Sparse {
+            capacity: 1,
+            sides: [2, 2, 2],
+            table,
+            pool: mixed,
+        },
+    );
+    assert_eq!(decoded(&format::encoded(&accepted)), Ok(accepted));
+
+    let mut table = vec![0, 0];
+    table.extend([format::UNIFORM, 0].repeat(7));
+    table.extend([0; 8]);
+    let both = |plane_one: Vec<u32>| {
+        let mut pool = vec![3; 8];
+        pool.extend(plane_one);
+        two_plane_image(
+            [4, 4, 4],
+            State::Sparse {
+                capacity: 1,
+                sides: [2, 2, 2],
+                table: table.clone(),
+                pool,
+            },
+        )
+    };
+    assert_eq!(refusal_of(&both(vec![4; 8])), "malformed");
+    let mut varied = vec![4; 8];
+    varied[2] = 6;
+    let image = both(varied);
+    assert_eq!(decoded(&format::encoded(&image)), Ok(image));
+}
+
+#[test]
+fn a_held_brick_gone_uniform_saves_as_uniform_and_steps_on_as_the_world() {
+    let Some(host) = device("branch uniform held") else {
+        return;
+    };
+    let folder = folder("gone-uniform");
+    let path = folder.join("w.world");
+    let params = params_of("heat", 3);
+    let mut world = World::create(&host, &made("heat", &params, true)).unwrap();
+    let hot: Vec<([u32; 3], u32)> = (0..8)
+        .map(|at| ([at, 1, 2], heat::cell(heat::FIRE, 900)))
+        .collect();
+    world.write(&hot).unwrap();
+    let held = world.pool_use().unwrap().unwrap().held;
+    assert!(held > 0);
+    let cold: Vec<([u32; 3], u32)> = hot.iter().map(|&(at, _)| (at, 0)).collect();
+    world.write(&cold).unwrap();
+    assert_eq!(world.pool_use().unwrap().unwrap().held, held);
+    let image = world.image().unwrap();
+    let State::Sparse { table, pool, .. } = &image.state else {
+        panic!("a sparse world saved as dense");
+    };
+    assert!(
+        table
+            .chunks(2)
+            .take(table.len() / 2)
+            .all(|entry| entry[0] == format::UNIFORM)
+    );
+    assert!(pool.is_empty());
+    let beside: Vec<([u32; 3], u32)> = (0..6)
+        .map(|at| ([31 - at, 1, 2], heat::cell(heat::FIRE, 1100)))
+        .collect();
+    world.write(&beside).unwrap();
+    let image = world.image().unwrap();
+    let State::Sparse { table, .. } = &image.state else {
+        panic!("a sparse world saved as dense");
+    };
+    let mixed = table
+        .chunks(2)
+        .take(table.len() / 2)
+        .filter(|entry| entry[0] != format::UNIFORM)
+        .count();
+    assert!(mixed >= 1 && (mixed as u32) < held + 1, "{mixed} of {held}");
+    world.save(&path).unwrap();
+    let mut loaded = World::load(&host, &path).unwrap();
+    assert_eq!(hashed(&mut loaded), hashed(&mut world));
+    let start = hashed(&mut world);
+    for _ in 0..6 {
+        world.step(5).unwrap();
+        loaded.step(5).unwrap();
+        assert_eq!(hashed(&mut loaded), hashed(&mut world));
+    }
+    assert_ne!(hashed(&mut world), start);
     let _ = fs::remove_dir_all(&folder);
 }
 
