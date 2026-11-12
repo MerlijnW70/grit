@@ -11,6 +11,7 @@ use crate::netlist::{Chip, Exam, Gate, Netlist, drawn};
 use crate::resident::Groups;
 use crate::rule::{KNOB, Kind, POINT};
 use crate::sand::{AIR, Grid, SAND, WALL, WATER, material_of};
+use crate::serve3::errors::{Code, Refusal, shown, shown_value};
 use crate::sweep;
 use crate::wire::{Json, counted, map, text};
 
@@ -476,37 +477,55 @@ fn told(found: &Found, sought: bool) -> Json {
     map(held)
 }
 
-fn number(held: &Json, key: &str, or: u32) -> Result<u32, Box<dyn std::error::Error>> {
+fn malformed(field: String, what: String) -> Box<dyn std::error::Error> {
+    Box::new(Refusal::new(Code::Malformed, &field, what))
+}
+
+fn number_at(
+    held: &Json,
+    place: &str,
+    key: &str,
+    or: u32,
+) -> Result<u32, Box<dyn std::error::Error>> {
     let Some(one) = held.get(key) else {
         return Ok(or);
     };
     one.int()
         .and_then(|one| u32::try_from(one).ok())
         .ok_or_else(|| {
-            format!(
-                "{key} is {}, which is not a whole number from 0 to {}",
-                crate::wire::written(one),
-                u32::MAX
+            malformed(
+                format!("{place}.{key}"),
+                format!(
+                    "{key} is {}, which is not a whole number from 0 to {}",
+                    shown_value(one),
+                    u32::MAX
+                ),
             )
-            .into()
         })
 }
 
-fn needed(held: &Json, key: &str) -> Result<u32, Box<dyn std::error::Error>> {
-    if held.get(key).is_none() {
-        return Err(format!("{key} is missing from {}", crate::wire::written(held)).into());
-    }
-    number(held, key, 0)
+fn number(held: &Json, key: &str, or: u32) -> Result<u32, Box<dyn std::error::Error>> {
+    number_at(held, "$", key, or)
 }
 
-fn numbers(held: &Json, key: &str) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+fn needed(held: &Json, place: &str, key: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    if held.get(key).is_none() {
+        return Err(malformed(
+            format!("{place}.{key}"),
+            format!("{key} is missing from {}", shown_value(held)),
+        ));
+    }
+    number_at(held, place, key, 0)
+}
+
+fn numbers(held: &Json, place: &str, key: &str) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     let Some(one) = held.get(key) else {
         return Ok(Vec::new());
     };
     let list = one.list().ok_or_else(|| {
-        format!(
-            "{key} is {}, which is not a list",
-            crate::wire::written(one)
+        malformed(
+            format!("{place}.{key}"),
+            format!("{key} is {}, which is not a list", shown_value(one)),
         )
     })?;
     list.iter()
@@ -515,12 +534,14 @@ fn numbers(held: &Json, key: &str) -> Result<Vec<u32>, Box<dyn std::error::Error
             one.int()
                 .and_then(|one| u32::try_from(one).ok())
                 .ok_or_else(|| {
-                    format!(
-                        "{key} entry {at} is {}, which is not a whole number from 0 to {}",
-                        crate::wire::written(one),
-                        u32::MAX
+                    malformed(
+                        format!("{place}.{key}[{at}]"),
+                        format!(
+                            "{key} entry {at} is {}, which is not a whole number from 0 to {}",
+                            shown_value(one),
+                            u32::MAX
+                        ),
                     )
-                    .into()
                 })
         })
         .collect()
@@ -531,7 +552,7 @@ fn asked(held: &Json) -> Result<(Netlist, Exam), Box<dyn std::error::Error>> {
     let outputs = number(held, "outputs", 1)?;
     let gates = number(held, "gates", 8)?;
     let shape = Netlist::over(inputs, outputs, gates, 16)?;
-    let table = numbers(held, "table")?;
+    let table = numbers(held, "$", "table")?;
     Ok((shape, Exam::of(shape, table)?))
 }
 
@@ -540,17 +561,18 @@ fn given(held: &Json, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Er
     let chip = match held.get("chip") {
         None => &[][..],
         Some(one) => one.list().ok_or_else(|| {
-            format!(
-                "chip is {}, which is not a list of gates",
-                crate::wire::written(one)
+            malformed(
+                "$.chip".to_owned(),
+                format!("chip is {}, which is not a list of gates", shown_value(one)),
             )
         })?,
     };
     for (at, one) in chip.iter().enumerate() {
+        let place = format!("$.chip[{at}]");
         let gate = Gate {
-            kind: needed(one, "kind")?,
-            left: needed(one, "left")?,
-            right: needed(one, "right")?,
+            kind: needed(one, &place, "kind")?,
+            left: needed(one, &place, "left")?,
+            right: needed(one, &place, "right")?,
         };
         shape
             .checked(u32::try_from(at)?, gate)
@@ -1168,15 +1190,22 @@ fn asked_machine(held: &Json) -> Result<(Machine, Runs), Box<dyn std::error::Err
     let given = match held.get("traces") {
         None => &[][..],
         Some(one) => one.list().ok_or_else(|| {
-            format!(
-                "traces is {}, which is not a list of runs",
-                crate::wire::written(one)
+            malformed(
+                "$.traces".to_owned(),
+                format!(
+                    "traces is {}, which is not a list of runs",
+                    shown_value(one)
+                ),
             )
         })?,
     };
     let traces: Runs = given
         .iter()
-        .map(|one| Ok((numbers(one, "feed")?, numbers(one, "want")?)))
+        .enumerate()
+        .map(|(at, one)| {
+            let place = format!("$.traces[{at}]");
+            Ok((numbers(one, &place, "feed")?, numbers(one, &place, "want")?))
+        })
         .collect::<Result<_, Box<dyn std::error::Error>>>()?;
     let longest = traces
         .iter()
@@ -1302,8 +1331,16 @@ fn slid(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
     let deep = held.counted("deep").unwrap_or(32).clamp(2, 256);
     let grid = Grid::of(wide, deep);
     let named = held.get("kind").and_then(Json::text).unwrap_or("living");
-    let kind = kind_named(named)
-        .ok_or_else(|| format!("kind {named} is not one of {}", KINDS_NAMED.join(", ")))?;
+    let kind = kind_named(named).ok_or_else(|| {
+        malformed(
+            "$.kind".to_owned(),
+            format!(
+                "kind {} is not one of {}",
+                shown(named),
+                KINDS_NAMED.join(", ")
+            ),
+        )
+    })?;
     let turning = held.counted("turning").unwrap_or(KNOB);
     let swing = held.counted("swing").unwrap_or(0);
     let depth = held.counted("depth").unwrap_or(16).clamp(1, 1 << 12);
@@ -1433,8 +1470,16 @@ fn settled(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>>
     let deep = held.counted("deep").unwrap_or(32).clamp(2, 256);
     let grid = Grid::of(wide, deep);
     let named = held.get("kind").and_then(Json::text).unwrap_or("living");
-    let kind = kind_named(named)
-        .ok_or_else(|| format!("kind {named} is not one of {}", KINDS_NAMED.join(", ")))?;
+    let kind = kind_named(named).ok_or_else(|| {
+        malformed(
+            "$.kind".to_owned(),
+            format!(
+                "kind {} is not one of {}",
+                shown(named),
+                KINDS_NAMED.join(", ")
+            ),
+        )
+    })?;
     let depth = held.counted("depth").unwrap_or(16).clamp(1, 1 << 12);
     let rounds = held.counted("rounds").unwrap_or(8).clamp(1, 1 << 10);
     let step = held.counted("step").unwrap_or(1).clamp(1, 1 << 16);
@@ -1626,11 +1671,21 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
     }
 
     let mut cells = walled(grid, walls);
-    for one in held.get("cells").and_then(Json::list).unwrap_or(&[]) {
+    for (place, one) in held
+        .get("cells")
+        .and_then(Json::list)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
         let at = one.counted("at").ok_or("a cell needs an at")? as usize;
         let named = one.get("is").and_then(Json::text).unwrap_or("sand");
-        let stuff = stuff_named(named)
-            .ok_or_else(|| format!("{named} is not one of {}", STUFF_NAMED.join(", ")))?;
+        let stuff = stuff_named(named).ok_or_else(|| {
+            malformed(
+                format!("$.cells[{place}].is"),
+                format!("{} is not one of {}", shown(named), STUFF_NAMED.join(", ")),
+            )
+        })?;
         let slot = cells
             .get_mut(at)
             .ok_or_else(|| format!("at {at} is outside the {} cells", grid.cells()))?;
@@ -1656,8 +1711,12 @@ fn poured(host: &Host, held: &Json) -> Result<Json, Box<dyn std::error::Error>> 
         .and_then(|one| one.get("is"))
         .and_then(Json::text)
         .unwrap_or("sand");
-    let stuff = stuff_named(named)
-        .ok_or_else(|| format!("{named} is not one of {}", STUFF_NAMED.join(", ")))?;
+    let stuff = stuff_named(named).ok_or_else(|| {
+        malformed(
+            "$.brush.is".to_owned(),
+            format!("{} is not one of {}", shown(named), STUFF_NAMED.join(", ")),
+        )
+    })?;
 
     // A step never crosses the frame the spout shuts at, so the pour stops on
     // that frame and not at the end of the batch it falls in.

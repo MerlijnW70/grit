@@ -62,6 +62,52 @@ pub const TOOLS: &[Tool] = &[
     },
 ];
 
+#[cfg(feature = "faults")]
+pub mod faults {
+    use std::cell::Cell;
+
+    use super::{Code, Failed, Refusal};
+
+    thread_local! {
+        static BATCH: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    pub fn fail_batch(nth: u32) {
+        BATCH.set(Some(nth));
+    }
+
+    pub fn disarm() {
+        BATCH.set(None);
+    }
+
+    pub(super) fn batch() -> Result<(), Failed> {
+        match BATCH.get() {
+            Some(0) => {
+                BATCH.set(None);
+                Err(Box::new(Refusal::new(
+                    Code::Device,
+                    "$",
+                    "an armed fault failed this batch of frames before it was submitted".to_owned(),
+                )))
+            }
+            Some(nth) => {
+                BATCH.set(Some(nth - 1));
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(not(feature = "faults"))]
+mod faults {
+    use super::Failed;
+
+    pub(super) const fn batch() -> Result<(), Failed> {
+        Ok(())
+    }
+}
+
 fn refused(code: Code, field: &str, message: String) -> Failed {
     Box::new(Refusal::new(code, field, message))
 }
@@ -527,10 +573,23 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let mut done = 0_u32;
     while done < frames {
         let step = BATCH.min(frames - done);
-        world.live.staged_frames(&groups, step)?;
+        if let Err(why) = faults::batch().and_then(|()| {
+            world
+                .live
+                .staged_frames(&groups, step)
+                .map(|_| ())
+                .map_err(Into::into)
+        }) {
+            let mut refusal = errors::refusal_of(why.as_ref());
+            refusal.message = format!(
+                "{}; {done} of the {frames} frames ran before it, and the world is at frame {}",
+                refusal.message, world.frame
+            );
+            return Err(Box::new(refusal));
+        }
         done += step;
+        world.frame = world.frame.wrapping_add(step);
     }
-    world.frame = world.frame.wrapping_add(frames);
     let tally = world.live.read(TALLY as usize, world.rule.tally_words())?;
     let listed = world.listed()?;
     world.reported(vec![

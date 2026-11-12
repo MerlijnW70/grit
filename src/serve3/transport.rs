@@ -128,6 +128,27 @@ fn parse_failed(message: String) -> Json {
     failed(Json::Null, &Refusal::new(Code::Parse, "$", message))
 }
 
+fn torn(line: &str, why: crate::wire::Torn) -> String {
+    if let crate::wire::Torn::Stray { at, saw: 'u' } = why
+        && let Some(escape) = line.get(at..at + 6)
+        && escape.starts_with("\\u")
+        && u32::from_str_radix(escape.get(2..).unwrap_or(""), 16)
+            .is_ok_and(|unit| (0xD800..=0xDFFF).contains(&unit))
+    {
+        return format!(
+            "the line is not JSON this server reads: {escape} at byte {at} is half of a UTF-16 surrogate pair with no other half, which is no character"
+        );
+    }
+    format!("the line is not JSON this server reads: {why}")
+}
+
+#[must_use]
+pub fn not_utf8(bytes: usize, at: usize) -> Json {
+    parse_failed(format!(
+        "the line of {bytes} bytes is not UTF-8 from byte {at}"
+    ))
+}
+
 pub fn heard(served: &mut dyn Served, line: &str) -> Option<Json> {
     if line.len() > LINE_MOST {
         return Some(too_long(line.len()));
@@ -137,11 +158,7 @@ pub fn heard(served: &mut dyn Served, line: &str) -> Option<Json> {
     }
     let request = match crate::wire::read(line) {
         Ok(request) => request,
-        Err(why) => {
-            return Some(parse_failed(format!(
-                "the line is not JSON this server reads: {why}"
-            )));
-        }
+        Err(why) => return Some(parse_failed(torn(line, why))),
     };
     handle(served, &request)
 }

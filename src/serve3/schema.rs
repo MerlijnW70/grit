@@ -243,11 +243,9 @@ fn walk(schema: &Json, value: &Json, path: &str, check: Check) -> Result<Json, F
             };
             let shut = schema.get("additionalProperties") == Some(&Json::Bool(false));
             if whole {
-                for (at, (key, _)) in held.iter().enumerate() {
-                    if held
-                        .get(..at)
-                        .is_some_and(|before| before.iter().any(|(other, _)| other == key))
-                    {
+                let mut seen = std::collections::HashSet::with_capacity(held.len());
+                for (key, _) in held {
+                    if !seen.insert(key.as_str()) {
                         let here = keyed(path, key);
                         return Err(found(
                             Wrong::Duplicate,

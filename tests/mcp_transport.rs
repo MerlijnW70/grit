@@ -1020,6 +1020,14 @@ fn every_published_schema_and_its_validator_agree_on_a_thousand_argument_sets() 
     }
     while let Some(schema) = walk.pop() {
         let Json::Map(held) = &schema else { continue };
+        if schema.get("type").and_then(Json::text) == Some("object") {
+            assert_eq!(
+                schema.get("additionalProperties"),
+                Some(&Json::Bool(false)),
+                "an object schema that takes any key: {}",
+                written(&schema)
+            );
+        }
         for (key, one) in held {
             assert!(
                 known.contains(&key.as_str()),
@@ -1078,7 +1086,11 @@ fn every_published_schema_and_its_validator_agree_on_a_thousand_argument_sets() 
             if wrong.is_empty() {
                 passed_sets += 1;
                 let schema_codes: &[&str] = if flat {
-                    &["unknown_key", "duplicate_key", "malformed"]
+                    if field == Some("$") {
+                        &["unknown_key", "duplicate_key", "malformed"]
+                    } else {
+                        &["unknown_key", "duplicate_key"]
+                    }
                 } else {
                     &[
                         "unknown_key",
@@ -1429,4 +1441,213 @@ fn a_sparse_world_past_four_billion_cells_opens_and_keeps_a_far_cell() {
         "{}",
         told.code
     );
+}
+
+#[test]
+fn a_surrogate_pair_is_one_character_and_half_of_one_is_refused_by_name() {
+    let mut server = Server::new(None);
+    let got = server
+        .heard(r#"{"jsonrpc":"2.0","id":"\ud83d\ude00","method":"ping"}"#)
+        .unwrap();
+    assert_eq!(got.get("id"), Some(&Json::Text("\u{1F600}".to_owned())));
+    assert_eq!(
+        read(r#""a\ud834\udd1eb""#).unwrap(),
+        Json::Text("a\u{1D11E}b".to_owned())
+    );
+    for (line, escape) in [
+        (
+            r#"{"jsonrpc":"2.0","id":"\ud800","method":"ping"}"#,
+            r"\ud800",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":"\udc00","method":"ping"}"#,
+            r"\udc00",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":"\uD83D\u0041","method":"ping"}"#,
+            r"\uD83D",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":"\ud83dx","method":"ping"}"#,
+            r"\ud83d",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grit_world_rules","arguments":{"\udfff":1}}}"#,
+            r"\udfff",
+        ),
+    ] {
+        let got = server.heard(line).unwrap();
+        let (code, named, id) = failed(&got);
+        assert_eq!(
+            (code, named.as_str(), id),
+            (-32700, "parse", Json::Null),
+            "{line}"
+        );
+        let message = got
+            .get("error")
+            .and_then(|one| one.get("message"))
+            .and_then(Json::text)
+            .unwrap();
+        assert!(
+            message.contains(escape) && message.contains("surrogate"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn a_2d_refusal_shows_a_long_value_cut_short_and_names_its_field() {
+    let mut server = Server::new(None);
+    let long = "x".repeat(600_000);
+    for (tool, arguments, field) in [
+        (
+            "grit_check",
+            format!("{{\"inputs\":\"{long}\"}}"),
+            "$.inputs",
+        ),
+        (
+            "grit_check",
+            format!("{{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,0,0,\"{long}\"]}}"),
+            "$.table[3]",
+        ),
+        (
+            "grit_check",
+            format!(
+                "{{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,0,0,1],\"chip\":[{{\"kind\":\"{long}\",\"left\":0,\"right\":1}}]}}"
+            ),
+            "$.chip[0].kind",
+        ),
+        (
+            "grit_check",
+            format!(
+                "{{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,0,0,1],\"chip\":\"{long}\"}}"
+            ),
+            "$.chip",
+        ),
+        (
+            "grit_machine",
+            format!(
+                "{{\"state\":1,\"inputs\":1,\"outputs\":1,\"gates\":2,\"traces\":[{{\"feed\":[1],\"want\":[1]}},{{\"feed\":[0,\"{long}\"],\"want\":[0]}}]}}"
+            ),
+            "$.traces[1].feed[1]",
+        ),
+        (
+            "grit_machine",
+            format!("{{\"traces\":\"{long}\"}}"),
+            "$.traces",
+        ),
+    ] {
+        let got = call(&mut server, tool, &arguments);
+        let size = written(&got).len();
+        assert!(size < 4096, "{tool} {field}: {size} bytes");
+        let told = refused(&got);
+        assert_eq!(
+            (told.code.as_str(), told.field.as_str()),
+            ("malformed", field),
+            "{}",
+            told.message
+        );
+        assert!(told.message.contains("600002 bytes"), "{}", told.message);
+    }
+}
+
+#[test]
+fn a_2d_refusal_of_a_long_name_needs_a_device_only_after_its_name() {
+    let Some(host) = device("long 2d names") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let long = "y".repeat(600_000);
+    for (tool, arguments, field) in [
+        ("grit_slope", format!("{{\"kind\":\"{long}\"}}"), "$.kind"),
+        (
+            "grit_settle",
+            format!("{{\"kind\":\"{long}\",\"want\":[]}}"),
+            "$.kind",
+        ),
+        (
+            "grit_pour",
+            format!("{{\"cells\":[{{\"at\":1}},{{\"at\":2,\"is\":\"{long}\"}}]}}"),
+            "$.cells[1].is",
+        ),
+        (
+            "grit_pour",
+            format!("{{\"brush\":{{\"at\":3,\"is\":\"{long}\"}}}}"),
+            "$.brush.is",
+        ),
+    ] {
+        let got = call(&mut server, tool, &arguments);
+        let size = written(&got).len();
+        assert!(size < 4096, "{tool} {field}: {size} bytes");
+        let told = refused(&got);
+        assert_eq!(
+            (told.code.as_str(), told.field.as_str()),
+            ("malformed", field),
+            "{}",
+            told.message
+        );
+    }
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_step_that_fails_part_way_reports_the_frame_its_state_is_on() {
+    use grit::sand3::Grid3;
+    let Some(host) = device("step fails part way") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = answer(&call(
+        &mut server,
+        "grit_world_create",
+        "{\"wide\":8,\"deep\":8,\"tall\":8,\"rule\":\"sand\"}",
+    ))
+    .counted("world")
+    .unwrap();
+    let grid = Grid3::new(8, 8, 8).unwrap();
+    let mut start = vec![0_u32; grid.cells()];
+    let mut cells = Vec::new();
+    for at in 0..40_u32 {
+        let (x, y, z) = (at % 8, (at / 8) % 3, (at * 3) % 8);
+        let word = [grit::sand::SAND, grit::sand::WATER, grit::sand::WALL][(at % 3) as usize];
+        start[grid.index(x, y, z)] = word;
+        cells.push(format!("[{x},{y},{z},{word}]"));
+    }
+    answer(&call(
+        &mut server,
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":[{}]}}", cells.join(",")),
+    ));
+    grit::serve3::tools::faults::fail_batch(1);
+    let told = refused(&call(
+        &mut server,
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":130}}"),
+    ));
+    grit::serve3::tools::faults::disarm();
+    assert_eq!(told.code, "device");
+    assert!(told.message.contains("frame 64"), "{}", told.message);
+    let got = answer(&call(
+        &mut server,
+        "grit_world_read",
+        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[7,7,7]}}"),
+    ));
+    assert_eq!(got.counted("frame"), Some(64));
+    let rules = grit::serve3::rules_on(Some(&host));
+    let sand = rules.iter().find(|one| one.name() == "sand").unwrap();
+    let want = (0..64).fold(start, |held, frame| sand.reference(grid, frame, &held, &[]));
+    let words: Vec<u32> = got
+        .get("cells")
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .map(|one| one.int().unwrap() as u32)
+        .collect();
+    assert_eq!(words, want);
+    let next = answer(&call(
+        &mut server,
+        "grit_world_step",
+        &format!("{{\"world\":{world}}}"),
+    ));
+    assert_eq!(next.counted("frame"), Some(65));
 }

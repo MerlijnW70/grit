@@ -111,6 +111,24 @@ impl Reading<'_> {
     }
 }
 
+fn unit(reading: &mut Reading<'_>) -> Result<u32, Torn> {
+    let mut code = 0_u32;
+    for _ in 0..4 {
+        let Some(digit) = reading.peek() else {
+            return Err(Torn::Ended { at: reading.at });
+        };
+        let Some(value) = char::from(digit).to_digit(16) else {
+            return Err(Torn::Stray {
+                at: reading.at,
+                saw: char::from(digit),
+            });
+        };
+        reading.at += 1;
+        code = code * 16 + value;
+    }
+    Ok(code)
+}
+
 fn stringed(reading: &mut Reading<'_>) -> Result<String, Torn> {
     reading.take(b'"')?;
     let mut held = String::new();
@@ -136,21 +154,29 @@ fn stringed(reading: &mut Reading<'_>) -> Result<String, Torn> {
                     b'b' => held.push('\u{8}'),
                     b'f' => held.push('\u{c}'),
                     b'u' => {
-                        let mut code = 0_u32;
-                        for _ in 0..4 {
-                            let Some(digit) = reading.peek() else {
-                                return Err(Torn::Ended { at: reading.at });
-                            };
-                            let Some(value) = char::from(digit).to_digit(16) else {
-                                return Err(Torn::Stray {
-                                    at: reading.at,
-                                    saw: char::from(digit),
-                                });
-                            };
-                            reading.at += 1;
-                            code = code * 16 + value;
-                        }
-                        held.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                        let escape = reading.at - 2;
+                        let lone = Torn::Stray {
+                            at: escape,
+                            saw: 'u',
+                        };
+                        let code = unit(reading)?;
+                        let code = match code {
+                            0xD800..=0xDBFF => {
+                                if reading.held.get(reading.at..reading.at + 2) != Some(&b"\\u"[..])
+                                {
+                                    return Err(lone);
+                                }
+                                reading.at += 2;
+                                let low = unit(reading)?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(lone);
+                                }
+                                0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                            }
+                            0xDC00..=0xDFFF => return Err(lone),
+                            _ => code,
+                        };
+                        held.push(char::from_u32(code).ok_or(lone)?);
                     }
                     saw => {
                         return Err(Torn::Stray {

@@ -396,10 +396,10 @@ fn mutated(rng: &mut Rng, mut line: String) -> String {
                 } else {
                     rng.below(20_000) as usize
                 };
-                let fill = if rng.chance(2) {
-                    format!("\"{}\"", "x".repeat(long))
-                } else {
-                    format!("[{}0]", "0,".repeat(long / 2))
+                let fill = match rng.below(3) {
+                    0 => format!("\"{}\"", "x".repeat(long)),
+                    1 => format!("[{}0]", "0,".repeat(long / 2)),
+                    _ => wide(long / 8),
                 };
                 match line.find("\"arguments\":{") {
                     Some(at) => {
@@ -431,6 +431,19 @@ fn mutated(rng: &mut Rng, mut line: String) -> String {
         }
     }
     line
+}
+
+fn key_of(at: usize) -> String {
+    (0..4)
+        .map(|place| char::from(b'a' + ((at / 26_usize.pow(place)) % 26) as u8))
+        .collect()
+}
+
+fn wide(keys: usize) -> String {
+    let held: Vec<String> = (0..keys.min(26_usize.pow(4)))
+        .map(|at| format!("\"{}\":0", key_of(at)))
+        .collect();
+    format!("{{{}}}", held.join(","))
 }
 
 fn garbage(rng: &mut Rng) -> String {
@@ -794,9 +807,14 @@ fn a_line_past_the_cap_is_refused_and_the_next_line_answers() {
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}"
     );
     assert_eq!(
-        written(&answers[2]),
-        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}"
+        answers[2]
+            .get("error")
+            .and_then(|one| one.get("message"))
+            .and_then(Json::text),
+        Some("the line of 49 bytes is not UTF-8 from byte 45"),
+        "{shown:?}"
     );
+    assert_eq!(answers[2].get("id"), Some(&Json::Null), "{shown:?}");
 }
 
 #[test]
@@ -1101,5 +1119,147 @@ fn the_device_fuzz_keeps_every_world_equal_to_its_replay() {
     assert!(
         compared >= 1 && changed > lines / 10,
         "{compared} {changed}"
+    );
+}
+
+fn widest(tool: &str, budget: usize) -> String {
+    let head = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{tool}\",\"arguments\":"
+    );
+    let mut keys = (budget - head.len() - 4) / 9;
+    loop {
+        let line = format!("{head}{}}}}}", wide(keys));
+        if line.len() <= budget {
+            return line;
+        }
+        keys -= 1;
+    }
+}
+
+fn long_list(tool: &str, key: &str, budget: usize) -> String {
+    let head = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{tool}\",\"arguments\":{{\"world\":1,\"inputs\":2,\"{key}\":["
+    );
+    let many = (budget - head.len() - 8) / 2;
+    format!("{head}{}0]}}}}}}", "0,".repeat(many - 1))
+}
+
+type Shape = Box<dyn Fn(usize) -> String>;
+
+fn quickest(server: &mut Server<'_>, line: &str) -> f64 {
+    (0..3)
+        .map(|_| {
+            let started = Instant::now();
+            let got = server.heard(line).unwrap();
+            assert!(written(&got).len() <= ANSWER_MOST);
+            started.elapsed().as_secs_f64()
+        })
+        .fold(f64::MAX, f64::min)
+}
+
+#[test]
+fn the_widest_object_and_longest_list_a_line_holds_cost_linear_work() {
+    let mut server = Server::new(None);
+    let shapes: Vec<(&str, Shape)> = vec![
+        (
+            "wide world arguments",
+            Box::new(|budget| widest("grit_world_step", budget)),
+        ),
+        (
+            "wide rules arguments",
+            Box::new(|budget| widest("grit_world_rules", budget)),
+        ),
+        (
+            "wide 2D arguments",
+            Box::new(|budget| widest("grit_check", budget)),
+        ),
+        (
+            "wide unknown tool",
+            Box::new(|budget| widest("grit_nothing", budget)),
+        ),
+        (
+            "long world params",
+            Box::new(|budget| long_list("grit_world_create", "params", budget)),
+        ),
+        (
+            "long world cells",
+            Box::new(|budget| long_list("grit_world_write", "cells", budget)),
+        ),
+        (
+            "long 2D table",
+            Box::new(|budget| long_list("grit_check", "table", budget)),
+        ),
+    ];
+    for (name, shape) in &shapes {
+        let full = shape(LINE_MOST);
+        let sixteenth = shape(LINE_MOST / 16);
+        assert!(
+            full.len() <= LINE_MOST && full.len() > LINE_MOST - 64,
+            "{name}"
+        );
+        let big = quickest(&mut server, &full);
+        let small = quickest(&mut server, &sixteenth);
+        println!(
+            "{name}: {} bytes in {:.4} s, {} bytes in {:.4} s, ratio {:.2}",
+            full.len(),
+            big,
+            sixteenth.len(),
+            small,
+            big / small.max(1e-6)
+        );
+        assert!(big < 2.0, "{name}: {big} s for one line");
+    }
+}
+
+#[test]
+fn a_line_that_is_not_utf8_is_refused_with_the_bytes_that_came() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_grit-mcp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut bytes = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"pad\":\"".to_vec();
+    bytes.extend(std::iter::repeat_n(0xff_u8, 400_000));
+    bytes.extend_from_slice(b"\"}");
+    let sent = bytes.len();
+    let first = bytes.iter().position(|one| *one == 0xff).unwrap();
+    let third: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\",\"x\":\"\xc3\"}\n";
+    let cut = third.iter().position(|one| *one == 0xc3).unwrap();
+    let feeding = std::thread::spawn(move || {
+        input.write_all(&bytes).unwrap();
+        input
+            .write_all(b"\n{\"jsonrpc\":\"2.0\",\"id\":\"caf\xc3\xa9\",\"method\":\"ping\"}\n")
+            .unwrap();
+        input.write_all(third).unwrap();
+    });
+    let answers: Vec<Json> = BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map(|one| read(&one.unwrap()).unwrap())
+        .collect();
+    feeding.join().unwrap();
+    assert!(child.wait().unwrap().success());
+    let shown: Vec<String> = answers.iter().map(|one| short(&written(one))).collect();
+    assert_eq!(answers.len(), 3, "{shown:?}");
+    for (at, from, bytes) in [(0, first, sent), (2, cut, third.len() - 1)] {
+        let error = answers[at].get("error").unwrap();
+        assert_eq!(
+            error.get("code").and_then(Json::int),
+            Some(-32700),
+            "{shown:?}"
+        );
+        let message = error.get("message").and_then(Json::text).unwrap();
+        assert_eq!(
+            message,
+            format!("the line of {bytes} bytes is not UTF-8 from byte {from}"),
+            "{shown:?}"
+        );
+        assert_eq!(answers[at].get("id"), Some(&Json::Null));
+    }
+    assert_eq!(
+        answers[1].get("id"),
+        Some(&Json::Text("caf\u{e9}".to_owned())),
+        "{shown:?}"
     );
 }
