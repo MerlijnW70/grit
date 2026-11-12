@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use super::expand::Places;
 use super::{Code, Refusal, limits};
 use crate::rule3::Tally;
 use crate::wire::{self, Json, Torn};
@@ -684,7 +685,7 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
         named: by_name,
         step: field(top, "step"),
     };
-    checked(&program)?;
+    checked(&program, json)?;
     Ok(program)
 }
 
@@ -693,7 +694,8 @@ struct Checking<'c, 'p> {
     globals: HashSet<&'p str>,
     locals: Vec<&'p str>,
     bound: HashMap<&'p str, usize>,
-    calls: Vec<(usize, String)>,
+    calls: Vec<(usize, usize)>,
+    site: usize,
 }
 
 fn arity(name: &str) -> Option<(usize, Option<usize>)> {
@@ -762,7 +764,10 @@ impl<'p> Checking<'_, 'p> {
                     ))
                 }
             }
-            Json::List(items) => self.operation(items, path),
+            Json::List(items) => {
+                self.site = std::ptr::from_ref(json).addr();
+                self.operation(items, path)
+            }
             other => Err(refused(
                 Code::Shape,
                 path,
@@ -803,7 +808,7 @@ impl<'p> Checking<'_, 'p> {
             None => match self.program.named.get(op.as_str()) {
                 Some(&index) => {
                     let wanted = self.program.defs.get(index).map_or(0, |def| def.args.len());
-                    self.calls.push((index, path.shown()));
+                    self.calls.push((index, self.site));
                     (wanted, Some(wanted))
                 }
                 None => {
@@ -896,7 +901,7 @@ impl<'p> Checking<'_, 'p> {
     }
 }
 
-fn checked(program: &Program<'_>) -> Result<(), Refusal> {
+fn checked(program: &Program<'_>, json: &Json) -> Result<(), Refusal> {
     let root = Path::root();
     let mut globals: HashSet<&str> = INPUTS.iter().copied().collect();
     globals.extend(program.consts.iter().map(|(name, _)| *name));
@@ -906,6 +911,7 @@ fn checked(program: &Program<'_>) -> Result<(), Refusal> {
         locals: Vec::new(),
         bound: HashMap::new(),
         calls: Vec::new(),
+        site: 0,
     };
     let defs_path = root.key("defs");
     let mut calls = Vec::with_capacity(program.defs.len());
@@ -921,10 +927,14 @@ fn checked(program: &Program<'_>) -> Result<(), Refusal> {
     }
     checking.unbind(0);
     checking.expression(program.step, &root.key("step"))?;
-    unlooped(program, &calls)
+    unlooped(program, &calls, json)
 }
 
-fn unlooped(program: &Program<'_>, calls: &[Vec<(usize, String)>]) -> Result<(), Refusal> {
+fn unlooped(
+    program: &Program<'_>,
+    calls: &[Vec<(usize, usize)>],
+    json: &Json,
+) -> Result<(), Refusal> {
     let mut state = vec![0_u8; calls.len()];
     for start in 0..calls.len() {
         if state.get(start).copied() != Some(0) {
@@ -955,7 +965,9 @@ fn unlooped(program: &Program<'_>, calls: &[Vec<(usize, String)>]) -> Result<(),
                                 .collect();
                             return Err(Refusal {
                                 code: Code::Recursion,
-                                path: site.clone(),
+                                path: Places::of(json, &[*site])
+                                    .path(0)
+                                    .unwrap_or_else(|| String::from("$.defs")),
                                 expected: String::from("defs that do not call themselves"),
                                 found: clipped(&cycle.join(" -> ")),
                                 limit: None,
