@@ -10,7 +10,7 @@ use simdr::lanes::LaneError;
 use crate::bricks::{self, Bricks, Content, ENTRY, Packed, UNIFORM};
 use crate::compact::{Plan, TooBig};
 use crate::host::{self, Host};
-use crate::layout::{Dimension, PARAMS, TALLY, Windows};
+use crate::layout::{Dimension, PARAMS, Windows};
 use crate::live;
 use crate::resident::{Groups, Resident};
 use crate::rule3::FIRST_PARAM;
@@ -644,8 +644,8 @@ impl<'host> World<'host> {
         Ok(())
     }
 
-    pub fn tally(&mut self) -> Result<Vec<u32>, Failed> {
-        Ok(self.live.read(TALLY as usize, self.rule.tally_words())?)
+    pub fn tally(&mut self) -> Result<Vec<u128>, Failed> {
+        Ok(live::read_tally(&mut self.live, self.rule.tally_words())?)
     }
 
     pub fn cells(&mut self) -> Result<Vec<u32>, Failed> {

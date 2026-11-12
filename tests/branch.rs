@@ -1018,6 +1018,8 @@ fn a_pool_that_does_not_fit_the_device_is_refused_by_name() {
 
 const TWO_PLANES_FIXTURE: &[u8] = include_bytes!("branch/two-planes.world");
 
+const HEAVY: &str = "{\"law\":1,\"name\":\"heavy\",\"params\":0,\"channels\":1,\"halo\":0,\"tally\":{\"counts\":1,\"weighted\":true},\"consts\":{},\"defs\":{},\"step\":[\"vec\",\"cells\",[\"vec\",4294967295]]}";
+
 fn heat_image(size: [u32; 3], state: State) -> Image {
     Image {
         law: Law::Rule {
@@ -1288,6 +1290,38 @@ fn a_held_brick_gone_uniform_saves_as_uniform_and_steps_on_as_the_world() {
     }
     assert_ne!(hashed(&mut world), start);
     let _ = fs::remove_dir_all(&folder);
+}
+
+#[test]
+fn a_world_tally_past_four_billion_is_exact() {
+    use grit::layout::COARSE;
+
+    let Some(host) = device("branch tally") else {
+        return;
+    };
+    let law = grit::law::Law::compile(HEAVY).unwrap();
+    let most = u128::from(u32::MAX);
+    let octs = u128::from(SIZE[0] / 2) * u128::from(SIZE[1] / 2) * u128::from(SIZE[2] / 2);
+    let mut want = vec![octs * most];
+    for side in SIZE.map(|side| side / 2) {
+        let others = octs / u128::from(side);
+        let along: u128 = (0..side).map(|at| u128::from(at >> COARSE)).sum();
+        want.push(along * others * most);
+    }
+    want.push(octs);
+    assert!(want[0] > u128::from(u32::MAX));
+    for sparse in [false, true] {
+        let made = Made {
+            rule: "heavy",
+            params: &[],
+            size: SIZE,
+            sparse,
+            slots: None,
+        };
+        let mut world = World::create_law(&host, &law, &made).unwrap();
+        world.step(1).unwrap();
+        assert_eq!(world.tally().unwrap(), want, "sparse {sparse}");
+    }
 }
 
 #[test]
