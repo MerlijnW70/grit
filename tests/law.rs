@@ -395,7 +395,7 @@ fn the_canonical_form_and_hash_of_the_shipped_laws_are_pinned() {
     assert_eq!(sand.hex(), SAND_HASH);
     assert_eq!(heat.hex(), HEAT_HASH);
     assert_eq!(
-        law::hex(&law::sha256(sand.canonical().as_bytes())),
+        law::hex(&grit::branch::sha256(sand.canonical().as_bytes())),
         SAND_HASH
     );
     assert!(!sand.canonical().contains(' '));
@@ -411,31 +411,6 @@ fn the_canonical_form_and_hash_of_the_shipped_laws_are_pinned() {
     assert_ne!(spaced, SAND);
     assert_eq!(compiled(&spaced).hex(), SAND_HASH);
     assert_eq!(compiled(&spaced).canonical(), sand.canonical());
-}
-
-#[test]
-fn sha256_gives_the_published_digests() {
-    let digests = [
-        (
-            String::new(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        ),
-        (
-            String::from("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        ),
-        (
-            String::from("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
-        ),
-        (
-            "a".repeat(1_000_000),
-            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
-        ),
-    ];
-    for (text, digest) in digests {
-        assert_eq!(law::hex(&law::sha256(text.as_bytes())), digest);
-    }
 }
 
 fn traced_equals<R: OneStep>(name: &str, rule: &R, params: &[u32], masks: &[u32]) {
