@@ -22,6 +22,8 @@ const JOURNAL_LEAST: usize = 64 << 10;
 
 const REPLAY_LEAST: Duration = Duration::from_secs(2);
 
+const SNAPSHOT_BYTES_PER_SECOND: f64 = 2.5e8;
+
 const DEVICES: [&str; 4] = ["con", "prn", "aux", "nul"];
 
 const NUMBERED: [&str; 2] = ["com", "lpt"];
@@ -167,7 +169,7 @@ impl Ledger {
         let bytes = usize::try_from(world_bytes)
             .unwrap_or(usize::MAX)
             .max(JOURNAL_LEAST);
-        self.bytes > bytes || self.replay > REPLAY_LEAST.max(self.snapping.saturating_mul(2))
+        self.bytes > bytes || self.replay > REPLAY_LEAST.max(self.snapping.saturating_mul(4))
     }
 
     pub fn rebase(&mut self, snap: Arc<Snap>, cost: Duration) {
@@ -179,6 +181,15 @@ impl Ledger {
     #[must_use]
     pub const fn journal_bytes(&self) -> usize {
         self.bytes
+    }
+
+    #[must_use]
+    pub fn snapping(&self, world_bytes: u64) -> Duration {
+        if self.snapping.is_zero() {
+            Duration::from_secs_f64(world_bytes as f64 / SNAPSHOT_BYTES_PER_SECOND)
+        } else {
+            self.snapping
+        }
     }
 }
 

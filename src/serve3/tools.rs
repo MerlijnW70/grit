@@ -7,7 +7,7 @@ use crate::host::Host;
 use crate::wire::{Json, counted, map, text};
 
 use super::budget::{
-    self, BATCH_MOST, BUDGET_MOST_MS, BUDGET_MS, Pace, SUBMIT_MOST_MS, Stop, bytes_of,
+    self, BATCH_MOST, BUDGET_MOST_MS, BUDGET_MS, Pace, SUBMIT_MOST_MS, Stop, world_cost,
 };
 use super::errors::{self, Code, Refusal};
 use super::journal::{self, Entry, Ledger, Made};
@@ -429,7 +429,7 @@ pub(super) fn admitted(
     what: &str,
 ) -> Result<u64, Failed> {
     host.limits().admits(sizes, None)?;
-    let bytes = bytes_of(sizes);
+    let bytes = world_cost(sizes);
     server.book.memory.admits(bytes, what)?;
     host.limits()
         .admits_on(sizes, None, host.heap())
@@ -981,6 +981,8 @@ pub fn describe(status: &Status) -> Json {
                 ("submission_ms", number(SUBMIT_MOST_MS)),
                 ("batch_frames", number(BATCH_MOST)),
                 ("name_bytes", number(journal::NAME_MOST)),
+                ("world_least_bytes", number(budget::WORLD_LEAST)),
+                ("queue_calls", number(super::exec::QUEUE_MOST)),
                 (
                     "memory_share",
                     text(&format!(

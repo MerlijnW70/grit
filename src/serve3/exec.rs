@@ -14,6 +14,8 @@ use super::{Book, Options, Server, Status};
 
 pub const QUEUE_MOST: usize = 256;
 
+pub const RESTORED_SHOWN: usize = 256;
+
 pub type Opener = Box<dyn FnMut() -> Result<Option<Host>, host::Error> + Send>;
 
 struct Job {
@@ -134,8 +136,15 @@ fn patched(answer: Json, restored: &[Json]) -> Json {
                     .map(|(_, held)| held.clone())
                     .unwrap_or_else(|| map(vec![]));
                 if let Json::Map(fields) = &mut told {
-                    fields.retain(|(name, _)| name != "restored");
-                    fields.push(("restored".to_owned(), Json::List(restored.to_vec())));
+                    fields.retain(|(name, _)| name != "restored" && name != "restored_total");
+                    fields.push((
+                        "restored".to_owned(),
+                        Json::List(restored.iter().take(RESTORED_SHOWN).cloned().collect()),
+                    ));
+                    fields.push((
+                        "restored_total".to_owned(),
+                        Json::Int(i64::try_from(restored.len()).unwrap_or(i64::MAX)),
+                    ));
                 }
                 let said = if failed {
                     format!(
@@ -210,8 +219,9 @@ fn work(
                 break;
             }
             retried = false;
-            server.arriving(job.arrived, Some(Arc::clone(&job.cancel)));
+            server.arriving(Some(job.arrived), Some(Arc::clone(&job.cancel)));
             let answer = server.handle(&job.request).unwrap_or(Json::Null);
+            server.arriving(None, None);
             shared.publish(&server);
             if server.lost() {
                 waiting = Some(Waiting::Answered(job, answer));
