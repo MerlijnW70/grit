@@ -335,10 +335,25 @@ fn sizes_the_device_cannot_hold_are_refused_with_the_engines_errors() {
     let blocks = wide.blocks().div_ceil(grit::sweep::cells(host.width()));
     let planned =
         grit::compact::Plan::over_in(host.width(), blocks, grit::layout::Dimension::Three);
-    let past_one_binding = if planned.is_ok() {
-        "too_large"
-    } else {
-        "too_big"
+    let past_one_binding = match planned {
+        Err(_) => "too_big",
+        Ok(plan) => {
+            let sand = rules()
+                .into_iter()
+                .find(|one| one.name() == "sand")
+                .unwrap();
+            let sizes = plan.windows().laid(&sand.sizes(&plan));
+            if host.limits().admits(&sizes, None).is_err() {
+                "too_large"
+            } else {
+                let bytes: u64 = sizes.iter().map(|words| *words as u64 * 4).sum();
+                assert!(
+                    bytes > grit::serve3::budget::Memory::share_of(host.heap()),
+                    "a dense 2048 by 1024 by 1024 world of {bytes} bytes fits this device"
+                );
+                "memory"
+            }
+        }
     };
     for (size, named) in [
         ("65536,65536,65536", "unfit"),
