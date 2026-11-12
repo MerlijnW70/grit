@@ -1762,3 +1762,25 @@ fn sizes_of_gives_the_bindings_a_created_world_has() {
     let why = grit::branch::sizes_of(&host, &unknown).unwrap_err();
     assert_eq!(refused(why.as_ref()), "unknown_rule");
 }
+
+#[test]
+fn temporary_names_held_by_folders_never_block_a_save() {
+    let folder = folder("stale-folders");
+    let path = folder.join("w.world");
+    let probe = format::temporary(&path);
+    let name = probe.file_name().unwrap().to_string_lossy().into_owned();
+    let parts: Vec<&str> = name.split('.').collect();
+    let pid = parts[parts.len() - 3];
+    let count: u64 = parts[parts.len() - 2].parse().unwrap();
+    let stale = 16;
+    for at in count + 1..=count + stale {
+        fs::create_dir_all(folder.join(format!(".w.world.{pid}.{at}.tmp"))).unwrap();
+    }
+    let image = decoded(DENSE_FIXTURE).unwrap();
+    for _ in 0..3 {
+        format::store(&path, &image).unwrap();
+        assert_eq!(format::fetch(&path).unwrap(), image);
+    }
+    assert_eq!(leftovers(&folder).len(), stale as usize + 1);
+    let _ = fs::remove_dir_all(&folder);
+}

@@ -1070,6 +1070,13 @@ fn fresh(path: &Path) -> io::Result<(PathBuf, File)> {
         }
     }
     Err(last)
+            Err(why)
+                if why.kind() == io::ErrorKind::PermissionDenied
+                    && !fs::symlink_metadata(&temporary)
+                        .is_err_and(|held| held.kind() == io::ErrorKind::NotFound) =>
+            {
+                last = why;
+            }
 }
 
 pub fn store(path: &Path, image: &Image) -> Result<u64, Refused> {
