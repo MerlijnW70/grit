@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::branch::format::{UNIFORM, brick_cells, lattice_of, place};
-use crate::branch::{State, World};
+use crate::branch::World;
 use crate::host::Host;
 use crate::wire::{Json, counted, map, text};
 
@@ -702,7 +701,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     let snapshot = server.settle(number);
     let live = server.world(held)?;
-    let tally: Vec<u128> = live.world.tally()?.into_iter().map(u128::from).collect();
+    let tally = live.world.exact_tally()?;
     let listed = live.world.listed()?;
     let mut answer = vec![
         ("world", counted(number)),
@@ -746,41 +745,7 @@ pub fn exactly(value: u128) -> Json {
 }
 
 pub(super) fn cells_at(world: &mut World<'_>, points: &[[u32; 3]]) -> Result<Vec<u32>, Failed> {
-    let image = world.image()?;
-    let size = image.size;
-    match &image.state {
-        State::Dense(cells) => points
-            .iter()
-            .map(|at| {
-                let index = (u64::from(at[2]) * u64::from(size[1]) + u64::from(at[1]))
-                    * u64::from(size[0])
-                    + u64::from(at[0]);
-                usize::try_from(index)
-                    .ok()
-                    .and_then(|index| cells.get(index).copied())
-                    .ok_or_else(|| "the world read back short".into())
-            })
-            .collect(),
-        State::Sparse {
-            sides, table, pool, ..
-        } => {
-            let lattice = lattice_of(size, *sides);
-            let per = brick_cells(*sides);
-            Ok(points
-                .iter()
-                .map(|&at| {
-                    let (brick, offset) = place(at, *sides, lattice);
-                    let slot = table.get(brick * 2).copied().unwrap_or(UNIFORM);
-                    let value = table.get(brick * 2 + 1).copied().unwrap_or(0);
-                    if slot == UNIFORM {
-                        value
-                    } else {
-                        pool.get(slot as usize * per + offset).copied().unwrap_or(0)
-                    }
-                })
-                .collect())
-        }
-    }
+    world.cells_at(points)
 }
 
 fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
