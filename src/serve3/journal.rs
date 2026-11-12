@@ -24,6 +24,10 @@ const JOURNAL_LEAST: usize = 64 << 10;
 
 const REPLAY_LEAST: Duration = Duration::from_secs(2);
 
+pub const HARD: u32 = 2;
+
+pub const WRITE_CHUNK: usize = 32;
+
 const SNAPSHOT_BYTES_PER_SECOND: f64 = 2.5e8;
 
 const DEVICES: [&str; 4] = ["con", "prn", "aux", "nul"];
@@ -98,7 +102,8 @@ pub enum Entry {
 }
 
 impl Entry {
-    fn bytes(&self) -> usize {
+    #[must_use]
+    pub fn bytes(&self) -> usize {
         match self {
             Self::Write(cells) => 16 * cells.len() + 8,
             Self::Step(_) => 8,
@@ -112,6 +117,7 @@ pub struct Ledger {
     pub entries: Vec<Entry>,
     pub frame: u32,
     recorded: Vec<Duration>,
+    pub unreadable: Option<String>,
     bytes: usize,
     replay: Duration,
     snapping: Duration,
@@ -125,6 +131,7 @@ impl Ledger {
             entries: Vec::new(),
             frame: 0,
             recorded: Vec::new(),
+            unreadable: None,
             bytes: 0,
             replay: Duration::ZERO,
             snapping: Duration::ZERO,
@@ -138,6 +145,7 @@ impl Ledger {
             base: Base::Snapshot(snap),
             entries: Vec::new(),
             recorded: Vec::new(),
+            unreadable: None,
             bytes: 0,
             replay: Duration::ZERO,
             snapping: Duration::ZERO,
@@ -177,11 +185,21 @@ impl Ledger {
 
     #[must_use]
     pub fn over(&self, extra: Duration, world_bytes: u64, ratio: f64) -> bool {
+        self.past(extra, world_bytes, ratio, 1)
+    }
+
+    #[must_use]
+    pub fn far_over(&self, extra: Duration, world_bytes: u64, ratio: f64) -> bool {
+        self.past(extra, world_bytes, ratio, HARD)
+    }
+
+    fn past(&self, extra: Duration, world_bytes: u64, ratio: f64, times: u32) -> bool {
         let bytes = usize::try_from(world_bytes)
             .unwrap_or(usize::MAX)
-            .max(JOURNAL_LEAST);
+            .max(JOURNAL_LEAST)
+            .saturating_mul(times as usize);
         let replaying = self.replay.saturating_add(extra).mul_f64(ratio.max(1.0));
-        self.bytes > bytes || replaying > self.replay_most()
+        self.bytes > bytes || replaying > self.replay_most().saturating_mul(times)
     }
 
     #[must_use]
@@ -192,6 +210,23 @@ impl Ledger {
     #[must_use]
     pub const fn replay(&self) -> Duration {
         self.replay
+    }
+
+    #[must_use]
+    pub fn step_recorded(&self) -> Duration {
+        self.entries
+            .iter()
+            .zip(&self.recorded)
+            .filter(|(entry, _)| matches!(entry, Entry::Step(_)))
+            .fold(Duration::ZERO, |all, (_, spent)| all.saturating_add(*spent))
+    }
+
+    #[must_use]
+    pub fn write_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Write(_)))
+            .fold(0_u64, |all, entry| all.saturating_add(entry.bytes() as u64))
     }
 
     pub fn rebase(&mut self, snap: Arc<Snap>, cost: Duration) {
@@ -613,8 +648,14 @@ impl Keep {
             Base::Created(made) => Ledger::created(made),
             Base::Snapshot(snap) => Ledger::snapped(snap),
         };
+        let mut index = 0_usize;
         while let Some((tag, payload)) = records.next() {
+            index += 1;
             let Some((entry, spent)) = entry_of(tag, payload) else {
+                ledger.unreadable = Some(format!(
+                    "record {index} of its journal has a good checksum and is not a record this server reads (tag {tag}, {} words)",
+                    payload.len()
+                ));
                 break;
             };
             ledger.push(entry, spent);
@@ -864,11 +905,23 @@ pub fn state_of(image: &Image) -> [u8; 32] {
     hash.finish()
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Timings {
+    pub build: Duration,
+    pub file_bytes: u64,
+    pub file: Duration,
+    pub write_bytes: u64,
+    pub writes: Duration,
+    pub recorded: Duration,
+    pub steps: Duration,
+}
+
 pub fn rebuilt<'host>(
     host: &'host Host,
     ledger: &Ledger,
     keep: Option<&Keep>,
     guard: &super::budget::Guard,
+    timings: &mut Timings,
     mut stepping: impl FnMut(&mut World<'host>, u32) -> Result<(), super::Failed>,
 ) -> Result<World<'host>, super::Failed> {
     if let Some(stop) = guard.stop() {
@@ -880,6 +933,7 @@ pub fn rebuilt<'host>(
             goal: ledger.frame,
         }));
     }
+    let began = std::time::Instant::now();
     let mut world = match &ledger.base {
         Base::Created(made) => World::create(host, &made.branch())?,
         Base::Snapshot(snap) => match (&snap.image, keep) {
@@ -896,7 +950,11 @@ pub fn rebuilt<'host>(
                         ),
                     )));
                 }
-                World::load(host, &path)?
+                let reading = std::time::Instant::now();
+                let image = crate::branch::format::fetch(&path)?;
+                timings.file_bytes = fs::metadata(&path).map_or(0, |found| found.len());
+                timings.file = reading.elapsed();
+                World::open(host, &image)?
             }
             (None, None) => {
                 return Err(Box::new(Refusal::new(
@@ -907,6 +965,7 @@ pub fn rebuilt<'host>(
             }
         },
     };
+    timings.build = began.elapsed().saturating_sub(timings.file);
     let of = ledger.entries.len();
     for (at, entry) in ledger.entries.iter().enumerate() {
         let halted = |stop, frame| {
@@ -922,9 +981,30 @@ pub fn rebuilt<'host>(
             return Err(halted(stop, world.frame()));
         }
         match entry {
-            Entry::Write(cells) => world.write(cells)?,
+            Entry::Write(cells) => {
+                let writing = std::time::Instant::now();
+                let chunk = if world.pool().is_some() {
+                    cells.len().max(1)
+                } else {
+                    WRITE_CHUNK
+                };
+                for piece in cells.chunks(chunk) {
+                    if let Some(stop) = guard.stop() {
+                        return Err(halted(stop, world.frame()));
+                    }
+                    world.write(piece)?;
+                }
+                timings.writes = timings.writes.saturating_add(writing.elapsed());
+                timings.write_bytes = timings.write_bytes.saturating_add(entry.bytes() as u64);
+            }
             Entry::Step(frames) => {
-                if let Err(why) = stepping(&mut world, *frames) {
+                let stepped = std::time::Instant::now();
+                let ran = stepping(&mut world, *frames);
+                timings.steps = timings.steps.saturating_add(stepped.elapsed());
+                timings.recorded = timings
+                    .recorded
+                    .saturating_add(ledger.recorded.get(at).copied().unwrap_or_default());
+                if let Err(why) = ran {
                     return Err(match why.downcast_ref::<super::budget::Cut>() {
                         Some(cut) => halted(cut.0, world.frame()),
                         None => why,

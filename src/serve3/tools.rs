@@ -554,14 +554,72 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         points.push(([x, y, z], word));
     }
     let owed = server.owed(number)?;
-    let live = server.world(held)?;
-    let began = Instant::now();
-    live.world.write(&points)?;
-    let spent = began.elapsed();
-    let written = u32::try_from(points.len())?;
-    let journal = server
-        .journaled(number, Entry::Write(points), spent)
-        .or(owed);
+    let sparse = server.world(held)?.world.pool().is_some();
+    let total = points.len();
+    let mut done = 0_usize;
+    let mut spent = Duration::ZERO;
+    let mut stopped = None;
+    let mut failure: Option<Failed> = None;
+    while done < total {
+        if done > 0
+            && let Some(stop) = server.stop()
+        {
+            stopped = Some(stop);
+            break;
+        }
+        let per_cell = server
+            .book
+            .rates
+            .estimate(Work::Write, 16)
+            .max(Duration::from_nanos(1));
+        let room = server.clock.left().min(AIM_WRITE);
+        let fits = usize::try_from(room.as_nanos() / per_cell.as_nanos()).unwrap_or(usize::MAX);
+        let probing = server.book.rates.observed(Work::Write) < budget::PADDED;
+        let chunk = if sparse {
+            total
+        } else if probing {
+            1
+        } else {
+            fits.clamp(1, total - done)
+        };
+        let piece = points.get(done..done + chunk).unwrap_or_default();
+        let began = Instant::now();
+        let ran = server.world(held)?.world.write(piece);
+        let took = began.elapsed();
+        if let Err(why) = ran {
+            failure = Some(why);
+            break;
+        }
+        if !sparse {
+            server
+                .book
+                .rates
+                .measure(Work::Write, 16 * chunk as u64, took);
+        }
+        spent = spent.saturating_add(took);
+        done += chunk;
+    }
+    let written = u32::try_from(done)?;
+    let journal = if done > 0 {
+        points.truncate(done);
+        server
+            .journaled(number, Entry::Write(points), spent)
+            .or(owed)
+    } else {
+        owed
+    };
+    if let Some(why) = failure {
+        let (mut refusal, _) = super::refused_with(why.as_ref());
+        refusal.message = format!(
+            "{}; {done} of the {total} cells were written before it",
+            refusal.message
+        );
+        if super::lost_device(why.as_ref()) {
+            refusal.code = Code::DeviceLost;
+            return Err(Box::new(Lost(refusal)));
+        }
+        return Err(Box::new(refusal));
+    }
     let snapshot = server.settle(number);
     let live = server.world(held)?;
     let listed = live.world.listed()?;
@@ -576,11 +634,18 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
     }
+    if let Some(stop) = stopped {
+        answer.push(("stopped", text(stop.name())));
+        answer.push(("asked", counted(u32::try_from(total)?)));
+        answer.push(("hint", text(stop.code().hint())));
+    }
     if let Some(note) = journal.or(snapshot) {
         answer.push(("journal", note));
     }
     Ok(map(answer))
 }
+
+const AIM_WRITE: Duration = Duration::from_millis(budget::SUBMIT_MOST_MS / 2);
 
 #[cfg(feature = "faults")]
 fn wedged_after(server: &Server<'_>, batch: u32) -> bool {
@@ -665,12 +730,16 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         pending += step;
         batch += 1;
         if done < frames && server.overdue(number, spent) {
+            let fits = server.clock.left() >= server.snapping(number);
+            if !fits && !server.far_overdue(number, spent) {
+                continue;
+            }
             journal = server
                 .journaled(number, Entry::Step(pending), spent)
                 .or(journal);
             pending = 0;
             spent = Duration::ZERO;
-            if server.clock.left() < server.snapping(number) {
+            if !fits {
                 stopped = Some(Stop::Budget);
                 break;
             }
@@ -998,7 +1067,7 @@ pub fn describe(status: &Status) -> Json {
                 ("batch_frames", number(BATCH_MOST)),
                 ("name_bytes", number(journal::NAME_MOST)),
                 ("world_least_bytes", number(budget::WORLD_LEAST)),
-                ("world_number_most", number(journal::NUMBER_MOST)),
+                ("world_number_most", number(journal::NUMBER_MOST - 1)),
                 (
                     "tally_words",
                     text(

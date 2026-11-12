@@ -259,6 +259,11 @@ impl Book {
         }
         let earlier: BTreeMap<u32, Ledger> = found;
         let mut broken_earlier = BTreeMap::new();
+        for (number, ledger) in &earlier {
+            if let Some(why) = &ledger.unreadable {
+                broken_earlier.insert(*number, why.clone());
+            }
+        }
         if let Some(keep) = keep.as_ref() {
             for (number, ledger) in &earlier {
                 if let Some(sum) = ledger.sum()
@@ -648,7 +653,8 @@ impl<'host> Server<'host> {
         rates
             .estimate(budget::Work::Build, bytes)
             .saturating_add(snapshot)
-            .saturating_add(rates.replaying(ledger.replay()))
+            .saturating_add(rates.estimate(budget::Work::Write, ledger.write_bytes()))
+            .saturating_add(rates.replaying(ledger.step_recorded()))
     }
 
     fn fits(&self, needs: Duration, what: &str) -> Result<(), Failed> {
@@ -659,7 +665,7 @@ impl<'host> Server<'host> {
         Ok(())
     }
 
-    fn replayed_world(
+    pub(super) fn replayed_world(
         &mut self,
         host: &'host Host,
         ledger: &Ledger,
@@ -667,28 +673,29 @@ impl<'host> Server<'host> {
         bytes: u64,
     ) -> Result<World<'host>, Failed> {
         let guard = self.guard();
-        let began = Instant::now();
-        let mut stepping = Duration::ZERO;
-        let world = journal::rebuilt(
+        let mut timings = journal::Timings::default();
+        let built = journal::rebuilt(
             host,
             ledger,
             self.book.keep.as_ref(),
             &guard,
-            |world, frames| {
-                let started = Instant::now();
-                let ran = paced(world, frames, pace, &guard);
-                stepping = stepping.saturating_add(started.elapsed());
-                ran
-            },
-        )?;
-        let rates = &mut self.book.rates;
-        rates.measure(
-            budget::Work::Build,
-            bytes,
-            began.elapsed().saturating_sub(stepping),
+            &mut timings,
+            |world, frames| paced(world, frames, pace, &guard),
         );
-        rates.measure_replay(ledger.replay(), stepping);
-        Ok(world)
+        let rates = &mut self.book.rates;
+        if !timings.build.is_zero() {
+            rates.measure(budget::Work::Build, bytes, timings.build);
+        }
+        if timings.file_bytes > 0 {
+            rates.measure(budget::Work::File, timings.file_bytes, timings.file);
+        }
+        if timings.write_bytes > 0 {
+            rates.measure(budget::Work::Write, timings.write_bytes, timings.writes);
+        }
+        if built.is_ok() {
+            rates.measure_replay(timings.recorded, timings.steps);
+        }
+        built
     }
 
     fn rebuild(&mut self, number: u32) -> Result<(), Failed> {
@@ -954,7 +961,7 @@ impl<'host> Server<'host> {
     fn settle(&mut self, number: u32) -> Option<Json> {
         let held = self.book.held.get(&number)?;
         if !held.ledger.due(held.bytes, self.book.rates.replay())
-            || self.clock.left() < held.ledger.snapping(held.bytes)
+            || self.clock.left() < self.snap_estimate(number)
         {
             return None;
         }
@@ -971,10 +978,14 @@ impl<'host> Server<'host> {
         let Some(held) = self.book.held.get(&number) else {
             return Ok(None);
         };
-        if !held.ledger.due(held.bytes, self.book.rates.replay()) {
+        let ratio = self.book.rates.replay();
+        if !held.ledger.due(held.bytes, ratio) {
             return Ok(None);
         }
-        let needs = held.ledger.snapping(held.bytes);
+        let needs = self.snap_estimate(number);
+        if self.clock.left() < needs && !held.ledger.far_over(Duration::ZERO, held.bytes, ratio) {
+            return Ok(None);
+        }
         if self.clock.left() < needs {
             return Err(Box::new(
                 Refusal::new(
@@ -1007,6 +1018,8 @@ impl<'host> Server<'host> {
         let began = Instant::now();
         let snap = snapshot(&mut live.world, made, keep.as_ref(), number)?;
         let cost = began.elapsed();
+        let size = self.book.held.get(&number).map_or(0, |held| held.bytes);
+        self.book.rates.measure(budget::Work::Save, size, cost);
         let held = self
             .book
             .held
@@ -1028,10 +1041,37 @@ impl<'host> Server<'host> {
     }
 
     fn snapping(&self, number: u32) -> Duration {
-        self.book
+        self.snap_estimate(number)
+    }
+
+    fn snap_estimate(&self, number: u32) -> Duration {
+        self.book.held.get(&number).map_or(Duration::ZERO, |held| {
+            self.book.rates.estimate(budget::Work::Save, held.bytes)
+        })
+    }
+
+    fn far_overdue(&self, number: u32, extra: Duration) -> bool {
+        self.book.held.get(&number).is_some_and(|held| {
+            held.ledger
+                .far_over(extra, held.bytes, self.book.rates.replay())
+        })
+    }
+
+    pub fn idle(&mut self) -> bool {
+        let ratio = self.book.rates.replay();
+        let owed = self
+            .book
             .held
-            .get(&number)
-            .map_or(Duration::ZERO, |held| held.ledger.snapping(held.bytes))
+            .iter()
+            .find(|(number, held)| {
+                self.live.contains_key(number) && held.ledger.due(held.bytes, ratio)
+            })
+            .map(|(number, _)| *number);
+        let Some(number) = owed else {
+            return false;
+        };
+        let _ = self.snap_now(number);
+        true
     }
 
     fn forget(&mut self, number: u32) {
