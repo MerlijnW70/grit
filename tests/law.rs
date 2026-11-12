@@ -1679,3 +1679,46 @@ fn a_repeated_key_is_refused_at_its_json_path() {
         assert_eq!(why.expected, "each key once");
     }
 }
+
+#[test]
+fn a_raw_control_byte_inside_a_string_is_refused_at_its_byte() {
+    for (byte, text) in [
+        (0x0a_u8, "[\"a\nb\"]"),
+        (0x09, "[\"a\tb\"]"),
+        (0x00, "[\"a\u{0}b\"]"),
+        (0x1f, "[\"a\u{1f}b\"]"),
+    ] {
+        assert_eq!(
+            wire::read(text),
+            Err(wire::Torn::Control { at: 3, byte }),
+            "{byte:#04x}"
+        );
+    }
+    assert_eq!(
+        wire::Torn::Control { at: 3, byte: 0x0a }.to_string(),
+        "3 control byte 0x0a"
+    );
+    assert_eq!(
+        wire::read("[\"a\\nb\",\"\u{7f}\",\"\u{e9}\"]"),
+        Ok(Json::List(vec![
+            Json::Text("a\nb".into()),
+            Json::Text("\u{7f}".into()),
+            Json::Text("\u{e9}".into()),
+        ]))
+    );
+    assert_eq!(
+        wire::read("[1,\n2]"),
+        Ok(Json::List(vec![Json::Int(1), Json::Int(2)]))
+    );
+    let raw = template("[\"let\",[[\"a\nb\",0]],[\"vec\",\"cells\",[\"vec\",0]]]");
+    let why = refused_at(&raw, Code::Json, "$");
+    let at = raw.find('\n').unwrap();
+    assert_eq!(
+        why.found,
+        format!(
+            "the control byte 0x0a raw inside a string at byte {at}, which JSON writes escaped"
+        )
+    );
+    let escaped = template("[\"let\",[[\"a\\nb\",0]],[\"vec\",\"cells\",[\"vec\",0]]]");
+    assert!(Law::compile(&escaped).is_ok());
+}

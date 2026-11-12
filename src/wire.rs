@@ -55,6 +55,7 @@ pub enum Torn {
     Ended { at: usize },
     Stray { at: usize, saw: char },
     Twice { at: usize },
+    Control { at: usize, byte: u8 },
     TooDeep { at: usize },
     NotANumber { at: usize },
 }
@@ -65,6 +66,7 @@ impl std::fmt::Display for Torn {
             Self::Ended { at } => write!(out, "{at}"),
             Self::Stray { at, saw } => write!(out, "{at} {saw:?}"),
             Self::Twice { at } => write!(out, "{at} '\"'"),
+            Self::Control { at, byte } => write!(out, "{at} control byte 0x{byte:02x}"),
             Self::TooDeep { at } => write!(out, "{at}"),
             Self::NotANumber { at } => write!(out, "{at}"),
         }
@@ -187,6 +189,12 @@ fn stringed(reading: &mut Reading<'_>) -> Result<String, Torn> {
                         });
                     }
                 }
+            }
+            byte if byte < 0x20 => {
+                return Err(Torn::Control {
+                    at: reading.at - 1,
+                    byte,
+                });
             }
             _ => {
                 let from = reading.at - 1;
