@@ -1393,7 +1393,8 @@ fn the_kernels_read_the_rules_parameters_and_nothing_more() {
     assert_eq!(live::sizes3(&Sand, &plan), plan.sizes());
     assert_eq!(live::sizes3(&Code, &plan), plan.sizes());
     let mut longer = plan.sizes();
-    longer[TALLY as usize] = Nature.tally().words().max(longer[TALLY as usize]);
+    longer[TALLY as usize] =
+        (Nature.tally().words() * live::TALLY_SPAN).max(longer[TALLY as usize]);
     longer[PARAMS as usize] = FIRST_PARAM + nature::PARAMS;
     assert_eq!(live::sizes3(&Nature, &plan), longer);
     let mut grown = plan.sizes();
@@ -1636,7 +1637,10 @@ fn tally_holds_the_cpu_counts<R: Rule>(subject: &Subject<R>, host: &Host, seed: 
         };
         let sizes = live::sizes3(&subject.rule, &engine.plan);
         let room = sizes[TALLY as usize];
-        assert_eq!(room, tally.words().max(Dimension::Three.tally_words()));
+        assert_eq!(
+            room,
+            tally.words().max(Dimension::Three.tally_words()) * live::TALLY_SPAN
+        );
         let start = random(subject, engine.reference, seed);
         let name = format!("{} tally {} {}", subject.name, tally.counts, tally.weighted);
         engine.restart(&start, label(&name, SHAPE, coarse, seed));
@@ -1648,11 +1652,13 @@ fn tally_holds_the_cpu_counts<R: Rule>(subject: &Subject<R>, host: &Host, seed: 
         engine.frame();
         let got = engine.live.read(TALLY as usize, room).unwrap();
         let wanted = tally_on_cpu(subject, engine.reference, 0, &before);
+        let exact = tally.words() * live::TALLY_SPAN;
         assert_eq!(got[..tally.words()], wanted[..], "{}", engine.label);
         assert!(
-            got[tally.words()..].iter().all(|&word| word == MARK),
+            got[tally.words()..exact].iter().all(|&word| word == 0),
             "{got:x?}"
         );
+        assert!(got[exact..].iter().all(|&word| word == MARK), "{got:x?}");
         last = wanted;
     }
     last

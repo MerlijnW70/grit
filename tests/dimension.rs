@@ -25,6 +25,8 @@ const PARAMS_GROWTH: u64 = 2 * 4;
 
 const SPARE_512: u64 = 536_870_912;
 
+const TALLY_GROWTH: u64 = 7 * (grit::live::TALLY_SPAN as u64 - 1) * 4;
+
 fn octs_in(cells: usize) -> u32 {
     u32::try_from(cells / 8).unwrap()
 }
@@ -65,7 +67,10 @@ fn the_two_dimensional_layout_keeps_the_values_it_always_had() {
     assert_eq!(by_default.sizes(), named.sizes());
     assert_eq!(by_default.grid, by_default.quads * 4);
     assert_eq!(by_default.sizes()[PARAMS as usize], 8);
-    assert_eq!(by_default.sizes()[TALLY as usize], 6);
+    assert_eq!(
+        by_default.sizes()[TALLY as usize],
+        6 * grit::live::TALLY_SPAN
+    );
     assert_eq!(
         by_default.sizes()[STATE as usize],
         by_default.grid + by_default.quads * 4
@@ -103,7 +108,7 @@ fn the_three_dimensional_layout_has_eight_corners_seven_tally_words_and_ten_para
     let held = Plan::over_in(SUBGROUP, 40, Dimension::Three).unwrap();
     assert_eq!(held.dimension, Dimension::Three);
     assert_eq!(held.sizes()[PARAMS as usize], 10);
-    assert_eq!(held.sizes()[TALLY as usize], 7);
+    assert_eq!(held.sizes()[TALLY as usize], 7 * grit::live::TALLY_SPAN);
 }
 
 #[test]
@@ -144,7 +149,10 @@ fn the_world_of_512_cubed_sums_to_the_bytes_the_report_computed() {
     let sizes = held.sizes();
     assert_eq!(held.quads, 16_777_216);
     assert_eq!(held.blocks, 65_536);
-    assert_eq!(bytes(&sizes), REPORT_512 - SPARE_512 + PARAMS_GROWTH);
+    assert_eq!(
+        bytes(&sizes),
+        REPORT_512 - SPARE_512 + PARAMS_GROWTH + TALLY_GROWTH
+    );
     assert_eq!(sizes[STATE as usize] as u64 * 4, 536_870_912);
     assert_eq!(Plan::reach(SUBGROUP) * 8, CELLS_512 as u64);
 }

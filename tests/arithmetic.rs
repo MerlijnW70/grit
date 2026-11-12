@@ -161,7 +161,25 @@ fn a_plan_sizes_every_binding_to_the_number_its_arithmetic_produces() {
     assert_eq!(
         held.sizes(),
         [
-            8, 16384, 2304, 256, 256, 256, 2304, 1, 3, 4096, 1, 6, 257, 288, 256, 256, 256, 288, 1,
+            8,
+            16384,
+            2304,
+            256,
+            256,
+            256,
+            2304,
+            1,
+            3,
+            4096,
+            1,
+            6 * grit::live::TALLY_SPAN,
+            257,
+            288,
+            256,
+            256,
+            256,
+            288,
+            1,
             3
         ]
     );

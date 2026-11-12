@@ -60,7 +60,11 @@ fn seeded(held: &mut Resident<'_>, plan: &Plan, blocks: u32, label: &str) {
         "{label}"
     );
     let tally = held.read(TALLY as usize, sizes[TALLY as usize]).unwrap();
-    assert_eq!(tally, vec![0; plan.dimension.tally_words()], "{label}");
+    assert_eq!(
+        tally,
+        vec![0; plan.dimension.tally_words() * live::TALLY_SPAN],
+        "{label}"
+    );
 }
 
 #[test]
