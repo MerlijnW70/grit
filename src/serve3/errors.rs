@@ -33,9 +33,19 @@ pub enum Code {
     NoComputeDevice,
     Device,
     Error,
+    Memory,
+    Budget,
+    Cancelled,
+    DeviceLost,
+    Path,
+    NoFile,
+    Exists,
+    BadFile,
+    Unlike,
+    Io,
 }
 
-pub const CODES: [Code; 29] = [
+pub const CODES: [Code; 39] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -65,6 +75,16 @@ pub const CODES: [Code; 29] = [
     Code::NoComputeDevice,
     Code::Device,
     Code::Error,
+    Code::Memory,
+    Code::Budget,
+    Code::Cancelled,
+    Code::DeviceLost,
+    Code::Path,
+    Code::NoFile,
+    Code::Exists,
+    Code::BadFile,
+    Code::Unlike,
+    Code::Io,
 ];
 
 impl Code {
@@ -100,6 +120,16 @@ impl Code {
             Self::NoComputeDevice => "no_compute_device",
             Self::Device => "device",
             Self::Error => "error",
+            Self::Memory => "memory",
+            Self::Budget => "budget",
+            Self::Cancelled => "cancelled",
+            Self::DeviceLost => "device_lost",
+            Self::Path => "path",
+            Self::NoFile => "no_file",
+            Self::Exists => "exists",
+            Self::BadFile => "bad_file",
+            Self::Unlike => "unlike",
+            Self::Io => "io",
         }
     }
 
@@ -179,6 +209,28 @@ impl Code {
             }
             Self::Device => "Close the world and create it again; if it repeats, report the call.",
             Self::Error => "Change the arguments the message names.",
+            Self::Memory => {
+                "Close or save a world first, or ask for a smaller one; the answer names the bytes asked, held and allowed."
+            }
+            Self::Budget => {
+                "Give the call a larger budget_ms, up to the limit grit_describe names, or ask for less in one call."
+            }
+            Self::Cancelled => "Nothing past the frames reported ran; call again for the rest.",
+            Self::DeviceLost => {
+                "Call again; the server rebuilt every world it could at the frame it reports, as restored says."
+            }
+            Self::Path => {
+                "Name a file with 1 to 64 of a-z, 0-9, _ and -, starting with a letter or digit, and not a device name such as con or nul."
+            }
+            Self::NoFile => "Name a file grit_world_list shows, or a world it lists as kept.",
+            Self::Exists => "Choose another name, or pass replace true to write over the file.",
+            Self::BadFile => {
+                "Open another file; this one is not a world this server wrote, or it was changed since."
+            }
+            Self::Unlike => {
+                "Restore a world only from one of the same rule, size and layout, such as a fork of it."
+            }
+            Self::Io => "Free disk space or fix the server directory, then call again.",
         }
     }
 }

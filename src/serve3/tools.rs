@@ -1,22 +1,21 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
-use crate::bricks::{Bricks, Content};
-use crate::compact::Plan;
-use crate::layout::{Dimension, PARAMS, TALLY};
-use crate::live;
-use crate::resident::Groups;
-use crate::rule3::FIRST_PARAM;
-use crate::sand::Grid;
-use crate::sand3::Grid3;
-use crate::sweep;
+use crate::branch::format::{UNIFORM, brick_cells, lattice_of, place};
+use crate::branch::{State, World};
+use crate::host::Host;
 use crate::wire::{Json, counted, map, text};
 
+use super::budget::{
+    self, BATCH_MOST, BUDGET_MOST_MS, BUDGET_MS, Pace, SUBMIT_MOST_MS, Stop, bytes_of,
+};
 use super::errors::{self, Code, Refusal};
+use super::journal::{self, Entry, Ledger, Made};
 use super::schema::{choice, object, property, whole, with, word};
 use super::transport::{ANSWER_MOST, DEPTH_MOST, ID_MOST, LINE_MOST, PROTOCOL};
 use super::{
-    BATCH, DIGITS, Failed, PAGE_BYTES, POOL_LEAST_CELLS, READ_MOST, SLICE_MOST, STEP_MOST, Server,
-    Slot, Tool, World, rules, rules_on,
+    DIGITS, Failed, Live, PAGE_BYTES, POOL_LEAST_CELLS, READ_MOST, SLICE_MOST, STEP_MOST, Server,
+    Status, Tool, rules, rules_on, shaped,
 };
 
 pub const TOOLS: &[Tool] = &[
@@ -108,15 +107,15 @@ mod faults {
     }
 }
 
-fn refused(code: Code, field: &str, message: String) -> Failed {
+pub(super) fn refused(code: Code, field: &str, message: String) -> Failed {
     Box::new(Refusal::new(code, field, message))
 }
 
-fn limited(code: Code, field: &str, message: String, limit: Json) -> Failed {
+pub(super) fn limited(code: Code, field: &str, message: String, limit: Json) -> Failed {
     Box::new(Refusal::new(code, field, message).limited(limit))
 }
 
-fn unread(key: &str) -> Failed {
+pub(super) fn unread(key: &str) -> Failed {
     refused(
         Code::Malformed,
         &format!("$.{key}"),
@@ -145,13 +144,13 @@ fn corner(held: &Json, key: &str) -> Result<[u32; 3], Failed> {
     <[u32; 3]>::try_from(got.as_slice()).map_err(|_| unread(key))
 }
 
-fn words_of<'held>(held: &'held Json, key: &str) -> Result<&'held str, Failed> {
+pub(super) fn words_of<'held>(held: &'held Json, key: &str) -> Result<&'held str, Failed> {
     held.get(key)
         .and_then(Json::text)
         .ok_or_else(|| unread(key))
 }
 
-fn sized(held: [u32; 3]) -> Json {
+pub(super) fn sized(held: [u32; 3]) -> Json {
     Json::List(held.iter().map(|one| counted(*one)).collect())
 }
 
@@ -159,11 +158,10 @@ fn largest(size: [u32; 3]) -> Json {
     sized(size.map(|side| side.saturating_sub(1)))
 }
 
-fn inside(world: &World<'_>, at: [u32; 3], what: &str, field: &str) -> Result<(), Failed> {
-    if at.iter().zip(world.size()).all(|(one, side)| *one < side) {
+fn inside(size: [u32; 3], at: [u32; 3], what: &str, field: &str) -> Result<(), Failed> {
+    if at.iter().zip(size).all(|(one, side)| *one < side) {
         return Ok(());
     }
-    let size = world.size();
     Err(limited(
         Code::Outside,
         field,
@@ -175,7 +173,7 @@ fn inside(world: &World<'_>, at: [u32; 3], what: &str, field: &str) -> Result<()
     ))
 }
 
-fn world_number() -> Json {
+pub(super) fn world_number() -> Json {
     whole(
         "the number grit_world_create answered with",
         1,
@@ -193,7 +191,27 @@ fn corner_shown(what: &str) -> Json {
     ])
 }
 
-fn tool(name: &str, what: &str, properties: Vec<(&str, Json)>, required: &[&str]) -> Json {
+fn budget_shown() -> Json {
+    with(
+        whole(
+            &format!("milliseconds this call may take; {BUDGET_MS} if left out"),
+            1,
+            i64::try_from(BUDGET_MOST_MS).unwrap_or(i64::MAX),
+        ),
+        vec![(
+            "default",
+            Json::Int(i64::try_from(BUDGET_MS).unwrap_or(i64::MAX)),
+        )],
+    )
+}
+
+pub(super) fn tool(
+    name: &str,
+    what: &str,
+    mut properties: Vec<(&str, Json)>,
+    required: &[&str],
+) -> Json {
+    properties.push(("budget_ms", budget_shown()));
     map(vec![
         ("name", text(name)),
         ("description", text(what)),
@@ -393,6 +411,48 @@ fn listed_rules(_: &mut Server<'_>, _: &Json) -> Result<Json, Failed> {
     Ok(map(vec![("rules", super::known_rules())]))
 }
 
+pub(super) fn reported(
+    live: &mut Live<'_>,
+    mut answer: Vec<(&'static str, Json)>,
+) -> Result<Json, Failed> {
+    if let Some(used) = live.world.pool_use()? {
+        answer.push(("sparse", Json::Bool(true)));
+        answer.push(("pool_use", super::pooled(used)));
+    }
+    Ok(map(answer))
+}
+
+pub(super) fn admitted(
+    server: &Server<'_>,
+    host: &Host,
+    sizes: &[usize],
+    what: &str,
+) -> Result<u64, Failed> {
+    host.limits().admits(sizes, None)?;
+    let bytes = bytes_of(sizes);
+    server.book.memory.admits(bytes, what)?;
+    host.limits()
+        .admits_on(sizes, None, host.heap())
+        .map_err(|why| match why {
+            crate::host::Error::TooMuchMemory { bytes, heap } => Box::new(budget::Short {
+                asked: bytes,
+                held: server.book.memory.held(),
+                allowed: heap,
+                what: format!("{what}, on a device of {heap} bytes,"),
+            }) as Failed,
+            other => Box::new(other) as Failed,
+        })?;
+    Ok(bytes)
+}
+
+pub(super) fn first_pace(world: &World<'_>) -> Pace {
+    let cells = world.pool().map_or_else(
+        || world.size().iter().map(|&side| u64::from(side)).product(),
+        |bricks| u64::from(bricks.capacity()) * bricks.cells() as u64,
+    );
+    Pace::first(cells)
+}
+
 fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let mut known = rules_on(server.host);
     let asked = words_of(held, "rule")?;
@@ -422,195 +482,284 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let deep = int(held, "deep")?;
     let tall = int(held, "tall")?;
     let host = server.host.ok_or(crate::host::Error::NoComputeDevice)?;
-
     let sparse = matches!(held.get("sparse"), Some(Json::Bool(true)));
     let slots = match held.get("slots") {
         None => None,
         Some(_) => Some(int(held, "slots")?),
     };
-    let grid = Grid::solid(wide, deep, tall)?;
-    let width = host.width();
-    let blocks = grid.blocks().div_ceil(sweep::cells(width));
-    let plan = if sparse {
-        Plan::bricked(width, blocks)?
-    } else {
-        Plan::over_in(width, blocks, Dimension::Three)?
+    let mut made = Made {
+        rule: rule.name().to_owned(),
+        params: params.clone(),
+        size: [wide, deep, tall],
+        sparse,
+        slots,
     };
-    let pool = if sparse {
-        let most = u32::try_from(((1_u64 << 32) - 1) / (u64::from(plan.per_block) * 8))
-            .unwrap_or(u32::MAX)
-            .min(plan.blocks);
-        let brick_cells = u64::from(plan.per_block) * 8;
-        let least = u32::try_from(POOL_LEAST_CELLS.div_ceil(brick_cells)).unwrap_or(u32::MAX);
-        let capacity = slots.unwrap_or((plan.blocks / 4).max(least)).clamp(1, most);
-        Some(Bricks::new(grid, &plan, capacity)?)
-    } else {
-        None
-    };
-    let ((passes, stages), sizes) = match pool.as_ref() {
-        Some(bricks) => (
-            rule.bricked(bricks, &plan)?,
-            rule.bricked_sizes(bricks, &plan),
-        ),
-        None => (rule.wired(width, grid, &plan)?, rule.sizes(&plan).to_vec()),
-    };
-    if pool.is_none() && Grid3::new(grid.wide, grid.deep, grid.tall).is_none() {
-        return Err(refused(
-            Code::Unfit,
-            "$",
-            format!(
-                "a dense world of {wide} by {deep} by {tall} cells is not solid; ask for a sparse one"
-            ),
-        ));
-    }
-    let solid = Grid3 {
-        wide: grid.wide,
-        deep: grid.deep,
-        tall: grid.tall,
-    };
-    let cells = u64::from(solid.wide) * u64::from(solid.deep) * u64::from(solid.tall);
-    if pool.is_some() {
-        host.limits().admits_on(&sizes, None, host.heap())?;
-    }
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-    let mut live = host.resident(&sizes, &modules)?;
-    for (binding, room) in sizes.iter().enumerate() {
-        live.write(binding, &vec![0_u32; *room])?;
-    }
-    if !params.is_empty() {
-        live.write_at(PARAMS as usize, FIRST_PARAM, &params)?;
-    }
-    match pool.as_ref() {
-        Some(bricks) => {
-            live.write(PARAMS as usize, &[u32::MAX])?;
-            let packed = bricks.compose(|_| Content::Uniform(0))?;
-            bricks.write_packed(&mut live, &plan, &packed)?;
-            bricks.seed(&mut live, &plan)?;
-        }
-        None => {
-            live.write(PARAMS as usize, &[u32::MAX, plan.dump()])?;
-            live::seed(&mut live, grid, &plan)?;
-        }
-    }
-
-    let mut world = World {
-        rule,
-        live,
-        stages,
-        grid,
-        solid,
-        plan,
-        frame: 0,
-        pool,
-    };
-    let listed = world.listed()?;
-    let id = server.next;
-    server.next = id.checked_add(1).ok_or_else(|| {
-        limited(
-            Code::TooMany,
-            "$",
-            "every world number has been used".to_owned(),
-            counted(u32::MAX),
-        )
-    })?;
-    let answer = world.reported(vec![
+    let (grid, sizes) = shaped(host, rule.as_ref(), &made)?;
+    made.size = [grid.wide, grid.deep, grid.tall];
+    let bytes = admitted(server, host, &sizes, "the world")?;
+    let world = World::create(host, &made.branch())?;
+    let id = server.number()?;
+    let pace = first_pace(&world);
+    let mut live = super::Live { world, rule };
+    let listed = live.world.listed()?;
+    let cells = u64::from(grid.wide) * u64::from(grid.deep) * u64::from(grid.tall);
+    let mut answer = vec![
         ("world", counted(id)),
-        ("rule", text(world.rule.name())),
+        ("rule", text(live.rule.name())),
         (
             "params",
             Json::List(params.iter().map(|one| counted(*one)).collect()),
         ),
-        ("size", sized(world.size())),
+        ("size", sized(live.world.size())),
         ("cells", Json::Int(i64::try_from(cells)?)),
-        ("frame", counted(world.frame)),
+        ("frame", counted(live.world.frame())),
         ("listed", counted(listed)),
-    ])?;
-    server.worlds.insert(id, Slot::Open(Box::new(world)));
-    Ok(answer)
+    ];
+    if let Some(used) = live.world.pool_use()? {
+        answer.push(("sparse", Json::Bool(true)));
+        answer.push(("pool_use", super::pooled(used)));
+    }
+    if let Some(note) = server.adopt(id, live, Ledger::created(made), bytes, pace) {
+        answer.push(("journal", note));
+    }
+    Ok(map(answer))
 }
 
 fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
-    let world = server.world(held)?;
+    let live = server.world(held)?;
+    let size = live.world.size();
     let list = held
         .get("cells")
         .and_then(Json::list)
         .ok_or_else(|| unread("cells"))?;
-    let mut cells = Vec::with_capacity(list.len());
     let mut points = Vec::with_capacity(list.len());
     for (at, one) in list.iter().enumerate() {
         let got = ints(one, "cells")?;
         let [x, y, z, word] = <[u32; 4]>::try_from(got.as_slice()).map_err(|_| unread("cells"))?;
         inside(
-            world,
+            size,
             [x, y, z],
             &format!("cell {at} at"),
             &format!("$.cells[{at}]"),
         )?;
         points.push(([x, y, z], word));
-        if world.pool.is_none() {
-            cells.push((u32::try_from(world.index([x, y, z]))?, word));
-        }
     }
-    match world.pool.as_ref() {
-        Some(bricks) => bricks.put_at(&mut world.live, &points)?,
-        None => live::put3(&mut world.live, world.grid, &world.plan, &cells)?,
-    }
-    let listed = world.listed()?;
-    world.reported(vec![
+    let began = Instant::now();
+    live.world.write(&points)?;
+    let spent = began.elapsed();
+    let written = u32::try_from(points.len())?;
+    let journal = server.journaled(number, Entry::Write(points), spent);
+    let snapshot = server.settle(number);
+    let live = server.world(held)?;
+    let listed = live.world.listed()?;
+    let frame = live.world.frame();
+    let mut answer = vec![
         ("world", counted(number)),
-        ("written", counted(u32::try_from(points.len())?)),
-        ("frame", counted(world.frame)),
+        ("written", counted(written)),
+        ("frame", counted(frame)),
         ("listed", counted(listed)),
-    ])
+    ];
+    if let Some(used) = live.world.pool_use()? {
+        answer.push(("sparse", Json::Bool(true)));
+        answer.push(("pool_use", super::pooled(used)));
+    }
+    if let Some(note) = journal.or(snapshot) {
+        answer.push(("journal", note));
+    }
+    Ok(map(answer))
+}
+
+#[cfg(feature = "faults")]
+fn wedged_after(server: &Server<'_>, batch: u32) -> bool {
+    let armed = server
+        .book
+        .faults
+        .lock()
+        .map(|mut faults| {
+            if faults.wedge_after_batch == Some(batch) {
+                faults.wedge_after_batch = None;
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+    if armed && let Some(host) = server.host {
+        host.wedge();
+    }
+    armed
+}
+
+#[cfg(not(feature = "faults"))]
+const fn wedged_after(_: &Server<'_>, _: u32) -> bool {
+    false
 }
 
 fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
-    let world = server.world(held)?;
     let frames = int(held, "frames")?;
-    let groups: Vec<&[Groups]> = world.stages.iter().map(Vec::as_slice).collect();
+    server.world(held)?;
+    let mut pace = server
+        .book
+        .held
+        .get(&number)
+        .map(|held| held.pace)
+        .ok_or("the world has no journal")?;
     let mut done = 0_u32;
+    let mut spent = Duration::ZERO;
+    let mut stopped = None;
+    let mut failure: Option<Failed> = None;
+    let mut batch = 0_u32;
     while done < frames {
-        let step = BATCH.min(frames - done);
-        if let Err(why) = faults::batch().and_then(|()| {
-            world
-                .live
-                .staged_frames(&groups, step)
-                .map(|_| ())
-                .map_err(Into::into)
-        }) {
-            let mut refusal = errors::refusal_of(why.as_ref());
-            refusal.message = format!(
-                "{}; {done} of the {frames} frames ran before it, and the world is at frame {}",
-                refusal.message, world.frame
-            );
-            return Err(Box::new(refusal));
+        if let Some(stop) = server.stop() {
+            stopped = Some(stop);
+            break;
         }
+        let step = pace.batch(frames - done, server.clock.left());
+        if step == 0 {
+            stopped = Some(Stop::Budget);
+            break;
+        }
+        if let Err(why) = faults::batch() {
+            failure = Some(why);
+            break;
+        }
+        let began = Instant::now();
+        let ran = server.world(held)?.world.step(step);
+        let took = began.elapsed();
+        if let Err(why) = ran {
+            failure = Some(why);
+            break;
+        }
+        if wedged_after(server, batch) {
+            failure = Some(Box::new(crate::host::Error::Wedged { after: took }));
+            break;
+        }
+        pace.ran(step, took);
+        let stats = &mut server.book.stats;
+        stats
+            .batches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if took > stats.longest {
+            stats.longest = took;
+            stats.longest_frames = step;
+        }
+        spent = spent.saturating_add(took);
         done += step;
-        world.frame = world.frame.wrapping_add(step);
+        batch += 1;
     }
-    let tally = world.live.read(TALLY as usize, world.rule.tally_words())?;
-    let listed = world.listed()?;
-    world.reported(vec![
+    if let Some(held) = server.book.held.get_mut(&number) {
+        held.pace = pace;
+    }
+    let journal = if done > 0 {
+        server.journaled(number, Entry::Step(done), spent)
+    } else {
+        None
+    };
+    let frame = server
+        .book
+        .held
+        .get(&number)
+        .map_or(0, |held| held.ledger.frame);
+    if let Some(why) = failure {
+        let (mut refusal, _) = super::refused_with(why.as_ref());
+        refusal.message = format!(
+            "{}; {done} of the {frames} frames ran before it, and the world is at frame {frame}",
+            refusal.message
+        );
+        if super::lost_device(why.as_ref()) {
+            refusal.code = Code::DeviceLost;
+            return Err(Box::new(Lost(refusal)));
+        }
+        return Err(Box::new(refusal));
+    }
+    let snapshot = server.settle(number);
+    let live = server.world(held)?;
+    let tally = live.world.tally()?;
+    let listed = live.world.listed()?;
+    let mut answer = vec![
         ("world", counted(number)),
         ("frames", counted(frames)),
-        ("frame", counted(world.frame)),
+        ("frame", counted(live.world.frame())),
         (
             "tally",
             Json::List(tally.iter().map(|one| counted(*one)).collect()),
         ),
         ("listed", counted(listed)),
-    ])
+    ];
+    if let Some(used) = live.world.pool_use()? {
+        answer.push(("sparse", Json::Bool(true)));
+        answer.push(("pool_use", super::pooled(used)));
+    }
+    if let Some(stop) = stopped {
+        answer.push(("stopped", text(stop.name())));
+        answer.push(("ran", counted(done)));
+        answer.push(("hint", text(stop.code().hint())));
+    }
+    if let Some(note) = journal.or(snapshot) {
+        answer.push(("journal", note));
+    }
+    Ok(map(answer))
+}
+
+#[derive(Debug)]
+pub struct Lost(pub Refusal);
+
+impl std::fmt::Display for Lost {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{}", self.0.message)
+    }
+}
+
+impl std::error::Error for Lost {}
+
+pub(super) fn cells_at(world: &mut World<'_>, points: &[[u32; 3]]) -> Result<Vec<u32>, Failed> {
+    let image = world.image()?;
+    let size = image.size;
+    match &image.state {
+        State::Dense(cells) => points
+            .iter()
+            .map(|at| {
+                let index = (u64::from(at[2]) * u64::from(size[1]) + u64::from(at[1]))
+                    * u64::from(size[0])
+                    + u64::from(at[0]);
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| cells.get(index).copied())
+                    .ok_or_else(|| "the world read back short".into())
+            })
+            .collect(),
+        State::Sparse {
+            sides, table, pool, ..
+        } => {
+            let lattice = lattice_of(size, *sides);
+            let per = brick_cells(*sides);
+            Ok(points
+                .iter()
+                .map(|&at| {
+                    let (brick, offset) = place(at, *sides, lattice);
+                    let slot = table.get(brick * 2).copied().unwrap_or(UNIFORM);
+                    let value = table.get(brick * 2 + 1).copied().unwrap_or(0);
+                    if slot == UNIFORM {
+                        value
+                    } else {
+                        pool.get(slot as usize * per + offset).copied().unwrap_or(0)
+                    }
+                })
+                .collect())
+        }
+    }
 }
 
 fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
-    let world = server.world(held)?;
+    let live = server.world(held)?;
+    let size = live.world.size();
     let from = corner(held, "from")?;
     let to = corner(held, "to")?;
-    inside(world, from, "from", "$.from")?;
-    inside(world, to, "to", "$.to")?;
+    inside(size, from, "from", "$.from")?;
+    inside(size, to, "to", "$.to")?;
     if from.iter().zip(to).any(|(one, other)| *one > other) {
         return Err(refused(
             Code::Reversed,
@@ -641,13 +790,13 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     let mut words = Vec::new();
     let mut kinds = BTreeMap::new();
-    for word in world.cells_at(&points)? {
-        *kinds.entry(world.rule.kind(word)).or_insert(0_u32) += 1;
+    for word in cells_at(&mut live.world, &points)? {
+        *kinds.entry(live.rule.kind(word)).or_insert(0_u32) += 1;
         words.push(counted(word));
     }
     Ok(map(vec![
         ("world", counted(number)),
-        ("frame", counted(world.frame)),
+        ("frame", counted(live.world.frame())),
         ("from", sized(from)),
         ("to", sized(to)),
         ("cells", Json::List(words)),
@@ -667,7 +816,7 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
 
 fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
-    let world = server.world(held)?;
+    let live = server.world(held)?;
     let axis = words_of(held, "axis")?;
     let (across, down, through) = match axis {
         "x" => (1, 2, 0),
@@ -675,7 +824,7 @@ fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         _ => (0, 1, 2),
     };
     let at = int(held, "at")?;
-    let size = world.size();
+    let size = live.world.size();
     let side = |axis: usize| size.get(axis).copied().unwrap_or(0);
     if at >= side(through) {
         return Err(limited(
@@ -722,7 +871,7 @@ fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             points.push(place(row, column));
         }
     }
-    let state = world.cells_at(&points)?;
+    let state = cells_at(&mut live.world, &points)?;
     let mut rows = Vec::new();
     let mut read = state.into_iter();
     let mut bytes = 0_usize;
@@ -733,7 +882,7 @@ fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         for _ in 0..side(across) {
             let word = read.next().ok_or("the world read back short")?;
             if shown == "kinds" {
-                let kind = world.rule.kind(word);
+                let kind = live.rule.kind(word);
                 kinds.push(
                     DIGITS
                         .get(kind as usize)
@@ -759,7 +908,7 @@ fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let name = |axis: usize| text(named.get(axis).copied().unwrap_or("x"));
     let mut answer = vec![
         ("world", counted(number)),
-        ("frame", counted(world.frame)),
+        ("frame", counted(live.world.frame())),
         ("axis", text(axis)),
         ("at", counted(at)),
         ("columns", name(across)),
@@ -775,8 +924,10 @@ fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
 
 fn closed(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let world = int(held, "world")?;
-    server.world(held)?;
-    server.worlds.insert(world, Slot::Closed);
+    if !server.book.held.contains_key(&world) {
+        server.world(held)?;
+    }
+    server.forget(world);
     Ok(map(vec![
         ("world", counted(world)),
         ("closed", Json::Bool(true)),
@@ -788,18 +939,16 @@ fn number(held: impl TryInto<i64>) -> Json {
 }
 
 fn described(server: &mut Server<'_>, _: &Json) -> Result<Json, Failed> {
-    let tools: Vec<Json> = super::transport::Served::listed(&*server)
+    Ok(describe(&server.status()))
+}
+
+#[must_use]
+pub fn describe(status: &Status) -> Json {
+    let tools: Vec<Json> = super::listing_all()
         .iter()
         .filter_map(|one| one.get("name").cloned())
         .collect();
-    let device = server.host.map_or(Json::Null, |host| {
-        map(vec![
-            ("name", text(host.name())),
-            ("subgroup", counted(host.width())),
-            ("heap_bytes", number(host.heap())),
-        ])
-    });
-    Ok(map(vec![
+    map(vec![
         (
             "server",
             map(vec![
@@ -827,9 +976,26 @@ fn described(server: &mut Server<'_>, _: &Json) -> Result<Json, Failed> {
                 ("rounds", number(crate::serve::ROUNDS)),
                 ("work", number(crate::serve::WORK)),
                 ("rungs", number(crate::serve::RUNGS)),
+                ("budget_ms", number(BUDGET_MS)),
+                ("budget_most_ms", number(BUDGET_MOST_MS)),
+                ("submission_ms", number(SUBMIT_MOST_MS)),
+                ("batch_frames", number(BATCH_MOST)),
+                ("name_bytes", number(journal::NAME_MOST)),
+                (
+                    "memory_share",
+                    text(&format!(
+                        "{}/{} of the device heap unless the server was started with its own",
+                        budget::SHARE_NUMERATOR,
+                        budget::SHARE_DENOMINATOR
+                    )),
+                ),
             ]),
         ),
-        ("device", device),
+        ("device", status.device.clone()),
+        ("memory", status.memory.clone()),
+        ("worlds", status.worlds.clone()),
+        ("submissions", status.submissions.clone()),
+        ("directory", status.directory.clone()),
         ("faults_caught", number(super::transport::faults())),
         (
             "features",
@@ -839,5 +1005,5 @@ fn described(server: &mut Server<'_>, _: &Json) -> Result<Json, Failed> {
                 ("faults", Json::Bool(cfg!(feature = "faults"))),
             ]),
         ),
-    ]))
+    ])
 }

@@ -4,16 +4,19 @@
 //! 2D tool through [`crate::serve::handle`] as before.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use simdr::lanes::LaneError;
 
-use crate::bricks::{Bricks, Content, PoolUse};
-
+use crate::branch::World;
+use crate::bricks::{Bricks, PoolUse};
 use crate::compact::Plan;
 use crate::host::Host;
-use crate::layout::{BINDINGS, GRAND, STATE};
+use crate::layout::{BINDINGS, Dimension};
 use crate::live::{self, Loop};
-use crate::resident::{Groups, Resident};
 use crate::rule3::Rule;
 use crate::rule3::code::{self, Code};
 use crate::rule3::embed::{self, Embed};
@@ -22,18 +25,24 @@ use crate::rule3::nature::{self, Nature};
 use crate::rule3::sand::{self, Sand};
 use crate::sand::Grid;
 use crate::sand3::Grid3;
+use crate::sweep;
 use crate::wire::{Json, counted, map, text};
 
 pub mod ask;
 pub mod branch;
+pub mod budget;
 pub mod errors;
+pub mod exec;
+pub mod journal;
 pub mod law;
 pub mod learn;
 pub mod schema;
 pub mod tools;
 pub mod transport;
 
+use budget::{Clock, Memory, Pace, Short, Stop};
 use errors::{Refusal, refusal_of};
+use journal::{Base, Entry, Keep, Ledger, Made};
 use schema::Check;
 
 /// The most cells one `grit_world_read` returns, and one `grit_world_write`
@@ -49,9 +58,6 @@ pub const STEP_MOST: u32 = 65536;
 pub const POOL_LEAST_CELLS: u64 = 1 << 21;
 
 pub const PAGE_BYTES: usize = (512 - 4) << 10;
-
-/// How many frames go to the device at a time.
-const BATCH: u32 = 64;
 
 /// The digits a slice of kinds is drawn with, one a kind.
 const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -169,97 +175,6 @@ pub fn refusal_name(why: &(dyn std::error::Error + 'static)) -> &'static str {
 
 pub type Failed = Box<dyn std::error::Error>;
 
-/// One open world: the listed engine under its rule, and the frame it is
-/// on.
-struct World<'host> {
-    rule: Box<dyn Listed>,
-    live: Resident<'host>,
-    stages: Vec<Vec<Groups>>,
-    grid: Grid,
-    solid: Grid3,
-    plan: Plan,
-    frame: u32,
-    pool: Option<Bricks>,
-}
-
-impl World<'_> {
-    const fn size(&self) -> [u32; 3] {
-        [self.solid.wide, self.solid.deep, self.solid.tall]
-    }
-
-    fn index(&self, at: [u32; 3]) -> usize {
-        self.solid.index(at[0], at[1], at[2])
-    }
-
-    fn listed(&mut self) -> Result<u32, Failed> {
-        if let Some(bricks) = self.pool.as_ref() {
-            let (octs, whole) = bricks.listed(&mut self.live)?;
-            return Ok(octs.saturating_add(whole.saturating_mul(bricks.per_block())));
-        }
-        Ok(self
-            .live
-            .read(GRAND as usize, 1)?
-            .first()
-            .copied()
-            .unwrap_or(0))
-    }
-
-    fn reported(&mut self, mut answer: Vec<(&'static str, Json)>) -> Result<Json, Failed> {
-        if let Some(bricks) = self.pool.as_ref() {
-            let used = bricks.pool_use(&mut self.live)?;
-            answer.push(("sparse", Json::Bool(true)));
-            answer.push(("pool_use", pooled(used)));
-        }
-        Ok(map(answer))
-    }
-
-    fn cells_at(&mut self, points: &[[u32; 3]]) -> Result<Vec<u32>, Failed> {
-        let Some(bricks) = self.pool.as_ref() else {
-            let last = points.iter().map(|&at| self.index(at)).max().unwrap_or(0);
-            let state = self.live.read(STATE as usize, last + 1)?;
-            return points
-                .iter()
-                .map(|&at| {
-                    state
-                        .get(self.index(at))
-                        .copied()
-                        .ok_or_else(|| "the world read back short".into())
-                })
-                .collect();
-        };
-        bricks.check(&mut self.live)?;
-        let table = self
-            .live
-            .read(bricks.table() as usize, bricks.table_words())?;
-        let per = bricks.cells();
-        let places: Vec<crate::bricks::Cell<u32>> =
-            points.iter().map(|&at| bricks.cell_of(at)).collect();
-        let slot_of = |brick: u32| {
-            table
-                .get(brick as usize * crate::bricks::ENTRY)
-                .copied()
-                .unwrap_or(crate::bricks::UNIFORM)
-        };
-        let reach = places
-            .iter()
-            .map(|place| slot_of(place.brick))
-            .filter(|&slot| slot != crate::bricks::UNIFORM)
-            .map(|slot| (slot as usize + 1) * per)
-            .max()
-            .unwrap_or(0);
-        let pool = live::read_state(&mut self.live, bricks.windows(), reach)?;
-        Ok(places
-            .iter()
-            .map(
-                |place| match bricks.brick_words(&table, &pool, place.brick) {
-                    Content::Uniform(value) => value,
-                    Content::Mixed(words) => words.get(place.offset as usize).copied().unwrap_or(0),
-                },
-            )
-            .collect())
-    }
-}
-
 fn pooled(used: PoolUse) -> Json {
     map(vec![
         ("held", counted(used.held)),
@@ -270,9 +185,145 @@ fn pooled(used: PoolUse) -> Json {
     ])
 }
 
-enum Slot<'host> {
-    Open(Box<World<'host>>),
-    Closed,
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    pub dir: Option<PathBuf>,
+    pub memory: Option<u64>,
+}
+
+pub struct Live<'host> {
+    world: World<'host>,
+    rule: Box<dyn Listed>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Held {
+    ledger: Ledger,
+    bytes: u64,
+    pace: Pace,
+    note: Option<Json>,
+}
+
+#[derive(Debug)]
+pub struct Book {
+    next: u32,
+    held: BTreeMap<u32, Held>,
+    earlier: BTreeMap<u32, Ledger>,
+    keep: Option<Keep>,
+    memory: Memory,
+    memory_fixed: bool,
+    lost: bool,
+    restorations: u64,
+    stats: Stats,
+    #[cfg(feature = "faults")]
+    faults: Arc<std::sync::Mutex<Faults>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    pub batches: Arc<std::sync::atomic::AtomicU64>,
+    pub longest: Duration,
+    pub longest_frames: u32,
+}
+
+#[cfg(feature = "faults")]
+#[derive(Debug, Clone, Default)]
+pub struct Faults {
+    pub wedge_after_batch: Option<u32>,
+    pub wedge_before_call: bool,
+}
+
+impl Book {
+    pub fn new(options: &Options) -> std::io::Result<Self> {
+        let keep = options.dir.as_deref().map(Keep::at).transpose()?;
+        let earlier: BTreeMap<u32, Ledger> = keep
+            .as_ref()
+            .map(Keep::earlier)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(keep) = keep.as_ref() {
+            let sums: Vec<[u8; 32]> = earlier.values().filter_map(Ledger::sum).collect();
+            keep.sweep(&sums);
+        }
+        let next = keep.as_ref().map_or(1, Keep::next).max(
+            earlier
+                .keys()
+                .max()
+                .map_or(1, |most| most.saturating_add(1)),
+        );
+        Ok(Self {
+            next,
+            held: BTreeMap::new(),
+            earlier,
+            keep,
+            memory: Memory::new(options.memory.unwrap_or(0)),
+            memory_fixed: options.memory.is_some(),
+            lost: false,
+            restorations: 0,
+            stats: Stats::default(),
+            #[cfg(feature = "faults")]
+            faults: Arc::default(),
+        })
+    }
+
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            next: 1,
+            held: BTreeMap::new(),
+            earlier: BTreeMap::new(),
+            keep: None,
+            memory: Memory::new(0),
+            memory_fixed: false,
+            lost: false,
+            restorations: 0,
+            stats: Stats::default(),
+            #[cfg(feature = "faults")]
+            faults: Arc::default(),
+        }
+    }
+
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub fn faults(&self) -> Arc<std::sync::Mutex<Faults>> {
+        Arc::clone(&self.faults)
+    }
+
+    fn referenced(&self, sum: &[u8; 32]) -> bool {
+        self.held
+            .values()
+            .map(|held| &held.ledger)
+            .chain(self.earlier.values())
+            .any(|ledger| ledger.sum().as_ref() == Some(sum))
+    }
+
+    fn release(&self, sum: Option<[u8; 32]>) {
+        if let (Some(sum), Some(keep)) = (sum, self.keep.as_ref())
+            && !self.referenced(&sum)
+        {
+            keep.drop_snapshot(&sum);
+        }
+    }
+
+    #[must_use]
+    pub const fn lost(&self) -> bool {
+        self.lost
+    }
+
+    #[must_use]
+    pub fn batches(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.stats.batches)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub device: Json,
+    pub memory: Json,
+    pub worlds: Json,
+    pub submissions: Json,
+    pub directory: Json,
 }
 
 pub struct Tool {
@@ -286,12 +337,15 @@ pub struct Tool {
 /// the world tools.
 pub struct Server<'host> {
     host: Option<&'host Host>,
-    worlds: BTreeMap<u32, Slot<'host>>,
-    next: u32,
+    book: Book,
+    live: BTreeMap<u32, Live<'host>>,
+    clock: Clock,
+    arrived: Option<Instant>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 /// The names of the world tools, in the order `tools/list` gives them.
-pub const WORLD_TOOLS: [&str; 8] = [
+pub const WORLD_TOOLS: [&str; 13] = [
     "grit_world_rules",
     "grit_world_create",
     "grit_world_write",
@@ -300,6 +354,11 @@ pub const WORLD_TOOLS: [&str; 8] = [
     "grit_world_slice",
     "grit_world_close",
     "grit_describe",
+    "grit_world_save",
+    "grit_world_open",
+    "grit_world_list",
+    "grit_world_fork",
+    "grit_world_restore",
 ];
 
 fn served() -> impl Iterator<Item = &'static Tool> {
@@ -333,6 +392,13 @@ fn flat() -> Vec<Json> {
         Json::List(held) => held.into_iter().map(shut).collect(),
         other => vec![shut(other)],
     }
+}
+
+#[must_use]
+pub fn listing_all() -> Vec<Json> {
+    let mut listed = flat();
+    listed.extend(served().map(|tool| (tool.shown)()));
+    listed
 }
 
 fn input(shown: &Json) -> Json {
@@ -381,7 +447,11 @@ fn listing() -> String {
         .join(", ")
 }
 
-fn world_refusal(mut refusal: Refusal, arguments: &Json) -> Json {
+fn world_refusal(
+    mut refusal: Refusal,
+    arguments: &Json,
+    mut more: Vec<(&'static str, Json)>,
+) -> Json {
     let code = refusal.code;
     if code == errors::Code::UnknownRule {
         let asked = match arguments.get("rule") {
@@ -391,11 +461,9 @@ fn world_refusal(mut refusal: Refusal, arguments: &Json) -> Json {
         };
         refusal.message = format!("rule {asked} is not one of {}", listing());
     }
-    let more = if matches!(code, errors::Code::UnknownRule | errors::Code::Params) {
-        vec![("rules", known_rules())]
-    } else {
-        Vec::new()
-    };
+    if matches!(code, errors::Code::UnknownRule | errors::Code::Params) {
+        more.push(("rules", known_rules()));
+    }
     transport::refused(&refusal, more)
 }
 
@@ -426,39 +494,389 @@ impl transport::Served for Flat<'_> {
     }
 }
 
+fn lost_device(why: &(dyn std::error::Error + 'static)) -> bool {
+    why.downcast_ref::<tools::Lost>().is_some()
+        || matches!(
+            why.downcast_ref::<crate::host::Error>(),
+            Some(
+                crate::host::Error::Wedged { .. }
+                    | crate::host::Error::Vulkan(ash::vk::Result::ERROR_DEVICE_LOST)
+            )
+        )
+}
+
+fn branch_refusal(why: &crate::branch::Refused) -> Refusal {
+    use crate::branch::Refused;
+    let code = match why {
+        Refused::Unfit { .. } => errors::Code::Unfit,
+        Refused::Rule { .. } => errors::Code::UnknownRule,
+        Refused::Params { .. } => errors::Code::Params,
+        Refused::Unlike { .. } => errors::Code::Unlike,
+        Refused::Outside { .. } => errors::Code::Outside,
+        Refused::Io { .. } => errors::Code::Io,
+        Refused::Magic
+        | Refused::Version { .. }
+        | Refused::Checksum
+        | Refused::Truncated { .. }
+        | Refused::Sizes { .. }
+        | Refused::LawHash
+        | Refused::Section { .. }
+        | Refused::Trailing { .. }
+        | Refused::Malformed { .. } => errors::Code::BadFile,
+    };
+    Refusal::new(code, "$", format!("{why} ({})", why.name()))
+}
+
+fn refused_with(why: &(dyn std::error::Error + 'static)) -> (Refusal, Vec<(&'static str, Json)>) {
+    if let Some(short) = why.downcast_ref::<Short>() {
+        return (short.refusal(), short.told());
+    }
+    if let Some(tools::Lost(refusal)) = why.downcast_ref::<tools::Lost>() {
+        return (refusal.clone(), Vec::new());
+    }
+    if let Some(held) = why.downcast_ref::<crate::branch::Refused>() {
+        return (branch_refusal(held), Vec::new());
+    }
+    if lost_device(why) {
+        return (
+            Refusal::new(
+                errors::Code::DeviceLost,
+                "$",
+                format!(
+                    "the device was lost during this call ({why}); every open world is kept by its journal"
+                ),
+            ),
+            Vec::new(),
+        );
+    }
+    (refusal_of(why), Vec::new())
+}
+
+fn number_of(held: &Json, key: &str) -> Option<u32> {
+    held.get(key)
+        .and_then(Json::int)
+        .and_then(|one| u32::try_from(one).ok())
+}
+
 impl<'host> Server<'host> {
     #[must_use]
-    pub const fn new(host: Option<&'host Host>) -> Self {
-        Self {
-            host,
-            worlds: BTreeMap::new(),
-            next: 1,
+    pub fn new(host: Option<&'host Host>) -> Self {
+        Self::resumed(host, Book::empty()).0
+    }
+
+    pub fn with(host: Option<&'host Host>, options: &Options) -> std::io::Result<Self> {
+        Ok(Self::resumed(host, Book::new(options)?).0)
+    }
+
+    #[must_use]
+    pub fn resumed(host: Option<&'host Host>, mut book: Book) -> (Self, Vec<Json>) {
+        if !book.memory_fixed {
+            book.memory
+                .set_allowed(host.map_or(0, |host| Memory::share_of(host.heap())));
         }
+        let was_lost = book.lost;
+        book.lost = false;
+        let mut server = Self {
+            host,
+            book,
+            live: BTreeMap::new(),
+            clock: Clock::of(Instant::now(), budget::BUDGET_MS),
+            arrived: None,
+            cancel: None,
+        };
+        let mut restored = Vec::new();
+        if !was_lost {
+            return (server, restored);
+        }
+        let numbers: Vec<u32> = server.book.held.keys().copied().collect();
+        for number in numbers {
+            restored.push(server.rebuild(number));
+        }
+        server.book.restorations = server.book.restorations.saturating_add(1);
+        if server.wedged() {
+            server.lose();
+        }
+        (server, restored)
+    }
+
+    fn rebuild(&mut self, number: u32) -> Json {
+        let Some(held) = self.book.held.get(&number) else {
+            return Json::Null;
+        };
+        let ledger = held.ledger.clone();
+        let mut pace = held.pace;
+        let from_frame = match &ledger.base {
+            Base::Created(_) => 0,
+            Base::Snapshot(snap) => snap.frame,
+        };
+        let replayed = u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX);
+        let built = match self.host {
+            None => Err(Box::new(crate::host::Error::NoComputeDevice) as Failed),
+            Some(host) => {
+                journal::rebuilt(host, &ledger, self.book.keep.as_ref(), |world, frames| {
+                    paced(world, frames, &mut pace)
+                })
+                .and_then(|world| {
+                    let rule = rule_of(host, world.rule())?;
+                    Ok(Live { world, rule })
+                })
+            }
+        };
+        let mut note = vec![
+            ("world", counted(number)),
+            ("from_frame", counted(from_frame)),
+            ("replayed", counted(replayed)),
+            ("frame", counted(ledger.frame)),
+        ];
+        match built {
+            Ok(live) => {
+                self.live.insert(number, live);
+            }
+            Err(why) => {
+                self.book.lost = true;
+                note.push(("failed", text(&refused_with(why.as_ref()).0.message)));
+            }
+        }
+        let note = map(note);
+        if let Some(held) = self.book.held.get_mut(&number) {
+            held.pace = pace;
+            held.note = Some(note.clone());
+        }
+        note
+    }
+
+    #[must_use]
+    pub fn into_book(self) -> Book {
+        self.book
+    }
+
+    #[must_use]
+    pub const fn lost(&self) -> bool {
+        self.book.lost
+    }
+
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub fn faults(&self) -> Arc<std::sync::Mutex<Faults>> {
+        self.book.faults()
     }
 
     /// How many worlds are open.
     #[must_use]
     pub fn open(&self) -> usize {
-        self.worlds
-            .values()
-            .filter(|slot| matches!(slot, Slot::Open(_)))
-            .count()
+        self.live.len()
     }
 
-    fn world(&mut self, held: &Json) -> Result<&mut World<'host>, Failed> {
-        let world = tools::int(held, "world")?;
-        match self.worlds.get_mut(&world) {
-            Some(Slot::Open(open)) => Ok(open),
-            Some(Slot::Closed) => Err(Box::new(Refusal::new(
-                errors::Code::Closed,
-                "$.world",
-                format!("world {world} was closed"),
-            ))),
-            None => Err(Box::new(Refusal::new(
+    pub fn arriving(&mut self, arrived: Instant, cancel: Option<Arc<AtomicBool>>) {
+        self.arrived = Some(arrived);
+        self.cancel = cancel;
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    fn stop(&self) -> Option<Stop> {
+        if self.cancelled() {
+            return Some(Stop::Cancelled);
+        }
+        self.clock.left().is_zero().then_some(Stop::Budget)
+    }
+
+    fn lose(&mut self) {
+        self.live.clear();
+        self.book.lost = true;
+    }
+
+    fn wedged(&self) -> bool {
+        self.host.is_some_and(Host::wedged)
+    }
+
+    fn world(&mut self, held: &Json) -> Result<&mut Live<'host>, Failed> {
+        let number = tools::int(held, "world")?;
+        self.world_at(number, "$.world")
+    }
+
+    fn world_at(&mut self, number: u32, field: &str) -> Result<&mut Live<'host>, Failed> {
+        if self.live.contains_key(&number) {
+            return self
+                .live
+                .get_mut(&number)
+                .ok_or_else(|| "the world went away".into());
+        }
+        let refusal = if self.book.held.contains_key(&number) {
+            Refusal::new(
+                errors::Code::DeviceLost,
+                field,
+                format!(
+                    "world {number} was on a device that was lost, and this server has not rebuilt it"
+                ),
+            )
+        } else if self.book.earlier.contains_key(&number) {
+            Refusal::new(
                 errors::Code::NoWorld,
-                "$.world",
-                format!("no world {world} was ever opened"),
+                field,
+                format!(
+                    "world {number} is kept from an earlier run of the server; open it with grit_world_open first"
+                ),
+            )
+        } else if number < self.book.next {
+            Refusal::new(
+                errors::Code::Closed,
+                field,
+                format!("world {number} was closed"),
+            )
+        } else {
+            Refusal::new(
+                errors::Code::NoWorld,
+                field,
+                format!("no world {number} was ever opened"),
+            )
+        };
+        Err(Box::new(refusal))
+    }
+
+    fn number(&mut self) -> Result<u32, Failed> {
+        let id = self.book.next;
+        let next = id.checked_add(1).ok_or_else(|| {
+            Box::new(
+                Refusal::new(
+                    errors::Code::TooMany,
+                    "$",
+                    "every world number has been used".to_owned(),
+                )
+                .limited(counted(u32::MAX)),
+            ) as Failed
+        })?;
+        if let Some(keep) = self.book.keep.as_ref() {
+            keep.set_next(next).map_err(|why| io_refusal(&why))?;
+        }
+        self.book.next = next;
+        Ok(id)
+    }
+
+    fn adopt(
+        &mut self,
+        number: u32,
+        live: Live<'host>,
+        ledger: Ledger,
+        bytes: u64,
+        pace: Pace,
+    ) -> Option<Json> {
+        let failed = self
+            .book
+            .keep
+            .as_ref()
+            .and_then(|keep| keep.begin(number, &ledger).err());
+        self.book.memory.hold(number, bytes);
+        self.book.held.insert(
+            number,
+            Held {
+                ledger,
+                bytes,
+                pace,
+                note: None,
+            },
+        );
+        self.live.insert(number, live);
+        failed.map(|why| text(&format!("the journal could not be written: {why}")))
+    }
+
+    fn journaled(&mut self, number: u32, entry: Entry, spent: Duration) -> Option<Json> {
+        let keep = self.book.keep.clone();
+        let failed = keep
+            .as_ref()
+            .and_then(|keep| keep.append(number, &entry).err());
+        let held = self.book.held.get_mut(&number)?;
+        held.ledger.push(entry, spent);
+        failed.map(|why| text(&format!("the journal could not be written: {why}")))
+    }
+
+    fn settle(&mut self, number: u32) -> Option<Json> {
+        let held = self.book.held.get(&number)?;
+        if !held.ledger.due(held.bytes) {
+            return None;
+        }
+        let made = held.ledger.made().clone();
+        let old = held.ledger.sum();
+        let keep = self.book.keep.clone();
+        let live = self.live.get_mut(&number)?;
+        let began = Instant::now();
+        let snapped = snapshot(&mut live.world, made, keep.as_ref(), number);
+        let cost = began.elapsed();
+        match snapped {
+            Ok(snap) => {
+                let held = self.book.held.get_mut(&number)?;
+                held.ledger.rebase(snap, cost);
+                let failed = keep
+                    .as_ref()
+                    .and_then(|keep| keep.begin(number, &held.ledger).err());
+                self.book.release(old);
+                failed.map(|why| text(&format!("the journal could not be written: {why}")))
+            }
+            Err(why) => Some(text(&format!(
+                "the snapshot could not be taken: {}",
+                refused_with(why.as_ref()).0.message
             ))),
+        }
+    }
+
+    fn forget(&mut self, number: u32) {
+        self.live.remove(&number);
+        let old = self
+            .book
+            .held
+            .remove(&number)
+            .and_then(|held| held.ledger.sum());
+        self.book.memory.free(number);
+        if let Some(keep) = self.book.keep.as_ref() {
+            keep.forget(number);
+        }
+        self.book.release(old);
+    }
+
+    #[must_use]
+    pub fn status(&self) -> Status {
+        let device = self.host.map_or(Json::Null, |host| {
+            map(vec![
+                ("name", text(host.name())),
+                ("subgroup", counted(host.width())),
+                ("heap_bytes", budget::counted64(host.heap())),
+            ])
+        });
+        let many = |count: usize| counted(u32::try_from(count).unwrap_or(u32::MAX));
+        Status {
+            device,
+            memory: self.book.memory.shown(),
+            worlds: map(vec![
+                ("open", many(self.live.len())),
+                (
+                    "lost",
+                    many(self.book.held.len().saturating_sub(self.live.len())),
+                ),
+                ("kept_earlier", many(self.book.earlier.len())),
+                ("restorations", budget::counted64(self.book.restorations)),
+            ]),
+            submissions: map(vec![
+                (
+                    "batches",
+                    budget::counted64(self.book.stats.batches.load(Ordering::SeqCst)),
+                ),
+                (
+                    "longest_ms",
+                    budget::counted64(
+                        u64::try_from(self.book.stats.longest.as_millis()).unwrap_or(u64::MAX),
+                    ),
+                ),
+                ("longest_frames", counted(self.book.stats.longest_frames)),
+            ]),
+            directory: self
+                .book
+                .keep
+                .as_ref()
+                .map_or(Json::Null, |keep| text(&keep.root().to_string_lossy())),
         }
     }
 
@@ -472,26 +890,270 @@ impl<'host> Server<'host> {
     pub fn heard(&mut self, line: &str) -> Option<Json> {
         transport::heard(self, line)
     }
+
+    fn noted(&mut self, number: Option<u32>) -> Option<Json> {
+        number
+            .and_then(|number| self.book.held.get_mut(&number))
+            .and_then(|held| held.note.take())
+    }
+
+    fn run_tool(&mut self, tool: &Tool, arguments: &Json) -> Json {
+        let given =
+            match schema::checked(tool.name, &input(&(tool.shown)()), arguments, Check::Whole) {
+                Ok(given) => given,
+                Err(refusal) => return world_refusal(refusal, arguments, Vec::new()),
+            };
+        let budget_ms = given
+            .get("budget_ms")
+            .and_then(Json::int)
+            .and_then(|one| u64::try_from(one).ok())
+            .unwrap_or(budget::BUDGET_MS);
+        let arrived = self.arrived.take().unwrap_or_else(Instant::now);
+        self.clock = Clock::of(arrived, budget_ms);
+        if self.cancelled() {
+            return world_refusal(
+                Refusal::new(
+                    errors::Code::Cancelled,
+                    "$",
+                    "the call was cancelled before it began; nothing ran".to_owned(),
+                ),
+                arguments,
+                Vec::new(),
+            );
+        }
+        if self.clock.left().is_zero() {
+            return world_refusal(
+                Refusal::new(
+                    errors::Code::Budget,
+                    "$.budget_ms",
+                    format!(
+                        "the call waited {} ms behind earlier calls, past its budget of {budget_ms} ms, so nothing ran",
+                        self.clock.spent().as_millis()
+                    ),
+                )
+                .limited(budget::counted64(budget_ms)),
+                arguments,
+                Vec::new(),
+            );
+        }
+        #[cfg(feature = "faults")]
+        {
+            let armed = self
+                .book
+                .faults
+                .lock()
+                .map(|mut faults| std::mem::take(&mut faults.wedge_before_call))
+                .unwrap_or(false);
+            if armed && let Some(host) = self.host {
+                host.wedge();
+            }
+        }
+        let number = number_of(&given, "world");
+        let ran = (tool.run)(self, &given);
+        let lost = self.wedged()
+            || ran
+                .as_ref()
+                .err()
+                .is_some_and(|why| lost_device(why.as_ref()));
+        if lost {
+            self.lose();
+        }
+        let note = self.noted(number);
+        match ran {
+            Ok(Json::Map(mut result)) => {
+                if let Some(note) = note {
+                    result.push(("restored".to_owned(), note));
+                }
+                delivery(Json::Map(result))
+            }
+            Ok(result) => delivery(result),
+            Err(why) => {
+                let (mut refusal, mut more) = refused_with(why.as_ref());
+                if lost {
+                    refusal.code = errors::Code::DeviceLost;
+                }
+                if let Some(note) = note {
+                    more.push(("restored", note));
+                }
+                world_refusal(refusal, arguments, more)
+            }
+        }
+    }
+}
+
+fn io_refusal(why: &std::io::Error) -> Failed {
+    Box::new(Refusal::new(
+        errors::Code::Io,
+        "$",
+        format!("the server directory could not be written: {why}"),
+    ))
+}
+
+fn rule_of(host: &Host, name: &str) -> Result<Box<dyn Listed>, Failed> {
+    let mut known = rules_on(Some(host));
+    let at = known
+        .iter()
+        .position(|one| one.name() == name)
+        .ok_or_else(|| {
+            Box::new(crate::branch::Refused::Rule {
+                name: name.to_owned(),
+            }) as Failed
+        })?;
+    Ok(known.swap_remove(at))
+}
+
+fn paced(world: &mut World<'_>, frames: u32, pace: &mut Pace) -> Result<(), Failed> {
+    let mut done = 0_u32;
+    while done < frames {
+        let step = pace.batch(frames - done, Duration::MAX).max(1);
+        let began = Instant::now();
+        world.step(step)?;
+        pace.ran(step, began.elapsed());
+        done += step;
+    }
+    Ok(())
+}
+
+fn snapshot(
+    world: &mut World<'_>,
+    made: Made,
+    keep: Option<&Keep>,
+    number: u32,
+) -> Result<Arc<journal::Snap>, Failed> {
+    let image = world.image()?;
+    let frame = image.frame;
+    let made = Made {
+        slots: match &image.state {
+            crate::branch::State::Sparse { capacity, .. } => Some(*capacity),
+            crate::branch::State::Dense(_) => made.slots,
+        },
+        ..made
+    };
+    match keep {
+        Some(keep) => {
+            let pending = keep.pending(number);
+            let _ = std::fs::remove_file(&pending);
+            crate::branch::format::store(&pending, &image)?;
+            let (sum, _) = keep.settle(&pending).map_err(|why| io_refusal(&why))?;
+            Ok(Arc::new(journal::Snap {
+                sum,
+                frame,
+                made,
+                image: None,
+            }))
+        }
+        None => {
+            let sum = journal::state_of(&image);
+            Ok(Arc::new(journal::Snap {
+                sum,
+                frame,
+                made,
+                image: Some(image),
+            }))
+        }
+    }
+}
+
+pub fn shaped(host: &Host, rule: &dyn Listed, made: &Made) -> Result<(Grid, Vec<usize>), Failed> {
+    let [wide, deep, tall] = made.size;
+    let grid = Grid::solid(wide, deep, tall)?;
+    if grid.tall < 2 {
+        return Err(Box::new(Refusal::new(
+            errors::Code::Lane,
+            "$.tall",
+            format!(
+                "a world of {wide} by {deep} by {tall} cells is not solid: tall needs at least 2 cells"
+            ),
+        )));
+    }
+    let width = host.width();
+    let blocks = grid.blocks().div_ceil(sweep::cells(width));
+    let plan = if made.sparse {
+        Plan::bricked(width, blocks)?
+    } else {
+        Plan::over_in(width, blocks, Dimension::Three)?
+    };
+    let sizes = if made.sparse {
+        let most = u32::try_from(((1_u64 << 32) - 1) / (u64::from(plan.per_block) * 8))
+            .unwrap_or(u32::MAX)
+            .min(plan.blocks);
+        let brick_cells = u64::from(plan.per_block) * 8;
+        let least = u32::try_from(POOL_LEAST_CELLS.div_ceil(brick_cells)).unwrap_or(u32::MAX);
+        let capacity = made
+            .slots
+            .unwrap_or((plan.blocks / 4).max(least))
+            .clamp(1, most.max(1));
+        let bricks = Bricks::new(grid, &plan, capacity)?;
+        rule.bricked_sizes(&bricks, &plan)
+    } else {
+        if Grid3::new(grid.wide, grid.deep, grid.tall).is_none() {
+            return Err(Box::new(Refusal::new(
+                errors::Code::Unfit,
+                "$",
+                format!(
+                    "a dense world of {wide} by {deep} by {tall} cells is not solid; ask for a sparse one"
+                ),
+            )));
+        }
+        plan.windows().laid(&rule.sizes(&plan))
+    };
+    Ok((grid, sizes))
+}
+
+pub fn image_shaped(
+    host: &Host,
+    rule: &dyn Listed,
+    image: &crate::branch::Image,
+) -> Result<Vec<usize>, Failed> {
+    let mut made = Made::of_image(image);
+    if let crate::branch::State::Sparse {
+        capacity,
+        sides,
+        pool,
+        ..
+    } = &image.state
+    {
+        let [wide, deep, tall] = image.size;
+        let grid = Grid::solid(wide, deep, tall)?;
+        let width = host.width();
+        let blocks = grid.blocks().div_ceil(sweep::cells(width));
+        let plan = Plan::bricked(width, blocks)?;
+        let probe = Bricks::new(grid, &plan, 1)?;
+        let per = crate::branch::format::brick_cells(*sides).max(1);
+        let held = u32::try_from(pool.len() / per).unwrap_or(u32::MAX);
+        made.slots = Some(if probe.sides() == *sides {
+            (*capacity).max(held)
+        } else {
+            plan.blocks
+        });
+    }
+    Ok(shaped(host, rule, &made)?.1)
+}
+
+fn world_bytes(host: &Host, live: &Live<'_>) -> u64 {
+    let made = Made {
+        rule: live.world.rule().to_owned(),
+        params: live.world.params().to_vec(),
+        size: live.world.size(),
+        sparse: live.world.pool().is_some(),
+        slots: live.world.pool().map(|bricks| bricks.capacity()),
+    };
+    shaped(host, live.rule.as_ref(), &made).map_or(0, |(_, sizes)| budget::bytes_of(&sizes))
 }
 
 impl transport::Served for Server<'_> {
     fn listed(&self) -> Vec<Json> {
-        let mut listed = flat();
-        listed.extend(served().map(|tool| (tool.shown)()));
-        listed
+        listing_all()
     }
 
     fn called(&mut self, name: &str, arguments: &Json) -> Option<Json> {
         let Some(tool) = served().find(|tool| tool.name == name) else {
-            return flat_called(self.host, &flat(), name, arguments);
+            let answer = flat_called(self.host, &flat(), name, arguments);
+            if self.wedged() {
+                self.lose();
+            }
+            return answer;
         };
-        let given = match schema::checked(name, &input(&(tool.shown)()), arguments, Check::Whole) {
-            Ok(given) => given,
-            Err(refusal) => return Some(world_refusal(refusal, arguments)),
-        };
-        Some(match (tool.run)(self, &given) {
-            Ok(result) => delivery(result),
-            Err(why) => world_refusal(refusal_of(why.as_ref()), arguments),
-        })
+        Some(self.run_tool(tool, arguments))
     }
 }
