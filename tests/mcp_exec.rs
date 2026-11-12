@@ -631,7 +631,7 @@ fn a_journal_torn_at_its_end_keeps_every_whole_record_before_it() {
     ];
     for entry in &entries {
         ledger.push(entry.clone(), Duration::ZERO);
-        keep.append(5, entry).unwrap();
+        keep.append(5, entry, Duration::ZERO).unwrap();
     }
     let path = scratch.dir().join("kept").join("world-5.journal");
     let whole = std::fs::read(&path).unwrap();
@@ -1908,12 +1908,12 @@ fn a_world_that_cannot_be_rebuilt_is_reported_once_and_leaves_the_others_alone()
         .and_then(Json::list)
         .unwrap()
         .to_vec();
-    let failed: Vec<i64> = restored
+    let pending: Vec<i64> = restored
         .iter()
-        .filter(|one| one.get("failed").is_some())
+        .filter(|one| one.get("pending") == Some(&Json::Bool(true)))
         .map(|one| one.int_at("world"))
         .collect();
-    assert_eq!(failed, [second]);
+    assert_eq!(pending, [first, second]);
     let restorations = |run: &mut Run| {
         answer(&run.ask("grit_describe", "{}"))
             .get("worlds")
@@ -1939,6 +1939,14 @@ fn a_world_that_cannot_be_rebuilt_is_reported_once_and_leaves_the_others_alone()
         "{}",
         told.message
     );
+    let note = told.all.get("restored").unwrap();
+    assert_eq!(note.int_at("world"), second);
+    assert!(note.get("failed").is_some(), "{}", written(note));
+    let again = refused(&run.ask(
+        "grit_world_read",
+        &format!("{{\"world\":{second},\"from\":[0,0,0],\"to\":[0,0,0]}}"),
+    ));
+    assert!(again.all.get("restored").is_none());
     assert_eq!(restorations(&mut run), 1);
     let listed = answer(&run.ask("grit_world_list", "{}"));
     let kinds = kinds_listed(&listed);
@@ -2160,4 +2168,381 @@ fn reading_one_cell_costs_the_same_device_waits_and_words_whatever_the_world_siz
             most(large)
         );
     }
+}
+
+#[test]
+fn a_save_an_open_a_fork_and_a_create_too_slow_for_their_budget_are_refused_before_they_start() {
+    let Some(host) = device("work estimated before it starts") else {
+        return;
+    };
+    let scratch = Scratch::new("estimates");
+    let options = Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    };
+    let mut server = Server::with(Some(&host), &options).unwrap();
+    let made = "{\"wide\":128,\"deep\":128,\"tall\":128,\"rule\":\"sand\"";
+    let world = create(&mut server, &format!("{made}}}"));
+    answer(&call(
+        &mut server,
+        "grit_world_save",
+        &format!("{{\"world\":{world},\"name\":\"first\"}}"),
+    ));
+    let before = entries(&scratch.dir());
+    let listed = answer(&call(&mut server, "grit_world_list", "{}")).int_at("total");
+    for (tool, arguments, what) in [
+        (
+            "grit_world_save",
+            format!("{{\"world\":{world},\"name\":\"second\",\"budget_ms\":1}}"),
+            "writing world",
+        ),
+        (
+            "grit_world_open",
+            "{\"name\":\"first\",\"budget_ms\":1}".to_owned(),
+            "",
+        ),
+        (
+            "grit_world_fork",
+            format!("{{\"world\":{world},\"budget_ms\":1}}"),
+            "copying world",
+        ),
+        (
+            "grit_world_create",
+            format!("{made},\"budget_ms\":1}}"),
+            "building the world",
+        ),
+    ] {
+        let began = Instant::now();
+        let told = refused(&call(&mut server, tool, &arguments));
+        let took = began.elapsed();
+        assert_eq!(
+            (told.code.as_str(), told.field.as_str()),
+            ("budget", "$.budget_ms"),
+            "{tool}: {}",
+            told.message
+        );
+        assert!(told.message.contains(what), "{tool}: {}", told.message);
+        assert!(told.message.contains("nothing ran"), "{}", told.message);
+        assert!(
+            told.all.int_at("limit") > 1,
+            "{tool}: {}",
+            written(&told.all)
+        );
+        assert!(took < Duration::from_millis(50), "{tool}: {took:?}");
+    }
+    assert_eq!(entries(&scratch.dir()), before);
+    let after = answer(&call(&mut server, "grit_world_list", "{}")).int_at("total");
+    assert_eq!(after, listed);
+    let rates = described(&mut server)
+        .get("submissions")
+        .and_then(|one| one.get("rates"))
+        .cloned()
+        .unwrap();
+    for work in ["build", "save"] {
+        assert_eq!(
+            rates.get(work).unwrap().get("measured"),
+            Some(&Json::Bool(true)),
+            "{work}: {}",
+            written(&rates)
+        );
+    }
+    let next = create(&mut server, &format!("{made}}}"));
+    assert_eq!(next, world + 1);
+}
+
+fn dense_side(host: &Host) -> u32 {
+    let sand = rules()
+        .into_iter()
+        .find(|one| one.name() == "sand")
+        .unwrap();
+    for side in [256, 128, 64] {
+        let made = Made {
+            rule: "sand".to_owned(),
+            params: Vec::new(),
+            size: [side, side, side],
+            sparse: false,
+            slots: None,
+        };
+        if let Ok((_, sizes)) = grit::serve3::shaped(host, sand.as_ref(), &made)
+            && host.limits().admits(&sizes, None).is_ok()
+        {
+            return side;
+        }
+    }
+    32
+}
+
+#[test]
+fn a_kept_world_too_large_to_build_in_the_budget_is_refused_before_it_is_built() {
+    let Some(host) = device("kept open estimated") else {
+        return;
+    };
+    let side = dense_side(&host);
+    drop(host);
+    let scratch = Scratch::new("kept-estimate");
+    let options = Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    };
+    let mut run = Run::new(&options);
+    let world = answer(&run.ask(
+        "grit_world_create",
+        &format!("{{\"wide\":{side},\"deep\":{side},\"tall\":{side},\"rule\":\"sand\"}}"),
+    ))
+    .int_at("world");
+    answer(&run.ask(
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":3}}"),
+    ));
+    run.exec.finish();
+    let mut again = Run::new(&options);
+    let began = Instant::now();
+    let told = refused(&again.ask(
+        "grit_world_open",
+        &format!("{{\"name\":\"world-{world}\",\"budget_ms\":20}}"),
+    ));
+    let took = began.elapsed();
+    eprintln!(
+        "a {side}^3 kept world refused in {took:?}: {}",
+        told.message
+    );
+    assert_eq!(told.code, "budget", "{}", told.message);
+    assert!(
+        told.message.contains("rebuilding world"),
+        "{}",
+        told.message
+    );
+    assert!(took < Duration::from_millis(20 + 100), "{took:?}");
+    let opened = answer(&again.ask(
+        "grit_world_open",
+        &format!("{{\"name\":\"world-{world}\"}}"),
+    ));
+    assert_eq!(opened.int_at("frame"), 3);
+    again.exec.finish();
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn after_a_lost_device_only_the_worlds_a_call_touches_are_rebuilt_inside_its_budget() {
+    let Some(host) = device("lazy rebuild") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("lazy");
+    let mut run = Run::new(&Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    });
+    let mut seed = 0x1A2B_u64;
+    let mut models = Vec::new();
+    for _ in 0..3 {
+        let mut model = Model::new("sand", &[], 16);
+        let world = answer(&run.ask("grit_world_create", &model.create(false))).int_at("world");
+        let cells = scattered(&mut seed, 16, 1000, &SAND_WORDS);
+        answer(&run.ask(
+            "grit_world_write",
+            &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
+        ));
+        model.write(&cells);
+        answer(&run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":20}}"),
+        ));
+        model.step(20);
+        models.push((world, model));
+    }
+    let worlds = |run: &mut Run| {
+        answer(&run.ask("grit_describe", "{}"))
+            .get("worlds")
+            .cloned()
+            .unwrap()
+    };
+    armed(&run, None, true);
+    let first = models[0].0;
+    let told = refused(&run.ask(
+        "grit_world_read",
+        &format!("{{\"world\":{first},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":1000}}"),
+    ));
+    assert_eq!(told.code, "device_lost", "{}", told.message);
+    let restored = told
+        .all
+        .get("restored")
+        .and_then(Json::list)
+        .unwrap()
+        .to_vec();
+    assert_eq!(restored.len(), 3);
+    for note in &restored {
+        assert_eq!(
+            note.get("pending"),
+            Some(&Json::Bool(true)),
+            "{}",
+            written(note)
+        );
+    }
+    let now = worlds(&mut run);
+    assert_eq!((now.int_at("open"), now.int_at("lost")), (0, 3));
+    let (second, model) = &models[1];
+    let got = answer(&run.ask("grit_world_read", &model.read(second)));
+    assert_eq!(numbers(&got, "cells"), model.cells);
+    let note = got.get("restored").unwrap();
+    assert_eq!(note.int_at("world"), *second);
+    assert_eq!(note.int_at("frame"), 20);
+    let now = worlds(&mut run);
+    assert_eq!((now.int_at("open"), now.int_at("lost")), (1, 2));
+    let third = models[2].0;
+    let told = refused(&run.ask(
+        "grit_world_read",
+        &format!("{{\"world\":{third},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":1}}"),
+    ));
+    assert_eq!(told.code, "budget", "{}", told.message);
+    assert!(
+        told.message.contains("rebuilding world"),
+        "{}",
+        told.message
+    );
+    let now = worlds(&mut run);
+    assert_eq!((now.int_at("open"), now.int_at("lost")), (1, 2));
+    for (world, model) in &models {
+        let got = answer(&run.ask("grit_world_read", &model.read(world)));
+        assert_eq!(numbers(&got, "cells"), model.cells, "world {world}");
+    }
+    let now = worlds(&mut run);
+    assert_eq!(
+        (
+            now.int_at("open"),
+            now.int_at("lost"),
+            now.int_at("restorations")
+        ),
+        (3, 0, 1)
+    );
+    run.exec.finish();
+}
+
+#[test]
+fn the_journal_bound_counts_replay_at_the_rate_replay_runs() {
+    let scratch = Scratch::new("ratio");
+    let keep = Keep::at(&scratch.dir()).unwrap();
+    let mut ledger = Ledger::created(Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [8, 8, 8],
+        sparse: false,
+        slots: None,
+    });
+    keep.begin(1, &ledger).unwrap();
+    for spent in [400, 500, 600] {
+        let entry = Entry::Step(10);
+        let spent = Duration::from_millis(spent);
+        ledger.push(entry.clone(), spent);
+        keep.append(1, &entry, spent).unwrap();
+    }
+    assert_eq!(ledger.replay(), Duration::from_millis(1500));
+    assert!(!ledger.over(Duration::ZERO, 0, 1.0));
+    assert!(!ledger.over(Duration::ZERO, 0, 1.3));
+    assert!(ledger.over(Duration::ZERO, 0, 1.4));
+    assert!(ledger.over(Duration::ZERO, 0, 2.0));
+    assert!(ledger.over(Duration::from_millis(600), 0, 1.0));
+    let found = keep.earlier();
+    assert_eq!(found[0].1.replay(), Duration::from_millis(1500));
+    assert!(found[0].1.over(Duration::ZERO, 0, 2.0));
+}
+
+#[test]
+fn the_last_world_number_is_refused_and_never_handed_out_twice() {
+    let Some(host) = device("last world number") else {
+        return;
+    };
+    let scratch = Scratch::new("last-number");
+    let most = journal::NUMBER_MOST;
+    Keep::at(&scratch.dir())
+        .unwrap()
+        .set_next(most - 1)
+        .unwrap();
+    let options = Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    };
+    let made = "{\"wide\":4,\"deep\":4,\"tall\":4,\"rule\":\"sand\"}";
+    {
+        let mut server = Server::with(Some(&host), &options).unwrap();
+        let world = create(&mut server, made);
+        assert_eq!(world, most - 1);
+        answer(&call(
+            &mut server,
+            "grit_world_close",
+            &format!("{{\"world\":{world}}}"),
+        ));
+        let told = refused(&call(&mut server, "grit_world_create", made));
+        assert_eq!(told.code, "too_many", "{}", told.message);
+        assert_eq!(told.all.int_at("limit"), i64::from(most));
+    }
+    let next = std::fs::read_to_string(scratch.dir().join("kept").join("next")).unwrap();
+    assert_eq!(next.trim(), most.to_string());
+    let mut server = Server::with(Some(&host), &options).unwrap();
+    let worlds = described(&mut server).get("worlds").cloned().unwrap();
+    assert_eq!(worlds.int_at("ignored_total"), 0, "{}", written(&worlds));
+    let told = refused(&call(&mut server, "grit_world_create", made));
+    assert_eq!(told.code, "too_many", "{}", told.message);
+    let told = refused(&call(
+        &mut server,
+        "grit_world_step",
+        &format!("{{\"world\":{}}}", most - 1),
+    ));
+    assert_eq!(told.code, "closed");
+}
+
+#[test]
+fn a_kept_world_that_cannot_be_rebuilt_is_listed_broken_and_closes_with_its_files() {
+    let scratch = Scratch::new("broken-kept");
+    let keep = Keep::at(&scratch.dir()).unwrap();
+    let made = Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [8, 8, 8],
+        sparse: false,
+        slots: None,
+    };
+    let gone = std::sync::Arc::new(journal::Snap {
+        sum: [7; 32],
+        frame: 4,
+        made: made.clone(),
+        image: None,
+    });
+    keep.begin(2, &Ledger::snapped(gone)).unwrap();
+    keep.begin(3, &Ledger::created(made)).unwrap();
+    keep.set_next(4).unwrap();
+    drop(keep);
+    let options = Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    };
+    for _ in 0..2 {
+        let mut server = Server::with(None, &options).unwrap();
+        let listed = answer(&call(&mut server, "grit_world_list", "{}"));
+        assert_eq!(
+            kinds_listed(&listed),
+            [("broken".to_owned(), 2), ("kept".to_owned(), 3)]
+        );
+        let told = refused(&call(
+            &mut server,
+            "grit_world_open",
+            "{\"name\":\"world-2\"}",
+        ));
+        assert_eq!(told.code, "bad_file", "{}", told.message);
+        assert!(told.message.contains("close it"), "{}", told.message);
+    }
+    let mut server = Server::with(None, &options).unwrap();
+    let closed = answer(&call(&mut server, "grit_world_close", "{\"world\":2}"));
+    assert_eq!(closed.get("closed"), Some(&Json::Bool(true)));
+    assert!(!entries(&scratch.dir().join("kept")).contains(&"world-2.journal".to_owned()));
+    let listed = answer(&call(&mut server, "grit_world_list", "{}"));
+    assert_eq!(kinds_listed(&listed), [("kept".to_owned(), 3)]);
+    let told = refused(&call(&mut server, "grit_world_step", "{\"world\":2}"));
+    assert_eq!(told.code, "closed");
+    let closed = answer(&call(&mut server, "grit_world_close", "{\"world\":3}"));
+    assert_eq!(closed.get("closed"), Some(&Json::Bool(true)));
+    drop(server);
+    let mut server = Server::with(None, &options).unwrap();
+    let listed = answer(&call(&mut server, "grit_world_list", "{}"));
+    assert_eq!(listed.int_at("total"), 0);
 }
