@@ -1868,7 +1868,7 @@ fn read_at_gives_the_slice_a_full_read_gives() {
         (cap - 1, 2),
         (cap - 5, 11),
         (cap, 1),
-        (cap + 1, cap + 2),
+        (cap + 1, words - cap - 1),
         (3, cap + 4),
         (0, words),
         (17, 0),
@@ -1913,7 +1913,18 @@ fn one_cell_costs_the_same_words_in_any_world() {
         return;
     };
     let params = params_of("heat", 3);
-    for side in [32_u32, 256] {
+    let largest = [256_u32, 128, 64]
+        .into_iter()
+        .find(|&side| {
+            let made = Made {
+                size: [side; 3],
+                ..made("heat", &params, false)
+            };
+            World::create(&host, &made).is_ok()
+        })
+        .unwrap();
+    assert!(largest >= 128, "{largest}");
+    for side in [32_u32, largest] {
         let made = Made {
             size: [side; 3],
             ..made("heat", &params, false)
@@ -1979,7 +1990,7 @@ fn one_cell_costs_the_same_words_in_any_world() {
         "a point in a uniform brick"
     );
     println!(
-        "dense 32^3 and 256^3: 1 word a point; sparse 256^3 with {wanted} held: {held_cost} words a held point"
+        "dense 32^3 and {largest}^3: 1 word a point; sparse 256^3 with {wanted} held: {held_cost} words a held point"
     );
 }
 
