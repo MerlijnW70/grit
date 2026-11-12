@@ -858,6 +858,15 @@ pub fn rebuilt<'host>(
     guard: &super::budget::Guard,
     mut stepping: impl FnMut(&mut World<'host>, u32) -> Result<(), super::Failed>,
 ) -> Result<World<'host>, super::Failed> {
+    if let Some(stop) = guard.stop() {
+        return Err(Box::new(super::budget::Halted {
+            stop,
+            entries: 0,
+            of: ledger.entries.len(),
+            frame: 0,
+            goal: ledger.frame,
+        }));
+    }
     let mut world = match &ledger.base {
         Base::Created(made) => World::create(host, &made.branch())?,
         Base::Snapshot(snap) => match (&snap.image, keep) {
