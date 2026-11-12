@@ -356,14 +356,15 @@ fn mutated(rng: &mut Rng, mut line: String) -> String {
                     let to = line[from..]
                         .find(|one: char| !one.is_ascii_digit())
                         .map_or(line.len(), |end| from + end);
-                    line.replace_range(from..to, rng.pick(&EXTREMES));
+                    let extreme: &&str = rng.pick(&EXTREMES);
+                    line.replace_range(from..to, extreme);
                 }
             }
             4 => {
                 let keys: Vec<usize> = line.match_indices("\":").map(|(at, _)| at).collect();
                 if !keys.is_empty() {
                     let at = *rng.pick(&keys);
-                    if rng.chance(2) && at > 1 {
+                    if rng.chance(2) && at > 1 && line.is_char_boundary(at - 1) {
                         line.remove(at - 1);
                     } else {
                         line.insert(at, 's');
@@ -415,7 +416,10 @@ fn mutated(rng: &mut Rng, mut line: String) -> String {
                 }
             }
             9 => line = format!("[{line},{line}]"),
-            10 => line.push_str(rng.pick(&["", " ", "x", "{}", "\r", "]"])),
+            10 => {
+                let tail: &&str = rng.pick(&["", " ", "x", "{}", "\r", "]"]);
+                line.push_str(tail);
+            }
             _ => {
                 if let Some(at) = line.find("\"id\":") {
                     let end = line[at..]
