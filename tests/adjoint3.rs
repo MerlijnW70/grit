@@ -36,8 +36,7 @@ const MIX_PARAMS: [u32; 2] = [3_000, 1_700];
 
 const STIR_PARAMS: [u32; 3] = [2_600, 900, 1_500];
 
-const EXPECTED_FORM: &str =
-    "a sequence of lifting steps over the 8 words: b += f, b -= f or b ^= f, with f free of b";
+const EXPECTED_FORM: &str = "a sequence of lifting steps over the cell's words, 8 a plane: b += f, b -= f or b ^= f, with f free of b";
 
 const RANDOM_OCTS: u32 = 100_000;
 
@@ -1341,4 +1340,391 @@ fn a_derived_inverse_is_no_larger_than_its_law() {
             assert_eq!(law.inverse().step(oct(out)).out, words, "{lifts} lifts");
         }
     }
+}
+
+const LAYERS: &str = r#"{"law":1,"name":"layers","params":2,"channels":2,"halo":0,"reversible":true,
+"tally":{"counts":1,"weighted":false},
+"consts":{"DROP":4,"POINT":12,"FINE":16,"BELOW":4},
+"defs":{
+"share":[["w","by"],["shr",["mul",["shr","w","DROP"],"by"],"POINT"]],
+"nudge":[["w","by"],["shr",["mul",["shr","w","DROP"],"by"],"FINE"]],
+"low":[["c","k"],["at",["at","c","k"],0]],
+"high":[["c","k"],["at",["at","c","k"],1]],
+"set":[["c","k","w","v"],["put","c","k",["vec","w","v"]]],
+"poured":[["c"],["fold","d","c","k",["range",4],["set","d",["add","k","BELOW"],["add",["low","d",["add","k","BELOW"]],["share",["low","d","k"],["param",0]]],["high","d",["add","k","BELOW"]]]]],
+"lifted":[["c"],["fold","d","c","k",["range",8],["set","d","k",["low","d","k"],["add",["high","d","k"],["share",["low","d","k"],["param",1]]]]]],
+"settled":[["c"],["fold","d","c","k",["range",8],["set","d","k",["sub",["low","d","k"],["nudge",["high","d","k"],["param",0]]],["high","d","k"]]]]
+},
+"step":["let",[["out",["settled",["lifted",["poured","cells"]]]]],["vec","out",["vec",["count",["map","k",["range",8],["ne",["low","cells","k"],["low","out","k"]]]]]]]}"#;
+
+const LAYERS_PARAMS: [u32; 2] = [2_600, 1_900];
+
+fn planed(corner: impl Fn(usize) -> String) -> String {
+    let corners: Vec<String> = (0..8).map(corner).collect();
+    format!(
+        "{{\"law\":1,\"name\":\"probe\",\"params\":0,\"channels\":2,\"halo\":0,\"reversible\":true,\"tally\":{{\"counts\":1,\"weighted\":false}},\"consts\":{{}},\"defs\":{{}},\"step\":[\"vec\",[\"vec\",{}],[\"vec\",0]]}}",
+        corners.join(",")
+    )
+}
+
+fn plane_of(k: usize, plane: usize) -> String {
+    format!("[\"at\",[\"at\",\"cells\",{k}],{plane}]")
+}
+
+#[test]
+fn every_word_of_every_plane_is_checked_for_lifting() {
+    let zeroed = planed(|k| format!("[\"vec\",{},0]", plane_of(k, 0)));
+    let why = refused(&zeroed);
+    assert_eq!(why.code, Code::Lifting, "{why}");
+    assert_eq!(
+        why.found,
+        "word 0 of plane 1 is made by the constant 0, which is not add, sub or xor of the word"
+    );
+    assert_eq!(why.path, "$.step");
+    let scaled = planed(|k| {
+        if k == 3 {
+            format!(
+                "[\"vec\",{},[\"mul\",{},3]]",
+                plane_of(k, 0),
+                plane_of(k, 1)
+            )
+        } else {
+            format!("[\"vec\",{},{}]", plane_of(k, 0), plane_of(k, 1))
+        }
+    });
+    let why = refused(&scaled);
+    assert_eq!(why.code, Code::Lifting, "{why}");
+    assert_eq!(why.path, "$.step[1][4][2]");
+    assert_eq!(
+        why.found,
+        "word 3 of plane 1 is made by mul, which is not add, sub or xor of the word"
+    );
+    let reading = planed(|k| {
+        if k == 5 {
+            format!(
+                "[\"vec\",{},[\"add\",{},[\"mul\",{},7]]]",
+                plane_of(k, 0),
+                plane_of(k, 1),
+                plane_of(k, 1)
+            )
+        } else {
+            format!("[\"vec\",{},{}]", plane_of(k, 0), plane_of(k, 1))
+        }
+    });
+    let why = refused(&reading);
+    assert_eq!(why.code, Code::Lifting, "{why}");
+    assert!(
+        why.found
+            .contains("word 5 of plane 1 reads word 5 of plane 1"),
+        "{why}"
+    );
+    let still = planed(|k| format!("[\"vec\",{},{}]", plane_of(k, 0), plane_of(k, 1)));
+    assert!(reversible(&still).steps().is_empty());
+    let layers = reversible(LAYERS);
+    assert_eq!(layers.steps().len(), 20);
+    assert_eq!(layers.forward().planes().len(), 1);
+    assert_eq!(layers.inverse().planes().len(), 1);
+    let planes: BTreeSet<usize> = layers
+        .steps()
+        .iter()
+        .map(|one| one.word / CORNERS)
+        .collect();
+    assert_eq!(planes, BTreeSet::from([0, 1]));
+}
+
+#[test]
+fn a_law_of_planes_is_undone_by_its_inverse_on_the_cpu() {
+    let law = reversible(LAYERS);
+    let mut state = 0x291A_u64;
+    let mut moved = 0;
+    for round in 0..RANDOM_OCTS {
+        let words: [u32; CORNERS] = core::array::from_fn(|_| word(&mut state));
+        let upper: [u32; CORNERS] = core::array::from_fn(|_| word(&mut state));
+        let params = if round % 2 == 0 {
+            LAYERS_PARAMS.to_vec()
+        } else {
+            vec![word(&mut state), word(&mut state)]
+        };
+        let oct = |words| Oct {
+            words,
+            frame: round,
+            at: [1, 2, 3],
+            params: &params,
+        };
+        let there = law
+            .forward()
+            .replay_planes(&mut grit::ops::Cpu, oct(words), &[upper]);
+        let back =
+            law.inverse()
+                .replay_planes(&mut grit::ops::Cpu, oct(there.ruled.out), &there.planes);
+        assert_eq!(back.ruled.out, words, "round {round}: plane 0");
+        assert_eq!(back.planes, vec![upper], "round {round}: plane 1");
+        moved += usize::from(there.ruled.out != words || there.planes != vec![upper]);
+    }
+    assert!(moved * 2 > RANDOM_OCTS as usize, "{moved}");
+}
+
+fn layered(grid: Grid3, seed: u64) -> Vec<u32> {
+    let mut start = calm(grid, seed);
+    start.extend(calm(grid, seed + 100));
+    start
+}
+
+fn layered_objective(
+    law: &Reversible,
+    grid: Grid3,
+    start: &[u32],
+    params: &[u32],
+    aim: &Aim<'_>,
+) -> u64 {
+    aim.measured(grid, &ran(law, grid, start, params, GRADIENT_FRAMES))
+}
+
+#[test]
+fn a_law_of_planes_comes_home_and_its_adjoint_agrees_with_finite_differences() {
+    let law = reversible(LAYERS);
+    let grid = Grid3::new(SMALL, SMALL, SMALL).unwrap();
+    let start = layered(grid, 21);
+    let first_plane = &start[..grid.cells()];
+    let aim = Aim {
+        region: Region::whole([SMALL, SMALL, SMALL]),
+        target: first_plane,
+    };
+    let walked = law
+        .walk(grid, &start, &LAYERS_PARAMS, 0, HOME_FRAMES, &aim)
+        .unwrap();
+    assert!(walked.objective > 0);
+    assert_eq!(walked.ended.len(), 2 * grid.cells());
+    assert_eq!(
+        law.walk(grid, first_plane, &LAYERS_PARAMS, 0, 1, &aim),
+        Err(Fault::Cells {
+            given: grid.cells(),
+            wanted: 2 * grid.cells(),
+        })
+    );
+    let mut worst = 0.0_f64;
+    for seed in [31_u64, 32] {
+        let start = layered(grid, seed);
+        let ended = ran(&law, grid, &start, &LAYERS_PARAMS, GRADIENT_FRAMES);
+        let target = ended[..grid.cells()].to_vec();
+        let aim = Aim {
+            region: Region::whole([SMALL, SMALL, SMALL]),
+            target: &target,
+        };
+        for scale in [115_u32, 85] {
+            let params: Vec<u32> = LAYERS_PARAMS.iter().map(|one| one * scale / 100).collect();
+            let walked = law
+                .walk(grid, &start, &params, 0, GRADIENT_FRAMES, &aim)
+                .unwrap();
+            assert_eq!(
+                walked.ended,
+                ran(&law, grid, &start, &params, GRADIENT_FRAMES)
+            );
+            assert!(walked.objective > 0);
+            for (index, &told) in walked.told.iter().enumerate() {
+                let mut up = params.clone();
+                up[index] += STEP;
+                let mut down = params.clone();
+                down[index] -= STEP;
+                let rise = i128::from(layered_objective(&law, grid, &start, &up, &aim))
+                    - i128::from(layered_objective(&law, grid, &start, &down, &aim));
+                let differenced = rise as f64 / f64::from(2 * STEP);
+                let slope = told as f64 / 2_f64.powi(adjoint::FRACTION as i32);
+                let off = 100.0 * (slope - differenced).abs() / differenced.abs();
+                println!(
+                    "layers seed {seed} params {params:?} param {index}: adjoint {slope:.2}, finite difference {differenced:.2}, {off:.3} % apart"
+                );
+                assert_ne!(rise, 0, "param {index}: flat");
+                assert_eq!(slope.is_sign_positive(), differenced.is_sign_positive());
+                assert!(
+                    off <= TOLERANCE_PERCENT,
+                    "seed {seed} param {index}: {off} % apart"
+                );
+                worst = worst.max(off);
+            }
+        }
+    }
+    println!(
+        "layers: came home after {HOME_FRAMES} frames; the adjoint is at most {worst:.3} % from the finite difference"
+    );
+}
+
+fn dense_frame(
+    host: &Host,
+    dag: &grit::law::Dag,
+    grid: Grid,
+    cells: &[u32],
+    params: &[u32],
+) -> Vec<u32> {
+    let width = host.width();
+    let built = sand3::settle_by(dag, width, grid, host.limits().groups).unwrap();
+    let tick = live::tick(width).unwrap();
+    let modules: Vec<&[u32]> = vec![&tick, &built.words];
+    let mut sizes = [1_usize; grit::layout::BINDINGS as usize];
+    sizes[PARAMS as usize] = grit::rule3::FIRST_PARAM + params.len();
+    sizes[grit::layout::STATE as usize] = cells.len();
+    let mut held = host.resident(&sizes, &modules).unwrap();
+    held.write(PARAMS as usize, &[u32::MAX]).unwrap();
+    held.write_at(PARAMS as usize, grit::rule3::FIRST_PARAM, params)
+        .unwrap();
+    held.write(grit::layout::STATE as usize, cells).unwrap();
+    held.frame(&[Groups::Fixed(1), built.spread.dispatch()])
+        .unwrap();
+    held.read(grit::layout::STATE as usize, cells.len())
+        .unwrap()
+}
+
+#[test]
+fn a_law_of_planes_is_undone_by_its_inverse_on_the_device() {
+    let Some(host) = device("adjoint3 planes") else {
+        return;
+    };
+    let law = reversible(LAYERS);
+    let (grid, reference_grid) = grids(SMALL);
+    for seed in [41_u64, 42, 43] {
+        let mut state = seed;
+        let start: Vec<u32> = (0..2 * reference_grid.cells())
+            .map(|_| word(&mut state))
+            .collect();
+        let there = dense_frame(&host, law.forward(), grid, &start, &LAYERS_PARAMS);
+        let wanted = reference(law.forward(), reference_grid, 0, &start, &LAYERS_PARAMS);
+        assert_eq!(there, wanted, "seed {seed}: step on {}", host.name());
+        assert_ne!(
+            there[reference_grid.cells()..],
+            start[reference_grid.cells()..]
+        );
+        let home = dense_frame(&host, law.inverse(), grid, &there, &LAYERS_PARAMS);
+        assert_eq!(home, start, "seed {seed}: home on {}", host.name());
+    }
+    println!(
+        "layers on {} width {}: the device step of both planes equals the CPU and its inverse brings both home",
+        host.name(),
+        host.width()
+    );
+}
+
+fn paired(one: &str, zero: &str) -> String {
+    let rest: Vec<String> = (2..8).map(cell).collect();
+    lifting_law(
+        "",
+        &format!(
+            "[\"let\",[[\"y1\",{one}],[\"y0\",{zero}]],[\"vec\",[\"vec\",\"y0\",\"y1\",{}],[\"vec\",0]]]",
+            rest.join(",")
+        ),
+    )
+}
+
+#[test]
+fn a_step_may_read_an_earlier_version_of_its_word_through_another_word() {
+    let lifted = format!("[\"add\",{},{}]", cell(1), cell(0));
+    for zero in [
+        format!("[\"add\",{},\"y1\"]", cell(0)),
+        format!("[\"xor\",{},\"y1\"]", cell(0)),
+        format!("[\"add\",{},[\"mul\",\"y1\",3]]", cell(0)),
+        format!("[\"sub\",{},\"y1\"]", cell(0)),
+        format!("[\"add\",\"y1\",{}]", cell(0)),
+    ] {
+        let text = paired(&lifted, &zero);
+        let law = reversible(&text);
+        assert_eq!(law.steps().len(), 2, "{zero}");
+        assert_eq!(law.steps()[0].word, 1, "{zero}");
+        let mut state = 0xBA_u64;
+        for _ in 0..1_000 {
+            let words: [u32; CORNERS] = core::array::from_fn(|_| word(&mut state));
+            let oct = |words| Oct {
+                words,
+                frame: 0,
+                at: [0; 3],
+                params: &[],
+            };
+            let out = law.forward().step(oct(words)).out;
+            assert_eq!(law.inverse().step(oct(out)).out, words, "{zero}");
+        }
+    }
+    for (one, zero, word) in [
+        (
+            lifted.clone(),
+            format!("[\"add\",{},{}]", cell(0), cell(0)),
+            0,
+        ),
+        (
+            lifted.clone(),
+            format!("[\"add\",{},[\"mul\",{},\"y1\"]]", cell(0), cell(0)),
+            0,
+        ),
+        (
+            format!("[\"add\",{},{}]", cell(1), cell(1)),
+            format!("[\"add\",{},\"y1\"]", cell(0)),
+            1,
+        ),
+    ] {
+        let why = refused(&paired(&one, &zero));
+        assert_eq!(why.code, Code::Lifting, "{zero}: {why}");
+        assert!(
+            why.found
+                .contains(&format!("reads word {word} in what it adds")),
+            "{zero}: {why}"
+        );
+    }
+}
+
+fn sequential(state: &mut u64) -> String {
+    let mut current: Vec<String> = (0..8).map(cell).collect();
+    let mut binds = Vec::new();
+    for step in 0..(2 + next(state) % 24) {
+        let word = (next(state) % 8) as usize;
+        let mut terms = Vec::new();
+        for _ in 0..1 + next(state) % 3 {
+            let mut other = (next(state) % 8) as usize;
+            if other == word {
+                other = (other + 1 + (next(state) % 7) as usize) % 8;
+            }
+            terms.push(current[other].clone());
+        }
+        let ops = ["add", "mul", "xor", "sub", "and"];
+        let mut f = terms[0].clone();
+        for term in &terms[1..] {
+            f = format!("[\"{}\",{f},{term}]", ops[(next(state) % 5) as usize]);
+        }
+        let how = ["add", "sub", "xor"][(next(state) % 3) as usize];
+        let name = format!("w{step}");
+        let made = if how != "sub" && next(state).is_multiple_of(2) {
+            format!("[\"{how}\",{f},{}]", current[word])
+        } else {
+            format!("[\"{how}\",{},{f}]", current[word])
+        };
+        binds.push(format!("[\"{name}\",{made}]"));
+        current[word] = format!("\"{name}\"");
+    }
+    format!(
+        "[\"let\",[{}],[\"vec\",[\"vec\",{}],[\"vec\",0]]]",
+        binds.join(","),
+        current.join(",")
+    )
+}
+
+#[test]
+fn every_sequential_lifting_program_is_admitted_and_undone() {
+    let mut state = 0x5E9_u64;
+    let mut steps = 0;
+    for program in 0..3_000 {
+        let text = lifting_law("", &sequential(&mut state));
+        let made = Law::compile(&text).unwrap_or_else(|why| panic!("{program}: {why} {text}"));
+        let law = Reversible::of(&made).unwrap_or_else(|why| panic!("{program}: {why}\n{text}"));
+        steps += law.steps().len();
+        for _ in 0..200 {
+            let words: [u32; CORNERS] = core::array::from_fn(|_| word(&mut state));
+            let oct = |words| Oct {
+                words,
+                frame: 0,
+                at: [0; 3],
+                params: &[],
+            };
+            let out = law.forward().step(oct(words)).out;
+            assert_eq!(law.inverse().step(oct(out)).out, words, "{program}\n{text}");
+        }
+    }
+    println!(
+        "3000 sequential lifting programs of {steps} steps: all admitted, each undone on 200 octs"
+    );
 }

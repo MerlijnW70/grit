@@ -14,8 +14,7 @@ pub const FRACTION: u32 = 64;
 
 const WORDS: u32 = 8;
 
-const EXPECTED: &str =
-    "a sequence of lifting steps over the 8 words: b += f, b -= f or b ^= f, with f free of b";
+const EXPECTED: &str = "a sequence of lifting steps over the cell's words, 8 a plane: b += f, b -= f or b ^= f, with f free of b";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Lifting {
@@ -102,20 +101,30 @@ impl Broken {
     pub fn found(self, dag: &Dag) -> String {
         let made = named(dag, self.node());
         match self {
-            Self::Written { word, .. } => {
-                format!("word {word} is made by {made}, which is not add, sub or xor of the word")
-            }
-            Self::Dropped { word, .. } => {
-                format!("word {word} is made by {made}, and neither side carries the word")
-            }
-            Self::ReadsItself { word, .. } => {
-                format!("the step {made} on word {word} reads word {word} in what it adds")
-            }
-            Self::Shared { word, other, .. } => {
+            Self::Written { word, .. } => format!(
+                "{} is made by {made}, which is not add, sub or xor of the word",
+                spoken(word)
+            ),
+            Self::Dropped { word, .. } => format!(
+                "{} is made by {made}, and neither side carries the word",
+                spoken(word)
+            ),
+            Self::ReadsItself { word, .. } => format!(
+                "the step {made} on {} reads {} in what it adds",
+                spoken(word),
+                spoken(word)
+            ),
+            Self::Shared { word, other, .. } if word < CORNERS && other < CORNERS => {
                 format!("words {other} and {word} are both made by the one step {made}")
             }
+            Self::Shared { word, other, .. } => format!(
+                "{} and {} are both made by the one step {made}",
+                spoken(other),
+                spoken(word)
+            ),
             Self::Tangled { word, .. } => format!(
-                "the step {made} on word {word} reads a word that is changed both before and after it"
+                "the step {made} on {} reads a word that is changed both before and after it",
+                spoken(word)
             ),
         }
     }
@@ -134,14 +143,32 @@ impl Broken {
     }
 }
 
+fn spoken(word: usize) -> String {
+    match word / CORNERS {
+        0 => format!("word {word}"),
+        plane => format!("word {} of plane {plane}", word % CORNERS),
+    }
+}
+
+fn cell_spoken(word: usize) -> String {
+    match word / CORNERS {
+        0 => format!("cell {word}"),
+        plane => format!("cell {} of plane {plane}", word % CORNERS),
+    }
+}
+
 fn named(dag: &Dag, node: u32) -> String {
     let found = usize::try_from(node)
         .ok()
         .and_then(|index| dag.nodes().get(index))
         .copied();
     let op = match found {
-        Some(Node::Input(which)) if which < WORDS => return format!("cell {which} unchanged"),
-        Some(Node::Input(which)) => return format!("input {which}"),
+        Some(Node::Input(which)) => {
+            return match input_word(dag, which) {
+                Some(word) => format!("{} unchanged", cell_spoken(word)),
+                None => format!("input {which}"),
+            };
+        }
         Some(Node::Const(value)) => return format!("the constant {value}"),
         Some(Node::And(..)) => "and",
         Some(Node::Or(..)) => "or",
@@ -215,50 +242,65 @@ fn node_at(dag: &Dag, id: u32) -> Node {
         .unwrap_or(Node::Const(0))
 }
 
-const fn bit(word: usize) -> u8 {
-    1_u8 << (word & 7)
+const fn bit(word: usize) -> u32 {
+    1_u32 << (word & 31)
 }
 
 fn word_of(word: usize) -> u32 {
     u32::try_from(word).unwrap_or(u32::MAX)
 }
 
+fn spread(dag: &Dag) -> usize {
+    CORNERS * (dag.planes().len() + 1)
+}
+
+fn word_input(dag: &Dag, word: usize) -> u32 {
+    match word / CORNERS {
+        0 => word_of(word),
+        _ => dag.first_plane().saturating_add(word_of(word - CORNERS)),
+    }
+}
+
+fn word_out(dag: &Dag, word: usize) -> u32 {
+    let corner = word % CORNERS;
+    let found = match word / CORNERS {
+        0 => dag.out().get(corner),
+        plane => dag
+            .planes()
+            .get(plane - 1)
+            .and_then(|outs| outs.get(corner)),
+    };
+    found.copied().unwrap_or(u32::MAX)
+}
+
+fn input_word(dag: &Dag, which: u32) -> Option<usize> {
+    if which < WORDS {
+        return usize::try_from(which).ok();
+    }
+    let above = usize::try_from(which.checked_sub(dag.first_plane())?).ok()?;
+    (above < CORNERS * dag.planes().len()).then_some(CORNERS + above)
+}
+
 struct Masks {
-    carries: Vec<u8>,
-    reaches: Vec<u8>,
+    reaches: Vec<u32>,
 }
 
 fn masks(dag: &Dag) -> Masks {
     let nodes = dag.nodes();
-    let mut carries = vec![0_u8; nodes.len()];
-    let mut reaches = vec![0_u8; nodes.len()];
+    let mut reaches = vec![0_u32; nodes.len()];
     for (index, &node) in nodes.iter().enumerate() {
-        let (carried, reached) = match node {
-            Node::Input(which) if which < WORDS => {
-                let one = bit(usize::try_from(which).unwrap_or(0));
-                (one, one)
-            }
-            other => {
-                let reached = operands(other)
-                    .iter()
-                    .flatten()
-                    .fold(0, |acc, &id| acc | at(&reaches, id));
-                let carried = match lifting(other) {
-                    Some((Lifting::Sub, left, _)) => at(&carries, left),
-                    Some((_, left, right)) => at(&carries, left) | at(&carries, right),
-                    None => 0,
-                };
-                (carried, reached)
-            }
+        let reached = match node {
+            Node::Input(which) => input_word(dag, which).map_or(0, bit),
+            other => operands(other)
+                .iter()
+                .flatten()
+                .fold(0, |acc, &id| acc | at(&reaches, id)),
         };
-        if let Some(slot) = carries.get_mut(index) {
-            *slot = carried;
-        }
         if let Some(slot) = reaches.get_mut(index) {
             *slot = reached;
         }
     }
-    Masks { carries, reaches }
+    Masks { reaches }
 }
 
 fn offender(dag: &Dag, masks: &Masks, word: usize, start: u32) -> Broken {
@@ -279,35 +321,162 @@ fn offender(dag: &Dag, masks: &Masks, word: usize, start: u32) -> Broken {
     }
 }
 
-fn chain(dag: &Dag, masks: &Masks, word: usize) -> Result<Vec<Lift>, Broken> {
-    let mut here = dag.out().get(word).copied().unwrap_or(u32::MAX);
-    let mut lifts = Vec::new();
-    loop {
-        let node = node_at(dag, here);
-        if node == Node::Input(word_of(word)) {
-            lifts.reverse();
-            return Ok(lifts);
+enum Stride {
+    Home,
+    Next(Lift),
+    Waiting,
+    Broken(Broken),
+}
+
+fn carrying(dag: &Dag, claimed: &HashMap<u32, usize>) -> Vec<u32> {
+    let nodes = dag.nodes();
+    let mut carries = vec![0_u32; nodes.len()];
+    for (index, &node) in nodes.iter().enumerate() {
+        let id = word_of(index);
+        let carried = match (claimed.get(&id), node) {
+            (Some(&word), _) => bit(word),
+            (None, Node::Input(which)) => input_word(dag, which).map_or(0, bit),
+            (None, other) => match lifting(other) {
+                Some((Lifting::Sub, left, _)) => at(&carries, left),
+                Some((_, left, right)) => at(&carries, left) | at(&carries, right),
+                None => 0,
+            },
+        };
+        if let Some(slot) = carries.get_mut(index) {
+            *slot = carried;
         }
-        let Some((how, left, right)) = lifting(node) else {
-            return Err(offender(dag, masks, word, here));
-        };
-        let on_left = at(&masks.carries, left) & bit(word) != 0;
-        let on_right = how != Lifting::Sub && at(&masks.carries, right) & bit(word) != 0;
-        let (before, by) = match (on_left, on_right) {
-            (true, false) => (left, right),
-            (false, true) => (right, left),
-            (true, true) => return Err(Broken::ReadsItself { word, node: here }),
-            (false, false) => return Err(offender(dag, masks, word, here)),
-        };
-        lifts.push(Lift {
-            word,
-            how,
-            node: here,
-            before,
-            by,
-        });
-        here = before;
     }
+    carries
+}
+
+fn strode(
+    dag: &Dag,
+    masks: &Masks,
+    carries: &[u32],
+    claimed: &HashMap<u32, usize>,
+    forced: &HashMap<(usize, u32), bool>,
+    word: usize,
+    here: u32,
+) -> Stride {
+    let node = node_at(dag, here);
+    if node == Node::Input(word_input(dag, word)) {
+        return Stride::Home;
+    }
+    let Some((how, left, right)) = lifting(node) else {
+        return Stride::Broken(offender(dag, masks, word, here));
+    };
+    let on_left = at(carries, left) & bit(word) != 0;
+    let on_right = how != Lifting::Sub && at(carries, right) & bit(word) != 0;
+    let elsewhere = |id: u32| claimed.get(&id).is_some_and(|&other| other != word);
+    let (before, by) = match (on_left, on_right) {
+        (true, false) => (left, right),
+        (false, true) => (right, left),
+        (true, true) => match (forced.get(&(word, here)), elsewhere(left), elsewhere(right)) {
+            (Some(true), _, _) | (None, false, true) => (left, right),
+            (Some(false), _, _) | (None, true, false) => (right, left),
+            (None, _, _) => return Stride::Waiting,
+        },
+        (false, false) => return Stride::Broken(offender(dag, masks, word, here)),
+    };
+    Stride::Next(Lift {
+        word,
+        how,
+        node: here,
+        before,
+        by,
+    })
+}
+
+type Guesses = Vec<(usize, u32)>;
+
+fn chains(
+    dag: &Dag,
+    masks: &Masks,
+    given: &HashMap<(usize, u32), bool>,
+) -> (Result<Vec<Vec<Lift>>, Broken>, Guesses) {
+    let words = spread(dag);
+    let mut forced = given.clone();
+    let mut guesses = Vec::new();
+    let mut claimed: HashMap<u32, usize> = HashMap::new();
+    for word in 0..words {
+        claimed.insert(word_input(dag, word), word);
+    }
+    for word in 0..words {
+        claimed.entry(word_out(dag, word)).or_insert(word);
+    }
+    let mut here: Vec<u32> = (0..words).map(|word| word_out(dag, word)).collect();
+    let mut lifts: Vec<Vec<Lift>> = vec![Vec::new(); words];
+    let mut open: Vec<bool> = vec![true; words];
+    let mut broken = Vec::new();
+    let mut carries = carrying(dag, &claimed);
+    let mut fresh = true;
+    loop {
+        let mut moved = false;
+        let mut waiting = Vec::new();
+        for word in 0..words {
+            if !open.get(word).copied().unwrap_or(false) {
+                continue;
+            }
+            loop {
+                let from = here.get(word).copied().unwrap_or(u32::MAX);
+                match strode(dag, masks, &carries, &claimed, &forced, word, from) {
+                    Stride::Home => {
+                        if let Some(slot) = open.get_mut(word) {
+                            *slot = false;
+                        }
+                        break;
+                    }
+                    Stride::Next(lift) => {
+                        claimed.entry(lift.before).or_insert(word);
+                        if let Some(slot) = here.get_mut(word) {
+                            *slot = lift.before;
+                        }
+                        if let Some(list) = lifts.get_mut(word) {
+                            list.push(lift);
+                        }
+                        moved = true;
+                    }
+                    Stride::Waiting => {
+                        waiting.push((word, from));
+                        break;
+                    }
+                    Stride::Broken(why) => {
+                        broken.push(why);
+                        if let Some(slot) = open.get_mut(word) {
+                            *slot = false;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if waiting.is_empty() {
+            break;
+        }
+        if moved {
+            fresh = false;
+            continue;
+        }
+        if !fresh {
+            carries = carrying(dag, &claimed);
+            fresh = true;
+            continue;
+        }
+        {
+            let Some(&guess) = waiting.iter().min_by_key(|(_, node)| *node) else {
+                break;
+            };
+            forced.insert(guess, true);
+            guesses.push(guess);
+        }
+    }
+    if let Some(why) = broken.into_iter().min_by_key(|why| why.node()) {
+        return (Err(why), guesses);
+    }
+    for list in &mut lifts {
+        list.reverse();
+    }
+    (Ok(lifts), guesses)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -320,13 +489,10 @@ fn versions(dag: &Dag, chains: &[Vec<Lift>]) -> Result<Vec<Option<Version>>, Bro
     let mut held: Vec<Option<Version>> = vec![None; dag.len()];
     for (index, &node) in dag.nodes().iter().enumerate() {
         if let Node::Input(which) = node
-            && which < WORDS
+            && let Some(word) = input_word(dag, which)
             && let Some(slot) = held.get_mut(index)
         {
-            *slot = Some(Version {
-                word: usize::try_from(which).unwrap_or(0),
-                index: 0,
-            });
+            *slot = Some(Version { word, index: 0 });
         }
     }
     let mut conflicts = Vec::new();
@@ -359,12 +525,11 @@ fn versions(dag: &Dag, chains: &[Vec<Lift>]) -> Result<Vec<Option<Version>>, Bro
 
 const UNREAD: u32 = u32::MAX;
 
-type Span = [(u32, u32); CORNERS];
-
-fn spans(dag: &Dag, held: &[Option<Version>]) -> Vec<Span> {
-    let mut out: Vec<Span> = Vec::with_capacity(dag.len());
+fn spans(dag: &Dag, held: &[Option<Version>]) -> Vec<(u32, u32)> {
+    let words = spread(dag);
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(dag.len() * words);
     for (index, &node) in dag.nodes().iter().enumerate() {
-        let mut span = [(UNREAD, 0); CORNERS];
+        let mut span = vec![(UNREAD, 0); words];
         match held.get(index).copied().flatten() {
             Some(version) => {
                 let place = u32::try_from(version.index).unwrap_or(UNREAD - 1);
@@ -374,7 +539,10 @@ fn spans(dag: &Dag, held: &[Option<Version>]) -> Vec<Span> {
             }
             None => {
                 for id in operands(node).into_iter().flatten() {
-                    let Some(other) = usize::try_from(id).ok().and_then(|at| out.get(at)) else {
+                    let Some(other) = usize::try_from(id)
+                        .ok()
+                        .and_then(|at| out.get(at * words..(at + 1) * words))
+                    else {
                         continue;
                     };
                     for (mine, theirs) in span.iter_mut().zip(other) {
@@ -386,7 +554,7 @@ fn spans(dag: &Dag, held: &[Option<Version>]) -> Vec<Span> {
                 }
             }
         }
-        out.push(span);
+        out.extend(span);
     }
     out
 }
@@ -424,15 +592,16 @@ fn ordered(dag: &Dag, chains: &[Vec<Lift>]) -> Result<Vec<Lift>, Broken> {
         waiting: vec![0; all.len()],
     };
     let spans = spans(dag, &held);
+    let words = spread(dag);
+    let unread = vec![(UNREAD, 0); words];
     let mut broken = Vec::new();
     for (index, lift) in all.iter().enumerate() {
         let version = at(&held, lift.node).map_or(0, |one| one.index);
         order.edge(lift_at(lift.word, version.saturating_sub(1)), Some(index));
         let span = usize::try_from(lift.by)
             .ok()
-            .and_then(|at| spans.get(at))
-            .copied()
-            .unwrap_or([(UNREAD, 0); CORNERS]);
+            .and_then(|at| spans.get(at * words..(at + 1) * words))
+            .unwrap_or(&unread);
         if span.get(lift.word).is_some_and(|read| read.0 != UNREAD) {
             broken.push(Broken::ReadsItself {
                 word: lift.word,
@@ -495,31 +664,41 @@ fn ordered(dag: &Dag, chains: &[Vec<Lift>]) -> Result<Vec<Lift>, Broken> {
     }
 }
 
+pub const GUESSES: usize = 32;
+
 pub fn lifted(dag: &Dag) -> Result<Vec<Lift>, Broken> {
     let masks = masks(dag);
-    let mut chains = Vec::with_capacity(CORNERS);
-    let mut broken = Vec::new();
-    for word in 0..CORNERS {
-        match chain(dag, &masks, word) {
-            Ok(lifts) => chains.push(lifts),
-            Err(why) => {
-                broken.push(why);
-                chains.push(Vec::new());
-            }
+    let mut first = None;
+    let mut tries = vec![HashMap::new()];
+    let mut tried = 0;
+    while let Some(forced) = tries.pop() {
+        tried += 1;
+        let (found, guesses) = chains(dag, &masks, &forced);
+        let why = match found.and_then(|chains| ordered(dag, &chains)) {
+            Ok(steps) => return Ok(steps),
+            Err(why) => why,
+        };
+        first.get_or_insert(why);
+        if tried + tries.len() >= GUESSES {
+            continue;
+        }
+        let mut kept = forced;
+        for &guess in &guesses {
+            let mut other = kept.clone();
+            other.insert(guess, false);
+            tries.push(other);
+            kept.insert(guess, true);
         }
     }
-    if let Some(why) = broken.into_iter().min_by_key(|why| why.node()) {
-        return Err(why);
-    }
-    ordered(dag, &chains)
+    Err(first.unwrap_or(Broken::Tangled { word: 0, node: 0 }))
 }
 
 struct Copier<'d> {
     dag: &'d Dag,
     nodes: Vec<Node>,
-    reaches: Vec<u8>,
-    copies: HashMap<u32, (u32, [u32; CORNERS])>,
-    undone: [u32; CORNERS],
+    reaches: Vec<u32>,
+    copies: HashMap<u32, (u32, Vec<u32>)>,
+    undone: Vec<u32>,
 }
 
 impl Copier<'_> {
@@ -530,15 +709,15 @@ impl Copier<'_> {
     }
 
     fn fresh(&self, id: u32) -> Option<u32> {
-        let &(copy, seen) = self.copies.get(&id)?;
+        let (copy, seen) = self.copies.get(&id)?;
         let reached = at(&self.reaches, id);
-        let unchanged = (0..CORNERS)
+        let unchanged = (0..self.undone.len())
             .all(|word| reached & bit(word) == 0 || seen.get(word) == self.undone.get(word));
-        unchanged.then_some(copy)
+        unchanged.then_some(*copy)
     }
 
     fn remember(&mut self, id: u32, copy: u32) {
-        self.copies.insert(id, (copy, self.undone));
+        self.copies.insert(id, (copy, self.undone.clone()));
     }
 
     fn copied(&mut self, root: u32, now: &HashMap<u32, u32>) -> u32 {
@@ -598,19 +777,25 @@ impl Copier<'_> {
 }
 
 fn undone(dag: &Dag, steps: &[Lift]) -> Dag {
-    let inputs = FIRST_PARAM
-        .saturating_add(u32::try_from(dag.params()).unwrap_or(u32::MAX))
+    let words = spread(dag);
+    let inputs = dag
+        .first_plane()
+        .saturating_add(word_of(words - CORNERS))
         .max(WORDS);
     let mut copier = Copier {
         dag,
         nodes: (0..inputs).map(Node::Input).collect(),
         reaches: masks(dag).reaches,
         copies: HashMap::new(),
-        undone: [0; CORNERS],
+        undone: vec![0; words],
     };
-    let mut current: [u32; CORNERS] = core::array::from_fn(word_of);
-    let mut holding: [u32; CORNERS] = *dag.out();
-    let mut now: HashMap<u32, u32> = holding.iter().copied().zip(current).collect();
+    let mut current: Vec<u32> = (0..words).map(|word| word_input(dag, word)).collect();
+    let mut holding: Vec<u32> = (0..words).map(|word| word_out(dag, word)).collect();
+    let mut now: HashMap<u32, u32> = holding
+        .iter()
+        .copied()
+        .zip(current.iter().copied())
+        .collect();
     for lift in steps.iter().rev() {
         let by = copier.copied(lift.by, &now);
         let (Some(word), Some(held)) = (current.get_mut(lift.word), holding.get_mut(lift.word))
@@ -628,7 +813,12 @@ fn undone(dag: &Dag, steps: &[Lift]) -> Dag {
     }
     let zero = copier.push(Node::Const(0));
     let counts = vec![zero; dag.counts().len()];
-    Dag::new(copier.nodes, current, counts, dag.params(), dag.tally())
+    let corners = |words: &[u32]| -> [u32; CORNERS] {
+        core::array::from_fn(|corner| words.get(corner).copied().unwrap_or(0))
+    };
+    let first = corners(&current);
+    let planes: Vec<[u32; CORNERS]> = current.chunks(CORNERS).skip(1).map(corners).collect();
+    Dag::new(copier.nodes, first, counts, dag.params(), dag.tally()).with_planes(planes)
 }
 
 #[derive(Clone, Debug)]
@@ -684,23 +874,25 @@ impl Reversible {
     pub fn carried(
         &self,
         oct: Oct<'_, u32>,
-        weights: [i128; CORNERS],
+        planes: &[[u32; CORNERS]],
+        weights: &[i128],
         told: &mut [i128],
-    ) -> Result<[i128; CORNERS], Fault> {
-        let values = evaluated(&self.forward, &oct);
+    ) -> Result<Vec<i128>, Fault> {
+        let dag = &self.forward;
+        let values = evaluated(dag, &oct, planes);
         let mut adjoint = vec![0_i128; values.len()];
-        for (&id, weight) in self.forward.out().iter().zip(weights) {
-            added(&mut adjoint, id, weight)?;
+        for (word, &weight) in weights.iter().enumerate().take(spread(dag)) {
+            added(&mut adjoint, word_out(dag, word), weight)?;
         }
-        let mut before = [0_i128; CORNERS];
-        for (index, &node) in self.forward.nodes().iter().enumerate().rev() {
+        let mut before = vec![0_i128; spread(dag)];
+        for (index, &node) in dag.nodes().iter().enumerate().rev() {
             let weight = adjoint.get(index).copied().unwrap_or(0);
             if weight == 0 {
                 continue;
             }
             if let Node::Input(which) = node {
-                if which < WORDS {
-                    added(&mut before, which, weight)?;
+                if let Some(word) = input_word(dag, which) {
+                    added(&mut before, word_of(word), weight)?;
                 } else if let Some(param) = which.checked_sub(FIRST_PARAM) {
                     added(told, param, weight)?;
                 }
@@ -722,10 +914,12 @@ impl Reversible {
         frames: u32,
         aim: &Aim<'_>,
     ) -> Result<Walked, Fault> {
-        if start.len() != grid.cells() {
+        let stride = grid.cells();
+        let layers = spread(&self.forward) / CORNERS;
+        if start.len() != stride * layers {
             return Err(Fault::Cells {
                 given: start.len(),
-                wanted: grid.cells(),
+                wanted: stride * layers,
             });
         }
         if params.len() != self.forward.params() {
@@ -748,8 +942,19 @@ impl Reversible {
             let mut carried = vec![0_i128; weights.len()];
             for oct in 0..grid.octs() {
                 let places = grid.corners(frame, oct);
+                let spots: Vec<usize> = (0..layers)
+                    .flat_map(|layer| places.map(|place| layer * stride + place))
+                    .collect();
                 let words = places.map(|place| before.get(place).copied().unwrap_or(0));
-                let given = places.map(|place| weights.get(place).copied().unwrap_or(0));
+                let upper: Vec<[u32; CORNERS]> = (1..layers)
+                    .map(|layer| {
+                        places.map(|place| before.get(layer * stride + place).copied().unwrap_or(0))
+                    })
+                    .collect();
+                let given: Vec<i128> = spots
+                    .iter()
+                    .map(|&spot| weights.get(spot).copied().unwrap_or(0))
+                    .collect();
                 let back = self.carried(
                     Oct {
                         words,
@@ -757,11 +962,12 @@ impl Reversible {
                         at: lattice(grid, oct),
                         params,
                     },
-                    given,
+                    &upper,
+                    &given,
                     &mut told,
                 )?;
-                for (place, value) in places.into_iter().zip(back) {
-                    if let Some(slot) = carried.get_mut(place) {
+                for (spot, value) in spots.into_iter().zip(back) {
+                    if let Some(slot) = carried.get_mut(spot) {
                         *slot = value;
                     }
                 }
@@ -876,13 +1082,20 @@ fn shares(node: Node, weight: i128, values: &[u32]) -> Result<Shares, Fault> {
     })
 }
 
-fn evaluated(dag: &Dag, oct: &Oct<'_, u32>) -> Vec<u32> {
+fn evaluated(dag: &Dag, oct: &Oct<'_, u32>, planes: &[[u32; CORNERS]]) -> Vec<u32> {
     let cpu = &mut Cpu;
     let mut values: Vec<u32> = Vec::with_capacity(dag.len());
     for &node in dag.nodes() {
         let get = |id: u32| at(&values, id);
         let made = match node {
-            Node::Input(which) => input(oct, which),
+            Node::Input(which) => match input_word(dag, which) {
+                Some(word) if word >= CORNERS => planes
+                    .get(word / CORNERS - 1)
+                    .and_then(|plane| plane.get(word % CORNERS))
+                    .copied()
+                    .unwrap_or(0),
+                _ => input(oct, which),
+            },
             Node::Const(value) => value,
             Node::Not(one) => cpu.not(get(one)),
             Node::Shl(one, by) => cpu.shift_left(get(one), by),
