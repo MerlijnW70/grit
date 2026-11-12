@@ -28,6 +28,8 @@ const ZEROS: usize = 1 << 22;
 
 const GATHER_GAP: usize = 16;
 
+const RUN_COST: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
     Magic,
@@ -714,42 +716,67 @@ impl<'host> World<'host> {
         self.words_read
     }
 
-    fn read_at(&mut self, binding: u32, at: usize, count: usize) -> Result<Vec<u32>, Failed> {
-        let words = self.live.read_at(binding as usize, at, count)?;
-        self.words_read = self.words_read.saturating_add(words.len() as u64);
-        Ok(words)
+    #[must_use]
+    pub const fn read_waits(&self) -> u64 {
+        self.live.copying().1
     }
 
     fn gathered(&mut self, wanted: &[(u32, usize)]) -> Result<Vec<u32>, Failed> {
         let mut order: Vec<usize> = (0..wanted.len()).collect();
         order.sort_unstable_by_key(|&at| wanted.get(at).copied());
-        let mut out = vec![0_u32; wanted.len()];
-        let mut start = 0;
-        while let Some(&first) = order.get(start) {
-            let Some(&(binding, from)) = wanted.get(first) else {
-                break;
+        let mut runs: Vec<(u32, usize, usize)> = Vec::new();
+        for &at in &order {
+            let Some(&(binding, index)) = wanted.get(at) else {
+                continue;
             };
-            let mut end = start + 1;
-            let mut last = from;
-            while let Some(&(next_binding, next)) = order.get(end).and_then(|&at| wanted.get(at)) {
-                if next_binding != binding || next > last.saturating_add(GATHER_GAP) {
-                    break;
+            match runs.last_mut() {
+                Some((held, _, last))
+                    if *held == binding && index <= last.saturating_add(GATHER_GAP) =>
+                {
+                    *last = (*last).max(index);
                 }
-                last = next;
-                end += 1;
+                _ => runs.push((binding, index, index)),
             }
-            let words = self.read_at(binding, from, last - from + 1)?;
-            for &at in order.get(start..end).unwrap_or_default() {
-                let word = wanted
-                    .get(at)
-                    .and_then(|&(_, index)| words.get(index - from))
-                    .copied()
-                    .ok_or("the world read back short")?;
-                if let Some(slot) = out.get_mut(at) {
-                    *slot = word;
-                }
+        }
+        let mut bindings: Vec<u32> = runs.iter().map(|&(binding, _, _)| binding).collect();
+        bindings.dedup();
+        let mut reads: Vec<(usize, usize, usize)> = Vec::new();
+        for binding in bindings {
+            let mine: Vec<(usize, usize)> = runs
+                .iter()
+                .filter(|&&(held, _, _)| held == binding)
+                .map(|&(_, from, last)| (from, last - from + 1))
+                .collect();
+            let whole = self.sizes.get(binding as usize).copied().unwrap_or(0);
+            let cost: usize = mine
+                .iter()
+                .map(|&(_, count)| count.saturating_add(RUN_COST))
+                .fold(0, usize::saturating_add);
+            if cost >= whole && whole > 0 {
+                reads.push((binding as usize, 0, whole));
+            } else {
+                reads.extend(
+                    mine.iter()
+                        .map(|&(from, count)| (binding as usize, from, count)),
+                );
             }
-            start = end;
+        }
+        let got = self.live.read_runs(&reads)?;
+        let read: usize = got.iter().map(Vec::len).sum();
+        self.words_read = self.words_read.saturating_add(read as u64);
+        let mut out = Vec::with_capacity(wanted.len());
+        for &(binding, index) in wanted {
+            let key = (binding as usize, index);
+            let place = reads
+                .partition_point(|&(held, from, _)| (held, from) <= key)
+                .checked_sub(1);
+            let word = place
+                .and_then(|place| Some((reads.get(place)?, got.get(place)?)))
+                .filter(|((held, _, _), _)| *held == binding as usize)
+                .and_then(|((_, from, _), words)| words.get(index.checked_sub(*from)?))
+                .copied()
+                .ok_or("the world read back short")?;
+            out.push(word);
         }
         Ok(out)
     }
@@ -784,7 +811,22 @@ impl<'host> World<'host> {
                 .collect();
             return self.gathered(&wanted);
         };
-        let head = self.read_at(bricks.slots(), 0, bricks::HEAD)?;
+        let places: Vec<bricks::Cell<u32>> = points.iter().map(|&at| bricks.cell_of(at)).collect();
+        let table = bricks.table();
+        let mut first: Vec<(u32, usize)> =
+            (0..bricks::HEAD).map(|at| (bricks.slots(), at)).collect();
+        first.extend(
+            places
+                .iter()
+                .map(|place| (table, place.brick as usize * ENTRY)),
+        );
+        first.extend(
+            places
+                .iter()
+                .map(|place| (table, bricks.value_at(plane as usize, place.brick))),
+        );
+        let first = self.gathered(&first)?;
+        let (head, entries) = first.split_at(bricks::HEAD.min(first.len()));
         if head.get(bricks::OVERFLOW).copied().unwrap_or_default() != 0 {
             return Err(Box::new(host::Error::PoolFull {
                 slots: bricks.capacity(),
@@ -793,23 +835,12 @@ impl<'host> World<'host> {
         if head.get(bricks::LOST).copied().unwrap_or_default() != 0 {
             return Err(Box::new(host::Error::LostWrite));
         }
-        let places: Vec<bricks::Cell<u32>> = points.iter().map(|&at| bricks.cell_of(at)).collect();
-        let table = bricks.table();
-        let slots: Vec<(u32, usize)> = places
-            .iter()
-            .map(|place| (table, place.brick as usize * ENTRY))
-            .collect();
-        let slots = self.gathered(&slots)?;
-        let values: Vec<(u32, usize)> = places
-            .iter()
-            .map(|place| (table, bricks.value_at(plane as usize, place.brick)))
-            .collect();
-        let values = self.gathered(&values)?;
+        let (slots, values) = entries.split_at(places.len().min(entries.len()));
         let windows = bricks.windows();
         let start = bricks.plane_start(plane as usize) as usize;
         let held: Vec<(usize, (u32, usize))> = places
             .iter()
-            .zip(&slots)
+            .zip(slots)
             .enumerate()
             .filter(|&(_, (_, &slot))| slot != UNIFORM)
             .map(|(at, (place, &slot))| {
@@ -817,9 +848,12 @@ impl<'host> World<'host> {
                 (at, windows.place(index))
             })
             .collect();
+        let mut out = values.to_vec();
+        if held.is_empty() {
+            return Ok(out);
+        }
         let wanted: Vec<(u32, usize)> = held.iter().map(|&(_, place)| place).collect();
         let words = self.gathered(&wanted)?;
-        let mut out = values;
         for (&(at, _), word) in held.iter().zip(words) {
             if let Some(slot) = out.get_mut(at) {
                 *slot = word;

@@ -1503,61 +1503,111 @@ impl Resident<'_> {
     }
 
     pub fn read_at(&mut self, index: usize, at: usize, count: usize) -> Result<Vec<u32>, Error> {
+        let mut every = self.read_runs(&[(index, at, count)])?;
+        Ok(every.pop().unwrap_or_default())
+    }
+
+    pub fn read_runs(&mut self, runs: &[(usize, usize, usize)]) -> Result<Vec<Vec<u32>>, Error> {
         self.live()?;
-        let (held, from) = self.within(index, at, count)?;
-        let handle = held.handle;
-        if self.sparse(index) {
-            staged(0, count, self.room)?;
+        let mut batches: Vec<Vec<(usize, vk::Buffer, u64, usize)>> = vec![Vec::new()];
+        let mut room = words_in(self.staging.bytes).max(1);
+        let piece = room;
+        for (run, &(index, at, count)) in runs.iter().enumerate() {
+            if count == 0 {
+                let held = self.at(index)?;
+                let words = words_in(held.bytes);
+                if at > words {
+                    return Err(Error::Overrun {
+                        index,
+                        needed: at,
+                        held: words,
+                    });
+                }
+                continue;
+            }
+            let (held, from) = self.within(index, at, count)?;
+            let handle = held.handle;
+            if self.sparse(index) {
+                staged(0, count, self.room)?;
+            }
+            let mut along = 0_usize;
+            while along < count {
+                if room == 0 {
+                    batches.push(Vec::new());
+                    room = piece;
+                }
+                let part = room.min(count - along);
+                if let Some(batch) = batches.last_mut() {
+                    batch.push((run, handle, from.from + along as u64 * WORD, part));
+                }
+                along += part;
+                room -= part;
+            }
         }
-        if from.bytes == 0 {
-            return Ok(Vec::new());
-        }
-        let piece = words_in(self.staging.bytes).max(1);
-        let mut out = Vec::with_capacity(count);
-        let mut along = 0_usize;
-        while along < count {
-            let part = piece.min(count - along);
-            unsafe { self.fetched(handle, from.from + along as u64 * WORD, part, &mut out) }?;
-            along += part;
+        let mut out: Vec<Vec<u32>> = runs
+            .iter()
+            .map(|&(_, _, count)| Vec::with_capacity(count))
+            .collect();
+        for batch in batches.iter().filter(|batch| !batch.is_empty()) {
+            unsafe { self.fetched(batch, &mut out) }?;
         }
         Ok(out)
     }
 
-    /// Copies `count` words from `handle` at byte `at` through the staging
-    /// buffer onto the end of `out`, once from the mapped memory; they fit
-    /// the staging buffer.
+    /// Copies every part, `(run, buffer, byte, words)`, into the staging
+    /// buffer one after another in one submission, waits once, and appends
+    /// each part's words to its run in `out`; the parts fit the staging
+    /// buffer together.
     unsafe fn fetched(
         &mut self,
-        handle: vk::Buffer,
-        at: u64,
-        count: usize,
-        out: &mut Vec<u32>,
+        parts: &[(usize, vk::Buffer, u64, usize)],
+        out: &mut [Vec<u32>],
     ) -> Result<(), Error> {
-        let into = staged(0, count, self.staging.bytes)?;
-        let region = [vk::BufferCopy::default()
-            .src_offset(at)
-            .dst_offset(into.from)
-            .size(into.bytes)];
+        let total: usize = parts.iter().map(|&(_, _, _, words)| words).sum();
+        let into = staged(0, total, self.staging.bytes)?;
+        let mut regions = Vec::with_capacity(parts.len());
+        let mut along = 0_usize;
+        for &(_, handle, at, words) in parts {
+            let place = staged(along, words, self.staging.bytes)?;
+            regions.push((
+                handle,
+                [vk::BufferCopy::default()
+                    .src_offset(at)
+                    .dst_offset(place.from)
+                    .size(place.bytes)],
+            ));
+            along += words;
+        }
         let began = std::time::Instant::now();
         let staging = self.staging.handle;
         unsafe {
             self.once(|device, command| {
-                device.cmd_copy_buffer(command, handle, staging, &region);
+                for (handle, region) in &regions {
+                    device.cmd_copy_buffer(command, *handle, staging, region);
+                }
                 to_host(device, command);
             })
         }?;
         self.copying += began.elapsed();
         self.copies += 1;
-        let (memory, room) = (self.staging.memory, self.staging.bytes);
-        let from = staged(0, count, room)?;
+        let memory = self.staging.memory;
         unsafe {
             let mapped = self.host.device().map_memory(
                 memory,
-                from.from,
-                from.bytes,
+                into.from,
+                into.bytes,
                 vk::MemoryMapFlags::empty(),
             )?;
-            out.extend_from_slice(std::slice::from_raw_parts(mapped.cast::<u32>(), count));
+            let words = std::slice::from_raw_parts(mapped.cast::<u32>(), total);
+            let mut along = 0_usize;
+            for &(run, _, _, count) in parts {
+                if let (Some(into), Some(part)) =
+                    (out.get_mut(run), words.get(along..along + count))
+                {
+                    into.extend_from_slice(part);
+                }
+                along += count;
+            }
             self.host.device().unmap_memory(memory);
         }
         Ok(())

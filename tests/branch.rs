@@ -2044,3 +2044,248 @@ fn cells_at_reads_across_split_windows() {
         );
     }
 }
+
+fn largest_dense<'host>(host: &'host Host, params: &[u32], sparse: bool) -> (u32, World<'host>) {
+    [256_u32, 128, 64]
+        .into_iter()
+        .find_map(|side| {
+            let made = Made {
+                size: [side; 3],
+                ..made("heat", params, sparse)
+            };
+            World::create(host, &made).ok().map(|world| (side, world))
+        })
+        .unwrap()
+}
+
+fn spread(side: u32, many: usize, seed: u64) -> Vec<[u32; 3]> {
+    let mut state = seed;
+    (0..many)
+        .map(|_| {
+            let at = next(&mut state);
+            [
+                (at % u64::from(side)) as u32,
+                ((at >> 20) % u64::from(side)) as u32,
+                ((at >> 40) % u64::from(side)) as u32,
+            ]
+        })
+        .collect()
+}
+
+fn index_of(size: [u32; 3], at: [u32; 3]) -> usize {
+    ((at[2] as usize * size[1] as usize) + at[1] as usize) * size[0] as usize + at[0] as usize
+}
+
+#[test]
+fn read_runs_takes_one_wait_for_every_run_that_fits_the_staging() {
+    use grit::Error;
+    use grit::layout::{BINDINGS, PARAMS, STATE};
+    use grit::resident::STAGING;
+
+    let Some(host) = device("branch read runs") else {
+        return;
+    };
+    let cap = usize::try_from(STAGING / 4).unwrap();
+    let range = usize::try_from(host.limits().storage_range / 4).unwrap();
+    let words = (cap * 2 + 3).min(range);
+    let tick = grit::live::tick(host.width()).unwrap();
+    let modules: Vec<&[u32]> = vec![&tick];
+    let mut sizes = [64_usize; BINDINGS as usize];
+    sizes[STATE as usize] = words;
+    let mut held = host.resident(&sizes, &modules).unwrap();
+    let pattern: Vec<u32> = (0..words as u32)
+        .map(|at| at.wrapping_mul(0x9E37_79B1) ^ 0x1234)
+        .collect();
+    held.write(STATE as usize, &pattern).unwrap();
+    let params: Vec<u32> = (0..64).map(|at| 1000 + at).collect();
+    held.write(PARAMS as usize, &params).unwrap();
+    let state = STATE as usize;
+    let small = [
+        (state, 0, 1),
+        (state, words - 1, 1),
+        (PARAMS as usize, 5, 7),
+        (state, 77, 0),
+        (state, words, 0),
+        (state, cap - 3, 6),
+        (PARAMS as usize, 0, 64),
+    ];
+    let before = held.copying().1;
+    let got = held.read_runs(&small).unwrap();
+    assert_eq!(held.copying().1 - before, 1, "small runs take one wait");
+    for (&(index, at, count), words) in small.iter().zip(&got) {
+        let want = if index == state {
+            &pattern[at..at + count]
+        } else {
+            &params[at..at + count]
+        };
+        assert_eq!(words.as_slice(), want, "run at {at}, {count} words");
+    }
+    let before = held.copying().1;
+    let big = [(state, 0, cap), (state, cap, words - cap)];
+    let got = held.read_runs(&big).unwrap();
+    assert_eq!(
+        held.copying().1 - before,
+        words.div_ceil(cap) as u64,
+        "{words} words through a staging of {cap} words"
+    );
+    assert_eq!(got.concat(), pattern);
+    assert_eq!(held.read_at(state, words, 0).unwrap(), Vec::<u32>::new());
+    assert!(matches!(
+        held.read_at(state, words + 1, 0),
+        Err(Error::Overrun { .. })
+    ));
+    assert!(matches!(
+        held.read_runs(&[(state, 0, 1), (state, words, 1)]),
+        Err(Error::Overrun { .. })
+    ));
+    assert!(matches!(
+        held.read_runs(&[(state, usize::MAX, 1)]),
+        Err(Error::Overrun { .. })
+    ));
+    assert!(held.read_runs(&[]).unwrap().is_empty());
+}
+
+#[test]
+fn cells_at_takes_a_fixed_number_of_waits_however_many_points() {
+    let Some(host) = device("branch cells at waits") else {
+        return;
+    };
+    let params = params_of("heat", 3);
+    let (side, mut world) = largest_dense(&host, &params, false);
+    assert!(side >= 128, "{side}");
+    let size = [side; 3];
+    let scattered: Vec<([u32; 3], u32)> =
+        spread(side, 2000, 0xD1).into_iter().zip(1_u32..).collect();
+    world.write(&scattered).unwrap();
+    let whole = world.cells().unwrap();
+    for many in [1_usize, 2, 11_000] {
+        let points = spread(side, many, 0xE5 + many as u64);
+        let before = world.read_waits();
+        let got = world.cells_at(&points).unwrap();
+        assert_eq!(
+            world.read_waits() - before,
+            1,
+            "dense {side}^3, {many} points"
+        );
+        for (point, word) in points.iter().zip(got) {
+            assert_eq!(word, whole[index_of(size, *point)], "{point:?}");
+        }
+    }
+
+    let (side, mut world) = largest_dense(&host, &params, true);
+    assert!(side >= 128, "{side}");
+    let size = [side; 3];
+    let pool = world.pool().unwrap();
+    let sides = pool.sides();
+    let lattice = [0, 1, 2].map(|axis| side / sides[axis]);
+    let marks: Vec<([u32; 3], u32)> =
+        (0..pool.capacity().min(lattice[0] * lattice[1] * lattice[2]) - 1)
+            .map(|brick| {
+                let at = [
+                    brick % lattice[0] * sides[0] + 1,
+                    brick / lattice[0] % lattice[1] * sides[1],
+                    brick / lattice[0] / lattice[1] * sides[2],
+                ];
+                (at, brick + 1)
+            })
+            .collect();
+    world.write(&marks).unwrap();
+    let whole = world.cells().unwrap();
+    let held_point = [marks[marks.len() - 1].0];
+    let uniform_point = [[side - 1; 3]];
+    let before = world.read_waits();
+    world.cells_at(&held_point).unwrap();
+    assert_eq!(world.read_waits() - before, 2, "sparse, one held point");
+    let before = world.read_waits();
+    world.cells_at(&uniform_point).unwrap();
+    assert_eq!(world.read_waits() - before, 1, "sparse, one uniform point");
+    let mut points: Vec<[u32; 3]> = marks.iter().map(|&(at, _)| at).take(5000).collect();
+    points.extend(spread(side, 11_000 - points.len(), 0x5A));
+    let before = world.read_waits();
+    let got = world.cells_at(&points).unwrap();
+    assert_eq!(
+        world.read_waits() - before,
+        2,
+        "sparse {side}^3, 11 000 points"
+    );
+    for (point, word) in points.iter().zip(got) {
+        assert_eq!(word, whole[index_of(size, *point)], "{point:?}");
+    }
+}
+
+#[test]
+fn many_points_read_the_binding_whole_and_few_read_runs() {
+    use grit::layout::STATE;
+
+    let Some(host) = device("branch cells at whole") else {
+        return;
+    };
+    let params = params_of("heat", 3);
+    let side = 64_u32;
+    let size = [side; 3];
+    let made = Made {
+        size,
+        ..made("heat", &params, false)
+    };
+    let mut world = World::create(&host, &made).unwrap();
+    world
+        .write(
+            &spread(side, 500, 0x77)
+                .into_iter()
+                .zip(3_u32..)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let whole = world.cells().unwrap();
+    let state = world.sizes()[STATE as usize] as u64;
+    let few = spread(side, 100, 0x10);
+    let before = world.words_read();
+    let got = world.cells_at(&few).unwrap();
+    let read = world.words_read() - before;
+    assert!(read <= 100 * 17, "{read} words for 100 points");
+    for (point, word) in few.iter().zip(got) {
+        assert_eq!(word, whole[index_of(size, *point)]);
+    }
+    let many = spread(side, 11_000, 0x11);
+    let before = world.words_read();
+    let waits = world.read_waits();
+    let got = world.cells_at(&many).unwrap();
+    assert_eq!(
+        world.words_read() - before,
+        state,
+        "11 000 points read STATE whole"
+    );
+    assert_eq!(world.read_waits() - waits, 1);
+    for (point, word) in many.iter().zip(got) {
+        assert_eq!(word, whole[index_of(size, *point)]);
+    }
+}
+
+#[test]
+fn scattered_points_cost_about_a_full_read_at_most() {
+    let Some(host) = device("branch cells at time") else {
+        return;
+    };
+    let params = params_of("heat", 3);
+    let (side, mut world) = largest_dense(&host, &params, false);
+    let points = spread(side, 11_000, 0x71);
+    let mut gathered = f64::MAX;
+    let mut full = f64::MAX;
+    for _ in 0..3 {
+        let began = std::time::Instant::now();
+        let got = world.cells_at(&points).unwrap();
+        gathered = gathered.min(began.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(got.len(), points.len());
+        let began = std::time::Instant::now();
+        let all = world.cells().unwrap();
+        full = full.min(began.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(all.len(), (side as usize).pow(3));
+    }
+    println!(
+        "dense {side}^3: 11 000 scattered points {gathered:.2} ms, full read {full:.2} ms (min of 3)"
+    );
+    assert!(
+        gathered <= 3.0 * full + 5.0,
+        "{gathered:.2} ms for 11 000 points against {full:.2} ms for the whole world"
+    );
+}
