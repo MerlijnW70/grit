@@ -2250,9 +2250,8 @@ fn a_save_an_open_a_fork_and_a_create_too_slow_for_their_budget_are_refused_befo
         .cloned()
         .unwrap();
     for work in ["build", "save"] {
-        assert_eq!(
-            rates.get(work).unwrap().get("measured"),
-            Some(&Json::Bool(true)),
+        assert!(
+            rates.get(work).unwrap().int_at("observations") >= 1,
             "{work}: {}",
             written(&rates)
         );
@@ -2559,4 +2558,321 @@ fn a_kept_world_that_cannot_be_rebuilt_is_listed_broken_and_closes_with_its_file
     let mut server = Server::with(None, &options).unwrap();
     let listed = answer(&call(&mut server, "grit_world_list", "{}"));
     assert_eq!(listed.int_at("total"), 0);
+}
+
+#[test]
+fn one_poisoned_observation_of_each_kind_changes_no_later_estimate() {
+    use grit::serve3::budget::{Rates, Work};
+    let unrelated = 64 << 20;
+    for work in Work::ALL {
+        let mut fresh = Rates::default();
+        let prior = fresh.estimate(work, unrelated);
+        for poison in [1000.0, 0.001] {
+            let mut first = Rates::default();
+            first.measure(work, 1 << 20, prior.mul_f64(poison));
+            assert_eq!(
+                first.estimate(work, unrelated),
+                prior,
+                "{work:?} poisoned first"
+            );
+        }
+        for _ in 0..2 {
+            fresh.measure(work, unrelated, prior.mul_f64(0.5));
+        }
+        let settled = fresh.estimate(work, unrelated);
+        for poison in [1000.0, 0.001] {
+            let mut poisoned = fresh.clone();
+            poisoned.measure(work, unrelated, settled.mul_f64(poison));
+            assert_eq!(
+                poisoned.estimate(work, unrelated),
+                settled,
+                "{work:?} x{poison}"
+            );
+        }
+        let mut moving = fresh.clone();
+        for _ in 0..5 {
+            moving.measure(work, unrelated, settled.mul_f64(3.0));
+        }
+        assert!(
+            moving.estimate(work, unrelated) > settled,
+            "{work:?} never learns"
+        );
+    }
+    let mut rates = Rates::default();
+    let prior = rates.replay();
+    rates.measure_replay(Duration::from_millis(50), Duration::from_secs(20));
+    assert!((rates.replay() - prior).abs() < 1e-9);
+    for _ in 0..2 {
+        rates.measure_replay(Duration::from_secs(1), Duration::from_millis(1500));
+    }
+    let settled = rates.replay();
+    rates.measure_replay(Duration::from_secs(1), Duration::from_secs(40));
+    assert!(
+        (rates.replay() - settled).abs() < 1e-9,
+        "{settled} {}",
+        rates.replay()
+    );
+    rates.measure_replay(Duration::from_secs(1), Duration::from_millis(10));
+    assert!((rates.replay() - settled).abs() < 1e-9);
+}
+
+#[test]
+fn a_write_replayed_on_open_does_not_slow_the_next_create() {
+    let Some(host) = device("write replay and build rate") else {
+        return;
+    };
+    let side = dense_side(&host);
+    drop(host);
+    let scratch = Scratch::new("write-build");
+    let options = Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    };
+    let mut run = Run::new(&options);
+    let world = answer(&run.ask(
+        "grit_world_create",
+        "{\"wide\":64,\"deep\":64,\"tall\":64,\"rule\":\"sand\"}",
+    ))
+    .int_at("world");
+    let mut seed = 0x7719_u64;
+    let cells = scattered(&mut seed, 64, 200, &SAND_WORDS);
+    let began = Instant::now();
+    answer(&run.ask(
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
+    ));
+    eprintln!("the write took {:?}", began.elapsed());
+    run.exec.finish();
+    eprintln!(
+        "kept before the restart: {:?}",
+        entries(&scratch.dir().join("kept"))
+    );
+    let mut again = Run::new(&options);
+    let opened = answer(&again.ask(
+        "grit_world_open",
+        &format!("{{\"name\":\"world-{world}\"}}"),
+    ));
+    eprintln!("opened: {}", written(&opened));
+    assert_eq!(opened.int_at("replayed"), 1);
+    let rates = answer(&again.ask("grit_describe", "{}"))
+        .get("submissions")
+        .and_then(|one| one.get("rates"))
+        .cloned()
+        .unwrap();
+    eprintln!("rates after the open: {}", written(&rates));
+    assert!(rates.get("write").unwrap().int_at("observations") >= 1);
+    for _ in 0..2 {
+        let made = answer(&again.ask(
+            "grit_world_create",
+            &format!("{{\"wide\":{side},\"deep\":{side},\"tall\":{side},\"rule\":\"sand\"}}"),
+        ));
+        answer(&again.ask(
+            "grit_world_close",
+            &format!("{{\"world\":{}}}", made.int_at("world")),
+        ));
+    }
+    again.exec.finish();
+}
+
+#[test]
+fn one_skewed_replay_does_not_slow_another_world() {
+    let Some(host) = device("skewed replay") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("skewed");
+    let keep = Keep::at(&scratch.dir()).unwrap();
+    let mut ledger = Ledger::created(Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [64, 64, 64],
+        sparse: false,
+        slots: None,
+    });
+    ledger.push(Entry::Step(20000), Duration::from_millis(50));
+    keep.begin(1, &ledger).unwrap();
+    keep.set_next(2).unwrap();
+    drop(keep);
+    let mut run = Run::new(&Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    });
+    let opened = answer(&run.ask("grit_world_open", "{\"name\":\"world-1\"}"));
+    assert_eq!(opened.int_at("frame"), 20000);
+    let rates = answer(&run.ask("grit_describe", "{}"))
+        .get("submissions")
+        .and_then(|one| one.get("rates"))
+        .cloned()
+        .unwrap();
+    eprintln!("rates after the skewed replay: {}", written(&rates));
+    assert_eq!(rates.int_at("replay_observations"), 1);
+    assert_eq!(rates.int_at("replay_per_recorded_percent"), 200);
+    run.exec.finish();
+}
+
+#[test]
+fn a_journal_record_with_a_good_checksum_that_does_not_read_is_refused_by_name() {
+    let scratch = Scratch::new("unreadable");
+    let keep = Keep::at(&scratch.dir()).unwrap();
+    let mut ledger = Ledger::created(Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [8, 8, 8],
+        sparse: false,
+        slots: None,
+    });
+    ledger.push(Entry::Step(5), Duration::from_millis(1));
+    keep.begin(1, &ledger).unwrap();
+    keep.set_next(2).unwrap();
+    drop(keep);
+    let path = scratch.dir().join("kept").join("world-1.journal");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut check = 0x811C_9DC5_u32;
+    let payload = [500_u32];
+    for word in [4_u32, 1].iter().chain(&payload) {
+        for byte in word.to_le_bytes() {
+            check ^= u32::from(byte);
+            check = check.wrapping_mul(0x0100_0193);
+        }
+    }
+    for word in [4_u32, 1, 500, check] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let options = Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    };
+    let mut server = Server::with(None, &options).unwrap();
+    let listed = answer(&call(&mut server, "grit_world_list", "{}"));
+    assert_eq!(kinds_listed(&listed), [("broken".to_owned(), 1)]);
+    let told = refused(&call(
+        &mut server,
+        "grit_world_open",
+        "{\"name\":\"world-1\"}",
+    ));
+    assert_eq!(told.code, "bad_file", "{}", told.message);
+    assert!(told.message.contains("record 2"), "{}", told.message);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    answer(&call(&mut server, "grit_world_close", "{\"world\":1}"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_world_stepped_with_small_budgets_keeps_making_progress() {
+    let Some(host) = device("small budgets progress") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("progress");
+    let mut run = Run::new(&Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    });
+    let world = answer(&run.ask(
+        "grit_world_create",
+        "{\"wide\":128,\"deep\":128,\"tall\":128,\"rule\":\"sand\"}",
+    ))
+    .int_at("world");
+    let mut seed = 0x5113_u64;
+    let cells = scattered(&mut seed, 128, 4096, &SAND_WORDS);
+    answer(&run.ask(
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
+    ));
+    let mut frame = 0;
+    for call in 0..16 {
+        let got = answer(&run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":300}}"),
+        ));
+        let now = got.int_at("frame");
+        assert!(
+            now > frame,
+            "call {call} made no progress: {}",
+            written(&got)
+        );
+        frame = now;
+    }
+    let rates = answer(&run.ask("grit_describe", "{}"))
+        .get("submissions")
+        .and_then(|one| one.get("rates"))
+        .cloned()
+        .unwrap();
+    eprintln!(
+        "16 small-budget steps reached frame {frame}; rates {}",
+        written(&rates)
+    );
+    assert!(rates.get("save").unwrap().int_at("observations") >= 1);
+    assert!(
+        entries(&scratch.dir().join("kept"))
+            .iter()
+            .any(|one| one.starts_with("snap-"))
+    );
+    run.exec.finish();
+}
+
+#[test]
+fn a_write_past_its_budget_stops_between_cells_and_says_how_many_it_wrote() {
+    let Some(host) = device("write budget") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = create(
+        &mut server,
+        "{\"wide\":64,\"deep\":64,\"tall\":64,\"rule\":\"sand\"}",
+    );
+    let mut seed = 0x3311_u64;
+    let mut cells = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (at, word) in scattered(&mut seed, 64, 8000, &SAND_WORDS) {
+        if seen.insert(at) && cells.len() < 4096 {
+            cells.push((at, word));
+        }
+    }
+    let began = Instant::now();
+    let got = answer(&call(
+        &mut server,
+        "grit_world_write",
+        &format!(
+            "{{\"world\":{world},\"cells\":{},\"budget_ms\":100}}",
+            writing(&cells)
+        ),
+    ));
+    let took = began.elapsed();
+    let wrote = usize::try_from(got.int_at("written")).unwrap();
+    eprintln!(
+        "a write of {} cells with budget_ms 100 wrote {wrote} in {took:?}",
+        cells.len()
+    );
+    assert!(took < Duration::from_millis(100 + 250 + 100), "{took:?}");
+    assert_eq!(got.get("stopped").and_then(Json::text), Some("budget"));
+    assert_eq!(got.int_at("asked"), i64::try_from(cells.len()).unwrap());
+    assert!(wrote >= 1 && wrote < cells.len(), "{wrote}");
+    for (index, (at, word)) in [
+        (0, cells[0]),
+        (wrote - 1, cells[wrote - 1]),
+        (wrote, cells[wrote]),
+    ] {
+        let got = answer(&call(
+            &mut server,
+            "grit_world_read",
+            &format!(
+                "{{\"world\":{world},\"from\":[{0},{1},{2}],\"to\":[{0},{1},{2}]}}",
+                at[0], at[1], at[2]
+            ),
+        ));
+        let want = if index < wrote { word } else { 0 };
+        assert_eq!(numbers(&got, "cells"), [want], "cell {index}");
+    }
+}
+
+#[test]
+fn the_highest_world_number_described_is_the_highest_handed_out() {
+    let mut server = Server::new(None);
+    let limits = described(&mut server).get("limits").cloned().unwrap();
+    assert_eq!(
+        limits.int_at("world_number_most"),
+        i64::from(journal::NUMBER_MOST) - 1
+    );
 }
