@@ -237,6 +237,17 @@ impl Ledger {
         self.snapping = snapping;
     }
 
+    pub fn rebase_at(&mut self, snap: Arc<Snap>, cost: Duration, from: usize) {
+        let entries = self.entries.split_off(from.min(self.entries.len()));
+        let recorded = self.recorded.split_off(from.min(self.recorded.len()));
+        let mut ledger = Self::snapped(snap);
+        ledger.snapping = cost;
+        for (entry, spent) in entries.into_iter().zip(recorded) {
+            ledger.push(entry, spent);
+        }
+        *self = ledger;
+    }
+
     #[must_use]
     pub const fn journal_bytes(&self) -> usize {
         self.bytes

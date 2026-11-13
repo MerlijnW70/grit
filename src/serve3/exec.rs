@@ -26,6 +26,8 @@ const ANSWERED: u8 = 2;
 
 const WATCH: Duration = Duration::from_millis(5);
 
+const LANDING: Duration = Duration::from_millis(10);
+
 struct Job {
     request: Json,
     id: Json,
@@ -40,11 +42,29 @@ struct Flight {
     state: Arc<AtomicU8>,
     arrived: Instant,
     budget_ms: u64,
+    excused: Duration,
+}
+
+impl Flight {
+    fn charged(&self, now: Instant, idle: Option<Instant>) -> Duration {
+        let behind = idle.map_or(Duration::ZERO, |began| {
+            now.saturating_duration_since(began.max(self.arrived))
+        });
+        now.saturating_duration_since(self.arrived)
+            .saturating_sub(self.excused)
+            .saturating_sub(behind)
+    }
+}
+
+#[derive(Default)]
+struct Flights {
+    list: Vec<Flight>,
+    idle: Option<Instant>,
 }
 
 struct Shared {
     status: Mutex<Status>,
-    flights: Mutex<Vec<Flight>>,
+    flights: Mutex<Flights>,
     batches: Arc<AtomicU64>,
     stopping: AtomicBool,
 }
@@ -60,13 +80,13 @@ fn budget_of(request: &Json) -> u64 {
         .unwrap_or(super::budget::BUDGET_MS)
 }
 
-fn waited(flight: &Flight) -> Json {
+fn waited(flight: &Flight, charged: Duration) -> Json {
     let refusal = Refusal::new(
         Code::Budget,
         "$.budget_ms",
         format!(
-            "the call waited {} ms behind earlier work, past its budget of {} ms, so nothing ran",
-            flight.arrived.elapsed().as_millis(),
+            "the call waited {} ms behind earlier calls, past its budget of {} ms, so nothing ran",
+            charged.as_millis(),
             flight.budget_ms
         ),
     )
@@ -85,10 +105,10 @@ fn watch(shared: &Shared, answers: &Sender<Json>) {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
-        flights.retain(|flight| {
-            let due = now.saturating_duration_since(flight.arrived)
-                >= Duration::from_millis(flight.budget_ms);
-            if !due {
+        let idle = flights.idle;
+        flights.list.retain(|flight| {
+            let charged = flight.charged(now, idle);
+            if charged < Duration::from_millis(flight.budget_ms) {
                 return true;
             }
             if flight
@@ -98,7 +118,7 @@ fn watch(shared: &Shared, answers: &Sender<Json>) {
             {
                 return true;
             }
-            let _ = answers.send(waited(flight));
+            let _ = answers.send(waited(flight, charged));
             false
         });
     }
@@ -112,11 +132,39 @@ impl Shared {
     fn landed(&self, cancel: &Arc<AtomicBool>) {
         let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(at) = flights
+            .list
             .iter()
             .position(|flight| Arc::ptr_eq(&flight.cancel, cancel))
         {
-            flights.swap_remove(at);
+            flights.list.swap_remove(at);
         }
+    }
+
+    fn excused(&self, cancel: &Arc<AtomicBool>) -> Duration {
+        self.flights
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .list
+            .iter()
+            .find(|flight| Arc::ptr_eq(&flight.cancel, cancel))
+            .map_or(Duration::ZERO, |flight| flight.excused)
+    }
+
+    fn idling(&self, server: &mut Server<'_>) -> bool {
+        self.flights
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .idle = Some(Instant::now());
+        let did = server.idle();
+        let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if let Some(began) = flights.idle.take() {
+            for flight in &mut flights.list {
+                let behind = now.saturating_duration_since(began.max(flight.arrived));
+                flight.excused = flight.excused.saturating_add(behind);
+            }
+        }
+        did
     }
 }
 
@@ -273,7 +321,7 @@ fn work(
                 None => match jobs.try_recv() {
                     Ok(job) => job,
                     Err(mpsc::TryRecvError::Empty) => {
-                        if !server.lost() && server.idle() {
+                        if !server.lost() && shared.idling(&mut server) {
                             shared.publish(&server);
                             if server.lost() {
                                 reopen = true;
@@ -281,9 +329,17 @@ fn work(
                             }
                             continue;
                         }
-                        match jobs.recv() {
-                            Ok(job) => job,
-                            Err(_) => break,
+                        if server.writing() {
+                            match jobs.recv_timeout(LANDING) {
+                                Ok(job) => job,
+                                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        } else {
+                            match jobs.recv() {
+                                Ok(job) => job,
+                                Err(_) => break,
+                            }
                         }
                     }
                     Err(mpsc::TryRecvError::Disconnected) => break,
@@ -302,7 +358,8 @@ fn work(
             {
                 continue;
             }
-            server.arriving(Some(job.arrived), Some(Arc::clone(&job.cancel)));
+            let arrived = job.arrived + shared.excused(&job.cancel);
+            server.arriving(Some(arrived), Some(Arc::clone(&job.cancel)));
             let answer = server.handle(&job.request).unwrap_or(Json::Null);
             server.arriving(None, None);
             shared.publish(&server);
@@ -318,6 +375,7 @@ fn work(
         book = server.into_book();
         drop(host);
         if !reopen {
+            book.drain();
             return;
         }
     }
@@ -334,7 +392,7 @@ impl Exec {
         let (ready, started) = mpsc::channel::<()>();
         let shared = Arc::new(Shared {
             status: Mutex::new(Server::new(None).status()),
-            flights: Mutex::new(Vec::new()),
+            flights: Mutex::new(Flights::default()),
             batches,
             stopping: AtomicBool::new(false),
         });
@@ -420,7 +478,7 @@ impl Exec {
                 .flights
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if flights.len() >= QUEUE_MOST {
+            if flights.list.len() >= QUEUE_MOST {
                 return Some(transport::failed(
                     id,
                     &Refusal::new(
@@ -433,12 +491,13 @@ impl Exec {
                     .limited(Json::Int(i64::try_from(QUEUE_MOST).unwrap_or(i64::MAX))),
                 ));
             }
-            flights.push(Flight {
+            flights.list.push(Flight {
                 id: id.clone(),
                 cancel: Arc::clone(&cancel),
                 state: Arc::clone(&state),
                 arrived,
                 budget_ms: budget_of(&request),
+                excused: Duration::ZERO,
             });
         }
         let job = Job {
@@ -475,7 +534,7 @@ impl Exec {
             .flights
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        for flight in flights.iter() {
+        for flight in &flights.list {
             if &flight.id == asked {
                 flight.cancel.store(true, Ordering::SeqCst);
             }
