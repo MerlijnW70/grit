@@ -817,7 +817,7 @@ const SELECTION_SEEDS: u64 = 40;
 
 const SELECTION_FRAMES: u32 = 128;
 
-const Z_999: f64 = 3.29;
+const T_999_39: f64 = 3.558;
 
 #[derive(Debug, Clone, Copy)]
 struct Contest {
@@ -879,7 +879,7 @@ fn interval(values: &[f64]) -> (f64, f64, f64) {
     let n = values.len() as f64;
     let mean = values.iter().sum::<f64>() / n;
     let var = values.iter().map(|one| (one - mean).powi(2)).sum::<f64>() / (n - 1.0);
-    let half = Z_999 * (var / n).sqrt();
+    let half = T_999_39 * (var / n).sqrt();
     (mean, mean - half, mean + half)
 }
 
