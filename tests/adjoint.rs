@@ -10,7 +10,7 @@ use grit::compact::Plan;
 use grit::layout::{BINDINGS, DENSE, GRAND, PARAMS, STATE};
 use grit::live::{Waking, corners, wake};
 use grit::sand::Grid;
-use grit::{Groups, Host, live, sweep};
+use grit::{Groups, Host, Resident, live, sweep};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, Lanes, U32, Vector};
 
@@ -646,8 +646,6 @@ struct Ran {
     carried: Vec<u32>,
     home: Vec<u32>,
     awake: u32,
-    ahead: Duration,
-    back: Duration,
 }
 
 const ROUNDS: u32 = 5;
@@ -676,77 +674,92 @@ fn wiring(width: u32, grid: Grid, plan: &Plan) -> Wiring {
     (passes, ahead, back)
 }
 
-fn ran_over(host: &Host, grid: Grid, held: [&[u32]; 3], sparse: bool, rounds: u32) -> Ran {
-    let width = host.width();
-    let quads = grid.quads();
-    let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
-    let [start, slope, weight] = held;
+struct Walk<'host> {
+    resident: Resident<'host>,
+    grid: Grid,
+    sparse: bool,
+    forward: Vec<Vec<Groups>>,
+    backward: Vec<Vec<Groups>>,
+    awake: u32,
+    pushed: Vec<u32>,
+}
 
-    let over = Groups::Fixed(quads.div_ceil(width));
-    let none = Groups::Fixed(0);
-    let whole_ahead = [over, none];
-    let whole_back = [none, over];
+impl<'host> Walk<'host> {
+    fn over(host: &'host Host, grid: Grid, held: [&[u32]; 3], sparse: bool) -> Self {
+        let width = host.width();
+        let quads = grid.quads();
+        let plan = Plan::over(width, quads.div_ceil(sweep::cells(width))).unwrap();
+        let [start, slope, weight] = held;
 
-    let (sparse_passes, sparse_ahead, sparse_back) = wiring(width, grid, &plan);
-    let whole_passes = vec![
-        built(width, grid, Pass::Tangent).unwrap(),
-        built(width, grid, Pass::Adjoint).unwrap(),
-    ];
-    let passes = if sparse { sparse_passes } else { whole_passes };
-    let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let over = Groups::Fixed(quads.div_ceil(width));
+        let none = Groups::Fixed(0);
 
-    let plan_sizes = plan.sizes();
-    let mut sizes = [1_usize; HOLDING as usize];
-    for (slot, words) in sizes.iter_mut().zip(plan_sizes) {
-        *slot = words;
+        let (sparse_passes, sparse_ahead, sparse_back) = wiring(width, grid, &plan);
+        let whole_passes = vec![
+            built(width, grid, Pass::Tangent).unwrap(),
+            built(width, grid, Pass::Adjoint).unwrap(),
+        ];
+        let passes = if sparse { sparse_passes } else { whole_passes };
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+
+        let plan_sizes = plan.sizes();
+        let mut sizes = [1_usize; HOLDING as usize];
+        for (slot, words) in sizes.iter_mut().zip(plan_sizes) {
+            *slot = words;
+        }
+        sizes[TANGENT as usize] = plan_sizes[STATE as usize];
+        sizes[CARRIED as usize] = plan_sizes[STATE as usize];
+
+        let mut resident = host.resident(&sizes, &modules).unwrap();
+        for (binding, words) in sizes.iter().enumerate() {
+            resident.write(binding, &vec![0_u32; *words]).unwrap();
+        }
+        resident.write(STATE as usize, start).unwrap();
+        resident.write(TANGENT as usize, slope).unwrap();
+        resident.write(CARRIED as usize, weight).unwrap();
+        resident
+            .write(PARAMS as usize, &[u32::MAX, plan.dump()])
+            .unwrap();
+        live::seed(&mut resident, grid, &plan).unwrap();
+
+        let (forward, backward) = if sparse {
+            (sparse_ahead, sparse_back)
+        } else {
+            (vec![vec![over, none]], vec![vec![none, over]])
+        };
+        Self {
+            resident,
+            grid,
+            sparse,
+            forward,
+            backward,
+            awake: quads,
+            pushed: Vec::new(),
+        }
     }
-    sizes[TANGENT as usize] = plan_sizes[STATE as usize];
-    sizes[CARRIED as usize] = plan_sizes[STATE as usize];
 
-    let mut resident = host.resident(&sizes, &modules).unwrap();
-    for (binding, words) in sizes.iter().enumerate() {
-        resident.write(binding, &vec![0_u32; *words]).unwrap();
-    }
-    resident.write(STATE as usize, start).unwrap();
-    resident.write(TANGENT as usize, slope).unwrap();
-    resident.write(CARRIED as usize, weight).unwrap();
-    resident
-        .write(PARAMS as usize, &[u32::MAX, plan.dump()])
-        .unwrap();
-    live::seed(&mut resident, grid, &plan).unwrap();
-
-    let forward: Vec<&[Groups]> = if sparse {
-        sparse_ahead.iter().map(Vec::as_slice).collect()
-    } else {
-        vec![&whole_ahead]
-    };
-    let backward: Vec<&[Groups]> = if sparse {
-        sparse_back.iter().map(Vec::as_slice).collect()
-    } else {
-        vec![&whole_back]
-    };
-
-    if rounds > 1 {
+    fn warmed(&mut self) {
+        let forward: Vec<&[Groups]> = self.forward.iter().map(Vec::as_slice).collect();
         let warming = std::time::Instant::now();
         while warming.elapsed() < Duration::from_millis(400) {
-            resident.staged(&forward).unwrap();
+            self.resident.staged(&forward).unwrap();
         }
     }
 
-    let mut fastest_ahead = Duration::MAX;
-    let mut fastest_back = Duration::MAX;
-    let mut awake = quads;
-    let mut pushed = Vec::new();
-    for _ in 0..rounds {
-        let mut spent = Duration::ZERO;
+    fn round(&mut self) -> (Duration, Duration) {
+        let forward: Vec<&[Groups]> = self.forward.iter().map(Vec::as_slice).collect();
+        let backward: Vec<&[Groups]> = self.backward.iter().map(Vec::as_slice).collect();
+        let resident = &mut self.resident;
+
+        let mut ahead = Duration::ZERO;
         for frame in 0..STEPS {
             resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
-            spent += resident.staged(&forward).unwrap();
+            resident.staged(&forward).unwrap();
+            ahead += resident.on_device().unwrap();
         }
-        fastest_ahead = fastest_ahead.min(spent / STEPS);
-        pushed = resident.read(TANGENT as usize, grid.cells()).unwrap();
-        if sparse {
-            awake = awake.min(
+        self.pushed = resident.read(TANGENT as usize, self.grid.cells()).unwrap();
+        if self.sparse {
+            self.awake = self.awake.min(
                 resident
                     .read(GRAND as usize, 1)
                     .unwrap()
@@ -756,30 +769,38 @@ fn ran_over(host: &Host, grid: Grid, held: [&[u32]; 3], sparse: bool, rounds: u3
             );
         }
 
-        let mut spent = Duration::ZERO;
+        let mut back = Duration::ZERO;
         for frame in (0..STEPS).rev() {
             resident.write_at(PARAMS as usize, 0, &[frame]).unwrap();
-            spent += resident.staged(&backward).unwrap();
+            resident.staged(&backward).unwrap();
+            back += resident.on_device().unwrap();
         }
-        fastest_back = fastest_back.min(spent / STEPS);
+        (ahead / STEPS, back / STEPS)
     }
 
-    Ran {
-        pushed,
-        carried: resident.read(CARRIED as usize, grid.cells()).unwrap(),
-        home: resident.read(STATE as usize, grid.cells()).unwrap(),
-        awake,
-        ahead: fastest_ahead,
-        back: fastest_back,
+    fn ran(mut self) -> Ran {
+        let cells = self.grid.cells();
+        Ran {
+            pushed: std::mem::take(&mut self.pushed),
+            carried: self.resident.read(CARRIED as usize, cells).unwrap(),
+            home: self.resident.read(STATE as usize, cells).unwrap(),
+            awake: self.awake,
+        }
     }
+}
+
+fn ran_over(host: &Host, grid: Grid, held: [&[u32]; 3], sparse: bool) -> Ran {
+    let mut walk = Walk::over(host, grid, held, sparse);
+    walk.round();
+    walk.ran()
 }
 
 fn over_the_list(host: &Host, grid: Grid, start: &[u32], slope: &[u32], weight: &[u32]) -> Ran {
-    ran_over(host, grid, [start, slope, weight], true, 1)
+    ran_over(host, grid, [start, slope, weight], true)
 }
 
 fn over_them_all(host: &Host, grid: Grid, start: &[u32], slope: &[u32], weight: &[u32]) -> Ran {
-    ran_over(host, grid, [start, slope, weight], false, 1)
+    ran_over(host, grid, [start, slope, weight], false)
 }
 
 #[test]
@@ -848,18 +869,6 @@ fn the_list_carries_the_weights_the_whole_grid_would_have() {
 /// The largest side the walk starts from where the bookkeeping can hold it.
 const TOP: u32 = 4096;
 
-/// How much more a walk over the whole grid must cost at the top of the ladder
-/// than at the bottom before the comparison means anything.
-///
-/// The sides span sixty-four to one. Measured over exactly that span, twice,
-/// because these are clocks and they move a little: 9.10 and 9.06 on an RTX
-/// 4080 at a subgroup of 32, 37.4 and 37.9 on an AMD iGPU at 64, against 1.49
-/// and 1.45 under lavapipe at 16 and 1.14 and 1.20 at 8. Three sits between
-/// them with room to spare on both sides, and what it separates is not a fast
-/// device from a slow one but a machine spending its time on cells from one
-/// spending it on dispatches.
-const SPENT: f64 = 3.0;
-
 /// The smallest side on which a list has been seen to leave anything out.
 ///
 /// Measured: at a subgroup of 8 the ladder tops at 1024 and the walk holds; at
@@ -907,48 +916,60 @@ fn the_list_starts_paying_when_the_grid_outgrows_the_bookkeeping() {
     let sides = [top, top / 2, top / 4, top / 8];
     eprintln!("{} {per_block} {top}", host.width());
 
-    let mut won = false;
-    let mut widest = None;
-    let mut narrowest = None;
+    let mut walks: Vec<(Grid, Walk<'_>, Walk<'_>)> = Vec::new();
     for side in sides {
         let grid = Grid::of(side, side);
         let cells = patched(grid, 0x1234_5678, 12);
         let held = [cells.as_slice(), cells.as_slice(), cells.as_slice()];
+        let mut whole = Walk::over(&host, grid, held, false);
+        let mut listed = Walk::over(&host, grid, held, true);
+        whole.warmed();
+        listed.warmed();
+        walks.push((grid, whole, listed));
+    }
 
-        let whole = ran_over(&host, grid, held, false, ROUNDS);
-        let listed = ran_over(&host, grid, held, true, ROUNDS);
+    let mut best = vec![[Duration::MAX; 4]; walks.len()];
+    for _ in 0..ROUNDS {
+        for ((_, whole, listed), kept) in walks.iter_mut().zip(best.iter_mut()) {
+            let (whole_ahead, whole_back) = whole.round();
+            let (listed_ahead, listed_back) = listed.round();
+            for (slot, spent) in
+                kept.iter_mut()
+                    .zip([whole_ahead, whole_back, listed_ahead, listed_back])
+            {
+                *slot = (*slot).min(spent);
+            }
+        }
+    }
+
+    let mut won = false;
+    for ((grid, _, listed), [whole_ahead, whole_back, listed_ahead, listed_back]) in
+        walks.iter().zip(&best)
+    {
         eprintln!(
             "{} {} {:.3?} {:.3?} {:.3?} {:.3?}",
             grid.quads(),
             listed.awake,
-            whole.ahead,
-            whole.back,
-            listed.ahead,
-            listed.back
+            whole_ahead,
+            whole_back,
+            listed_ahead,
+            listed_back
         );
-        assert!(listed.awake < grid.quads() || side == sides[3]);
-        if widest.is_none() {
-            widest = Some(whole.ahead);
-        }
-        narrowest = Some(whole.ahead);
-        if listed.ahead < whole.ahead && listed.back < whole.back {
+        assert!(listed.awake < grid.quads() || grid.wide == sides[3]);
+        if listed_ahead < whole_ahead && listed_back < whole_back {
             won = true;
         }
     }
+    let widest = best.first().map(|kept| kept[0]);
+    let narrowest = best.last().map(|kept| kept[0]);
 
-    // **The question needs a machine that spends its time on the grid.** The
-    // sides span sixty-four to one, so a walk over the whole grid should cost
-    // about that much more at the top than at the bottom. Measured: 9.10 times
-    // at a subgroup of 32 on an RTX 4080 and 37.4 at 64 on an AMD iGPU, against
-    // 1.49 and 1.14 under lavapipe at 16 and 8, where both walks are paying for
-    // dispatch on a CPU rather than for the cells. Below `SPENT` the two sides
-    // of the comparison are not measuring the grid, so the list cannot be shown
-    // to pay and is not shown to fail either.
     let (top_cost, bottom_cost) = (widest.unwrap(), narrowest.unwrap());
     let spent = top_cost.as_secs_f64() / bottom_cost.as_secs_f64().max(f64::MIN_POSITIVE);
-    if spent < SPENT {
+    let span = Grid::of(sides[0], sides[0]).quads() / Grid::of(sides[3], sides[3]).quads();
+    let least = f64::from(span).sqrt();
+    if spent < least {
         common::skip(format_args!(
-            "the_list_starts_paying_when_the_grid_outgrows {spent:.2} under {SPENT:.2}"
+            "the_list_starts_paying_when_the_grid_outgrows {spent:.2} under {least:.2}"
         ));
         return;
     }
