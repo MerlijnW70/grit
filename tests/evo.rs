@@ -268,6 +268,48 @@ fn mutation_flips_each_bit_at_its_rate_within_the_binomial_interval() {
 }
 
 #[test]
+fn mutation_flips_every_two_bits_independently_within_the_binomial_interval() {
+    let bits = evo::GENOME_BITS as usize;
+    let mut state = 0x9A12;
+    for rate in [1024_u32, 16_384, 49_152] {
+        let draws: u64 = 200_000;
+        let mut both = vec![0_u64; bits * bits];
+        for _ in 0..draws {
+            let base = word(&mut state);
+            let corner = (next(&mut state) % 8) as usize;
+            let genome = word(&mut state) & evo::GENOME_MASK;
+            let mask = evo::flips_of(base, corner, genome, rate);
+            for one in 0..bits {
+                if (mask >> one) & 1 == 0 {
+                    continue;
+                }
+                for other in one + 1..bits {
+                    both[one * bits + other] += u64::from((mask >> other) & 1);
+                }
+            }
+        }
+        let p = f64::from(rate) / f64::from(evo::CHANCES);
+        let pp = p * p;
+        let mean = draws as f64 * pp;
+        let spread = 5.0 * (draws as f64 * pp * (1.0 - pp)).sqrt() + 1.0;
+        let mut worst = 0.0_f64;
+        for one in 0..bits {
+            for other in one + 1..bits {
+                let count = both[one * bits + other] as f64;
+                worst = worst.max((count - mean).abs() / spread);
+                assert!(
+                    (count - mean).abs() <= spread,
+                    "rate {rate} bits {one} and {other}: both flipped {count}, expected {mean:.1} +- {spread:.1}"
+                );
+            }
+        }
+        println!(
+            "rate {rate}/65536: each of the 120 pairs of bits flipped together within {mean:.1} +- {spread:.1} in {draws} draws; worst pair at {worst:.2} of the interval"
+        );
+    }
+}
+
+#[test]
 fn the_mutation_hash_reads_the_point_the_frame_and_the_genome() {
     let rate = evo::CHANCES / 2;
     let base = evo::base_of([3, 4, 5], 6, 0);
