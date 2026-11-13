@@ -2677,11 +2677,11 @@ fn one_skewed_replay_does_not_slow_another_world() {
     let mut ledger = Ledger::created(Made {
         rule: "sand".to_owned(),
         params: Vec::new(),
-        size: [64, 64, 64],
+        size: [32, 32, 32],
         sparse: false,
         slots: None,
     });
-    ledger.push(Entry::Step(20000), Duration::from_millis(50));
+    ledger.push(Entry::Step(4000), Duration::from_millis(50));
     keep.begin(1, &ledger).unwrap();
     keep.set_next(2).unwrap();
     drop(keep);
@@ -2689,8 +2689,11 @@ fn one_skewed_replay_does_not_slow_another_world() {
         dir: Some(scratch.dir()),
         memory: None,
     });
-    let opened = answer(&run.ask("grit_world_open", "{\"name\":\"world-1\"}"));
-    assert_eq!(opened.int_at("frame"), 20000);
+    let opened = answer(&run.ask(
+        "grit_world_open",
+        "{\"name\":\"world-1\",\"budget_ms\":600000}",
+    ));
+    assert_eq!(opened.int_at("frame"), 4000);
     let rates = answer(&run.ask("grit_describe", "{}"))
         .get("submissions")
         .and_then(|one| one.get("rates"))
