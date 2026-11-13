@@ -205,9 +205,9 @@ impl Ledger {
         extra: Duration,
         world_bytes: u64,
         ratio: f64,
-        writing: Option<usize>,
+        writing: Option<(usize, Duration)>,
     ) -> bool {
-        let Some(from) = writing else {
+        let Some((from, elapsed)) = writing else {
             return self.far_over(extra, world_bytes, ratio);
         };
         let from = from.min(self.entries.len());
@@ -225,10 +225,14 @@ impl Ledger {
             .max(JOURNAL_LEAST);
         let ratio = ratio.max(1.0);
         let hard = self.replay_most().saturating_mul(HARD);
+        let tail_most = self
+            .replay_most()
+            .max(elapsed.saturating_mul(4))
+            .saturating_mul(HARD);
         let tail = tail_replay.saturating_add(extra).mul_f64(ratio);
         let whole = self.replay.saturating_add(extra).mul_f64(ratio);
         tail_bytes > bound.saturating_mul(HARD as usize)
-            || tail > hard
+            || tail > tail_most
             || self.bytes > bound.saturating_mul(WRITING_BYTES_FACTOR)
             || whole > hard.max(WRITING_REPLAY_MOST)
     }

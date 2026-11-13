@@ -3177,7 +3177,7 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     });
     let world = sand_world(&mut run, 32);
     let faults = run.exec.faults();
-    let slow = Duration::from_millis(1200);
+    let slow = Duration::from_millis(3000);
     faults.lock().unwrap().slow_write = slow;
     let budget = 40;
     let mut worst = Duration::ZERO;
@@ -3198,7 +3198,7 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
             "call {calls} after {took:?}: {}",
             written(&got)
         );
-        let most = off_worker_most(&mut run, budget, Duration::ZERO);
+        let most = off_worker_most(&mut run, budget, slow / 2);
         assert!(
             took <= most,
             "call {calls} took {took:?}, more than {most:?}"
@@ -3356,7 +3356,7 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
     let mut run = Run::new(&options);
     let world = sand_world(&mut run, 32);
     let faults = run.exec.faults();
-    let slow = Duration::from_millis(2000);
+    let slow = Duration::from_millis(3000);
     faults.lock().unwrap().slow_write = slow;
     let budget = 200;
     let began = Instant::now();
@@ -3385,7 +3385,7 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
             written(&got)
         );
         frame = told.int_at("frame");
-        let most = off_worker_most(&mut run, budget, Duration::ZERO);
+        let most = off_worker_most(&mut run, budget, slow / 2);
         assert!(
             took <= most,
             "call {calls} took {took:?}, more than {most:?}"
@@ -3424,16 +3424,21 @@ fn a_write_in_flight_bounds_the_journal_after_it_and_caps_the_whole() {
     let bytes = 1 << 20;
     let mut ledger = Ledger::created(made.clone());
     ledger.push(Entry::Step(1), Duration::from_secs(30));
-    let from = Some(ledger.entries.len());
+    let from = Some((ledger.entries.len(), Duration::ZERO));
     assert!(ledger.far_over(Duration::ZERO, bytes, 2.0));
     assert!(ledger.far_over_writing(Duration::ZERO, bytes, 2.0, None));
     assert!(!ledger.far_over_writing(Duration::ZERO, bytes, 2.0, from));
     ledger.push(Entry::Step(1), Duration::from_secs(2));
     assert!(!ledger.far_over_writing(Duration::ZERO, bytes, 2.0, from));
     assert!(ledger.far_over_writing(Duration::from_millis(1), bytes, 2.0, from));
+    let started = from.map(|(at, _)| (at, Duration::from_secs(2)));
+    ledger.push(Entry::Step(1), Duration::from_secs(4));
+    assert!(ledger.far_over_writing(Duration::ZERO, bytes, 2.0, from));
+    assert!(!ledger.far_over_writing(Duration::ZERO, bytes, 2.0, started));
+    assert!(ledger.far_over_writing(Duration::from_millis(2001), bytes, 2.0, started));
     let mut whole = Ledger::created(made);
     whole.push(Entry::Step(1), Duration::from_secs(120));
-    let from = Some(whole.entries.len());
+    let from = Some((whole.entries.len(), Duration::ZERO));
     assert!(!whole.far_over_writing(Duration::ZERO, bytes, 1.0, from));
     assert!(whole.far_over_writing(Duration::from_millis(1), bytes, 1.0, from));
     assert_eq!(journal::WRITING_REPLAY_MOST, Duration::from_secs(120));
@@ -3488,7 +3493,7 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
     });
     let world = sand_world(&mut run, 64);
     let faults = run.exec.faults();
-    let slow = Duration::from_millis(2000);
+    let slow = Duration::from_millis(3000);
     faults.lock().unwrap().slow_write = slow;
     let budget = 1000;
     let mut worst = Duration::ZERO;
@@ -3501,7 +3506,7 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
         let took = asked.elapsed();
         let told = answer(&got);
         assert!(told.int_at("frame") > 0, "call {call}: {}", written(&got));
-        let most = off_worker_most(&mut run, budget, Duration::ZERO);
+        let most = off_worker_most(&mut run, budget, slow / 2);
         assert!(
             took <= most,
             "call {call} took {took:?}, more than {most:?}"
