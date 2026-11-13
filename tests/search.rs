@@ -7,11 +7,11 @@ use std::time::Duration;
 use common::device;
 
 use grit::machine::Machine;
-use grit::marking::{BINDINGS, HELD, SEED, TRIAL, turned_on, words_of};
+use grit::marking::{BINDINGS, HELD, SEED, TRIAL, chosen, marked, turned_on, words_of};
 use grit::netlist::{Exam, Gate, Netlist, drawn, turned};
 use grit::serve::{
-    ASIDE, Effort, Pace, Rolls, SEEDING, SUBMISSION, handle, machined, mixed, opening, pressed,
-    shaken,
+    ASIDE, Effort, Pace, Rolls, SEEDING, SIDE, SUBMISSION, Staged, Submits, handle, machined,
+    mixed, opening, pressed, shaken, walked,
 };
 use grit::wire::{Json, read, written};
 use grit::{Groups, Host};
@@ -658,43 +658,183 @@ fn a_submission_is_sized_to_the_measured_cost_of_its_work() {
         1,
         "before anything is measured one round goes alone"
     );
-    pace.learn(1, Duration::from_millis(30), None);
-    let planned = pace.next(100);
-    assert_eq!(planned, (SUBMISSION.as_secs_f64() / 0.030).floor() as u32);
-    pace.learn(1, Duration::from_millis(2), Some(Duration::from_millis(40)));
+    pace.learn(Duration::from_millis(30));
     assert_eq!(
         pace.next(100),
-        (SUBMISSION.as_secs_f64() / 0.040).floor() as u32,
-        "the slower of the wall and the device clock sizes the next"
+        (SUBMISSION.as_secs_f64() / 0.030).floor() as u32
     );
-    pace.learn(5, Duration::from_micros(50), None);
+    pace.learn(Duration::from_micros(50));
     assert_eq!(pace.next(100), 100, "a cheap round fills the look");
     assert_eq!(pace.next(7), 7, "never past the look");
-    pace.learn(1, SUBMISSION * 3, None);
-    assert_eq!(pace.next(100), 1, "a round over the span goes alone");
+    pace.learn(SUBMISSION * 3);
+    assert_eq!(pace.next(100), 1, "a round over the target goes alone");
     let mut capped = Pace::over(10, 4);
-    capped.learn(10, Duration::from_nanos(10), None);
+    capped.learn(Duration::from_nanos(10));
     assert_eq!(capped.next(100), 4, "never past what the caller allows");
-    let mut light = Pace::over(1, u32::MAX);
-    light.learn(10, Duration::from_micros(10), None);
+    let mut light = Pace::over(1000, u32::MAX);
+    light.learn(Duration::from_micros(1));
     let each = light.measured().unwrap();
     assert!(
-        (each - 1e-6).abs() < 1e-12,
-        "a unit of work costs the time over the work"
+        (each - 1e-9).abs() < 1e-15,
+        "a unit of work costs a round's time over a round's work"
     );
-    for (work, nanos) in [
-        (1_u64, 1_u64),
-        (1 << 20, 3),
-        (1 << 26, 40),
-        (12_345, 99_999),
-    ] {
-        let mut pace = Pace::over(work, u32::MAX);
-        pace.learn(1, Duration::from_nanos(nanos * work), None);
-        let rounds = pace.next(u32::MAX);
-        let planned = Duration::from_nanos(nanos * work * u64::from(rounds));
+}
+
+struct Timed {
+    round: Duration,
+    sent: Vec<u32>,
+}
+
+impl Submits for Timed {
+    fn submitted(&mut self, rounds: u32) -> Result<Duration, Box<dyn std::error::Error>> {
+        self.sent.push(rounds);
+        let whole = self.round * rounds;
+        Ok(whole / rounds.max(1))
+    }
+}
+
+#[test]
+fn every_submission_stays_within_its_target_however_long_a_round_takes() {
+    for millis in [1_u64, 5, 30, 60, 99, 101, 250] {
+        for seeded in [false, true] {
+            let round = Duration::from_millis(millis);
+            let mut pace = Pace::over(123_456, u32::MAX);
+            if seeded {
+                pace.learn(round);
+            }
+            let mut timed = Timed {
+                round,
+                sent: Vec::new(),
+            };
+            for _ in 0..10 {
+                walked(&mut timed, &mut pace, 100).unwrap();
+            }
+            let fits = (SUBMISSION.as_millis() as u64 / millis).clamp(1, 100) as u32;
+            assert_eq!(timed.sent.iter().sum::<u32>(), 1000);
+            for (at, rounds) in timed.sent.iter().enumerate() {
+                assert!(
+                    *rounds <= fits,
+                    "a round of {millis} ms: submission {at} held {rounds} rounds, {:?}, over the {SUBMISSION:?} target: {:?}",
+                    round * *rounds,
+                    timed.sent
+                );
+            }
+            let chunks = |mut left: u32, held: &mut Vec<u32>| {
+                while left > 0 {
+                    let one = fits.min(left);
+                    held.push(one);
+                    left -= one;
+                }
+            };
+            let mut wanted = Vec::new();
+            for look in 0..10 {
+                if look == 0 && !seeded {
+                    wanted.push(1);
+                    chunks(99, &mut wanted);
+                } else {
+                    chunks(100, &mut wanted);
+                }
+            }
+            assert_eq!(
+                timed.sent, wanted,
+                "a round of {millis} ms goes {fits} rounds a submission once it is measured"
+            );
+        }
+    }
+}
+
+struct Watched<S: Submits> {
+    inner: S,
+    sent: Vec<(u32, Duration)>,
+}
+
+impl<S: Submits> Submits for Watched<S> {
+    fn submitted(&mut self, rounds: u32) -> Result<Duration, Box<dyn std::error::Error>> {
+        let began = std::time::Instant::now();
+        let round = self.inner.submitted(rounds)?;
+        self.sent.push((rounds, began.elapsed()));
+        Ok(round)
+    }
+}
+
+fn round_of(host: &Host, shape: Netlist, many: u32, rounds: u32) -> Vec<(u32, Duration)> {
+    let width = host.width();
+    let wide = words_of(shape);
+    let turn = turned_on(width, shape).unwrap();
+    let mark = marked(width, shape).unwrap();
+    let pick = chosen(width, shape, SIDE, many).unwrap();
+    let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
+    let sizes: [usize; BINDINGS as usize] = [
+        (many * shape.gates) as usize,
+        (many * shape.gates) as usize,
+        (many * shape.sources() * wide) as usize,
+        (shape.outputs * wide) as usize,
+        many as usize,
+        many as usize,
+        many as usize,
+        1,
+    ];
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+    for (binding, words) in sizes.iter().enumerate() {
+        resident.write(binding, &vec![0_u32; *words]).unwrap();
+    }
+    let (crowd, seeds) = opening(shape, 7, 0, many);
+    resident.write(HELD as usize, &crowd).unwrap();
+    resident.write(SEED as usize, &seeds).unwrap();
+    let over = [Groups::Fixed(many.div_ceil(width))];
+    let stages: Vec<&[Groups]> = vec![&over, &over, &over];
+    let work = u64::from(many) * u64::from(shape.gates) * u64::from(wide);
+    let mut pace = Pace::over(work, u32::MAX);
+    let mut watched = Watched {
+        inner: Staged::new(&mut resident, &stages),
+        sent: Vec::new(),
+    };
+    let mut gone = 0;
+    while gone < rounds {
+        let look = 100.min(rounds - gone);
+        walked(&mut watched, &mut pace, look).unwrap();
+        gone += look;
+    }
+    watched.sent
+}
+
+#[test]
+fn a_real_search_keeps_every_submission_within_its_target_on_this_device() {
+    let Some(host) =
+        device("a_real_search_keeps_every_submission_within_its_target_on_this_device")
+    else {
+        return;
+    };
+    let width = host.width();
+    let shape = Netlist::over(9, 1, 60, 16).unwrap();
+    let mut many = 1024_u32.div_ceil(width) * width;
+    loop {
+        let one = round_of(&host, shape, many, 1);
+        let round = one.first().unwrap().1;
+        eprintln!("crowd {many}: one round {round:?}");
+        if round >= Duration::from_millis(3) || many >= 65536 {
+            break;
+        }
+        let grown = (f64::from(many) * 5e-3 / round.as_secs_f64().max(1e-6)).min(65536.0) as u32;
+        many = (grown.max(many * 2).min(65536) / width).max(1) * width;
+    }
+    let sent = round_of(&host, shape, many, 300);
+    let longest = sent.iter().map(|one| one.1).max().unwrap();
+    eprintln!(
+        "{} at crowd {many}: {} submissions, rounds {:?}, longest {longest:?}",
+        host.name(),
+        sent.len(),
+        sent.iter().map(|one| one.0).collect::<Vec<_>>()
+    );
+    assert_eq!(sent.iter().map(|one| one.0).sum::<u32>(), 300);
+    assert!(
+        sent.iter().any(|one| one.0 > 1),
+        "rounds of this size should share submissions: {sent:?}"
+    );
+    for (rounds, took) in &sent {
         assert!(
-            rounds == 1 || planned <= SUBMISSION,
-            "work {work} at {nanos} ns a unit plans {rounds} rounds, {planned:?}"
+            *rounds == 1 || *took <= SUBMISSION * 2,
+            "a submission of {rounds} rounds ran {took:?} against a target of {SUBMISSION:?}: {sent:?}"
         );
     }
 }
