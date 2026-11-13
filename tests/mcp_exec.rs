@@ -2881,6 +2881,77 @@ fn a_write_past_its_budget_stops_between_cells_and_says_how_many_it_wrote() {
 }
 
 #[test]
+fn an_evo_world_made_and_stepped_through_the_tools_equals_the_cpu_reference() {
+    let Some(host) = device("evo world") else {
+        return;
+    };
+    let side = 16;
+    let grid = Grid3::new(side, side, side).unwrap();
+    let mut server = Server::new(Some(&host));
+    let mut params = grit::rule3::evo::DEFAULTS.to_vec();
+    params[grit::rule3::evo::SEED] = 0x5EED;
+    let made = answer(&call(
+        &mut server,
+        "grit_world_create",
+        &format!(
+            "{{\"wide\":{side},\"deep\":{side},\"tall\":{side},\"rule\":\"evo\",\"params\":{params:?}}}"
+        ),
+    ));
+    assert_eq!(made.get("rule").and_then(Json::text), Some("evo"));
+    let world = made.int_at("world");
+    let mut seed = 0xE70_u64;
+    let mut want = vec![0_u32; grid.cells()];
+    let mut cells = Vec::new();
+    for _ in 0..256 {
+        let roll = next(&mut seed);
+        let at = [
+            (roll % u64::from(side)) as u32,
+            ((roll >> 8) % u64::from(side)) as u32,
+            ((roll >> 16) % u64::from(side)) as u32,
+        ];
+        let genome = ((roll >> 24) & u64::from(grit::rule3::evo::GENOME_MASK)) as u32;
+        let word = grit::rule3::evo::cell(genome, 128 + ((roll >> 48) % 128) as u32, 0);
+        want[grid.index(at[0], at[1], at[2])] = word;
+        cells.push((at, word));
+    }
+    answer(&call(
+        &mut server,
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
+    ));
+    let listed = rules().into_iter().find(|one| one.name() == "evo").unwrap();
+    let start = want.clone();
+    let mut frame = 0;
+    for batch in 0..4 {
+        let got = answer(&call(
+            &mut server,
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":16}}"),
+        ));
+        assert_eq!(got.int_at("frame"), i64::from(frame + 16));
+        for _ in 0..16 {
+            want = listed.reference(grid, frame, &want, &params);
+            frame += 1;
+        }
+        let read = answer(&call(
+            &mut server,
+            "grit_world_read",
+            &format!(
+                "{{\"world\":{world},\"from\":[0,0,0],\"to\":[{0},{0},{0}]}}",
+                side - 1
+            ),
+        ));
+        assert_eq!(numbers(&read, "cells"), want, "batch {batch}");
+    }
+    let alive = want
+        .iter()
+        .filter(|&&word| grit::rule3::evo::alive_of(word))
+        .count();
+    eprintln!("an evo world of {side}^3 after {frame} frames holds {alive} living cells");
+    assert_ne!(want, start);
+}
+
+#[test]
 fn the_highest_world_number_described_is_the_highest_handed_out() {
     let mut server = Server::new(None);
     let limits = described(&mut server).get("limits").cloned().unwrap();

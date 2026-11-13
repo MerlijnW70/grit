@@ -20,6 +20,7 @@ use crate::live::{self, Loop};
 use crate::rule3::Rule;
 use crate::rule3::code::{self, Code};
 use crate::rule3::embed::{self, Embed};
+use crate::rule3::evo::{self, Evo};
 use crate::rule3::heat::{self, Heat};
 use crate::rule3::nature::{self, Nature};
 use crate::rule3::sand::{self, Sand};
@@ -164,6 +165,7 @@ pub fn rules_on(host: Option<&Host>) -> Vec<Box<dyn Listed>> {
         named("heat", Heat, heat::kind_of),
         named("code", Code, code::instruction_of),
         named("nature", Nature, nature::kind_of),
+        named("evo", Evo, evo::kind_of),
         named("embed", embedding, embed::kind_of),
     ]
 }
