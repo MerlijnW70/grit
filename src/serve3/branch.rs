@@ -562,9 +562,11 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .keep
         .as_ref()
         .and_then(|keep| keep.begin(number, &taken.0).err());
+    let epoch = server.book.bump();
     if let Some(held) = server.book.held.get_mut(&number) {
         held.ledger = taken.0;
         held.pace = taken.1;
+        held.epoch = epoch;
     }
     server.book.release(old);
     let live = server.world(held)?;

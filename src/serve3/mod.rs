@@ -206,7 +206,30 @@ pub struct Held {
     note: Option<Json>,
     broken: Option<String>,
     snap_failure: Option<SnapFailure>,
+    epoch: u64,
 }
+
+#[derive(Debug)]
+struct Writing {
+    number: u32,
+    epoch: u64,
+    from: usize,
+    frame: u32,
+    made: Made,
+    bytes: u64,
+    began: Instant,
+    done: std::sync::mpsc::Receiver<Result<[u8; 32], String>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Wait {
+    Poll,
+    For(Duration),
+    Landed,
+}
+
+const WRITER_STOPPED: &str = "the thread writing the snapshot stopped before it finished";
 
 #[derive(Debug, Clone)]
 pub struct SnapFailure {
@@ -233,6 +256,8 @@ pub struct Book {
     broken_earlier: BTreeMap<u32, String>,
     stats: Stats,
     ignored: Vec<String>,
+    epochs: u64,
+    writing: Option<Writing>,
     #[cfg(feature = "faults")]
     faults: Arc<std::sync::Mutex<Faults>>,
 }
@@ -317,6 +342,8 @@ impl Book {
             broken_earlier,
             stats: Stats::default(),
             ignored,
+            epochs: 0,
+            writing: None,
             #[cfg(feature = "faults")]
             faults: Arc::default(),
         })
@@ -337,6 +364,8 @@ impl Book {
             broken_earlier: BTreeMap::new(),
             stats: Stats::default(),
             ignored: Vec::new(),
+            epochs: 0,
+            writing: None,
             #[cfg(feature = "faults")]
             faults: Arc::default(),
         }
@@ -362,6 +391,116 @@ impl Book {
         {
             keep.drop_snapshot(&sum);
         }
+    }
+
+    fn bump(&mut self) -> u64 {
+        self.epochs = self.epochs.wrapping_add(1);
+        self.epochs
+    }
+
+    fn snap_failed(&mut self, number: u32, message: String) {
+        let now = Instant::now();
+        if let Some(held) = self.held.get_mut(&number) {
+            let failures = held
+                .snap_failure
+                .as_ref()
+                .map_or(1, |old| old.failures.saturating_add(1));
+            let wait = SNAP_RETRY_LEAST
+                .saturating_mul(1_u32 << failures.saturating_sub(1).min(16))
+                .min(SNAP_RETRY_MOST);
+            held.snap_failure = Some(SnapFailure {
+                message,
+                failures,
+                next: now + wait,
+            });
+        }
+    }
+
+    fn writing_for(&self, number: u32) -> bool {
+        self.writing
+            .as_ref()
+            .is_some_and(|writing| writing.number == number)
+    }
+
+    pub fn drain(&mut self) {
+        self.landed(Wait::Landed);
+    }
+
+    fn landed(&mut self, wait: Wait) -> bool {
+        let Some(writing) = self.writing.as_ref() else {
+            return false;
+        };
+        let got = match wait {
+            Wait::Poll => match writing.done.try_recv() {
+                Ok(got) => got,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(WRITER_STOPPED.to_owned()),
+            },
+            Wait::For(left) => match writing.done.recv_timeout(left) {
+                Ok(got) => got,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(WRITER_STOPPED.to_owned())
+                }
+            },
+            Wait::Landed => writing
+                .done
+                .recv()
+                .unwrap_or_else(|_| Err(WRITER_STOPPED.to_owned())),
+        };
+        let Some(mut writing) = self.writing.take() else {
+            return false;
+        };
+        if let Some(thread) = writing.thread.take() {
+            let _ = thread.join();
+        }
+        let cost = writing.began.elapsed();
+        let number = writing.number;
+        let current = self
+            .held
+            .get(&number)
+            .is_some_and(|held| held.epoch == writing.epoch);
+        let sum = match got {
+            Ok(sum) => sum,
+            Err(message) => {
+                if current {
+                    self.snap_failed(number, message);
+                }
+                return true;
+            }
+        };
+        self.rates.measure(budget::Work::Save, writing.bytes, cost);
+        if !current {
+            self.release(Some(sum));
+            return true;
+        }
+        let epoch = self.bump();
+        let snap = Arc::new(journal::Snap {
+            sum,
+            frame: writing.frame,
+            made: writing.made,
+            image: None,
+        });
+        let keep = self.keep.clone();
+        let Some(held) = self.held.get_mut(&number) else {
+            return true;
+        };
+        let old = held.ledger.sum();
+        let mut ledger = held.ledger.clone();
+        ledger.rebase_at(snap, cost, writing.from);
+        match keep.as_ref().map(|keep| keep.begin(number, &ledger)) {
+            Some(Err(why)) => {
+                self.release(Some(sum));
+                self.snap_failed(number, format!("the journal could not be written: {why}"));
+            }
+            _ => {
+                held.ledger = ledger;
+                held.epoch = epoch;
+                held.snap_failure = None;
+                self.release(old);
+            }
+        }
+        true
     }
 
     #[must_use]
@@ -950,6 +1089,7 @@ impl<'host> Server<'host> {
             .as_ref()
             .and_then(|keep| keep.begin(number, &ledger).err());
         self.book.memory.hold(number, bytes);
+        let epoch = self.book.bump();
         self.book.held.insert(
             number,
             Held {
@@ -959,6 +1099,7 @@ impl<'host> Server<'host> {
                 note: None,
                 broken: None,
                 snap_failure: None,
+                epoch,
             },
         );
         self.live.insert(number, live);
@@ -1000,6 +1141,25 @@ impl<'host> Server<'host> {
             return Ok(None);
         }
         let far = held.ledger.far_over(Duration::ZERO, held.bytes, ratio);
+        if self.book.writing_for(number) {
+            if !far {
+                return Ok(None);
+            }
+            self.book.landed(Wait::For(self.clock.left()));
+            if self.book.writing_for(number) {
+                return Err(Box::new(Refusal::new(
+                    errors::Code::Budget,
+                    "$.budget_ms",
+                    format!(
+                        "world {number} owes a snapshot of its journal before it changes again, and the one being written did not land within this call's budget; nothing ran"
+                    ),
+                )));
+            }
+            return self.owed(number);
+        }
+        let Some(held) = self.book.held.get(&number) else {
+            return Ok(None);
+        };
         if let Some(failure) = held.snap_failure.as_ref()
             && failure.next > Instant::now()
         {
@@ -1044,31 +1204,35 @@ impl<'host> Server<'host> {
     }
 
     fn snap_now(&mut self, number: u32) -> Result<Option<Json>, Failed> {
+        if self.book.writing_for(number) {
+            self.book.landed(Wait::Poll);
+            if self.book.writing_for(number) || !self.due(number) {
+                return Ok(None);
+            }
+        }
         let taken = self.snap_attempt(number);
-        let now = Instant::now();
-        if let Some(held) = self.book.held.get_mut(&number) {
-            match &taken {
-                Ok(_) => held.snap_failure = None,
-                Err(why) => {
-                    let failures = held
-                        .snap_failure
-                        .as_ref()
-                        .map_or(1, |old| old.failures.saturating_add(1));
-                    let wait = SNAP_RETRY_LEAST
-                        .saturating_mul(1_u32 << failures.saturating_sub(1).min(16))
-                        .min(SNAP_RETRY_MOST);
-                    held.snap_failure = Some(SnapFailure {
-                        message: refused_with(why.as_ref()).0.message,
-                        failures,
-                        next: now + wait,
-                    });
+        match &taken {
+            Ok(_) => {
+                if let Some(held) = self.book.held.get_mut(&number) {
+                    held.snap_failure = None;
                 }
+            }
+            Err(why) => {
+                let message = refused_with(why.as_ref()).0.message;
+                self.book.snap_failed(number, message);
             }
         }
         taken
     }
 
-    fn snap_attempt(&mut self, number: u32) -> Result<Option<Json>, Failed> {
+    fn due(&self, number: u32) -> bool {
+        self.book
+            .held
+            .get(&number)
+            .is_some_and(|held| held.ledger.due(held.bytes, self.book.rates.replay()))
+    }
+
+    fn snap_image(&mut self, number: u32) -> Result<(crate::branch::Image, Made, Instant), Failed> {
         #[cfg(feature = "faults")]
         {
             let (fail, wedge) = self
@@ -1094,31 +1258,108 @@ impl<'host> Server<'host> {
                 )));
             }
         }
-        let held = self
+        let made = self
             .book
             .held
             .get(&number)
-            .ok_or("the world has no journal")?;
-        let made = held.ledger.made().clone();
-        let old = held.ledger.sum();
-        let keep = self.book.keep.clone();
+            .ok_or("the world has no journal")?
+            .ledger
+            .made()
+            .clone();
         let live = self.live.get_mut(&number).ok_or("the world is not open")?;
         let began = Instant::now();
-        let snap = snapshot(&mut live.world, made, keep.as_ref(), number)?;
+        let image = live.world.image()?;
+        let made = Made {
+            slots: match &image.state {
+                crate::branch::State::Sparse { capacity, .. } => Some(*capacity),
+                crate::branch::State::Dense(_) => made.slots,
+            },
+            ..made
+        };
+        Ok((image, made, began))
+    }
+
+    fn snap_attempt(&mut self, number: u32) -> Result<Option<Json>, Failed> {
+        let (image, made, began) = self.snap_image(number)?;
+        let frame = image.frame;
+        let keep = self.book.keep.clone();
+        let snap = match keep.as_ref() {
+            Some(keep) => journal::Snap {
+                sum: stored(keep, number, &image)?,
+                frame,
+                made,
+                image: None,
+            },
+            None => journal::Snap {
+                sum: journal::state_of(&image),
+                frame,
+                made,
+                image: Some(image),
+            },
+        };
+        let sum = snap.sum;
         let cost = began.elapsed();
         let size = self.book.held.get(&number).map_or(0, |held| held.bytes);
         self.book.rates.measure(budget::Work::Save, size, cost);
+        let epoch = self.book.bump();
         let held = self
             .book
             .held
             .get_mut(&number)
             .ok_or("the world has no journal")?;
-        held.ledger.rebase(snap, cost);
-        let failed = keep
-            .as_ref()
-            .and_then(|keep| keep.begin(number, &held.ledger).err());
+        let old = held.ledger.sum();
+        let mut ledger = held.ledger.clone();
+        ledger.rebase(Arc::new(snap), cost);
+        if let Some(Err(why)) = keep.as_ref().map(|keep| keep.begin(number, &ledger)) {
+            self.book.release(Some(sum));
+            return Ok(Some(text(&format!(
+                "the journal could not be written: {why}"
+            ))));
+        }
+        held.ledger = ledger;
+        held.epoch = epoch;
         self.book.release(old);
-        Ok(failed.map(|why| text(&format!("the journal could not be written: {why}"))))
+        Ok(None)
+    }
+
+    fn snap_behind(&mut self, number: u32, keep: Keep) -> Result<(), Failed> {
+        let started = self.snap_image(number).and_then(|(image, made, began)| {
+            let held = self
+                .book
+                .held
+                .get(&number)
+                .ok_or("the world has no journal")?;
+            let (epoch, from, bytes) = (held.epoch, held.ledger.entries.len(), held.bytes);
+            let frame = image.frame;
+            let slow = self.slow_idle();
+            let (sender, done) = std::sync::mpsc::channel();
+            let thread = std::thread::Builder::new()
+                .name("grit-snapshot".to_owned())
+                .spawn(move || {
+                    std::thread::sleep(slow);
+                    let got = stored(&keep, number, &image)
+                        .map_err(|why| refused_with(why.as_ref()).0.message);
+                    let _ = sender.send(got);
+                })
+                .map_err(|why| io_refusal(&why))?;
+            self.book.writing = Some(Writing {
+                number,
+                epoch,
+                from,
+                frame,
+                made,
+                bytes,
+                began,
+                done,
+                thread: Some(thread),
+            });
+            Ok(())
+        });
+        if let Err(why) = &started {
+            let message = refused_with(why.as_ref()).0.message;
+            self.book.snap_failed(number, message);
+        }
+        started
     }
 
     fn overdue(&self, number: u32, extra: Duration) -> bool {
@@ -1146,15 +1387,20 @@ impl<'host> Server<'host> {
     }
 
     pub fn idle(&mut self) -> bool {
+        if self.book.writing.is_some() {
+            return self.book.landed(Wait::Poll);
+        }
         let ratio = self.book.rates.replay();
         let now = Instant::now();
+        let behind = self.book.keep.is_some();
         let owed = self
             .book
             .held
             .iter()
             .find(|(number, held)| {
-                let quick = self.book.rates.estimate(budget::Work::Save, held.bytes)
-                    <= Duration::from_millis(budget::SUBMIT_MOST_MS);
+                let quick = behind
+                    || self.book.rates.estimate(budget::Work::Save, held.bytes)
+                        <= Duration::from_millis(budget::SUBMIT_MOST_MS);
                 self.live.contains_key(number)
                     && held.ledger.due(held.bytes, ratio)
                     && (quick || held.ledger.far_over(Duration::ZERO, held.bytes, ratio))
@@ -1169,9 +1415,10 @@ impl<'host> Server<'host> {
         };
         let wedged_before = self.wedged();
         self.clock = Clock::of(Instant::now(), budget::BUDGET_MOST_MS);
-        #[cfg(feature = "faults")]
-        self.slow_idle();
-        let taken = self.snap_now(number);
+        let taken = match self.book.keep.clone() {
+            Some(keep) => self.snap_behind(number, keep),
+            None => self.snap_now(number).map(|_| ()),
+        };
         let lost = (!wedged_before && self.wedged())
             || taken
                 .as_ref()
@@ -1184,9 +1431,8 @@ impl<'host> Server<'host> {
     }
 
     #[cfg(feature = "faults")]
-    fn slow_idle(&self) {
-        let slow = self
-            .book
+    fn slow_idle(&self) -> Duration {
+        self.book
             .faults
             .lock()
             .map(|mut faults| {
@@ -1195,16 +1441,33 @@ impl<'host> Server<'host> {
                 }
                 faults.slow_idle_snapshot
             })
-            .unwrap_or_default();
-        std::thread::sleep(slow);
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(feature = "faults"))]
+    const fn slow_idle(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    #[must_use]
+    pub const fn writing(&self) -> bool {
+        self.book.writing.is_some()
+    }
+
+    fn wait_write(&mut self, number: u32) {
+        if self.book.writing_for(number) {
+            self.book.landed(Wait::For(self.clock.left()));
+        }
     }
 
     fn snap_waiting(&self, number: u32) -> bool {
-        self.book
-            .held
-            .get(&number)
-            .and_then(|held| held.snap_failure.as_ref())
-            .is_some_and(|failure| failure.next > Instant::now())
+        self.book.writing_for(number)
+            || self
+                .book
+                .held
+                .get(&number)
+                .and_then(|held| held.snap_failure.as_ref())
+                .is_some_and(|failure| failure.next > Instant::now())
     }
 
     #[must_use]
@@ -1449,46 +1712,14 @@ fn paced(
     Ok(())
 }
 
-fn snapshot(
-    world: &mut World<'_>,
-    made: Made,
-    keep: Option<&Keep>,
-    number: u32,
-) -> Result<Arc<journal::Snap>, Failed> {
-    let image = world.image()?;
-    let frame = image.frame;
-    let made = Made {
-        slots: match &image.state {
-            crate::branch::State::Sparse { capacity, .. } => Some(*capacity),
-            crate::branch::State::Dense(_) => made.slots,
-        },
-        ..made
-    };
-    match keep {
-        Some(keep) => {
-            let pending = keep.pending(number);
-            crate::branch::format::store(&pending, &image)?;
-            let (sum, _) = keep.settle(&pending).map_err(|why| {
-                let _ = std::fs::remove_file(&pending);
-                io_refusal(&why)
-            })?;
-            Ok(Arc::new(journal::Snap {
-                sum,
-                frame,
-                made,
-                image: None,
-            }))
-        }
-        None => {
-            let sum = journal::state_of(&image);
-            Ok(Arc::new(journal::Snap {
-                sum,
-                frame,
-                made,
-                image: Some(image),
-            }))
-        }
-    }
+fn stored(keep: &Keep, number: u32, image: &crate::branch::Image) -> Result<[u8; 32], Failed> {
+    let pending = keep.pending(number);
+    crate::branch::format::store(&pending, image)?;
+    let (sum, _) = keep.settle(&pending).map_err(|why| {
+        let _ = std::fs::remove_file(&pending);
+        io_refusal(&why)
+    })?;
+    Ok(sum)
 }
 
 pub fn shaped(host: &Host, _: &dyn Listed, made: &Made) -> Result<(Grid, Vec<usize>), Failed> {
