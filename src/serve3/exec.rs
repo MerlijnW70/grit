@@ -371,6 +371,14 @@ fn work(
             }
             let _ = answers.send(answer);
             shared.landed(&job.cancel);
+            #[cfg(feature = "faults")]
+            std::thread::sleep(
+                server
+                    .faults()
+                    .lock()
+                    .map(|faults| faults.pause_after_answer)
+                    .unwrap_or_default(),
+            );
         }
         book = server.into_book();
         drop(host);

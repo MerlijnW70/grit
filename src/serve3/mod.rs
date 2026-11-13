@@ -282,6 +282,7 @@ pub struct Faults {
     pub slowed: u32,
     pub slow_idle_work: Duration,
     pub idle_works: u32,
+    pub pause_after_answer: Duration,
 }
 
 impl Book {

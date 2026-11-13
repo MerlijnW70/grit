@@ -3189,6 +3189,7 @@ fn behind_idle_work(dir: bool) {
     let faults = run.exec.faults();
     let slow = Duration::from_millis(800);
     faults.lock().unwrap().slow_idle_work = slow;
+    faults.lock().unwrap().pause_after_answer = Duration::from_millis(5);
     let budget = 100;
     let most = slow + Duration::from_millis(budget + grit::serve3::budget::SUBMIT_MOST_MS + 150);
     let want = if dir { 2 } else { 1 };
