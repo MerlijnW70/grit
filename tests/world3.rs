@@ -176,7 +176,7 @@ fn the_server_lists_every_2d_tool_unchanged_and_then_the_world_tools() {
         .map(written)
         .collect();
     let all = listed_by("");
-    assert_eq!(flat.len(), 7);
+    assert_eq!(flat.len(), 8);
     assert_eq!(all[..flat.len()], flat[..]);
     let names: Vec<String> = all[flat.len()..]
         .iter()

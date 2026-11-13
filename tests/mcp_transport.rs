@@ -9,13 +9,14 @@ use grit::wire::{Json, read, written};
 
 const ANSWER_MOST: usize = 1 << 20;
 
-const FLAT: [&str; 7] = [
+const FLAT: [&str; 8] = [
     "grit_machine",
     "grit_synthesise",
     "grit_least",
     "grit_slope",
     "grit_settle",
     "grit_pour",
+    "grit_credit",
     "grit_check",
 ];
 

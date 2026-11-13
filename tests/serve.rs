@@ -63,6 +63,7 @@ fn the_server_names_every_tool_it_has() {
             "grit_slope",
             "grit_settle",
             "grit_pour",
+            "grit_credit",
             "grit_check"
         ]
     );
