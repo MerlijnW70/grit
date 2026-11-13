@@ -1189,7 +1189,10 @@ fn a_slice_past_one_answer_comes_in_pages_that_join_to_the_whole() {
         answer(&call(
             &mut server,
             "grit_world_write",
-            &format!("{{\"world\":{world},\"cells\":[{}]}}", cells.join(",")),
+            &format!(
+                "{{\"world\":{world},\"cells\":[{}],\"budget_ms\":600000}}",
+                cells.join(",")
+            ),
         ));
     }
     let mut cursor = 0;
@@ -1264,7 +1267,10 @@ fn the_largest_read_answer_fits_one_answer() {
     answer(&call(
         &mut server,
         "grit_world_write",
-        &format!("{{\"world\":{world},\"cells\":[{}]}}", cells.join(",")),
+        &format!(
+            "{{\"world\":{world},\"cells\":[{}],\"budget_ms\":600000}}",
+            cells.join(",")
+        ),
     ));
     let got = call(
         &mut server,
@@ -1616,7 +1622,10 @@ fn a_step_that_fails_part_way_reports_the_frame_its_state_is_on() {
     answer(&call(
         &mut server,
         "grit_world_write",
-        &format!("{{\"world\":{world},\"cells\":[{}]}}", cells.join(",")),
+        &format!(
+            "{{\"world\":{world},\"cells\":[{}],\"budget_ms\":600000}}",
+            cells.join(",")
+        ),
     ));
     grit::serve3::tools::faults::fail_batch(1);
     let told = refused(&call(
