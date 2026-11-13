@@ -9,6 +9,7 @@ use grit::credit::{
     self, Board, Complements, Marker, Twin, applied, counted_singles, credited, escape, inserted,
     inserts, paired, repaired, repairs, singles,
 };
+use grit::marking::{TRIAL, VALUES};
 use grit::netlist::{Exam, Gate, Netlist, drawn};
 use grit::serve::{CROWD, Effort, Escape, Escapes, checked, handle, sought};
 use grit::wire::{Json, read, written};
@@ -460,6 +461,53 @@ fn a_complement_batch_wider_than_the_device_room_is_marked_in_parts() {
             "room {room}"
         );
         assert!(marker.spent.most <= room, "{:?}", marker.spent);
+    }
+}
+
+#[test]
+fn every_lane_a_complement_batch_dispatches_reads_a_gate_written_for_it() {
+    let Some(host) = device("every_lane_a_complement_batch_dispatches_reads_a_gate_written_for_it")
+    else {
+        return;
+    };
+    let width = host.width();
+    let (shape, exam) = alu_exam(22);
+    let board = Board::of(&exam);
+    let gates = shape.gates as usize;
+    let span = (shape.sources() * 4) as usize;
+    let mut rng = Rng(0x0bad_9a7e);
+    let circuit = random_chip(shape, &mut rng);
+    let mut resident = credit::opened(&host, &board, width).unwrap();
+    resident
+        .write(TRIAL as usize, &vec![u32::MAX; width as usize * gates])
+        .unwrap();
+    let mut marker = Marker::within(&mut resident, 1, 0, width, width, shape);
+    let tangent = marker
+        .tangents(&board, std::slice::from_ref(&circuit))
+        .unwrap();
+    assert_eq!(
+        tangent,
+        Twin.tangents(&board, std::slice::from_ref(&circuit))
+            .unwrap()
+    );
+    let mut candidates: Vec<Vec<u32>> = (0..gates)
+        .map(|at| {
+            let mut held = circuit.clone();
+            held[at] ^= credit::COMPLEMENT;
+            board.values(&held)
+        })
+        .collect();
+    candidates.push(board.values(&circuit));
+    candidates.push(board.values(&vec![0; gates]));
+    let values = resident
+        .read(VALUES as usize, width as usize * span)
+        .unwrap();
+    for (lane, one) in values.chunks(span).enumerate() {
+        assert!(
+            candidates.iter().any(|held| held.as_slice() == one),
+            "lane {lane} of {width} marked a circuit nobody wrote: {:?}",
+            &one[..span.min(16)]
+        );
     }
 }
 

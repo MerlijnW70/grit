@@ -467,9 +467,20 @@ impl<'held, 'host> Marker<'held, 'host> {
         many: usize,
     ) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
         let span = board.shape.sources() as usize * board.wide;
-        let began = Instant::now();
-        self.resident.write(TRIAL as usize, flat)?;
+        let gates = board.shape.gates as usize;
         let groups = u32::try_from(many)?.div_ceil(self.width);
+        let lanes = groups as usize * self.width as usize;
+        if lanes > self.room as usize || flat.len() != many * gates {
+            return Err(format!(
+                "{many} circuits in {groups} groups of {} lanes do not fit the {} circuits the device holds",
+                self.width, self.room
+            )
+            .into());
+        }
+        let mut whole = flat.to_vec();
+        whole.resize(lanes * gates, 0);
+        let began = Instant::now();
+        self.resident.write(TRIAL as usize, &whole)?;
         let held: Vec<[Groups; 1]> = (0..self.pipelines)
             .map(|one| [Groups::Fixed(if one == self.at { groups } else { 0 })])
             .collect();
