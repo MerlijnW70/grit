@@ -2959,6 +2959,27 @@ fn the_highest_world_number_described_is_the_highest_handed_out() {
     );
 }
 
+#[cfg(feature = "faults")]
+fn off_worker_most(run: &mut Run, budget: u64, unit: Duration) -> Duration {
+    let told = answer(&run.ask("grit_describe", "{}"))
+        .get("submissions")
+        .cloned()
+        .unwrap();
+    let batch = u64::try_from(told.int_at("longest_ms"))
+        .unwrap()
+        .max(grit::serve3::budget::SUBMIT_MOST_MS);
+    Duration::from_millis(budget + batch + 300) + unit
+}
+
+#[cfg(feature = "faults")]
+fn idle_longest(run: &mut Run) -> Duration {
+    let told = answer(&run.ask("grit_describe", "{}"))
+        .get("submissions")
+        .cloned()
+        .unwrap();
+    Duration::from_millis(u64::try_from(told.int_at("idle_longest_ms")).unwrap())
+}
+
 fn late_most(run: &mut Run, budget: u64) -> Duration {
     let told = answer(&run.ask("grit_describe", "{}"))
         .get("submissions")
@@ -3156,7 +3177,7 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     });
     let world = sand_world(&mut run, 32);
     let faults = run.exec.faults();
-    let slow = Duration::from_millis(600);
+    let slow = Duration::from_millis(1200);
     faults.lock().unwrap().slow_write = slow;
     let budget = 40;
     let mut worst = Duration::ZERO;
@@ -3177,7 +3198,7 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
             "call {calls} after {took:?}: {}",
             written(&got)
         );
-        let most = late_most(&mut run, budget);
+        let most = off_worker_most(&mut run, budget, Duration::ZERO);
         assert!(
             took <= most,
             "call {calls} took {took:?}, more than {most:?}"
@@ -3190,6 +3211,11 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     }
     eprintln!(
         "{calls} steps of {budget} ms beside a snapshot written for {slow:?} between calls; the slowest took {worst:?}"
+    );
+    let idle = idle_longest(&mut run);
+    assert!(
+        idle < slow / 2,
+        "the longest unit of work between calls took {idle:?}, near the injected write of {slow:?}"
     );
     run.exec.finish();
     let left: Vec<String> = kept_files(&scratch)
@@ -3239,7 +3265,7 @@ fn behind_idle_work(dir: bool) {
             "call {calls} after {took:?}: {}",
             written(&got)
         );
-        let most = late_most(&mut run, budget);
+        let most = off_worker_most(&mut run, budget, slow + slow / 3);
         assert!(
             took <= most,
             "call {calls} took {took:?}, more than {most:?}"
@@ -3359,7 +3385,7 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
             written(&got)
         );
         frame = told.int_at("frame");
-        let most = late_most(&mut run, budget);
+        let most = off_worker_most(&mut run, budget, Duration::ZERO);
         assert!(
             took <= most,
             "call {calls} took {took:?}, more than {most:?}"
@@ -3370,6 +3396,11 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
     let slowed = faults.lock().unwrap().slowed;
     eprintln!(
         "{calls} steps of {budget} ms beside {slowed} background writes of {slow:?} each reached frame {frame}; the slowest took {worst:?}"
+    );
+    let idle = idle_longest(&mut run);
+    assert!(
+        idle < slow / 2,
+        "the longest unit of work between calls took {idle:?}, near the injected write of {slow:?}"
     );
     run.exec.finish();
     let mut again = Run::new(&options);
@@ -3470,7 +3501,7 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
         let took = asked.elapsed();
         let told = answer(&got);
         assert!(told.int_at("frame") > 0, "call {call}: {}", written(&got));
-        let most = late_most(&mut run, budget);
+        let most = off_worker_most(&mut run, budget, Duration::ZERO);
         assert!(
             took <= most,
             "call {call} took {took:?}, more than {most:?}"
@@ -3482,6 +3513,11 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
         "10 steps of {budget} ms beside {slowed} snapshot writes of {slow:?}; the slowest took {worst:?}"
     );
     assert!(slowed >= 2, "{slowed}");
+    let idle = idle_longest(&mut run);
+    assert!(
+        idle < slow / 2,
+        "the longest unit of work between calls took {idle:?}, near the injected write of {slow:?}"
+    );
     run.exec.finish();
 }
 
