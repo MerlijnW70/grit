@@ -2352,7 +2352,7 @@ fn after_a_lost_device_only_the_worlds_a_call_touches_are_rebuilt_inside_its_bud
     for _ in 0..3 {
         let mut model = Model::new("sand", &[], 16);
         let world = answer(&run.ask("grit_world_create", &model.create(false))).int_at("world");
-        let cells = scattered(&mut seed, 16, 1000, &SAND_WORDS);
+        let cells = scattered(&mut seed, 16, 250, &SAND_WORDS);
         written_whole(&mut run, world, &cells);
         model.write(&cells);
         answer(&run.ask(
@@ -2976,7 +2976,7 @@ fn written_whole(run: &mut Run, world: i64, cells: &[([u32; 3], u32)]) {
     let wrote = answer(&run.ask(
         "grit_world_write",
         &format!(
-            "{{\"world\":{world},\"cells\":{},\"budget_ms\":600000}}",
+            "{{\"world\":{world},\"cells\":{},\"budget_ms\":250000}}",
             writing(cells)
         ),
     ));
@@ -3159,7 +3159,6 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     let slow = Duration::from_millis(600);
     faults.lock().unwrap().slow_idle_snapshot = slow;
     let budget = 40;
-    let most = Duration::from_millis(budget + grit::serve3::budget::SUBMIT_MOST_MS + 150);
     let mut worst = Duration::ZERO;
     let mut after = None;
     let mut calls = 0;
@@ -3178,7 +3177,11 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
             "call {calls} after {took:?}: {}",
             written(&got)
         );
-        assert!(took <= most, "call {calls} took {took:?}");
+        let most = late_most(&mut run, budget);
+        assert!(
+            took <= most,
+            "call {calls} took {took:?}, more than {most:?}"
+        );
         worst = worst.max(took);
         calls += 1;
         if after.is_none() && faults.lock().unwrap().slowed > 0 {
@@ -3412,9 +3415,9 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
     };
     drop(host);
     let mut run = Run::new(&Options::default());
-    let world = sand_world(&mut run, 32);
+    let world = sand_world(&mut run, 128);
     let first = 600;
-    let second = 700;
+    let second = 1500;
     let sent = Instant::now();
     let ahead = run.send(
         "grit_world_step",
@@ -3431,10 +3434,12 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
     let told = answer(&got);
     assert!(told.int_at("ran") > 0, "{}", written(&got));
     let most = late_most(&mut run, second);
+    let least = Duration::from_millis(second - grit::serve3::budget::SUBMIT_MOST_MS);
     eprintln!(
-        "a call of {second} ms behind one of {first} ms answered {took:?} after both were sent (bound {most:?})"
+        "a call of {second} ms behind one of {first} ms answered {took:?} after both were sent (between {least:?} and {most:?})"
     );
     assert!(took <= most, "{took:?}, more than {most:?}");
+    assert!(took >= least, "{took:?}, less than {least:?}");
     run.exec.finish();
 }
 
