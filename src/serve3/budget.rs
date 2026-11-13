@@ -369,8 +369,9 @@ impl Work {
 
     const fn prior(self) -> f64 {
         match self {
-            Self::Build | Self::Fork => 2e-9,
-            Self::Save | Self::File => 4e-9,
+            Self::Build | Self::Fork => 1e-8,
+            Self::Save => 5e-8,
+            Self::File => 2e-8,
             Self::Write => 2e-4,
         }
     }
@@ -411,18 +412,32 @@ fn median(mut held: Vec<f64>, prior: f64) -> f64 {
 
 impl Kept {
     fn rate(&self, prior: f64, bytes: f64) -> f64 {
+        let chosen = self.chosen(bytes);
+        let recent = chosen
+            .iter()
+            .rev()
+            .take(RECENT)
+            .copied()
+            .fold(0.0_f64, f64::max);
+        median(chosen, prior).max(recent)
+    }
+
+    fn middle(&self, prior: f64, bytes: f64) -> f64 {
+        median(self.chosen(bytes), prior)
+    }
+
+    fn chosen(&self, bytes: f64) -> Vec<f64> {
         let similar: Vec<f64> = self
             .seen
             .iter()
             .filter(|(size, _)| *size * SIMILAR >= bytes && *size <= bytes * SIMILAR)
             .map(|(_, rate)| *rate)
             .collect();
-        let chosen = if similar.is_empty() {
+        if similar.is_empty() {
             self.seen.iter().map(|(_, rate)| *rate).collect()
         } else {
             similar
-        };
-        median(chosen, prior)
+        }
     }
 
     fn push(&mut self, bytes: f64, rate: f64) {
@@ -439,10 +454,10 @@ pub struct Rates {
     replay: Kept,
 }
 
+pub const RECENT: usize = 3;
+
 fn bounded(sample: f64, around: f64, least: f64, most: f64) -> f64 {
-    sample
-        .clamp(around / STEP_MOST_FACTOR, around * STEP_MOST_FACTOR)
-        .clamp(least, most)
+    sample.max(around / STEP_MOST_FACTOR).clamp(least, most)
 }
 
 impl Rates {
@@ -474,7 +489,9 @@ impl Rates {
         if !sample.is_finite() || sample <= 0.0 {
             return;
         }
-        let around = self.rate(work, bytes);
+        let around = self
+            .kept(work)
+            .map_or(work.prior(), |kept| kept.middle(work.prior(), size));
         let taken = bounded(sample, around, 0.0, f64::MAX);
         if let Some(kept) = self.kinds.get_mut(work.index()) {
             kept.push(size, taken);
@@ -499,7 +516,8 @@ impl Rates {
         if !sample.is_finite() || sample <= 0.0 {
             return;
         }
-        let taken = bounded(sample, self.replay(), RATIO_LEAST, RATIO_MOST);
+        let around = self.replay.middle(2.0, 1.0).clamp(RATIO_LEAST, RATIO_MOST);
+        let taken = bounded(sample, around, RATIO_LEAST, RATIO_MOST);
         self.replay.push(1.0, taken);
     }
 

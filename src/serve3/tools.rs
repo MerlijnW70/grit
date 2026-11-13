@@ -730,7 +730,8 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         pending += step;
         batch += 1;
         if done < frames && server.overdue(number, spent) {
-            let fits = server.clock.left() >= server.snapping(number);
+            let fits =
+                server.clock.left() >= server.snapping(number) && !server.snap_waiting(number);
             if !fits && !server.far_overdue(number, spent) {
                 continue;
             }
@@ -746,8 +747,14 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             match server.snap_now(number) {
                 Ok(note) => journal = note.or(journal),
                 Err(why) => {
-                    failure = Some(why);
-                    break;
+                    if super::lost_device(why.as_ref()) {
+                        failure = Some(why);
+                        break;
+                    }
+                    journal = Some(text(&format!(
+                        "the snapshot could not be taken: {}",
+                        super::refused_with(why.as_ref()).0.message
+                    )));
                 }
             }
         }

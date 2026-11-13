@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::host::{self, Host};
 use crate::wire::{Json, map, text};
@@ -18,17 +18,90 @@ pub const RESTORED_SHOWN: usize = 256;
 
 pub type Opener = Box<dyn FnMut() -> Result<Option<Host>, host::Error> + Send>;
 
+const QUEUED: u8 = 0;
+
+const RUNNING: u8 = 1;
+
+const ANSWERED: u8 = 2;
+
+const WATCH: Duration = Duration::from_millis(5);
+
 struct Job {
     request: Json,
     id: Json,
     arrived: Instant,
     cancel: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
+}
+
+struct Flight {
+    id: Json,
+    cancel: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
+    arrived: Instant,
+    budget_ms: u64,
 }
 
 struct Shared {
     status: Mutex<Status>,
-    flights: Mutex<Vec<(Json, Arc<AtomicBool>)>>,
+    flights: Mutex<Vec<Flight>>,
     batches: Arc<AtomicU64>,
+    stopping: AtomicBool,
+}
+
+fn budget_of(request: &Json) -> u64 {
+    request
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .and_then(|arguments| arguments.get("budget_ms"))
+        .and_then(Json::int)
+        .and_then(|one| u64::try_from(one).ok())
+        .filter(|one| (1..=super::budget::BUDGET_MOST_MS).contains(one))
+        .unwrap_or(super::budget::BUDGET_MS)
+}
+
+fn waited(flight: &Flight) -> Json {
+    let refusal = Refusal::new(
+        Code::Budget,
+        "$.budget_ms",
+        format!(
+            "the call waited {} ms behind earlier work, past its budget of {} ms, so nothing ran",
+            flight.arrived.elapsed().as_millis(),
+            flight.budget_ms
+        ),
+    )
+    .limited(super::budget::counted64(flight.budget_ms));
+    transport::answered(
+        flight.id.clone(),
+        super::world_refusal(refusal, &Json::Map(Vec::new()), Vec::new()),
+    )
+}
+
+fn watch(shared: &Shared, answers: &Sender<Json>) {
+    while !shared.stopping.load(Ordering::SeqCst) {
+        std::thread::sleep(WATCH);
+        let mut flights = shared
+            .flights
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        flights.retain(|flight| {
+            let due = now.saturating_duration_since(flight.arrived)
+                >= Duration::from_millis(flight.budget_ms);
+            if !due {
+                return true;
+            }
+            if flight
+                .state
+                .compare_exchange(QUEUED, ANSWERED, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return true;
+            }
+            let _ = answers.send(waited(flight));
+            false
+        });
+    }
 }
 
 impl Shared {
@@ -40,7 +113,7 @@ impl Shared {
         let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(at) = flights
             .iter()
-            .position(|(_, flag)| Arc::ptr_eq(flag, cancel))
+            .position(|flight| Arc::ptr_eq(&flight.cancel, cancel))
         {
             flights.swap_remove(at);
         }
@@ -52,6 +125,7 @@ pub struct Exec {
     answers: Sender<Json>,
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
+    watcher: Option<JoinHandle<()>>,
     #[cfg(feature = "faults")]
     faults: Arc<Mutex<super::Faults>>,
 }
@@ -201,6 +275,10 @@ fn work(
                     Err(mpsc::TryRecvError::Empty) => {
                         if !server.lost() && server.idle() {
                             shared.publish(&server);
+                            if server.lost() {
+                                reopen = true;
+                                break;
+                            }
                             continue;
                         }
                         match jobs.recv() {
@@ -217,6 +295,13 @@ fn work(
                 break;
             }
             retried = false;
+            if job
+                .state
+                .compare_exchange(QUEUED, RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                continue;
+            }
             server.arriving(Some(job.arrived), Some(Arc::clone(&job.cancel)));
             let answer = server.handle(&job.request).unwrap_or(Json::Null);
             server.arriving(None, None);
@@ -251,6 +336,7 @@ impl Exec {
             status: Mutex::new(Server::new(None).status()),
             flights: Mutex::new(Vec::new()),
             batches,
+            stopping: AtomicBool::new(false),
         });
         let worker = {
             let shared = Arc::clone(&shared);
@@ -259,6 +345,13 @@ impl Exec {
                 .name("grit-worker".to_owned())
                 .spawn(move || work(opener, book, &inbox, &answers, &shared, &ready))?
         };
+        let watcher = {
+            let shared = Arc::clone(&shared);
+            let answers = answers.clone();
+            std::thread::Builder::new()
+                .name("grit-watch".to_owned())
+                .spawn(move || watch(&shared, &answers))?
+        };
         let _ = started.recv();
         Ok((
             Self {
@@ -266,6 +359,7 @@ impl Exec {
                 answers,
                 shared,
                 worker: Some(worker),
+                watcher: Some(watcher),
                 #[cfg(feature = "faults")]
                 faults,
             },
@@ -318,6 +412,8 @@ impl Exec {
             return transport::handle(&mut control, &request);
         };
         let cancel = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(AtomicU8::new(QUEUED));
+        let arrived = Instant::now();
         {
             let mut flights = self
                 .shared
@@ -337,13 +433,20 @@ impl Exec {
                     .limited(Json::Int(i64::try_from(QUEUE_MOST).unwrap_or(i64::MAX))),
                 ));
             }
-            flights.push((id.clone(), Arc::clone(&cancel)));
+            flights.push(Flight {
+                id: id.clone(),
+                cancel: Arc::clone(&cancel),
+                state: Arc::clone(&state),
+                arrived,
+                budget_ms: budget_of(&request),
+            });
         }
         let job = Job {
             request,
             id,
-            arrived: Instant::now(),
+            arrived,
             cancel,
+            state,
         };
         let refused = self.jobs.as_ref().and_then(|jobs| jobs.send(job).err());
         refused.map(|job| {
@@ -372,9 +475,9 @@ impl Exec {
             .flights
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        for (id, flag) in flights.iter() {
-            if id == asked {
-                flag.store(true, Ordering::SeqCst);
+        for flight in flights.iter() {
+            if &flight.id == asked {
+                flight.cancel.store(true, Ordering::SeqCst);
             }
         }
     }
@@ -387,6 +490,10 @@ impl Exec {
         self.jobs = None;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
         }
     }
 }

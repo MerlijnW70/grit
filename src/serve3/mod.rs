@@ -205,7 +205,19 @@ pub struct Held {
     pace: Pace,
     note: Option<Json>,
     broken: Option<String>,
+    snap_failure: Option<SnapFailure>,
 }
+
+#[derive(Debug, Clone)]
+pub struct SnapFailure {
+    message: String,
+    failures: u32,
+    next: Instant,
+}
+
+pub const SNAP_RETRY_LEAST: Duration = Duration::from_secs(1);
+
+pub const SNAP_RETRY_MOST: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub struct Book {
@@ -237,6 +249,8 @@ pub struct Stats {
 pub struct Faults {
     pub wedge_after_batch: Option<u32>,
     pub wedge_before_call: bool,
+    pub fail_snapshots: u32,
+    pub wedge_in_snapshot: bool,
 }
 
 impl Book {
@@ -907,10 +921,10 @@ impl<'host> Server<'host> {
                         "$",
                         format!(
                             "every world number up to {} has been used",
-                            journal::NUMBER_MOST
+                            journal::NUMBER_MOST - 1
                         ),
                     )
-                    .limited(counted(journal::NUMBER_MOST)),
+                    .limited(counted(journal::NUMBER_MOST - 1)),
                 ) as Failed
             })?;
         if let Some(keep) = self.book.keep.as_ref() {
@@ -942,6 +956,7 @@ impl<'host> Server<'host> {
                 pace,
                 note: None,
                 broken: None,
+                snap_failure: None,
             },
         );
         self.live.insert(number, live);
@@ -982,8 +997,29 @@ impl<'host> Server<'host> {
         if !held.ledger.due(held.bytes, ratio) {
             return Ok(None);
         }
+        let far = held.ledger.far_over(Duration::ZERO, held.bytes, ratio);
+        if let Some(failure) = held.snap_failure.as_ref()
+            && failure.next > Instant::now()
+        {
+            if !far {
+                return Ok(None);
+            }
+            return Err(Box::new(Refusal::new(
+                errors::Code::Io,
+                "$.world",
+                format!(
+                    "world {number} owes a snapshot of its journal before it changes again, and its last {} attempts failed ({}); the next is due in {} ms; nothing ran",
+                    failure.failures,
+                    errors::shown(&failure.message),
+                    failure
+                        .next
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                ),
+            )));
+        }
         let needs = self.snap_estimate(number);
-        if self.clock.left() < needs && !held.ledger.far_over(Duration::ZERO, held.bytes, ratio) {
+        if self.clock.left() < needs && !far {
             return Ok(None);
         }
         if self.clock.left() < needs {
@@ -1006,6 +1042,56 @@ impl<'host> Server<'host> {
     }
 
     fn snap_now(&mut self, number: u32) -> Result<Option<Json>, Failed> {
+        let taken = self.snap_attempt(number);
+        let now = Instant::now();
+        if let Some(held) = self.book.held.get_mut(&number) {
+            match &taken {
+                Ok(_) => held.snap_failure = None,
+                Err(why) => {
+                    let failures = held
+                        .snap_failure
+                        .as_ref()
+                        .map_or(1, |old| old.failures.saturating_add(1));
+                    let wait = SNAP_RETRY_LEAST
+                        .saturating_mul(1_u32 << failures.saturating_sub(1).min(16))
+                        .min(SNAP_RETRY_MOST);
+                    held.snap_failure = Some(SnapFailure {
+                        message: refused_with(why.as_ref()).0.message,
+                        failures,
+                        next: now + wait,
+                    });
+                }
+            }
+        }
+        taken
+    }
+
+    fn snap_attempt(&mut self, number: u32) -> Result<Option<Json>, Failed> {
+        #[cfg(feature = "faults")]
+        {
+            let (fail, wedge) = self
+                .book
+                .faults
+                .lock()
+                .map(|mut faults| {
+                    let fail = faults.fail_snapshots > 0;
+                    if fail {
+                        faults.fail_snapshots -= 1;
+                    }
+                    (fail, std::mem::take(&mut faults.wedge_in_snapshot))
+                })
+                .unwrap_or((false, false));
+            if wedge && let Some(host) = self.host {
+                host.wedge();
+            }
+            if fail {
+                return Err(Box::new(Refusal::new(
+                    errors::Code::Io,
+                    "$",
+                    "an armed fault failed this snapshot".to_owned(),
+                )));
+            }
+        }
         let held = self
             .book
             .held
@@ -1059,19 +1145,55 @@ impl<'host> Server<'host> {
 
     pub fn idle(&mut self) -> bool {
         let ratio = self.book.rates.replay();
+        let now = Instant::now();
         let owed = self
             .book
             .held
             .iter()
             .find(|(number, held)| {
-                self.live.contains_key(number) && held.ledger.due(held.bytes, ratio)
+                let quick = self.book.rates.estimate(budget::Work::Save, held.bytes)
+                    <= Duration::from_millis(budget::SUBMIT_MOST_MS);
+                self.live.contains_key(number)
+                    && held.ledger.due(held.bytes, ratio)
+                    && (quick || held.ledger.far_over(Duration::ZERO, held.bytes, ratio))
+                    && held
+                        .snap_failure
+                        .as_ref()
+                        .is_none_or(|failure| failure.next <= now)
             })
             .map(|(number, _)| *number);
         let Some(number) = owed else {
             return false;
         };
-        let _ = self.snap_now(number);
+        let wedged_before = self.wedged();
+        self.clock = Clock::of(Instant::now(), budget::BUDGET_MOST_MS);
+        let taken = self.snap_now(number);
+        let lost = (!wedged_before && self.wedged())
+            || taken
+                .as_ref()
+                .err()
+                .is_some_and(|why| lost_device(why.as_ref()));
+        if lost {
+            self.lose();
+        }
         true
+    }
+
+    fn snap_waiting(&self, number: u32) -> bool {
+        self.book
+            .held
+            .get(&number)
+            .and_then(|held| held.snap_failure.as_ref())
+            .is_some_and(|failure| failure.next > Instant::now())
+    }
+
+    #[must_use]
+    pub fn snapshot_failures(&self) -> usize {
+        self.book
+            .held
+            .values()
+            .filter(|held| held.snap_failure.is_some())
+            .count()
     }
 
     fn forget(&mut self, number: u32) {
@@ -1108,6 +1230,7 @@ impl<'host> Server<'host> {
                     many(self.book.held.len().saturating_sub(self.live.len())),
                 ),
                 ("kept_earlier", many(self.book.earlier.len())),
+                ("snapshot_failures", many(self.snapshot_failures())),
                 ("restorations", budget::counted64(self.book.restorations)),
                 (
                     "ignored",
@@ -1324,9 +1447,11 @@ fn snapshot(
     match keep {
         Some(keep) => {
             let pending = keep.pending(number);
-            let _ = std::fs::remove_file(&pending);
             crate::branch::format::store(&pending, &image)?;
-            let (sum, _) = keep.settle(&pending).map_err(|why| io_refusal(&why))?;
+            let (sum, _) = keep.settle(&pending).map_err(|why| {
+                let _ = std::fs::remove_file(&pending);
+                io_refusal(&why)
+            })?;
             Ok(Arc::new(journal::Snap {
                 sum,
                 frame,
