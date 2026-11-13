@@ -251,6 +251,8 @@ pub struct Faults {
     pub wedge_before_call: bool,
     pub fail_snapshots: u32,
     pub wedge_in_snapshot: bool,
+    pub slow_idle_snapshot: Duration,
+    pub slowed: u32,
 }
 
 impl Book {
@@ -1167,6 +1169,8 @@ impl<'host> Server<'host> {
         };
         let wedged_before = self.wedged();
         self.clock = Clock::of(Instant::now(), budget::BUDGET_MOST_MS);
+        #[cfg(feature = "faults")]
+        self.slow_idle();
         let taken = self.snap_now(number);
         let lost = (!wedged_before && self.wedged())
             || taken
@@ -1177,6 +1181,22 @@ impl<'host> Server<'host> {
             self.lose();
         }
         true
+    }
+
+    #[cfg(feature = "faults")]
+    fn slow_idle(&self) {
+        let slow = self
+            .book
+            .faults
+            .lock()
+            .map(|mut faults| {
+                if !faults.slow_idle_snapshot.is_zero() {
+                    faults.slowed = faults.slowed.saturating_add(1);
+                }
+                faults.slow_idle_snapshot
+            })
+            .unwrap_or_default();
+        std::thread::sleep(slow);
     }
 
     fn snap_waiting(&self, number: u32) -> bool {
