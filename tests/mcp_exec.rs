@@ -3406,6 +3406,39 @@ fn a_write_in_flight_bounds_the_journal_after_it_and_caps_the_whole() {
 }
 
 #[test]
+fn a_call_queued_behind_another_is_charged_that_wait_once() {
+    let Some(host) = device("charged once") else {
+        return;
+    };
+    drop(host);
+    let mut run = Run::new(&Options::default());
+    let world = sand_world(&mut run, 32);
+    let first = 600;
+    let second = 700;
+    let sent = Instant::now();
+    let ahead = run.send(
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{first}}}"),
+    );
+    let behind = run.send(
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{second}}}"),
+    );
+    let went = answer(&run.wait(ahead));
+    assert!(went.int_at("ran") > 0, "{}", written(&went));
+    let got = run.wait(behind);
+    let took = sent.elapsed();
+    let told = answer(&got);
+    assert!(told.int_at("ran") > 0, "{}", written(&got));
+    let most = late_most(&mut run, second);
+    eprintln!(
+        "a call of {second} ms behind one of {first} ms answered {took:?} after both were sent (bound {most:?})"
+    );
+    assert!(took <= most, "{took:?}, more than {most:?}");
+    run.exec.finish();
+}
+
+#[test]
 fn a_directory_planted_where_a_snapshot_is_written_does_not_stop_snapshots() {
     let Some(host) = device("planted pending directory") else {
         return;
