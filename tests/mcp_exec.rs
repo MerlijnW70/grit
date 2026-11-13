@@ -1114,7 +1114,10 @@ fn a_long_step_on_a_large_world_returns_within_its_budget_with_whole_frames() {
     answer(&call(
         &mut server,
         "grit_world_write",
-        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
+        &format!(
+            "{{\"world\":{world},\"cells\":{},\"budget_ms\":600000}}",
+            writing(&cells)
+        ),
     ));
     let fork = u32::try_from(
         answer(&call(
