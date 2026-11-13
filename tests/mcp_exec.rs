@@ -3583,6 +3583,52 @@ fn a_world_restored_while_its_snapshot_is_written_is_held_to_its_new_journal() {
     run.exec.finish();
 }
 
+#[cfg(feature = "faults")]
+#[test]
+fn a_world_far_over_while_another_worlds_snapshot_is_written_is_refused_once() {
+    let Some(host) = device("another world's write") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("other-writing");
+    let keep = Keep::at(&scratch.dir()).unwrap();
+    for world in [1, 2] {
+        let mut ledger = Ledger::created(Made {
+            rule: "sand".to_owned(),
+            params: Vec::new(),
+            size: [32, 32, 32],
+            sparse: false,
+            slots: None,
+        });
+        ledger.push(Entry::Step(4), Duration::from_secs(30));
+        keep.begin(world, &ledger).unwrap();
+    }
+    keep.set_next(3).unwrap();
+    drop(keep);
+    let mut run = Run::new(&Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    });
+    let faults = run.exec.faults();
+    faults.lock().unwrap().slow_write = Duration::from_secs(6);
+    answer(&run.ask(
+        "grit_world_open",
+        "{\"name\":\"world-1\",\"budget_ms\":600000}",
+    ));
+    answer(&run.ask(
+        "grit_world_open",
+        "{\"name\":\"world-2\",\"budget_ms\":600000}",
+    ));
+    assert_eq!(faults.lock().unwrap().slowed, 1);
+    let told = refused(&run.ask(
+        "grit_world_step",
+        "{\"world\":2,\"frames\":1,\"budget_ms\":300}",
+    ));
+    assert_eq!(told.code, "budget", "{}", told.message);
+    assert!(told.message.contains("being written"), "{}", told.message);
+    run.exec.finish();
+}
+
 #[test]
 fn a_directory_planted_where_a_snapshot_is_written_does_not_stop_snapshots() {
     let Some(host) = device("planted pending directory") else {
