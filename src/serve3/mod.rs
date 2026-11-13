@@ -426,7 +426,13 @@ impl Book {
     fn writing_from(&self, number: u32) -> Option<usize> {
         self.writing
             .as_ref()
-            .filter(|writing| writing.number == number)
+            .filter(|writing| {
+                writing.number == number
+                    && self
+                        .held
+                        .get(&number)
+                        .is_some_and(|held| held.epoch == writing.epoch)
+            })
             .map(|writing| writing.from)
     }
 

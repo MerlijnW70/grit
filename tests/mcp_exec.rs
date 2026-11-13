@@ -3521,6 +3521,63 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
     run.exec.finish();
 }
 
+#[cfg(feature = "faults")]
+#[test]
+fn a_world_restored_while_its_snapshot_is_written_is_held_to_its_new_journal() {
+    let Some(host) = device("restore during a write") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("restore-writing");
+    let keep = Keep::at(&scratch.dir()).unwrap();
+    let mut ledger = Ledger::created(Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [32, 32, 32],
+        sparse: false,
+        slots: None,
+    });
+    ledger.push(Entry::Step(4), Duration::from_secs(30));
+    keep.begin(1, &ledger).unwrap();
+    keep.set_next(2).unwrap();
+    drop(keep);
+    let mut run = Run::new(&Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    });
+    let faults = run.exec.faults();
+    faults.lock().unwrap().fail_snapshots = 1;
+    answer(&run.ask(
+        "grit_world_open",
+        "{\"name\":\"world-1\",\"budget_ms\":600000}",
+    ));
+    let target = answer(&run.ask(
+        "grit_world_create",
+        "{\"wide\":32,\"deep\":32,\"tall\":32,\"rule\":\"sand\"}",
+    ))
+    .int_at("world");
+    faults.lock().unwrap().slow_write = Duration::from_secs(6);
+    let began = Instant::now();
+    while faults.lock().unwrap().slowed == 0 {
+        assert!(began.elapsed() < Duration::from_secs(30), "no write began");
+        answer(&run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{target},\"frames\":65536,\"budget_ms\":1500}}"),
+        ));
+    }
+    answer(&run.ask(
+        "grit_world_restore",
+        &format!("{{\"world\":{target},\"from\":1,\"budget_ms\":600000}}"),
+    ));
+    let told = refused(&run.ask(
+        "grit_world_step",
+        &format!("{{\"world\":{target},\"frames\":1,\"budget_ms\":300}}"),
+    ));
+    assert_eq!(told.code, "budget", "{}", told.message);
+    assert!(told.message.contains("being written"), "{}", told.message);
+    run.exec.finish();
+}
+
 #[test]
 fn a_directory_planted_where_a_snapshot_is_written_does_not_stop_snapshots() {
     let Some(host) = device("planted pending directory") else {
