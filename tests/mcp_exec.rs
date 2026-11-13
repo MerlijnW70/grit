@@ -1628,10 +1628,14 @@ fn a_world_survives_the_end_of_its_server_and_opens_at_its_frame() {
         let many = if round == 1 { 4096 } else { 300 };
         let cells = scattered(&mut seed, 16, many, &SAND_WORDS);
         for (one, held) in [(world, &mut model), (sparse, &mut sparse_model)] {
-            answer(&first.ask(
+            let wrote = answer(&first.ask(
                 "grit_world_write",
-                &format!("{{\"world\":{one},\"cells\":{}}}", writing(&cells)),
+                &format!(
+                    "{{\"world\":{one},\"cells\":{},\"budget_ms\":600000}}",
+                    writing(&cells)
+                ),
             ));
+            assert_eq!(wrote.int_at("written"), many as i64, "{}", written(&wrote));
             held.write(&cells);
             answer(&first.ask(
                 "grit_world_step",
