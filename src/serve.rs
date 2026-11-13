@@ -36,6 +36,7 @@ pub struct Found {
     pub table: Vec<u32>,
     pub wrong: Vec<u32>,
     pub most: u32,
+    pub longest: std::time::Duration,
 }
 
 fn columns(exam: &Exam) -> Vec<u32> {
@@ -240,6 +241,7 @@ fn judged(shape: Netlist, exam: &Exam, gates: &[u32]) -> Result<Found, Box<dyn s
         table,
         wrong,
         most: CROWD,
+        longest: std::time::Duration::ZERO,
     })
 }
 
@@ -351,15 +353,8 @@ impl Pace {
         fits.min(self.most).min(left).max(1.min(left))
     }
 
-    pub fn learn(
-        &mut self,
-        rounds: u32,
-        wall: std::time::Duration,
-        device: Option<std::time::Duration>,
-    ) {
-        let spent = device.map_or(wall, |device| device.max(wall));
-        let units = self.work as f64 * f64::from(rounds.max(1));
-        self.each = Some(spent.as_secs_f64() / units);
+    pub fn learn(&mut self, round: std::time::Duration) {
+        self.each = Some(round.as_secs_f64() / self.work as f64);
     }
 
     #[must_use]
@@ -373,6 +368,7 @@ pub struct Gauge {
     pub round: std::time::Duration,
     pub most: u32,
     pub probes: u32,
+    pub longest: std::time::Duration,
 }
 
 fn spent_on(resident: &Resident<'_>, wall: std::time::Duration) -> std::time::Duration {
@@ -388,10 +384,13 @@ fn gauged(
     let quarter = ROUND_MOST.as_secs_f64() / 4.0;
     let mut groups = 1_u32;
     let mut probes = 0_u32;
+    let mut longest = std::time::Duration::ZERO;
     loop {
         let part = [Groups::Fixed(groups)];
         let stages: Vec<&[Groups]> = vec![&part, &part, &part];
+        let began = std::time::Instant::now();
         let wall = resident.staged_frames(&stages, 1)?;
+        longest = longest.max(began.elapsed());
         probes += 1;
         let spent = resident.on_device().unwrap_or(wall).as_secs_f64();
         let each = spent / f64::from(groups);
@@ -420,6 +419,7 @@ fn gauged(
             round: std::time::Duration::from_secs_f64(round),
             most,
             probes,
+            longest,
         });
     }
 }
@@ -458,20 +458,51 @@ fn leader(best: &[u32]) -> (usize, u32) {
         .unwrap_or((0, 0))
 }
 
-fn walked(
-    resident: &mut Resident<'_>,
-    stages: &[&[Groups]],
+pub trait Submits {
+    fn submitted(&mut self, rounds: u32)
+    -> Result<std::time::Duration, Box<dyn std::error::Error>>;
+}
+
+pub struct Staged<'held, 'host> {
+    resident: &'held mut Resident<'host>,
+    stages: &'held [&'held [Groups]],
+}
+
+impl<'held, 'host> Staged<'held, 'host> {
+    pub const fn new(
+        resident: &'held mut Resident<'host>,
+        stages: &'held [&'held [Groups]],
+    ) -> Self {
+        Self { resident, stages }
+    }
+}
+
+impl Submits for Staged<'_, '_> {
+    fn submitted(
+        &mut self,
+        rounds: u32,
+    ) -> Result<std::time::Duration, Box<dyn std::error::Error>> {
+        let wall = self.resident.staged_frames(self.stages, rounds)?;
+        Ok(spent_on(self.resident, wall))
+    }
+}
+
+pub fn walked(
+    submits: &mut impl Submits,
     pace: &mut Pace,
     rounds: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<std::time::Duration, Box<dyn std::error::Error>> {
     let mut gone = 0_u32;
+    let mut longest = std::time::Duration::ZERO;
     while gone < rounds {
         let step = pace.next(rounds - gone);
-        let wall = resident.staged_frames(stages, step)?;
-        pace.learn(step, spent_on(resident, wall), None);
+        let began = std::time::Instant::now();
+        let round = submits.submitted(step)?;
+        longest = longest.max(began.elapsed());
+        pace.learn(round);
         gone += step;
     }
-    Ok(())
+    Ok(longest)
 }
 
 fn climbed(
@@ -481,11 +512,12 @@ fn climbed(
     effort: Effort,
     restart: u32,
     gauge: Gauge,
-) -> Result<(u32, Vec<u32>), Box<dyn std::error::Error>> {
+) -> Result<(u32, Vec<u32>, std::time::Duration), Box<dyn std::error::Error>> {
     let gates = climb.shape.gates as usize;
+    let mut longest = gauge.longest;
     let room = climb.many as usize * gates;
     let mut pace = Pace::over(climb.work, effort.submitted);
-    pace.learn(1, gauge.round, None);
+    pace.learn(gauge.round);
     let mut done = 0_u32;
     let mut top = 0_u32;
     let mut since = 0_u32;
@@ -494,7 +526,7 @@ fn climbed(
     let mut best = Vec::new();
     while done < effort.rounds {
         let step = climb.look.min(effort.rounds - done);
-        walked(resident, stages, &mut pace, step)?;
+        longest = longest.max(walked(&mut Staged::new(resident, stages), &mut pace, step)?);
         done += step;
         best = resident.read(BEST as usize, climb.many as usize)?;
         let (who, now) = leader(&best);
@@ -529,11 +561,15 @@ fn climbed(
     if let Some((score, gates)) = kept
         && score > now
     {
-        return Ok((done, gates));
+        return Ok((done, gates, longest));
     }
     let held = resident.read(HELD as usize, room)?;
     let from = who * gates;
-    Ok((done, held.get(from..from + gates).unwrap_or(&[]).to_vec()))
+    Ok((
+        done,
+        held.get(from..from + gates).unwrap_or(&[]).to_vec(),
+        longest,
+    ))
 }
 
 pub fn sought(
@@ -595,11 +631,12 @@ fn sought_within(
         look: LOOK,
         work: u64::from(many) * u64::from(shape.gates) * u64::from(words_of(shape)),
     };
-    let (done, gates) = climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
+    let (done, gates, longest) = climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
     let mut found = judged(shape, exam, &gates)?;
     found.rounds = done;
     found.crowd = many;
     found.most = gauge.most;
+    found.longest = longest;
     Ok(Ok(found))
 }
 
@@ -613,10 +650,13 @@ pub fn pressed(
     let mut restart = 0_u32;
     let mut before: Option<Found> = None;
     loop {
-        let found = match sought_within(host, shape, exam, effort, restart)? {
+        let mut found = match sought_within(host, shape, exam, effort, restart)? {
             Ok(found) => found,
             Err(held) => return before.ok_or_else(|| refused_overlong(&held)),
         };
+        if let Some(held) = &before {
+            found.longest = found.longest.max(held.longest);
+        }
         let most = CROWD.min(found.most);
         if found.marks >= found.full || effort.crowd >= most {
             return Ok(found);
@@ -671,6 +711,7 @@ pub struct Ran {
     pub said: Vec<Vec<u32>>,
     pub wrong: Vec<(u32, u32)>,
     pub most: u32,
+    pub longest: std::time::Duration,
 }
 
 fn laid(held: Machine, traces: &[(Vec<u32>, Vec<u32>)], wide: u32) -> (Vec<u32>, Vec<u32>) {
@@ -744,6 +785,7 @@ fn told_of(
         said,
         wrong,
         most: CROWD,
+        longest: std::time::Duration::ZERO,
     })
 }
 
@@ -828,10 +870,11 @@ fn machined_within(
                 + u64::from(held.outputs))
             * u64::from(wide),
     };
-    let (done, gates) = climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
+    let (done, gates, longest) = climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
     let chip = Chip::of(shape, gates.clone(), held.named())?;
     let mut ran = told_of(held, traces, &chip, &gates, done, many)?;
     ran.most = gauge.most;
+    ran.longest = longest;
     Ok(Ok(ran))
 }
 
@@ -845,10 +888,13 @@ pub fn pressed_machine(
     let mut restart = 0_u32;
     let mut before: Option<Ran> = None;
     loop {
-        let ran = match machined_within(host, held, traces, effort, restart)? {
+        let mut ran = match machined_within(host, held, traces, effort, restart)? {
             Ok(ran) => ran,
             Err(over) => return before.ok_or_else(|| refused_overlong(&over)),
         };
+        if let Some(earlier) = &before {
+            ran.longest = ran.longest.max(earlier.longest);
+        }
         let most = CROWD.min(ran.most);
         if ran.marks >= ran.full || effort.crowd >= most {
             return Ok(ran);
@@ -979,16 +1025,18 @@ fn gated(
     reads: u32,
     written_by: &str,
 ) -> Result<u32, Box<dyn std::error::Error>> {
-    let gates = Whole { least: 0, ..*gates }.count(held, "$")?;
-    if gates < least {
+    if let Some(value) = held.get(gates.key).and_then(Json::int)
+        && (0..i64::from(least)).contains(&value)
+    {
         return Err(beyond(
             "$.gates".to_owned(),
             format!(
-                "gates is {gates}, and the last {least} gates are its {written_by}, so gates must be at least {least}"
+                "gates is {value}, and the last {least} gates are its {written_by}, so gates must be at least {least}"
             ),
             least,
         ));
     }
+    let gates = gates.count(held, "$")?;
     let most = SOURCES - reads;
     if gates > most {
         return Err(beyond(
