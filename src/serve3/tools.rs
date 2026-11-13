@@ -731,7 +731,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         batch += 1;
         if done < frames && server.overdue(number, spent) {
             if server.far_overdue(number, spent) {
-                server.wait_write(number);
+                server.wait_write();
             }
             let fits =
                 server.clock.left() >= server.snapping(number) && !server.snap_waiting(number);

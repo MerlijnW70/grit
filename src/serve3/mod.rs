@@ -1163,7 +1163,7 @@ impl<'host> Server<'host> {
             ratio,
             self.book.writing_from(number),
         );
-        if self.book.writing_for(number) {
+        if self.book.writing.is_some() {
             if !far {
                 return Ok(None);
             }
@@ -1226,11 +1226,11 @@ impl<'host> Server<'host> {
     }
 
     fn snap_now(&mut self, number: u32) -> Result<Option<Json>, Failed> {
-        if self.book.writing_for(number) {
-            self.book.landed(Wait::Poll);
-            if self.book.writing_for(number) || !self.due(number) {
-                return Ok(None);
-            }
+        if self.book.writing.is_some() {
+            return Ok(None);
+        }
+        if let Some(keep) = self.book.keep.clone() {
+            return self.snap_behind(number, keep).map(|()| None);
         }
         let taken = self.snap_attempt(number);
         match &taken {
@@ -1245,13 +1245,6 @@ impl<'host> Server<'host> {
             }
         }
         taken
-    }
-
-    fn due(&self, number: u32) -> bool {
-        self.book
-            .held
-            .get(&number)
-            .is_some_and(|held| held.ledger.due(held.bytes, self.book.rates.replay()))
     }
 
     fn snap_image(&mut self, number: u32) -> Result<(crate::branch::Image, Made, Instant), Failed> {
@@ -1376,7 +1369,6 @@ impl<'host> Server<'host> {
                 done,
                 thread: Some(thread),
             });
-            self.idle_slowly();
             Ok(())
         });
         if let Err(why) = &started {
@@ -1455,7 +1447,13 @@ impl<'host> Server<'host> {
         let wedged_before = self.wedged();
         self.clock = Clock::of(Instant::now(), budget::BUDGET_MOST_MS);
         let taken = match self.book.keep.clone() {
-            Some(keep) => self.snap_behind(number, keep),
+            Some(keep) => {
+                let started = self.snap_behind(number, keep);
+                if started.is_ok() {
+                    self.idle_slowly();
+                }
+                started
+            }
             None => {
                 self.idle_slowly();
                 self.snap_now(number).map(|_| ())
@@ -1515,8 +1513,8 @@ impl<'host> Server<'host> {
         self.book.writing.is_some()
     }
 
-    fn wait_write(&mut self, number: u32) {
-        if self.book.writing_for(number) {
+    fn wait_write(&mut self) {
+        if self.book.writing.is_some() {
             self.book.landed(Wait::For(self.clock.left()));
         }
     }
