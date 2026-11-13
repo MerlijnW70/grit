@@ -4,9 +4,17 @@ mod common;
 
 use common::device;
 
+#[cfg(feature = "faults")]
+use std::sync::Arc;
+#[cfg(feature = "faults")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use grit::{Error, Groups, Resident};
+#[cfg(feature = "faults")]
+use grit::Error;
+#[cfg(feature = "faults")]
+use grit::resident::faults;
+use grit::{Groups, Resident};
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 
@@ -14,9 +22,11 @@ const WORDS: usize = 1 << 16;
 
 const PER_LANE: u32 = 4;
 
+#[cfg(feature = "faults")]
 const IMPATIENT: Duration = Duration::ZERO;
 
-const TRIES: usize = 8;
+#[cfg(feature = "faults")]
+const LATE: Duration = Duration::from_millis(200);
 
 fn walk(subgroup: u32) -> Result<Vec<u32>, LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, 2))?;
@@ -48,17 +58,45 @@ fn over(width: u32) -> u32 {
     u32::try_from(WORDS / (width as usize * PER_LANE as usize)).unwrap_or(1)
 }
 
-fn wedge(held: &mut Resident<'_>, groups: &[Groups]) -> Option<Duration> {
-    for _ in 0..TRIES {
-        match held.frame(groups) {
-            Err(Error::Wedged { after }) => return Some(after),
-            Err(other) => panic!("{other:?}"),
-            Ok(_) => {}
-        }
+#[cfg(feature = "faults")]
+fn wedge(held: &mut Resident<'_>, groups: &[Groups]) -> (u64, Duration) {
+    let holding = faults::hold();
+    match held.frame(groups) {
+        Err(Error::Wedged { after }) => (holding, after),
+        other => panic!("{other:?}"),
     }
-    None
 }
 
+#[cfg(feature = "faults")]
+struct Late {
+    released: Arc<AtomicBool>,
+    releasing: std::thread::JoinHandle<()>,
+}
+
+#[cfg(feature = "faults")]
+impl Late {
+    fn after(holding: u64) -> Self {
+        let released = Arc::new(AtomicBool::new(false));
+        let marking = Arc::clone(&released);
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(LATE);
+            marking.store(true, Ordering::SeqCst);
+            faults::release(holding);
+        });
+        Self {
+            released,
+            releasing,
+        }
+    }
+
+    fn waited(self) -> bool {
+        let released = self.released.load(Ordering::SeqCst);
+        self.releasing.join().unwrap();
+        released
+    }
+}
+
+#[cfg(feature = "faults")]
 #[test]
 fn a_fence_that_does_not_come_back_in_time_presumes_the_device_lost() {
     let Some(host) = device("a_fence_that_does_not_come_back_in_time_presumes_the_device_lost")
@@ -84,10 +122,12 @@ fn a_fence_that_does_not_come_back_in_time_presumes_the_device_lost() {
     held.set_patience(IMPATIENT);
     let groups = [Groups::Fixed(over(host.width()))];
 
-    let after = wedge(&mut held, &groups).unwrap();
+    let (holding, after) = wedge(&mut held, &groups);
+    faults::release(holding);
     assert_eq!(after, IMPATIENT);
 }
 
+#[cfg(feature = "faults")]
 #[test]
 fn a_wedged_device_refuses_everything_afterwards() {
     let Some(host) = device("a_wedged_device_refuses_everything_afterwards") else {
@@ -100,7 +140,7 @@ fn a_wedged_device_refuses_everything_afterwards() {
 
     held.set_patience(IMPATIENT);
     let groups = [Groups::Fixed(over(host.width()))];
-    assert!(wedge(&mut held, &groups).is_some());
+    let (holding, _) = wedge(&mut held, &groups);
 
     assert!(matches!(held.frame(&groups), Err(Error::Wedged { .. })));
     assert!(matches!(held.write(0, &[7]), Err(Error::Wedged { .. })));
@@ -110,8 +150,10 @@ fn a_wedged_device_refuses_everything_afterwards() {
     ));
     assert!(matches!(held.read(1, 1), Err(Error::Wedged { .. })));
     assert!(matches!(held.submit(&[&groups]), Err(Error::Wedged { .. })));
+    faults::release(holding);
 }
 
+#[cfg(feature = "faults")]
 #[test]
 fn a_wedged_device_is_dropped_rather_than_waited_for() {
     let Some(host) = device("a_wedged_device_is_dropped_rather_than_waited_for") else {
@@ -124,10 +166,11 @@ fn a_wedged_device_is_dropped_rather_than_waited_for() {
 
     held.set_patience(IMPATIENT);
     let groups = [Groups::Fixed(over(host.width()))];
-    assert!(wedge(&mut held, &groups).is_some());
+    let late = Late::after(wedge(&mut held, &groups).0);
 
     drop(held);
     drop(host);
+    late.waited();
 }
 
 #[test]
@@ -187,7 +230,7 @@ fn the_bound_is_settable_from_outside_and_ignores_what_is_not_a_bound() {
 
 #[cfg(feature = "faults")]
 mod freed {
-    use super::{IMPATIENT, TRIES, WORDS, device, over, walk, wedge};
+    use super::{IMPATIENT, Late, WORDS, device, over, walk, wedge};
 
     use grit::resident::faults::{self, Step};
     use grit::{Error, Groups};
@@ -221,10 +264,12 @@ mod freed {
 
         held.set_patience(IMPATIENT);
         let groups = [Groups::Fixed(over(host.width()))];
-        assert!(wedge(&mut held, &groups).is_some());
+        let (holding, _) = wedge(&mut held, &groups);
         assert_eq!(held.in_flight(), 1, "the frame that ran out of time");
 
+        let late = Late::after(holding);
         drop(held);
+        assert!(late.waited(), "dropped before its frame could finish");
         let left = alive();
         assert!(left.is_empty(), "{left:?}");
     }
@@ -242,24 +287,14 @@ mod freed {
         let mut held = host.resident(&[WORDS, 1], &every).unwrap();
 
         held.set_patience(IMPATIENT);
-        let mut wedged = false;
-        for _ in 0..TRIES {
-            match held.read(0, WORDS) {
-                Err(Error::Wedged { .. }) => {
-                    wedged = true;
-                    break;
-                }
-                Err(other) => panic!("{other:?}"),
-                Ok(_) => {}
-            }
-        }
-        assert!(
-            wedged,
-            "no transfer of {WORDS} words ran out of no time at all"
-        );
+        let holding = faults::hold();
+        let read = held.read(0, WORDS);
+        assert!(matches!(read, Err(Error::Wedged { .. })), "{read:?}");
         assert_eq!(held.in_flight(), 0, "only the transfer was sent");
 
+        let late = Late::after(holding);
         drop(held);
+        assert!(late.waited(), "dropped before its transfer could finish");
         let left = alive();
         assert!(left.is_empty(), "{left:?}");
     }
@@ -280,10 +315,11 @@ mod freed {
 
         wedging.set_patience(IMPATIENT);
         let groups = [Groups::Fixed(over(host.width()))];
-        assert!(wedge(&mut wedging, &groups).is_some());
+        let late = Late::after(wedge(&mut wedging, &groups).0);
 
         drop(idle);
         drop(wedging);
+        assert!(late.waited(), "dropped before its frame could finish");
         let left = alive();
         assert!(left.is_empty(), "{left:?}");
     }
@@ -306,20 +342,13 @@ mod freed {
         let page = held.page(1).unwrap();
 
         held.set_patience(IMPATIENT);
-        let mut wedged = false;
-        for at in 0..TRIES {
-            match held.bind(1, at * page, page) {
-                Err(Error::Wedged { .. }) => {
-                    wedged = true;
-                    break;
-                }
-                Err(other) => panic!("{other:?}"),
-                Ok(()) => {}
-            }
-        }
-        assert!(wedged, "no sparse bind ran out of no time at all");
+        let holding = faults::hold();
+        let bound = held.bind(1, 0, page);
+        assert!(matches!(bound, Err(Error::Wedged { .. })), "{bound:?}");
 
+        let late = Late::after(holding);
         drop(held);
+        assert!(late.waited(), "dropped before its sparse bind could finish");
         let left = alive();
         assert!(left.is_empty(), "{left:?}");
     }
@@ -338,10 +367,11 @@ mod freed {
 
         held.set_patience(IMPATIENT);
         let groups = [Groups::Fixed(over(host.width()))];
-        assert!(wedge(&mut held, &groups).is_some());
+        let late = Late::after(wedge(&mut held, &groups).0);
 
         drop(held);
         drop(host);
+        assert!(late.waited(), "dropped before its frame could finish");
         let made = faults::count(Step::Device);
         assert_eq!(
             (made.made, made.gone, made.outstanding),
@@ -364,11 +394,12 @@ mod freed {
 
         held.set_patience(IMPATIENT);
         let groups = [Groups::Fixed(over(host.width()))];
-        assert!(wedge(&mut held, &groups).is_some());
+        let (holding, _) = wedge(&mut held, &groups);
 
         std::mem::forget(held);
         drop(host);
         let made = faults::count(Step::Device);
+        faults::release(holding);
         assert_eq!((made.made, made.gone), (1, 0), "{made:?}");
     }
 }
