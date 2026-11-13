@@ -10,8 +10,8 @@ use grit::machine::Machine;
 use grit::marking::{BINDINGS, HELD, SEED, TRIAL, chosen, marked, turned_on, words_of};
 use grit::netlist::{Exam, Gate, Netlist, drawn, turned};
 use grit::serve::{
-    ASIDE, Effort, Escape, Pace, Rolls, SEEDING, SIDE, SUBMISSION, Staged, Submits, handle, machined,
-    mixed, opening, pressed, shaken, walked,
+    ASIDE, Effort, Escape, Pace, Rolls, SEEDING, SIDE, SUBMISSION, Staged, Submits, handle,
+    machined, mixed, opening, pressed, shaken, walked,
 };
 use grit::wire::{Json, read, written};
 use grit::{Groups, Host};
@@ -745,21 +745,33 @@ fn every_submission_stays_within_its_target_however_long_a_round_takes() {
     }
 }
 
-struct Watched<S: Submits> {
-    inner: S,
-    sent: Vec<(u32, Duration)>,
+struct Sent {
+    rounds: u32,
+    wall: Duration,
+    round: Duration,
+    device: Option<Duration>,
 }
 
-impl<S: Submits> Submits for Watched<S> {
+struct Watched<'held, 'host> {
+    inner: Staged<'held, 'host>,
+    sent: Vec<Sent>,
+}
+
+impl Submits for Watched<'_, '_> {
     fn submitted(&mut self, rounds: u32) -> Result<Duration, Box<dyn std::error::Error>> {
         let began = std::time::Instant::now();
         let round = self.inner.submitted(rounds)?;
-        self.sent.push((rounds, began.elapsed()));
+        self.sent.push(Sent {
+            rounds,
+            wall: began.elapsed(),
+            round,
+            device: self.inner.on_device(),
+        });
         Ok(round)
     }
 }
 
-fn round_of(host: &Host, shape: Netlist, many: u32, rounds: u32) -> Vec<(u32, Duration)> {
+fn round_of(host: &Host, shape: Netlist, many: u32, rounds: u32) -> Vec<Sent> {
     let width = host.width();
     let wide = words_of(shape);
     let turn = turned_on(width, shape).unwrap();
@@ -812,7 +824,8 @@ fn a_real_search_keeps_every_submission_within_its_target_on_this_device() {
     let mut many = 1024_u32.div_ceil(width) * width;
     loop {
         let one = round_of(&host, shape, many, 1);
-        let round = one.first().unwrap().1;
+        let first = one.first().unwrap();
+        let round = first.device.unwrap_or(first.round);
         eprintln!("crowd {many}: one round {round:?}");
         if round >= Duration::from_millis(3) || many >= 65536 {
             break;
@@ -821,22 +834,49 @@ fn a_real_search_keeps_every_submission_within_its_target_on_this_device() {
         many = (grown.max(many * 2).min(65536) / width).max(1) * width;
     }
     let sent = round_of(&host, shape, many, 300);
-    let longest = sent.iter().map(|one| one.1).max().unwrap();
+    let shown: Vec<String> = sent
+        .iter()
+        .map(|one| {
+            format!(
+                "{} x {:?} (device {:?}, wall {:?})",
+                one.rounds, one.round, one.device, one.wall
+            )
+        })
+        .collect();
     eprintln!(
-        "{} at crowd {many}: {} submissions, rounds {:?}, longest {longest:?}",
+        "{} at crowd {many}: {} submissions, longest wall {:?}: {shown:?}",
         host.name(),
         sent.len(),
-        sent.iter().map(|one| one.0).collect::<Vec<_>>()
+        sent.iter().map(|one| one.wall).max().unwrap()
     );
-    assert_eq!(sent.iter().map(|one| one.0).sum::<u32>(), 300);
+    assert_eq!(sent.iter().map(|one| one.rounds).sum::<u32>(), 300);
     assert!(
-        sent.iter().any(|one| one.0 > 1),
-        "rounds of this size should share submissions: {sent:?}"
+        sent.iter().any(|one| one.rounds > 1),
+        "rounds of this size should share submissions: {shown:?}"
     );
-    for (rounds, took) in &sent {
+    assert_eq!(
+        sent.first().map(|one| one.rounds),
+        Some(1),
+        "before anything is measured one round goes alone: {shown:?}"
+    );
+    for one in &sent {
+        if let Some(device) = one.device {
+            assert!(
+                one.round >= device,
+                "a submission answered {:?} a round, under the {device:?} its own device stamps spent on each: {shown:?}",
+                one.round
+            );
+        }
+    }
+    for (at, pair) in sent.windows(2).enumerate() {
+        let (before, now) = (&pair[0], &pair[1]);
+        let measured = before.round.max(before.device.unwrap_or(Duration::ZERO));
         assert!(
-            *rounds == 1 || *took <= SUBMISSION * 2,
-            "a submission of {rounds} rounds ran {took:?} against a target of {SUBMISSION:?}: {sent:?}"
+            now.rounds == 1 || measured * now.rounds <= SUBMISSION,
+            "submission {} held {} rounds of the {measured:?} the one before it measured, {:?} against the {SUBMISSION:?} target: {shown:?}",
+            at + 1,
+            now.rounds,
+            measured * now.rounds
         );
     }
 }
