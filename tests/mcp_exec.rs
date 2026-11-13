@@ -2628,30 +2628,22 @@ fn a_write_replayed_on_open_does_not_slow_the_next_create() {
         dir: Some(scratch.dir()),
         memory: None,
     };
-    let mut run = Run::new(&options);
-    let world = answer(&run.ask(
-        "grit_world_create",
-        "{\"wide\":64,\"deep\":64,\"tall\":64,\"rule\":\"sand\"}",
-    ))
-    .int_at("world");
+    let keep = Keep::at(&scratch.dir()).unwrap();
+    let mut ledger = Ledger::created(Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [64, 64, 64],
+        sparse: false,
+        slots: None,
+    });
     let mut seed = 0x7719_u64;
     let cells = scattered(&mut seed, 64, 200, &SAND_WORDS);
-    let began = Instant::now();
-    answer(&run.ask(
-        "grit_world_write",
-        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
-    ));
-    eprintln!("the write took {:?}", began.elapsed());
-    run.exec.finish();
-    eprintln!(
-        "kept before the restart: {:?}",
-        entries(&scratch.dir().join("kept"))
-    );
+    ledger.push(Entry::Write(cells), Duration::from_millis(50));
+    keep.begin(1, &ledger).unwrap();
+    keep.set_next(2).unwrap();
+    drop(keep);
     let mut again = Run::new(&options);
-    let opened = answer(&again.ask(
-        "grit_world_open",
-        &format!("{{\"name\":\"world-{world}\"}}"),
-    ));
+    let opened = answer(&again.ask("grit_world_open", "{\"name\":\"world-1\"}"));
     eprintln!("opened: {}", written(&opened));
     assert_eq!(opened.int_at("replayed"), 1);
     let rates = answer(&again.ask("grit_describe", "{}"))
