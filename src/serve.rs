@@ -1761,6 +1761,14 @@ const CREDIT_LISTED: Whole = sized(
     "how many single changes to list, best credit first; the counts cover every change whatever is listed",
 );
 
+const CREDIT_WORK: Whole = sized(
+    "work",
+    1,
+    credit::WORK_MOST as i64,
+    credit::WORK as i64,
+    "the most word operations, estimated, this call may spend: one complement batch is gates x (gates + 1) x row words, each single change, pair, value, insert or repair (outputs + 1) x row words. The batch and the singles must fit or the call is refused up front with the estimate; the pairs, inserts and repairs then stop where the rest runs out and say complete false",
+);
+
 fn escape_choice() -> (&'static str, Json) {
     choice(
         "escape",
@@ -1834,6 +1842,7 @@ pub(crate) fn tools() -> Json {
         CREDIT_PAIRS.shown(),
         CREDIT_MOVES.shown(),
         CREDIT_LISTED.shown(),
+        CREDIT_WORK.shown(),
     ]);
     let mut checking = shape.clone();
     if let Some(first) = checking.first_mut() {
@@ -2024,7 +2033,7 @@ pub(crate) fn tools() -> Json {
         ),
         tool(
             "grit_credit",
-            "Credit every change of a given circuit exactly: for each single change of one gate's kind, left or right, how many marks the changed circuit gains or loses, from one batch of the circuit and its gates complemented one at a time, and at depth 2 the same for every pair of changes. Returns, per gate, the rows each output is fixed and broken on if that gate flips; every single change with its credit, best first; the best pairs and their count; the dead gates, which no output reads; the best insert, a dead gate rewritten and read by a later gate, and the best repair, a live gate rebuilt over a rewritten dead gate. certified k means no circuit within k field changes scores more, proved by evaluating every one of them, with the counts in the answer. Nothing is searched and nothing is sampled. One batch holds at most 16777216 words of values, which bounds the gates at each input count.",
+            "Credit every change of a given circuit exactly: for each single change of one gate's kind, left or right, how many marks the changed circuit gains or loses, from one batch of the circuit and its gates complemented one at a time, and at depth 2 the same for every pair of changes. Returns, per gate, the rows each output is fixed and broken on if that gate flips; every single change with its credit, best first; the best pairs and their count; the dead gates, which no output reads; the best insert, a dead gate rewritten and read by a later gate, and the best repair, a live gate rebuilt over a rewritten dead gate. certified k means no circuit within k field changes scores more, proved by evaluating every one of them, with the counts in the answer. Nothing is searched and nothing is sampled. It runs on the host: for one circuit the host twin measured as fast as a device batch or faster at every shape tried, and it answers the same. Its cost is counted in work, never in time.",
             object(crediting, &["inputs", "outputs", "gates", "table", "chip"]),
         ),
         tool(
@@ -2889,7 +2898,7 @@ pub(crate) fn ran(
         return settled(host, held);
     }
     if name == "grit_credit" {
-        return credit_tool(host, held);
+        return credit_tool(held);
     }
     if name == "grit_machine" {
         let (machine, traces) = asked_machine(held)?;
@@ -3053,31 +3062,44 @@ pub(crate) fn ran(
     }
 }
 
-fn credit_fits(shape: Netlist) -> Result<u32, Box<dyn std::error::Error>> {
-    let room = credit::room(shape, CROWD);
-    if room > shape.gates {
-        return Ok(room);
+fn credit_fits(shape: Netlist, work: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let needed = credit::Costs::of(shape).least();
+    if needed <= work {
+        return Ok(());
     }
-    let most = (shape.outputs..shape.gates)
-        .rev()
-        .find(|gates| {
-            Netlist::over(shape.inputs, shape.outputs, *gates, shape.kinds)
-                .is_ok_and(|one| credit::room(one, CROWD) > *gates)
-        })
-        .unwrap_or(shape.outputs);
+    if needed > credit::WORK_MOST {
+        let most = (shape.outputs..shape.gates)
+            .rev()
+            .find(|gates| {
+                Netlist::over(shape.inputs, shape.outputs, *gates, shape.kinds)
+                    .is_ok_and(|one| credit::Costs::of(one).least() <= credit::WORK_MOST)
+            })
+            .unwrap_or(shape.outputs);
+        return Err(Box::new(
+            Refusal::new(
+                Code::TooMany,
+                "$.gates",
+                format!(
+                    "crediting every single change of {} gates over {} inputs costs an estimated {needed} word operations, past the {} one call may spend; at {} inputs at most {most} gates fit",
+                    shape.gates,
+                    shape.inputs,
+                    credit::WORK_MOST,
+                    shape.inputs
+                ),
+            )
+            .limited(counted(most)),
+        ));
+    }
     Err(Box::new(
         Refusal::new(
             Code::TooMany,
-            "$.gates",
+            "$.work",
             format!(
-                "one complement batch of {} circuits over {} sources needs more than the {} words of values a credit batch may hold; at {} inputs at most {most} gates fit",
-                shape.gates + 1,
-                shape.sources(),
-                credit::CREDIT_WORDS,
-                shape.inputs
+                "crediting every single change of {} gates over {} inputs costs an estimated {needed} word operations, past the {work} this call allows; ask for at least {needed}",
+                shape.gates, shape.inputs
             ),
         )
-        .limited(counted(most)),
+        .limited(big(needed)),
     ))
 }
 
@@ -3152,6 +3174,7 @@ pub struct Credited {
     pub pairs: u64,
     pub moves: u64,
     pub listed: u32,
+    pub work: u64,
 }
 
 fn pairs_shown(pairs: &credit::Pairs) -> Json {
@@ -3194,11 +3217,13 @@ pub fn credit_answer(
     asked: Credited,
 ) -> Result<Json, Box<dyn std::error::Error>> {
     let shape = board.shape();
+    let costs = credit::Costs::of(shape);
     let tangent = source
         .tangents(board, &[chip.to_vec()])?
         .pop()
         .ok_or("the complement batch answered nothing")?;
     let found = credit::credited(board, &tangent, chip);
+    let mut spent = costs.least();
     let dead = board.dead(chip);
     let wide = board.wide();
     let gates = Json::List(
@@ -3227,9 +3252,29 @@ pub fn credit_answer(
             })
             .collect(),
     );
+    let early = [&gates, &changes]
+        .iter()
+        .map(|one| {
+            let said = crate::wire::written(one);
+            2 * said.len() + said.matches('"').count()
+        })
+        .sum::<usize>();
+    let most = crate::serve3::transport::ANSWER_MOST;
+    if early > most {
+        return Err(Box::new(
+            Refusal::new(
+                Code::AnswerTooLarge,
+                "$.gates",
+                format!(
+                    "the row masks of {} gates and the {} changes listed alone would answer about {early} bytes, past the {most} one answer may hold; ask for fewer listed, fewer gates or fewer inputs",
+                    shape.gates,
+                    found.changes.len().min(asked.listed as usize)
+                ),
+            )
+            .limited(Json::Int(i64::try_from(most).unwrap_or(i64::MAX))),
+        ));
+    }
     let singles = found.changes.len() as u64;
-    let inserts = credit::inserts(board, &tangent, chip, asked.moves);
-    let repairs = credit::repairs(board, &tangent, chip, asked.moves);
     let mut certified = u32::from(found.improving == 0);
     let mut by = vec![("singles", big(singles))];
     let mut held = vec![
@@ -3264,23 +3309,35 @@ pub fn credit_answer(
                     .collect(),
             ),
         ),
-        (
-            "insert",
-            moves_shown(&inserts, chip, |one| credit::inserted(shape, chip, one)),
-        ),
-        (
-            "repair",
-            moves_shown(&repairs, chip, |one| credit::repaired(shape, chip, one)),
-        ),
     ];
     if asked.depth >= 2 {
-        let pairs = credit::paired(board, source, chip, asked.pairs, credit::PAIRS_LISTED)?;
+        let firsts = asked.work.saturating_sub(spent) / costs.first().max(1);
+        let budget = asked.pairs.min(firsts.saturating_mul(singles));
+        let pairs = credit::paired(board, source, chip, budget, credit::PAIRS_LISTED)?;
+        spent += pairs.firsts * costs.first();
         if certified == 1 && pairs.complete() && pairs.best <= 0 {
             certified = 2;
         }
         by.push(("pairs", big(pairs.evaluated)));
         held.push(("pairs", pairs_shown(&pairs)));
     }
+    let afford = |spent: u64| {
+        asked
+            .moves
+            .min(asked.work.saturating_sub(spent) / costs.unit.max(1))
+    };
+    let inserts = credit::inserts(board, &tangent, chip, afford(spent));
+    spent += inserts.evaluated * costs.unit;
+    let repairs = credit::repairs(board, &tangent, chip, afford(spent));
+    spent += repairs.evaluated * costs.unit;
+    held.push((
+        "insert",
+        moves_shown(&inserts, chip, |one| credit::inserted(shape, chip, one)),
+    ));
+    held.push((
+        "repair",
+        moves_shown(&repairs, chip, |one| credit::repaired(shape, chip, one)),
+    ));
     held.push(("certified", counted(certified)));
     held.push(("certified_by", map(by)));
     held.push((
@@ -3289,36 +3346,36 @@ pub fn credit_answer(
             "no circuit within this many field changes scores more than this one: every single change, and at 2 every pair, was evaluated exactly and none gains; 0 means a single change gains",
         ),
     ));
+    held.push((
+        "work",
+        map(vec![
+            ("allowed", big(asked.work)),
+            ("spent", big(spent)),
+            (
+                "means",
+                text(
+                    "estimated word operations: the complement batch and the singles first, then the pairs, the inserts and the repairs, each cut where the work allowed runs out; a cut phase answers complete false",
+                ),
+            ),
+        ]),
+    ));
     Ok(map(held))
 }
 
-fn credit_tool(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+fn credit_tool(held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
     let (shape, exam) = asked(held, &SYNTH_INPUTS)?;
-    present(held, "chip")?;
-    let chip = given(held, shape)?;
     let asked = Credited {
         depth: CREDIT_DEPTH.count(held, "$")?,
         pairs: u64::from(CREDIT_PAIRS.count(held, "$")?),
         moves: u64::from(CREDIT_MOVES.count(held, "$")?),
         listed: CREDIT_LISTED.count(held, "$")?,
+        work: u64::try_from(CREDIT_WORK.read(held, "$")?)?,
     };
-    let room = credit_fits(shape)?;
+    credit_fits(shape, asked.work)?;
+    present(held, "chip")?;
+    let chip = given(held, shape)?;
     let board = Board::of(&exam);
-    let mut answer = match host {
-        Some(host) => {
-            let mut resident = credit::opened(host, &board, room)?;
-            let mut marker = Marker::within(&mut resident, 1, 0, host.width(), room, shape);
-            credit_answer(&board, &mut marker, &chip, asked)?
-        }
-        None => credit_answer(&board, &mut credit::Twin, &chip, asked)?,
-    };
-    if let Json::Map(fields) = &mut answer {
-        fields.push((
-            "computed_on".to_owned(),
-            text(if host.is_some() { "device" } else { "host" }),
-        ));
-    }
-    Ok(answer)
+    credit_answer(&board, &mut credit::Twin, &chip, asked)
 }
 
 #[must_use]

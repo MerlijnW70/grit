@@ -29,6 +29,41 @@ pub const ESCAPE_ROUNDS: u64 = 128;
 
 pub const DEPTH_MOST: u32 = 2;
 
+pub const WORK: u64 = 1 << 31;
+
+pub const WORK_MOST: u64 = 1 << 33;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Costs {
+    pub tangent: u64,
+    pub unit: u64,
+    pub singles: u64,
+}
+
+impl Costs {
+    #[must_use]
+    pub fn of(shape: Netlist) -> Self {
+        let wide = u64::from(words_of(shape));
+        let gates = u64::from(shape.gates);
+        Self {
+            tangent: (gates + 1) * gates * wide,
+            unit: (u64::from(shape.outputs) + 1) * wide,
+            singles: counted_singles(shape),
+        }
+    }
+
+    #[must_use]
+    pub const fn least(&self) -> u64 {
+        self.tangent
+            .saturating_add(self.singles.saturating_mul(self.unit))
+    }
+
+    #[must_use]
+    pub const fn first(&self) -> u64 {
+        self.least()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Change {
     pub at: u32,
@@ -411,16 +446,16 @@ impl<'held, 'host> Marker<'held, 'host> {
         room: u32,
         shape: Netlist,
     ) -> Self {
-        let group = u64::from(shape.gates) + 1;
-        let most = u32::try_from(u64::from(room) / group).unwrap_or(u32::MAX);
-        let work = group * u64::from(shape.gates) * u64::from(words_of(shape));
+        let width = width.max(1);
+        let room = room / width * width;
+        let work = u64::from(shape.gates) * u64::from(words_of(shape));
         Self {
             resident,
             pipelines,
             at,
             width,
             room,
-            pace: Pace::over(work, most),
+            pace: Pace::over(work, room),
             spent: Spent::default(),
         }
     }
@@ -428,28 +463,12 @@ impl<'held, 'host> Marker<'held, 'host> {
     fn submitted(
         &mut self,
         board: &Board,
-        circuits: &[Vec<u32>],
-    ) -> Result<Vec<Tangent>, Box<dyn std::error::Error>> {
-        let gates = board.shape.gates as usize;
-        let group = gates + 1;
-        let wide = board.wide;
-        let span = board.shape.sources() as usize * wide;
-        let outputs = board.shape.outputs as usize * wide;
-        let first = board.first() * wide;
-        let mut flat = Vec::with_capacity(circuits.len() * group * gates);
-        for circuit in circuits {
-            flat.extend_from_slice(circuit);
-            for at in 0..gates {
-                let from = flat.len();
-                flat.extend_from_slice(circuit);
-                if let Some(word) = flat.get_mut(from + at) {
-                    *word ^= COMPLEMENT;
-                }
-            }
-        }
-        let many = circuits.len() * group;
+        flat: &[u32],
+        many: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
+        let span = board.shape.sources() as usize * board.wide;
         let began = Instant::now();
-        self.resident.write(TRIAL as usize, &flat)?;
+        self.resident.write(TRIAL as usize, flat)?;
         let groups = u32::try_from(many)?.div_ceil(self.width);
         let held: Vec<[Groups; 1]> = (0..self.pipelines)
             .map(|one| [Groups::Fixed(if one == self.at { groups } else { 0 })])
@@ -465,32 +484,11 @@ impl<'held, 'host> Marker<'held, 'host> {
         let took = began.elapsed();
         self.spent.submissions += 1;
         self.spent.circuits += many as u64;
-        self.spent.most = self.spent.most.max(u32::try_from(circuits.len())?);
+        self.spent.most = self.spent.most.max(u32::try_from(many)?);
         self.spent.longest = self.spent.longest.max(took);
         self.spent.wall += took;
-        self.pace
-            .learn(spent / u32::try_from(circuits.len())?.max(1));
-        let mut out = Vec::with_capacity(circuits.len());
-        for one in 0..circuits.len() {
-            let cand = one * group;
-            let base = values
-                .get(cand * span..(cand + 1) * span)
-                .unwrap_or(&[])
-                .to_vec();
-            let right = board.rights(&base);
-            let mut flipped = Vec::with_capacity(gates * outputs);
-            for at in 0..gates {
-                let from = (cand + 1 + at) * span + first;
-                flipped.extend(board.rights_of(values.get(from..from + outputs).unwrap_or(&[])));
-            }
-            out.push(Tangent {
-                base,
-                right,
-                flipped,
-                marks: scores.get(cand).copied().unwrap_or(0),
-            });
-        }
-        Ok(out)
+        self.pace.learn(spent / u32::try_from(many)?.max(1));
+        Ok((scores, values))
     }
 }
 
@@ -500,23 +498,60 @@ impl Complements for Marker<'_, '_> {
         board: &Board,
         circuits: &[Vec<u32>],
     ) -> Result<Vec<Tangent>, Box<dyn std::error::Error>> {
-        let group = board.shape.gates + 1;
-        if self.room < group {
-            return Err(format!(
-                "one complement batch of {group} circuits does not fit the {} the device holds",
-                self.room
-            )
-            .into());
+        if self.room == 0 {
+            return Err("the device holds no circuit to mark".into());
         }
-        let mut out = Vec::with_capacity(circuits.len());
-        let mut left = circuits;
-        while !left.is_empty() {
-            let step =
-                self.pace
-                    .next(u32::try_from(left.len()).unwrap_or(u32::MAX)) as usize;
-            let (now, rest) = left.split_at(step.clamp(1, left.len()));
-            out.extend(self.submitted(board, now)?);
-            left = rest;
+        let gates = board.shape.gates as usize;
+        let group = gates + 1;
+        let wide = board.wide;
+        let span = board.shape.sources() as usize * wide;
+        let outputs = board.shape.outputs as usize * wide;
+        let first = board.first() * wide;
+        let total = circuits.len() * group;
+        let mut out: Vec<Tangent> = circuits
+            .iter()
+            .map(|_| Tangent {
+                base: Vec::new(),
+                right: Vec::new(),
+                flipped: Vec::with_capacity(gates * outputs),
+                marks: 0,
+            })
+            .collect();
+        let mut done = 0_usize;
+        while done < total {
+            let left = u32::try_from(total - done).unwrap_or(u32::MAX);
+            let step = (self.pace.next(left) as usize).clamp(1, total - done);
+            let mut flat = Vec::with_capacity(step * gates);
+            for one in done..done + step {
+                let circuit = circuits.get(one / group).map_or(&[][..], Vec::as_slice);
+                let from = flat.len();
+                flat.extend_from_slice(circuit);
+                if let Some(at) = (one % group).checked_sub(1)
+                    && let Some(word) = flat.get_mut(from + at)
+                {
+                    *word ^= COMPLEMENT;
+                }
+            }
+            let (scores, values) = self.submitted(board, &flat, step)?;
+            for (here, one) in (done..done + step).enumerate() {
+                let Some(tangent) = out.get_mut(one / group) else {
+                    continue;
+                };
+                if one % group == 0 {
+                    tangent.base = values
+                        .get(here * span..(here + 1) * span)
+                        .unwrap_or(&[])
+                        .to_vec();
+                    tangent.right = board.rights(&tangent.base);
+                    tangent.marks = scores.get(here).copied().unwrap_or(0);
+                } else {
+                    let from = here * span + first;
+                    tangent
+                        .flipped
+                        .extend(board.rights_of(values.get(from..from + outputs).unwrap_or(&[])));
+                }
+            }
+            done += step;
         }
         Ok(out)
     }

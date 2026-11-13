@@ -252,18 +252,6 @@ fn arguments(shape: Netlist, exam: &Exam, circuit: &[u32], more: &str) -> String
     )
 }
 
-fn without_place(answer: &Json) -> Json {
-    match answer {
-        Json::Map(held) => Json::Map(
-            held.iter()
-                .filter(|(key, _)| key != "computed_on")
-                .cloned()
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
 fn host_for_test(label: &str) -> Option<Host> {
     device(label)
 }
@@ -440,23 +428,91 @@ fn the_device_answer_equals_the_host_twin_bit_for_bit() {
     for one in fixtures().iter().step_by(9) {
         let (shape, exam) = alu_exam(one.gates);
         let asked = arguments(shape, &exam, &one.circuit, "");
-        let on_device = tool(Some(&host), &asked);
-        let on_host = tool(None, &asked);
         assert_eq!(
-            on_device.get("computed_on"),
-            Some(&Json::Text("device".to_owned()))
-        );
-        assert_eq!(
-            on_host.get("computed_on"),
-            Some(&Json::Text("host".to_owned()))
-        );
-        assert_eq!(
-            written(&without_place(&on_device)),
-            written(&without_place(&on_host)),
+            written(&tool(Some(&host), &asked)),
+            written(&tool(None, &asked)),
             "ALU {} seed {}",
             one.gates,
             one.seed
         );
+    }
+}
+
+#[test]
+fn a_complement_batch_wider_than_the_device_room_is_marked_in_parts() {
+    let Some(host) = device("a_complement_batch_wider_than_the_device_room_is_marked_in_parts")
+    else {
+        return;
+    };
+    let mut rng = Rng(0x0070_0064);
+    let shape = Netlist::over(7, 4, 70, 16).unwrap();
+    let table = (0..shape.words()).map(|_| rng.next() & 15).collect();
+    let exam = Exam::of(shape, table).unwrap();
+    let board = Board::of(&exam);
+    let circuits: Vec<Vec<u32>> = (0..3).map(|_| random_chip(shape, &mut rng)).collect();
+    let width = host.width();
+    for room in [width, 64.max(width), 71_u32.div_ceil(width) * width, 213] {
+        let mut resident = credit::opened(&host, &board, room).unwrap();
+        let mut marker = Marker::within(&mut resident, 1, 0, width, room, shape);
+        assert_eq!(
+            marker.tangents(&board, &circuits).unwrap(),
+            Twin.tangents(&board, &circuits).unwrap(),
+            "room {room}"
+        );
+        assert!(marker.spent.most <= room, "{:?}", marker.spent);
+    }
+}
+
+#[test]
+fn a_crowd_smaller_than_one_complement_batch_still_escapes() {
+    let Some(host) = device("a_crowd_smaller_than_one_complement_batch_still_escapes") else {
+        return;
+    };
+    let mut rng = Rng(12345);
+    let shape = Netlist::over(7, 4, 70, 16).unwrap();
+    let table: Vec<u32> = (0..shape.words()).map(|_| rng.next() & 15).collect();
+    let exam = Exam::of(shape, table.clone()).unwrap();
+    let effort = Effort {
+        seed: 1,
+        stall: 2,
+        escape: Escape::Credit,
+        ..Effort::of(64, 3000)
+    };
+    let once = sought(&host, shape, &exam, effort, 0).unwrap();
+    let again = sought(&host, shape, &exam, effort, 0).unwrap();
+    assert!(once.escapes.ran > 0, "{:?}", once.escapes);
+    assert_eq!(
+        (once.marks, once.rounds, &once.gates, once.escapes),
+        (again.marks, again.rounds, &again.gates, again.escapes)
+    );
+    let rows: Vec<String> = table.iter().map(u32::to_string).collect();
+    for name in ["grit_synthesise", "grit_least"] {
+        let asked = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{{\"name\":\"{name}\",\"arguments\":{{\"inputs\":7,\"outputs\":4,\"gates\":70,\"table\":[{}],\"crowd\":64,\"rounds\":3000,\"stall\":2,\"seed\":1,\"escape\":\"credit\"}}}}}}",
+            rows.join(",")
+        );
+        let answer = handle(Some(&host), &read(&asked).unwrap()).unwrap();
+        let result = answer.get("result").unwrap();
+        assert_eq!(
+            result.get("isError"),
+            Some(&Json::Bool(false)),
+            "{name}: {}",
+            written(&answer)
+        );
+        let said = written(result.get("structuredContent").unwrap());
+        let ran: Vec<u64> = said
+            .match_indices("\"ran\":")
+            .map(|(at, key)| {
+                said[at + key.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        eprintln!("{name}: escapes ran {ran:?}");
+        assert!(ran.iter().any(|one| *one > 0), "{name}: {said}");
     }
 }
 
@@ -741,6 +797,7 @@ fn every_number_the_credit_tools_hold_is_published_in_their_schema() {
             i64::from(credit::LISTED),
             i64::from(credit::LISTED),
         ),
+        ("work", 1, credit::WORK_MOST as i64, credit::WORK as i64),
     ] {
         let held = property(&credit_tool, key);
         assert_eq!(
@@ -751,8 +808,6 @@ fn every_number_the_credit_tools_hold_is_published_in_their_schema() {
         assert_eq!(held.get("maximum").and_then(Json::int), Some(most), "{key}");
         assert_eq!(held.get("default").and_then(Json::int), Some(or), "{key}");
     }
-    let said = written(&credit_tool);
-    assert!(said.contains(&credit::CREDIT_WORDS.to_string()), "{said}");
     for name in ["grit_synthesise", "grit_least"] {
         let held = property(&listed_tool(name), "escape");
         assert_eq!(held.get("default"), Some(&Json::Text("shake".to_owned())));
@@ -776,41 +831,97 @@ fn every_number_the_credit_tools_hold_is_published_in_their_schema() {
     );
 }
 
+fn told(answer: &Json, key: &str) -> Option<Json> {
+    answer
+        .get("result")
+        .and_then(|one| one.get("structuredContent"))
+        .and_then(|one| one.get(key))
+        .cloned()
+}
+
 #[test]
-fn a_credit_call_past_what_a_batch_holds_is_refused_with_the_largest_that_fits() {
-    let inputs = 12;
-    let rows = 1_u32 << inputs;
-    let gates = 2000;
-    let table = vec!["0"; rows as usize].join(",");
-    let chip: Vec<String> = (0..gates)
-        .map(|_| "{\"kind\":0,\"left\":0,\"right\":0}".to_owned())
-        .collect();
+fn a_credit_call_past_what_its_work_allows_is_refused_up_front_with_the_estimate() {
+    let (inputs, outputs, gates) = (11_u32, 32_u32, 4085_u32);
+    let table = vec!["0"; 1 << inputs].join(",");
     let answer = refused(&format!(
-        "{{\"inputs\":{inputs},\"outputs\":1,\"gates\":{gates},\"table\":[{table}],\"chip\":[{}]}}",
-        chip.join(",")
+        "{{\"inputs\":{inputs},\"outputs\":{outputs},\"gates\":{gates},\"table\":[{table}],\"chip\":[]}}"
     ));
     let said = written(&answer);
-    assert!(
-        said.contains("too_many") || said.contains("TooMany"),
+    assert_eq!(
+        told(&answer, "code"),
+        Some(Json::Text("too_many".to_owned())),
         "{said}"
     );
-    assert!(said.contains("$.gates"), "{said}");
-    let most = (1..gates)
+    assert_eq!(
+        told(&answer, "field"),
+        Some(Json::Text("$.gates".to_owned())),
+        "{said}"
+    );
+    let most = (outputs..gates)
         .rev()
-        .find(|g| credit::room(Netlist::over(inputs, 1, *g, 16).unwrap(), CROWD) > *g)
+        .find(|g| {
+            credit::Costs::of(Netlist::over(inputs, outputs, *g, 16).unwrap()).least()
+                <= credit::WORK_MOST
+        })
         .unwrap();
     assert!(said.contains(&format!("at most {most} gates")), "{said}");
     assert_eq!(
-        answer
-            .get("result")
-            .and_then(|one| one.get("structuredContent"))
-            .and_then(|one| one.get("limit"))
-            .and_then(Json::int),
-        Some(i64::from(most)),
+        told(&answer, "limit"),
+        Some(Json::Int(i64::from(most))),
         "{said}"
     );
+    let (inputs, gates) = (12_u32, 3000_u32);
+    let table = vec!["0"; 1 << inputs].join(",");
+    let answer = refused(&format!(
+        "{{\"inputs\":{inputs},\"outputs\":1,\"gates\":{gates},\"table\":[{table}],\"chip\":[]}}"
+    ));
+    let needed = credit::Costs::of(Netlist::over(inputs, 1, gates, 16).unwrap()).least();
+    assert!(needed > credit::WORK && needed <= credit::WORK_MOST);
+    assert_eq!(
+        told(&answer, "field"),
+        Some(Json::Text("$.work".to_owned()))
+    );
+    assert_eq!(told(&answer, "limit"), Some(Json::Int(needed as i64)));
+    let one = &fixtures()[0];
+    let (shape, exam) = alu_exam(one.gates);
+    let least = credit::Costs::of(shape).least();
+    let short = refused(&arguments(
+        shape,
+        &exam,
+        &one.circuit,
+        &format!(",\"work\":{}", least - 1),
+    ));
+    assert_eq!(told(&short, "field"), Some(Json::Text("$.work".to_owned())));
+    assert_eq!(told(&short, "limit"), Some(Json::Int(least as i64)));
+    let enough = tool(
+        None,
+        &arguments(shape, &exam, &one.circuit, &format!(",\"work\":{least}")),
+    );
+    assert_eq!(enough.counted("certified"), Some(1));
+    let pairs = enough.get("pairs").unwrap();
+    assert_eq!(pairs.get("complete"), Some(&Json::Bool(false)));
+    assert_eq!(pairs.get("evaluated").unwrap().int(), Some(0));
+    let work = enough.get("work").unwrap();
+    assert_eq!(work.get("spent").unwrap().int(), Some(least as i64));
+    let whole = tool(None, &arguments(shape, &exam, &one.circuit, ""));
+    let work = whole.get("work").unwrap();
+    assert!(work.get("spent").unwrap().int().unwrap() <= credit::WORK as i64);
+    assert_eq!(whole.counted("certified"), Some(2));
     let deep = refused(
         "{\"inputs\":2,\"outputs\":1,\"gates\":1,\"table\":[0,1,1,0],\"chip\":[{\"kind\":6,\"left\":0,\"right\":1}],\"depth\":3}",
     );
     assert!(written(&deep).contains("$.depth"));
+    let shape = Netlist::over(12, 4, 400, 16).unwrap();
+    let mut rng = Rng(400);
+    let table: Vec<u32> = (0..shape.words()).map(|_| rng.next() & 15).collect();
+    let exam = Exam::of(shape, table).unwrap();
+    let circuit = random_chip(shape, &mut rng);
+    let wide = refused(&arguments(shape, &exam, &circuit, ",\"depth\":1"));
+    assert_eq!(
+        told(&wide, "code"),
+        Some(Json::Text("answer_too_large".to_owned())),
+        "{}",
+        written(&wide)
+    );
+    assert_eq!(told(&wide, "field"), Some(Json::Text("$.gates".to_owned())));
 }
