@@ -1174,7 +1174,7 @@ impl<'host> Server<'host> {
                 return Ok(None);
             }
             self.book.landed(Wait::For(self.clock.left()));
-            if self.book.writing_for(number) {
+            if self.book.writing.is_some() {
                 return Err(Box::new(Refusal::new(
                     errors::Code::Budget,
                     "$.budget_ms",
