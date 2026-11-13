@@ -14,6 +14,8 @@ pub const NAME_MOST: usize = 64;
 
 pub const NUMBER_MOST: u32 = 1 << 31;
 
+static PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub const SUFFIX: &str = ".grit";
 
 const KEPT: &str = "kept";
@@ -472,7 +474,11 @@ impl Keep {
 
     #[must_use]
     pub fn pending(&self, world: u32) -> PathBuf {
-        self.kept.join(format!("pending-{world}{SUFFIX}"))
+        let count = PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.kept.join(format!(
+            "pending-{world}-{}-{count}{SUFFIX}",
+            std::process::id()
+        ))
     }
 
     fn journal(&self, world: u32) -> PathBuf {

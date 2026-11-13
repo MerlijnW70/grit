@@ -402,6 +402,15 @@ fn listed(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         let mut item = vec![("kind", text(state)), ("world", counted(*number))];
         item.extend(shown_made(one.ledger.made(), one.ledger.frame));
         item.push(("bytes", counted64(one.bytes)));
+        if let Some(failure) = &one.snap_failure {
+            item.push((
+                "snapshot_failed",
+                map(vec![
+                    ("message", text(&failure.message)),
+                    ("failures", counted(failure.failures)),
+                ]),
+            ));
+        }
         items.push(item);
     }
     for (number, ledger) in &server.book.earlier {
