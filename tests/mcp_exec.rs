@@ -3285,6 +3285,69 @@ fn a_call_to_an_idle_server_is_not_charged_for_the_worker_waking() {
     run.exec.finish();
 }
 
+#[cfg(feature = "faults")]
+#[test]
+fn a_slow_background_write_never_refuses_a_sequential_client() {
+    let Some(host) = device("slow background write") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("slow-write");
+    let options = Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    };
+    let mut run = Run::new(&options);
+    let world = sand_world(&mut run, 32);
+    let faults = run.exec.faults();
+    let slow = Duration::from_millis(2000);
+    faults.lock().unwrap().slow_idle_snapshot = slow;
+    let budget = 200;
+    let most = Duration::from_millis(budget + grit::serve3::budget::SUBMIT_MOST_MS + 300);
+    let began = Instant::now();
+    let mut calls = 0;
+    let mut frame = 0;
+    let mut worst = Duration::ZERO;
+    while began.elapsed() < slow * 4 || faults.lock().unwrap().slowed < 3 {
+        assert!(calls < 400, "no write was started between calls");
+        let asked = Instant::now();
+        let got = run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
+        );
+        let took = asked.elapsed();
+        let result = got.get("result").unwrap();
+        assert_eq!(
+            result.get("isError"),
+            Some(&Json::Bool(false)),
+            "call {calls} after {took:?}: {}",
+            written(&got)
+        );
+        let told = result.get("structuredContent").unwrap();
+        assert!(
+            told.int_at("frame") > frame,
+            "call {calls}: {}",
+            written(&got)
+        );
+        frame = told.int_at("frame");
+        assert!(took <= most, "call {calls} took {took:?}");
+        worst = worst.max(took);
+        calls += 1;
+    }
+    let slowed = faults.lock().unwrap().slowed;
+    eprintln!(
+        "{calls} steps of {budget} ms beside {slowed} background writes of {slow:?} each reached frame {frame}; the slowest took {worst:?}"
+    );
+    run.exec.finish();
+    let mut again = Run::new(&options);
+    let opened = answer(&again.ask(
+        "grit_world_open",
+        &format!("{{\"name\":\"world-{world}\",\"budget_ms\":600000}}"),
+    ));
+    assert_eq!(opened.int_at("frame"), frame);
+    again.exec.finish();
+}
+
 #[test]
 fn a_directory_planted_where_a_snapshot_is_written_does_not_stop_snapshots() {
     let Some(host) = device("planted pending directory") else {
