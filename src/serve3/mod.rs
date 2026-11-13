@@ -280,6 +280,8 @@ pub struct Faults {
     pub wedge_in_snapshot: bool,
     pub slow_idle_snapshot: Duration,
     pub slowed: u32,
+    pub slow_idle_work: Duration,
+    pub idle_works: u32,
 }
 
 impl Book {
@@ -1355,6 +1357,7 @@ impl<'host> Server<'host> {
                 done,
                 thread: Some(thread),
             });
+            self.idle_slowly();
             Ok(())
         });
         if let Err(why) = &started {
@@ -1390,7 +1393,11 @@ impl<'host> Server<'host> {
 
     pub fn idle(&mut self) -> bool {
         if self.book.writing.is_some() {
-            return self.book.landed(Wait::Poll);
+            let landed = self.book.landed(Wait::Poll);
+            if landed {
+                self.idle_slowly();
+            }
+            return landed;
         }
         let ratio = self.book.rates.replay();
         let now = Instant::now();
@@ -1419,7 +1426,10 @@ impl<'host> Server<'host> {
         self.clock = Clock::of(Instant::now(), budget::BUDGET_MOST_MS);
         let taken = match self.book.keep.clone() {
             Some(keep) => self.snap_behind(number, keep),
-            None => self.snap_now(number).map(|_| ()),
+            None => {
+                self.idle_slowly();
+                self.snap_now(number).map(|_| ())
+            }
         };
         let lost = (!wedged_before && self.wedged())
             || taken
@@ -1450,6 +1460,25 @@ impl<'host> Server<'host> {
     const fn slow_idle(&self) -> Duration {
         Duration::ZERO
     }
+
+    #[cfg(feature = "faults")]
+    fn idle_slowly(&self) {
+        let slow = self
+            .book
+            .faults
+            .lock()
+            .map(|mut faults| {
+                if !faults.slow_idle_work.is_zero() {
+                    faults.idle_works = faults.idle_works.saturating_add(1);
+                }
+                faults.slow_idle_work
+            })
+            .unwrap_or_default();
+        std::thread::sleep(slow);
+    }
+
+    #[cfg(not(feature = "faults"))]
+    const fn idle_slowly(&self) {}
 
     #[must_use]
     pub const fn writing(&self) -> bool {

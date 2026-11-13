@@ -1086,6 +1086,12 @@ pub fn describe(status: &Status) -> Json {
                 ),
                 ("queue_calls", number(super::exec::QUEUE_MOST)),
                 (
+                    "budget_late",
+                    text(
+                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to read its largest world back for a snapshot between calls; a call is not charged for that wait",
+                    ),
+                ),
+                (
                     "memory_share",
                     text(&format!(
                         "{}/{} of the device heap unless the server was started with its own",

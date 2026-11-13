@@ -3174,6 +3174,84 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     );
 }
 
+#[cfg(feature = "faults")]
+fn behind_idle_work(dir: bool) {
+    let Some(host) = device("slow idle work") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("idle-work");
+    let mut run = Run::new(&Options {
+        dir: dir.then(|| scratch.dir()),
+        memory: None,
+    });
+    let world = sand_world(&mut run, 32);
+    let faults = run.exec.faults();
+    let slow = Duration::from_millis(800);
+    faults.lock().unwrap().slow_idle_work = slow;
+    let budget = 100;
+    let most = slow + Duration::from_millis(budget + grit::serve3::budget::SUBMIT_MOST_MS + 150);
+    let want = if dir { 2 } else { 1 };
+    let mut behind = Duration::ZERO;
+    let mut calls = 0;
+    while faults.lock().unwrap().idle_works < want + 1 {
+        assert!(calls < 200, "the server did no idle work");
+        let began = Instant::now();
+        let got = run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
+        );
+        let took = began.elapsed();
+        let result = got.get("result").unwrap();
+        assert_eq!(
+            result.get("isError"),
+            Some(&Json::Bool(false)),
+            "call {calls} after {took:?}: {}",
+            written(&got)
+        );
+        assert!(
+            took <= most,
+            "call {calls} took {took:?}, more than {most:?}"
+        );
+        assert!(
+            got_frames(&got) > 0,
+            "call {calls} ran no frame: {}",
+            written(&got)
+        );
+        if took > slow / 2 {
+            behind = behind.max(took);
+        }
+        calls += 1;
+    }
+    let units = faults.lock().unwrap().idle_works;
+    eprintln!(
+        "{calls} steps of {budget} ms beside {units} units of idle work of {slow:?} each (directory {dir}); the longest call behind one took {behind:?}"
+    );
+    assert!(behind > slow / 2, "no call waited behind idle work");
+    run.exec.finish();
+}
+
+#[cfg(feature = "faults")]
+fn got_frames(got: &Json) -> i64 {
+    got.get("result")
+        .and_then(|one| one.get("structuredContent"))
+        .and_then(|one| one.get("ran"))
+        .and_then(Json::int)
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_call_queued_behind_slow_idle_work_keeps_its_whole_budget_and_no_more() {
+    behind_idle_work(true);
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_call_queued_behind_a_slow_snapshot_kept_in_memory_keeps_its_whole_budget() {
+    behind_idle_work(false);
+}
+
 #[test]
 fn a_directory_planted_where_a_snapshot_is_written_does_not_stop_snapshots() {
     let Some(host) = device("planted pending directory") else {
