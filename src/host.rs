@@ -671,6 +671,14 @@ impl Host {
             extensions.push(ash::khr::shader_integer_dot_product::NAME.as_ptr());
             create = create.push_next(&mut dotting);
         }
+        #[cfg(feature = "faults")]
+        let mut timeline =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+        #[cfg(feature = "faults")]
+        {
+            extensions.push(ash::khr::timeline_semaphore::NAME.as_ptr());
+            create = create.push_next(&mut timeline);
+        }
         let create = create.enabled_extension_names(&extensions);
 
         let made =
@@ -769,7 +777,7 @@ impl Host {
         &self.entry
     }
 
-    #[cfg(feature = "window")]
+    #[cfg(any(feature = "window", feature = "faults"))]
     pub(crate) const fn instance(&self) -> &ash::Instance {
         &self.instance
     }

@@ -22,8 +22,11 @@ pub mod faults {
     use std::cell::{Cell, RefCell};
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
     use ash::vk;
+
+    use crate::host::Host;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Step {
@@ -99,6 +102,69 @@ pub mod faults {
         static FIRED: Cell<bool> = const { Cell::new(false) };
         static COUNTS: RefCell<[(u64, u64); KINDS]> = const { RefCell::new([(0, 0); KINDS]) };
         static HOOKS: &'static Hooks = hooks();
+        static HOLDING: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    struct Gate {
+        device: ash::Device,
+        timeline: ash::khr::timeline_semaphore::Device,
+        owner: u64,
+        held: u64,
+        semaphore: vk::Semaphore,
+    }
+
+    static GATES: Mutex<Vec<Gate>> = Mutex::new(Vec::new());
+
+    static HELD: AtomicU64 = AtomicU64::new(0);
+
+    fn gates() -> MutexGuard<'static, Vec<Gate>> {
+        GATES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[must_use]
+    pub fn hold() -> u64 {
+        let held = HELD.fetch_add(1, Ordering::Relaxed);
+        HOLDING.set(Some(held));
+        held
+    }
+
+    pub fn release(held: u64) {
+        for gate in gates().iter().filter(|gate| gate.held == held) {
+            let signal = vk::SemaphoreSignalInfo::default()
+                .semaphore(gate.semaphore)
+                .value(1);
+            let _ = unsafe { gate.timeline.signal_semaphore(&signal) };
+        }
+    }
+
+    pub(crate) fn gate(host: &Host, owner: u64) -> Result<Option<vk::Semaphore>, vk::Result> {
+        let Some(held) = HOLDING.take() else {
+            return Ok(None);
+        };
+        let device = host.device();
+        let mut typed = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let create = vk::SemaphoreCreateInfo::default().push_next(&mut typed);
+        let semaphore = unsafe { device.create_semaphore(&create, None) }?;
+        gates().push(Gate {
+            device: device.clone(),
+            timeline: ash::khr::timeline_semaphore::Device::new(host.instance(), device),
+            owner,
+            held,
+            semaphore,
+        });
+        Ok(Some(semaphore))
+    }
+
+    pub(crate) fn ungate(device: &ash::Device, owner: u64) {
+        gates().retain(|gate| {
+            if gate.owner != owner || gate.device.handle() != device.handle() {
+                return true;
+            }
+            unsafe { gate.device.destroy_semaphore(gate.semaphore, None) };
+            false
+        });
     }
 
     fn hooks() -> &'static Hooks {
@@ -224,6 +290,7 @@ pub mod faults {
     pub fn reset() {
         disarm();
         FIRED.set(false);
+        HOLDING.set(None);
         COUNTS.with_borrow_mut(|counts| *counts = [(0, 0); KINDS]);
         HOOKS.with(|hooks| {
             for tally in &hooks.tallies {
@@ -330,6 +397,17 @@ pub(crate) mod faults {
     pub(crate) const fn callbacks(_: Step) -> Option<&'static vk::AllocationCallbacks<'static>> {
         None
     }
+
+    #[inline(always)]
+    pub(crate) const fn gate(
+        _: &crate::host::Host,
+        _: u64,
+    ) -> Result<Option<vk::Semaphore>, vk::Result> {
+        Ok(None)
+    }
+
+    #[inline(always)]
+    pub(crate) fn ungate(_: &ash::Device, _: u64) {}
 }
 
 use faults::Step;
@@ -1077,6 +1155,10 @@ impl Resident<'_> {
         self.patience = patience;
     }
 
+    fn owner(&self) -> u64 {
+        vk::Handle::as_raw(self.fence)
+    }
+
     fn live(&self) -> Result<(), Error> {
         if self.host.wedged() {
             return Err(Error::Wedged {
@@ -1405,8 +1487,6 @@ impl Resident<'_> {
             let one = [vk::SparseBufferMemoryBindInfo::default()
                 .buffer(held.handle)
                 .binds(&binds)];
-            let info = [vk::BindSparseInfo::default().buffer_binds(&one)];
-
             let fence = match device.create_fence(&vk::FenceCreateInfo::default(), None) {
                 Ok(fence) => fence,
                 Err(code) => {
@@ -1414,6 +1494,25 @@ impl Resident<'_> {
                     return Err(code.into());
                 }
             };
+            let waits: Vec<vk::Semaphore> = match faults::gate(self.host, self.owner()) {
+                Ok(gate) => gate.into_iter().collect(),
+                Err(code) => {
+                    device.destroy_fence(fence, None);
+                    device.free_memory(memory, None);
+                    return Err(code.into());
+                }
+            };
+            let values = vec![1_u64; waits.len()];
+            let mut timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+            let info = vk::BindSparseInfo::default()
+                .wait_semaphores(&waits)
+                .buffer_binds(&one);
+            let info = [if waits.is_empty() {
+                info
+            } else {
+                info.push_next(&mut timeline)
+            }];
             let ordered = self.host.ordered();
             let held = device.queue_bind_sparse(self.host.queue(), &info, fence);
             drop(ordered);
@@ -1471,7 +1570,19 @@ impl Resident<'_> {
             let one = [vk::SparseBufferMemoryBindInfo::default()
                 .buffer(handle)
                 .binds(&binds)];
-            let info = [vk::BindSparseInfo::default().buffer_binds(&one)];
+            let waits: Vec<vk::Semaphore> =
+                faults::gate(self.host, self.owner())?.into_iter().collect();
+            let values = vec![1_u64; waits.len()];
+            let mut timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+            let info = vk::BindSparseInfo::default()
+                .wait_semaphores(&waits)
+                .buffer_binds(&one);
+            let info = [if waits.is_empty() {
+                info
+            } else {
+                info.push_next(&mut timeline)
+            }];
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let ordered = self.host.ordered();
             let sent = device.queue_bind_sparse(self.host.queue(), &info, fence);
@@ -2008,7 +2119,21 @@ impl Resident<'_> {
         let took;
 
         let commands = [facing.command];
-        let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+        let waits: Vec<vk::Semaphore> =
+            faults::gate(self.host, self.owner())?.into_iter().collect();
+        let waited = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+        let values = vec![1_u64; waits.len()];
+        let mut timeline =
+            vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+        let info = vk::SubmitInfo::default()
+            .command_buffers(&commands)
+            .wait_semaphores(&waits)
+            .wait_dst_stage_mask(&waited);
+        let submit = [if waits.is_empty() {
+            info
+        } else {
+            info.push_next(&mut timeline)
+        }];
 
         let wanted = Recorded {
             stages: stages.iter().map(|one| one.to_vec()).collect(),
@@ -2220,7 +2345,21 @@ impl Resident<'_> {
             device.end_command_buffer(self.transfer)?;
 
             let commands = [self.transfer];
-            let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+            let waits: Vec<vk::Semaphore> =
+                faults::gate(self.host, self.owner())?.into_iter().collect();
+            let waited = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+            let values = vec![1_u64; waits.len()];
+            let mut timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+            let info = vk::SubmitInfo::default()
+                .command_buffers(&commands)
+                .wait_semaphores(&waits)
+                .wait_dst_stage_mask(&waited);
+            let submit = [if waits.is_empty() {
+                info
+            } else {
+                info.push_next(&mut timeline)
+            }];
             let ordered = self.host.ordered();
             device.reset_fences(&[self.fence])?;
             device.queue_submit(self.host.queue(), &submit, self.fence)?;
@@ -2423,6 +2562,7 @@ impl Drop for Resident<'_> {
             if self.built && !wedged {
                 let _ = device.device_wait_idle();
             }
+            faults::ungate(device, self.owner());
             device.destroy_fence(self.fence, faults::callbacks(Step::Fence));
             faults::gone(Step::Fence, self.fence);
             for slot in &self.slots {
