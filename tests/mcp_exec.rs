@@ -2487,7 +2487,12 @@ fn the_last_world_number_is_refused_and_never_handed_out_twice() {
         ));
         let told = refused(&call(&mut server, "grit_world_create", made));
         assert_eq!(told.code, "too_many", "{}", told.message);
-        assert_eq!(told.all.int_at("limit"), i64::from(most));
+        assert_eq!(told.all.int_at("limit"), i64::from(most - 1));
+        assert!(
+            told.message.contains(&format!("up to {} ", most - 1)),
+            "{}",
+            told.message
+        );
     }
     let next = std::fs::read_to_string(scratch.dir().join("kept").join("next")).unwrap();
     assert_eq!(next.trim(), most.to_string());
@@ -2561,59 +2566,68 @@ fn a_kept_world_that_cannot_be_rebuilt_is_listed_broken_and_closes_with_its_file
 }
 
 #[test]
-fn one_poisoned_observation_of_each_kind_changes_no_later_estimate() {
+fn a_fast_observation_moves_no_estimate_and_a_slow_one_raises_it_at_once() {
     use grit::serve3::budget::{Rates, Work};
     let unrelated = 64 << 20;
     for work in Work::ALL {
         let mut fresh = Rates::default();
         let prior = fresh.estimate(work, unrelated);
-        for poison in [1000.0, 0.001] {
-            let mut first = Rates::default();
-            first.measure(work, 1 << 20, prior.mul_f64(poison));
-            assert_eq!(
-                first.estimate(work, unrelated),
-                prior,
-                "{work:?} poisoned first"
-            );
-        }
+        let mut first = Rates::default();
+        first.measure(work, unrelated, prior.mul_f64(0.001));
+        assert_eq!(
+            first.estimate(work, unrelated),
+            prior,
+            "{work:?} fast first"
+        );
+        let mut first = Rates::default();
+        first.measure(work, unrelated, prior.mul_f64(3.0));
+        assert!(
+            first.estimate(work, unrelated) >= prior.mul_f64(2.99),
+            "{work:?} a slow first observation must raise the estimate at once"
+        );
         for _ in 0..2 {
             fresh.measure(work, unrelated, prior.mul_f64(0.5));
         }
         let settled = fresh.estimate(work, unrelated);
-        for poison in [1000.0, 0.001] {
-            let mut poisoned = fresh.clone();
-            poisoned.measure(work, unrelated, settled.mul_f64(poison));
-            assert_eq!(
-                poisoned.estimate(work, unrelated),
-                settled,
-                "{work:?} x{poison}"
-            );
-        }
-        let mut moving = fresh.clone();
-        for _ in 0..5 {
-            moving.measure(work, unrelated, settled.mul_f64(3.0));
-        }
+        assert!(settled < prior, "{work:?} never learns a faster device");
+        let mut poisoned = fresh.clone();
+        poisoned.measure(work, unrelated, settled.mul_f64(0.001));
+        assert_eq!(
+            poisoned.estimate(work, unrelated),
+            settled,
+            "{work:?} fast poison"
+        );
+        let mut slow = fresh.clone();
+        slow.measure(work, unrelated, settled.mul_f64(1000.0));
         assert!(
-            moving.estimate(work, unrelated) > settled,
-            "{work:?} never learns"
+            slow.estimate(work, unrelated) >= settled.mul_f64(999.0),
+            "{work:?} a slow observation must raise the estimate at once"
+        );
+        for _ in 0..3 {
+            slow.measure(work, unrelated, settled);
+        }
+        let back = slow.estimate(work, unrelated);
+        assert!(
+            back <= settled.mul_f64(1.01) && back >= settled.mul_f64(0.99),
+            "{work:?}: {back:?} against {settled:?}"
         );
     }
     let mut rates = Rates::default();
     let prior = rates.replay();
-    rates.measure_replay(Duration::from_millis(50), Duration::from_secs(20));
+    rates.measure_replay(Duration::from_millis(40), Duration::from_secs(20));
     assert!((rates.replay() - prior).abs() < 1e-9);
     for _ in 0..2 {
         rates.measure_replay(Duration::from_secs(1), Duration::from_millis(1500));
     }
     let settled = rates.replay();
-    rates.measure_replay(Duration::from_secs(1), Duration::from_secs(40));
+    rates.measure_replay(Duration::from_secs(1), Duration::from_millis(10));
     assert!(
         (rates.replay() - settled).abs() < 1e-9,
         "{settled} {}",
         rates.replay()
     );
-    rates.measure_replay(Duration::from_secs(1), Duration::from_millis(10));
-    assert!((rates.replay() - settled).abs() < 1e-9);
+    rates.measure_replay(Duration::from_secs(1), Duration::from_secs(6));
+    assert!(rates.replay() >= 6.0 - 1e-9, "{}", rates.replay());
 }
 
 #[test]
@@ -2870,4 +2884,316 @@ fn the_highest_world_number_described_is_the_highest_handed_out() {
         limits.int_at("world_number_most"),
         i64::from(journal::NUMBER_MOST) - 1
     );
+}
+
+fn kept_files(scratch: &Scratch) -> Vec<String> {
+    entries(&scratch.dir().join("kept"))
+}
+
+fn far_over(run: &mut Run, scratch: &Scratch, world: i64) {
+    for _ in 0..12 {
+        answer(&run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":2500}}"),
+        ));
+        answer(&run.ask("grit_world_rules", "{}"));
+        let item = listed_world(run, world);
+        if item.get("snapshot_failed").is_some()
+            || kept_files(scratch)
+                .iter()
+                .any(|one| one.starts_with("snap-"))
+        {
+            return;
+        }
+    }
+    panic!("the world never owed a snapshot");
+}
+
+fn listed_world(run: &mut Run, world: i64) -> Json {
+    let listed = answer(&run.ask("grit_world_list", "{}"));
+    listed
+        .get("items")
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .find(|one| one.get("world").and_then(Json::int) == Some(world))
+        .cloned()
+        .unwrap()
+}
+
+fn sand_world(run: &mut Run, side: u32) -> i64 {
+    let world = answer(&run.ask(
+        "grit_world_create",
+        &format!("{{\"wide\":{side},\"deep\":{side},\"tall\":{side},\"rule\":\"sand\"}}"),
+    ))
+    .int_at("world");
+    let cells: Vec<([u32; 3], u32)> = (0..side.min(32))
+        .map(|at| ([at, 0, at], grit::sand::SAND))
+        .collect();
+    answer(&run.ask(
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
+    ));
+    world
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_failed_snapshot_between_calls_backs_off_is_named_and_leaves_no_files() {
+    let Some(host) = device("failed idle snapshot") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("snap-fails");
+    let mut run = Run::new(&Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    });
+    let world = sand_world(&mut run, 32);
+    run.exec.faults().lock().unwrap().fail_snapshots = 1000;
+    far_over(&mut run, &scratch, world);
+    let began = Instant::now();
+    for _ in 0..40 {
+        answer(&run.ask("grit_world_rules", "{}"));
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let spent = began.elapsed();
+    let item = listed_world(&mut run, world);
+    let failed = item
+        .get("snapshot_failed")
+        .cloned()
+        .unwrap_or_else(|| panic!("no snapshot failure named: {}", written(&item)));
+    let failures = failed.int_at("failures");
+    eprintln!(
+        "{failures} snapshot attempts in {spent:?}: {}",
+        written(&failed)
+    );
+    assert!(
+        (1..=3).contains(&failures),
+        "{failures} attempts in {spent:?}"
+    );
+    assert!(
+        failed
+            .get("message")
+            .and_then(Json::text)
+            .unwrap()
+            .contains("armed fault")
+    );
+    let worlds = answer(&run.ask("grit_describe", "{}"))
+        .get("worlds")
+        .cloned()
+        .unwrap();
+    assert_eq!(worlds.int_at("snapshot_failures"), 1);
+    let left: Vec<String> = kept_files(&scratch)
+        .into_iter()
+        .filter(|one| one.starts_with("pending-") || one.ends_with(".tmp") || one.starts_with('.'))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    let got = run.ask(
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":3}}"),
+    );
+    let said = written(&got);
+    let result = got.get("result").unwrap();
+    let told = result.get("structuredContent").unwrap();
+    if result.get("isError") == Some(&Json::Bool(true)) {
+        assert_eq!(told.get("code").and_then(Json::text), Some("io"), "{said}");
+    }
+    assert!(
+        said.contains("armed fault"),
+        "the failure is not named: {said}"
+    );
+    run.exec.faults().lock().unwrap().fail_snapshots = 0;
+    let began = Instant::now();
+    loop {
+        answer(&run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":1}}"),
+        ));
+        let item = listed_world(&mut run, world);
+        if item.get("snapshot_failed").is_none() {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "{}",
+            written(&item)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        kept_files(&scratch)
+            .iter()
+            .any(|one| one.starts_with("snap-"))
+    );
+    run.exec.finish();
+}
+
+#[test]
+fn a_directory_planted_where_a_snapshot_is_written_does_not_stop_snapshots() {
+    let Some(host) = device("planted pending directory") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("planted");
+    let options = Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    };
+    std::fs::create_dir_all(scratch.dir().join("kept")).unwrap();
+    for name in ["pending-1.grit", "pending-1-0.grit"] {
+        std::fs::create_dir_all(scratch.dir().join("kept").join(name)).unwrap();
+    }
+    let mut run = Run::new(&options);
+    let world = sand_world(&mut run, 32);
+    far_over(&mut run, &scratch, world);
+    let began = Instant::now();
+    while !kept_files(&scratch)
+        .iter()
+        .any(|one| one.starts_with("snap-"))
+    {
+        answer(&run.ask("grit_world_rules", "{}"));
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            kept_files(&scratch)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let item = listed_world(&mut run, world);
+    assert!(item.get("snapshot_failed").is_none(), "{}", written(&item));
+    let files = kept_files(&scratch);
+    assert!(files.contains(&"pending-1.grit".to_owned()), "{files:?}");
+    let strays: Vec<&String> = files
+        .iter()
+        .filter(|one| {
+            one.starts_with("pending-") && *one != "pending-1.grit" && *one != "pending-1-0.grit"
+        })
+        .collect();
+    assert!(strays.is_empty(), "{files:?}");
+    run.exec.finish();
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_device_lost_during_a_snapshot_between_calls_is_handled_as_a_loss() {
+    let Some(host) = device("loss in idle snapshot") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("idle-loss");
+    let mut run = Run::new(&Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    });
+    let world = sand_world(&mut run, 32);
+    run.exec.faults().lock().unwrap().wedge_in_snapshot = true;
+    let mut frame = 0;
+    let mut saw = false;
+    let began = Instant::now();
+    loop {
+        let got = run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":200}}"),
+        );
+        let result = got.get("result").unwrap();
+        let told = result.get("structuredContent").unwrap();
+        if result.get("isError") == Some(&Json::Bool(true)) {
+            assert_eq!(
+                told.get("code").and_then(Json::text),
+                Some("budget"),
+                "{}",
+                written(told)
+            );
+        } else {
+            frame = frame.max(told.int_at("frame"));
+            saw |= told.get("restored").is_some();
+        }
+        let worlds = answer(&run.ask("grit_describe", "{}"))
+            .get("worlds")
+            .cloned()
+            .unwrap();
+        if worlds.int_at("restorations") == 1 {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "{}",
+            written(&worlds)
+        );
+    }
+    let got = answer(&run.ask(
+        "grit_world_read",
+        &format!("{{\"world\":{world},\"from\":[0,31,0],\"to\":[15,31,15]}}"),
+    ));
+    saw |= got.get("restored").is_some();
+    assert!(saw, "no answer said the world was restored");
+    assert_eq!(got.int_at("frame"), frame);
+    let worlds = answer(&run.ask("grit_describe", "{}"))
+        .get("worlds")
+        .cloned()
+        .unwrap();
+    assert_eq!(worlds.int_at("restorations"), 1);
+    run.exec.finish();
+}
+
+fn step_within(run: &mut Run, world: i64, budget: u64) -> (Duration, i64) {
+    let began = Instant::now();
+    let got = run.ask(
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
+    );
+    let took = began.elapsed();
+    let told = got
+        .get("result")
+        .and_then(|one| one.get("structuredContent"))
+        .cloned()
+        .unwrap();
+    (took, told.get("frame").and_then(Json::int).unwrap_or(-1))
+}
+
+#[test]
+fn a_cold_server_stepping_with_small_budgets_never_overruns_by_more_than_a_batch() {
+    let Some(host) = device("cold small budgets") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("cold");
+    let options = Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    };
+    let budget = 300;
+    let most = Duration::from_millis(budget + grit::serve3::budget::SUBMIT_MOST_MS + 150);
+    let mut worst = Duration::ZERO;
+    let mut moved = 0;
+    let mut run = Run::new(&options);
+    let world = sand_world(&mut run, 128);
+    for _ in 0..12 {
+        let (took, frame) = step_within(&mut run, world, budget);
+        worst = worst.max(took);
+        moved += i64::from(frame > 0);
+        assert!(took <= most, "first run: {took:?}");
+    }
+    run.exec.finish();
+    let mut again = Run::new(&options);
+    answer(&again.ask(
+        "grit_world_open",
+        &format!("{{\"name\":\"world-{world}\"}}"),
+    ));
+    for _ in 0..8 {
+        let (took, _) = step_within(&mut again, world, budget);
+        worst = worst.max(took);
+        assert!(took <= most, "after a restart: {took:?}");
+    }
+    let small = sand_world(&mut again, 64);
+    for _ in 0..8 {
+        let (took, frame) = step_within(&mut again, small, budget);
+        worst = worst.max(took);
+        moved += i64::from(frame > 0);
+        assert!(took <= most, "a new size: {took:?}");
+    }
+    eprintln!("the slowest of 28 small-budget steps took {worst:?}; {moved} advanced");
+    assert!(moved >= 10, "{moved}");
+    again.exec.finish();
 }
