@@ -220,7 +220,7 @@ struct Writing {
     made: Made,
     bytes: u64,
     began: Instant,
-    done: std::sync::mpsc::Receiver<Result<[u8; 32], String>>,
+    done: std::sync::mpsc::Receiver<(Result<[u8; 32], String>, Instant)>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -422,6 +422,13 @@ impl Book {
         }
     }
 
+    fn writing_elapsed(&self, number: u32) -> Duration {
+        self.writing
+            .as_ref()
+            .filter(|writing| writing.number == number)
+            .map_or(Duration::ZERO, |writing| writing.began.elapsed())
+    }
+
     fn writing_for(&self, number: u32) -> bool {
         self.writing
             .as_ref()
@@ -440,27 +447,30 @@ impl Book {
             Wait::Poll => match writing.done.try_recv() {
                 Ok(got) => got,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(WRITER_STOPPED.to_owned()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    (Err(WRITER_STOPPED.to_owned()), Instant::now())
+                }
             },
             Wait::For(left) => match writing.done.recv_timeout(left) {
                 Ok(got) => got,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    Err(WRITER_STOPPED.to_owned())
+                    (Err(WRITER_STOPPED.to_owned()), Instant::now())
                 }
             },
             Wait::Landed => writing
                 .done
                 .recv()
-                .unwrap_or_else(|_| Err(WRITER_STOPPED.to_owned())),
+                .unwrap_or_else(|_| (Err(WRITER_STOPPED.to_owned()), Instant::now())),
         };
+        let (got, finished) = got;
         let Some(mut writing) = self.writing.take() else {
             return false;
         };
         if let Some(thread) = writing.thread.take() {
             let _ = thread.join();
         }
-        let cost = writing.began.elapsed();
+        let cost = finished.saturating_duration_since(writing.began);
         let number = writing.number;
         let current = self
             .held
@@ -1146,7 +1156,12 @@ impl<'host> Server<'host> {
         if !held.ledger.due(held.bytes, ratio) {
             return Ok(None);
         }
-        let far = held.ledger.far_over(Duration::ZERO, held.bytes, ratio);
+        let far = held.ledger.far_over_writing(
+            Duration::ZERO,
+            held.bytes,
+            ratio,
+            self.book.writing_elapsed(number),
+        );
         if self.book.writing_for(number) {
             if !far {
                 return Ok(None);
@@ -1345,7 +1360,7 @@ impl<'host> Server<'host> {
                     std::thread::sleep(slow);
                     let got = stored(&keep, number, &image)
                         .map_err(|why| refused_with(why.as_ref()).0.message);
-                    let _ = sender.send(got);
+                    let _ = sender.send((got, Instant::now()));
                 })
                 .map_err(|why| io_refusal(&why))?;
             self.book.writing = Some(Writing {
@@ -1388,8 +1403,12 @@ impl<'host> Server<'host> {
 
     fn far_overdue(&self, number: u32, extra: Duration) -> bool {
         self.book.held.get(&number).is_some_and(|held| {
-            held.ledger
-                .far_over(extra, held.bytes, self.book.rates.replay())
+            held.ledger.far_over_writing(
+                extra,
+                held.bytes,
+                self.book.rates.replay(),
+                self.book.writing_elapsed(number),
+            )
         })
     }
 

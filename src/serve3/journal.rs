@@ -28,6 +28,8 @@ const REPLAY_LEAST: Duration = Duration::from_secs(2);
 
 pub const HARD: u32 = 2;
 
+pub const WRITING_REPLAY_MOST: Duration = Duration::from_secs(120);
+
 pub const WRITE_CHUNK: usize = 32;
 
 const SNAPSHOT_BYTES_PER_SECOND: f64 = 2.5e8;
@@ -195,13 +197,43 @@ impl Ledger {
         self.past(extra, world_bytes, ratio, HARD)
     }
 
+    #[must_use]
+    pub fn far_over_writing(
+        &self,
+        extra: Duration,
+        world_bytes: u64,
+        ratio: f64,
+        writing: Duration,
+    ) -> bool {
+        let hard = self.replay_most().saturating_mul(HARD);
+        let most = hard.max(
+            writing
+                .saturating_mul(4)
+                .saturating_mul(HARD)
+                .min(WRITING_REPLAY_MOST),
+        );
+        self.beyond(extra, world_bytes, ratio, HARD, most)
+    }
+
     fn past(&self, extra: Duration, world_bytes: u64, ratio: f64, times: u32) -> bool {
+        let most = self.replay_most().saturating_mul(times);
+        self.beyond(extra, world_bytes, ratio, times, most)
+    }
+
+    fn beyond(
+        &self,
+        extra: Duration,
+        world_bytes: u64,
+        ratio: f64,
+        times: u32,
+        most: Duration,
+    ) -> bool {
         let bytes = usize::try_from(world_bytes)
             .unwrap_or(usize::MAX)
             .max(JOURNAL_LEAST)
             .saturating_mul(times as usize);
         let replaying = self.replay.saturating_add(extra).mul_f64(ratio.max(1.0));
-        self.bytes > bytes || replaying > self.replay_most().saturating_mul(times)
+        self.bytes > bytes || replaying > most
     }
 
     #[must_use]

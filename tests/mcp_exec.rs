@@ -3353,6 +3353,32 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
 }
 
 #[test]
+fn a_write_in_flight_lets_the_journal_grow_with_it_up_to_a_cap() {
+    let mut ledger = Ledger::created(Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [16, 16, 16],
+        sparse: false,
+        slots: None,
+    });
+    for _ in 0..30 {
+        ledger.push(Entry::Step(1), Duration::from_secs(1));
+    }
+    let bytes = 1 << 20;
+    assert!(ledger.far_over(Duration::ZERO, bytes, 2.0));
+    assert!(ledger.far_over_writing(Duration::ZERO, bytes, 2.0, Duration::ZERO));
+    assert!(ledger.far_over_writing(Duration::ZERO, bytes, 2.0, Duration::from_secs(7)));
+    assert!(!ledger.far_over_writing(Duration::ZERO, bytes, 2.0, Duration::from_secs(8)));
+    for _ in 0..90 {
+        ledger.push(Entry::Step(1), Duration::from_secs(1));
+    }
+    assert!(!ledger.far_over_writing(Duration::ZERO, bytes, 1.0, Duration::from_secs(1000)));
+    ledger.push(Entry::Step(1), Duration::from_secs(1));
+    assert!(ledger.far_over_writing(Duration::ZERO, bytes, 1.0, Duration::from_secs(1000)));
+    assert_eq!(journal::WRITING_REPLAY_MOST, Duration::from_secs(120));
+}
+
+#[test]
 fn a_directory_planted_where_a_snapshot_is_written_does_not_stop_snapshots() {
     let Some(host) = device("planted pending directory") else {
         return;
