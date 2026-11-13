@@ -3041,6 +3041,65 @@ fn a_failed_snapshot_between_calls_backs_off_is_named_and_leaves_no_files() {
     run.exec.finish();
 }
 
+#[cfg(feature = "faults")]
+#[test]
+fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
+    let Some(host) = device("slow idle snapshot") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("slow-idle");
+    let mut run = Run::new(&Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    });
+    let world = sand_world(&mut run, 32);
+    let faults = run.exec.faults();
+    let slow = Duration::from_millis(600);
+    faults.lock().unwrap().slow_idle_snapshot = slow;
+    let budget = 40;
+    let most = Duration::from_millis(budget + grit::serve3::budget::SUBMIT_MOST_MS + 150);
+    let mut worst = Duration::ZERO;
+    let mut after = None;
+    let mut calls = 0;
+    while after.is_none_or(|first: Instant| first.elapsed() < slow * 2) {
+        assert!(calls < 200, "no snapshot was taken between calls");
+        let began = Instant::now();
+        let got = run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
+        );
+        let took = began.elapsed();
+        let result = got.get("result").unwrap();
+        assert_eq!(
+            result.get("isError"),
+            Some(&Json::Bool(false)),
+            "call {calls} after {took:?}: {}",
+            written(&got)
+        );
+        assert!(took <= most, "call {calls} took {took:?}");
+        worst = worst.max(took);
+        calls += 1;
+        if after.is_none() && faults.lock().unwrap().slowed > 0 {
+            after = Some(Instant::now());
+        }
+    }
+    eprintln!(
+        "{calls} steps of {budget} ms beside a snapshot written for {slow:?} between calls; the slowest took {worst:?}"
+    );
+    run.exec.finish();
+    let left: Vec<String> = kept_files(&scratch)
+        .into_iter()
+        .filter(|one| one.starts_with("pending-") || one.ends_with(".tmp"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    assert!(
+        kept_files(&scratch)
+            .iter()
+            .any(|one| one.starts_with("snap-"))
+    );
+}
+
 #[test]
 fn a_directory_planted_where_a_snapshot_is_written_does_not_stop_snapshots() {
     let Some(host) = device("planted pending directory") else {
