@@ -3218,7 +3218,6 @@ fn behind_idle_work(dir: bool) {
     faults.lock().unwrap().slow_idle_work = slow;
     faults.lock().unwrap().pause_after_answer = Duration::from_millis(5);
     let budget = 100;
-    let most = slow * 2 - Duration::from_millis(budget);
     let want = if dir { 2 } else { 1 };
     let mut behind = Duration::ZERO;
     let mut calls = 0;
@@ -3237,6 +3236,7 @@ fn behind_idle_work(dir: bool) {
             "call {calls} after {took:?}: {}",
             written(&got)
         );
+        let most = late_most(&mut run, budget);
         assert!(
             took <= most,
             "call {calls} took {took:?}, more than {most:?}"
