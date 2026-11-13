@@ -208,8 +208,8 @@ pub fn mixed<const LANES: u32>(
     let wide = lanes.splat_bits::<U32, LANES>(PRODUCT)?;
     let narrow = lanes.splat_bits::<U32, LANES>(SHARE)?;
     let held = lanes.mul(first, second)?;
-    let held = lanes.shift_right_logical(held, wide)?;
-    let part = lanes.shift_right_logical(third, narrow)?;
+    let held = lanes.shift_right_arithmetic(held, wide)?;
+    let part = lanes.shift_right_arithmetic(third, narrow)?;
     lanes.add(held, part)
 }
 
