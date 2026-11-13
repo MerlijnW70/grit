@@ -1,5 +1,8 @@
+use std::collections::HashSet;
+
 use crate::board::seated;
 use crate::compact::Plan;
+use crate::credit::{self, Board, ESCAPE_ROUNDS, Marker};
 use crate::host::Host;
 use crate::layout::{BRUSH, GRAND, PARAMS, STATE};
 use crate::machine::Machine;
@@ -37,6 +40,27 @@ pub struct Found {
     pub wrong: Vec<u32>,
     pub most: u32,
     pub longest: std::time::Duration,
+    pub escapes: Escapes,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Escapes {
+    pub ran: u32,
+    pub lifted: u32,
+    pub rounds: u64,
+    pub evaluated: u64,
+}
+
+impl Escapes {
+    #[must_use]
+    pub const fn and(self, other: Self) -> Self {
+        Self {
+            ran: self.ran + other.ran,
+            lifted: self.lifted + other.lifted,
+            rounds: self.rounds + other.rounds,
+            evaluated: self.evaluated + other.evaluated,
+        }
+    }
 }
 
 fn columns(exam: &Exam) -> Vec<u32> {
@@ -242,6 +266,7 @@ fn judged(shape: Netlist, exam: &Exam, gates: &[u32]) -> Result<Found, Box<dyn s
         wrong,
         most: CROWD,
         longest: std::time::Duration::ZERO,
+        escapes: Escapes::default(),
     })
 }
 
@@ -261,7 +286,16 @@ pub struct Effort {
     pub stall: u32,
     pub shake: u32,
     pub submitted: u32,
+    pub escape: Escape,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escape {
+    Shake,
+    Credit,
+}
+
+pub const ESCAPES: [&str; 2] = ["shake", "credit"];
 
 pub const STALL: u32 = 300;
 
@@ -277,6 +311,7 @@ impl Effort {
             stall: STALL,
             shake: SHAKE,
             submitted: u32::MAX,
+            escape: Escape::Shake,
         }
     }
 }
@@ -315,6 +350,8 @@ struct Climb {
     full: u32,
     look: u32,
     work: u64,
+    width: u32,
+    board: Option<Board>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -477,6 +514,13 @@ impl<'held, 'host> Staged<'held, 'host> {
     }
 }
 
+impl Staged<'_, '_> {
+    #[must_use]
+    pub const fn on_device(&self) -> Option<std::time::Duration> {
+        self.resident.on_device()
+    }
+}
+
 impl Submits for Staged<'_, '_> {
     fn submitted(
         &mut self,
@@ -505,6 +549,8 @@ pub fn walked(
     Ok(longest)
 }
 
+type Climbed = (u32, Vec<u32>, std::time::Duration, Escapes);
+
 fn climbed(
     resident: &mut Resident<'_>,
     stages: &[&[Groups]],
@@ -512,8 +558,9 @@ fn climbed(
     effort: Effort,
     restart: u32,
     gauge: Gauge,
-) -> Result<(u32, Vec<u32>, std::time::Duration), Box<dyn std::error::Error>> {
+) -> Result<Climbed, Box<dyn std::error::Error>> {
     let gates = climb.shape.gates as usize;
+    let mut escapes = Escapes::default();
     let mut longest = gauge.longest;
     let room = climb.many as usize * gates;
     let mut pace = Pace::over(climb.work, effort.submitted);
@@ -524,6 +571,7 @@ fn climbed(
     let mut shakes = 0_u32;
     let mut kept: Option<(u32, Vec<u32>)> = None;
     let mut best = Vec::new();
+    let mut escaped: HashSet<Vec<u32>> = HashSet::new();
     while done < effort.rounds {
         let step = climb.look.min(effort.rounds - done);
         longest = longest.max(walked(&mut Staged::new(resident, stages), &mut pace, step)?);
@@ -542,6 +590,46 @@ fn climbed(
         }
         if effort.stall > 0 && since >= effort.stall && done < effort.rounds {
             let held = resident.read(HELD as usize, room)?;
+            if effort.escape == Escape::Credit
+                && let Some(board) = &climb.board
+            {
+                let from = who * gates;
+                let lead = held.get(from..from + gates).unwrap_or(&[]).to_vec();
+                if escaped.insert(lead.clone()) {
+                    let budget = u64::from(climb.many) * ESCAPE_ROUNDS;
+                    let mut marker = Marker::within(
+                        resident,
+                        stages.len(),
+                        1,
+                        climb.width,
+                        climb.many,
+                        climb.shape,
+                    );
+                    let out = credit::escape(board, &mut marker, &lead, budget)?;
+                    let charged = out.evaluated.div_ceil(u64::from(climb.many).max(1));
+                    let before = done;
+                    done = done.saturating_add(u32::try_from(charged).unwrap_or(u32::MAX));
+                    done = done.min(effort.rounds);
+                    escapes.ran += 1;
+                    escapes.rounds += u64::from(done - before);
+                    escapes.evaluated += out.evaluated;
+                    if out.marks > now {
+                        escapes.lifted += 1;
+                        resident.write_at(HELD as usize, from, &out.circuit)?;
+                        resident.write_at(BEST as usize, who, &[out.marks])?;
+                        best = resident.read(BEST as usize, climb.many as usize)?;
+                        top = out.marks;
+                        since = 0;
+                        if out.marks >= climb.full {
+                            break;
+                        }
+                        continue;
+                    }
+                    if done >= effort.rounds {
+                        break;
+                    }
+                }
+            }
             if kept.as_ref().is_none_or(|(score, _)| now > *score) {
                 let from = who * gates;
                 kept = Some((now, held.get(from..from + gates).unwrap_or(&[]).to_vec()));
@@ -561,7 +649,7 @@ fn climbed(
     if let Some((score, gates)) = kept
         && score > now
     {
-        return Ok((done, gates, longest));
+        return Ok((done, gates, longest, escapes));
     }
     let held = resident.read(HELD as usize, room)?;
     let from = who * gates;
@@ -569,6 +657,7 @@ fn climbed(
         done,
         held.get(from..from + gates).unwrap_or(&[]).to_vec(),
         longest,
+        escapes,
     ))
 }
 
@@ -630,9 +719,13 @@ fn sought_within(
         full: exam.marks(),
         look: LOOK,
         work: u64::from(many) * u64::from(shape.gates) * u64::from(words_of(shape)),
+        width,
+        board: Some(Board::of(exam)),
     };
-    let (done, gates, longest) = climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
+    let (done, gates, longest, escapes) =
+        climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
     let mut found = judged(shape, exam, &gates)?;
+    found.escapes = escapes;
     found.rounds = done;
     found.crowd = many;
     found.most = gauge.most;
@@ -656,6 +749,7 @@ pub fn pressed(
         };
         if let Some(held) = &before {
             found.longest = found.longest.max(held.longest);
+            found.escapes = found.escapes.and(held.escapes);
         }
         let most = CROWD.min(found.most);
         if found.marks >= found.full || effort.crowd >= most {
@@ -869,8 +963,11 @@ fn machined_within(
                 + u64::from(held.inputs)
                 + u64::from(held.outputs))
             * u64::from(wide),
+        width,
+        board: None,
     };
-    let (done, gates, longest) = climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
+    let (done, gates, longest, _) =
+        climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
     let chip = Chip::of(shape, gates.clone(), held.named())?;
     let mut ran = told_of(held, traces, &chip, &gates, done, many)?;
     ran.most = gauge.most;
@@ -903,6 +1000,37 @@ pub fn pressed_machine(
         restart += 1;
         before = Some(ran);
     }
+}
+
+fn escapes_shown(held: Escapes) -> Json {
+    map(vec![
+        ("ran", counted(held.ran)),
+        ("lifted", counted(held.lifted)),
+        (
+            "rounds",
+            Json::Int(i64::try_from(held.rounds).unwrap_or(i64::MAX)),
+        ),
+        (
+            "evaluated",
+            Json::Int(i64::try_from(held.evaluated).unwrap_or(i64::MAX)),
+        ),
+        (
+            "means",
+            text(
+                "ran counts the whole-crowd stalls credit ran on a leader it had not run on before, lifted those where it found a higher score; rounds is the work it spent, charged against rounds as evaluated candidates over the crowd",
+            ),
+        ),
+    ])
+}
+
+fn told_escaped(found: &Found, effort: Effort) -> Json {
+    let mut held = told(found, true);
+    if effort.escape == Escape::Credit
+        && let Json::Map(fields) = &mut held
+    {
+        fields.push(("escapes".to_owned(), escapes_shown(found.escapes)));
+    }
+    held
 }
 
 fn told(found: &Found, sought: bool) -> Json {
@@ -1601,6 +1729,47 @@ const POURING: Whole = Whole {
     said: "how many frames the spout pours before it shuts off; half the frames of the run when left out, and never more than they are",
 };
 
+const CREDIT_DEPTH: Whole = sized(
+    "depth",
+    1,
+    credit::DEPTH_MOST as i64,
+    credit::DEPTH_MOST as i64,
+    "how many field changes deep to look: 1 credits every single change, 2 also every pair of changes, which certifies 2 when none improves",
+);
+
+const CREDIT_PAIRS: Whole = sized(
+    "pairs",
+    1,
+    credit::PAIRS_MOST as i64,
+    credit::PAIRS as i64,
+    "the most pairs of changes to evaluate at depth 2; a circuit has as many pairs as the square of its single changes, and certified reaches 2 only when every pair fits",
+);
+
+const CREDIT_MOVES: Whole = sized(
+    "moves",
+    0,
+    credit::MOVES_MOST as i64,
+    credit::MOVES as i64,
+    "the most dead-gate values, inserts and repairs to evaluate, each counted once; the insert and the repair each get this many",
+);
+
+const CREDIT_LISTED: Whole = sized(
+    "listed",
+    0,
+    credit::LISTED as i64,
+    credit::LISTED as i64,
+    "how many single changes to list, best credit first; the counts cover every change whatever is listed",
+);
+
+fn escape_choice() -> (&'static str, Json) {
+    choice(
+        "escape",
+        &ESCAPES,
+        "shake",
+        "what the search does when the whole crowd has stood on one score for stall rounds. shake shakes every candidate, the best kept aside. credit first runs exact credit on the leader alone: the best single change, then the best dead-gate insert, dead-gate repair and pair of changes, repeated while one improves, within 128 rounds of the crowd's work, 128 x crowd candidates, which count against rounds. An improvement becomes the leader and the crowd climbs on without a shake; without one the crowd is shaken as with shake",
+    )
+}
+
 fn whole_item() -> Json {
     map(vec![
         ("type", text("integer")),
@@ -1651,6 +1820,21 @@ pub(crate) fn tools() -> Json {
     ];
     let mut seeking = shape.clone();
     seeking.extend(search.iter().cloned());
+    seeking.push(escape_choice());
+    let mut crediting = shape.clone();
+    crediting.push((
+        "chip",
+        array(
+            gate(),
+            "the gates to credit, each an object of kind, left and right",
+        ),
+    ));
+    crediting.extend([
+        CREDIT_DEPTH.shown(),
+        CREDIT_PAIRS.shown(),
+        CREDIT_MOVES.shown(),
+        CREDIT_LISTED.shown(),
+    ]);
     let mut checking = shape.clone();
     if let Some(first) = checking.first_mut() {
         *first = CHECK_INPUTS.shown();
@@ -1837,6 +2021,11 @@ pub(crate) fn tools() -> Json {
             "grit_pour",
             "Pour sand or water into a room and step it until it settles. Returns how much of each thing ended where, how many cells of sand and water lie in each row, and how many quads the work list actually named on an average look. That last number is the point of the engine rather than a detail of it: the frame costs what is moving, not what the grid could hold, so a settled room is cheap however large it is. Nothing is searched and nothing is judged; this is what happened.",
             object(pouring, &[]),
+        ),
+        tool(
+            "grit_credit",
+            "Credit every change of a given circuit exactly: for each single change of one gate's kind, left or right, how many marks the changed circuit gains or loses, from one batch of the circuit and its gates complemented one at a time, and at depth 2 the same for every pair of changes. Returns, per gate, the rows each output is fixed and broken on if that gate flips; every single change with its credit, best first; the best pairs and their count; the dead gates, which no output reads; the best insert, a dead gate rewritten and read by a later gate, and the best repair, a live gate rebuilt over a rewritten dead gate. certified k means no circuit within k field changes scores more, proved by evaluating every one of them, with the counts in the answer. Nothing is searched and nothing is sampled. One batch holds at most 16777216 words of values, which bounds the gates at each input count.",
+            object(crediting, &["inputs", "outputs", "gates", "table", "chip"]),
         ),
         tool(
             "grit_check",
@@ -2677,6 +2866,11 @@ fn effort(held: &Json) -> Result<Effort, Box<dyn std::error::Error>> {
         stall: STALLED.count(held, "$")?,
         shake: SHAKEN.count(held, "$")?,
         submitted: u32::MAX,
+        escape: if named_in(held, "$", "escape", &ESCAPES, "shake")? == "credit" {
+            Escape::Credit
+        } else {
+            Escape::Shake
+        },
     })
 }
 
@@ -2693,6 +2887,9 @@ pub(crate) fn ran(
     }
     if name == "grit_settle" {
         return settled(host, held);
+    }
+    if name == "grit_credit" {
+        return credit_tool(host, held);
     }
     if name == "grit_machine" {
         let (machine, traces) = asked_machine(held)?;
@@ -2771,7 +2968,10 @@ pub(crate) fn ran(
         }
         "grit_synthesise" => {
             let effort = effort(held)?;
-            Ok(told(&pressed(device(host)?, shape, &exam, effort)?, true))
+            Ok(told_escaped(
+                &pressed(device(host)?, shape, &exam, effort)?,
+                effort,
+            ))
         }
         "grit_least" => {
             let effort = effort(held)?;
@@ -2803,7 +3003,7 @@ pub(crate) fn ran(
                 .iter()
                 .filter(|rung| rung.found.marks >= rung.found.full)
                 .min_by_key(|rung| rung.gates)
-                .map_or(Json::Null, |rung| told(&rung.found, true));
+                .map_or(Json::Null, |rung| told_escaped(&rung.found, effort));
             let mut held = vec![
                 ("smallest_that_solved", smallest.map_or(Json::Null, counted)),
                 ("ladder", ladder),
@@ -2835,7 +3035,7 @@ pub(crate) fn ran(
             }
             if smallest.is_none() {
                 if let Some(rung) = rungs.iter().max_by_key(|rung| rung.found.marks) {
-                    held.push(("best_attempt", told(&rung.found, true)));
+                    held.push(("best_attempt", told_escaped(&rung.found, effort)));
                 }
                 held.push((
                     "nothing_solved",
@@ -2851,6 +3051,274 @@ pub(crate) fn ran(
             limit: 0,
         })),
     }
+}
+
+fn credit_fits(shape: Netlist) -> Result<u32, Box<dyn std::error::Error>> {
+    let room = credit::room(shape, CROWD);
+    if room > shape.gates {
+        return Ok(room);
+    }
+    let most = (shape.outputs..shape.gates)
+        .rev()
+        .find(|gates| {
+            Netlist::over(shape.inputs, shape.outputs, *gates, shape.kinds)
+                .is_ok_and(|one| credit::room(one, CROWD) > *gates)
+        })
+        .unwrap_or(shape.outputs);
+    Err(Box::new(
+        Refusal::new(
+            Code::TooMany,
+            "$.gates",
+            format!(
+                "one complement batch of {} circuits over {} sources needs more than the {} words of values a credit batch may hold; at {} inputs at most {most} gates fit",
+                shape.gates + 1,
+                shape.sources(),
+                credit::CREDIT_WORDS,
+                shape.inputs
+            ),
+        )
+        .limited(counted(most)),
+    ))
+}
+
+fn change_shown(change: credit::Change) -> Vec<(&'static str, Json)> {
+    vec![
+        ("gate", counted(change.at)),
+        (
+            "field",
+            text(
+                credit::FIELDS
+                    .get(change.field as usize)
+                    .copied()
+                    .unwrap_or("right"),
+            ),
+        ),
+        ("value", counted(change.value)),
+    ]
+}
+
+fn edits_shown(before: &[u32], after: &[u32]) -> Json {
+    Json::List(
+        (0_u32..)
+            .zip(before.iter().zip(after))
+            .filter(|(_, (one, other))| one != other)
+            .map(|(at, (_, word))| {
+                let gate = Gate::unpack(*word);
+                map(vec![
+                    ("gate", counted(at)),
+                    ("kind", counted(gate.kind)),
+                    ("left", counted(gate.left)),
+                    ("right", counted(gate.right)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn big(held: u64) -> Json {
+    Json::Int(i64::try_from(held).unwrap_or(i64::MAX))
+}
+
+fn moves_shown<T: Copy>(
+    found: &credit::Moves<T>,
+    before: &[u32],
+    moved: impl Fn(T) -> Vec<u32>,
+) -> Json {
+    let best = found.best.map_or(Json::Null, |(gain, one)| {
+        map(vec![
+            ("credit", Json::Int(gain)),
+            ("edits", edits_shown(before, &moved(one))),
+        ])
+    });
+    map(vec![
+        ("evaluated", big(found.evaluated)),
+        ("complete", Json::Bool(found.complete)),
+        ("improving", big(found.improving)),
+        ("best", best),
+    ])
+}
+
+fn words_shown(held: &[u32], wide: usize) -> Json {
+    Json::List(
+        held.chunks(wide.max(1))
+            .map(|one| Json::List(one.iter().map(|word| counted(*word)).collect()))
+            .collect(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Credited {
+    pub depth: u32,
+    pub pairs: u64,
+    pub moves: u64,
+    pub listed: u32,
+}
+
+fn pairs_shown(pairs: &credit::Pairs) -> Json {
+    map(vec![
+        ("evaluated", big(pairs.evaluated)),
+        ("of", big(pairs.total)),
+        ("complete", Json::Bool(pairs.complete())),
+        ("improving", big(pairs.improving)),
+        (
+            "best",
+            if pairs.evaluated == 0 {
+                Json::Null
+            } else {
+                Json::Int(pairs.best)
+            },
+        ),
+        (
+            "top",
+            Json::List(
+                pairs
+                    .top
+                    .iter()
+                    .map(|(gain, first, second)| {
+                        map(vec![
+                            ("credit", Json::Int(*gain)),
+                            ("first", map(change_shown(*first))),
+                            ("second", map(change_shown(*second))),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+pub fn credit_answer(
+    board: &Board,
+    source: &mut impl credit::Complements,
+    chip: &[u32],
+    asked: Credited,
+) -> Result<Json, Box<dyn std::error::Error>> {
+    let shape = board.shape();
+    let tangent = source
+        .tangents(board, &[chip.to_vec()])?
+        .pop()
+        .ok_or("the complement batch answered nothing")?;
+    let found = credit::credited(board, &tangent, chip);
+    let dead = board.dead(chip);
+    let wide = board.wide();
+    let gates = Json::List(
+        (0..shape.gates)
+            .zip(&dead)
+            .map(|(at, is_dead)| {
+                let (fix, broken) = board.masks(&tangent, at);
+                map(vec![
+                    ("gate", counted(at)),
+                    ("dead", Json::Bool(*is_dead)),
+                    ("fix", words_shown(&fix, wide)),
+                    ("break", words_shown(&broken, wide)),
+                ])
+            })
+            .collect(),
+    );
+    let changes = Json::List(
+        found
+            .changes
+            .iter()
+            .take(asked.listed as usize)
+            .map(|(gain, change)| {
+                let mut held = change_shown(*change);
+                held.push(("credit", Json::Int(*gain)));
+                map(held)
+            })
+            .collect(),
+    );
+    let singles = found.changes.len() as u64;
+    let inserts = credit::inserts(board, &tangent, chip, asked.moves);
+    let repairs = credit::repairs(board, &tangent, chip, asked.moves);
+    let mut certified = u32::from(found.improving == 0);
+    let mut by = vec![("singles", big(singles))];
+    let mut held = vec![
+        ("solved", Json::Bool(tangent.marks >= board.full())),
+        ("marks", counted(tangent.marks)),
+        ("of", counted(board.full())),
+        ("gates", gates),
+        (
+            "rows_mean",
+            text(
+                "fix and break hold one list per output, each the rows as words: row r is bit r mod 32 of word r / 32. fix is where that output is wrong now and right with the gate flipped, break where it is right now and wrong flipped",
+            ),
+        ),
+        ("singles", big(singles)),
+        ("improving_singles", big(found.improving)),
+        ("neutral_singles", big(found.neutral)),
+        (
+            "best_single",
+            found
+                .changes
+                .first()
+                .map_or(Json::Null, |one| Json::Int(one.0)),
+        ),
+        ("changes", changes),
+        (
+            "dead",
+            Json::List(
+                (0..shape.gates)
+                    .zip(&dead)
+                    .filter(|(_, one)| **one)
+                    .map(|(at, _)| counted(at))
+                    .collect(),
+            ),
+        ),
+        (
+            "insert",
+            moves_shown(&inserts, chip, |one| credit::inserted(shape, chip, one)),
+        ),
+        (
+            "repair",
+            moves_shown(&repairs, chip, |one| credit::repaired(shape, chip, one)),
+        ),
+    ];
+    if asked.depth >= 2 {
+        let pairs = credit::paired(board, source, chip, asked.pairs, credit::PAIRS_LISTED)?;
+        if certified == 1 && pairs.complete() && pairs.best <= 0 {
+            certified = 2;
+        }
+        by.push(("pairs", big(pairs.evaluated)));
+        held.push(("pairs", pairs_shown(&pairs)));
+    }
+    held.push(("certified", counted(certified)));
+    held.push(("certified_by", map(by)));
+    held.push((
+        "certified_means",
+        text(
+            "no circuit within this many field changes scores more than this one: every single change, and at 2 every pair, was evaluated exactly and none gains; 0 means a single change gains",
+        ),
+    ));
+    Ok(map(held))
+}
+
+fn credit_tool(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {
+    let (shape, exam) = asked(held, &SYNTH_INPUTS)?;
+    present(held, "chip")?;
+    let chip = given(held, shape)?;
+    let asked = Credited {
+        depth: CREDIT_DEPTH.count(held, "$")?,
+        pairs: u64::from(CREDIT_PAIRS.count(held, "$")?),
+        moves: u64::from(CREDIT_MOVES.count(held, "$")?),
+        listed: CREDIT_LISTED.count(held, "$")?,
+    };
+    let room = credit_fits(shape)?;
+    let board = Board::of(&exam);
+    let mut answer = match host {
+        Some(host) => {
+            let mut resident = credit::opened(host, &board, room)?;
+            let mut marker = Marker::within(&mut resident, 1, 0, host.width(), room, shape);
+            credit_answer(&board, &mut marker, &chip, asked)?
+        }
+        None => credit_answer(&board, &mut credit::Twin, &chip, asked)?,
+    };
+    if let Json::Map(fields) = &mut answer {
+        fields.push((
+            "computed_on".to_owned(),
+            text(if host.is_some() { "device" } else { "host" }),
+        ));
+    }
+    Ok(answer)
 }
 
 #[must_use]

@@ -10,7 +10,7 @@ use grit::machine::Machine;
 use grit::marking::{BINDINGS, HELD, SEED, TRIAL, chosen, marked, turned_on, words_of};
 use grit::netlist::{Exam, Gate, Netlist, drawn, turned};
 use grit::serve::{
-    ASIDE, Effort, Pace, Rolls, SEEDING, SIDE, SUBMISSION, Staged, Submits, handle, machined,
+    ASIDE, Effort, Escape, Pace, Rolls, SEEDING, SIDE, SUBMISSION, Staged, Submits, handle, machined,
     mixed, opening, pressed, shaken, walked,
 };
 use grit::wire::{Json, read, written};
@@ -587,6 +587,7 @@ fn a_search_answers_alike_however_its_rounds_are_split_into_submissions() {
                 stall,
                 shake: 6,
                 submitted,
+                escape: Escape::Shake,
             };
             found_of(&pressed(&host, shape, &exam, effort).unwrap())
         };
@@ -632,6 +633,7 @@ fn a_machine_search_answers_alike_however_its_rounds_are_split_into_submissions(
             stall: 100,
             shake: 6,
             submitted,
+            escape: Escape::Shake,
         };
         let told = machined(&host, held, &traces, effort, 0).unwrap();
         format!(
