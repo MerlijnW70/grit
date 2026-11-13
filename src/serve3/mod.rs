@@ -279,7 +279,7 @@ pub struct Faults {
     pub wedge_before_call: bool,
     pub fail_snapshots: u32,
     pub wedge_in_snapshot: bool,
-    pub slow_idle_snapshot: Duration,
+    pub slow_write: Duration,
     pub slowed: u32,
     pub slow_idle_work: Duration,
     pub idle_works: u32,
@@ -1303,6 +1303,7 @@ impl<'host> Server<'host> {
 
     fn snap_attempt(&mut self, number: u32) -> Result<Option<Json>, Failed> {
         let (image, made, began) = self.snap_image(number)?;
+        std::thread::sleep(self.slow_idle());
         let frame = image.frame;
         let keep = self.book.keep.clone();
         let snap = match keep.as_ref() {
@@ -1477,10 +1478,10 @@ impl<'host> Server<'host> {
             .faults
             .lock()
             .map(|mut faults| {
-                if !faults.slow_idle_snapshot.is_zero() {
+                if !faults.slow_write.is_zero() {
                     faults.slowed = faults.slowed.saturating_add(1);
                 }
-                faults.slow_idle_snapshot
+                faults.slow_write
             })
             .unwrap_or_default()
     }

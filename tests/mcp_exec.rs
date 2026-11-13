@@ -3157,7 +3157,7 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     let world = sand_world(&mut run, 32);
     let faults = run.exec.faults();
     let slow = Duration::from_millis(600);
-    faults.lock().unwrap().slow_idle_snapshot = slow;
+    faults.lock().unwrap().slow_write = slow;
     let budget = 40;
     let mut worst = Duration::ZERO;
     let mut after = None;
@@ -3331,7 +3331,7 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
     let world = sand_world(&mut run, 32);
     let faults = run.exec.faults();
     let slow = Duration::from_millis(2000);
-    faults.lock().unwrap().slow_idle_snapshot = slow;
+    faults.lock().unwrap().slow_write = slow;
     let budget = 200;
     let began = Instant::now();
     let mut calls = 0;
@@ -3440,6 +3440,48 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
     );
     assert!(took <= most, "{took:?}, more than {most:?}");
     assert!(took >= least, "{took:?}, less than {least:?}");
+    run.exec.finish();
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
+    let Some(host) = device("slow disk in a step") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("slow-disk");
+    let mut run = Run::new(&Options {
+        dir: Some(scratch.dir()),
+        memory: None,
+    });
+    let world = sand_world(&mut run, 64);
+    let faults = run.exec.faults();
+    let slow = Duration::from_millis(2000);
+    faults.lock().unwrap().slow_write = slow;
+    let budget = 1000;
+    let mut worst = Duration::ZERO;
+    for call in 0..10 {
+        let asked = Instant::now();
+        let got = run.ask(
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
+        );
+        let took = asked.elapsed();
+        let told = answer(&got);
+        assert!(told.int_at("frame") > 0, "call {call}: {}", written(&got));
+        let most = late_most(&mut run, budget);
+        assert!(
+            took <= most,
+            "call {call} took {took:?}, more than {most:?}"
+        );
+        worst = worst.max(took);
+    }
+    let slowed = faults.lock().unwrap().slowed;
+    eprintln!(
+        "10 steps of {budget} ms beside {slowed} snapshot writes of {slow:?}; the slowest took {worst:?}"
+    );
+    assert!(slowed >= 2, "{slowed}");
     run.exec.finish();
 }
 
