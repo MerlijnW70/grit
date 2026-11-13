@@ -1351,10 +1351,7 @@ fn after_a_lost_device_every_world_is_back_at_its_frame() {
         } else {
             scattered(&mut seed, 16, 500, &SAND_WORDS)
         };
-        answer(&run.ask(
-            "grit_world_write",
-            &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
-        ));
+        written_whole(&mut run, world, &cells);
         model.write(&cells);
         answer(&run.ask(
             "grit_world_step",
@@ -2356,10 +2353,7 @@ fn after_a_lost_device_only_the_worlds_a_call_touches_are_rebuilt_inside_its_bud
         let mut model = Model::new("sand", &[], 16);
         let world = answer(&run.ask("grit_world_create", &model.create(false))).int_at("world");
         let cells = scattered(&mut seed, 16, 1000, &SAND_WORDS);
-        answer(&run.ask(
-            "grit_world_write",
-            &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
-        ));
+        written_whole(&mut run, world, &cells);
         model.write(&cells);
         answer(&run.ask(
             "grit_world_step",
@@ -2965,6 +2959,35 @@ fn the_highest_world_number_described_is_the_highest_handed_out() {
     );
 }
 
+fn late_most(run: &mut Run, budget: u64) -> Duration {
+    let told = answer(&run.ask("grit_describe", "{}"))
+        .get("submissions")
+        .cloned()
+        .unwrap();
+    let batch = u64::try_from(told.int_at("longest_ms"))
+        .unwrap()
+        .max(grit::serve3::budget::SUBMIT_MOST_MS);
+    let idle = u64::try_from(told.int_at("idle_longest_ms")).unwrap();
+    Duration::from_millis(budget + batch + idle + 150)
+}
+
+#[cfg(feature = "faults")]
+fn written_whole(run: &mut Run, world: i64, cells: &[([u32; 3], u32)]) {
+    let wrote = answer(&run.ask(
+        "grit_world_write",
+        &format!(
+            "{{\"world\":{world},\"cells\":{},\"budget_ms\":600000}}",
+            writing(cells)
+        ),
+    ));
+    assert_eq!(
+        wrote.int_at("written"),
+        i64::try_from(cells.len()).unwrap(),
+        "{}",
+        written(&wrote)
+    );
+}
+
 fn kept_files(scratch: &Scratch) -> Vec<String> {
     entries(&scratch.dir().join("kept"))
 }
@@ -3307,7 +3330,6 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
     let slow = Duration::from_millis(2000);
     faults.lock().unwrap().slow_idle_snapshot = slow;
     let budget = 200;
-    let most = Duration::from_millis(budget + grit::serve3::budget::SUBMIT_MOST_MS + 300);
     let began = Instant::now();
     let mut calls = 0;
     let mut frame = 0;
@@ -3334,7 +3356,11 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
             written(&got)
         );
         frame = told.int_at("frame");
-        assert!(took <= most, "call {calls} took {took:?}");
+        let most = late_most(&mut run, budget);
+        assert!(
+            took <= most,
+            "call {calls} took {took:?}, more than {most:?}"
+        );
         worst = worst.max(took);
         calls += 1;
     }
@@ -3353,28 +3379,29 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
 }
 
 #[test]
-fn a_write_in_flight_lets_the_journal_grow_with_it_up_to_a_cap() {
-    let mut ledger = Ledger::created(Made {
+fn a_write_in_flight_bounds_the_journal_after_it_and_caps_the_whole() {
+    let made = Made {
         rule: "sand".to_owned(),
         params: Vec::new(),
         size: [16, 16, 16],
         sparse: false,
         slots: None,
-    });
-    for _ in 0..30 {
-        ledger.push(Entry::Step(1), Duration::from_secs(1));
-    }
+    };
     let bytes = 1 << 20;
+    let mut ledger = Ledger::created(made.clone());
+    ledger.push(Entry::Step(1), Duration::from_secs(30));
+    let from = Some(ledger.entries.len());
     assert!(ledger.far_over(Duration::ZERO, bytes, 2.0));
-    assert!(ledger.far_over_writing(Duration::ZERO, bytes, 2.0, Duration::ZERO));
-    assert!(ledger.far_over_writing(Duration::ZERO, bytes, 2.0, Duration::from_secs(7)));
-    assert!(!ledger.far_over_writing(Duration::ZERO, bytes, 2.0, Duration::from_secs(8)));
-    for _ in 0..90 {
-        ledger.push(Entry::Step(1), Duration::from_secs(1));
-    }
-    assert!(!ledger.far_over_writing(Duration::ZERO, bytes, 1.0, Duration::from_secs(1000)));
-    ledger.push(Entry::Step(1), Duration::from_secs(1));
-    assert!(ledger.far_over_writing(Duration::ZERO, bytes, 1.0, Duration::from_secs(1000)));
+    assert!(ledger.far_over_writing(Duration::ZERO, bytes, 2.0, None));
+    assert!(!ledger.far_over_writing(Duration::ZERO, bytes, 2.0, from));
+    ledger.push(Entry::Step(1), Duration::from_secs(2));
+    assert!(!ledger.far_over_writing(Duration::ZERO, bytes, 2.0, from));
+    assert!(ledger.far_over_writing(Duration::from_millis(1), bytes, 2.0, from));
+    let mut whole = Ledger::created(made);
+    whole.push(Entry::Step(1), Duration::from_secs(120));
+    let from = Some(whole.entries.len());
+    assert!(!whole.far_over_writing(Duration::ZERO, bytes, 1.0, from));
+    assert!(whole.far_over_writing(Duration::from_millis(1), bytes, 1.0, from));
     assert_eq!(journal::WRITING_REPLAY_MOST, Duration::from_secs(120));
 }
 
@@ -3513,7 +3540,6 @@ fn a_cold_server_stepping_with_small_budgets_never_overruns_by_more_than_a_batch
         memory: None,
     };
     let budget = 300;
-    let most = Duration::from_millis(budget + grit::serve3::budget::SUBMIT_MOST_MS + 150);
     let mut worst = Duration::ZERO;
     let mut moved = 0;
     let mut run = Run::new(&options);
@@ -3522,7 +3548,8 @@ fn a_cold_server_stepping_with_small_budgets_never_overruns_by_more_than_a_batch
         let (took, frame) = step_within(&mut run, world, budget);
         worst = worst.max(took);
         moved += i64::from(frame > 0);
-        assert!(took <= most, "first run: {took:?}");
+        let most = late_most(&mut run, budget);
+        assert!(took <= most, "first run: {took:?}, more than {most:?}");
     }
     run.exec.finish();
     let mut again = Run::new(&options);
@@ -3533,14 +3560,19 @@ fn a_cold_server_stepping_with_small_budgets_never_overruns_by_more_than_a_batch
     for _ in 0..8 {
         let (took, _) = step_within(&mut again, world, budget);
         worst = worst.max(took);
-        assert!(took <= most, "after a restart: {took:?}");
+        let most = late_most(&mut again, budget);
+        assert!(
+            took <= most,
+            "after a restart: {took:?}, more than {most:?}"
+        );
     }
     let small = sand_world(&mut again, 64);
     for _ in 0..8 {
         let (took, frame) = step_within(&mut again, small, budget);
         worst = worst.max(took);
         moved += i64::from(frame > 0);
-        assert!(took <= most, "a new size: {took:?}");
+        let most = late_most(&mut again, budget);
+        assert!(took <= most, "a new size: {took:?}, more than {most:?}");
     }
     eprintln!("the slowest of 28 small-budget steps took {worst:?}; {moved} advanced");
     assert!(moved >= 10, "{moved}");

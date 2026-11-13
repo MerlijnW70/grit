@@ -31,7 +31,6 @@ const LANDING: Duration = Duration::from_millis(10);
 struct Job {
     request: Json,
     id: Json,
-    arrived: Instant,
     cancel: Arc<AtomicBool>,
     state: Arc<AtomicU8>,
 }
@@ -42,24 +41,22 @@ struct Flight {
     state: Arc<AtomicU8>,
     arrived: Instant,
     budget_ms: u64,
-    excused: Duration,
+    behind: Duration,
 }
 
 impl Flight {
-    fn charged(&self, now: Instant, idle: Option<Instant>) -> Duration {
-        let behind = idle.map_or(Duration::ZERO, |began| {
+    fn charged(&self, now: Instant, busy: Option<Instant>) -> Duration {
+        let running = busy.map_or(Duration::ZERO, |began| {
             now.saturating_duration_since(began.max(self.arrived))
         });
-        now.saturating_duration_since(self.arrived)
-            .saturating_sub(self.excused)
-            .saturating_sub(behind)
+        self.behind.saturating_add(running)
     }
 }
 
 #[derive(Default)]
 struct Flights {
     list: Vec<Flight>,
-    idle: Option<Instant>,
+    busy: Option<Instant>,
 }
 
 struct Shared {
@@ -105,9 +102,9 @@ fn watch(shared: &Shared, answers: &Sender<Json>) {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
-        let idle = flights.idle;
+        let busy = flights.busy;
         flights.list.retain(|flight| {
-            let charged = flight.charged(now, idle);
+            let charged = flight.charged(now, busy);
             if charged < Duration::from_millis(flight.budget_ms) {
                 return true;
             }
@@ -140,32 +137,28 @@ impl Shared {
         }
     }
 
-    fn excused(&self, cancel: &Arc<AtomicBool>) -> Duration {
+    fn behind(&self, cancel: &Arc<AtomicBool>) -> Duration {
         self.flights
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .list
             .iter()
             .find(|flight| Arc::ptr_eq(&flight.cancel, cancel))
-            .map_or(Duration::ZERO, |flight| flight.excused)
+            .map_or(Duration::ZERO, |flight| flight.behind)
     }
 
-    fn idling(&self, server: &mut Server<'_>) -> bool {
-        self.aside(|| server.idle())
-    }
-
-    fn aside<T>(&self, work: impl FnOnce() -> T) -> T {
+    fn running<T>(&self, work: impl FnOnce() -> T) -> T {
         self.flights
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .idle = Some(Instant::now());
+            .busy = Some(Instant::now());
         let did = work();
         let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
-        if let Some(began) = flights.idle.take() {
+        if let Some(began) = flights.busy.take() {
             for flight in &mut flights.list {
                 let behind = now.saturating_duration_since(began.max(flight.arrived));
-                flight.excused = flight.excused.saturating_add(behind);
+                flight.behind = flight.behind.saturating_add(behind);
             }
         }
         did
@@ -321,7 +314,7 @@ fn work(
         let mut reopen = false;
         let mut answered = false;
         loop {
-            if std::mem::take(&mut answered) && !server.lost() && shared.idling(&mut server) {
+            if std::mem::take(&mut answered) && !server.lost() && server.idle() {
                 shared.publish(&server);
                 if server.lost() {
                     reopen = true;
@@ -333,7 +326,7 @@ fn work(
                 None => match jobs.try_recv() {
                     Ok(job) => job,
                     Err(mpsc::TryRecvError::Empty) => {
-                        if !server.lost() && shared.idling(&mut server) {
+                        if !server.lost() && server.idle() {
                             shared.publish(&server);
                             if server.lost() {
                                 reopen = true;
@@ -342,22 +335,20 @@ fn work(
                             continue;
                         }
                         let waited = if server.writing() {
-                            shared.aside(|| jobs.recv_timeout(LANDING))
+                            jobs.recv_timeout(LANDING)
                         } else {
-                            shared.aside(|| {
-                                let got = jobs
-                                    .recv()
-                                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
-                                #[cfg(feature = "faults")]
-                                std::thread::sleep(
-                                    server
-                                        .faults()
-                                        .lock()
-                                        .map(|faults| faults.slow_wake)
-                                        .unwrap_or_default(),
-                                );
-                                got
-                            })
+                            let got = jobs
+                                .recv()
+                                .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
+                            #[cfg(feature = "faults")]
+                            std::thread::sleep(
+                                server
+                                    .faults()
+                                    .lock()
+                                    .map(|faults| faults.slow_wake)
+                                    .unwrap_or_default(),
+                            );
+                            got
                         };
                         match waited {
                             Ok(job) => job,
@@ -381,9 +372,10 @@ fn work(
             {
                 continue;
             }
-            let arrived = job.arrived + shared.excused(&job.cancel);
+            let now = Instant::now();
+            let arrived = now.checked_sub(shared.behind(&job.cancel)).unwrap_or(now);
             server.arriving(Some(arrived), Some(Arc::clone(&job.cancel)));
-            let answer = server.handle(&job.request).unwrap_or(Json::Null);
+            let answer = shared.running(|| server.handle(&job.request).unwrap_or(Json::Null));
             server.arriving(None, None);
             shared.publish(&server);
             if server.lost() {
@@ -529,13 +521,12 @@ impl Exec {
                 state: Arc::clone(&state),
                 arrived,
                 budget_ms: budget_of(&request),
-                excused: Duration::ZERO,
+                behind: Duration::ZERO,
             });
         }
         let job = Job {
             request,
             id,
-            arrived,
             cancel,
             state,
         };

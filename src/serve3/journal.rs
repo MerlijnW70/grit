@@ -30,6 +30,8 @@ pub const HARD: u32 = 2;
 
 pub const WRITING_REPLAY_MOST: Duration = Duration::from_secs(120);
 
+pub const WRITING_BYTES_FACTOR: usize = 8;
+
 pub const WRITE_CHUNK: usize = 32;
 
 const SNAPSHOT_BYTES_PER_SECOND: f64 = 2.5e8;
@@ -203,37 +205,41 @@ impl Ledger {
         extra: Duration,
         world_bytes: u64,
         ratio: f64,
-        writing: Duration,
+        writing: Option<usize>,
     ) -> bool {
-        let hard = self.replay_most().saturating_mul(HARD);
-        let most = hard.max(
-            writing
-                .saturating_mul(4)
-                .saturating_mul(HARD)
-                .min(WRITING_REPLAY_MOST),
+        let Some(from) = writing else {
+            return self.far_over(extra, world_bytes, ratio);
+        };
+        let from = from.min(self.entries.len());
+        let (tail_bytes, tail_replay) = self.entries.iter().zip(&self.recorded).skip(from).fold(
+            (0_usize, Duration::ZERO),
+            |(bytes, replay), (entry, spent)| {
+                (
+                    bytes.saturating_add(entry.bytes()),
+                    replay.saturating_add(*spent),
+                )
+            },
         );
-        self.beyond(extra, world_bytes, ratio, HARD, most)
+        let bound = usize::try_from(world_bytes)
+            .unwrap_or(usize::MAX)
+            .max(JOURNAL_LEAST);
+        let ratio = ratio.max(1.0);
+        let hard = self.replay_most().saturating_mul(HARD);
+        let tail = tail_replay.saturating_add(extra).mul_f64(ratio);
+        let whole = self.replay.saturating_add(extra).mul_f64(ratio);
+        tail_bytes > bound.saturating_mul(HARD as usize)
+            || tail > hard
+            || self.bytes > bound.saturating_mul(WRITING_BYTES_FACTOR)
+            || whole > hard.max(WRITING_REPLAY_MOST)
     }
 
     fn past(&self, extra: Duration, world_bytes: u64, ratio: f64, times: u32) -> bool {
-        let most = self.replay_most().saturating_mul(times);
-        self.beyond(extra, world_bytes, ratio, times, most)
-    }
-
-    fn beyond(
-        &self,
-        extra: Duration,
-        world_bytes: u64,
-        ratio: f64,
-        times: u32,
-        most: Duration,
-    ) -> bool {
         let bytes = usize::try_from(world_bytes)
             .unwrap_or(usize::MAX)
             .max(JOURNAL_LEAST)
             .saturating_mul(times as usize);
         let replaying = self.replay.saturating_add(extra).mul_f64(ratio.max(1.0));
-        self.bytes > bytes || replaying > most
+        self.bytes > bytes || replaying > self.replay_most().saturating_mul(times)
     }
 
     #[must_use]

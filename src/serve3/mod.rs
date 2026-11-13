@@ -269,6 +269,7 @@ pub struct Stats {
     pub batches: Arc<std::sync::atomic::AtomicU64>,
     pub longest: Duration,
     pub longest_frames: u32,
+    pub idle_longest: Duration,
 }
 
 #[cfg(feature = "faults")]
@@ -422,11 +423,11 @@ impl Book {
         }
     }
 
-    fn writing_elapsed(&self, number: u32) -> Duration {
+    fn writing_from(&self, number: u32) -> Option<usize> {
         self.writing
             .as_ref()
             .filter(|writing| writing.number == number)
-            .map_or(Duration::ZERO, |writing| writing.began.elapsed())
+            .map(|writing| writing.from)
     }
 
     fn writing_for(&self, number: u32) -> bool {
@@ -1160,7 +1161,7 @@ impl<'host> Server<'host> {
             Duration::ZERO,
             held.bytes,
             ratio,
-            self.book.writing_elapsed(number),
+            self.book.writing_from(number),
         );
         if self.book.writing_for(number) {
             if !far {
@@ -1407,12 +1408,24 @@ impl<'host> Server<'host> {
                 extra,
                 held.bytes,
                 self.book.rates.replay(),
-                self.book.writing_elapsed(number),
+                self.book.writing_from(number),
             )
         })
     }
 
     pub fn idle(&mut self) -> bool {
+        let began = Instant::now();
+        let did = self.idle_unit();
+        if did {
+            let took = began.elapsed();
+            if took > self.book.stats.idle_longest {
+                self.book.stats.idle_longest = took;
+            }
+        }
+        did
+    }
+
+    fn idle_unit(&mut self) -> bool {
         if self.book.writing.is_some() {
             let landed = self.book.landed(Wait::Poll);
             if landed {
@@ -1587,6 +1600,12 @@ impl<'host> Server<'host> {
                     ),
                 ),
                 ("longest_frames", counted(self.book.stats.longest_frames)),
+                (
+                    "idle_longest_ms",
+                    budget::counted64(
+                        u64::try_from(self.book.stats.idle_longest.as_millis()).unwrap_or(u64::MAX),
+                    ),
+                ),
                 ("rates", self.book.rates.shown()),
                 (
                     "read_waits",
