@@ -3253,6 +3253,38 @@ fn a_call_queued_behind_a_slow_snapshot_kept_in_memory_keeps_its_whole_budget() 
     behind_idle_work(false);
 }
 
+#[cfg(feature = "faults")]
+#[test]
+fn a_call_to_an_idle_server_is_not_charged_for_the_worker_waking() {
+    let Some(host) = device("slow wake") else {
+        return;
+    };
+    drop(host);
+    let mut run = Run::new(&Options::default());
+    let world = sand_world(&mut run, 16);
+    let wake = Duration::from_millis(60);
+    run.exec.faults().lock().unwrap().slow_wake = wake;
+    std::thread::sleep(Duration::from_millis(100));
+    let budget = 20;
+    let began = Instant::now();
+    let got = run.ask(
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
+    );
+    let took = began.elapsed();
+    let result = got.get("result").unwrap();
+    assert_eq!(
+        result.get("isError"),
+        Some(&Json::Bool(false)),
+        "after {took:?}: {}",
+        written(&got)
+    );
+    let told = result.get("structuredContent").unwrap();
+    assert!(told.int_at("ran") > 0, "{}", written(&got));
+    eprintln!("a call of {budget} ms to a worker that woke {wake:?} late answered in {took:?}");
+    run.exec.finish();
+}
+
 #[test]
 fn a_directory_planted_where_a_snapshot_is_written_does_not_stop_snapshots() {
     let Some(host) = device("planted pending directory") else {

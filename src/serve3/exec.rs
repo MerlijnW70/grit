@@ -151,11 +151,15 @@ impl Shared {
     }
 
     fn idling(&self, server: &mut Server<'_>) -> bool {
+        self.aside(|| server.idle())
+    }
+
+    fn aside<T>(&self, work: impl FnOnce() -> T) -> T {
         self.flights
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .idle = Some(Instant::now());
-        let did = server.idle();
+        let did = work();
         let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         if let Some(began) = flights.idle.take() {
@@ -315,7 +319,15 @@ fn work(
             waiting = Some(Waiting::Unrun(job));
         }
         let mut reopen = false;
+        let mut answered = false;
         loop {
+            if std::mem::take(&mut answered) && !server.lost() && shared.idling(&mut server) {
+                shared.publish(&server);
+                if server.lost() {
+                    reopen = true;
+                    break;
+                }
+            }
             let job = match waiting.take() {
                 Some(Waiting::Unrun(job)) => job,
                 None => match jobs.try_recv() {
@@ -329,17 +341,28 @@ fn work(
                             }
                             continue;
                         }
-                        if server.writing() {
-                            match jobs.recv_timeout(LANDING) {
-                                Ok(job) => job,
-                                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                            }
+                        let waited = if server.writing() {
+                            shared.aside(|| jobs.recv_timeout(LANDING))
                         } else {
-                            match jobs.recv() {
-                                Ok(job) => job,
-                                Err(_) => break,
-                            }
+                            shared.aside(|| {
+                                let got = jobs
+                                    .recv()
+                                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
+                                #[cfg(feature = "faults")]
+                                std::thread::sleep(
+                                    server
+                                        .faults()
+                                        .lock()
+                                        .map(|faults| faults.slow_wake)
+                                        .unwrap_or_default(),
+                                );
+                                got
+                            })
+                        };
+                        match waited {
+                            Ok(job) => job,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         }
                     }
                     Err(mpsc::TryRecvError::Disconnected) => break,
@@ -379,6 +402,7 @@ fn work(
                     .map(|faults| faults.pause_after_answer)
                     .unwrap_or_default(),
             );
+            answered = true;
         }
         book = server.into_book();
         drop(host);

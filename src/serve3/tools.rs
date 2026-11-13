@@ -1088,7 +1088,7 @@ pub fn describe(status: &Status) -> Json {
                 (
                     "budget_late",
                     text(
-                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to read its largest world back for a snapshot between calls; a call is not charged for that wait",
+                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait",
                     ),
                 ),
                 (

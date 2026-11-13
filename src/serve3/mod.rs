@@ -283,6 +283,7 @@ pub struct Faults {
     pub slow_idle_work: Duration,
     pub idle_works: u32,
     pub pause_after_answer: Duration,
+    pub slow_wake: Duration,
 }
 
 impl Book {
@@ -1402,18 +1403,13 @@ impl<'host> Server<'host> {
         }
         let ratio = self.book.rates.replay();
         let now = Instant::now();
-        let behind = self.book.keep.is_some();
         let owed = self
             .book
             .held
             .iter()
             .find(|(number, held)| {
-                let quick = behind
-                    || self.book.rates.estimate(budget::Work::Save, held.bytes)
-                        <= Duration::from_millis(budget::SUBMIT_MOST_MS);
                 self.live.contains_key(number)
                     && held.ledger.due(held.bytes, ratio)
-                    && (quick || held.ledger.far_over(Duration::ZERO, held.bytes, ratio))
                     && held
                         .snap_failure
                         .as_ref()
