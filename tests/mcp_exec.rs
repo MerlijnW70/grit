@@ -2681,7 +2681,7 @@ fn a_write_replayed_on_open_does_not_slow_the_next_create() {
 }
 
 #[test]
-fn one_skewed_replay_does_not_slow_another_world() {
+fn one_skewed_replay_raises_the_replay_estimate_at_once_and_no_further_than_its_clamp() {
     let Some(host) = device("skewed replay") else {
         return;
     };
@@ -2695,7 +2695,7 @@ fn one_skewed_replay_does_not_slow_another_world() {
         sparse: false,
         slots: None,
     });
-    ledger.push(Entry::Step(4000), Duration::from_millis(50));
+    ledger.push(Entry::Step(40000), Duration::from_millis(50));
     keep.begin(1, &ledger).unwrap();
     keep.set_next(2).unwrap();
     drop(keep);
@@ -2707,7 +2707,7 @@ fn one_skewed_replay_does_not_slow_another_world() {
         "grit_world_open",
         "{\"name\":\"world-1\",\"budget_ms\":600000}",
     ));
-    assert_eq!(opened.int_at("frame"), 4000);
+    assert_eq!(opened.int_at("frame"), 40000);
     let rates = answer(&run.ask("grit_describe", "{}"))
         .get("submissions")
         .and_then(|one| one.get("rates"))
@@ -2715,7 +2715,8 @@ fn one_skewed_replay_does_not_slow_another_world() {
         .unwrap();
     eprintln!("rates after the skewed replay: {}", written(&rates));
     assert_eq!(rates.int_at("replay_observations"), 1);
-    assert_eq!(rates.int_at("replay_per_recorded_percent"), 200);
+    let ratio = rates.int_at("replay_per_recorded_percent");
+    assert!(ratio > 200 && ratio <= 800, "{ratio}");
     run.exec.finish();
 }
 
@@ -3006,10 +3007,21 @@ fn a_failed_snapshot_between_calls_backs_off_is_named_and_leaves_no_files() {
     run.exec.faults().lock().unwrap().fail_snapshots = 0;
     let began = Instant::now();
     loop {
-        answer(&run.ask(
+        let got = run.ask(
             "grit_world_step",
             &format!("{{\"world\":{world},\"frames\":1}}"),
-        ));
+        );
+        let result = got.get("result").unwrap();
+        if result.get("isError") == Some(&Json::Bool(true)) {
+            let told = result.get("structuredContent").unwrap();
+            assert_eq!(
+                told.get("code").and_then(Json::text),
+                Some("io"),
+                "{}",
+                written(&got)
+            );
+            assert!(written(&got).contains("the next is"), "{}", written(&got));
+        }
         let item = listed_world(&mut run, world);
         if item.get("snapshot_failed").is_none() {
             break;
