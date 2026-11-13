@@ -606,10 +606,19 @@ fn the_time_a_repeated_frame_reports_is_the_time_of_one_of_them() {
     held.write(0, &[0, 0, 0, 0]).unwrap();
 
     let groups = [Groups::Fixed(1)];
-    let once = held.frames(&groups, 1).unwrap();
-    let many = held.frames(&groups, 16).unwrap();
-    eprintln!("{once:?} {many:?}");
+    for times in [1_u32, 16] {
+        let began = std::time::Instant::now();
+        let reported = held.frames(&groups, times).unwrap();
+        let around = began.elapsed();
+        let device = held.on_device().unwrap();
+        eprintln!("{times} {reported:?} {around:?} {device:?}");
+
+        assert!(
+            reported * times <= around,
+            "{reported:?} x {times} > {around:?}"
+        );
+        assert!(reported >= device, "{reported:?} < {device:?}");
+    }
 
     assert_eq!(held.read(0, 1).unwrap(), vec![17]);
-    assert!(many < once * 8);
 }
