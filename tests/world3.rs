@@ -245,7 +245,7 @@ fn the_rules_are_listed_with_their_parameter_counts() {
     let got = answer(&call(&mut Server::new(None), "grit_world_rules", "{}"));
     assert_eq!(
         written(got.get("rules").unwrap()),
-        "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":1},{\"name\":\"embed\",\"params\":1}]"
+        "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":1},{\"name\":\"evo\",\"params\":8},{\"name\":\"embed\",\"params\":1}]"
     );
 }
 
@@ -265,7 +265,7 @@ fn an_unknown_rule_is_refused_and_the_refusal_lists_the_rules() {
             .unwrap();
         assert_eq!(
             written(told.get("rules").unwrap()),
-            "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":1},{\"name\":\"embed\",\"params\":1}]"
+            "[{\"name\":\"sand\",\"params\":0},{\"name\":\"heat\",\"params\":3},{\"name\":\"code\",\"params\":0},{\"name\":\"nature\",\"params\":1},{\"name\":\"evo\",\"params\":8},{\"name\":\"embed\",\"params\":1}]"
         );
         let message = told.get("message").and_then(Json::text).unwrap();
         assert!(
