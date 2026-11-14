@@ -900,7 +900,9 @@ impl<'host> Server<'host> {
             .as_ref()
             .err()
             .is_some_and(|why| why.downcast_ref::<budget::Halted>().is_some());
-        if built.is_ok() || cut {
+        if cut {
+            rates.measure_cut_replay(timings.recorded, timings.steps);
+        } else if built.is_ok() {
             rates.measure_replay(timings.recorded, timings.steps);
         }
         built

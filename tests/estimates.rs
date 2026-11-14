@@ -277,6 +277,27 @@ fn the_prior_never_outvotes_one_measured_write_of_a_similar_size() {
 }
 
 #[test]
+fn a_cut_replay_that_ran_few_frames_is_still_measured() {
+    let mut rates = Rates::default();
+    rates.measure_replay(Duration::from_secs(1), Duration::from_secs(1));
+    let recorded = Duration::from_millis(30);
+    let spent = Duration::from_millis(1500);
+    rates.measure_replay(recorded, spent);
+    assert!(
+        (rates.replay_least() - 1.0).abs() < 1e-9,
+        "a finished replay below the floor is noise"
+    );
+    for _ in 0..3 {
+        rates.measure_cut_replay(recorded, spent);
+    }
+    assert!(
+        rates.replay_least() >= 8.0 - 1e-9,
+        "three cut replays that ran 30 ms of recorded steps in 1.5 s: {}",
+        rates.replay_least()
+    );
+}
+
+#[test]
 fn a_slow_replay_never_raises_the_least_replay_ratio() {
     let mut rates = Rates::default();
     assert!(rates.replay_least().abs() < 1e-9);
@@ -473,6 +494,17 @@ mod served {
         Scratch(path)
     }
 
+    fn replays_measured(server: &mut Server<'_>) -> usize {
+        let told = result(&call(server, "grit_describe", "{}"), false);
+        let observed = told
+            .get("submissions")
+            .and_then(|one| one.get("rates"))
+            .and_then(|one| one.get("replay_observations"))
+            .and_then(Json::int)
+            .unwrap();
+        usize::try_from(observed).unwrap()
+    }
+
     fn opened(server: &mut Server<'_>, number: u32, budget: Duration) -> Json {
         call(
             server,
@@ -511,11 +543,14 @@ mod served {
         };
         let mut server = Server::with(Some(&host), &options).unwrap();
         result(&opened(&mut server, 1, Duration::from_secs(600)), false);
+        let fast = replays_measured(&mut server);
+        let bound = 2 * fast + 1;
         let budget = Duration::from_millis(1500);
         grit::serve3::tools::faults::stall_every(Duration::from_millis(2));
         let mut cut = 0;
         let mut refused = None;
-        for _ in 0..6 {
+        for _ in 0..=bound + 1 {
+            let before = replays_measured(&mut server);
             let began = Instant::now();
             let told = result(&opened(&mut server, 2, budget), true);
             let took = began.elapsed();
@@ -524,6 +559,11 @@ mod served {
             assert_eq!(told.get("code").and_then(Json::text), Some("budget"));
             assert!(took < budget + Duration::from_secs(1), "{took:?}");
             if message.contains("nothing was opened") {
+                assert_eq!(
+                    replays_measured(&mut server),
+                    before + 1,
+                    "a cut replay was not measured"
+                );
                 cut += 1;
                 continue;
             }
@@ -535,6 +575,9 @@ mod served {
         grit::serve3::tools::faults::disarm();
         let refused = refused.expect("a replay that never fits was never refused up front");
         assert!(refused < Duration::from_millis(500), "{refused:?}");
-        assert!(cut <= 3, "{cut} calls were cut before the refusal");
+        assert!(
+            cut <= bound,
+            "{cut} calls were cut before the refusal; with {fast} fast ratios kept the lower third needs at most {bound}"
+        );
     }
 }

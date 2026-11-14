@@ -660,7 +660,17 @@ impl Rates {
         if recorded < RATIO_LEAST_RECORDED {
             return;
         }
-        let sample = spent.as_secs_f64() / recorded.as_secs_f64();
+        self.replayed(spent.as_secs_f64() / recorded.as_secs_f64());
+    }
+
+    pub fn measure_cut_replay(&mut self, recorded: Duration, spent: Duration) {
+        if spent < RATIO_LEAST_RECORDED {
+            return;
+        }
+        self.replayed(spent.as_secs_f64() / recorded.as_secs_f64().max(f64::MIN_POSITIVE));
+    }
+
+    fn replayed(&mut self, sample: f64) {
         if !sample.is_finite() || sample <= 0.0 {
             return;
         }
