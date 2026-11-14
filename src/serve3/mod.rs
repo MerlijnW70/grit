@@ -839,7 +839,7 @@ impl<'host> Server<'host> {
             _ => Duration::ZERO,
         };
         rates
-            .least(budget::Work::Build, bytes)
+            .least(budget::Work::build(ledger.made().sparse), bytes)
             .saturating_add(snapshot)
             .saturating_add(rates.least(budget::Work::Write, ledger.write_bytes()))
             .saturating_add(rates.replaying_least(ledger.step_recorded()))
@@ -872,7 +872,11 @@ impl<'host> Server<'host> {
         );
         let rates = &mut self.book.rates;
         if !timings.build.is_zero() {
-            rates.measure(budget::Work::Build, bytes, timings.build);
+            rates.measure(
+                budget::Work::build(ledger.made().sparse),
+                bytes,
+                timings.build,
+            );
         }
         if timings.file_bytes > 0 {
             rates.measure(budget::Work::File, timings.file_bytes, timings.file);
@@ -880,7 +884,11 @@ impl<'host> Server<'host> {
         if timings.write_bytes > 0 {
             rates.measure(budget::Work::Write, timings.write_bytes, timings.writes);
         }
-        if built.is_ok() {
+        let cut = built
+            .as_ref()
+            .err()
+            .is_some_and(|why| why.downcast_ref::<budget::Halted>().is_some());
+        if built.is_ok() || cut {
             rates.measure_replay(timings.recorded, timings.steps);
         }
         built
@@ -1228,7 +1236,7 @@ impl<'host> Server<'host> {
                     errors::Code::Budget,
                     "$.budget_ms",
                     format!(
-                        "world {number} owes a snapshot of its journal before it changes again, which needs at least {} ms by the fastest the server has measured such work, and this call has {} ms left; nothing ran",
+                        "world {number} owes a snapshot of its journal before it changes again, which needs at least {} ms by the lowest third of the server's recent measurements of such work, and this call has {} ms left; nothing ran",
                         needs.as_millis(),
                         self.clock.left().as_millis()
                     ),
@@ -1332,7 +1340,7 @@ impl<'host> Server<'host> {
         let sum = snap.sum;
         let cost = began.elapsed();
         let size = self.book.held.get(&number).map_or(0, |held| held.bytes);
-        self.book.rates.measure(budget::Work::Save, size, cost);
+        self.book.rates.measure(self.snap_work(), size, cost);
         let epoch = self.book.bump();
         let held = self
             .book
@@ -1407,14 +1415,22 @@ impl<'host> Server<'host> {
 
     fn snap_estimate(&self, number: u32) -> Duration {
         self.book.held.get(&number).map_or(Duration::ZERO, |held| {
-            self.book.rates.estimate(budget::Work::Save, held.bytes)
+            self.book.rates.estimate(self.snap_work(), held.bytes)
         })
     }
 
     fn snap_least(&self, number: u32) -> Duration {
         self.book.held.get(&number).map_or(Duration::ZERO, |held| {
-            self.book.rates.least(budget::Work::Save, held.bytes)
+            self.book.rates.least(self.snap_work(), held.bytes)
         })
+    }
+
+    const fn snap_work(&self) -> budget::Work {
+        if self.book.keep.is_some() {
+            budget::Work::Save
+        } else {
+            budget::Work::Snap
+        }
     }
 
     fn far_overdue(&self, number: u32, extra: Duration) -> bool {

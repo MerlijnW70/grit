@@ -578,7 +578,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     made.size = [grid.wide, grid.deep, grid.tall];
     let bytes = admitted(server, host, &sizes, "the world")?;
     server.fits(
-        server.book.rates.least(Work::Build, bytes),
+        server.book.rates.least(Work::build(sparse), bytes),
         "building the world",
     )?;
     let began = Instant::now();
@@ -595,7 +595,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server
         .book
         .rates
-        .measure(Work::Build, bytes, began.elapsed());
+        .measure(Work::build(sparse), bytes, began.elapsed());
     let id = server.number()?;
     let pace = first_pace(&world);
     let law = rule
@@ -1194,7 +1194,7 @@ pub fn describe(status: &Status) -> Json {
                 (
                     "budget_late",
                     text(
-                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait. A step whose budget the world's last two measured frames, by any client, both do not fit is refused at once, but after two calls in a row were refused since the last measurement the next one runs one frame to measure again; when only the last of the two does not fit, the step runs one frame to measure again; an open or rebuild runs one frame at the start of each journal entry its replay would otherwise stop at. Either answer can come after its budget by up to one frame of that world. Work that cannot stop part way (building, copying, saving or reading a world, and a snapshot a world owes) starts when the least time its recent measurements allow fits the time left and is refused at once when even that does not fit, so its answer can come after its budget by as much as the device runs slower than its fastest recent measurement",
+                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait. A step whose budget the world's last two measured frames, by any client, both do not fit is refused at once, but after two calls in a row were refused since the last measurement the next one runs one frame to measure again; when only the last of the two does not fit, the step runs one frame to measure again; an open or rebuild runs one frame at the start of each journal entry its replay would otherwise stop at. Either answer can come after its budget by up to one frame of that world. Work that cannot stop part way (building, copying, saving or reading a world, and a snapshot a world owes) is refused at once when even the lowest third of its recent measurements of the same kind (dense and sparse builds, and snapshots to disk and in memory, each apart) says it cannot fit the time left; otherwise it runs to its end, so its answer can come after its budget by as much as it then runs slower than those measurements, as when the device is busy or a world of a new shape compiles its kernels on its first build",
                     ),
                 ),
                 (
