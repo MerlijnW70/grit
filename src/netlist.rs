@@ -253,12 +253,14 @@ pub const fn turned(netlist: &Netlist, at: u32, gate: Gate, roll: u32) -> Gate {
 pub struct Exam {
     shape: Netlist,
     answers: Vec<u32>,
+    care: Option<Vec<bool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotAnExam {
     Rows { given: usize, wanted: usize },
     Stray { row: u32, holds: u32, outputs: u32 },
+    Nothing { rows: usize },
 }
 
 impl fmt::Display for NotAnExam {
@@ -278,6 +280,10 @@ impl fmt::Display for NotAnExam {
                 out,
                 "row {row} is {holds:#x}, which sets a bit that no output holds; with {outputs} outputs a row may only name bits 0 to {}",
                 outputs.saturating_sub(1)
+            ),
+            Self::Nothing { rows } => write!(
+                out,
+                "all {rows} rows of the table are null, so no row is cared about and nothing is asked; give at least one row a number, and leave null only the rows whose answer does not matter"
             ),
         }
     }
@@ -312,7 +318,66 @@ impl Exam {
                 });
             }
         }
-        Ok(Self { shape, answers })
+        Ok(Self {
+            shape,
+            answers,
+            care: None,
+        })
+    }
+
+    pub fn partial(shape: Netlist, answers: Vec<Option<u32>>) -> Result<Self, NotAnExam> {
+        let rows = answers.len();
+        let cared: Vec<bool> = answers.iter().map(Option::is_some).collect();
+        let held: Vec<u32> = answers.iter().map(|one| one.unwrap_or(0)).collect();
+        let whole = Self::of(shape, held)?;
+        if !cared.iter().any(|one| *one) {
+            return Err(NotAnExam::Nothing { rows });
+        }
+        if cared.iter().all(|one| *one) {
+            return Ok(whole);
+        }
+        Ok(Self {
+            care: Some(cared),
+            ..whole
+        })
+    }
+
+    pub fn over(&self, shape: Netlist) -> Result<Self, NotAnExam> {
+        let wanted = shape.words() as usize;
+        if self.answers.len() != wanted {
+            return Err(NotAnExam::Rows {
+                given: self.answers.len(),
+                wanted,
+            });
+        }
+        Ok(Self {
+            shape,
+            answers: self.answers.clone(),
+            care: self.care.clone(),
+        })
+    }
+
+    #[must_use]
+    pub const fn is_partial(&self) -> bool {
+        self.care.is_some()
+    }
+
+    #[must_use]
+    pub fn cares(&self, row: u32) -> bool {
+        match &self.care {
+            None => (row as usize) < self.answers.len(),
+            Some(care) => care.get(row as usize).copied().unwrap_or(false),
+        }
+    }
+
+    #[must_use]
+    pub fn cared(&self) -> u32 {
+        match &self.care {
+            None => self.shape.words(),
+            Some(care) => {
+                u32::try_from(care.iter().filter(|one| **one).count()).unwrap_or(u32::MAX)
+            }
+        }
     }
 
     #[must_use]
@@ -326,8 +391,8 @@ impl Exam {
     }
 
     #[must_use]
-    pub const fn marks(&self) -> u32 {
-        self.shape.words() * self.shape.outputs
+    pub fn marks(&self) -> u32 {
+        self.cared() * self.shape.outputs
     }
 
     #[must_use]
@@ -336,6 +401,7 @@ impl Exam {
         self.answers
             .iter()
             .enumerate()
+            .filter(|(row, _)| self.cares(*row as u32))
             .map(|(row, wanted)| {
                 let held = got.get(row).copied().unwrap_or(!*wanted);
                 (!(held ^ wanted) & !past).count_ones()

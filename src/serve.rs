@@ -7,8 +7,8 @@ use crate::host::Host;
 use crate::layout::{BRUSH, GRAND, PARAMS, STATE};
 use crate::machine::Machine;
 use crate::marking::{
-    BEST, BINDINGS, FEED, HELD, MARKED_INPUTS, SCORE, SEED, TRIAL, VALUES, WANTED, chosen, marked,
-    stepped, turned_on, words_of,
+    BEST, BINDINGS, FEED, HELD, MARKED_INPUTS, SCORE, SEED, TRIAL, VALUES, WANTED, chosen,
+    marked_by, stepped, turned_on, words_of,
 };
 use crate::netlist::{Chip, Exam, Gate, INPUTS, Netlist, OUTPUTS, SOURCES, drawn, turned};
 use crate::resident::{Groups, Resident};
@@ -33,6 +33,7 @@ pub const SEEDING: u32 = 0x1234_5678;
 pub struct Found {
     pub marks: u32,
     pub full: u32,
+    pub cared: Option<u32>,
     pub rounds: u32,
     pub crowd: u32,
     pub gates: Vec<Gate>,
@@ -72,7 +73,19 @@ fn columns(exam: &Exam) -> Vec<u32> {
             let mut one = 0_u32;
             for bit in 0..32_u32 {
                 let row = word * 32 + bit;
-                if row < shape.words() && (exam.asked(row) >> output) & 1 == 1 {
+                if row < shape.words() && exam.cares(row) && (exam.asked(row) >> output) & 1 == 1 {
+                    one |= 1 << bit;
+                }
+            }
+            held.push(one);
+        }
+    }
+    if exam.is_partial() {
+        for word in 0..wide {
+            let mut one = 0_u32;
+            for bit in 0..32_u32 {
+                let row = word * 32 + bit;
+                if row < shape.words() && exam.cares(row) {
                     one |= 1 << bit;
                 }
             }
@@ -182,13 +195,14 @@ fn times(parts: &[u32]) -> Result<usize, Box<dyn std::error::Error>> {
 fn room(
     shape: Netlist,
     many: u32,
+    partial: bool,
 ) -> Result<[usize; BINDINGS as usize], Box<dyn std::error::Error>> {
     let wide = words_of(shape);
     Ok([
         times(&[many, shape.gates])?,
         times(&[many, shape.gates])?,
         times(&[many, shape.sources(), wide])?,
-        times(&[shape.outputs, wide])?,
+        times(&[shape.outputs + u32::from(partial), wide])?,
         many as usize,
         many as usize,
         many as usize,
@@ -254,11 +268,13 @@ fn judged(shape: Netlist, exam: &Exam, gates: &[u32]) -> Result<Found, Box<dyn s
     let chip = Chip::of(shape, gates.to_vec(), named(shape))?;
     let table = chip.table();
     let wrong = (0..shape.words())
+        .filter(|row| exam.cares(*row))
         .filter(|row| table.get(*row as usize).copied() != Some(exam.asked(*row)))
         .collect();
     Ok(Found {
         marks: exam.scored(&table),
         full: exam.marks(),
+        cared: exam.is_partial().then(|| exam.cared()),
         rounds: 0,
         crowd: 0,
         gates: gates.iter().map(|one| Gate::unpack(*one)).collect(),
@@ -681,10 +697,10 @@ fn sought_within(
     let width = host.width();
     let many = whole(effort.crowd, width);
     let turn = turned_on(width, shape)?;
-    let mark = marked(width, shape)?;
+    let mark = marked_by(width, shape, exam.is_partial())?;
     let pick = chosen(width, shape, SIDE, many)?;
     let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
-    let sizes = room(shape, many)?;
+    let sizes = room(shape, many, exam.is_partial())?;
     let mut resident = host.resident(&sizes, &modules)?;
 
     let (crowd, seeds) = opening(shape, effort.seed, restart, many);
@@ -774,12 +790,33 @@ pub fn least(
     table: &[u32],
     effort: Effort,
 ) -> Result<Vec<Rung>, Box<dyn std::error::Error>> {
+    ladder(host, shape, effort, |narrowed| {
+        Ok(Exam::of(narrowed, table.to_vec())?)
+    })
+}
+
+pub fn least_of(
+    host: &Host,
+    exam: &Exam,
+    effort: Effort,
+) -> Result<Vec<Rung>, Box<dyn std::error::Error>> {
+    ladder(host, exam.shape(), effort, |narrowed| {
+        Ok(exam.over(narrowed)?)
+    })
+}
+
+fn ladder(
+    host: &Host,
+    shape: Netlist,
+    effort: Effort,
+    exam_for: impl Fn(Netlist) -> Result<Exam, Box<dyn std::error::Error>>,
+) -> Result<Vec<Rung>, Box<dyn std::error::Error>> {
     let mut rungs = Vec::new();
     let mut gates = shape.gates;
     let mut missed = 0;
     while gates >= shape.outputs.max(1) && missed < PATIENCE && rungs.len() < RUNGS {
         let narrowed = Netlist::over(shape.inputs, shape.outputs, gates, shape.kinds)?;
-        let exam = Exam::of(narrowed, table.to_vec())?;
+        let exam = exam_for(narrowed)?;
         let found = pressed(host, narrowed, &exam, effort)?;
         let solved = found.marks >= found.full;
         rungs.push(Rung { gates, found });
@@ -1062,6 +1099,9 @@ fn told(found: &Found, sought: bool) -> Json {
         ),
         ("checked_on_the_host", Json::Bool(true)),
     ];
+    if let Some(cared) = found.cared {
+        held.insert(3, ("cared", counted(cared)));
+    }
     if sought {
         held.push(("rounds", counted(found.rounds)));
         held.push(("crowd", counted(found.crowd)));
@@ -1093,6 +1133,39 @@ fn numbers(held: &Json, place: &str, key: &str) -> Result<Vec<u32>, Box<dyn std:
                         format!("{place}.{key}[{at}]"),
                         format!(
                             "{key} entry {at} is {}, which is not a whole number from 0 to {}",
+                            shown_value(one),
+                            u32::MAX
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn rows_given(held: &Json) -> Result<Vec<Option<u32>>, Box<dyn std::error::Error>> {
+    let Some(one) = held.get("table") else {
+        return Ok(Vec::new());
+    };
+    let list = one.list().ok_or_else(|| {
+        malformed(
+            "$.table".to_owned(),
+            format!("table is {}, which is not a list", shown_value(one)),
+        )
+    })?;
+    list.iter()
+        .enumerate()
+        .map(|(at, one)| {
+            if matches!(one, Json::Null) {
+                return Ok(None);
+            }
+            one.int()
+                .and_then(|one| u32::try_from(one).ok())
+                .map(Some)
+                .ok_or_else(|| {
+                    malformed(
+                        format!("$.table[{at}]"),
+                        format!(
+                            "table entry {at} is {}, which is neither null for a row that does not matter nor a whole number from 0 to {}",
                             shown_value(one),
                             u32::MAX
                         ),
@@ -1184,13 +1257,13 @@ fn asked(held: &Json, inputs: &Whole) -> Result<(Netlist, Exam), Box<dyn std::er
     let gates = gated(held, &GATES_WHOLE, outputs, inputs, "outputs")?;
     let shape = Netlist::over(inputs, outputs, gates, KINDS_HELD)?;
     present(held, "table")?;
-    let table = numbers(held, "$", "table")?;
+    let table = rows_given(held)?;
     let rows = shape.words();
     if table.len() != rows as usize {
         return Err(beyond(
             "$.table".to_owned(),
             format!(
-                "the table holds {} rows, and {inputs} inputs need exactly {rows}, one for every combination of the inputs",
+                "the table holds {} rows, and {inputs} inputs need exactly {rows}, one for every combination of the inputs; a row whose answer does not matter is null",
                 table.len()
             ),
             rows,
@@ -1198,7 +1271,9 @@ fn asked(held: &Json, inputs: &Whole) -> Result<(Netlist, Exam), Box<dyn std::er
     }
     let most = widest(outputs);
     for (at, row) in table.iter().enumerate() {
-        if *row > most {
+        if let Some(row) = row
+            && *row > most
+        {
             return Err(beyond(
                 format!("$.table[{at}]"),
                 format!("row {at} is {row}, which sets a bit past the {outputs} outputs"),
@@ -1206,7 +1281,16 @@ fn asked(held: &Json, inputs: &Whole) -> Result<(Netlist, Exam), Box<dyn std::er
             ));
         }
     }
-    Ok((shape, Exam::of(shape, table)?))
+    if table.iter().all(Option::is_none) {
+        return Err(malformed(
+            "$.table".to_owned(),
+            format!(
+                "all {} rows of the table are null, so no row is cared about and nothing is asked; give at least one row a number, and leave null only the rows whose answer does not matter",
+                table.len()
+            ),
+        ));
+    }
+    Ok((shape, Exam::partial(shape, table)?))
 }
 
 fn given(held: &Json, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
@@ -1786,6 +1870,14 @@ fn whole_item() -> Json {
     ])
 }
 
+fn row_item() -> Json {
+    map(vec![
+        ("type", Json::List(vec![text("integer"), text("null")])),
+        ("minimum", Json::Int(0)),
+        ("maximum", Json::Int(WORD)),
+    ])
+}
+
 fn gate() -> Json {
     object(
         vec![KIND_WHOLE.shown(), LEFT_WHOLE.shown(), RIGHT_WHOLE.shown()],
@@ -1809,8 +1901,8 @@ pub(crate) fn tools() -> Json {
     let table = (
         "table",
         array(
-            whole_item(),
-            "one word a row, the wanted output bits, lowest output in bit zero, below two to the outputs; exactly two to the inputs rows",
+            row_item(),
+            "one word a row, the wanted output bits, lowest output in bit zero, below two to the outputs; exactly two to the inputs rows; null marks a row whose answer does not matter, and only the other rows are scored, at least one",
         ),
     );
     let shape = vec![
@@ -2987,8 +3079,7 @@ pub(crate) fn ran(
             let host = device(host)?;
             let many = effort.crowd;
             let rounds = effort.rounds;
-            let table: Vec<u32> = (0..shape.words()).map(|row| exam.asked(row)).collect();
-            let rungs = least(host, shape, &table, effort)?;
+            let rungs = least_of(host, &exam, effort)?;
             let smallest = rungs
                 .iter()
                 .filter(|rung| rung.found.marks >= rung.found.full)
@@ -3026,6 +3117,9 @@ pub(crate) fn ran(
                     ),
                 ),
             ];
+            if exam.is_partial() {
+                held.insert(3, ("cared", counted(exam.cared())));
+            }
             let failed_twice = rungs
                 .iter()
                 .rev()
@@ -3340,11 +3434,16 @@ pub fn credit_answer(
     ));
     held.push(("certified", counted(certified)));
     held.push(("certified_by", map(by)));
+    if board.partial() {
+        held.insert(3, ("cared", counted(board.cared())));
+    }
     held.push((
         "certified_means",
-        text(
-            "no circuit within this many field changes scores more than this one: every single change, and at 2 every pair, was evaluated exactly and none gains; 0 means a single change gains",
-        ),
+        text(if board.partial() {
+            "no circuit within this many field changes matches more cared rows than this one: every single change, and at 2 every pair, was evaluated exactly on the cared rows and none gains; 0 means a single change gains"
+        } else {
+            "no circuit within this many field changes scores more than this one: every single change, and at 2 every pair, was evaluated exactly and none gains; 0 means a single change gains"
+        }),
     ));
     held.push((
         "work",

@@ -214,7 +214,23 @@ fn kind_of(value: &Json) -> &'static str {
 }
 
 fn walk(schema: &Json, value: &Json, path: &str, check: Check) -> Result<Json, Found> {
-    let kind = schema.get("type").and_then(Json::text).unwrap_or("");
+    let kinds = schema.get("type").and_then(Json::list);
+    if matches!(value, Json::Null)
+        && kinds.is_some_and(|held| held.iter().any(|one| one.text() == Some("null")))
+    {
+        return Ok(value.clone());
+    }
+    let kind = schema
+        .get("type")
+        .and_then(Json::text)
+        .or_else(|| {
+            kinds.and_then(|held| {
+                held.iter()
+                    .filter_map(Json::text)
+                    .find(|one| *one != "null")
+            })
+        })
+        .unwrap_or("");
     let whole = check == Check::Whole;
     let typed = |wanted: &str| {
         found(

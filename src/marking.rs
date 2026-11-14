@@ -100,6 +100,18 @@ fn counted<const LANES: u32>(
 }
 
 pub fn marked(subgroup: u32, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    marked_by(subgroup, shape, false)
+}
+
+pub fn marked_cared(subgroup: u32, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    marked_by(subgroup, shape, true)
+}
+
+pub fn marked_by(
+    subgroup: u32,
+    shape: Netlist,
+    cared: bool,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     if shape.inputs > MARKED_INPUTS {
         return Err(Box::new(TooDeep::Inputs {
             inputs: shape.inputs,
@@ -107,11 +119,11 @@ pub fn marked(subgroup: u32, shape: Netlist) -> Result<Vec<u32>, Box<dyn std::er
         }));
     }
     Ok(match subgroup {
-        4 => marking::<4>(subgroup, shape)?,
-        8 => marking::<8>(subgroup, shape)?,
-        16 => marking::<16>(subgroup, shape)?,
-        32 => marking::<32>(subgroup, shape)?,
-        64 => marking::<64>(subgroup, shape)?,
+        4 => marking_by::<4>(subgroup, shape, cared)?,
+        8 => marking_by::<8>(subgroup, shape, cared)?,
+        16 => marking_by::<16>(subgroup, shape, cared)?,
+        32 => marking_by::<32>(subgroup, shape, cared)?,
+        64 => marking_by::<64>(subgroup, shape, cared)?,
         other => {
             return Err(Box::new(LaneError::NoMapping {
                 lanes: other,
@@ -162,6 +174,14 @@ pub fn marking<const LANES: u32>(
     subgroup: u32,
     shape: Netlist,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    marking_by::<LANES>(subgroup, shape, false)
+}
+
+pub fn marking_by<const LANES: u32>(
+    subgroup: u32,
+    shape: Netlist,
+    cared: bool,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
     let uint = kernel.index_type();
     let group = kernel.workgroup_index();
@@ -198,11 +218,20 @@ pub fn marking<const LANES: u32>(
             let got = kernel.load_at(VALUES, place)?;
             let asked = kernel.module().constant_u32(output * wide + word)?;
             let wanted = kernel.load_at(WANTED, asked)?;
+            let care = if cared {
+                let at = kernel.module().constant_u32(shape.outputs * wide + word)?;
+                Some(kernel.load_at(WANTED, at)?)
+            } else {
+                None
+            };
             let marks = {
                 let mut lanes = kernel.lanes()?;
                 let got = lanes.splat_id::<U32, LANES>(got)?;
                 let wanted = lanes.splat_id::<U32, LANES>(wanted)?;
-                let rows = lanes.splat_bits::<U32, LANES>(rows_of(shape, word))?;
+                let rows = match care {
+                    Some(care) => lanes.splat_id::<U32, LANES>(care)?,
+                    None => lanes.splat_bits::<U32, LANES>(rows_of(shape, word))?,
+                };
                 let apart = lanes.xor(got, wanted)?;
                 let same = lanes.not(apart)?;
                 let same = lanes.and(same, rows)?;
