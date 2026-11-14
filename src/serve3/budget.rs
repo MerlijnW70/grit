@@ -46,14 +46,15 @@ impl Stop {
     }
 }
 
+pub const REFUSED_MOST: u32 = 2;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {
     per_frame: Duration,
+    previous: Duration,
     measured: bool,
     last: u32,
-    probe: Option<Duration>,
-    doubt: u32,
-    confirmed: u32,
+    refused: u32,
 }
 
 impl Pace {
@@ -65,11 +66,10 @@ impl Pace {
             .saturating_add(WORST_PER_SUBMIT);
         Self {
             per_frame: guess,
+            previous: guess,
             measured: false,
             last: BATCH_MOST,
-            probe: None,
-            doubt: 0,
-            confirmed: 0,
+            refused: 0,
         }
     }
 
@@ -86,21 +86,26 @@ impl Pace {
     }
 
     pub fn opening(&mut self, left: u32, time: Duration) -> u32 {
-        self.probe = None;
         let step = self.batch(left, time);
         if step > 0 || left == 0 || time.is_zero() {
             return step;
         }
-        let patience = self
-            .confirmed
-            .checked_sub(2)
-            .map_or(0, |twice| 1_u32.checked_shl(twice).unwrap_or(u32::MAX));
-        if self.doubt < patience {
-            self.doubt = self.doubt.saturating_add(1);
+        if frames_in(time, self.per_frame.min(self.previous)) > 0 {
+            return 1;
+        }
+        if self.refused < REFUSED_MOST {
+            self.refused += 1;
             return 0;
         }
-        self.doubt = 0;
-        self.probe = Some(time);
+        1
+    }
+
+    #[must_use]
+    pub fn resumed(&self, left: u32, time: Duration) -> u32 {
+        let step = self.batch(left, time);
+        if step > 0 || left == 0 || time.is_zero() {
+            return step;
+        }
         1
     }
 
@@ -108,12 +113,9 @@ impl Pace {
         if frames == 0 {
             return;
         }
+        self.previous = self.per_frame;
         self.per_frame = spent / frames;
-        self.confirmed = match self.probe.take() {
-            Some(time) if spent > time => self.confirmed.saturating_add(1),
-            _ => 0,
-        };
-        self.doubt = 0;
+        self.refused = 0;
         self.measured = true;
         self.last = frames;
     }
