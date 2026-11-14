@@ -1414,6 +1414,214 @@ fn a_law_world_survives_save_open_fork_restore_and_a_restart() {
     second.kill();
 }
 
+const ONES: &str = r#"{"law":1,"name":"ones","params":0,"channels":1,"halo":0,"tally":{"counts":1,"weighted":false},"consts":{},"defs":{},
+"step":["vec","cells",["vec",1]]}"#;
+
+const ONES_FRAMED: &str = r#"{"law":1,"name":"onesf","params":0,"channels":1,"halo":0,"tally":{"counts":1,"weighted":false},"consts":{},"defs":{},
+"step":["vec",["map","w","cells",["add","w",["and","frame",0]]],["vec",1]]}"#;
+
+fn held_bytes(server: &mut Server<'_>) -> i64 {
+    answer(&call(server, "grit_describe", "{}"))
+        .get("memory")
+        .unwrap()
+        .int_at("held_bytes")
+}
+
+#[test]
+fn a_class_changing_param_write_holds_no_second_copy_of_the_world() {
+    let Some(host) = device("param write memory") else {
+        return;
+    };
+    let mut probe = Server::new(Some(&host));
+    let made = answer(&call(
+        &mut probe,
+        "grit_world_create",
+        &making_law(BIAS, &[0, 7], false),
+    ));
+    let bytes = held_bytes(&mut probe);
+    drop(made);
+    drop(probe);
+    let room = u64::try_from(bytes + bytes / 2).unwrap();
+    let mut server = Server::with(
+        Some(&host),
+        &Options {
+            dir: None,
+            memory: Some(room),
+        },
+    )
+    .unwrap();
+    let bias = compiled(BIAS);
+    let start = landscape(small_cell, 0x3E31);
+    let world = answer(&call(
+        &mut server,
+        "grit_world_create",
+        &making_law(BIAS, &[0, 7], false),
+    ))
+    .int_at("world");
+    write_all(&mut server, world, &start);
+    stepped(&mut server, world, 3);
+    let told = refusal(&call(
+        &mut server,
+        "grit_world_fork",
+        &format!("{{\"world\":{world}}}"),
+    ));
+    assert_eq!(told.text_at("code"), "memory", "{}", written(&told));
+    let held = held_bytes(&mut server);
+    assert_eq!(held, bytes);
+    let changed = answer(&call(
+        &mut server,
+        "grit_world_params",
+        &format!("{{\"world\":{world},\"params\":[5,7]}}"),
+    ));
+    assert_eq!(changed.text_at("quiet"), "whole");
+    assert_eq!(held_bytes(&mut server), held);
+    let mut want = replay(&bias, &start, 0, 3, &[0, 7]);
+    let step = stepped(&mut server, world, 5);
+    assert_eq!(step.int_at("listed"), i64::from(grid().octs()));
+    want = replay(&bias, &want, 3, 5, &[5, 7]);
+    assert_eq!(read_all(&mut server, world), want);
+    assert_eq!(held_bytes(&mut server), held);
+    println!(
+        "a world of {bytes} bytes in a server of {room}: the fork is refused, the params write that makes it whole holds {} bytes",
+        held_bytes(&mut server)
+    );
+}
+
+#[test]
+fn a_restore_takes_the_class_and_stepping_of_a_fork_whose_params_changed_it() {
+    let Some(host) = device("restore across classes") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let bias = compiled(BIAS);
+    let start = landscape(small_cell, 0x5E57);
+    let first = answer(&call(
+        &mut server,
+        "grit_world_create",
+        &making_law(BIAS, &[0, 7], false),
+    ))
+    .int_at("world");
+    write_all(&mut server, first, &start);
+    stepped(&mut server, first, 4);
+    let mut want = replay(&bias, &start, 0, 4, &[0, 7]);
+    let fork = answer(&call(
+        &mut server,
+        "grit_world_fork",
+        &format!("{{\"world\":{first}}}"),
+    ))
+    .int_at("world");
+    let changed = answer(&call(
+        &mut server,
+        "grit_world_params",
+        &format!("{{\"world\":{fork},\"params\":[5,7]}}"),
+    ));
+    assert_eq!(changed.text_at("quiet"), "whole");
+    stepped(&mut server, fork, 3);
+    want = replay(&bias, &want, 4, 3, &[5, 7]);
+    let restored = answer(&call(
+        &mut server,
+        "grit_world_restore",
+        &format!("{{\"world\":{first},\"from\":{fork}}}"),
+    ));
+    assert_eq!(restored.text_at("quiet"), "whole", "{}", written(&restored));
+    assert_eq!(restored.int_at("frame"), 7);
+    assert_eq!(read_all(&mut server, first), want);
+    for _ in 0..3 {
+        let step = stepped(&mut server, first, 4);
+        assert_eq!(step.int_at("listed"), i64::from(grid().octs()));
+    }
+    want = replay(&bias, &want, 7, 12, &[5, 7]);
+    assert_eq!(read_all(&mut server, first), want);
+    let back = answer(&call(
+        &mut server,
+        "grit_world_fork",
+        &format!("{{\"world\":{first}}}"),
+    ))
+    .int_at("world");
+    answer(&call(
+        &mut server,
+        "grit_world_params",
+        &format!("{{\"world\":{back},\"params\":[0,7]}}"),
+    ));
+    let restored = answer(&call(
+        &mut server,
+        "grit_world_restore",
+        &format!("{{\"world\":{first},\"from\":{back}}}"),
+    ));
+    assert_eq!(
+        restored.text_at("quiet"),
+        "proved",
+        "{}",
+        written(&restored)
+    );
+    let mut listed = Vec::new();
+    for _ in 0..4 {
+        listed.push(stepped(&mut server, first, 2).int_at("listed"));
+    }
+    want = replay(&bias, &want, 19, 8, &[0, 7]);
+    assert_eq!(read_all(&mut server, first), want);
+    assert!(
+        listed.last().copied().unwrap() < i64::from(grid().octs()),
+        "{listed:?}"
+    );
+}
+
+#[test]
+fn a_law_world_names_what_its_tally_counts() {
+    let Some(host) = device("law tally") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let described = answer(&call(&mut server, "grit_describe", "{}"));
+    let text = described.get("limits").unwrap().text_at("law_tally");
+    assert!(
+        text.contains("listed octs") && text.contains("every oct"),
+        "{text}"
+    );
+    let octs = i64::from(grid().octs());
+    for (law, tallied, quiet) in [
+        (ONES, "listed octs", "proved"),
+        (ONES_FRAMED, "every oct", "whole"),
+    ] {
+        let made = answer(&call(
+            &mut server,
+            "grit_world_create",
+            &making_law(law, &[], false),
+        ));
+        assert_eq!(made.text_at("quiet"), quiet);
+        assert_eq!(made.text_at("tallied"), tallied);
+        let world = made.int_at("world");
+        answer(&call(
+            &mut server,
+            "grit_world_write",
+            &format!("{{\"world\":{world},\"cells\":[[3,3,3,7]]}}"),
+        ));
+        let mut tallies = Vec::new();
+        for _ in 0..6 {
+            let step = stepped(&mut server, world, 1);
+            assert_eq!(step.text_at("tallied"), tallied);
+            tallies.push(
+                step.get("tally")
+                    .and_then(Json::list)
+                    .unwrap()
+                    .first()
+                    .and_then(Json::int)
+                    .unwrap(),
+            );
+        }
+        println!(
+            "{} ({tallied}): tallies {tallies:?} of {octs} octs a phase",
+            compiled(law).name()
+        );
+        if quiet == "proved" {
+            assert_eq!(tallies.first().copied(), Some(octs));
+            assert_eq!(tallies.last().copied(), Some(0));
+        } else {
+            assert!(tallies.iter().all(|&one| one == octs), "{tallies:?}");
+        }
+    }
+}
+
 #[cfg(feature = "faults")]
 mod faulted {
     use super::*;
