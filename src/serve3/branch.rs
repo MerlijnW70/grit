@@ -174,6 +174,7 @@ fn saved(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         &format!("writing world {number} to a file"),
     )?;
     let began = Instant::now();
+    server.slowly(Work::Save);
     let live = server.world(held)?;
     let image = live.world.image()?;
     let bytes = format::store(&path, &image).map_err(|why| file_refusal(&why, &name))?;
@@ -237,6 +238,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         &format!("reading the file {name}{}", journal::SUFFIX),
     )?;
     let began = Instant::now();
+    server.slowly(Work::File);
     let pending = keep
         .copied(&path, server.book.next)
         .map_err(|why| super::io_refusal(&why))?;
@@ -265,6 +267,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
             "building the world from the file",
         )?;
         let began = Instant::now();
+        server.slowly(work);
         let world = super::law::opened(host, &image)?;
         server.book.rates.measure(work, bytes, began.elapsed());
         let rule = super::law::listed(host, &world)?;
@@ -514,6 +517,7 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         &format!("copying world {number}"),
     )?;
     let began = Instant::now();
+    server.slowly(Work::Fork);
     let live = server.world(held)?;
     let fork = live.world.fork()?;
     server
@@ -570,6 +574,7 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         &format!("copying world {from} into world {number}"),
     )?;
     let began = Instant::now();
+    server.slowly(Work::Fork);
     let mut source = server.live.remove(&from).ok_or_else(|| unread("from"))?;
     let done = server
         .live

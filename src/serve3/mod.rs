@@ -291,6 +291,9 @@ pub struct Faults {
     pub slow_wake: Duration,
     pub slow_builds: u32,
     pub slow_build: Duration,
+    pub held_work: Vec<budget::Work>,
+    pub held_replays: u32,
+    pub held_by: Duration,
 }
 
 impl Book {
@@ -861,6 +864,7 @@ impl<'host> Server<'host> {
         bytes: u64,
     ) -> Result<World<'host>, Failed> {
         let guard = self.guard();
+        let mut held = self.held_replay();
         let mut timings = journal::Timings::default();
         let built = journal::rebuilt(
             host,
@@ -868,7 +872,10 @@ impl<'host> Server<'host> {
             self.book.keep.as_ref(),
             &guard,
             &mut timings,
-            |world, frames| paced(world, frames, pace, &guard),
+            |world, frames| {
+                std::thread::sleep(std::mem::take(&mut held));
+                paced(world, frames, pace, &guard)
+            },
         );
         let rates = &mut self.book.rates;
         if !timings.build.is_zero() {
@@ -1320,6 +1327,7 @@ impl<'host> Server<'host> {
 
     fn snap_attempt(&mut self, number: u32) -> Result<Option<Json>, Failed> {
         let (image, made, began) = self.snap_image(number)?;
+        self.slowly(self.snap_work());
         std::thread::sleep(self.slow_idle());
         let frame = image.frame;
         let keep = self.book.keep.clone();
@@ -1509,24 +1517,51 @@ impl<'host> Server<'host> {
     }
 
     #[cfg(feature = "faults")]
-    pub(super) fn build_slowly(&self) {
+    pub(super) fn slowly(&self, work: budget::Work) {
         let slow = self
             .book
             .faults
             .lock()
             .map(|mut faults| {
-                if faults.slow_builds == 0 {
-                    return Duration::ZERO;
+                let mut slow = Duration::ZERO;
+                if matches!(work, budget::Work::Build | budget::Work::BuildSparse)
+                    && faults.slow_builds > 0
+                {
+                    faults.slow_builds -= 1;
+                    slow = slow.saturating_add(faults.slow_build);
                 }
-                faults.slow_builds -= 1;
-                faults.slow_build
+                if let Some(at) = faults.held_work.iter().position(|one| *one == work) {
+                    faults.held_work.remove(at);
+                    slow = slow.saturating_add(faults.held_by);
+                }
+                slow
             })
             .unwrap_or_default();
         std::thread::sleep(slow);
     }
 
     #[cfg(not(feature = "faults"))]
-    pub(super) const fn build_slowly(&self) {}
+    pub(super) const fn slowly(&self, _: budget::Work) {}
+
+    #[cfg(feature = "faults")]
+    fn held_replay(&self) -> Duration {
+        self.book
+            .faults
+            .lock()
+            .map(|mut faults| {
+                if faults.held_replays == 0 {
+                    return Duration::ZERO;
+                }
+                faults.held_replays -= 1;
+                faults.held_by
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(feature = "faults"))]
+    const fn held_replay(&self) -> Duration {
+        Duration::ZERO
+    }
 
     #[cfg(feature = "faults")]
     fn slow_idle(&self) -> Duration {
