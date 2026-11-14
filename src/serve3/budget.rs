@@ -388,10 +388,11 @@ pub enum Work {
     File,
     FileOpen,
     Write,
+    WriteSparse,
 }
 
 impl Work {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Build,
         Self::BuildSparse,
         Self::Fork,
@@ -401,6 +402,7 @@ impl Work {
         Self::File,
         Self::FileOpen,
         Self::Write,
+        Self::WriteSparse,
     ];
 
     #[must_use]
@@ -409,6 +411,15 @@ impl Work {
             Self::BuildSparse
         } else {
             Self::Build
+        }
+    }
+
+    #[must_use]
+    pub const fn write(sparse: bool) -> Self {
+        if sparse {
+            Self::WriteSparse
+        } else {
+            Self::Write
         }
     }
 
@@ -428,6 +439,7 @@ impl Work {
             Self::File => 6,
             Self::FileOpen => 7,
             Self::Write => 8,
+            Self::WriteSparse => 9,
         }
     }
 
@@ -436,7 +448,7 @@ impl Work {
             Self::Build | Self::BuildSparse | Self::Fork | Self::ForkSparse => 1e-8,
             Self::Save | Self::Snap => 5e-8,
             Self::File | Self::FileOpen => 2e-8,
-            Self::Write => 2e-4,
+            Self::Write | Self::WriteSparse => 2e-4,
         }
     }
 
@@ -449,13 +461,13 @@ impl Work {
             Self::Save => Some(FASTEST_SAVE),
             Self::Snap => Some(FASTEST_SNAP),
             Self::File | Self::FileOpen => Some(FASTEST_FILE),
-            Self::Write => None,
+            Self::Write | Self::WriteSparse => None,
         }
     }
 
     const fn fixed(self) -> f64 {
         match self {
-            Self::Write => 0.0,
+            Self::Write | Self::WriteSparse => 0.0,
             _ => FIXED_BYTES,
         }
     }
@@ -472,6 +484,7 @@ impl Work {
             Self::File => "file",
             Self::FileOpen => "file_open",
             Self::Write => "write",
+            Self::WriteSparse => "write_sparse",
         }
     }
 }
@@ -488,7 +501,68 @@ pub const FASTEST_SNAP: f64 = 2.0e-11;
 
 pub const FASTEST_FILE: f64 = 2.0e-9;
 
-pub const SLOPE_SPAN: f64 = 2.0;
+pub const SAMPLES_KEPT: usize = 32;
+
+pub const REMEASURE_AFTER: u32 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    Measured,
+    Fastest,
+    Both,
+}
+
+impl Basis {
+    #[must_use]
+    pub const fn with(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Measured, Self::Measured) => Self::Measured,
+            (Self::Fastest, Self::Fastest) => Self::Fastest,
+            _ => Self::Both,
+        }
+    }
+
+    #[must_use]
+    pub const fn told(self) -> &'static str {
+        match self {
+            Self::Measured => "by the fastest the server measured for work of this size",
+            Self::Fastest => "by the fastest any tested device has shown per byte",
+            Self::Both => {
+                "by the fastest the server measured for work of this size and, where it measured none, the fastest any tested device has shown per byte"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Samples {
+    seen: std::collections::VecDeque<(u64, f64)>,
+}
+
+impl Samples {
+    fn push(&mut self, bytes: u64, spent: f64) {
+        if self.seen.len() == SAMPLES_KEPT {
+            self.seen.pop_front();
+        }
+        self.seen.push_back((bytes, spent));
+    }
+
+    fn evidence(&self, bytes: u64) -> Option<f64> {
+        let class = self
+            .seen
+            .iter()
+            .map(|(size, _)| *size)
+            .filter(|size| *size <= bytes)
+            .max()?;
+        self.seen
+            .iter()
+            .rev()
+            .filter(|(size, _)| *size == class)
+            .take(RECENT)
+            .map(|(_, spent)| *spent)
+            .reduce(f64::min)
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct Kept {
@@ -496,13 +570,6 @@ struct Kept {
 }
 
 pub const PADDED: usize = 3;
-
-pub const LOW_SHARE: usize = 3;
-
-fn low(mut held: Vec<f64>) -> Option<f64> {
-    held.sort_by(f64::total_cmp);
-    held.get(held.len().checked_sub(1)? / LOW_SHARE).copied()
-}
 
 fn median(mut held: Vec<f64>, prior: f64) -> f64 {
     while held.len() < PADDED {
@@ -526,30 +593,6 @@ impl Kept {
 
     fn middle(&self, prior: f64, bytes: f64) -> f64 {
         median(self.chosen(bytes), prior)
-    }
-
-    fn least(&self, fixed: f64, fastest: f64, bytes: f64) -> Option<f64> {
-        let costs: Vec<(f64, f64)> = self
-            .seen
-            .iter()
-            .map(|(size, rate)| ((size - fixed).max(1.0), size * rate))
-            .collect();
-        let most = costs
-            .iter()
-            .map(|(held, spent)| spent / held)
-            .fold(f64::INFINITY, f64::min);
-        let slopes: Vec<f64> = costs
-            .iter()
-            .flat_map(|small| costs.iter().map(move |large| (*small, *large)))
-            .filter(|((small, _), (large, _))| *large >= small * SLOPE_SPAN)
-            .map(|((small, quick), (large, slow))| (slow - quick) / (large - small))
-            .filter(|slope| *slope > 0.0)
-            .collect();
-        let marginal = low(slopes).unwrap_or(fastest).min(most);
-        low(costs
-            .iter()
-            .map(|(held, spent)| spent + marginal * (bytes - held).max(0.0))
-            .collect())
     }
 
     fn chosen(&self, bytes: f64) -> Vec<f64> {
@@ -576,8 +619,11 @@ impl Kept {
 
 #[derive(Debug, Clone, Default)]
 pub struct Rates {
-    kinds: [Kept; 9],
+    kinds: [Kept; 10],
     replay: Kept,
+    samples: [Samples; 10],
+    ratios: std::collections::VecDeque<f64>,
+    refused: BTreeMap<(usize, u64), u32>,
 }
 
 pub const RECENT: usize = 3;
@@ -611,12 +657,48 @@ impl Rates {
 
     #[must_use]
     pub fn least(&self, work: Work, bytes: u64) -> Duration {
-        let fastest = work.fastest().unwrap_or(0.0);
-        let least = self
-            .kept(work)
-            .and_then(|kept| kept.least(work.fixed(), fastest, bytes as f64))
-            .unwrap_or(fastest * bytes as f64);
-        Duration::try_from_secs_f64(least).unwrap_or(Duration::MAX)
+        self.least_of(work, bytes).0
+    }
+
+    #[must_use]
+    pub fn least_of(&self, work: Work, bytes: u64) -> (Duration, Basis) {
+        let fastest = work.fastest().unwrap_or(0.0) * bytes as f64;
+        let measured = self
+            .samples
+            .get(work.index())
+            .and_then(|samples| samples.evidence(bytes))
+            .unwrap_or(0.0);
+        let (least, basis) = if measured > 0.0 && measured >= fastest {
+            (measured, Basis::Measured)
+        } else {
+            (fastest, Basis::Fastest)
+        };
+        (
+            Duration::try_from_secs_f64(least).unwrap_or(Duration::MAX),
+            basis,
+        )
+    }
+
+    pub fn refuses(&mut self, work: Work, bytes: u64, basis: Basis) -> bool {
+        let refused = self.refused.entry((work.index(), bytes)).or_insert(0);
+        if basis != Basis::Fastest && *refused >= REMEASURE_AFTER {
+            *refused = 0;
+            return false;
+        }
+        *refused = refused.saturating_add(1);
+        true
+    }
+
+    pub fn admitted(&mut self, work: Work, bytes: u64) {
+        self.refused.remove(&(work.index(), bytes));
+    }
+
+    pub fn measure_cut(&mut self, work: Work, bytes: u64, spent: Duration) {
+        if let Some(samples) = self.samples.get_mut(work.index())
+            && !spent.is_zero()
+        {
+            samples.push(bytes, spent.as_secs_f64());
+        }
     }
 
     pub fn measure(&mut self, work: Work, bytes: u64, spent: Duration) {
@@ -632,6 +714,7 @@ impl Rates {
         if let Some(kept) = self.kinds.get_mut(work.index()) {
             kept.push(size, taken);
         }
+        self.measure_cut(work, bytes, spent);
     }
 
     #[must_use]
@@ -646,9 +729,13 @@ impl Rates {
 
     #[must_use]
     pub fn replay_least(&self) -> f64 {
-        let most = self.replay();
-        low(self.replay.seen.iter().map(|(_, ratio)| *ratio).collect())
-            .map_or(0.0, |least| least.clamp(RATIO_LEAST, RATIO_MOST).min(most))
+        self.ratios
+            .iter()
+            .rev()
+            .take(RECENT)
+            .copied()
+            .reduce(f64::min)
+            .unwrap_or(0.0)
     }
 
     #[must_use]
@@ -664,7 +751,7 @@ impl Rates {
     }
 
     pub fn measure_cut_replay(&mut self, recorded: Duration, spent: Duration) {
-        if spent < RATIO_LEAST_RECORDED {
+        if spent.is_zero() {
             return;
         }
         self.replayed(spent.as_secs_f64() / recorded.as_secs_f64().max(f64::MIN_POSITIVE));
@@ -674,6 +761,11 @@ impl Rates {
         if !sample.is_finite() || sample <= 0.0 {
             return;
         }
+        let ratio = sample.clamp(RATIO_LEAST, RATIO_MOST);
+        if self.ratios.len() == SAMPLES_KEPT {
+            self.ratios.pop_front();
+        }
+        self.ratios.push_back(ratio);
         let around = self.replay.middle(2.0, 1.0).clamp(RATIO_LEAST, RATIO_MOST);
         let taken = bounded(sample, around, RATIO_LEAST, RATIO_MOST);
         self.replay.push(1.0, taken);
@@ -702,22 +794,20 @@ impl Rates {
             "replay_per_recorded_percent",
             counted64((self.replay() * 100.0) as u64),
         ));
-        shown.push((
-            "replay_observations",
-            counted64(self.replay.seen.len() as u64),
-        ));
+        shown.push(("replay_observations", counted64(self.ratios.len() as u64)));
         map(shown)
     }
 }
 
 #[must_use]
-pub fn too_slow(needs: Duration, left: Duration, what: &str) -> Refusal {
+pub fn too_slow(needs: Duration, left: Duration, what: &str, basis: Basis) -> Refusal {
     Refusal::new(
         Code::Budget,
         "$.budget_ms",
         format!(
-            "{what} needs at least {} ms on this device, by the lowest third of the server's recent measurements of such work, or where it has none by the fastest any tested device has shown for it, and the call has {} ms left; nothing ran",
+            "{what} needs at least {} ms on this device, {}, and the call has {} ms left; nothing ran",
             needs.as_millis(),
+            basis.told(),
             left.as_millis()
         ),
     )

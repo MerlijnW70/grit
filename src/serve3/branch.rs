@@ -170,7 +170,8 @@ fn saved(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server.world(held)?;
     let size = server.book.held.get(&number).map_or(0, |held| held.bytes);
     server.fits(
-        server.book.rates.least(Work::Save, size),
+        Work::Save,
+        size,
         &format!("writing world {number} to a file"),
     )?;
     let began = Instant::now();
@@ -234,7 +235,8 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         }));
     }
     server.fits(
-        server.book.rates.least(Work::FileOpen, length),
+        Work::FileOpen,
+        length,
         &format!("reading the file {name}{}", journal::SUFFIX),
     )?;
     let began = Instant::now();
@@ -262,10 +264,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         let sizes = image_shaped(host, planned.as_ref(), &image)?;
         let bytes = admitted(server, host, &sizes, "the world")?;
         let work = Work::build(matches!(image.state, crate::branch::State::Sparse { .. }));
-        server.fits(
-            server.book.rates.least(work, bytes),
-            "building the world from the file",
-        )?;
+        server.fits(work, bytes, "building the world from the file")?;
         let began = Instant::now();
         server.slowly(work);
         let world = super::law::opened(host, &image)?;
@@ -360,8 +359,11 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
     )?;
     let (_, sizes) = shaped(host, planned.as_ref(), ledger.made())?;
     let bytes = admitted(server, host, &sizes, "the world")?;
-    server.fits(
-        server.replay_least(&ledger, bytes),
+    let needs = server.replay_least(&ledger, bytes);
+    server.admits(
+        needs,
+        Work::build(ledger.made().sparse),
+        bytes,
         &format!("rebuilding world {number} from its journal"),
     )?;
     let mut pace = super::budget::Pace::first(0);
@@ -513,10 +515,7 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .ok_or_else(|| unread("world"))?;
     server.book.memory.admits(source.bytes, "the fork")?;
     let work = Work::fork(source.ledger.made().sparse);
-    server.fits(
-        server.book.rates.least(work, source.bytes),
-        &format!("copying world {number}"),
-    )?;
+    server.fits(work, source.bytes, &format!("copying world {number}"))?;
     let began = Instant::now();
     server.slowly(work);
     let live = server.world(held)?;
@@ -578,7 +577,8 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             .is_some_and(|held| held.ledger.made().sparse),
     );
     server.fits(
-        server.book.rates.least(work, size),
+        work,
+        size,
         &format!("copying world {from} into world {number}"),
     )?;
     let began = Instant::now();

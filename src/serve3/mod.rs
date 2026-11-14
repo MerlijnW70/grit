@@ -832,32 +832,57 @@ impl<'host> Server<'host> {
         (server, restored)
     }
 
-    fn replay_least(&self, ledger: &Ledger, bytes: u64) -> Duration {
+    fn replay_least(&self, ledger: &Ledger, bytes: u64) -> (Duration, budget::Basis) {
         let rates = &self.book.rates;
+        let sparse = ledger.made().sparse;
         let snapshot = match (&ledger.base, self.book.keep.as_ref()) {
             (Base::Snapshot(snap), Some(keep)) if snap.image.is_none() => {
-                std::fs::metadata(keep.snapshot(&snap.sum)).map_or(Duration::ZERO, |found| {
-                    rates.least(budget::Work::File, found.len())
-                })
+                std::fs::metadata(keep.snapshot(&snap.sum)).map_or(0, |found| found.len())
             }
-            _ => Duration::ZERO,
+            _ => 0,
         };
-        rates
-            .least(budget::Work::build(ledger.made().sparse), bytes)
-            .saturating_add(snapshot)
-            .saturating_add(if ledger.made().sparse {
-                Duration::ZERO
-            } else {
-                rates.least(budget::Work::Write, ledger.write_bytes())
-            })
-            .saturating_add(rates.replaying_least(ledger.step_recorded()))
+        let mut parts = vec![rates.least_of(budget::Work::build(sparse), bytes)];
+        if snapshot > 0 {
+            parts.push(rates.least_of(budget::Work::File, snapshot));
+        }
+        if ledger.write_bytes() > 0 {
+            parts.push(rates.least_of(budget::Work::write(sparse), ledger.write_bytes()));
+        }
+        let steps = rates.replaying_least(ledger.step_recorded());
+        if !steps.is_zero() {
+            parts.push((steps, budget::Basis::Measured));
+        }
+        parts
+            .into_iter()
+            .filter(|(needs, _)| !needs.is_zero())
+            .fold(
+                None,
+                |all: Option<(Duration, budget::Basis)>, (needs, basis)| {
+                    Some(all.map_or((needs, basis), |(sum, was)| {
+                        (sum.saturating_add(needs), was.with(basis))
+                    }))
+                },
+            )
+            .unwrap_or((Duration::ZERO, budget::Basis::Fastest))
     }
 
-    fn fits(&self, needs: Duration, what: &str) -> Result<(), Failed> {
+    fn fits(&mut self, work: budget::Work, bytes: u64, what: &str) -> Result<(), Failed> {
+        let needs = self.book.rates.least_of(work, bytes);
+        self.admits(needs, work, bytes, what)
+    }
+
+    fn admits(
+        &mut self,
+        (needs, basis): (Duration, budget::Basis),
+        work: budget::Work,
+        bytes: u64,
+        what: &str,
+    ) -> Result<(), Failed> {
         let left = self.clock.left();
-        if needs > left {
-            return Err(Box::new(budget::too_slow(needs, left, what)));
+        if needs > left && self.book.rates.refuses(work, bytes, basis) {
+            return Err(Box::new(budget::too_slow(needs, left, what, basis)));
         }
+        self.book.rates.admitted(work, bytes);
         Ok(())
     }
 
@@ -893,17 +918,24 @@ impl<'host> Server<'host> {
         if timings.file_bytes > 0 {
             rates.measure(budget::Work::File, timings.file_bytes, timings.file);
         }
-        if timings.write_bytes > 0 && !ledger.made().sparse {
-            rates.measure(budget::Work::Write, timings.write_bytes, timings.writes);
-        }
+        let write = budget::Work::write(ledger.made().sparse);
         let cut = built
             .as_ref()
             .err()
             .is_some_and(|why| why.downcast_ref::<budget::Halted>().is_some());
-        if cut {
-            rates.measure_cut_replay(timings.recorded, timings.steps);
-        } else if built.is_ok() {
-            rates.measure_replay(timings.recorded, timings.steps);
+        if timings.write_cut && !timings.writes.is_zero() {
+            let total = ledger.write_bytes();
+            let share = total as f64 / timings.write_bytes.max(1) as f64;
+            rates.measure_cut(write, total, timings.writes.mul_f64(share));
+        } else {
+            if timings.write_bytes > 0 {
+                rates.measure(write, timings.write_bytes, timings.writes);
+            }
+            if cut {
+                rates.measure_cut_replay(timings.recorded, timings.steps);
+            } else if built.is_ok() {
+                rates.measure_replay(timings.recorded, timings.steps);
+            }
         }
         built
     }
@@ -921,8 +953,11 @@ impl<'host> Server<'host> {
         };
         let replayed = u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX);
         let host = self.host.ok_or(crate::host::Error::NoComputeDevice)?;
-        self.fits(
-            self.replay_least(&ledger, bytes),
+        let needs = self.replay_least(&ledger, bytes);
+        self.admits(
+            needs,
+            budget::Work::build(ledger.made().sparse),
+            bytes,
             &format!("rebuilding world {number} after the lost device"),
         )?;
         let built = self
@@ -1243,15 +1278,18 @@ impl<'host> Server<'host> {
         if self.clock.left() < self.snap_estimate(number) && !far {
             return Ok(None);
         }
-        let needs = self.snap_least(number);
-        if self.clock.left() < needs {
+        let size = self.book.held.get(&number).map_or(0, |held| held.bytes);
+        let work = self.snap_work();
+        let (needs, basis) = self.book.rates.least_of(work, size);
+        if self.clock.left() < needs && self.book.rates.refuses(work, size, basis) {
             return Err(Box::new(
                 Refusal::new(
                     errors::Code::Budget,
                     "$.budget_ms",
                     format!(
-                        "world {number} owes a snapshot of its journal before it changes again, which needs at least {} ms by the lowest third of the server's recent measurements of such work, or where it has none by the fastest any tested device has shown for it, and this call has {} ms left; nothing ran",
+                        "world {number} owes a snapshot of its journal before it changes again, which needs at least {} ms {}, and this call has {} ms left; nothing ran",
                         needs.as_millis(),
+                        basis.told(),
                         self.clock.left().as_millis()
                     ),
                 )
@@ -1431,12 +1469,6 @@ impl<'host> Server<'host> {
     fn snap_estimate(&self, number: u32) -> Duration {
         self.book.held.get(&number).map_or(Duration::ZERO, |held| {
             self.book.rates.estimate(self.snap_work(), held.bytes)
-        })
-    }
-
-    fn snap_least(&self, number: u32) -> Duration {
-        self.book.held.get(&number).map_or(Duration::ZERO, |held| {
-            self.book.rates.least(self.snap_work(), held.bytes)
         })
     }
 

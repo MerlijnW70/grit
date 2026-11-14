@@ -5,7 +5,9 @@ mod common;
 
 use std::time::Duration;
 
-use grit::serve3::budget::{BUDGET_MS, Rates, WINDOW, WORLD_LEAST, Work};
+use grit::serve3::budget::{
+    BUDGET_MS, Basis, RECENT, REMEASURE_AFTER, Rates, WINDOW, WORLD_LEAST, Work,
+};
 
 const SIXTY_FOUR: u64 = 1_615_268;
 
@@ -53,46 +55,24 @@ fn held_up_builds_of_other_sizes_never_refuse_a_large_sparse_world_the_device_bu
 }
 
 #[test]
-fn slow_samples_never_raise_the_least_estimate_while_a_third_of_the_kept_ones_are_faster() {
-    let unrelated = 64 << 20;
+fn a_held_up_sample_raises_the_least_only_when_the_last_three_of_its_size_are_held_up() {
+    let size = 64 << 20;
+    let quick = Duration::from_secs(1);
+    let slow = Duration::from_secs(100);
     for work in Work::ALL {
-        let prior = Rates::default().estimate(work, unrelated);
         let mut rates = Rates::default();
-        for _ in 0..3 {
-            rates.measure(work, unrelated, prior.mul_f64(0.5));
+        rates.measure(work, size, quick);
+        for _ in 0..RECENT - 1 {
+            rates.measure(work, size, slow);
+            assert_eq!(rates.least(work, size), quick, "{work:?}");
         }
-        let settled = rates.least(work, unrelated);
-        let close = |got: Duration, want: Duration| {
-            got <= want.mul_f64(1.001) && got >= want.mul_f64(0.999)
-        };
-        assert!(close(settled, prior.mul_f64(0.5)), "{work:?}: {settled:?}");
-        for _ in 0..WINDOW - 3 {
-            rates.measure(work, unrelated, prior.mul_f64(500.0));
-            let least = rates.least(work, unrelated);
-            assert!(
-                close(least, settled),
-                "{work:?}: {least:?} against {settled:?}"
-            );
-        }
-        assert!(
-            rates.estimate(work, unrelated) >= prior.mul_f64(499.0),
-            "{work:?}: the sizing estimate still errs slow"
-        );
-        rates.measure(work, unrelated, prior.mul_f64(500.0));
-        let slowed = rates.least(work, unrelated);
-        assert!(
-            close(slowed, prior.mul_f64(500.0)),
-            "{work:?}: once more than two thirds of the kept samples are slow the least estimate is slow: {slowed:?}"
-        );
-        let mut lone = Rates::default();
-        lone.measure(work, unrelated, prior.mul_f64(0.5));
-        for _ in 0..WINDOW - 1 {
-            lone.measure(work, unrelated, prior.mul_f64(500.0));
-        }
-        let hidden = lone.least(work, unrelated);
-        assert!(
-            close(hidden, prior.mul_f64(500.0)),
-            "{work:?}: one fast sample among slow ones decides nothing: {hidden:?}"
+        rates.measure(work, size, slow);
+        assert_eq!(rates.least(work, size), slow, "{work:?}");
+        rates.measure(work, size, quick);
+        assert_eq!(
+            rates.least(work, size),
+            quick,
+            "{work:?}: a call of this size that just fit is never refused by evidence"
         );
     }
 }
@@ -111,23 +91,39 @@ fn one_fast_replay_never_hides_slow_ones_from_the_refusal() {
 }
 
 #[test]
-fn the_cost_per_byte_of_a_larger_world_is_the_slope_between_measured_sizes() {
-    let huge: u64 = 4 << 30;
-    for (label, fixed, per_byte) in [("faster", 0.05, 2.2e-9), ("slower", 0.05, 5e-8)] {
-        let cost = |bytes: u64| Duration::from_secs_f64(fixed + per_byte * bytes as f64);
-        let mut rates = Rates::default();
-        for _ in 0..3 {
-            rates.measure(Work::Build, TWO_FIFTY_SIX, cost(TWO_FIFTY_SIX));
-            rates.measure(Work::Build, WORLD_LEAST, cost(WORLD_LEAST));
-        }
-        let least = rates.least(Work::Build, huge).as_secs_f64();
-        let want = cost(huge).as_secs_f64();
-        eprintln!("{label} device ({per_byte} s/B): 4 GiB least {least} s, true {want} s");
-        assert!(
-            (least - want).abs() <= want * 0.002,
-            "{label}: the cost per byte comes from the measured sizes: {least} against {want}"
-        );
+fn a_larger_sample_never_raises_the_least_of_a_smaller_request() {
+    let cost = |bytes: u64| Duration::from_secs_f64(0.02 + 3e-9 * bytes as f64);
+    let mut rates = Rates::default();
+    rates.measure(Work::Build, WORLD_LEAST, cost(WORLD_LEAST));
+    for _ in 0..3 {
+        rates.measure(Work::Build, 400_000_000, Duration::from_secs(30));
     }
+    assert_eq!(rates.least(Work::Build, WORLD_LEAST), cost(WORLD_LEAST));
+    assert_eq!(
+        rates.least(Work::Build, 2 * WORLD_LEAST),
+        cost(WORLD_LEAST),
+        "a size between two measured ones has the smaller one's evidence"
+    );
+}
+
+#[test]
+fn past_every_measured_size_the_least_is_the_larger_of_the_largest_smaller_sample_and_the_fastest_per_byte()
+ {
+    let measured = Duration::from_millis(20);
+    let mut rates = Rates::default();
+    rates.measure(Work::Build, WORLD_LEAST, measured);
+    let huge: u64 = 4 << 30;
+    let fastest = Work::Build.fastest().unwrap();
+    let per_byte = Duration::from_secs_f64(fastest * huge as f64);
+    assert!(per_byte > measured);
+    assert_eq!(
+        rates.least_of(Work::Build, huge),
+        (per_byte, Basis::Fastest)
+    );
+    assert_eq!(
+        rates.least_of(Work::Build, 2 * WORLD_LEAST),
+        (measured, Basis::Measured)
+    );
 }
 
 #[test]
@@ -136,16 +132,11 @@ fn a_device_slower_than_the_prior_is_refused_by_its_own_samples() {
     let cost = |bytes: u64| Duration::from_secs_f64(0.05 + per_byte * bytes as f64);
     let large: u64 = 800_000_000;
     let mut rates = Rates::default();
-    rates.measure(Work::Build, 200_000_000, cost(200_000_000));
     rates.measure(Work::Build, WORLD_LEAST, cost(WORLD_LEAST));
-    let least = rates.least(Work::Build, large);
-    eprintln!(
-        "800 MB on a device at {per_byte} s/B: least {least:?}, true {:?}",
-        cost(large)
-    );
+    rates.measure(Work::Build, large, cost(large));
     assert!(cost(large) > budget());
-    assert!(least > budget(), "{least:?}");
-    assert!(least <= cost(large).mul_f64(1.002), "{least:?}");
+    assert_eq!(rates.least(Work::Build, large), cost(large));
+    assert!(rates.least(Work::Build, 2 * large) >= cost(large));
 }
 
 #[test]
@@ -161,6 +152,8 @@ fn unlike_work_never_shares_a_least_estimate() {
         (Work::ForkSparse, Work::Fork),
         (Work::File, Work::FileOpen),
         (Work::FileOpen, Work::File),
+        (Work::Write, Work::WriteSparse),
+        (Work::WriteSparse, Work::Write),
     ] {
         let fresh = Rates::default().least(asked, bytes);
         let mut rates = Rates::default();
@@ -177,43 +170,45 @@ fn unlike_work_never_shares_a_least_estimate() {
 }
 
 #[test]
-fn a_build_every_recent_sample_shows_too_slow_is_still_refused() {
+fn with_nothing_measured_only_the_fastest_per_byte_refuses() {
     for work in Work::ALL {
         let fresh = Rates::default();
         for bytes in [0, WORLD_LEAST, TWO_FIFTY_SIX] {
             let want = Duration::from_secs_f64(work.fastest().unwrap_or(0.0) * bytes as f64);
             assert_eq!(
-                fresh.least(work, bytes),
-                want,
+                fresh.least_of(work, bytes),
+                (want, Basis::Fastest),
                 "{work:?} with nothing measured"
             );
-            assert!(fresh.least(work, bytes) <= fresh.estimate(work, bytes));
         }
     }
     assert_eq!(Rates::default().replay_least(), 0.0);
-    let short = Duration::from_millis(1000);
     let slow = Duration::from_millis(3000);
     let mut rates = Rates::default();
     rates.measure(Work::Build, SIXTY_FOUR, slow);
-    for bytes in [WORLD_LEAST, SIXTY_FOUR, TWO_FIFTY_SIX] {
-        let least = rates.least(Work::Build, bytes);
-        assert!(least > short, "{bytes}: {least:?}");
-        assert!(
-            bytes < SIXTY_FOUR || least >= slow.mul_f64(0.999),
-            "{bytes}: {least:?}"
-        );
+    for bytes in [SIXTY_FOUR, TWO_FIFTY_SIX] {
+        assert_eq!(rates.least(Work::Build, bytes), slow, "{bytes}");
     }
-    let mut fast = Rates::default();
-    fast.measure(Work::Build, WORLD_LEAST, Duration::from_millis(20));
-    let huge = 4 << 30;
-    let least = fast.least(Work::Build, huge);
-    let floor = Duration::from_secs_f64(
-        0.02 + Work::Build.fastest().unwrap() * (huge - WORLD_LEAST) as f64,
-    );
-    assert!(
-        least >= floor.mul_f64(0.999) && least <= floor.mul_f64(1.001),
-        "a world far past every measured size pays the fastest cost per byte any tested device has shown: {least:?} against {floor:?}"
-    );
+    assert!(rates.least(Work::Build, WORLD_LEAST) < Duration::from_millis(1));
+}
+
+#[test]
+fn eight_refusals_by_evidence_in_a_row_let_the_next_call_run() {
+    let mut rates = Rates::default();
+    for round in 0..3 {
+        for refusal in 0..REMEASURE_AFTER {
+            assert!(
+                rates.refuses(Work::Build, TWO_FIFTY_SIX, Basis::Measured),
+                "round {round}, refusal {refusal}"
+            );
+        }
+        assert!(!rates.refuses(Work::Build, TWO_FIFTY_SIX, Basis::Measured));
+    }
+    for _ in 0..3 * REMEASURE_AFTER {
+        assert!(rates.refuses(Work::Build, TWO_FIFTY_SIX, Basis::Fastest));
+    }
+    rates.admitted(Work::Build, TWO_FIFTY_SIX);
+    assert!(rates.refuses(Work::Fork, TWO_FIFTY_SIX, Basis::Measured));
 }
 
 #[test]
@@ -228,13 +223,10 @@ fn a_held_up_one_cell_write_never_refuses_a_rebuild_whose_writes_fit() {
     eprintln!("journal writes after a held-up one-cell write: scaled {scaled:?}, least {least:?}");
     assert!(scaled > budget(), "{scaled:?}");
     assert!(least < budget(), "{least:?}");
-    rates.measure(Work::Write, 16 * 4000, Duration::from_millis(40));
-    let chunked = rates.least(Work::Write, journal_writes);
-    assert!(chunked < budget(), "{chunked:?}");
 }
 
 #[test]
-fn the_prior_never_outvotes_one_measured_write_of_a_similar_size() {
+fn the_prior_never_outvotes_one_measured_write_and_a_cut_tail_is_refused() {
     let tail: u64 = 168_632;
     let chunk: u64 = 16 * 659;
     let per_byte = 2.8e-5;
@@ -258,21 +250,14 @@ fn the_prior_never_outvotes_one_measured_write_of_a_similar_size() {
     );
     assert!(scaled > budget(), "{scaled:?}");
     assert!(least < budget(), "{least:?}");
-    assert!(
-        least <= Duration::from_secs_f64(per_byte * tail as f64 * 1.01),
-        "{least:?}"
+    rates.measure_cut(
+        Work::Write,
+        tail,
+        Duration::from_secs_f64(2e-4 * tail as f64),
     );
-    let mut slow = Rates::default();
-    for written in [chunk, chunk * 8] {
-        slow.measure(
-            Work::Write,
-            written,
-            Duration::from_secs_f64(2e-4 * written as f64),
-        );
-    }
     assert!(
-        slow.least(Work::Write, tail) > budget(),
-        "a tail that writes of two sizes both say is too slow is still refused"
+        rates.least(Work::Write, tail) > budget(),
+        "a tail one cut replay measured as too slow is refused"
     );
 }
 
@@ -287,7 +272,7 @@ fn a_cut_replay_that_ran_few_frames_is_still_measured() {
         (rates.replay_least() - 1.0).abs() < 1e-9,
         "a finished replay below the floor is noise"
     );
-    for _ in 0..3 {
+    for _ in 0..RECENT {
         rates.measure_cut_replay(recorded, spent);
     }
     assert!(
@@ -298,7 +283,7 @@ fn a_cut_replay_that_ran_few_frames_is_still_measured() {
 }
 
 #[test]
-fn a_slow_replay_never_raises_the_least_replay_ratio() {
+fn a_slow_replay_never_raises_the_least_replay_ratio_while_a_faster_one_is_recent() {
     let mut rates = Rates::default();
     assert!(rates.replay_least().abs() < 1e-9);
     for _ in 0..2 {
@@ -475,6 +460,40 @@ mod served {
         faults.lock().unwrap().slow_builds = 0;
     }
 
+    #[test]
+    fn after_eight_refusals_by_evidence_the_next_build_runs_and_is_measured_again() {
+        let Some(host) = device("remeasure") else {
+            return;
+        };
+        let mut server = Server::new(Some(&host));
+        let faults = server.faults();
+        let slow = Duration::from_millis(1500);
+        {
+            let mut armed = faults.lock().unwrap();
+            armed.slow_builds = 1;
+            armed.slow_build = slow;
+        }
+        let first = built(&mut server, 16, None);
+        assert!(first >= slow, "{first:?}");
+        let short = Duration::from_millis(1000);
+        for refusal in 0..grit::serve3::budget::REMEASURE_AFTER {
+            let told = result(
+                &call(&mut server, "grit_world_create", &cube(16, Some(short))),
+                true,
+            );
+            let message = told.get("message").and_then(Json::text).unwrap();
+            assert!(
+                message.contains("by the fastest the server measured for work of this size"),
+                "refusal {refusal}: {message}"
+            );
+        }
+        let again = built(&mut server, 16, Some(short));
+        eprintln!("a held-up 16^3 build {first:?}, 8 refusals, then it ran in {again:?}");
+        assert!(again < short, "{again:?}");
+        let fits = built(&mut server, 16, Some(short));
+        assert!(fits < short, "{fits:?}");
+    }
+
     struct Scratch(std::path::PathBuf);
 
     impl Drop for Scratch {
@@ -544,7 +563,7 @@ mod served {
         let mut server = Server::with(Some(&host), &options).unwrap();
         result(&opened(&mut server, 1, Duration::from_secs(600)), false);
         let fast = replays_measured(&mut server);
-        let bound = 2 * fast + 1;
+        let bound = grit::serve3::budget::RECENT;
         let budget = Duration::from_millis(1500);
         grit::serve3::tools::faults::stall_every(Duration::from_millis(2));
         let mut cut = 0;
@@ -577,7 +596,7 @@ mod served {
         assert!(refused < Duration::from_millis(500), "{refused:?}");
         assert!(
             cut <= bound,
-            "{cut} calls were cut before the refusal; with {fast} fast ratios kept the lower third needs at most {bound}"
+            "{cut} calls were cut before the refusal; with {fast} fast ratios kept, the fastest of the last {bound} ratios needs at most {bound} cut calls"
         );
     }
 }

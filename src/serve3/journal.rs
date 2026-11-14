@@ -1033,6 +1033,7 @@ pub struct Timings {
     pub writes: Duration,
     pub recorded: Duration,
     pub steps: Duration,
+    pub write_cut: bool,
 }
 
 pub fn rebuilt<'host>(
@@ -1100,6 +1101,7 @@ pub fn rebuilt<'host>(
             }) as super::Failed
         };
         if let Some(stop) = guard.stop() {
+            timings.write_cut = matches!(entry, Entry::Write(_));
             return Err(halted(stop, world.frame()));
         }
         match entry {
@@ -1126,6 +1128,7 @@ pub fn rebuilt<'host>(
                     .write_bytes
                     .saturating_add((entry.bytes() as f64 * share) as u64);
                 if let Some(stop) = stopped {
+                    timings.write_cut = true;
                     return Err(halted(stop, world.frame()));
                 }
             }
