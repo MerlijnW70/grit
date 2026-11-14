@@ -53,7 +53,7 @@ fn held_up_builds_of_other_sizes_never_refuse_a_large_sparse_world_the_device_bu
 }
 
 #[test]
-fn a_slow_sample_never_raises_the_least_estimate_while_a_faster_one_is_kept() {
+fn slow_samples_never_raise_the_least_estimate_while_a_third_of_the_kept_ones_are_faster() {
     let unrelated = 64 << 20;
     for work in Work::ALL {
         let prior = Rates::default().estimate(work, unrelated);
@@ -66,7 +66,7 @@ fn a_slow_sample_never_raises_the_least_estimate_while_a_faster_one_is_kept() {
             got <= want.mul_f64(1.001) && got >= want.mul_f64(0.999)
         };
         assert!(close(settled, prior.mul_f64(0.5)), "{work:?}: {settled:?}");
-        for _ in 0..WINDOW - 1 {
+        for _ in 0..WINDOW - 3 {
             rates.measure(work, unrelated, prior.mul_f64(500.0));
             let least = rates.least(work, unrelated);
             assert!(
@@ -82,8 +82,76 @@ fn a_slow_sample_never_raises_the_least_estimate_while_a_faster_one_is_kept() {
         let slowed = rates.least(work, unrelated);
         assert!(
             close(slowed, prior.mul_f64(500.0)),
-            "{work:?}: once every kept sample is slow the least estimate is slow: {slowed:?}"
+            "{work:?}: once more than two thirds of the kept samples are slow the least estimate is slow: {slowed:?}"
         );
+        let mut lone = Rates::default();
+        lone.measure(work, unrelated, prior.mul_f64(0.5));
+        for _ in 0..WINDOW - 1 {
+            lone.measure(work, unrelated, prior.mul_f64(500.0));
+        }
+        let hidden = lone.least(work, unrelated);
+        assert!(
+            close(hidden, prior.mul_f64(500.0)),
+            "{work:?}: one fast sample among slow ones decides nothing: {hidden:?}"
+        );
+    }
+}
+
+#[test]
+fn one_fast_replay_never_hides_slow_ones_from_the_refusal() {
+    let mut rates = Rates::default();
+    rates.measure_replay(Duration::from_secs(1), Duration::from_secs(1));
+    for _ in 0..WINDOW - 1 {
+        rates.measure_replay(Duration::from_secs(1), Duration::from_secs(4));
+    }
+    let recorded = Duration::from_secs(10);
+    assert!(rates.replaying(recorded) > budget());
+    let least = rates.replaying_least(recorded);
+    assert!(least > budget(), "{least:?}");
+}
+
+#[test]
+fn a_fast_large_build_sets_the_cost_per_byte_of_a_larger_world_below_the_prior() {
+    let large = Duration::from_millis(278);
+    let small = Duration::from_millis(50);
+    let mut rates = Rates::default();
+    rates.measure(Work::Build, TWO_FIFTY_SIX, large);
+    rates.measure(Work::Build, WORLD_LEAST, small);
+    let huge: u64 = 4 << 30;
+    let per_byte = large.as_secs_f64() / TWO_FIFTY_SIX as f64;
+    let want = large.as_secs_f64() + per_byte * (huge - TWO_FIFTY_SIX) as f64;
+    let least = rates.least(Work::Build, huge).as_secs_f64();
+    eprintln!(
+        "4 GiB after 256^3 in {large:?} and 1 MiB in {small:?}: least {least} s, want {want} s"
+    );
+    assert!(per_byte < 1e-8, "{per_byte}");
+    assert!(
+        (least - want).abs() <= want * 0.002,
+        "the cost per byte is the large build's time over its own bytes: {least} against {want}"
+    );
+}
+
+#[test]
+fn unlike_work_never_shares_a_least_estimate() {
+    let bytes = TWO_FIFTY_SIX;
+    let fast = Duration::from_millis(5);
+    for (measured, asked) in [
+        (Work::Snap, Work::Save),
+        (Work::Save, Work::Snap),
+        (Work::Build, Work::BuildSparse),
+        (Work::BuildSparse, Work::Build),
+    ] {
+        let fresh = Rates::default().least(asked, bytes);
+        let mut rates = Rates::default();
+        for _ in 0..WINDOW {
+            rates.measure(measured, bytes, fast);
+        }
+        assert_eq!(
+            rates.least(asked, bytes),
+            fresh,
+            "{measured:?} moved {asked:?}"
+        );
+        assert!(rates.least(measured, bytes) < fresh, "{measured:?}");
     }
 }
 
@@ -152,8 +220,8 @@ mod served {
     use std::time::{Duration, Instant};
 
     use grit::Host;
-    use grit::serve3::journal::Made;
-    use grit::serve3::{Server, rules};
+    use grit::serve3::journal::{Entry, Keep, Ledger, Made};
+    use grit::serve3::{Options, Server, rules};
     use grit::wire::{Json, written};
 
     use super::common::device;
@@ -298,5 +366,89 @@ mod served {
             "a refused create built nothing"
         );
         faults.lock().unwrap().slow_builds = 0;
+    }
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(label: &str) -> Scratch {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("grit-f2-{label}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Scratch(path)
+    }
+
+    fn opened(server: &mut Server<'_>, number: u32, budget: Duration) -> Json {
+        call(
+            server,
+            "grit_world_open",
+            &format!(
+                "{{\"name\":\"world-{number}\",\"budget_ms\":{}}}",
+                budget.as_millis()
+            ),
+        )
+    }
+
+    #[test]
+    fn a_replay_too_slow_for_its_budget_is_refused_up_front_after_few_cut_calls() {
+        let Some(host) = device("cut replays") else {
+            return;
+        };
+        let held = scratch("cut-replay");
+        let dir = held.0.join("worlds");
+        let keep = Keep::at(&dir).unwrap();
+        for number in [1, 2] {
+            let mut ledger = Ledger::created(Made {
+                rule: "sand".to_owned(),
+                params: Vec::new(),
+                size: [32, 32, 32],
+                sparse: false,
+                slots: None,
+            });
+            ledger.push(Entry::Step(4000), Duration::from_millis(400));
+            keep.begin(number, &ledger).unwrap();
+        }
+        keep.set_next(3).unwrap();
+        drop(keep);
+        let options = Options {
+            dir: Some(dir),
+            memory: None,
+        };
+        let mut server = Server::with(Some(&host), &options).unwrap();
+        result(&opened(&mut server, 1, Duration::from_secs(600)), false);
+        let budget = Duration::from_millis(1500);
+        grit::serve3::tools::faults::stall_every(Duration::from_millis(2));
+        let mut cut = 0;
+        let mut refused = None;
+        for _ in 0..6 {
+            let began = Instant::now();
+            let told = result(&opened(&mut server, 2, budget), true);
+            let took = began.elapsed();
+            let message = told.get("message").and_then(Json::text).unwrap().to_owned();
+            eprintln!("open with a {budget:?} budget answered in {took:?}: {message}");
+            assert_eq!(told.get("code").and_then(Json::text), Some("budget"));
+            assert!(took < budget + Duration::from_secs(1), "{took:?}");
+            if message.contains("nothing was opened") {
+                cut += 1;
+                continue;
+            }
+            assert!(message.contains("rebuilding world 2"), "{message}");
+            assert!(message.contains("nothing ran"), "{message}");
+            refused = Some(took);
+            break;
+        }
+        grit::serve3::tools::faults::disarm();
+        let refused = refused.expect("a replay that never fits was never refused up front");
+        assert!(refused < Duration::from_millis(500), "{refused:?}");
+        assert!(cut <= 3, "{cut} calls were cut before the refusal");
     }
 }

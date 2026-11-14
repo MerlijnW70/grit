@@ -1110,23 +1110,41 @@ pub fn rebuilt<'host>(
                 } else {
                     WRITE_CHUNK
                 };
+                let mut written = 0_usize;
+                let mut stopped = None;
                 for piece in cells.chunks(chunk) {
                     if let Some(stop) = guard.stop() {
-                        return Err(halted(stop, world.frame()));
+                        stopped = Some(stop);
+                        break;
                     }
                     world.write(piece)?;
+                    written += piece.len();
                 }
+                let share = written as f64 / cells.len().max(1) as f64;
                 timings.writes = timings.writes.saturating_add(writing.elapsed());
-                timings.write_bytes = timings.write_bytes.saturating_add(entry.bytes() as u64);
+                timings.write_bytes = timings
+                    .write_bytes
+                    .saturating_add((entry.bytes() as f64 * share) as u64);
+                if let Some(stop) = stopped {
+                    return Err(halted(stop, world.frame()));
+                }
             }
             Entry::Params(params) => super::law::reparam(&mut world, params)?,
             Entry::Step(frames) => {
                 let stepped = std::time::Instant::now();
+                let from = world.frame();
                 let ran = stepping(&mut world, *frames);
                 timings.steps = timings.steps.saturating_add(stepped.elapsed());
-                timings.recorded = timings
-                    .recorded
-                    .saturating_add(ledger.recorded.get(at).copied().unwrap_or_default());
+                let share =
+                    f64::from(world.frame().saturating_sub(from)) / f64::from((*frames).max(1));
+                timings.recorded = timings.recorded.saturating_add(
+                    ledger
+                        .recorded
+                        .get(at)
+                        .copied()
+                        .unwrap_or_default()
+                        .mul_f64(share.min(1.0)),
+                );
                 if let Err(why) = ran {
                     return Err(match why.downcast_ref::<super::budget::Cut>() {
                         Some(cut) => halted(cut.0, world.frame()),

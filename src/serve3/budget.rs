@@ -380,29 +380,50 @@ const RATIO_MOST: f64 = 8.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
     Build,
+    BuildSparse,
     Fork,
     Save,
+    Snap,
     File,
     Write,
 }
 
 impl Work {
-    pub const ALL: [Self; 5] = [Self::Build, Self::Fork, Self::Save, Self::File, Self::Write];
+    pub const ALL: [Self; 7] = [
+        Self::Build,
+        Self::BuildSparse,
+        Self::Fork,
+        Self::Save,
+        Self::Snap,
+        Self::File,
+        Self::Write,
+    ];
+
+    #[must_use]
+    pub const fn build(sparse: bool) -> Self {
+        if sparse {
+            Self::BuildSparse
+        } else {
+            Self::Build
+        }
+    }
 
     const fn index(self) -> usize {
         match self {
             Self::Build => 0,
-            Self::Fork => 1,
-            Self::Save => 2,
-            Self::File => 3,
-            Self::Write => 4,
+            Self::BuildSparse => 1,
+            Self::Fork => 2,
+            Self::Save => 3,
+            Self::Snap => 4,
+            Self::File => 5,
+            Self::Write => 6,
         }
     }
 
     const fn prior(self) -> f64 {
         match self {
-            Self::Build | Self::Fork => 1e-8,
-            Self::Save => 5e-8,
+            Self::Build | Self::BuildSparse | Self::Fork => 1e-8,
+            Self::Save | Self::Snap => 5e-8,
             Self::File => 2e-8,
             Self::Write => 2e-4,
         }
@@ -419,8 +440,10 @@ impl Work {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Build => "build",
+            Self::BuildSparse => "build_sparse",
             Self::Fork => "fork",
             Self::Save => "save",
+            Self::Snap => "snapshot_in_memory",
             Self::File => "file",
             Self::Write => "write",
         }
@@ -433,6 +456,13 @@ struct Kept {
 }
 
 pub const PADDED: usize = 3;
+
+pub const LOW_SHARE: usize = 3;
+
+fn low(mut held: Vec<f64>) -> Option<f64> {
+    held.sort_by(f64::total_cmp);
+    held.get(held.len().checked_sub(1)? / LOW_SHARE).copied()
+}
 
 fn median(mut held: Vec<f64>, prior: f64) -> f64 {
     while held.len() < PADDED {
@@ -468,10 +498,10 @@ impl Kept {
             .iter()
             .map(|(held, spent)| spent / held.max(1.0))
             .fold(prior, f64::min);
-        costs
+        low(costs
             .iter()
             .map(|(held, spent)| spent + marginal * (bytes - held).max(0.0))
-            .reduce(f64::min)
+            .collect())
     }
 
     fn chosen(&self, bytes: f64) -> Vec<f64> {
@@ -498,7 +528,7 @@ impl Kept {
 
 #[derive(Debug, Clone, Default)]
 pub struct Rates {
-    kinds: [Kept; 5],
+    kinds: [Kept; 7],
     replay: Kept,
 }
 
@@ -568,11 +598,7 @@ impl Rates {
     #[must_use]
     pub fn replay_least(&self) -> f64 {
         let most = self.replay();
-        self.replay
-            .seen
-            .iter()
-            .map(|(_, ratio)| *ratio)
-            .reduce(f64::min)
+        low(self.replay.seen.iter().map(|(_, ratio)| *ratio).collect())
             .map_or(most, |least| least.clamp(RATIO_LEAST, RATIO_MOST).min(most))
     }
 
@@ -631,7 +657,7 @@ pub fn too_slow(needs: Duration, left: Duration, what: &str) -> Refusal {
         Code::Budget,
         "$.budget_ms",
         format!(
-            "{what} needs at least {} ms on this device, by the fastest the server has measured such work, and the call has {} ms left; nothing ran",
+            "{what} needs at least {} ms on this device, by the lowest third of the server's recent measurements of such work, and the call has {} ms left; nothing ran",
             needs.as_millis(),
             left.as_millis()
         ),
