@@ -484,9 +484,38 @@ pub fn arranged3_by<R: Rule>(
     coarse: bool,
 ) -> Result<Loop, LaneError> {
     fits("live::arranged3", grid, plan)?;
+    let (listed, _) = tiers(plan, coarse);
+    arranged3_with(
+        rule,
+        subgroup,
+        grid,
+        plan,
+        (coarse, decay(subgroup, listed)?),
+    )
+}
 
+pub fn wired3_whole_by<R: Rule>(
+    rule: &R,
+    subgroup: u32,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+) -> Result<Loop, LaneError> {
+    fits("live::wired3", grid, plan)?;
+    let coarse = coarse_pays(plan.blocks);
+    let (listed, _) = tiers(plan, coarse);
+    let kept = decay_whole(subgroup, listed, grid.blocks())?;
+    arranged3_with(rule, subgroup, grid, plan, (coarse, kept))
+}
+
+fn arranged3_with<R: Rule>(
+    rule: &R,
+    subgroup: u32,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+    (coarse, decayed): (bool, Vec<u32>),
+) -> Result<Loop, LaneError> {
     let mut stages: Stages = vec![
-        opening3(rule, subgroup, plan, coarse)?,
+        opening3(rule, subgroup, plan, coarse, decayed)?,
         vec![(
             settle3_in(rule, subgroup, grid, windows3(rule, plan))?,
             crate::compact::Plan::listed(),
@@ -511,17 +540,18 @@ pub(crate) fn opening3<R: Rule>(
     subgroup: u32,
     plan: &crate::compact::Plan,
     coarse: bool,
+    decayed: Vec<u32>,
 ) -> Result<Vec<(Vec<u32>, crate::Groups)>, LaneError> {
     use crate::Groups;
     use crate::sweep::COUNTS;
 
-    let (listed, hot) = tiers(plan, coarse);
+    let (_, hot) = tiers(plan, coarse);
     let tiles = Groups::Fixed(plan.tiles);
     let one = Groups::Fixed(1);
 
     let mut first = vec![
         (tick(subgroup)?, one),
-        (decay(subgroup, listed)?, hot),
+        (decayed, hot),
         (wipe3(subgroup, rule.tally().words())?, one),
         (wipe_counts(subgroup, COUNTS)?, tiles),
         (unclaimed(subgroup, plan)?, one),
@@ -909,6 +939,84 @@ fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, Lane
         lowered.push(step(&mut kernel, was)?);
     }
     for (&quad, &lower) in quads.iter().zip(&lowered) {
+        kernel.store_at(AWAKE, quad, lower)?;
+    }
+    let mut highest = kernel.module().constant_u32(0)?;
+    for &lower in &lowered {
+        let mut lanes = kernel.lanes()?;
+        let so_far = lanes.splat_id::<U32, 1>(highest)?;
+        let now = lanes.splat_id::<U32, 1>(lower)?;
+        highest = lanes.max(so_far, now)?.id();
+    }
+
+    let flag = {
+        let mut lanes = kernel.lanes()?;
+        let mine = lanes.splat_id::<U32, LANES>(highest)?;
+        lanes.reduce_max::<U32, LANES>(mine)?
+    };
+    kernel.store_at(HOT, block, flag)?;
+    kernel.finish()
+}
+
+pub fn decay_whole(subgroup: u32, over: Over, quads: u32) -> Result<Vec<u32>, LaneError> {
+    match subgroup {
+        4 => decayed_whole::<4>(subgroup, over, quads),
+        8 => decayed_whole::<8>(subgroup, over, quads),
+        16 => decayed_whole::<16>(subgroup, over, quads),
+        32 => decayed_whole::<32>(subgroup, over, quads),
+        64 => decayed_whole::<64>(subgroup, over, quads),
+        other => Err(LaneError::NoMapping {
+            lanes: other,
+            width: subgroup,
+        }),
+    }
+}
+
+fn decayed_whole<const LANES: u32>(
+    subgroup: u32,
+    over: Over,
+    quads: u32,
+) -> Result<Vec<u32>, LaneError> {
+    use crate::sweep::{self, PER_LANE};
+
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let uint = kernel.index_type();
+
+    let block = owned(&mut kernel, over)?;
+    let lane = kernel.local_index();
+    let span = kernel.module().constant_u32(sweep::cells(subgroup))?;
+    let start = kernel.module().i_mul(uint, block, span)?;
+    let run = kernel.module().constant_u32(PER_LANE)?;
+    let along = kernel.module().i_mul(uint, lane, run)?;
+    let mine = kernel.module().i_add(uint, start, along)?;
+
+    let kept = |kernel: &mut Kernel<U32>, held: simdr::module::Id, quad: simdr::module::Id| {
+        let mut lanes = kernel.lanes()?;
+        let now = lanes.splat_id::<U32, 1>(held)?;
+        let at = lanes.splat_id::<U32, 1>(quad)?;
+        let one = lanes.splat_bits::<U32, 1>(1)?;
+        let minus = lanes.splat_bits::<U32, 1>(u32::MAX)?;
+        let past = lanes.splat_bits::<U32, 1>(quads)?;
+        let floored = lanes.max(now, one)?;
+        let back = lanes.mul(one, minus)?;
+        let lowered = lanes.add(floored, back)?;
+        let inside = lanes.greater_than(past, at)?;
+        Ok::<_, LaneError>(lanes.select(inside, one, lowered)?.id())
+    };
+
+    let mut quad_ids = Vec::with_capacity(PER_LANE as usize);
+    let mut held = Vec::with_capacity(PER_LANE as usize);
+    for offset in 0..PER_LANE {
+        let along = kernel.module().constant_u32(offset)?;
+        let quad = kernel.module().i_add(uint, mine, along)?;
+        held.push(kernel.load_at(AWAKE, quad)?);
+        quad_ids.push(quad);
+    }
+    let mut lowered = Vec::with_capacity(PER_LANE as usize);
+    for (&was, &quad) in held.iter().zip(&quad_ids) {
+        lowered.push(kept(&mut kernel, was, quad)?);
+    }
+    for (&quad, &lower) in quad_ids.iter().zip(&lowered) {
         kernel.store_at(AWAKE, quad, lower)?;
     }
     let mut highest = kernel.module().constant_u32(0)?;

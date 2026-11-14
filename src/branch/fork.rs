@@ -55,7 +55,9 @@ impl<'host> World<'host> {
 
     pub fn restore(&mut self, from: &mut World<'_>) -> Result<(), Failed> {
         let unlike = |what| Err(Box::new(Refused::Unlike { what }) as Failed);
-        if self.rule.name() != from.rule.name() {
+        if self.rule.name() != from.rule.name()
+            || self.law().map(crate::law::Law::hash) != from.law().map(crate::law::Law::hash)
+        {
             return unlike("rules");
         }
         if self.size() != from.size() {

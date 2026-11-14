@@ -189,72 +189,79 @@ pub struct Made<'made> {
     pub slots: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stepping {
+    Listed,
+    Whole,
+}
+
 pub(crate) enum Stepper {
     Named(Box<dyn Listed>),
-    Law(Box<crate::law::Law>),
+    Law(Box<crate::law::Law>, Stepping),
 }
 
 impl Stepper {
     pub(crate) fn name(&self) -> &str {
         match self {
             Self::Named(rule) => rule.name(),
-            Self::Law(law) => law.name(),
+            Self::Law(law, _) => law.name(),
         }
     }
 
     fn tally_words(&self) -> usize {
         match self {
             Self::Named(rule) => rule.tally_words(),
-            Self::Law(law) => crate::rule3::Declared::tally(&**law).words(),
+            Self::Law(law, _) => crate::rule3::Declared::tally(&**law).words(),
         }
     }
 
     pub(crate) fn planes(&self) -> u32 {
         match self {
             Self::Named(_) => 1,
-            Self::Law(law) => law.channels().max(1),
+            Self::Law(law, _) => law.channels().max(1),
         }
     }
 
     fn wired(&self, subgroup: u32, grid: Grid, plan: &Plan) -> Result<live::Loop, LaneError> {
         match self {
             Self::Named(rule) => rule.wired(subgroup, grid, plan),
-            Self::Law(law) => live::wired3_by(&**law, subgroup, grid, plan),
+            Self::Law(law, Stepping::Listed) => live::wired3_by(&**law, subgroup, grid, plan),
+            Self::Law(law, Stepping::Whole) => live::wired3_whole_by(&**law, subgroup, grid, plan),
         }
     }
 
     fn laid(&self, plan: &Plan) -> Vec<usize> {
         match self {
             Self::Named(rule) => plan.windows().laid(&rule.sizes(plan)),
-            Self::Law(law) => live::windows3(&**law, plan).laid(&live::sizes3(&**law, plan)),
+            Self::Law(law, _) => live::windows3(&**law, plan).laid(&live::sizes3(&**law, plan)),
         }
     }
 
     pub(crate) fn windows(&self, plan: &Plan) -> Windows {
         match self {
             Self::Named(_) => plan.windows(),
-            Self::Law(law) => live::windows3(&**law, plan),
+            Self::Law(law, _) => live::windows3(&**law, plan),
         }
     }
 
     fn bricked(&self, bricks: &Bricks, plan: &Plan) -> Result<live::Loop, LaneError> {
         match self {
             Self::Named(rule) => rule.bricked(bricks, plan),
-            Self::Law(law) => bricks::arranged(&**law, bricks, plan, true),
+            Self::Law(law, _) => bricks::arranged(&**law, bricks, plan, true),
         }
     }
 
     fn bricked_sizes(&self, bricks: &Bricks, plan: &Plan) -> Vec<usize> {
         match self {
             Self::Named(rule) => rule.bricked_sizes(bricks, plan),
-            Self::Law(law) => bricks.sizes(&**law, plan),
+            Self::Law(law, _) => bricks.sizes(&**law, plan),
         }
     }
 
     pub(crate) fn again(&self, host: &Host, params: &[u32]) -> Result<Self, Refused> {
         match self {
             Self::Named(rule) => Ok(Self::Named(ruled(host, rule.name(), params)?)),
-            Self::Law(law) => Ok(Self::Law(law.clone())),
+            Self::Law(law, stepping) => Ok(Self::Law(law.clone(), *stepping)),
         }
     }
 
@@ -263,7 +270,7 @@ impl Stepper {
             Self::Named(rule) => Law::Rule {
                 name: rule.name().to_owned(),
             },
-            Self::Law(law) => Law::Law {
+            Self::Law(law, _) => Law::Law {
                 name: law.name().to_owned(),
                 canonical: law.canonical().to_owned(),
             },
@@ -271,7 +278,7 @@ impl Stepper {
     }
 }
 
-fn lawful(law: &crate::law::Law, params: &[u32]) -> Result<Stepper, Refused> {
+fn lawful(law: &crate::law::Law, params: &[u32], stepping: Stepping) -> Result<Stepper, Refused> {
     let wanted = crate::rule3::Declared::params(law);
     if params.len() != wanted {
         return Err(Refused::Params {
@@ -280,10 +287,15 @@ fn lawful(law: &crate::law::Law, params: &[u32]) -> Result<Stepper, Refused> {
             wanted,
         });
     }
-    Ok(Stepper::Law(Box::new(law.clone())))
+    Ok(Stepper::Law(Box::new(law.clone()), stepping))
 }
 
-fn stepper_of(host: &Host, law: &Law, params: &[u32]) -> Result<Stepper, Failed> {
+fn stepper_of(
+    host: &Host,
+    law: &Law,
+    params: &[u32],
+    stepping: Stepping,
+) -> Result<Stepper, Failed> {
     match law {
         Law::Rule { name } => Ok(Stepper::Named(ruled(host, name, params)?)),
         Law::Law { canonical, .. } => {
@@ -292,9 +304,18 @@ fn stepper_of(host: &Host, law: &Law, params: &[u32]) -> Result<Stepper, Failed>
                     what: format!("the law: {why}"),
                 }) as Failed
             })?;
-            Ok(lawful(&compiled, params)?)
+            Ok(lawful(&compiled, params, stepping)?)
         }
     }
+}
+
+fn listed_if_sparse(sparse: bool, stepping: Stepping) -> Result<(), Failed> {
+    if sparse && stepping == Stepping::Whole {
+        return Err(Box::new(Refused::Malformed {
+            what: "a sparse world steps only the octs it lists".to_owned(),
+        }));
+    }
+    Ok(())
 }
 
 fn pooled(bricks: Bricks, rule: &Stepper) -> Result<Bricks, Failed> {
@@ -322,8 +343,21 @@ fn pool_for(
 
 pub fn sizes_of(host: &Host, made: &Made<'_>) -> Result<Vec<usize>, Failed> {
     let rule = Stepper::Named(ruled(host, made.rule, made.params)?);
+    sizes_by(host, made, &rule)
+}
+
+pub fn sizes_of_law(
+    host: &Host,
+    law: &crate::law::Law,
+    made: &Made<'_>,
+) -> Result<Vec<usize>, Failed> {
+    let rule = lawful(law, made.params, Stepping::Listed)?;
+    sizes_by(host, made, &rule)
+}
+
+fn sizes_by(host: &Host, made: &Made<'_>, rule: &Stepper) -> Result<Vec<usize>, Failed> {
     let shape = planned(host.width(), made.size, made.sparse)?;
-    Ok(match pool_for(&shape, made, &rule)? {
+    Ok(match pool_for(&shape, made, rule)? {
         Some(bricks) => rule.bricked_sizes(&bricks, &shape.1),
         None => rule.laid(&shape.1),
     })
@@ -479,7 +513,22 @@ impl<'host> World<'host> {
                 name: made.rule.to_owned(),
             }));
         }
-        let rule = lawful(law, made.params)?;
+        Self::create_law_stepped(host, law, made, Stepping::Listed)
+    }
+
+    pub fn create_law_stepped(
+        host: &'host Host,
+        law: &crate::law::Law,
+        made: &Made<'_>,
+        stepping: Stepping,
+    ) -> Result<Self, Failed> {
+        if made.rule != law.name() {
+            return Err(Box::new(Refused::Rule {
+                name: made.rule.to_owned(),
+            }));
+        }
+        listed_if_sparse(made.sparse, stepping)?;
+        let rule = lawful(law, made.params, stepping)?;
         Self::made(host, rule, made)
     }
 
@@ -535,7 +584,16 @@ impl<'host> World<'host> {
     }
 
     pub fn open(host: &'host Host, image: &Image) -> Result<Self, Failed> {
-        let rule = stepper_of(host, &image.law, &image.params)?;
+        Self::open_stepped(host, image, Stepping::Listed)
+    }
+
+    pub fn open_stepped(
+        host: &'host Host,
+        image: &Image,
+        stepping: Stepping,
+    ) -> Result<Self, Failed> {
+        listed_if_sparse(matches!(image.state, State::Sparse { .. }), stepping)?;
+        let rule = stepper_of(host, &image.law, &image.params, stepping)?;
         if rule.planes() != image.channels() {
             return Err(Box::new(Refused::Sizes {
                 what: "channels",
@@ -614,6 +672,90 @@ impl<'host> World<'host> {
     #[must_use]
     pub fn rule(&self) -> &str {
         self.rule.name()
+    }
+
+    #[must_use]
+    pub fn law(&self) -> Option<&crate::law::Law> {
+        match &self.rule {
+            Stepper::Named(_) => None,
+            Stepper::Law(law, _) => Some(law),
+        }
+    }
+
+    #[must_use]
+    pub const fn stepping(&self) -> Stepping {
+        match &self.rule {
+            Stepper::Named(_) => Stepping::Listed,
+            Stepper::Law(_, stepping) => *stepping,
+        }
+    }
+
+    pub fn set_params(&mut self, params: &[u32], stepping: Stepping) -> Result<(), Failed> {
+        let stepping = match &self.rule {
+            Stepper::Named(rule) => {
+                if params.len() != rule.params() {
+                    return Err(Box::new(Refused::Params {
+                        rule: rule.name().to_owned(),
+                        given: params.len(),
+                        wanted: rule.params(),
+                    }));
+                }
+                Stepping::Listed
+            }
+            Stepper::Law(law, _) => {
+                let wanted = crate::rule3::Declared::params(&**law);
+                if params.len() != wanted {
+                    return Err(Box::new(Refused::Params {
+                        rule: law.name().to_owned(),
+                        given: params.len(),
+                        wanted,
+                    }));
+                }
+                stepping
+            }
+        };
+        listed_if_sparse(self.pool.is_some(), stepping)?;
+        if stepping != self.stepping() {
+            let mut image = self.image()?;
+            image.params = params.to_vec();
+            *self = Self::open_stepped(self.host, &image, stepping)?;
+            return Ok(());
+        }
+        self.params = params.to_vec();
+        self.parameters()?;
+        self.reseed()?;
+        self.live
+            .write(PARAMS as usize, &[self.frame.wrapping_sub(1)])?;
+        Ok(())
+    }
+
+    pub fn uniforms(&mut self) -> Result<Vec<Vec<u32>>, Failed> {
+        let Some(bricks) = self.pool else {
+            return Ok(Vec::new());
+        };
+        let table = self
+            .live
+            .read(bricks.table() as usize, bricks.table_words())?;
+        let mut found = std::collections::BTreeSet::new();
+        for brick in 0..bricks.count() {
+            let slot = table
+                .get(brick as usize * ENTRY)
+                .copied()
+                .unwrap_or(UNIFORM);
+            if slot != UNIFORM {
+                continue;
+            }
+            let value: Vec<u32> = (0..bricks.planes())
+                .map(|plane| {
+                    table
+                        .get(bricks.value_at(plane, brick))
+                        .copied()
+                        .unwrap_or_default()
+                })
+                .collect();
+            found.insert(value);
+        }
+        Ok(found.into_iter().collect())
     }
 
     #[must_use]
