@@ -4582,13 +4582,12 @@ fn a_replay_held_up_once_never_refuses_the_next_open_of_a_kept_world_that_fits()
 
 #[cfg(feature = "faults")]
 #[test]
-fn a_replay_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that_fits() {
+fn a_build_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that_fits() {
     let Some(host) = device("held up rebuild") else {
         return;
     };
     drop(host);
     let scratch = Scratch::new("held-rebuild");
-    kept_journals(&scratch, &[1, 2]);
     let mut run = Run::new(&Options {
         dir: Some(scratch.dir()),
         memory: None,
@@ -4596,22 +4595,17 @@ fn a_replay_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that
     let world = sand_world(&mut run, 32);
     answer(&run.ask(
         "grit_world_step",
-        &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":400}}"),
+        &format!("{{\"world\":{world},\"frames\":10}}"),
     ));
-    let frame = answer(&run.ask(
-        "grit_world_read",
-        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0]}}"),
-    ))
-    .int_at("frame");
-    answer(&run.ask("grit_world_open", &opened_kept(1, 600_000)));
     let faults = run.exec.faults();
     {
         let mut armed = faults.lock().unwrap();
-        armed.held_replays = 1;
-        armed.held_by = Duration::from_secs(8);
+        armed.held_work = vec![grit::serve3::budget::Work::Build];
+        armed.held_by = Duration::from_millis(1500);
     }
-    answer(&run.ask("grit_world_open", &opened_kept(2, 600_000)));
-    assert_eq!(faults.lock().unwrap().held_replays, 0);
+    let other = sand_world(&mut run, 32);
+    assert!(faults.lock().unwrap().held_work.is_empty());
+    answer(&run.ask("grit_world_close", &format!("{{\"world\":{other}}}")));
     faults.lock().unwrap().wedge_before_call = true;
     let wedged = run.ask(
         "grit_world_read",
@@ -4620,11 +4614,11 @@ fn a_replay_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that
     eprintln!("wedged: {}", written(&wedged));
     let got = run.ask(
         "grit_world_read",
-        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":2000}}"),
+        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":700}}"),
     );
-    eprintln!("rebuild after one held-up replay: {}", written(&got));
+    eprintln!("rebuild after one held-up build: {}", written(&got));
     let read = answer(&got);
-    assert_eq!(read.int_at("frame"), frame);
+    assert_eq!(read.int_at("frame"), 10);
     assert!(read.get("restored").is_some(), "{}", written(&read));
     run.exec.finish();
 }
