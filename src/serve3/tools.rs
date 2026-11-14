@@ -578,10 +578,11 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     made.size = [grid.wide, grid.deep, grid.tall];
     let bytes = admitted(server, host, &sizes, "the world")?;
     server.fits(
-        server.book.rates.estimate(Work::Build, bytes),
+        server.book.rates.least(Work::Build, bytes),
         "building the world",
     )?;
     let began = Instant::now();
+    server.build_slowly();
     let world = match rule.lawful() {
         None => World::create(host, &made.branch())?,
         Some(lawful) => World::create_law_stepped(
@@ -1193,7 +1194,7 @@ pub fn describe(status: &Status) -> Json {
                 (
                     "budget_late",
                     text(
-                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait. A step whose budget the world's last two measured frames, by any client, both do not fit is refused at once, but after two calls in a row were refused since the last measurement the next one runs one frame to measure again; when only the last of the two does not fit, the step runs one frame to measure again; an open or rebuild runs one frame at the start of each journal entry its replay would otherwise stop at. Either answer can come after its budget by up to one frame of that world",
+                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait. A step whose budget the world's last two measured frames, by any client, both do not fit is refused at once, but after two calls in a row were refused since the last measurement the next one runs one frame to measure again; when only the last of the two does not fit, the step runs one frame to measure again; an open or rebuild runs one frame at the start of each journal entry its replay would otherwise stop at. Either answer can come after its budget by up to one frame of that world. Work that cannot stop part way (building, copying, saving or reading a world, and a snapshot a world owes) starts when the least time its recent measurements allow fits the time left and is refused at once when even that does not fit, so its answer can come after its budget by as much as the device runs slower than its fastest recent measurement",
                     ),
                 ),
                 (

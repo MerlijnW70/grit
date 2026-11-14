@@ -458,6 +458,22 @@ impl Kept {
         median(self.chosen(bytes), prior)
     }
 
+    fn least(&self, prior: f64, fixed: f64, bytes: f64) -> Option<f64> {
+        let costs: Vec<(f64, f64)> = self
+            .seen
+            .iter()
+            .map(|(size, rate)| ((size - fixed).max(0.0), size * rate))
+            .collect();
+        let marginal = costs
+            .iter()
+            .map(|(held, spent)| spent / held.max(1.0))
+            .fold(prior, f64::min);
+        costs
+            .iter()
+            .map(|(held, spent)| spent + marginal * (bytes - held).max(0.0))
+            .reduce(f64::min)
+    }
+
     fn chosen(&self, bytes: f64) -> Vec<f64> {
         let similar: Vec<f64> = self
             .seen
@@ -515,6 +531,15 @@ impl Rates {
         Duration::try_from_secs_f64(size * self.rate(work, bytes)).unwrap_or(Duration::MAX)
     }
 
+    #[must_use]
+    pub fn least(&self, work: Work, bytes: u64) -> Duration {
+        let most = self.estimate(work, bytes);
+        self.kept(work)
+            .and_then(|kept| kept.least(work.prior(), work.fixed(), bytes as f64))
+            .and_then(|spent| Duration::try_from_secs_f64(spent).ok())
+            .map_or(most, |least| least.min(most))
+    }
+
     pub fn measure(&mut self, work: Work, bytes: u64, spent: Duration) {
         let size = bytes as f64 + work.fixed();
         let sample = spent.as_secs_f64() / size;
@@ -538,6 +563,22 @@ impl Rates {
     #[must_use]
     pub fn replaying(&self, recorded: Duration) -> Duration {
         recorded.mul_f64(self.replay())
+    }
+
+    #[must_use]
+    pub fn replay_least(&self) -> f64 {
+        let most = self.replay();
+        self.replay
+            .seen
+            .iter()
+            .map(|(_, ratio)| *ratio)
+            .reduce(f64::min)
+            .map_or(most, |least| least.clamp(RATIO_LEAST, RATIO_MOST).min(most))
+    }
+
+    #[must_use]
+    pub fn replaying_least(&self, recorded: Duration) -> Duration {
+        recorded.mul_f64(self.replay_least())
     }
 
     pub fn measure_replay(&mut self, recorded: Duration, spent: Duration) {
@@ -590,7 +631,7 @@ pub fn too_slow(needs: Duration, left: Duration, what: &str) -> Refusal {
         Code::Budget,
         "$.budget_ms",
         format!(
-            "{what} needs about {} ms on this device, by the rates the server has measured, and the call has {} ms left; nothing ran",
+            "{what} needs at least {} ms on this device, by the fastest the server has measured such work, and the call has {} ms left; nothing ran",
             needs.as_millis(),
             left.as_millis()
         ),

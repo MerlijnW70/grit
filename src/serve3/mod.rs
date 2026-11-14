@@ -289,6 +289,8 @@ pub struct Faults {
     pub idle_works: u32,
     pub pause_after_answer: Duration,
     pub slow_wake: Duration,
+    pub slow_builds: u32,
+    pub slow_build: Duration,
 }
 
 impl Book {
@@ -826,21 +828,21 @@ impl<'host> Server<'host> {
         (server, restored)
     }
 
-    fn replay_estimate(&self, ledger: &Ledger, bytes: u64) -> Duration {
+    fn replay_least(&self, ledger: &Ledger, bytes: u64) -> Duration {
         let rates = &self.book.rates;
         let snapshot = match (&ledger.base, self.book.keep.as_ref()) {
             (Base::Snapshot(snap), Some(keep)) if snap.image.is_none() => {
                 std::fs::metadata(keep.snapshot(&snap.sum)).map_or(Duration::ZERO, |found| {
-                    rates.estimate(budget::Work::File, found.len())
+                    rates.least(budget::Work::File, found.len())
                 })
             }
             _ => Duration::ZERO,
         };
         rates
-            .estimate(budget::Work::Build, bytes)
+            .least(budget::Work::Build, bytes)
             .saturating_add(snapshot)
-            .saturating_add(rates.estimate(budget::Work::Write, ledger.write_bytes()))
-            .saturating_add(rates.replaying(ledger.step_recorded()))
+            .saturating_add(rates.least(budget::Work::Write, ledger.write_bytes()))
+            .saturating_add(rates.replaying_least(ledger.step_recorded()))
     }
 
     fn fits(&self, needs: Duration, what: &str) -> Result<(), Failed> {
@@ -898,7 +900,7 @@ impl<'host> Server<'host> {
         let replayed = u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX);
         let host = self.host.ok_or(crate::host::Error::NoComputeDevice)?;
         self.fits(
-            self.replay_estimate(&ledger, bytes),
+            self.replay_least(&ledger, bytes),
             &format!("rebuilding world {number} after the lost device"),
         )?;
         let built = self
@@ -1216,17 +1218,17 @@ impl<'host> Server<'host> {
                 ),
             )));
         }
-        let needs = self.snap_estimate(number);
-        if self.clock.left() < needs && !far {
+        if self.clock.left() < self.snap_estimate(number) && !far {
             return Ok(None);
         }
+        let needs = self.snap_least(number);
         if self.clock.left() < needs {
             return Err(Box::new(
                 Refusal::new(
                     errors::Code::Budget,
                     "$.budget_ms",
                     format!(
-                        "world {number} owes a snapshot of its journal before it changes again, which needs about {} ms, and this call has {} ms left; nothing ran",
+                        "world {number} owes a snapshot of its journal before it changes again, which needs at least {} ms by the fastest the server has measured such work, and this call has {} ms left; nothing ran",
                         needs.as_millis(),
                         self.clock.left().as_millis()
                     ),
@@ -1409,6 +1411,12 @@ impl<'host> Server<'host> {
         })
     }
 
+    fn snap_least(&self, number: u32) -> Duration {
+        self.book.held.get(&number).map_or(Duration::ZERO, |held| {
+            self.book.rates.least(budget::Work::Save, held.bytes)
+        })
+    }
+
     fn far_overdue(&self, number: u32, extra: Duration) -> bool {
         self.book.held.get(&number).is_some_and(|held| {
             held.ledger.far_over_writing(
@@ -1483,6 +1491,26 @@ impl<'host> Server<'host> {
         }
         true
     }
+
+    #[cfg(feature = "faults")]
+    pub(super) fn build_slowly(&self) {
+        let slow = self
+            .book
+            .faults
+            .lock()
+            .map(|mut faults| {
+                if faults.slow_builds == 0 {
+                    return Duration::ZERO;
+                }
+                faults.slow_builds -= 1;
+                faults.slow_build
+            })
+            .unwrap_or_default();
+        std::thread::sleep(slow);
+    }
+
+    #[cfg(not(feature = "faults"))]
+    pub(super) const fn build_slowly(&self) {}
 
     #[cfg(feature = "faults")]
     fn slow_idle(&self) -> Duration {
