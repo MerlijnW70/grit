@@ -869,6 +869,9 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ),
         ("listed", counted(listed)),
     ];
+    if let Some(lawful) = live.rule.lawful() {
+        answer.push(("tallied", text(lawful.tallied())));
+    }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
@@ -1153,6 +1156,7 @@ pub fn describe(status: &Status) -> Json {
                     ),
                 ),
                 ("queue_calls", number(super::exec::QUEUE_MOST)),
+                ("law_tally", text(super::law::TALLIED)),
                 (
                     "budget_late",
                     text(

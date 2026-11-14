@@ -30,6 +30,12 @@ pub const TOOLS: &[Tool] = &[Tool {
 
 pub const KINDS: u32 = 15;
 
+pub const TALLIED_LISTED: &str = "listed octs";
+
+pub const TALLIED_EVERY: &str = "every oct";
+
+pub const TALLIED: &str = "a law world's tally sums its counts over the octs a frame steps, and its answers name which as tallied: every oct for a whole world; listed octs for a proved one, which sums only the octs the frame lists, so it equals the sum over every oct only for counts that are 0 on an oct the step leaves unchanged";
+
 pub struct Lawful {
     law: Law,
     class: Class,
@@ -52,10 +58,20 @@ impl Lawful {
     }
 
     #[must_use]
+    pub const fn tallied(&self) -> &'static str {
+        if self.class.proved() {
+            TALLIED_LISTED
+        } else {
+            TALLIED_EVERY
+        }
+    }
+
+    #[must_use]
     pub fn told(&self) -> Vec<(&'static str, Json)> {
         let mut told = vec![
             ("law", text(&self.law.hex())),
             ("quiet", text(self.class.name())),
+            ("tallied", text(self.tallied())),
         ];
         if let Some(why) = self.class.why() {
             told.push(("quiet_why", text(&why)));
