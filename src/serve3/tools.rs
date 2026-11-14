@@ -63,19 +63,37 @@ pub const TOOLS: &[Tool] = &[
 #[cfg(feature = "faults")]
 pub mod faults {
     use std::cell::Cell;
+    use std::time::Duration;
 
     use super::{Code, Failed, Refusal};
 
     thread_local! {
         static BATCH: Cell<Option<u32>> = const { Cell::new(None) };
+        static STALL: Cell<Option<(u32, Duration)>> = const { Cell::new(None) };
     }
 
     pub fn fail_batch(nth: u32) {
         BATCH.set(Some(nth));
     }
 
+    pub fn stall_batch(nth: u32, by: Duration) {
+        STALL.set(Some((nth, by)));
+    }
+
+    pub(super) fn stall() {
+        match STALL.get() {
+            Some((0, by)) => {
+                STALL.set(None);
+                std::thread::sleep(by);
+            }
+            Some((nth, by)) => STALL.set(Some((nth - 1, by))),
+            None => {}
+        }
+    }
+
     pub fn disarm() {
         BATCH.set(None);
+        STALL.set(None);
     }
 
     pub(super) fn batch() -> Result<(), Failed> {
@@ -104,6 +122,8 @@ mod faults {
     pub(super) const fn batch() -> Result<(), Failed> {
         Ok(())
     }
+
+    pub(super) const fn stall() {}
 }
 
 pub(super) fn refused(code: Code, field: &str, message: String) -> Failed {
@@ -774,6 +794,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             break;
         }
         let began = Instant::now();
+        faults::stall();
         let ran = server.world(held)?.world.step(step);
         let took = began.elapsed();
         if let Err(why) = ran {
