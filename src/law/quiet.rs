@@ -1,3 +1,4 @@
+use crate::halo::BOX;
 use crate::law::Law;
 use crate::law::dag::{AT, Dag, FIRST_PARAM, FRAME, Node};
 use crate::rule3::{CORNERS, Declared, Oct, Rule};
@@ -131,7 +132,12 @@ pub fn stepped(law: &Law, params: &[u32], value: &[u32]) -> Vec<u32> {
         params,
     };
     let upper: Vec<[u32; CORNERS]> = (1..planes).map(|plane| [word(plane); CORNERS]).collect();
-    let planed = law.step_planes(oct, &upper);
+    let planed = if law.looks().is_empty() {
+        law.step_planes(oct, &upper)
+    } else {
+        let halo: Vec<[u32; BOX]> = (0..planes).map(|plane| [word(plane); BOX]).collect();
+        law.step_halo(oct, &upper, &halo)
+    };
     let mut out = Vec::with_capacity(planes * CORNERS);
     out.extend_from_slice(&planed.ruled.out);
     for plane in 1..planes {

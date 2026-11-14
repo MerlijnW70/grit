@@ -599,11 +599,12 @@ fn a_refusal_names_the_path_the_code_what_was_expected_and_what_was_found() {
         Code::Type,
         "$.defs.mat[1][2]",
     );
-    refused_at(
+    let why = refused_at(
         &mat("[\"and\",\"w\",[\"look\",0,0,0,0,0]]"),
-        Code::Unsupported,
-        "$.defs.mat[1][2][0]",
+        Code::HaloDeclared,
+        "$.halo",
     );
+    assert_eq!(why.found, "halo 0, and a look at $.defs.mat[1][2]");
     refused_at(
         &mat("[\"and\",\"w\",null]"),
         Code::Shape,
@@ -706,7 +707,8 @@ fn params_counts_channels_and_halo_are_admitted_at_their_limit_and_refused_past_
     let with = |key: &str, value: i64| edited(SAND, |json| set(json, key, Json::Int(value)));
     assert_eq!(compiled(&with("params", 32)).params(), 32);
     refused_at(&with("params", 33), Code::Params, "$.params");
-    assert_eq!(compiled(&with("halo", 1)).halo(), 1);
+    assert_eq!(compiled(&with("halo", 0)).halo(), 0);
+    refused_at(&with("halo", 1), Code::HaloDeclared, "$.halo");
     refused_at(&with("halo", 2), Code::Halo, "$.halo");
     let why = refused_at(&with("channels", 5), Code::Channels, "$.channels");
     assert_eq!(why.limit, Some(4));

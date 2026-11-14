@@ -714,7 +714,7 @@ fn arity(name: &str) -> Option<(usize, Option<usize>)> {
     match name {
         "let" | "at" => Some((2, Some(2))),
         "if" | "put" | "map" | "filter" => Some((3, Some(3))),
-        "fold" => Some((5, Some(5))),
+        "fold" | "look" => Some((5, Some(5))),
         "range" | "rev" | "param" => Some((1, Some(1))),
         "noise" => Some((0, Some(0))),
         "vec" | "concat" => Some((0, None)),
@@ -798,14 +798,6 @@ impl<'p> Checking<'_, 'p> {
             ));
         };
         short(op, &path.index(0))?;
-        if op == "look" {
-            return Err(refused(
-                Code::Unsupported,
-                &path.index(0),
-                "an operation other than look: the halo is not built yet",
-                "look",
-            ));
-        }
         let (least, most) = match arity(op) {
             Some(range) => range,
             None => match self.program.named.get(op.as_str()) {
@@ -882,6 +874,14 @@ impl<'p> Checking<'_, 'p> {
                 self.bind(name);
                 self.expression(arg(2), &at(2))?;
                 self.unbind(mark);
+            }
+            "look" => {
+                for (index, one) in args.iter().enumerate() {
+                    if (1..=3).contains(&index) && matches!(one, Json::Int(_)) {
+                        continue;
+                    }
+                    self.expression(one, &at(index))?;
+                }
             }
             "fold" => {
                 let acc = self.binder(arg(0), &at(0))?;

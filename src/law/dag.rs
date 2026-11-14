@@ -1,3 +1,4 @@
+use crate::halo::{BOX, Halo};
 use crate::ops::{Flag, Ops};
 use crate::rule3::{CORNERS, Declared, Oct, OneStep, Planed, Ruled, Tally};
 
@@ -40,6 +41,7 @@ pub struct Dag {
     params: usize,
     tally: Tally,
     planes: Vec<[u32; CORNERS]>,
+    halo: Halo,
 }
 
 fn held<O: Ops>(ops: &mut O, values: &[O::Word], id: u32) -> O::Word {
@@ -49,14 +51,32 @@ fn held<O: Ops>(ops: &mut O, values: &[O::Word], id: u32) -> O::Word {
     }
 }
 
+struct Inputs<'held, W> {
+    planes: &'held [[W; CORNERS]],
+    first_plane: u32,
+    halo: &'held [[W; BOX]],
+    first_halo: u32,
+}
+
 fn input<O: Ops>(
     ops: &mut O,
     oct: &Oct<'_, O::Word>,
-    upper: (&[[O::Word; CORNERS]], u32),
+    inputs: &Inputs<'_, O::Word>,
     which: u32,
 ) -> O::Word {
-    let (planes, first_plane) = upper;
+    let Inputs {
+        planes,
+        first_plane,
+        halo,
+        first_halo,
+    } = *inputs;
     let found = match which {
+        _ if which >= first_halo => {
+            let at = usize::try_from(which - first_halo).unwrap_or(usize::MAX);
+            halo.get(at / BOX)
+                .and_then(|plane| plane.get(at % BOX))
+                .copied()
+        }
         _ if which >= first_plane => {
             let at = usize::try_from(which - first_plane).unwrap_or(usize::MAX);
             planes
@@ -99,7 +119,24 @@ impl Dag {
             params,
             tally,
             planes: Vec::new(),
+            halo: Halo::NONE,
         }
+    }
+
+    pub(crate) const fn with_halo(mut self, halo: Halo) -> Self {
+        self.halo = halo;
+        self
+    }
+
+    #[must_use]
+    pub const fn halo(&self) -> Halo {
+        self.halo
+    }
+
+    #[must_use]
+    pub fn first_halo(&self) -> u32 {
+        let upper = u32::try_from(self.planes.len() * CORNERS).unwrap_or(u32::MAX);
+        self.first_plane().saturating_add(upper)
     }
 
     pub(crate) fn with_planes(mut self, planes: Vec<[u32; CORNERS]>) -> Self {
@@ -152,15 +189,34 @@ impl Dag {
         oct: Oct<'_, O::Word>,
         planes: &[[O::Word; CORNERS]],
     ) -> Planed<O::Word> {
-        let first_plane = if self.planes.is_empty() {
-            u32::MAX
-        } else {
-            self.first_plane()
+        self.replay_halo(ops, oct, planes, &[])
+    }
+
+    pub fn replay_halo<O: Ops>(
+        &self,
+        ops: &mut O,
+        oct: Oct<'_, O::Word>,
+        planes: &[[O::Word; CORNERS]],
+        halo: &[[O::Word; BOX]],
+    ) -> Planed<O::Word> {
+        let inputs = Inputs {
+            planes,
+            first_plane: if self.planes.is_empty() {
+                u32::MAX
+            } else {
+                self.first_plane()
+            },
+            halo,
+            first_halo: if self.halo.is_empty() {
+                u32::MAX
+            } else {
+                self.first_halo()
+            },
         };
         let mut values: Vec<O::Word> = Vec::with_capacity(self.nodes.len());
         for &node in &self.nodes {
             let made = match node {
-                Node::Input(which) => input(ops, &oct, (planes, first_plane), which),
+                Node::Input(which) => input(ops, &oct, &inputs, which),
                 Node::Const(value) => ops.constant(value),
                 Node::Not(one) => {
                     let one = held(ops, &values, one);
@@ -258,6 +314,10 @@ impl Declared for Dag {
     fn planes(&self) -> usize {
         self.planes.len() + 1
     }
+
+    fn looks(&self) -> Halo {
+        self.halo
+    }
 }
 
 impl OneStep for Dag {
@@ -272,5 +332,15 @@ impl OneStep for Dag {
         planes: &[[O::Word; CORNERS]],
     ) -> Planed<O::Word> {
         self.replay_planes(ops, oct, planes)
+    }
+
+    fn one_step_halo<O: Ops>(
+        &self,
+        ops: &mut O,
+        oct: Oct<'_, O::Word>,
+        planes: &[[O::Word; CORNERS]],
+        halo: &[[O::Word; BOX]],
+    ) -> Planed<O::Word> {
+        self.replay_halo(ops, oct, planes, halo)
     }
 }

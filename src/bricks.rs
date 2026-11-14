@@ -1119,6 +1119,8 @@ macro_rules! widths {
     };
 }
 
+pub const LOOKS_SPARSE: &str = "the rule looks at its neighbours, and the sparse tier steps only rules that read their own oct";
+
 pub fn settle<R: Rule>(
     rule: &R,
     bricks: &Bricks,
@@ -1129,6 +1131,12 @@ pub fn settle<R: Rule>(
         return Err(LaneError::NoSuchForm {
             operation: "bricks::settle",
             because: UNLIKE_PLANES,
+        });
+    }
+    if !rule.looks().is_empty() {
+        return Err(LaneError::NoSuchForm {
+            operation: "bricks::settle",
+            because: LOOKS_SPARSE,
         });
     }
     let subgroup = bricks.subgroup;

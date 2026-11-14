@@ -22,6 +22,7 @@ use core::ops::{Index, IndexMut};
 
 use simdr::lanes::{LaneError, Lanes};
 
+use crate::halo::BOX;
 use crate::layout::Dimension;
 use crate::ops::{Cpu, Device, Ops};
 
@@ -272,6 +273,10 @@ pub trait Declared {
     fn planes(&self) -> usize {
         1
     }
+
+    fn looks(&self) -> crate::halo::Halo {
+        crate::halo::Halo::NONE
+    }
 }
 
 pub const MOST_PLANES: usize = 4;
@@ -317,6 +322,25 @@ pub trait Rule: Declared {
             planes: Vec::new(),
         })
     }
+
+    fn step_halo(
+        &self,
+        oct: Oct<'_, u32>,
+        planes: &[[u32; CORNERS]],
+        _halo: &[[u32; BOX]],
+    ) -> Planed<u32> {
+        self.step_planes(oct, planes)
+    }
+
+    fn emit_halo<const LANES: u32>(
+        &self,
+        lanes: &mut Lanes<'_>,
+        oct: Oct<'_, Word<LANES>>,
+        planes: &[[Word<LANES>; CORNERS]],
+        _halo: &[[Word<LANES>; BOX]],
+    ) -> Result<Planed<Word<LANES>>, LaneError> {
+        self.emit_planes::<LANES>(lanes, oct, planes)
+    }
 }
 
 /// A rule written once, over [`Ops`]: [`OneStep::one_step`] with [`Cpu`]
@@ -335,6 +359,16 @@ pub trait OneStep: Declared {
             ruled: self.one_step(ops, oct),
             planes: Vec::new(),
         }
+    }
+
+    fn one_step_halo<O: Ops>(
+        &self,
+        ops: &mut O,
+        oct: Oct<'_, O::Word>,
+        planes: &[[O::Word; CORNERS]],
+        _halo: &[[O::Word; BOX]],
+    ) -> Planed<O::Word> {
+        self.one_step_planes(ops, oct, planes)
     }
 }
 
@@ -365,6 +399,27 @@ impl<S: OneStep> Rule for S {
     ) -> Result<Planed<Word<LANES>>, LaneError> {
         let mut device = Device::<LANES>::new(lanes)?;
         let planed = self.one_step_planes(&mut device, oct, planes);
+        device.finish(planed)
+    }
+
+    fn step_halo(
+        &self,
+        oct: Oct<'_, u32>,
+        planes: &[[u32; CORNERS]],
+        halo: &[[u32; BOX]],
+    ) -> Planed<u32> {
+        self.one_step_halo(&mut Cpu, oct, planes, halo)
+    }
+
+    fn emit_halo<const LANES: u32>(
+        &self,
+        lanes: &mut Lanes<'_>,
+        oct: Oct<'_, Word<LANES>>,
+        planes: &[[Word<LANES>; CORNERS]],
+        halo: &[[Word<LANES>; BOX]],
+    ) -> Result<Planed<Word<LANES>>, LaneError> {
+        let mut device = Device::<LANES>::new(lanes)?;
+        let planed = self.one_step_halo(&mut device, oct, planes, halo);
         device.finish(planed)
     }
 }

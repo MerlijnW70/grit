@@ -77,6 +77,9 @@ pub enum Refused {
     Io {
         what: String,
     },
+    HaloSparse {
+        law: String,
+    },
 }
 
 impl Refused {
@@ -98,6 +101,7 @@ impl Refused {
             Self::Unlike { .. } => "unlike",
             Self::Outside { .. } => "outside",
             Self::Io { .. } => "io",
+            Self::HaloSparse { .. } => "halo_sparse",
         }
     }
 }
@@ -158,6 +162,10 @@ impl std::fmt::Display for Refused {
                 size[0], size[1], size[2]
             ),
             Self::Io { what } => write!(out, "{what}"),
+            Self::HaloSparse { law } => write!(
+                out,
+                "the law {law} looks at its neighbours, and a sparse world steps only laws that read their own oct; make the world dense"
+            ),
         }
     }
 }
@@ -324,6 +332,15 @@ fn stepper_of(
     }
 }
 
+pub fn looks_dense(law: &crate::law::Law, sparse: bool) -> Result<(), Refused> {
+    if sparse && !crate::rule3::Declared::looks(law).is_empty() {
+        return Err(Refused::HaloSparse {
+            law: law.name().to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn listed_if_sparse(sparse: bool, stepping: Stepping) -> Result<(), Failed> {
     if sparse && stepping == Stepping::Whole {
         return Err(Box::new(Refused::Malformed {
@@ -485,6 +502,9 @@ impl<'host> World<'host> {
         (grid, plan): (Grid, Plan),
         pool: Option<Bricks>,
     ) -> Result<Self, Failed> {
+        if let (Stepper::Law(law, _), Some(_)) = (&rule, pool.as_ref()) {
+            looks_dense(law, true)?;
+        }
         let ((passes, stages), sizes) = match pool.as_ref() {
             Some(bricks) => (
                 rule.bricked(bricks, &plan)?,
@@ -830,6 +850,9 @@ impl<'host> World<'host> {
                 let placed = live::Placed3 {
                     windows: Some(self.rule.windows(&self.plan)),
                     plane,
+                    around: self
+                        .law()
+                        .is_some_and(|law| !crate::rule3::Declared::looks(law).is_empty()),
                 };
                 live::put3_in(&mut self.live, self.grid, &self.plan, placed, &indexed)?;
             }

@@ -1,0 +1,21 @@
+{
+ "law": 1,
+ "name": "edge2d",
+ "params": 1,
+ "channels": 2,
+ "halo": 1,
+ "tally": {"counts": 1, "weighted": false},
+ "consts": {"HIGH": 2147483648},
+ "defs": {
+  "abs": [["s"], ["sel", ["lt", "s", "HIGH"], "s", ["sub", 0, "s"]]],
+  "gx": [["c"], ["sub",
+   ["add", ["add", ["look", 0, 1, -1, 0, "c"], ["mul", 2, ["look", 0, 1, 0, 0, "c"]]], ["look", 0, 1, 1, 0, "c"]],
+   ["add", ["add", ["look", 0, -1, -1, 0, "c"], ["mul", 2, ["look", 0, -1, 0, 0, "c"]]], ["look", 0, -1, 1, 0, "c"]]]],
+  "gy": [["c"], ["sub",
+   ["add", ["add", ["look", 0, -1, 1, 0, "c"], ["mul", 2, ["look", 0, 0, 1, 0, "c"]]], ["look", 0, 1, 1, 0, "c"]],
+   ["add", ["add", ["look", 0, -1, -1, 0, "c"], ["mul", 2, ["look", 0, 0, -1, 0, "c"]]], ["look", 0, 1, -1, 0, "c"]]]],
+  "edge": [["c"], ["word", ["gt", ["add", ["abs", ["gx", "c"]], ["abs", ["gy", "c"]]], ["param", 0]]]]
+ },
+ "step": ["let", [["out", ["map", "c", ["range", 8], ["vec", ["at", ["at", "cells", "c"], 0], ["edge", "c"]]]]],
+  ["vec", "out", ["vec", ["count", ["map", "k", ["range", 8], ["ne", ["at", ["at", "cells", "k"], 1], ["at", ["at", "out", "k"], 1]]]]]]]
+}

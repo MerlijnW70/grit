@@ -3,6 +3,7 @@ use simdr::lanes::{LaneError, Lanes, U32, Vector};
 use simdr::module::Id;
 
 use crate::geometry::{Emit, Solid};
+use crate::halo::{BOX, Halo};
 use crate::layout::{BINDINGS, PARAMS, STATE};
 use crate::rule3::{FIRST_PARAM, Oct, Rule};
 use crate::sand::{Grid, WALL};
@@ -123,6 +124,7 @@ pub fn reference<R: Rule>(
     let mut out = cells.to_vec();
     let planes = rule.planes();
     let stride = grid.cells();
+    let looks = rule.looks();
     'octs: for oct in 0..grid.octs() {
         let places = grid.corners(frame, oct);
         let mut words = [0; CORNERS];
@@ -138,6 +140,41 @@ pub fn reference<R: Rule>(
             at: lattice(grid, oct),
             params: &held,
         };
+        if !looks.is_empty() {
+            let mut upper = vec![[0_u32; CORNERS]; planes.saturating_sub(1)];
+            for (plane, words) in (1..).zip(upper.iter_mut()) {
+                for (slot, place) in words.iter_mut().zip(places) {
+                    let Some(&word) = out.get(plane * stride + place) else {
+                        continue 'octs;
+                    };
+                    *slot = word;
+                }
+            }
+            let mut halo = vec![[0_u32; BOX]; planes];
+            for (plane, slot) in halo.iter_mut().enumerate() {
+                if !looks.looked(plane) {
+                    continue;
+                }
+                let Some(boxed) = cells
+                    .get(plane * stride..(plane + 1) * stride)
+                    .and_then(|start| crate::halo::boxed(grid, frame, oct, start))
+                else {
+                    continue 'octs;
+                };
+                *slot = boxed;
+            }
+            let planed = rule.step_halo(oct_of, &upper, &halo);
+            let mut stored = vec![planed.ruled.out];
+            stored.extend(planed.planes.iter().take(planes - 1).copied());
+            for (plane, words) in stored.iter().enumerate() {
+                for (place, &value) in places.into_iter().zip(words) {
+                    if let Some(slot) = out.get_mut(plane * stride + place) {
+                        *slot = value;
+                    }
+                }
+            }
+            continue;
+        }
         if planes <= 1 {
             let ruled = rule.step(oct_of);
             for (place, value) in places.into_iter().zip(ruled.out) {
@@ -194,6 +231,8 @@ pub const FLAT: &str = "the grid is flat (tall 1), and the 3D kernel steps a sol
 pub const MISCOUNTED: &str = "the rule declares no tally count, more than rule3::MOST_COUNTS, or another number than its step gives";
 
 pub const UNPLANED: &str = "the rule declares no plane, more than rule3::MOST_PLANES, or gives another number of planes than it declares";
+
+pub const PAST_HALO: &str = "the rule looks at a plane past the planes it declares";
 
 pub const PLANES_PAST: &str =
     "the grid's cells times the rule's planes pass the u32 index a kernel addresses STATE with";
@@ -412,6 +451,34 @@ fn step<const LANES: u32, R: Rule>(
         placed::<LANES>(&mut lanes, grid, oct, given.frame)?
     };
 
+    let looks = rule.looks();
+    if !looks.is_empty() {
+        let places = lifted::<LANES, R>(kernel, rule, grid, &placing)?;
+        let mut loaded = Vec::with_capacity(places.len());
+        for plane in &places {
+            let mut words = [given.frame; CORNERS];
+            for (word, place) in words.iter_mut().zip(plane) {
+                *word = kernel.load_at(STATE, place.id())?;
+            }
+            loaded.push(words);
+        }
+        let halo = halo_loads::<LANES, R>(kernel, rule, grid, &placing, given, |kernel, at| {
+            kernel.load_at(STATE, at)
+        })?;
+        let out = {
+            let mut lanes = kernel.lanes()?;
+            ruled_halo::<LANES, R>(&mut lanes, rule, &placing, (&loaded, &halo), given)?
+        };
+        let mut stored = vec![out.ruled.out];
+        stored.extend(out.planes);
+        for (plane, values) in places.iter().zip(&stored) {
+            for (place, value) in plane.iter().zip(values) {
+                kernel.store_at(STATE, place.id(), value.id())?;
+            }
+        }
+        return Ok(());
+    }
+
     let planes = rule.planes();
     if planes > 1 {
         let stride = stride_of(rule, grid)?;
@@ -465,6 +532,139 @@ fn step<const LANES: u32, R: Rule>(
         kernel.store_at(STATE, place.id(), value.id())?;
     }
     Ok(())
+}
+
+pub(crate) fn lifted<const LANES: u32, R: Rule>(
+    kernel: &mut Kernel<U32>,
+    rule: &R,
+    grid: Grid,
+    placing: &Placing<LANES>,
+) -> Result<Vec<[Word<LANES>; CORNERS]>, LaneError> {
+    let stride = stride_of(rule, grid)?;
+    let mut places = vec![placing.places];
+    for plane in 1..rule.planes() {
+        let mut lanes = kernel.lanes()?;
+        let by = u32::try_from(plane).unwrap_or(0).wrapping_mul(stride);
+        let by = lanes.splat_bits::<U32, LANES>(by)?;
+        let mut lifted = placing.places;
+        for place in &mut lifted {
+            *place = lanes.add(*place, by)?;
+        }
+        places.push(lifted);
+    }
+    Ok(places)
+}
+
+pub(crate) fn halo_loads<const LANES: u32, R: Rule>(
+    kernel: &mut Kernel<U32>,
+    rule: &R,
+    grid: Grid,
+    placing: &Placing<LANES>,
+    given: Given<'_>,
+    mut load: impl FnMut(&mut Kernel<U32>, Id) -> Result<Id, LaneError>,
+) -> Result<Vec<[Id; BOX]>, LaneError> {
+    let looks = rule.looks();
+    let planes = rule.planes();
+    if looks.planes() > planes {
+        return Err(LaneError::NoSuchForm {
+            operation: "sand3::halo",
+            because: PAST_HALO,
+        });
+    }
+    let stride = stride_of(rule, grid)?;
+    let places = {
+        let mut lanes = kernel.lanes()?;
+        let frame = lanes.splat_id::<U32, LANES>(given.frame)?;
+        crate::halo::places(
+            &mut Emit::<LANES>(&mut lanes),
+            grid,
+            placing.block,
+            frame,
+            looks,
+        )?
+    };
+    let mut halo = vec![[given.frame; BOX]; planes];
+    for (plane, words) in halo.iter_mut().enumerate() {
+        let cells = looks.cells(plane);
+        for &(at, place) in &places {
+            if (cells >> at) & 1 == 0 {
+                continue;
+            }
+            let lifted = {
+                let mut lanes = kernel.lanes()?;
+                let by = u32::try_from(plane).unwrap_or(0).wrapping_mul(stride);
+                let by = lanes.splat_bits::<U32, LANES>(by)?;
+                lanes.add(place, by)?
+            };
+            if let Some(slot) = words.get_mut(at) {
+                *slot = load(kernel, lifted.id())?;
+            }
+        }
+    }
+    Ok(halo)
+}
+
+pub(crate) fn ruled_halo<const LANES: u32, R: Rule>(
+    lanes: &mut Lanes<'_>,
+    rule: &R,
+    placing: &Placing<LANES>,
+    (loaded, halo): (&[[Id; CORNERS]], &[[Id; BOX]]),
+    given: Given<'_>,
+) -> Result<crate::rule3::Planed<Word<LANES>>, LaneError> {
+    let looks: Halo = rule.looks();
+    let frame = lanes.splat_id::<U32, LANES>(given.frame)?;
+    let mut splatted = Vec::with_capacity(loaded.len());
+    for plane in loaded {
+        let mut words = [frame; CORNERS];
+        for (word, &id) in words.iter_mut().zip(plane) {
+            *word = lanes.splat_id::<U32, LANES>(id)?;
+        }
+        splatted.push(words);
+    }
+    let mut seen = Vec::with_capacity(halo.len());
+    for (plane, ids) in halo.iter().enumerate() {
+        let cells = looks.cells(plane);
+        let mut words = [frame; BOX];
+        for (at, (word, &id)) in words.iter_mut().zip(ids).enumerate() {
+            if (cells >> at) & 1 == 1 {
+                *word = lanes.splat_id::<U32, LANES>(id)?;
+            }
+        }
+        seen.push(words);
+    }
+    let mut params = Vec::with_capacity(given.params.len());
+    for &id in given.params {
+        params.push(lanes.splat_id::<U32, LANES>(id)?);
+    }
+    let (first, upper) = splatted.split_first().ok_or(LaneError::NoSuchForm {
+        operation: "sand3::ruled_halo",
+        because: UNPLANED,
+    })?;
+    let stepped = rule.emit_halo::<LANES>(
+        lanes,
+        Oct {
+            words: *first,
+            frame,
+            at: placing.block,
+            params: &params,
+        },
+        upper,
+        &seen,
+    )?;
+    let tally = rule.tally();
+    if !tally.fits() || stepped.ruled.counts.len() != tally.counts {
+        return Err(LaneError::NoSuchForm {
+            operation: "sand3::ruled",
+            because: MISCOUNTED,
+        });
+    }
+    if stepped.planes.len() + 1 != rule.planes() || loaded.len() != rule.planes() {
+        return Err(LaneError::NoSuchForm {
+            operation: "sand3::ruled_halo",
+            because: UNPLANED,
+        });
+    }
+    Ok(stepped)
 }
 
 /// Where the cells of an oct lie, in the order of [`Grid3::corners`], and

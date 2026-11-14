@@ -15,6 +15,10 @@ impl Tracer {
         }
     }
 
+    pub(crate) fn input(&mut self, which: u32) -> u32 {
+        self.push(Node::Input(which))
+    }
+
     fn push(&mut self, node: Node) -> u32 {
         let id = u32::try_from(self.nodes.len()).unwrap_or(u32::MAX);
         self.nodes.push(node);

@@ -739,6 +739,7 @@ fn branch_refusal(why: &crate::branch::Refused) -> Refusal {
         Refused::Unlike { .. } => errors::Code::Unlike,
         Refused::Outside { .. } => errors::Code::Outside,
         Refused::Io { .. } => errors::Code::Io,
+        Refused::HaloSparse { .. } => errors::Code::HaloSparse,
         Refused::Magic
         | Refused::Version { .. }
         | Refused::Checksum

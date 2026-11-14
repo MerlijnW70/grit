@@ -1,0 +1,22 @@
+{
+ "law": 1,
+ "name": "sobel3",
+ "params": 1,
+ "channels": 2,
+ "halo": 1,
+ "tally": {"counts": 1, "weighted": false},
+ "consts": {"HIGH": 2147483648, "BACK": 4294967295},
+ "defs": {
+  "abs": [["s"], ["sel", ["lt", "s", "HIGH"], "s", ["sub", 0, "s"]]],
+  "weight": [["a"], ["if", ["eq", "a", 0], 2, 1]],
+  "tap": [["c", "axis", "d", "a", "b"], ["if", ["eq", "axis", 0], ["look", 0, "d", "a", "b", "c"],
+   ["if", ["eq", "axis", 1], ["look", 0, "a", "d", "b", "c"], ["look", 0, "a", "b", "d", "c"]]]],
+  "face": [["c", "axis", "d"], ["fold", "s", 0, "a", ["vec", "BACK", 0, 1],
+   ["fold", "t", "s", "b", ["vec", "BACK", 0, 1],
+    ["add", "t", ["mul", ["mul", ["weight", "a"], ["weight", "b"]], ["tap", "c", "axis", "d", "a", "b"]]]]]],
+  "grad": [["c", "axis"], ["abs", ["sub", ["face", "c", "axis", 1], ["face", "c", "axis", "BACK"]]]],
+  "edge": [["c"], ["word", ["gt", ["add", ["add", ["grad", "c", 0], ["grad", "c", 1]], ["grad", "c", 2]], ["param", 0]]]]
+ },
+ "step": ["let", [["out", ["map", "c", ["range", 8], ["vec", ["at", ["at", "cells", "c"], 0], ["edge", "c"]]]]],
+  ["vec", "out", ["vec", ["count", ["map", "k", ["range", 8], ["ne", ["at", ["at", "cells", "k"], 1], ["at", ["at", "out", "k"], 1]]]]]]]
+}

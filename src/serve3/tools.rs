@@ -250,7 +250,7 @@ fn create_shown() -> Json {
                 "law",
                 property(
                     "string",
-                    "the JSON text of a law, as tests/law/*.law.json; give this or rule. The answer names its hash and quiet class: proved steps listed octs, whole steps every oct and only dense",
+                    "the JSON text of a law, as tests/law/*.law.json; give this or rule. The answer names its hash and quiet class: proved steps listed octs, whole steps every oct and only dense. A law that looks (halo 1) runs only dense",
                 ),
             ),
             (
@@ -527,6 +527,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         None => rule,
         Some(lawful) => {
             let law = lawful.law().clone();
+            super::law::halo_refused(&law, sparse, "$.sparse")?;
             let class = super::law::background_class(&law, &params);
             if sparse && !class.proved() {
                 return Err(super::law::quiet_refused(&law, &class, "$.sparse"));
@@ -1157,6 +1158,7 @@ pub fn describe(status: &Status) -> Json {
                 ),
                 ("queue_calls", number(super::exec::QUEUE_MOST)),
                 ("law_tally", text(super::law::TALLIED)),
+                ("law_look", text(super::law::LOOK)),
                 (
                     "budget_late",
                     text(

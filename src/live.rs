@@ -625,12 +625,14 @@ pub fn put3(
 pub struct Placed3 {
     pub windows: Option<crate::layout::Windows>,
     pub plane: u32,
+    pub around: bool,
 }
 
 impl Placed3 {
     pub const FIRST: Self = Self {
         windows: None,
         plane: 0,
+        around: false,
     };
 }
 
@@ -642,7 +644,7 @@ pub fn put3_in(
     cells: &[(u32, u32)],
 ) -> Result<(), crate::Error> {
     use crate::geometry::Solid;
-    use crate::layout::INDIRECT;
+    use crate::layout::{HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT};
 
     fits("live::put3", grid, plan).map_err(crate::Error::Lane)?;
     let past = grid.cells();
@@ -672,21 +674,41 @@ pub fn put3_in(
     for &(cell, word) in cells {
         write_state(held, windows, lifted + cell as usize, &[word])?;
         for phase in 0..2 {
-            woken.insert(Solid::held(grid, cell, phase).index);
+            let holder = Solid::held(grid, cell, phase).index;
+            if placed.around {
+                woken.extend(Solid::woken(grid, holder));
+            } else {
+                woken.insert(holder);
+            }
         }
     }
 
     let by = plan.per_block.trailing_zeros();
+    let hot_grand = held
+        .read(HOT_GRAND as usize, 1)?
+        .first()
+        .copied()
+        .unwrap_or(0);
+    let mut blocks: std::collections::BTreeSet<u32> = held
+        .read(HOT_DENSE as usize, hot_grand as usize)?
+        .into_iter()
+        .collect();
     for &oct in &woken {
         held.write_at(AWAKE as usize, oct as usize, &[2])?;
         held.write_at(HOT as usize, (oct >> by) as usize, &[2])?;
+        blocks.insert(oct >> by);
     }
     octs.extend(woken);
     let list: Vec<u32> = octs.into_iter().collect();
     let count = u32::try_from(list.len()).unwrap_or(u32::MAX);
     held.write(DENSE as usize, &list)?;
     held.write(GRAND as usize, &[count])?;
-    held.write(INDIRECT as usize, &[count.div_ceil(plan.subgroup), 1, 1])
+    held.write(INDIRECT as usize, &[count.div_ceil(plan.subgroup), 1, 1])?;
+    let hot: Vec<u32> = blocks.into_iter().collect();
+    let hot_count = u32::try_from(hot.len()).unwrap_or(u32::MAX);
+    held.write(HOT_DENSE as usize, &hot)?;
+    held.write(HOT_GRAND as usize, &[hot_count])?;
+    held.write(HOT_INDIRECT as usize, &[hot_count, 1, 1])
 }
 
 /// Writes `words` into `STATE` laid out as `windows`, from word `at`: each
@@ -1510,7 +1532,49 @@ fn listed3<const LANES: u32, R: Rule>(
     };
 
     let planes = rule.planes();
-    let (places, settled, counted, touched) = if planes > 1 {
+    let (places, settled, counted, touched) = if !rule.looks().is_empty() {
+        let given = Given {
+            frame,
+            params: &params,
+        };
+        let places = crate::sand3::lifted::<LANES, R>(&mut kernel, rule, grid, &placing)?;
+        let mut loaded = Vec::with_capacity(places.len());
+        for plane in &places {
+            let mut words = [frame; CORNERS];
+            for (word, place) in words.iter_mut().zip(plane) {
+                *word = state_load(&mut kernel, windows, place.id())?;
+            }
+            loaded.push(words);
+        }
+        let halo = crate::sand3::halo_loads::<LANES, R>(
+            &mut kernel,
+            rule,
+            grid,
+            &placing,
+            given,
+            |kernel, at| state_load(kernel, windows, at),
+        )?;
+        let mut lanes = kernel.lanes()?;
+        let step = crate::sand3::ruled_halo::<LANES, R>(
+            &mut lanes,
+            rule,
+            &placing,
+            (&loaded, &halo),
+            given,
+        )?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let mut settled = vec![step.ruled.out];
+        settled.extend(step.planes);
+        let mut touched = none;
+        for (before, after) in loaded.iter().flatten().zip(settled.iter().flatten()) {
+            let before = lanes.splat_id::<U32, LANES>(*before)?;
+            let same = lanes.equal(before, *after)?;
+            let differs = lanes.select(same, none, one)?;
+            touched = lanes.add(touched, differs)?;
+        }
+        (places, settled, step.ruled.counts, touched)
+    } else if planes > 1 {
         let stride = crate::sand3::stride_of(rule, grid)?;
         let mut places = vec![placing.places];
         for plane in 1..planes {

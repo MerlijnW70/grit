@@ -46,9 +46,10 @@ pub enum Code {
     RuleOrLaw,
     LawRefused,
     QuietRefused,
+    HaloSparse,
 }
 
-pub const CODES: [Code; 42] = [
+pub const CODES: [Code; 43] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -91,6 +92,7 @@ pub const CODES: [Code; 42] = [
     Code::RuleOrLaw,
     Code::LawRefused,
     Code::QuietRefused,
+    Code::HaloSparse,
 ];
 
 impl Code {
@@ -139,6 +141,7 @@ impl Code {
             Self::RuleOrLaw => "rule_or_law",
             Self::LawRefused => "law_refused",
             Self::QuietRefused => "quiet_refused",
+            Self::HaloSparse => "halo_sparse",
         }
     }
 
@@ -248,6 +251,9 @@ impl Code {
             }
             Self::QuietRefused => {
                 "Make the world dense, which steps every oct, or keep params under which the law is proved."
+            }
+            Self::HaloSparse => {
+                "Make the world dense: a law that looks (halo 1) runs only on dense worlds."
             }
         }
     }

@@ -36,6 +36,8 @@ pub const TALLIED_EVERY: &str = "every oct";
 
 pub const TALLIED: &str = "a law world's tally sums its counts over the octs a frame steps, and its answers name which as tallied: every oct for a whole world; listed octs for a proved one, which sums only the octs the frame lists, so it equals the sum over every oct only for counts that are 0 on an oct the step leaves unchanged";
 
+pub const LOOK: &str = "[\"look\", plane, dx, dy, dz, corner] is the word of plane at the corner's cell plus (dx, dy, dz), each -1, 0 or 1, wrapped on the torus; plane, offsets and corner are ints known when the law compiles. A law that looks declares halo 1, one that does not halo 0. It may look only at a frozen plane: one whose 8 out words are its own input words unchanged; a look at a plane the law writes is refused halo_written. A law that looks runs only on dense worlds";
+
 pub struct Lawful {
     law: Law,
     class: Class,
@@ -174,12 +176,21 @@ pub fn quiet_refused(law: &Law, class: &Class, field: &str) -> Failed {
     ))
 }
 
+pub fn halo_refused(law: &Law, sparse: bool, field: &str) -> Result<(), Failed> {
+    crate::branch::looks_dense(law, sparse).map_err(|why| {
+        let mut refusal = super::branch_refusal(&why);
+        field.clone_into(&mut refusal.field);
+        Box::new(refusal) as Failed
+    })
+}
+
 pub fn made_world<'host>(
     host: &'host Host,
     held: &str,
     made: &Made,
 ) -> Result<World<'host>, Failed> {
     let law = compiled(held)?;
+    halo_refused(&law, made.sparse, "$.sparse")?;
     let class = background_class(&law, &made.params);
     World::create_law_stepped(host, &law, &made.branch(), stepping_of(&class, made.sparse))
 }
@@ -194,6 +205,7 @@ pub fn opened<'host>(
             let law = compiled(canonical)?;
             let class = background_class(&law, &image.params);
             let sparse = matches!(image.state, crate::branch::State::Sparse { .. });
+            halo_refused(&law, sparse, "$.name")?;
             World::open_stepped(host, image, stepping_of(&class, sparse))
         }
     }

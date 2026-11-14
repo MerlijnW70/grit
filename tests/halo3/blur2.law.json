@@ -1,0 +1,19 @@
+{
+ "law": 1,
+ "name": "blur2",
+ "params": 0,
+ "channels": 3,
+ "halo": 1,
+ "tally": {"counts": 1, "weighted": false},
+ "consts": {"BACK": 4294967295},
+ "defs": {
+  "six": [["c"], ["add", ["add", ["add", ["look", 0, 1, 0, 0, "c"], ["look", 0, -1, 0, 0, "c"]],
+   ["add", ["look", 0, 0, 1, 0, "c"], ["look", 0, 0, -1, 0, "c"]]],
+   ["add", ["look", 0, 0, 0, 1, "c"], ["look", 0, 0, 0, -1, "c"]]]],
+  "flat": [["c"], ["fold", "s", 0, "a", ["vec", "BACK", 0, 1],
+   ["fold", "t", "s", "b", ["vec", "BACK", 0, 1], ["add", "t", ["look", 1, "a", "b", 0, "c"]]]]],
+  "blur": [["c"], ["shr", ["add", ["add", ["six", "c"], ["mul", 2, ["look", 0, 0, 0, 0, "c"]]], ["flat", "c"]], 4]]
+ },
+ "step": ["let", [["out", ["map", "c", ["range", 8], ["vec", ["at", ["at", "cells", "c"], 0], ["at", ["at", "cells", "c"], 1], ["blur", "c"]]]]],
+  ["vec", "out", ["vec", ["count", ["map", "k", ["range", 8], ["ne", ["at", ["at", "cells", "k"], 2], ["at", ["at", "out", "k"], 2]]]]]]]
+}

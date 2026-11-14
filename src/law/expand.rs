@@ -5,6 +5,7 @@ use super::parse::{Path, Program, Step, clipped, described, limited, refused, sh
 use super::trace::Tracer;
 use super::value::{Items, Value};
 use super::{Code, Refusal, limits};
+use crate::halo::{self, BOX, Halo};
 use crate::ops::{Cpu, Ops};
 use crate::rule3::{CORNERS, noise_by};
 use crate::wire::Json;
@@ -58,6 +59,9 @@ struct Expander<'c, 'p> {
     deepest: usize,
     site: usize,
     sites: Vec<usize>,
+    halo: Halo,
+    halo_inputs: HashMap<u32, u32>,
+    looks: Vec<(u32, String)>,
 }
 
 fn address(json: &Json) -> usize {
@@ -403,6 +407,7 @@ impl<'p> Expander<'_, 'p> {
             "concat" => self.joined(args, path, depth),
             "param" => self.param(args, path, depth),
             "noise" => self.noise(path),
+            "look" => self.looked(args, path, depth),
             _ => match self.program.named.get(op.as_str()) {
                 Some(&index) => self.call(index, args, path, depth),
                 None => self.builtin(op, args, path, depth),
@@ -610,6 +615,95 @@ impl<'p> Expander<'_, 'p> {
         let made = noise_by(&mut self.tracer, [AT, AT + 1, AT + 2], FRAME);
         self.grown(path)?;
         Ok(Value::Word(made))
+    }
+
+    fn known(&mut self, json: &'p Json, path: &Path<'_>, depth: usize) -> Result<u32, Refusal> {
+        let value = self.eval(json, path, depth)?;
+        match value {
+            Value::Int(held) => Ok(held),
+            Value::Word(_) | Value::Flag(_) => {
+                Err(refused(Code::HaloConstant, path, KNOWN_INT, live(&value)))
+            }
+            other => Err(refused(Code::Type, path, KNOWN_INT, kind(&other))),
+        }
+    }
+
+    fn step_of(&mut self, json: &'p Json, path: &Path<'_>, depth: usize) -> Result<i32, Refusal> {
+        let step = match json {
+            Json::Int(held) => *held,
+            other => i64::from(self.known(other, path, depth)?.cast_signed()),
+        };
+        match i32::try_from(step) {
+            Ok(step) if step.abs() <= halo::RADIUS => Ok(step),
+            _ => Err(limited(
+                Code::HaloRadius,
+                path,
+                "an offset of -1, 0 or 1: a look reaches only the cells next to the corner",
+                step.to_string(),
+                u64::from(halo::RADIUS.unsigned_abs()),
+            )),
+        }
+    }
+
+    fn looked(
+        &mut self,
+        args: &'p [Json],
+        path: &Path<'_>,
+        depth: usize,
+    ) -> Result<Value, Refusal> {
+        let channels = self.program.channels.max(1);
+        let plane_path = path.index(1);
+        let plane = self.known(arg(args, 0), &plane_path, depth)?;
+        if plane >= channels {
+            return Err(limited(
+                Code::HaloPlane,
+                &plane_path,
+                format!("a plane below the law's {channels} channels"),
+                plane.to_string(),
+                u64::from(channels),
+            ));
+        }
+        let mut offset = [0_i32; 3];
+        for (axis, slot) in offset.iter_mut().enumerate() {
+            *slot = self.step_of(arg(args, axis + 1), &path.index(axis + 2), depth)?;
+        }
+        let corner_path = path.index(5);
+        let corner = self.known(arg(args, 4), &corner_path, depth)?;
+        let corners = u32::try_from(CORNERS).unwrap_or(8);
+        let Some(cell) = usize::try_from(corner)
+            .ok()
+            .filter(|&corner| corner < CORNERS)
+            .and_then(|corner| halo::looked(corner, offset))
+        else {
+            return Err(limited(
+                Code::Index,
+                &corner_path,
+                format!("a corner below {corners}"),
+                corner.to_string(),
+                u64::from(corners),
+            ));
+        };
+        self.looks.push((plane, path.shown()));
+        if let Some(own) = halo::own(cell) {
+            let own = u32::try_from(own).unwrap_or(0);
+            return Ok(Value::Word(match plane {
+                0 => own,
+                _ => first_plane(self.program) + (plane - 1) * corners + own,
+            }));
+        }
+        let first = first_plane(self.program) + (channels - 1) * corners;
+        let box_cells = u32::try_from(BOX).unwrap_or(u32::MAX);
+        let which = first + plane * box_cells + u32::try_from(cell).unwrap_or(0);
+        if let Some(&id) = self.halo_inputs.get(&which) {
+            return Ok(Value::Word(id));
+        }
+        let id = self.tracer.input(which);
+        self.grown(path)?;
+        self.halo_inputs.insert(which, id);
+        self.halo = self
+            .halo
+            .with(usize::try_from(plane).unwrap_or(usize::MAX), cell);
+        Ok(Value::Word(id))
     }
 
     fn int_at(
@@ -889,6 +983,9 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
         deepest: 0,
         site: 0,
         sites: vec![0; inputs],
+        halo: Halo::NONE,
+        halo_inputs: HashMap::new(),
+        looks: Vec::new(),
     };
     let root = Path::root();
     let step = root.key("step");
@@ -962,6 +1059,7 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
             .map_err(|_| shaped(&step, format!("{} at counts[{index}]", kind(one))))?;
         tallied.push(expander.id(made, &step)?);
     }
+    looked(program, &expander.looks, (&ids, &upper))?;
     let mut sites = std::mem::take(&mut expander.sites);
     sites.resize(expander.tracer.nodes.len(), address(program.step));
     Ok(Expanded {
@@ -973,10 +1071,71 @@ pub fn expand(program: &Program<'_>) -> Result<Expanded, Refusal> {
             program.params,
             program.tally,
         )
-        .with_planes(upper),
+        .with_planes(upper)
+        .with_halo(expander.halo),
         work: expander.work,
         depth: expander.deepest,
     })
+}
+
+fn looked(
+    program: &Program<'_>,
+    looks: &[(u32, String)],
+    (out, upper): (&[u32; CORNERS], &[[u32; CORNERS]]),
+) -> Result<(), Refusal> {
+    let root = Path::root();
+    let looking = !looks.is_empty();
+    if looking != (program.halo == 1) {
+        let (expected, found) = match looks.first() {
+            Some((_, at)) => (
+                String::from("halo 1, for a law that looks"),
+                format!("halo {}, and a look at {at}", program.halo),
+            ),
+            None => (
+                String::from("halo 0, for a law that does not look"),
+                format!("halo {}, and no look", program.halo),
+            ),
+        };
+        return Err(refused(
+            Code::HaloDeclared,
+            &root.key("halo"),
+            expected,
+            found,
+        ));
+    }
+    let corners = u32::try_from(CORNERS).unwrap_or(8);
+    let first = first_plane(program);
+    for (plane, at) in looks {
+        let input = |corner: u32| match *plane {
+            0 => corner,
+            _ => first + (*plane - 1) * corners + corner,
+        };
+        let outs = match *plane {
+            0 => Some(out),
+            _ => upper.get(usize::try_from(*plane - 1).unwrap_or(usize::MAX)),
+        };
+        let written = outs.map_or(Some(0), |words| {
+            words
+                .iter()
+                .zip(0..corners)
+                .find(|(id, corner)| **id != input(*corner))
+                .map(|(_, corner)| corner)
+        });
+        if let Some(corner) = written {
+            return Err(Refusal {
+                code: Code::HaloWritten,
+                path: at.clone(),
+                expected: format!(
+                    "a look only at a plane the law leaves unchanged: out must give plane {plane} its own 8 words, or the look must read another plane"
+                ),
+                found: format!(
+                    "a look at plane {plane}, which the law writes: out changes corner {corner} of plane {plane}"
+                ),
+                limit: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

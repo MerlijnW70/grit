@@ -48,10 +48,15 @@ pub enum Code {
     Result,
     Unsupported,
     Lifting,
+    HaloRadius,
+    HaloConstant,
+    HaloPlane,
+    HaloDeclared,
+    HaloWritten,
 }
 
 impl Code {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 33] = [
         Self::Json,
         Self::Size,
         Self::Trailing,
@@ -80,6 +85,11 @@ impl Code {
         Self::Result,
         Self::Unsupported,
         Self::Lifting,
+        Self::HaloRadius,
+        Self::HaloConstant,
+        Self::HaloPlane,
+        Self::HaloDeclared,
+        Self::HaloWritten,
     ];
 
     #[must_use]
@@ -113,6 +123,11 @@ impl Code {
             Self::Result => "result",
             Self::Unsupported => "unsupported",
             Self::Lifting => "lifting",
+            Self::HaloRadius => "halo_radius",
+            Self::HaloConstant => "halo_constant",
+            Self::HaloPlane => "halo_plane",
+            Self::HaloDeclared => "halo_declared",
+            Self::HaloWritten => "halo_written",
         }
     }
 }
@@ -195,6 +210,17 @@ impl Law {
         }
         let expanded = expand::expand(&program)?;
         let places = Places::of(json, &expanded.sites);
+        if program.reversible && program.halo > 0 {
+            return Err(Refusal {
+                code: Code::Unsupported,
+                path: String::from("$.reversible"),
+                expected: String::from(
+                    "a reversible law that does not look: the inverse of a look is not built",
+                ),
+                found: String::from("reversible true and halo 1"),
+                limit: None,
+            });
+        }
         if program.reversible {
             adjoint::lifted(&expanded.dag)
                 .map_err(|broken| broken.refusal(&expanded.dag, &places))?;
@@ -287,6 +313,10 @@ impl Declared for Law {
     fn planes(&self) -> usize {
         usize::try_from(self.channels).unwrap_or(1).max(1)
     }
+
+    fn looks(&self) -> crate::halo::Halo {
+        self.dag.halo()
+    }
 }
 
 impl OneStep for Law {
@@ -301,6 +331,16 @@ impl OneStep for Law {
         planes: &[[O::Word; CORNERS]],
     ) -> Planed<O::Word> {
         self.dag.replay_planes(ops, oct, planes)
+    }
+
+    fn one_step_halo<O: Ops>(
+        &self,
+        ops: &mut O,
+        oct: Oct<'_, O::Word>,
+        planes: &[[O::Word; CORNERS]],
+        halo: &[[O::Word; crate::halo::BOX]],
+    ) -> Planed<O::Word> {
+        self.dag.replay_halo(ops, oct, planes, halo)
     }
 }
 
