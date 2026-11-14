@@ -3230,6 +3230,76 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     );
 }
 
+#[test]
+fn one_held_up_batch_never_locks_a_short_budget_out_of_a_world() {
+    use grit::serve3::budget::{BATCH_MOST, Pace, SUBMIT_MOST_MS};
+    let frame = Duration::from_micros(20);
+    let budget = Duration::from_millis(40);
+    let mut pace = Pace::first(32 * 32 * 32);
+    for _ in 0..4 {
+        pace.ran(BATCH_MOST, frame * BATCH_MOST);
+    }
+    for frames in [1, 2, 4] {
+        let mut held = pace;
+        held.ran(frames, Duration::from_millis(SUBMIT_MOST_MS));
+        let step = held.batch(65536, budget);
+        assert!(
+            step > 0,
+            "{frames} frames held up for {SUBMIT_MOST_MS} ms refused a {budget:?} budget: {held:?}"
+        );
+        held.ran(step, frame * step);
+        let next = held.batch(65536, budget);
+        assert!(next > step, "{held:?} did not grow back after {step}");
+    }
+    let mut slow = pace;
+    slow.ran(BATCH_MOST, budget * 2 * BATCH_MOST);
+    assert_eq!(slow.batch(65536, budget), 0, "{slow:?}");
+    let mut late = pace;
+    late.ran(1, Duration::from_millis(SUBMIT_MOST_MS));
+    assert_eq!(late.batch(65536, frame / 2), 0, "{late:?}");
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_single_frame_held_up_on_the_device_never_locks_short_budgets_out_of_a_world() {
+    let Some(host) = device("held up batch") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = answer(&call(
+        &mut server,
+        "grit_world_create",
+        "{\"wide\":32,\"deep\":32,\"tall\":32,\"rule\":\"sand\"}",
+    ))
+    .int_at("world");
+    let cells: Vec<([u32; 3], u32)> = (0..32).map(|at| ([at, 0, at], grit::sand::SAND)).collect();
+    answer(&call(
+        &mut server,
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":{}}}", writing(&cells)),
+    ));
+    let budget = 40;
+    let short = format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}");
+    for _ in 0..4 {
+        assert!(got_frames(&call(&mut server, "grit_world_step", &short)) > 0);
+    }
+    let held = Duration::from_millis(grit::serve3::budget::SUBMIT_MOST_MS);
+    grit::serve3::tools::faults::stall_batch(0, held);
+    answer(&call(
+        &mut server,
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":1}}"),
+    ));
+    for call_at in 0..8 {
+        let got = call(&mut server, "grit_world_step", &short);
+        assert!(
+            got_frames(&got) > 0,
+            "call {call_at} after one frame held up for {held:?} ran no frame: {}",
+            written(&got)
+        );
+    }
+}
+
 #[cfg(feature = "faults")]
 fn behind_idle_work(dir: bool) {
     let Some(host) = device("slow idle work") else {

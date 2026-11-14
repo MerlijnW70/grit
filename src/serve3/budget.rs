@@ -49,6 +49,7 @@ impl Stop {
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {
     per_frame: Duration,
+    steady: Duration,
     measured: bool,
     last: u32,
 }
@@ -62,6 +63,7 @@ impl Pace {
             .saturating_add(WORST_PER_SUBMIT);
         Self {
             per_frame: guess,
+            steady: guess,
             measured: false,
             last: BATCH_MOST,
         }
@@ -74,7 +76,7 @@ impl Pace {
         }
         let aimed = frames_in(AIM, self.per_frame).max(1);
         let grown = self.last.saturating_mul(2).max(1);
-        let fits = frames_in(time, self.per_frame);
+        let fits = frames_in(time, self.per_frame).max(frames_in(time, self.steady).min(1));
         let fits = if self.measured { fits } else { fits.max(1) };
         aimed.min(grown).min(BATCH_MOST).min(left).min(fits)
     }
@@ -84,6 +86,14 @@ impl Pace {
             return;
         }
         self.per_frame = spent / frames;
+        self.steady = if self.measured && frames < BATCH_MOST {
+            self.steady
+                .saturating_mul(BATCH_MOST - frames)
+                .saturating_add(spent)
+                / BATCH_MOST
+        } else {
+            self.per_frame
+        };
         self.measured = true;
         self.last = frames;
     }
