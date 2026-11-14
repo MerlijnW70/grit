@@ -225,15 +225,22 @@ impl Stepper {
     fn wired(&self, subgroup: u32, grid: Grid, plan: &Plan) -> Result<live::Loop, LaneError> {
         match self {
             Self::Named(rule) => rule.wired(subgroup, grid, plan),
-            Self::Law(law, Stepping::Listed) => live::wired3_by(&**law, subgroup, grid, plan),
-            Self::Law(law, Stepping::Whole) => live::wired3_whole_by(&**law, subgroup, grid, plan),
+            Self::Law(law, _) => {
+                live::wired3_switched_by(&**law, subgroup, grid, plan, switch_of(law, plan))
+            }
         }
     }
 
     fn laid(&self, plan: &Plan) -> Vec<usize> {
         match self {
             Self::Named(rule) => plan.windows().laid(&rule.sizes(plan)),
-            Self::Law(law, _) => live::windows3(&**law, plan).laid(&live::sizes3(&**law, plan)),
+            Self::Law(law, _) => {
+                let mut sizes = live::sizes3(&**law, plan);
+                if let Some(params) = sizes.get_mut(PARAMS as usize) {
+                    *params += 1;
+                }
+                live::windows3(&**law, plan).laid(&sizes)
+            }
         }
     }
 
@@ -276,6 +283,14 @@ impl Stepper {
             },
         }
     }
+}
+
+fn switch_of(law: &crate::law::Law, plan: &Plan) -> u32 {
+    let words = live::sizes3(law, plan)
+        .get(PARAMS as usize)
+        .copied()
+        .unwrap_or(FIRST_PARAM);
+    u32::try_from(words).unwrap_or(u32::MAX)
 }
 
 fn lawful(law: &crate::law::Law, params: &[u32], stepping: Stepping) -> Result<Stepper, Refused> {
@@ -576,6 +591,11 @@ impl<'host> World<'host> {
     }
 
     fn parameters(&mut self) -> Result<(), host::Error> {
+        if let (Stepper::Law(law, stepping), None) = (&self.rule, self.pool) {
+            let whole = u32::from(*stepping == Stepping::Whole);
+            let switch = switch_of(law, &self.plan) as usize;
+            self.live.write_at(PARAMS as usize, switch, &[whole])?;
+        }
         if self.params.is_empty() {
             return Ok(());
         }
@@ -715,11 +735,8 @@ impl<'host> World<'host> {
             }
         };
         listed_if_sparse(self.pool.is_some(), stepping)?;
-        if stepping != self.stepping() {
-            let mut image = self.image()?;
-            image.params = params.to_vec();
-            *self = Self::open_stepped(self.host, &image, stepping)?;
-            return Ok(());
+        if let Stepper::Law(_, held) = &mut self.rule {
+            *held = stepping;
         }
         self.params = params.to_vec();
         self.parameters()?;

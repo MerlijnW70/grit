@@ -73,6 +73,11 @@ impl<'host> World<'host> {
         copied(&mut from.live, &mut self.live, &self.sizes, reach)?;
         self.params.clone_from(&from.params);
         self.frame = from.frame;
+        if let (super::Stepper::Law(_, into), super::Stepper::Law(_, taken)) =
+            (&mut self.rule, &from.rule)
+        {
+            *into = *taken;
+        }
         Ok(())
     }
 }

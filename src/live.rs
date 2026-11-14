@@ -494,16 +494,17 @@ pub fn arranged3_by<R: Rule>(
     )
 }
 
-pub fn wired3_whole_by<R: Rule>(
+pub fn wired3_switched_by<R: Rule>(
     rule: &R,
     subgroup: u32,
     grid: Grid,
     plan: &crate::compact::Plan,
+    switch: u32,
 ) -> Result<Loop, LaneError> {
     fits("live::wired3", grid, plan)?;
     let coarse = coarse_pays(plan.blocks);
     let (listed, _) = tiers(plan, coarse);
-    let kept = decay_whole(subgroup, listed, grid.blocks())?;
+    let kept = decay_switched(subgroup, listed, grid.blocks(), switch)?;
     arranged3_with(rule, subgroup, grid, plan, (coarse, kept))
 }
 
@@ -958,13 +959,18 @@ fn decayed<const LANES: u32>(subgroup: u32, over: Over) -> Result<Vec<u32>, Lane
     kernel.finish()
 }
 
-pub fn decay_whole(subgroup: u32, over: Over, quads: u32) -> Result<Vec<u32>, LaneError> {
+pub fn decay_switched(
+    subgroup: u32,
+    over: Over,
+    quads: u32,
+    switch: u32,
+) -> Result<Vec<u32>, LaneError> {
     match subgroup {
-        4 => decayed_whole::<4>(subgroup, over, quads),
-        8 => decayed_whole::<8>(subgroup, over, quads),
-        16 => decayed_whole::<16>(subgroup, over, quads),
-        32 => decayed_whole::<32>(subgroup, over, quads),
-        64 => decayed_whole::<64>(subgroup, over, quads),
+        4 => decayed_switched::<4>(subgroup, over, quads, switch),
+        8 => decayed_switched::<8>(subgroup, over, quads, switch),
+        16 => decayed_switched::<16>(subgroup, over, quads, switch),
+        32 => decayed_switched::<32>(subgroup, over, quads, switch),
+        64 => decayed_switched::<64>(subgroup, over, quads, switch),
         other => Err(LaneError::NoMapping {
             lanes: other,
             width: subgroup,
@@ -972,10 +978,11 @@ pub fn decay_whole(subgroup: u32, over: Over, quads: u32) -> Result<Vec<u32>, La
     }
 }
 
-fn decayed_whole<const LANES: u32>(
+fn decayed_switched<const LANES: u32>(
     subgroup: u32,
     over: Over,
     quads: u32,
+    switch: u32,
 ) -> Result<Vec<u32>, LaneError> {
     use crate::sweep::{self, PER_LANE};
 
@@ -989,9 +996,13 @@ fn decayed_whole<const LANES: u32>(
     let run = kernel.module().constant_u32(PER_LANE)?;
     let along = kernel.module().i_mul(uint, lane, run)?;
     let mine = kernel.module().i_add(uint, start, along)?;
+    let switch_at = kernel.module().constant_u32(switch)?;
+    let whole = kernel.load_at(PARAMS, switch_at)?;
 
     let kept = |kernel: &mut Kernel<U32>, held: simdr::module::Id, quad: simdr::module::Id| {
         let mut lanes = kernel.lanes()?;
+        let on = lanes.splat_id::<U32, 1>(whole)?;
+        let none = lanes.splat_bits::<U32, 1>(0)?;
         let now = lanes.splat_id::<U32, 1>(held)?;
         let at = lanes.splat_id::<U32, 1>(quad)?;
         let one = lanes.splat_bits::<U32, 1>(1)?;
@@ -1001,7 +1012,9 @@ fn decayed_whole<const LANES: u32>(
         let back = lanes.mul(one, minus)?;
         let lowered = lanes.add(floored, back)?;
         let inside = lanes.greater_than(past, at)?;
-        Ok::<_, LaneError>(lanes.select(inside, one, lowered)?.id())
+        let kept = lanes.select(inside, one, lowered)?;
+        let on = lanes.greater_than(on, none)?;
+        Ok::<_, LaneError>(lanes.select(on, kept, lowered)?.id())
     };
 
     let mut quad_ids = Vec::with_capacity(PER_LANE as usize);
