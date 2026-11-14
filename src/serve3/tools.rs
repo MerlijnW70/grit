@@ -353,6 +353,7 @@ fn read_shown() -> Json {
             ("world", world_number()),
             ("from", corner_shown("the least corner, [x, y, z]")),
             ("to", corner_shown("the greatest corner, [x, y, z]")),
+            ("plane", plane_shown()),
         ],
         &["world", "from", "to"],
     )
@@ -395,9 +396,35 @@ fn slice_shown() -> Json {
                     vec![("default", Json::Int(0))],
                 ),
             ),
+            ("plane", plane_shown()),
         ],
         &["world", "at"],
     )
+}
+
+fn plane_shown() -> Json {
+    with(
+        whole(
+            "which plane of a law world's words, below its channels; 0 if left out",
+            0,
+            i64::from(crate::law::limits::CHANNELS - 1),
+        ),
+        vec![("default", Json::Int(0))],
+    )
+}
+
+fn plane_of(held: &Json, world: &World<'_>) -> Result<u32, Failed> {
+    let plane = int(held, "plane")?;
+    let planes = world.planes();
+    if plane >= planes {
+        return Err(limited(
+            Code::Outside,
+            "$.plane",
+            format!("plane {plane} is past the world's {planes} planes"),
+            counted(planes.saturating_sub(1)),
+        ));
+    }
+    Ok(plane)
 }
 
 fn close_shown() -> Json {
@@ -904,10 +931,6 @@ pub fn exactly(value: u128) -> Json {
     i64::try_from(value).map_or_else(|_| text(&value.to_string()), Json::Int)
 }
 
-pub(super) fn cells_at(world: &mut World<'_>, points: &[[u32; 3]]) -> Result<Vec<u32>, Failed> {
-    world.cells_at(points)
-}
-
 fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
     let live = server.world(held)?;
@@ -944,9 +967,10 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             }
         }
     }
+    let plane = plane_of(held, &live.world)?;
     let mut words = Vec::new();
     let mut kinds = BTreeMap::new();
-    for word in cells_at(&mut live.world, &points)? {
+    for word in live.world.cells_at_plane(&points, plane)? {
         *kinds.entry(live.rule.kind(word)).or_insert(0_u32) += 1;
         words.push(counted(word));
     }
@@ -1027,7 +1051,8 @@ fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             points.push(place(row, column));
         }
     }
-    let state = cells_at(&mut live.world, &points)?;
+    let plane = plane_of(held, &live.world)?;
+    let state = live.world.cells_at_plane(&points, plane)?;
     let mut rows = Vec::new();
     let mut read = state.into_iter();
     let mut bytes = 0_usize;
@@ -1159,6 +1184,7 @@ pub fn describe(status: &Status) -> Json {
                 ("queue_calls", number(super::exec::QUEUE_MOST)),
                 ("law_tally", text(super::law::TALLIED)),
                 ("law_look", text(super::law::LOOK)),
+                ("law_from_chip", text(super::law::FROM_CHIP)),
                 (
                     "budget_late",
                     text(

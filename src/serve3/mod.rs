@@ -569,7 +569,7 @@ pub struct Server<'host> {
 }
 
 /// The names of the world tools, in the order `tools/list` gives them.
-pub const WORLD_TOOLS: [&str; 14] = [
+pub const WORLD_TOOLS: [&str; 15] = [
     "grit_world_rules",
     "grit_world_create",
     "grit_world_write",
@@ -579,6 +579,7 @@ pub const WORLD_TOOLS: [&str; 14] = [
     "grit_world_close",
     "grit_describe",
     "grit_world_params",
+    "grit_law_from_chip",
     "grit_world_save",
     "grit_world_open",
     "grit_world_list",

@@ -465,9 +465,25 @@ pub fn code_of(tool: &str, path: &str, wrong: Wrong) -> Code {
         }
         ("grit_world_step", "$.frames", Wrong::Range) => Code::Frames,
         ("grit_world_slice", "$.axis", Wrong::Type | Wrong::Choice) => Code::Axis,
+        ("grit_law_from_chip", _, Wrong::Range) => chip_range(path),
         (_, _, Wrong::Unknown) => Code::UnknownKey,
         (_, _, Wrong::Duplicate) => Code::DuplicateKey,
         (_, _, Wrong::Long) => Code::TooMany,
+        _ => Code::Malformed,
+    }
+}
+
+fn chip_range(path: &str) -> Code {
+    let field = path.rsplit('.').next().unwrap_or(path);
+    match field {
+        "bit" => Code::BitPast,
+        "plane" => Code::PlanePast,
+        "dx" | "dy" | "dz" => Code::OffsetPast,
+        _ if path.starts_with("$.gates")
+            || matches!(path, "$.inputs" | "$.outputs" | "$.state") =>
+        {
+            Code::ChipRefused
+        }
         _ => Code::Malformed,
     }
 }
