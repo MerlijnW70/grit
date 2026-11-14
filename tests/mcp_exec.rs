@@ -3317,7 +3317,7 @@ fn a_held_up_first_batch_never_locks_a_short_budget_out_of_a_world() {
 }
 
 #[test]
-fn a_world_whose_frames_do_not_fit_is_refused_up_front_after_one_frame_confirms_it() {
+fn a_world_whose_frames_do_not_fit_is_refused_up_front_after_two_frames_confirm_it() {
     use grit::serve3::budget::BATCH_MOST;
     let slow = PACE_BUDGET * 2;
     let mut pace = warm_pace();
@@ -3331,7 +3331,7 @@ fn a_world_whose_frames_do_not_fit_is_refused_up_front_after_one_frame_confirms_
             pace.ran(1, slow);
         }
     }
-    assert_eq!(probed, vec![0, 2, 5, 10, 19, 36], "{pace:?}");
+    assert_eq!(probed, vec![0, 1, 3, 6, 11, 20, 37], "{pace:?}");
     let next = (0..64)
         .find(|_| pace.opening(65536, PACE_BUDGET) > 0)
         .unwrap();
@@ -3408,14 +3408,35 @@ fn advanced(server: &mut Server<'_>, world: i64, budget_ms: u64) -> (i64, Json) 
 
 #[cfg(feature = "faults")]
 fn short_steps_all_run(server: &mut Server<'_>, world: i64, what: &str) {
-    for call_at in 0..8 {
+    let mut running = 0;
+    let mut refused = Vec::new();
+    for call_at in 0..64 {
+        let began = Instant::now();
         let (ran, got) = advanced(server, world, 40);
+        eprintln!(
+            "call {call_at} after {what}: {ran} frames in {:?}",
+            began.elapsed()
+        );
         assert!(
-            ran > 0,
-            "call {call_at} after {what} ran no frame: {}",
+            call_at > 0 || ran > 0,
+            "the first call after {what} ran no frame: {}",
             written(&got)
         );
+        if ran > 0 {
+            running += 1;
+            if running == 4 {
+                assert!(
+                    refused.len() <= 3,
+                    "after {what}, refused calls {refused:?}"
+                );
+                return;
+            }
+        } else {
+            running = 0;
+            refused.push(call_at);
+        }
     }
+    panic!("after {what}, refused calls {refused:?} of 64");
 }
 
 #[cfg(feature = "faults")]
@@ -3554,7 +3575,7 @@ fn a_world_whose_frames_outlast_a_short_budget_is_refused_at_once_between_rare_p
         );
     }
     grit::serve3::tools::faults::disarm();
-    assert_eq!(probed, vec![0, 2, 5, 10]);
+    assert_eq!(probed, vec![0, 1, 3, 6, 11]);
     let (ran, got) = advanced(&mut server, world, 1000);
     assert!(ran > 0, "{}", written(&got));
     short_steps_all_run(&mut server, world, "frames that fit again");

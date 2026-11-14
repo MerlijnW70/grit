@@ -53,7 +53,7 @@ pub struct Pace {
     last: u32,
     probe: Option<Duration>,
     doubt: u32,
-    patience: u32,
+    confirmed: u32,
 }
 
 impl Pace {
@@ -69,7 +69,7 @@ impl Pace {
             last: BATCH_MOST,
             probe: None,
             doubt: 0,
-            patience: 0,
+            confirmed: 0,
         }
     }
 
@@ -91,7 +91,11 @@ impl Pace {
         if step > 0 || left == 0 || time.is_zero() {
             return step;
         }
-        if self.doubt < self.patience {
+        let patience = self
+            .confirmed
+            .checked_sub(2)
+            .map_or(0, |twice| 1_u32.checked_shl(twice).unwrap_or(u32::MAX));
+        if self.doubt < patience {
             self.doubt = self.doubt.saturating_add(1);
             return 0;
         }
@@ -105,8 +109,8 @@ impl Pace {
             return;
         }
         self.per_frame = spent / frames;
-        self.patience = match self.probe.take() {
-            Some(time) if spent > time => self.patience.saturating_mul(2).max(1),
+        self.confirmed = match self.probe.take() {
+            Some(time) if spent > time => self.confirmed.saturating_add(1),
             _ => 0,
         };
         self.doubt = 0;
