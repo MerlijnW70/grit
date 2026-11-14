@@ -973,3 +973,29 @@ fn a_credit_call_past_what_its_work_allows_is_refused_up_front_with_the_estimate
     );
     assert_eq!(told(&wide, "field"), Some(Json::Text("$.gates".to_owned())));
 }
+
+#[test]
+fn grit_describe_names_every_credit_number() {
+    let asked = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"grit_describe\",\"arguments\":{}}}";
+    let answer = grit::serve3::Server::new(None).heard(asked).unwrap();
+    let limits = answer
+        .get("result")
+        .and_then(|one| one.get("structuredContent"))
+        .and_then(|one| one.get("limits"))
+        .cloned()
+        .unwrap_or_else(|| panic!("{}", written(&answer)));
+    for (key, value) in [
+        ("credit_depth", i64::from(credit::DEPTH_MOST)),
+        ("credit_pairs", credit::PAIRS as i64),
+        ("credit_pairs_most", credit::PAIRS_MOST as i64),
+        ("credit_moves", credit::MOVES as i64),
+        ("credit_moves_most", credit::MOVES_MOST as i64),
+        ("credit_listed", i64::from(credit::LISTED)),
+        ("credit_pairs_listed", credit::PAIRS_LISTED as i64),
+        ("credit_work", credit::WORK as i64),
+        ("credit_work_most", credit::WORK_MOST as i64),
+        ("escape_rounds", credit::ESCAPE_ROUNDS as i64),
+    ] {
+        assert_eq!(limits.get(key).and_then(Json::int), Some(value), "{key}");
+    }
+}
