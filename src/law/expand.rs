@@ -683,15 +683,15 @@ impl<'p> Expander<'_, 'p> {
                 u64::from(corners),
             ));
         };
-        if !self.looks.iter().any(|(seen, _)| *seen == plane) {
-            self.looks.push((plane, path.shown()));
-        }
         if let Some(own) = halo::own(cell) {
             let own = u32::try_from(own).unwrap_or(0);
             return Ok(Value::Word(match plane {
                 0 => own,
                 _ => first_plane(self.program) + (plane - 1) * corners + own,
             }));
+        }
+        if !self.looks.iter().any(|(seen, _)| *seen == plane) {
+            self.looks.push((plane, path.shown()));
         }
         let first = first_plane(self.program) + (channels - 1) * corners;
         let box_cells = u32::try_from(BOX).unwrap_or(u32::MAX);
@@ -1090,12 +1090,12 @@ fn looked(
     if looking != (program.halo == 1) {
         let (expected, found) = match looks.first() {
             Some((_, at)) => (
-                String::from("halo 1, for a law that looks"),
+                String::from("halo 1, for a law that looks past its own oct"),
                 format!("halo {}, and a look at {at}", program.halo),
             ),
             None => (
-                String::from("halo 0, for a law that does not look"),
-                format!("halo {}, and no look", program.halo),
+                String::from("halo 0, for a law whose looks all stay inside its oct"),
+                format!("halo {}, and no look past the oct", program.halo),
             ),
         };
         return Err(refused(

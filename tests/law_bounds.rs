@@ -386,11 +386,11 @@ fn stresses(op: &str) -> Vec<(String, Stress)> {
             for (name, body) in [
                 (
                     "look",
-                    "[\"add\",\"a\",[\"look\",0,1,0,0,[\"and\",\"i\",7]]]",
+                    "[\"add\",\"a\",[\"look\",0,-1,0,0,[\"and\",\"i\",6]]]",
                 ),
                 (
                     "look moving",
-                    "[\"add\",\"a\",[\"look\",0,[\"and\",\"i\",1],[\"and\",[\"shr\",\"i\",1],1],[\"and\",[\"shr\",\"i\",2],1],[\"and\",\"i\",7]]]",
+                    "[\"add\",\"a\",[\"look\",0,-1,[\"and\",\"i\",1],[\"and\",[\"shr\",\"i\",1],1],[\"and\",[\"shr\",\"i\",2],6]]]",
                 ),
             ] {
                 let make = folded("0", body);

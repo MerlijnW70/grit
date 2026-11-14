@@ -210,6 +210,15 @@ impl Law {
         }
         let expanded = expand::expand(&program)?;
         let places = Places::of(json, &expanded.sites);
+        if (program.halo == 1) == expanded.dag.halo().is_empty() {
+            return Err(Refusal {
+                code: Code::HaloDeclared,
+                path: String::from("$.halo"),
+                expected: String::from("halo 1 exactly when a look leaves the oct"),
+                found: format!("halo {}", program.halo),
+                limit: None,
+            });
+        }
         if program.reversible && program.halo > 0 {
             return Err(Refusal {
                 code: Code::Unsupported,

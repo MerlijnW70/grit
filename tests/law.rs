@@ -600,7 +600,7 @@ fn a_refusal_names_the_path_the_code_what_was_expected_and_what_was_found() {
         "$.defs.mat[1][2]",
     );
     let why = refused_at(
-        &mat("[\"and\",\"w\",[\"look\",0,0,0,0,0]]"),
+        &mat("[\"and\",\"w\",[\"look\",0,-1,0,0,0]]"),
         Code::HaloDeclared,
         "$.halo",
     );

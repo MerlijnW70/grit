@@ -734,7 +734,7 @@ fn every_refused_look_is_named_by_its_code_and_path() {
         Code::HaloDeclared,
         "$.halo",
     );
-    assert_eq!(why.found, "halo 1, and no look");
+    assert_eq!(why.found, "halo 1, and no look past the oct");
     refused_at(
         &probe(
             2,
@@ -747,6 +747,74 @@ fn every_refused_look_is_named_by_its_code_and_path() {
     );
     let reversible = ok.replacen("\"halo\":1,", "\"halo\":1,\"reversible\":true,", 1);
     refused_at(&reversible, Code::Unsupported, "$.reversible");
+}
+
+#[test]
+fn the_declared_halo_is_whether_a_look_leaves_the_oct() {
+    let inside = "[\"vec\",[\"at\",[\"at\",\"cells\",\"c\"],0],[\"add\",[\"look\",0,0,0,0,\"c\"],[\"look\",0,1,0,0,[\"and\",\"c\",6]]]]";
+    let why = refused_at(&probe(2, 1, 0, inside), Code::HaloDeclared, "$.halo");
+    assert_eq!(why.found, "halo 1, and no look past the oct");
+    let law = compiled(&probe(2, 0, 0, inside));
+    assert_eq!(law.halo(), 0);
+    assert!(law.looks().is_empty());
+    assert!(branch::looks_dense(&law, true).is_ok());
+    let twin = compiled(&probe(
+        2,
+        0,
+        0,
+        "[\"vec\",[\"at\",[\"at\",\"cells\",\"c\"],0],[\"add\",[\"at\",[\"at\",\"cells\",\"c\"],0],[\"at\",[\"at\",\"cells\",[\"or\",[\"and\",\"c\",6],1]],0]]]",
+    ));
+    let mut state = 0x1A51_u64;
+    for _ in 0..64 {
+        let words: [u32; CORNERS] = core::array::from_fn(|_| below(&mut state, 1000));
+        let upper = [core::array::from_fn(|_| below(&mut state, 1000))];
+        let oct = || Oct {
+            words,
+            frame: 0,
+            at: [0; 3],
+            params: &[],
+        };
+        assert_eq!(
+            law.step_planes(oct(), &upper),
+            twin.step_planes(oct(), &upper)
+        );
+    }
+    let written = compiled(&probe(
+        2,
+        0,
+        0,
+        "[\"vec\",[\"at\",[\"at\",\"cells\",\"c\"],0],[\"add\",[\"look\",1,0,0,0,\"c\"],1]]",
+    ));
+    assert!(written.looks().is_empty());
+    let outside =
+        "[\"vec\",[\"at\",[\"at\",\"cells\",\"c\"],0],[\"look\",0,0,0,0,[\"look\",0,0,0,0,\"c\"]]]";
+    refused_at(
+        &probe(2, 0, 0, outside),
+        Code::HaloConstant,
+        "$.step[1][3][2][5]",
+    );
+    for (text, halo) in [(EDGE, 1), (SOBEL, 1), (BLUR, 1)] {
+        let law = compiled(text);
+        assert_eq!(law.halo(), halo);
+        assert_eq!(law.halo() == 1, !law.looks().is_empty());
+        assert!(branch::looks_dense(&law, true).is_err());
+    }
+    for corner in 0..CORNERS {
+        for dx in [-1_i32, 0, 1] {
+            let look = format!(
+                "[\"vec\",[\"at\",[\"at\",\"cells\",\"c\"],0],[\"look\",0,{dx},0,0,{corner}]]"
+            );
+            let leaves = grit::halo::own(grit::halo::looked(corner, [dx, 0, 0]).unwrap()).is_none();
+            let declared = u32::from(leaves);
+            let law = compiled(&probe(2, declared, 0, &look));
+            assert_eq!(law.halo() == 1, !law.looks().is_empty(), "{look}");
+            refused_at(
+                &probe(2, 1 - declared, 0, &look),
+                Code::HaloDeclared,
+                "$.halo",
+            );
+        }
+    }
 }
 
 #[test]
@@ -772,7 +840,7 @@ fn a_look_at_a_written_plane_is_refused_halo_written_with_the_plane_named() {
             "[\"vec\",[\"add\",[\"look\",0,0,0,0,\"c\"],1],[\"look\",0,1,0,0,\"c\"]]",
         ),
         Code::HaloWritten,
-        "$.step[1][3][1][1]",
+        "$.step[1][3][2]",
     );
     assert!(why.found.contains("plane 0"), "{why}");
     refused_at(
@@ -783,7 +851,7 @@ fn a_look_at_a_written_plane_is_refused_halo_written_with_the_plane_named() {
             "[\"vec\",[\"look\",0,0,0,0,[\"xor\",\"c\",1]],[\"look\",0,1,0,0,\"c\"]]",
         ),
         Code::HaloWritten,
-        "$.step[1][3][1]",
+        "$.step[1][3][2]",
     );
     let kept = compiled(&probe(
         2,
