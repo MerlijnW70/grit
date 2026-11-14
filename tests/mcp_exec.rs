@@ -3180,11 +3180,23 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     let slow = Duration::from_millis(3000);
     faults.lock().unwrap().slow_write = slow;
     let budget = 40;
+    let due = Ledger::created(Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [32, 32, 32],
+        sparse: false,
+        slots: None,
+    })
+    .replay_most();
     let mut worst = Duration::ZERO;
     let mut after = None;
     let mut calls = 0;
+    let mut stepping = Duration::ZERO;
     while after.is_none_or(|first: Instant| first.elapsed() < slow * 2) {
-        assert!(calls < 200, "no snapshot was taken between calls");
+        assert!(
+            after.is_some() || stepping <= due * 2,
+            "no snapshot was taken between {calls} calls that spent {stepping:?}, twice the replay of {due:?} that makes one due"
+        );
         let began = Instant::now();
         let got = run.ask(
             "grit_world_step",
@@ -3198,6 +3210,11 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
             "call {calls} after {took:?}: {}",
             written(&got)
         );
+        assert!(
+            got_frames(&got) > 0,
+            "call {calls} ran no frame: {}",
+            written(&got)
+        );
         let most = off_worker_most(&mut run, budget, slow / 2);
         assert!(
             took <= most,
@@ -3205,6 +3222,9 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
         );
         worst = worst.max(took);
         calls += 1;
+        if after.is_none() {
+            stepping += took;
+        }
         if after.is_none() && faults.lock().unwrap().slowed > 0 {
             after = Some(Instant::now());
         }
@@ -3567,6 +3587,8 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
     faults.lock().unwrap().slow_write = slow;
     let budget = 1000;
     let mut worst = Duration::ZERO;
+    let mut frame = 0;
+    let mut began = Vec::new();
     for call in 0..10 {
         let asked = Instant::now();
         let got = run.ask(
@@ -3575,17 +3597,26 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
         );
         let took = asked.elapsed();
         let told = answer(&got);
-        assert!(told.int_at("frame") > 0, "call {call}: {}", written(&got));
+        assert!(
+            told.int_at("frame") > frame,
+            "call {call}: {}",
+            written(&got)
+        );
+        frame = told.int_at("frame");
         let most = off_worker_most(&mut run, budget, slow / 2);
         assert!(
             took <= most,
             "call {call} took {took:?}, more than {most:?}"
         );
         worst = worst.max(took);
+        let slowed = faults.lock().unwrap().slowed;
+        if usize::try_from(slowed).unwrap() > began.len() {
+            began.push(call);
+        }
     }
     let slowed = faults.lock().unwrap().slowed;
     eprintln!(
-        "10 steps of {budget} ms beside {slowed} snapshot writes of {slow:?}; the slowest took {worst:?}"
+        "10 steps of {budget} ms beside {slowed} snapshot writes of {slow:?}, begun by calls {began:?}; the slowest took {worst:?}"
     );
     assert!(slowed >= 2, "{slowed}");
     let idle = idle_longest(&mut run);
