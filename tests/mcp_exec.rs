@@ -4538,7 +4538,7 @@ fn kept_journals(scratch: &Scratch, numbers: &[u32]) {
             sparse: false,
             slots: None,
         });
-        ledger.push(Entry::Step(4000), Duration::from_secs(1));
+        ledger.push(Entry::Step(400), Duration::from_secs(1));
         keep.begin(number, &ledger).unwrap();
     }
     keep.set_next(numbers.iter().max().unwrap() + 1).unwrap();
@@ -4567,7 +4567,7 @@ fn a_replay_held_up_once_never_refuses_the_next_open_of_a_kept_world_that_fits()
         let faults = server.faults();
         let mut armed = faults.lock().unwrap();
         armed.held_replays = 1;
-        armed.held_by = Duration::from_secs(7);
+        armed.held_by = Duration::from_secs(4);
     }
     answer(&call(
         &mut server,
@@ -4575,9 +4575,9 @@ fn a_replay_held_up_once_never_refuses_the_next_open_of_a_kept_world_that_fits()
         &opened_kept(2, 600_000),
     ));
     assert_eq!(server.faults().lock().unwrap().held_replays, 0);
-    let got = call(&mut server, "grit_world_open", &opened_kept(3, 5000));
+    let got = call(&mut server, "grit_world_open", &opened_kept(3, 2500));
     eprintln!("open after one held-up replay: {}", written(&got));
-    assert_eq!(answer(&got).int_at("frame"), 4000);
+    assert_eq!(answer(&got).int_at("frame"), 400);
 }
 
 #[cfg(feature = "faults")]
@@ -4608,7 +4608,7 @@ fn a_replay_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that
     {
         let mut armed = faults.lock().unwrap();
         armed.held_replays = 1;
-        armed.held_by = Duration::from_secs(7);
+        armed.held_by = Duration::from_secs(8);
     }
     answer(&run.ask("grit_world_open", &opened_kept(2, 600_000)));
     assert_eq!(faults.lock().unwrap().held_replays, 0);
@@ -4620,7 +4620,7 @@ fn a_replay_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that
     eprintln!("wedged: {}", written(&wedged));
     let got = run.ask(
         "grit_world_read",
-        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":2500}}"),
+        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":2000}}"),
     );
     eprintln!("rebuild after one held-up replay: {}", written(&got));
     let read = answer(&got);
