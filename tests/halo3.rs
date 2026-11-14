@@ -817,6 +817,66 @@ fn the_declared_halo_is_whether_a_look_leaves_the_oct() {
     }
 }
 
+fn one_corner_written(plane: usize, corner: usize, how: &str) -> String {
+    let other = 1 - plane;
+    let bumped = |word: &str| match how {
+        "def" => format!("[\"bump\",{word},\"c\"]"),
+        "let" => format!(
+            "[\"let\",[[\"w\",{word}]],[\"if\",[\"eq\",\"c\",{corner}],[\"add\",\"w\",1],\"w\"]]"
+        ),
+        _ => format!("[\"if\",[\"eq\",\"c\",{corner}],[\"add\",{word},1],{word}]"),
+    };
+    let own = |at: usize| format!("[\"at\",[\"at\",\"cells\",\"c\"],{at}]");
+    let looked = format!(
+        "[\"add\",{},[\"look\",{plane},-1,0,0,[\"and\",\"c\",6]]]",
+        own(other)
+    );
+    let mut words = [String::new(), String::new()];
+    words[plane] = bumped(&own(plane));
+    words[other] = looked;
+    format!(
+        "{{\"law\":1,\"name\":\"probe\",\"params\":0,\"channels\":2,\"halo\":1,\"tally\":{{\"counts\":1,\"weighted\":false}},\"consts\":{{}},\"defs\":{{\"bump\":[[\"w\",\"c\"],[\"if\",[\"eq\",\"c\",{corner}],[\"add\",\"w\",1],\"w\"]]}},\"step\":[\"vec\",[\"map\",\"c\",[\"range\",8],[\"vec\",{},{}]],[\"vec\",0]]}}",
+        words[0], words[1]
+    )
+}
+
+#[test]
+fn a_look_at_a_plane_whose_out_changes_one_corner_is_refused_for_every_corner() {
+    let mut missed = Vec::new();
+    for plane in 0..2 {
+        for corner in 0..CORNERS {
+            for how in ["direct", "def", "let"] {
+                let case = format!("plane {plane} corner {corner} {how}");
+                match Law::compile(&one_corner_written(plane, corner, how)) {
+                    Ok(law) => missed.push(format!("{case}: compiled into {} nodes", law.nodes())),
+                    Err(why) => {
+                        let named = format!("out changes corner {corner} of plane {plane}");
+                        if why.code != Code::HaloWritten || !why.found.ends_with(&named) {
+                            missed.push(format!("{case}: {why}"));
+                        }
+                    }
+                }
+            }
+            let frozen = one_corner_written(plane, corner, "direct").replace(
+                &format!("[\"add\",[\"at\",[\"at\",\"cells\",\"c\"],{plane}],1]"),
+                &format!("[\"at\",[\"at\",\"cells\",\"c\"],{plane}]"),
+            );
+            let law = compiled(&frozen);
+            assert!(law.looks().looked(plane), "plane {plane} corner {corner}");
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "{} of 48 looks at a plane whose out changes one corner were not refused halo_written:
+{}",
+        missed.len(),
+        missed.join(
+            "
+"
+        )
+    );
+}
+
 #[test]
 fn a_look_at_a_written_plane_is_refused_halo_written_with_the_plane_named() {
     let at = "$.step[1][3][2]";
