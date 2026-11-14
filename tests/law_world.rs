@@ -772,7 +772,7 @@ fn a_law_that_moves_the_empty_oct_is_whole_and_would_lose_cells_sparse() {
     assert_eq!(kept.cells().unwrap(), want_of(&keep));
     let used = kept.pool_use().unwrap().unwrap();
     assert!(
-        !used.overflow && !used.lost && used.held < capacity / 2,
+        !used.overflow && !used.lost && used.held < bricks,
         "{used:?}"
     );
     println!(
