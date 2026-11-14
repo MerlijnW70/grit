@@ -1193,7 +1193,7 @@ pub fn describe(status: &Status) -> Json {
                 (
                     "budget_late",
                     text(
-                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait. A step or rebuild that would be refused at its start because the world's last measured frame did not fit runs one frame to measure again, so its answer can come after its budget by up to one frame of that world; after two such frames in a row still do not fit, the next calls are refused at once, twice as many each time it stays so",
+                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait. A step whose budget the world's last two measured frames, by any client, both do not fit is refused at once, but after two calls in a row were refused since the last measurement the next one runs one frame to measure again; when only the last of the two does not fit, the step runs one frame to measure again; an open or rebuild runs one frame at the start of each journal entry its replay would otherwise stop at. Either answer can come after its budget by up to one frame of that world",
                     ),
                 ),
                 (

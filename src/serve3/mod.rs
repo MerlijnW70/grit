@@ -1796,7 +1796,7 @@ fn paced(
             return Err(Box::new(budget::Cut(stop)));
         }
         let step = if done == 0 {
-            pace.opening(frames - done, guard.left())
+            pace.resumed(frames - done, guard.left())
         } else {
             pace.batch(frames - done, guard.left())
         };

@@ -3191,6 +3191,7 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     let mut worst = Duration::ZERO;
     let mut after = None;
     let mut calls = 0;
+    let mut idle_run = 0;
     let mut stepping = Duration::ZERO;
     while after.is_none_or(|first: Instant| first.elapsed() < slow * 2) {
         assert!(
@@ -3210,9 +3211,14 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
             "call {calls} after {took:?}: {}",
             written(&got)
         );
+        if got_frames(&got) > 0 {
+            idle_run = 0;
+        } else {
+            idle_run += 1;
+        }
         assert!(
-            got_frames(&got) > 0,
-            "call {calls} ran no frame: {}",
+            idle_run <= grit::serve3::budget::REFUSED_MOST,
+            "call {calls} was the {idle_run}th in a row to run no frame: {}",
             written(&got)
         );
         let most = off_worker_most(&mut run, budget, slow / 2);
@@ -3273,6 +3279,19 @@ fn grown_back(pace: &mut grit::serve3::budget::Pace) -> u32 {
     step
 }
 
+fn refused_before_a_frame(pace: &mut grit::serve3::budget::Pace, budget: Duration) -> u32 {
+    use grit::serve3::budget::REFUSED_MOST;
+    let mut refused = 0;
+    loop {
+        let step = pace.opening(65536, budget);
+        if step > 0 {
+            return refused;
+        }
+        refused += 1;
+        assert!(refused <= REFUSED_MOST, "{pace:?}");
+    }
+}
+
 #[test]
 fn one_held_up_batch_never_locks_a_short_budget_out_of_a_world() {
     use grit::serve3::budget::{BATCH_MOST, SUBMIT_MOST_MS};
@@ -3280,12 +3299,9 @@ fn one_held_up_batch_never_locks_a_short_budget_out_of_a_world() {
     for frames in [1, 2, 4] {
         let mut held = pace;
         held.ran(frames, Duration::from_millis(SUBMIT_MOST_MS));
-        let step = held.opening(65536, PACE_BUDGET);
-        assert!(
-            step > 0,
-            "{frames} frames held up for {SUBMIT_MOST_MS} ms refused a {PACE_BUDGET:?} budget: {held:?}"
-        );
-        held.ran(step, PACE_FRAME * step);
+        let refused = refused_before_a_frame(&mut held, PACE_BUDGET);
+        assert_eq!(refused, 0, "{frames} frames: {held:?}");
+        held.ran(1, PACE_FRAME);
         assert_eq!(grown_back(&mut held), BATCH_MOST, "{held:?}");
     }
     let mut late = pace;
@@ -3299,7 +3315,7 @@ fn a_held_up_full_batch_never_locks_a_short_budget_out_of_a_world() {
     let mut pace = warm_pace();
     pace.ran(BATCH_MOST, Duration::from_secs(3));
     assert_eq!(pace.batch(65536, PACE_BUDGET), 0, "{pace:?}");
-    assert_eq!(pace.opening(65536, PACE_BUDGET), 1, "{pace:?}");
+    assert_eq!(refused_before_a_frame(&mut pace, PACE_BUDGET), 0);
     pace.ran(1, PACE_FRAME);
     assert_eq!(grown_back(&mut pace), BATCH_MOST, "{pace:?}");
 }
@@ -3311,19 +3327,19 @@ fn a_held_up_first_batch_never_locks_a_short_budget_out_of_a_world() {
     let first = pace.opening(65536, PACE_BUDGET);
     assert!(first > 0, "{pace:?}");
     pace.ran(first, Duration::from_secs(3));
-    assert_eq!(pace.opening(65536, PACE_BUDGET), 1, "{pace:?}");
+    assert_eq!(refused_before_a_frame(&mut pace, PACE_BUDGET), 0);
     pace.ran(1, PACE_FRAME);
     assert_eq!(grown_back(&mut pace), BATCH_MOST, "{pace:?}");
 }
 
 #[test]
-fn a_world_whose_frames_do_not_fit_is_refused_up_front_after_two_frames_confirm_it() {
-    use grit::serve3::budget::BATCH_MOST;
+fn a_world_whose_frames_do_not_fit_is_refused_up_front_but_measured_every_third_call() {
+    use grit::serve3::budget::{BATCH_MOST, REFUSED_MOST};
     let slow = PACE_BUDGET * 2;
     let mut pace = warm_pace();
     pace.ran(BATCH_MOST, slow * BATCH_MOST);
     let mut probed = Vec::new();
-    for call in 0..64 {
+    for call in 0..12 {
         let step = pace.opening(65536, PACE_BUDGET);
         if step > 0 {
             assert_eq!(step, 1, "call {call}: {pace:?}");
@@ -3331,45 +3347,66 @@ fn a_world_whose_frames_do_not_fit_is_refused_up_front_after_two_frames_confirm_
             pace.ran(1, slow);
         }
     }
-    assert_eq!(probed, vec![0, 1, 3, 6, 11, 20, 37], "{pace:?}");
-    let next = (0..64)
-        .find(|_| pace.opening(65536, PACE_BUDGET) > 0)
-        .unwrap();
+    let every = REFUSED_MOST + 1;
+    let want: Vec<u32> = (0..12).filter(|call| call % every == 0).collect();
+    assert_eq!(probed, want, "{pace:?}");
+    refused_before_a_frame(&mut pace, PACE_BUDGET);
     pace.ran(1, PACE_FRAME);
+    assert_eq!(grown_back(&mut pace), BATCH_MOST, "{pace:?}");
+}
+
+#[test]
+fn a_second_client_keeps_a_world_too_slow_for_a_short_budget_refused_up_front() {
+    use grit::serve3::budget::BATCH_MOST;
+    let slow = PACE_BUDGET * 2;
+    let long = Duration::from_secs(1);
+    let mut pace = warm_pace();
+    pace.ran(BATCH_MOST, slow * BATCH_MOST);
+    let mut probes = 0;
+    for _ in 0..64 {
+        let step = pace.opening(65536, long);
+        assert!(step > 0, "{pace:?}");
+        pace.ran(step, slow * step);
+        if pace.opening(65536, PACE_BUDGET) > 0 {
+            probes += 1;
+            pace.ran(1, slow);
+        }
+    }
     assert_eq!(
-        grown_back(&mut pace),
-        BATCH_MOST,
-        "after {next} more refusals: {pace:?}"
+        probes, 0,
+        "a world whose frames take {slow:?}, measured by a second client before each call, ran a frame on {probes} of 64 calls with a {PACE_BUDGET:?} budget"
     );
 }
 
 #[test]
-fn any_run_of_held_up_probes_ends_at_the_first_probe_that_is_not() {
-    use grit::serve3::budget::{BATCH_MOST, SUBMIT_MOST_MS};
-    for held in 0..8_u32 {
+fn any_run_of_held_up_probes_ends_within_the_same_few_calls() {
+    use grit::serve3::budget::{BATCH_MOST, REFUSED_MOST, SUBMIT_MOST_MS};
+    for held in [0_u32, 1, 2, 10, 64] {
         let mut pace = warm_pace();
         pace.ran(BATCH_MOST, Duration::from_secs(3));
-        let mut probes = 0;
-        let mut calls = 0_u32;
-        loop {
-            assert!(
-                calls < 1 << (held + 2),
-                "{held} held-up probes: still refused after {calls} calls: {pace:?}"
-            );
-            calls += 1;
-            if pace.opening(65536, PACE_BUDGET) == 0 {
-                continue;
-            }
-            if probes < held {
-                pace.ran(1, Duration::from_millis(SUBMIT_MOST_MS));
-                probes += 1;
-                continue;
-            }
-            pace.ran(1, PACE_FRAME);
-            break;
+        for _ in 0..held {
+            refused_before_a_frame(&mut pace, PACE_BUDGET);
+            pace.ran(1, Duration::from_millis(SUBMIT_MOST_MS));
         }
+        let refused = refused_before_a_frame(&mut pace, PACE_BUDGET);
+        assert!(
+            refused <= REFUSED_MOST,
+            "after {held} held-up probes: {refused} refused, {pace:?}"
+        );
+        pace.ran(1, PACE_FRAME);
         assert_eq!(grown_back(&mut pace), BATCH_MOST, "{held}: {pace:?}");
     }
+}
+
+#[test]
+fn a_replay_measures_again_at_once_where_its_entry_would_stop() {
+    use grit::serve3::budget::BATCH_MOST;
+    let mut pace = warm_pace();
+    pace.ran(BATCH_MOST, Duration::from_secs(3));
+    assert_eq!(pace.resumed(64, PACE_BUDGET), 1, "{pace:?}");
+    assert_eq!(pace.resumed(64, Duration::ZERO), 0, "{pace:?}");
+    pace.ran(1, PACE_FRAME);
+    assert!(pace.resumed(64, PACE_BUDGET) > 1, "{pace:?}");
 }
 
 #[cfg(feature = "faults")]
@@ -3407,26 +3444,26 @@ fn advanced(server: &mut Server<'_>, world: i64, budget_ms: u64) -> (i64, Json) 
 }
 
 #[cfg(feature = "faults")]
+fn most_refused() -> usize {
+    usize::try_from(2 * grit::serve3::budget::REFUSED_MOST + 1).unwrap()
+}
+
+#[cfg(feature = "faults")]
 fn short_steps_all_run(server: &mut Server<'_>, world: i64, what: &str) {
     let mut running = 0;
     let mut refused = Vec::new();
     for call_at in 0..64 {
         let began = Instant::now();
-        let (ran, got) = advanced(server, world, 40);
+        let (ran, _) = advanced(server, world, 40);
         eprintln!(
             "call {call_at} after {what}: {ran} frames in {:?}",
             began.elapsed()
-        );
-        assert!(
-            call_at > 0 || ran > 0,
-            "the first call after {what} ran no frame: {}",
-            written(&got)
         );
         if ran > 0 {
             running += 1;
             if running == 4 {
                 assert!(
-                    refused.len() <= 3,
+                    refused.len() <= most_refused(),
                     "after {what}, refused calls {refused:?}"
                 );
                 return;
@@ -3531,7 +3568,7 @@ fn a_first_batch_held_up_on_the_device_never_locks_short_budgets_out_of_a_world(
 
 #[cfg(feature = "faults")]
 #[test]
-fn a_world_whose_frames_outlast_a_short_budget_is_refused_at_once_between_rare_probes() {
+fn a_world_whose_frames_outlast_a_short_budget_is_refused_at_once_between_probes() {
     let Some(host) = device("frames over budget") else {
         return;
     };
@@ -3575,10 +3612,98 @@ fn a_world_whose_frames_outlast_a_short_budget_is_refused_at_once_between_rare_p
         );
     }
     grit::serve3::tools::faults::disarm();
-    assert_eq!(probed, vec![0, 1, 3, 6, 11]);
+    assert_eq!(probed, vec![0, 3, 6, 9]);
     let (ran, got) = advanced(&mut server, world, 1000);
     assert!(ran > 0, "{}", written(&got));
     short_steps_all_run(&mut server, world, "frames that fit again");
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_second_client_never_lets_short_calls_run_late_on_a_world_too_slow_for_them() {
+    let Some(host) = device("second client") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = sand_server_world(&mut server);
+    answer(&call(
+        &mut server,
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":64}}"),
+    ));
+    let budget = Duration::from_millis(40);
+    let frame = budget * 2;
+    grit::serve3::tools::faults::stall_every(frame);
+    let short = format!(
+        "{{\"world\":{world},\"frames\":65536,\"budget_ms\":{}}}",
+        budget.as_millis()
+    );
+    let long = format!("{{\"world\":{world},\"frames\":2,\"budget_ms\":1000}}");
+    let mut probed = Vec::new();
+    for call_at in 0..12 {
+        answer(&call(&mut server, "grit_world_step", &long));
+        let began = Instant::now();
+        let got = call(&mut server, "grit_world_step", &short);
+        let took = began.elapsed();
+        let ran = got_frames(&got);
+        eprintln!("short call {call_at}: {ran} frames in {took:?}");
+        if ran > 0 {
+            probed.push(call_at);
+        }
+    }
+    grit::serve3::tools::faults::disarm();
+    assert!(
+        probed.is_empty() || probed == [0],
+        "frames of {frame:?} measured by a second client before each call: short calls {probed:?} of 12 ran a frame past their {budget:?} budget"
+    );
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn ten_held_up_probes_leave_a_world_refused_no_longer_than_a_few_calls() {
+    let Some(host) = device("held up probes") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = sand_server_world(&mut server);
+    answer(&call(
+        &mut server,
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":64}}"),
+    ));
+    grit::serve3::tools::faults::stall_every(Duration::from_millis(45));
+    answer(&call(
+        &mut server,
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":1}}"),
+    ));
+    let mut probes = 0;
+    let mut calls = 0;
+    while probes < 10 {
+        let (ran, _) = advanced(&mut server, world, 40);
+        if ran > 0 {
+            probes += 1;
+        }
+        calls += 1;
+        assert!(
+            calls <= 10 * (grit::serve3::budget::REFUSED_MOST + 1),
+            "{probes} probes in {calls} calls"
+        );
+    }
+    grit::serve3::tools::faults::disarm();
+    let mut refused = 0;
+    loop {
+        let (ran, got) = advanced(&mut server, world, 40);
+        if ran > 0 {
+            break;
+        }
+        refused += 1;
+        assert!(
+            refused <= most_refused(),
+            "after {probes} held-up probes in {calls} calls, {refused} calls of 40 ms in a row ran nothing although the device was no longer held up: {}",
+            written(&got)
+        );
+    }
 }
 
 #[cfg(feature = "faults")]
