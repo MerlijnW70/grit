@@ -1748,6 +1748,22 @@ mod faulted {
             answer(&run.ask("grit_world_rules", "{}"));
             std::thread::sleep(Duration::from_millis(20));
         }
+        let tail: Vec<[u32; 3]> = (0..16).map(|x| [x, 0, SIDE - 1]).collect();
+        let grid = grid();
+        for &[x, y, z] in &tail {
+            worlds[0].1.cells[grid.index(x, y, z)] = 1;
+        }
+        let listed: Vec<String> = tail
+            .iter()
+            .map(|[x, y, z]| format!("[{x},{y},{z},1]"))
+            .collect();
+        answer(&run.ask(
+            "grit_world_write",
+            &format!(
+                "{{\"world\":{first},\"cells\":[{}],\"budget_ms\":600000}}",
+                listed.join(",")
+            ),
+        ));
         step_by(&mut run, first, 6);
         worlds[0].1.step(6);
         params_by(&mut run, first, &mut worlds[0].1, &[2]);
@@ -1776,6 +1792,19 @@ mod faulted {
         for note in restored {
             assert!(note.get("failed").is_none(), "{}", written(note));
         }
+        let rebuilt = answer(&run.ask(
+            "grit_world_read",
+            &format!("{{\"world\":{first},\"from\":[0,0,0],\"to\":[0,0,0]}}"),
+        ));
+        let replayed = rebuilt
+            .get("restored")
+            .and_then(|note| note.get("replayed"))
+            .and_then(Json::int)
+            .unwrap_or_else(|| panic!("{}", written(&rebuilt)));
+        assert!(
+            replayed >= 4,
+            "world {first} was rebuilt replaying {replayed} entries, after its snapshot; its tail write, two steps and a parameter change follow it"
+        );
         for (world, model) in &mut worlds {
             assert_eq!(
                 read_by(&mut run, *world),
