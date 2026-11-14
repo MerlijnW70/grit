@@ -208,6 +208,47 @@ fn a_held_up_one_cell_write_never_refuses_a_rebuild_whose_writes_fit() {
 }
 
 #[test]
+fn the_prior_never_outvotes_one_measured_write_of_a_similar_size() {
+    let tail: u64 = 168_632;
+    let chunk: u64 = 16 * 659;
+    let per_byte = 2.8e-5;
+    let mut rates = Rates::default();
+    for _ in 0..3 {
+        rates.measure(Work::Write, 16, Duration::from_millis(1));
+    }
+    rates.measure(
+        Work::Write,
+        chunk,
+        Duration::from_secs_f64(per_byte * chunk as f64),
+    );
+    let scaled = rates.estimate(Work::Write, tail);
+    let least = rates.least(Work::Write, tail);
+    eprintln!(
+        "a {tail} byte write tail after one similar chunk: scaled {scaled:?}, least {least:?}"
+    );
+    assert!(
+        scaled >= Duration::from_secs_f64(2e-4 * tail as f64 * 0.999),
+        "the sizing estimate is the padded prior: {scaled:?}"
+    );
+    assert!(scaled > budget(), "{scaled:?}");
+    assert!(least < budget(), "{least:?}");
+    assert!(
+        least <= Duration::from_secs_f64(per_byte * tail as f64 * 1.01),
+        "{least:?}"
+    );
+    let mut slow = Rates::default();
+    slow.measure(
+        Work::Write,
+        chunk,
+        Duration::from_secs_f64(2e-4 * chunk as f64),
+    );
+    assert!(
+        slow.least(Work::Write, tail) > budget(),
+        "a tail every measured write says is too slow is still refused"
+    );
+}
+
+#[test]
 fn a_slow_replay_never_raises_the_least_replay_ratio() {
     let mut rates = Rates::default();
     assert!((rates.replay_least() - rates.replay()).abs() < 1e-9);
