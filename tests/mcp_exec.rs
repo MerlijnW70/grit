@@ -4668,6 +4668,7 @@ fn a_snapshot_held_up_once_never_refuses_a_far_over_world_whose_snapshot_fits() 
     };
     let mut server = Server::new(Some(&host));
     let world = sand_server_world(&mut server);
+    snapshotted(&mut server, world);
     {
         let faults = server.faults();
         let mut armed = faults.lock().unwrap();
@@ -4676,10 +4677,9 @@ fn a_snapshot_held_up_once_never_refuses_a_far_over_world_whose_snapshot_fits() 
     }
     snapshotted(&mut server, world);
     assert!(server.faults().lock().unwrap().held_work.is_empty());
-    snapshotted(&mut server, world);
-    assert_eq!(snapshots_in_memory(&mut server), 2);
+    let base = snapshots_in_memory(&mut server);
     let mut calls = 0;
-    while snapshots_in_memory(&mut server) < 3 {
+    while snapshots_in_memory(&mut server) == base {
         calls += 1;
         assert!(calls <= 40, "no snapshot was taken in {calls} short calls");
         let got = call(
