@@ -191,6 +191,23 @@ fn a_build_every_recent_sample_shows_too_slow_is_still_refused() {
 }
 
 #[test]
+fn a_held_up_one_cell_write_never_refuses_a_rebuild_whose_writes_fit() {
+    let journal_writes: u64 = 15_832;
+    let mut rates = Rates::default();
+    for spent in [1, 1, 34] {
+        rates.measure(Work::Write, 16, Duration::from_micros(spent * 1000 + 300));
+    }
+    let scaled = rates.estimate(Work::Write, journal_writes);
+    let least = rates.least(Work::Write, journal_writes);
+    eprintln!("journal writes after a held-up one-cell write: scaled {scaled:?}, least {least:?}");
+    assert!(scaled > budget(), "{scaled:?}");
+    assert!(least < budget(), "{least:?}");
+    rates.measure(Work::Write, 16 * 4000, Duration::from_millis(40));
+    let chunked = rates.least(Work::Write, journal_writes);
+    assert!(chunked <= least, "{chunked:?} against {least:?}");
+}
+
+#[test]
 fn a_slow_replay_never_raises_the_least_replay_ratio() {
     let mut rates = Rates::default();
     assert!((rates.replay_least() - rates.replay()).abs() < 1e-9);
