@@ -43,9 +43,12 @@ pub enum Code {
     BadFile,
     Unlike,
     Io,
+    RuleOrLaw,
+    LawRefused,
+    QuietRefused,
 }
 
-pub const CODES: [Code; 39] = [
+pub const CODES: [Code; 42] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -85,6 +88,9 @@ pub const CODES: [Code; 39] = [
     Code::BadFile,
     Code::Unlike,
     Code::Io,
+    Code::RuleOrLaw,
+    Code::LawRefused,
+    Code::QuietRefused,
 ];
 
 impl Code {
@@ -130,6 +136,9 @@ impl Code {
             Self::BadFile => "bad_file",
             Self::Unlike => "unlike",
             Self::Io => "io",
+            Self::RuleOrLaw => "rule_or_law",
+            Self::LawRefused => "law_refused",
+            Self::QuietRefused => "quiet_refused",
         }
     }
 
@@ -231,6 +240,15 @@ impl Code {
                 "Restore a world only from one of the same rule, size and layout, such as a fork of it."
             }
             Self::Io => "Free disk space or fix the server directory, then call again.",
+            Self::RuleOrLaw => {
+                "Give exactly one of rule, a name grit_world_rules lists, and law, the JSON text of a law."
+            }
+            Self::LawRefused => {
+                "Fix the law at the path its refusal names; law.code says what is wrong there."
+            }
+            Self::QuietRefused => {
+                "Make the world dense, which steps every oct, or keep params under which the law is proved."
+            }
         }
     }
 }

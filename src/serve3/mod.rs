@@ -68,7 +68,7 @@ const DIGITS: &[u8; 16] = b"0123456789abcdef";
 /// A rule the world tools run by name. [`Named`] makes one of any
 /// [`Rule`].
 pub trait Listed {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// How many words of parameters the rule reads.
     fn params(&self) -> usize;
@@ -93,6 +93,10 @@ pub trait Listed {
     /// The kind of a cell word, from 0 to 15; a slice shows a kind past 15
     /// as `+`.
     fn kind(&self, word: u32) -> u32;
+
+    fn lawful(&self) -> Option<&law::Lawful> {
+        None
+    }
 }
 
 /// A [`Rule`] under a name, with the kind of its words.
@@ -103,7 +107,7 @@ pub struct Named<R> {
 }
 
 impl<R: Rule> Listed for Named<R> {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         self.name
     }
 
@@ -565,7 +569,7 @@ pub struct Server<'host> {
 }
 
 /// The names of the world tools, in the order `tools/list` gives them.
-pub const WORLD_TOOLS: [&str; 13] = [
+pub const WORLD_TOOLS: [&str; 14] = [
     "grit_world_rules",
     "grit_world_create",
     "grit_world_write",
@@ -574,6 +578,7 @@ pub const WORLD_TOOLS: [&str; 13] = [
     "grit_world_slice",
     "grit_world_close",
     "grit_describe",
+    "grit_world_params",
     "grit_world_save",
     "grit_world_open",
     "grit_world_list",
@@ -760,6 +765,9 @@ fn refused_with(why: &(dyn std::error::Error + 'static)) -> (Refusal, Vec<(&'sta
     if let Some(held) = why.downcast_ref::<crate::branch::Refused>() {
         return (branch_refusal(held), Vec::new());
     }
+    if let Some(held) = why.downcast_ref::<law::Refused>() {
+        return held.refusal();
+    }
     if lost_device(why) {
         return (
             Refusal::new(
@@ -895,8 +903,8 @@ impl<'host> Server<'host> {
         )?;
         let built = self
             .replayed_world(host, &ledger, &mut pace, bytes)
-            .and_then(|world| {
-                let rule = rule_of(host, world.rule())?;
+            .and_then(|mut world| {
+                let rule = law::listed(host, &mut world)?;
                 Ok(Live { world, rule })
             });
         let mut note = vec![
@@ -1592,6 +1600,7 @@ impl<'host> Server<'host> {
                     ),
                 ),
                 ("ignored_total", many(self.book.ignored.len())),
+                ("laws", self.laws_shown()),
             ]),
             submissions: map(vec![
                 (
@@ -1635,6 +1644,21 @@ impl<'host> Server<'host> {
                 .as_ref()
                 .map_or(Json::Null, |keep| text(&keep.root().to_string_lossy())),
         }
+    }
+
+    fn laws_shown(&self) -> Json {
+        Json::List(
+            self.live
+                .iter()
+                .filter_map(|(number, live)| {
+                    let lawful = live.rule.lawful()?;
+                    let mut shown = vec![("world", counted(*number))];
+                    shown.extend(lawful.told());
+                    Some(map(shown))
+                })
+                .take(IGNORED_SHOWN)
+                .collect(),
+        )
     }
 
     /// Answers one request, as [`crate::serve::handle`] does for the 2D
@@ -1793,7 +1817,7 @@ fn stored(keep: &Keep, number: u32, image: &crate::branch::Image) -> Result<[u8;
     Ok(sum)
 }
 
-pub fn shaped(host: &Host, _: &dyn Listed, made: &Made) -> Result<(Grid, Vec<usize>), Failed> {
+pub fn shaped(host: &Host, rule: &dyn Listed, made: &Made) -> Result<(Grid, Vec<usize>), Failed> {
     let [wide, deep, tall] = made.size;
     let grid = Grid::solid(wide, deep, tall)?;
     if grid.tall < 2 {
@@ -1817,7 +1841,10 @@ pub fn shaped(host: &Host, _: &dyn Listed, made: &Made) -> Result<(Grid, Vec<usi
             ),
         )));
     }
-    let sizes = crate::branch::sizes_of(host, &made.branch())?;
+    let sizes = match rule.lawful() {
+        Some(lawful) => crate::branch::sizes_of_law(host, lawful.law(), &made.branch())?,
+        None => crate::branch::sizes_of(host, &made.branch())?,
+    };
     Ok((grid, sizes))
 }
 

@@ -13,8 +13,8 @@ use super::journal::{self, Entry, Ledger, Made};
 use super::schema::{choice, object, property, whole, with, word};
 use super::transport::{ANSWER_MOST, DEPTH_MOST, ID_MOST, LINE_MOST, PROTOCOL};
 use super::{
-    DIGITS, Failed, Live, PAGE_BYTES, POOL_LEAST_CELLS, READ_MOST, SLICE_MOST, STEP_MOST, Server,
-    Status, Tool, rules, rules_on, shaped,
+    DIGITS, Failed, Listed, Live, PAGE_BYTES, POOL_LEAST_CELLS, READ_MOST, SLICE_MOST, STEP_MOST,
+    Server, Status, Tool, rules, rules_on, shaped,
 };
 
 pub const TOOLS: &[Tool] = &[
@@ -130,7 +130,7 @@ pub fn int(held: &Json, key: &str) -> Result<u32, Failed> {
     held.get(key).and_then(whole_of).ok_or_else(|| unread(key))
 }
 
-fn ints(one: &Json, key: &str) -> Result<Vec<u32>, Failed> {
+pub(super) fn ints(one: &Json, key: &str) -> Result<Vec<u32>, Failed> {
     one.list()
         .ok_or_else(|| unread(key))?
         .iter()
@@ -227,20 +227,32 @@ fn rules_shown() -> Json {
     )
 }
 
-fn names() -> Vec<&'static str> {
-    rules().iter().map(|one| one.name()).collect()
+fn names() -> Vec<String> {
+    rules().iter().map(|one| one.name().to_owned()).collect()
 }
 
 fn create_shown() -> Json {
     let side = |what: &str| whole(what, 0, i64::from(u32::MAX));
+    let names = names();
+    let named: Vec<&str> = names.iter().map(String::as_str).collect();
     tool(
         "grit_world_create",
-        "Open a solid world of wide by deep by tall cells, each side rounded up to a power of two, every cell 0, under a rule. Returns its number. Refused when the device cannot hold it.",
+        "Open a solid world of wide by deep by tall cells, each side rounded up to a power of two, every cell 0, under a rule or a law. Returns its number.",
         vec![
             ("wide", side("cells along x")),
             ("deep", side("cells along y, which is down")),
             ("tall", side("cells along z; at least 2")),
-            ("rule", choice("a name grit_world_rules lists", &names())),
+            (
+                "rule",
+                choice("a name grit_world_rules lists; give this or law", &named),
+            ),
+            (
+                "law",
+                property(
+                    "string",
+                    "the JSON text of a law, as tests/law/*.law.json; give this or rule. The answer names its hash and quiet class: proved steps listed octs, whole steps every oct and only dense",
+                ),
+            ),
             (
                 "sparse",
                 with(
@@ -267,14 +279,14 @@ fn create_shown() -> Json {
                     (
                         "description",
                         text(
-                            "exactly as many words as the rule reads; heat reads ignition, chance out of 16, flare",
+                            "exactly as many words as the rule or law reads; heat reads ignition, chance out of 16, flare",
                         ),
                     ),
                     ("default", Json::List(Vec::new())),
                 ]),
             ),
         ],
-        &["wide", "deep", "tall", "rule"],
+        &["wide", "deep", "tall"],
     )
 }
 
@@ -452,14 +464,39 @@ pub(super) fn first_pace(world: &World<'_>) -> Pace {
     Pace::first(cells)
 }
 
+fn chosen(server: &Server<'_>, held: &Json) -> Result<Box<dyn Listed>, Failed> {
+    match (held.get("rule"), held.get("law")) {
+        (Some(_), None) => {
+            let mut known = rules_on(server.host);
+            let asked = words_of(held, "rule")?;
+            let at = known
+                .iter()
+                .position(|one| one.name() == asked)
+                .ok_or_else(|| unread("rule"))?;
+            Ok(known.swap_remove(at))
+        }
+        (None, Some(_)) => {
+            let law = super::law::compiled(words_of(held, "law")?)?;
+            Ok(Box::new(super::law::Lawful::new(
+                law,
+                crate::law::quiet::Class::Proved,
+            )))
+        }
+        (given, _) => Err(refused(
+            Code::RuleOrLaw,
+            "$",
+            if given.is_some() {
+                "give a rule or a law, and not both".to_owned()
+            } else {
+                "give a rule, a name grit_world_rules lists, or a law, the JSON text of one"
+                    .to_owned()
+            },
+        )),
+    }
+}
+
 fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
-    let mut known = rules_on(server.host);
-    let asked = words_of(held, "rule")?;
-    let at = known
-        .iter()
-        .position(|one| one.name() == asked)
-        .ok_or_else(|| unread("rule"))?;
-    let rule = known.swap_remove(at);
+    let rule = chosen(server, held)?;
     let params = ints(
         held.get("params").ok_or_else(|| unread("params"))?,
         "params",
@@ -469,7 +506,12 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             Code::Params,
             "$.params",
             format!(
-                "rule {} reads {} parameters, and {} were given",
+                "{} {} reads {} parameters, and {} were given",
+                if rule.lawful().is_some() {
+                    "law"
+                } else {
+                    "rule"
+                },
                 rule.name(),
                 rule.params(),
                 params.len()
@@ -480,8 +522,19 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let wide = int(held, "wide")?;
     let deep = int(held, "deep")?;
     let tall = int(held, "tall")?;
-    let host = server.host.ok_or(crate::host::Error::NoComputeDevice)?;
     let sparse = matches!(held.get("sparse"), Some(Json::Bool(true)));
+    let rule: Box<dyn Listed> = match rule.lawful() {
+        None => rule,
+        Some(lawful) => {
+            let law = lawful.law().clone();
+            let class = super::law::background_class(&law, &params);
+            if sparse && !class.proved() {
+                return Err(super::law::quiet_refused(&law, &class, "$.sparse"));
+            }
+            Box::new(super::law::Lawful::new(law, class))
+        }
+    };
+    let host = server.host.ok_or(crate::host::Error::NoComputeDevice)?;
     let slots = match held.get("slots") {
         None => None,
         Some(_) => Some(int(held, "slots")?),
@@ -501,13 +554,24 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         "building the world",
     )?;
     let began = Instant::now();
-    let world = World::create(host, &made.branch())?;
+    let world = match rule.lawful() {
+        None => World::create(host, &made.branch())?,
+        Some(lawful) => World::create_law_stepped(
+            host,
+            lawful.law(),
+            &made.branch(),
+            super::law::stepping_of(lawful.class(), sparse),
+        )?,
+    };
     server
         .book
         .rates
         .measure(Work::Build, bytes, began.elapsed());
     let id = server.number()?;
     let pace = first_pace(&world);
+    let law = rule
+        .lawful()
+        .map(|lawful| std::sync::Arc::from(lawful.law().canonical()));
     let mut live = super::Live { world, rule };
     let listed = live.world.listed()?;
     let cells = u64::from(grid.wide) * u64::from(grid.deep) * u64::from(grid.tall);
@@ -523,11 +587,15 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ("frame", counted(live.world.frame())),
         ("listed", counted(listed)),
     ];
+    if let Some(lawful) = live.rule.lawful() {
+        answer.extend(lawful.told());
+    }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
     }
-    if let Some(note) = server.adopt(id, live, Ledger::created(made), bytes, pace) {
+    let ledger = Ledger::created(made).with_law(law);
+    if let Some(note) = server.adopt(id, live, ledger, bytes, pace) {
         answer.push(("journal", note));
     }
     Ok(map(answer))

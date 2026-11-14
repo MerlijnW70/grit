@@ -48,6 +48,10 @@ const WRITE: u32 = 3;
 
 const STEP: u32 = 4;
 
+const LAW: u32 = 5;
+
+const PARAMS: u32 = 6;
+
 const RECORD_WORDS_MOST: usize = 1 << 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +109,7 @@ pub enum Base {
 pub enum Entry {
     Write(Vec<([u32; 3], u32)>),
     Step(u32),
+    Params(Vec<u32>),
 }
 
 impl Entry {
@@ -113,6 +118,7 @@ impl Entry {
         match self {
             Self::Write(cells) => 16 * cells.len() + 8,
             Self::Step(_) => 8,
+            Self::Params(params) => 4 * params.len() + 8,
         }
     }
 }
@@ -120,6 +126,7 @@ impl Entry {
 #[derive(Debug, Clone)]
 pub struct Ledger {
     pub base: Base,
+    pub law: Option<Arc<str>>,
     pub entries: Vec<Entry>,
     pub frame: u32,
     recorded: Vec<Duration>,
@@ -134,6 +141,7 @@ impl Ledger {
     pub const fn created(made: Made) -> Self {
         Self {
             base: Base::Created(made),
+            law: None,
             entries: Vec::new(),
             frame: 0,
             recorded: Vec::new(),
@@ -149,6 +157,7 @@ impl Ledger {
         Self {
             frame: snap.frame,
             base: Base::Snapshot(snap),
+            law: None,
             entries: Vec::new(),
             recorded: Vec::new(),
             unreadable: None,
@@ -156,6 +165,12 @@ impl Ledger {
             replay: Duration::ZERO,
             snapping: Duration::ZERO,
         }
+    }
+
+    #[must_use]
+    pub fn with_law(mut self, law: Option<Arc<str>>) -> Self {
+        self.law = law;
+        self
     }
 
     #[must_use]
@@ -275,14 +290,15 @@ impl Ledger {
 
     pub fn rebase(&mut self, snap: Arc<Snap>, cost: Duration) {
         let snapping = cost;
-        *self = Self::snapped(snap);
+        let law = self.law.take();
+        *self = Self::snapped(snap).with_law(law);
         self.snapping = snapping;
     }
 
     pub fn rebase_at(&mut self, snap: Arc<Snap>, cost: Duration, from: usize) {
         let entries = self.entries.split_off(from.min(self.entries.len()));
         let recorded = self.recorded.split_off(from.min(self.recorded.len()));
-        let mut ledger = Self::snapped(snap);
+        let mut ledger = Self::snapped(snap).with_law(self.law.take());
         ledger.snapping = cost;
         for (entry, spent) in entries.into_iter().zip(recorded) {
             ledger.push(entry, spent);
@@ -559,6 +575,9 @@ impl Keep {
     pub fn begin(&self, world: u32, ledger: &Ledger) -> io::Result<()> {
         let mut words = Vec::new();
         record(&mut words, base_record(&ledger.base));
+        if let Some(law) = &ledger.law {
+            record(&mut words, (LAW, text_words(law)));
+        }
         for (at, entry) in ledger.entries.iter().enumerate() {
             let spent = ledger.recorded.get(at).copied().unwrap_or_default();
             record(&mut words, entry_record(entry, spent));
@@ -708,6 +727,13 @@ impl Keep {
             Base::Snapshot(snap) => Ledger::snapped(snap),
         };
         let mut index = 0_usize;
+        let mut ahead = records.at;
+        if let Some((LAW, payload)) = records.next() {
+            ledger.law = Some(Arc::from(text_of(payload)?));
+            index += 1;
+            ahead = records.at;
+        }
+        records.at = ahead;
         while let Some((tag, payload)) = records.next() {
             index += 1;
             let Some((entry, spent)) = entry_of(tag, payload) else {
@@ -771,6 +797,34 @@ fn record(words: &mut Vec<u32>, (tag, payload): (u32, Vec<u32>)) {
 
 fn bytes_of(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+fn text_words(held: &str) -> Vec<u32> {
+    let bytes = held.as_bytes();
+    let mut words = Vec::with_capacity(1 + bytes.len().div_ceil(4));
+    words.push(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+    for chunk in bytes.chunks(4) {
+        let mut word = [0_u8; 4];
+        if let Some(into) = word.get_mut(..chunk.len()) {
+            into.copy_from_slice(chunk);
+        }
+        words.push(u32::from_le_bytes(word));
+    }
+    words
+}
+
+fn text_of(words: &[u32]) -> Option<String> {
+    let (&length, rest) = words.split_first()?;
+    let length = length as usize;
+    if rest.len() != length.div_ceil(4) {
+        return None;
+    }
+    let bytes: Vec<u8> = rest
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .take(length)
+        .collect();
+    String::from_utf8(bytes).ok()
 }
 
 fn made_words(made: &Made, words: &mut Vec<u32>) {
@@ -883,6 +937,11 @@ fn entry_record(entry: &Entry, spent: Duration) -> (u32, Vec<u32>) {
             (WRITE, words)
         }
         Entry::Step(frames) => (STEP, vec![*frames, micros]),
+        Entry::Params(params) => {
+            let mut words = params.clone();
+            words.push(micros);
+            (PARAMS, words)
+        }
     }
 }
 
@@ -908,6 +967,7 @@ fn entry_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration)> {
             [frames] => Some((Entry::Step(*frames), spent)),
             _ => None,
         },
+        PARAMS => Some((Entry::Params(payload.to_vec()), spent)),
         _ => None,
     }
 }
@@ -994,9 +1054,12 @@ pub fn rebuilt<'host>(
     }
     let began = std::time::Instant::now();
     let mut world = match &ledger.base {
-        Base::Created(made) => World::create(host, &made.branch())?,
+        Base::Created(made) => match &ledger.law {
+            None => World::create(host, &made.branch())?,
+            Some(law) => super::law::made_world(host, law, made)?,
+        },
         Base::Snapshot(snap) => match (&snap.image, keep) {
-            (Some(image), _) => World::open(host, image)?,
+            (Some(image), _) => super::law::opened(host, image)?,
             (None, Some(keep)) => {
                 let path = keep.snapshot(&snap.sum);
                 if tail_sum(&path).ok() != Some(snap.sum) {
@@ -1013,7 +1076,7 @@ pub fn rebuilt<'host>(
                 let image = crate::branch::format::fetch(&path)?;
                 timings.file_bytes = fs::metadata(&path).map_or(0, |found| found.len());
                 timings.file = reading.elapsed();
-                World::open(host, &image)?
+                super::law::opened(host, &image)?
             }
             (None, None) => {
                 return Err(Box::new(Refusal::new(
@@ -1056,6 +1119,7 @@ pub fn rebuilt<'host>(
                 timings.writes = timings.writes.saturating_add(writing.elapsed());
                 timings.write_bytes = timings.write_bytes.saturating_add(entry.bytes() as u64);
             }
+            Entry::Params(params) => super::law::reparam(&mut world, params)?,
             Entry::Step(frames) => {
                 let stepped = std::time::Instant::now();
                 let ran = stepping(&mut world, *frames);

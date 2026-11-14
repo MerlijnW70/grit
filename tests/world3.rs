@@ -278,7 +278,7 @@ fn an_unknown_rule_is_refused_and_the_refusal_lists_the_rules() {
         "grit_world_create",
         "{\"wide\":16,\"deep\":16,\"tall\":16}",
     );
-    assert_eq!(refusal(&got), "unknown_rule");
+    assert_eq!(refusal(&got), "rule_or_law");
 }
 
 #[test]

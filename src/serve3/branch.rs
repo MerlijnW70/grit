@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::branch::World;
 use crate::branch::format;
 use crate::wire::{Json, counted, map, text};
 
@@ -13,7 +12,7 @@ use super::tools::{
     admitted, first_pace, int, limited, refused, reported, sized, tool, unread, words_of,
     world_number,
 };
-use super::{Failed, Live, PAGE_BYTES, Server, Tool, image_shaped, rule_of, shaped};
+use super::{Failed, Live, PAGE_BYTES, Server, Tool, image_shaped, shaped};
 
 pub const TOOLS: &[Tool] = &[
     Tool {
@@ -255,20 +254,32 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
     let (sum, _) = keep
         .settle(&pending)
         .map_err(|why| super::io_refusal(&why))?;
+    let law = super::law::image_text(&image);
     let opened = (|| {
-        let rule = rule_of(host, image.law.name())?;
-        let sizes = image_shaped(host, rule.as_ref(), &image)?;
+        let planned = super::law::planned(host, image.law.name(), law.as_deref(), &image.params)?;
+        let sizes = image_shaped(host, planned.as_ref(), &image)?;
         let bytes = admitted(server, host, &sizes, "the world")?;
         server.fits(
             server.book.rates.estimate(Work::Build, bytes),
             "building the world from the file",
         )?;
         let began = Instant::now();
-        let world = World::open(host, &image)?;
+        let mut world = super::law::opened(host, &image)?;
         server
             .book
             .rates
             .measure(Work::Build, bytes, began.elapsed());
+        let rule = super::law::listed(host, &mut world)?;
+        if let Some(lawful) = rule.lawful()
+            && world.pool().is_some()
+            && !lawful.class().proved()
+        {
+            return Err(super::law::quiet_refused(
+                lawful.law(),
+                lawful.class(),
+                "$.name",
+            ));
+        }
         Ok::<_, Failed>(Live { world, rule })
     })();
     let mut live = match opened {
@@ -294,6 +305,9 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         ("frame", counted(live.world.frame())),
         ("listed", counted(listed)),
     ];
+    if let Some(lawful) = live.rule.lawful() {
+        answer.extend(lawful.told());
+    }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
@@ -303,7 +317,8 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         frame: image.frame,
         made: Made::of_image(&image),
         image: None,
-    }));
+    }))
+    .with_law(law);
     if let Some(note) = server.adopt(id, live, ledger, bytes, pace) {
         answer.push(("journal", note));
     }
@@ -336,15 +351,20 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
         ));
     };
     let host = server.host.ok_or(crate::host::Error::NoComputeDevice)?;
-    let rule = rule_of(host, &ledger.made().rule)?;
-    let (_, sizes) = shaped(host, rule.as_ref(), ledger.made())?;
+    let planned = super::law::planned(
+        host,
+        &ledger.made().rule,
+        ledger.law.as_deref(),
+        &ledger.made().params,
+    )?;
+    let (_, sizes) = shaped(host, planned.as_ref(), ledger.made())?;
     let bytes = admitted(server, host, &sizes, "the world")?;
     server.fits(
         server.replay_estimate(&ledger, bytes),
         &format!("rebuilding world {number} from its journal"),
     )?;
     let mut pace = super::budget::Pace::first(0);
-    let world = match server.replayed_world(host, &ledger, &mut pace, bytes) {
+    let mut world = match server.replayed_world(host, &ledger, &mut pace, bytes) {
         Ok(world) => world,
         Err(why) => {
             let stopped = why.downcast_ref::<super::budget::Halted>().is_some();
@@ -355,6 +375,7 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
             return Err(why);
         }
     };
+    let rule = super::law::listed(host, &mut world)?;
     let mut live = Live { world, rule };
     let bytes = super::world_bytes(host, &live);
     let replayed = u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX);
@@ -368,6 +389,9 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
         ("listed", counted(listed)),
         ("replayed", counted(replayed)),
     ];
+    if let Some(lawful) = live.rule.lawful() {
+        answer.extend(lawful.told());
+    }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
@@ -379,13 +403,18 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
     Ok(map(answer))
 }
 
-fn shown_made(made: &Made, frame: u32) -> Vec<(&'static str, Json)> {
-    vec![
-        ("rule", text(&made.rule)),
+fn shown_made(ledger: &Ledger) -> Vec<(&'static str, Json)> {
+    let made = ledger.made();
+    let mut shown = vec![("rule", text(&made.rule))];
+    if let Some(law) = &ledger.law {
+        shown.push(("law", text(&super::law::hash_of(law))));
+    }
+    shown.extend([
         ("size", sized(made.size)),
         ("sparse", Json::Bool(made.sparse)),
-        ("frame", counted(frame)),
-    ]
+        ("frame", counted(ledger.frame)),
+    ]);
+    shown
 }
 
 fn listed(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
@@ -400,7 +429,10 @@ fn listed(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             "lost"
         };
         let mut item = vec![("kind", text(state)), ("world", counted(*number))];
-        item.extend(shown_made(one.ledger.made(), one.ledger.frame));
+        item.extend(shown_made(&one.ledger));
+        if let Some(lawful) = server.live.get(number).and_then(|live| live.rule.lawful()) {
+            item.extend(lawful.told().into_iter().filter(|(key, _)| *key != "law"));
+        }
         item.push(("bytes", counted64(one.bytes)));
         if let Some(failure) = &one.snap_failure {
             item.push((
@@ -424,7 +456,7 @@ fn listed(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             ("world", counted(*number)),
             ("name", text(&kept_name(*number))),
         ];
-        item.extend(shown_made(ledger.made(), ledger.frame));
+        item.extend(shown_made(ledger));
         items.push(item);
     }
     if let Some(keep) = server.book.keep.as_ref() {
@@ -490,7 +522,8 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .book
         .rates
         .measure(Work::Fork, source.bytes, began.elapsed());
-    let rule = rule_of(host, fork.rule())?;
+    let mut fork = fork;
+    let rule = super::law::listed(host, &mut fork)?;
     let id = server.number()?;
     let mut live = Live { world: fork, rule };
     let listed = live.world.listed()?;
@@ -502,6 +535,9 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ("frame", counted(live.world.frame())),
         ("listed", counted(listed)),
     ];
+    if let Some(lawful) = live.rule.lawful() {
+        answer.extend(lawful.told());
+    }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
@@ -569,7 +605,9 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         held.epoch = epoch;
     }
     server.book.release(old);
+    let host = server.host.ok_or(crate::host::Error::NoComputeDevice)?;
     let live = server.world(held)?;
+    live.rule = super::law::listed(host, &mut live.world)?;
     let listed = live.world.listed()?;
     let mut answer = vec![
         ("world", counted(number)),
@@ -577,6 +615,9 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ("frame", counted(live.world.frame())),
         ("listed", counted(listed)),
     ];
+    if let Some(lawful) = live.rule.lawful() {
+        answer.extend(lawful.told());
+    }
     if failed.is_some() {
         answer.push((
             "journal",
