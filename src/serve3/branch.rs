@@ -234,11 +234,11 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         }));
     }
     server.fits(
-        server.book.rates.least(Work::File, length),
+        server.book.rates.least(Work::FileOpen, length),
         &format!("reading the file {name}{}", journal::SUFFIX),
     )?;
     let began = Instant::now();
-    server.slowly(Work::File);
+    server.slowly(Work::FileOpen);
     let pending = keep
         .copied(&path, server.book.next)
         .map_err(|why| super::io_refusal(&why))?;
@@ -252,7 +252,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
     server
         .book
         .rates
-        .measure(Work::File, length, began.elapsed());
+        .measure(Work::FileOpen, length, began.elapsed());
     let (sum, _) = keep
         .settle(&pending)
         .map_err(|why| super::io_refusal(&why))?;
@@ -512,18 +512,19 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .cloned()
         .ok_or_else(|| unread("world"))?;
     server.book.memory.admits(source.bytes, "the fork")?;
+    let work = Work::fork(source.ledger.made().sparse);
     server.fits(
-        server.book.rates.least(Work::Fork, source.bytes),
+        server.book.rates.least(work, source.bytes),
         &format!("copying world {number}"),
     )?;
     let began = Instant::now();
-    server.slowly(Work::Fork);
+    server.slowly(work);
     let live = server.world(held)?;
     let fork = live.world.fork()?;
     server
         .book
         .rates
-        .measure(Work::Fork, source.bytes, began.elapsed());
+        .measure(work, source.bytes, began.elapsed());
     let rule = super::law::listed(host, &fork)?;
     let id = server.number()?;
     let mut live = Live { world: fork, rule };
@@ -569,12 +570,19 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         );
     }
     let size = server.book.held.get(&from).map_or(0, |held| held.bytes);
+    let work = Work::fork(
+        server
+            .book
+            .held
+            .get(&from)
+            .is_some_and(|held| held.ledger.made().sparse),
+    );
     server.fits(
-        server.book.rates.least(Work::Fork, size),
+        server.book.rates.least(work, size),
         &format!("copying world {from} into world {number}"),
     )?;
     let began = Instant::now();
-    server.slowly(Work::Fork);
+    server.slowly(work);
     let mut source = server.live.remove(&from).ok_or_else(|| unread("from"))?;
     let done = server
         .live
@@ -583,7 +591,7 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .and_then(|target| target.world.restore(&mut source.world));
     server.live.insert(from, source);
     done?;
-    server.book.rates.measure(Work::Fork, size, began.elapsed());
+    server.book.rates.measure(work, size, began.elapsed());
     let taken = server
         .book
         .held

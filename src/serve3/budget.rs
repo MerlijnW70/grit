@@ -382,20 +382,24 @@ pub enum Work {
     Build,
     BuildSparse,
     Fork,
+    ForkSparse,
     Save,
     Snap,
     File,
+    FileOpen,
     Write,
 }
 
 impl Work {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Build,
         Self::BuildSparse,
         Self::Fork,
+        Self::ForkSparse,
         Self::Save,
         Self::Snap,
         Self::File,
+        Self::FileOpen,
         Self::Write,
     ];
 
@@ -408,24 +412,44 @@ impl Work {
         }
     }
 
+    #[must_use]
+    pub const fn fork(sparse: bool) -> Self {
+        if sparse { Self::ForkSparse } else { Self::Fork }
+    }
+
     const fn index(self) -> usize {
         match self {
             Self::Build => 0,
             Self::BuildSparse => 1,
             Self::Fork => 2,
-            Self::Save => 3,
-            Self::Snap => 4,
-            Self::File => 5,
-            Self::Write => 6,
+            Self::ForkSparse => 3,
+            Self::Save => 4,
+            Self::Snap => 5,
+            Self::File => 6,
+            Self::FileOpen => 7,
+            Self::Write => 8,
         }
     }
 
     const fn prior(self) -> f64 {
         match self {
-            Self::Build | Self::BuildSparse | Self::Fork => 1e-8,
+            Self::Build | Self::BuildSparse | Self::Fork | Self::ForkSparse => 1e-8,
             Self::Save | Self::Snap => 5e-8,
-            Self::File => 2e-8,
+            Self::File | Self::FileOpen => 2e-8,
             Self::Write => 2e-4,
+        }
+    }
+
+    #[must_use]
+    pub const fn fastest(self) -> Option<f64> {
+        match self {
+            Self::Build => Some(FASTEST_BUILD),
+            Self::BuildSparse => Some(FASTEST_BUILD_SPARSE),
+            Self::Fork | Self::ForkSparse => Some(FASTEST_FORK),
+            Self::Save => Some(FASTEST_SAVE),
+            Self::Snap => Some(FASTEST_SNAP),
+            Self::File | Self::FileOpen => Some(FASTEST_FILE),
+            Self::Write => None,
         }
     }
 
@@ -442,13 +466,29 @@ impl Work {
             Self::Build => "build",
             Self::BuildSparse => "build_sparse",
             Self::Fork => "fork",
+            Self::ForkSparse => "fork_sparse",
             Self::Save => "save",
             Self::Snap => "snapshot_in_memory",
             Self::File => "file",
+            Self::FileOpen => "file_open",
             Self::Write => "write",
         }
     }
 }
+
+pub const FASTEST_BUILD: f64 = 2.0e-10;
+
+pub const FASTEST_BUILD_SPARSE: f64 = 1.5e-10;
+
+pub const FASTEST_FORK: f64 = 1.5e-10;
+
+pub const FASTEST_SAVE: f64 = 1.5e-9;
+
+pub const FASTEST_SNAP: f64 = 2.0e-11;
+
+pub const FASTEST_FILE: f64 = 2.0e-9;
+
+pub const SLOPE_SPAN: f64 = 2.0;
 
 #[derive(Debug, Clone, Default)]
 struct Kept {
@@ -488,16 +528,24 @@ impl Kept {
         median(self.chosen(bytes), prior)
     }
 
-    fn least(&self, prior: f64, fixed: f64, bytes: f64) -> Option<f64> {
+    fn least(&self, fixed: f64, fastest: f64, bytes: f64) -> Option<f64> {
         let costs: Vec<(f64, f64)> = self
             .seen
             .iter()
-            .map(|(size, rate)| ((size - fixed).max(0.0), size * rate))
+            .map(|(size, rate)| ((size - fixed).max(1.0), size * rate))
             .collect();
-        let marginal = costs
+        let most = costs
             .iter()
-            .map(|(held, spent)| spent / held.max(1.0))
-            .fold(prior, f64::min);
+            .map(|(held, spent)| spent / held)
+            .fold(f64::INFINITY, f64::min);
+        let slopes: Vec<f64> = costs
+            .iter()
+            .flat_map(|small| costs.iter().map(move |large| (*small, *large)))
+            .filter(|((small, _), (large, _))| *large >= small * SLOPE_SPAN)
+            .map(|((small, quick), (large, slow))| (slow - quick) / (large - small))
+            .filter(|slope| *slope > 0.0)
+            .collect();
+        let marginal = low(slopes).unwrap_or(fastest).min(most);
         low(costs
             .iter()
             .map(|(held, spent)| spent + marginal * (bytes - held).max(0.0))
@@ -528,7 +576,7 @@ impl Kept {
 
 #[derive(Debug, Clone, Default)]
 pub struct Rates {
-    kinds: [Kept; 7],
+    kinds: [Kept; 9],
     replay: Kept,
 }
 
@@ -563,11 +611,12 @@ impl Rates {
 
     #[must_use]
     pub fn least(&self, work: Work, bytes: u64) -> Duration {
-        let most = self.estimate(work, bytes);
-        self.kept(work)
-            .and_then(|kept| kept.least(work.prior(), work.fixed(), bytes as f64))
-            .and_then(|spent| Duration::try_from_secs_f64(spent).ok())
-            .map_or(most, |least| least.min(most))
+        let fastest = work.fastest().unwrap_or(0.0);
+        let least = self
+            .kept(work)
+            .and_then(|kept| kept.least(work.fixed(), fastest, bytes as f64))
+            .unwrap_or(fastest * bytes as f64);
+        Duration::try_from_secs_f64(least).unwrap_or(Duration::MAX)
     }
 
     pub fn measure(&mut self, work: Work, bytes: u64, spent: Duration) {
@@ -599,7 +648,7 @@ impl Rates {
     pub fn replay_least(&self) -> f64 {
         let most = self.replay();
         low(self.replay.seen.iter().map(|(_, ratio)| *ratio).collect())
-            .map_or(most, |least| least.clamp(RATIO_LEAST, RATIO_MOST).min(most))
+            .map_or(0.0, |least| least.clamp(RATIO_LEAST, RATIO_MOST).min(most))
     }
 
     #[must_use]
@@ -657,7 +706,7 @@ pub fn too_slow(needs: Duration, left: Duration, what: &str) -> Refusal {
         Code::Budget,
         "$.budget_ms",
         format!(
-            "{what} needs at least {} ms on this device, by the lowest third of the server's recent measurements of such work, and the call has {} ms left; nothing ran",
+            "{what} needs at least {} ms on this device, by the lowest third of the server's recent measurements of such work, or where it has none by the fastest any tested device has shown for it, and the call has {} ms left; nothing ran",
             needs.as_millis(),
             left.as_millis()
         ),

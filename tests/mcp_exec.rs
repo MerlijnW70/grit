@@ -4475,7 +4475,7 @@ fn file_opened_after_held_up(work: grit::serve3::budget::Work, label: &str) {
 #[cfg(feature = "faults")]
 #[test]
 fn a_file_read_held_up_once_never_refuses_the_next_open_that_fits() {
-    file_opened_after_held_up(grit::serve3::budget::Work::File, "held-file");
+    file_opened_after_held_up(grit::serve3::budget::Work::FileOpen, "held-file");
 }
 
 #[cfg(feature = "faults")]

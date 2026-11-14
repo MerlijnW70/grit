@@ -845,7 +845,11 @@ impl<'host> Server<'host> {
         rates
             .least(budget::Work::build(ledger.made().sparse), bytes)
             .saturating_add(snapshot)
-            .saturating_add(rates.least(budget::Work::Write, ledger.write_bytes()))
+            .saturating_add(if ledger.made().sparse {
+                Duration::ZERO
+            } else {
+                rates.least(budget::Work::Write, ledger.write_bytes())
+            })
             .saturating_add(rates.replaying_least(ledger.step_recorded()))
     }
 
@@ -889,7 +893,7 @@ impl<'host> Server<'host> {
         if timings.file_bytes > 0 {
             rates.measure(budget::Work::File, timings.file_bytes, timings.file);
         }
-        if timings.write_bytes > 0 {
+        if timings.write_bytes > 0 && !ledger.made().sparse {
             rates.measure(budget::Work::Write, timings.write_bytes, timings.writes);
         }
         let cut = built
@@ -1244,7 +1248,7 @@ impl<'host> Server<'host> {
                     errors::Code::Budget,
                     "$.budget_ms",
                     format!(
-                        "world {number} owes a snapshot of its journal before it changes again, which needs at least {} ms by the lowest third of the server's recent measurements of such work, and this call has {} ms left; nothing ran",
+                        "world {number} owes a snapshot of its journal before it changes again, which needs at least {} ms by the lowest third of the server's recent measurements of such work, or where it has none by the fastest any tested device has shown for it, and this call has {} ms left; nothing ran",
                         needs.as_millis(),
                         self.clock.left().as_millis()
                     ),
