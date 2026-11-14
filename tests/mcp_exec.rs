@@ -2310,6 +2310,12 @@ fn a_kept_world_too_large_to_build_in_the_budget_is_refused_before_it_is_built()
     ));
     run.exec.finish();
     let mut again = Run::new(&options);
+    let measured = answer(&again.ask(
+        "grit_world_create",
+        &format!("{{\"wide\":{side},\"deep\":{side},\"tall\":{side},\"rule\":\"sand\"}}"),
+    ))
+    .int_at("world");
+    answer(&again.ask("grit_world_close", &format!("{{\"world\":{measured}}}")));
     let began = Instant::now();
     let told = refused(&again.ask(
         "grit_world_open",
@@ -4592,16 +4598,19 @@ fn a_build_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that_
         dir: Some(scratch.dir()),
         memory: None,
     });
+    let began = Instant::now();
     let world = sand_world(&mut run, 32);
+    let plain = began.elapsed();
     answer(&run.ask(
         "grit_world_step",
         &format!("{{\"world\":{world},\"frames\":10}}"),
     ));
+    let short = plain * 2 + Duration::from_millis(300);
     let faults = run.exec.faults();
     {
         let mut armed = faults.lock().unwrap();
         armed.held_work = vec![grit::serve3::budget::Work::Build];
-        armed.held_by = Duration::from_millis(1500);
+        armed.held_by = short * 2 + Duration::from_secs(1);
     }
     let other = sand_world(&mut run, 32);
     assert!(faults.lock().unwrap().held_work.is_empty());
@@ -4614,9 +4623,15 @@ fn a_build_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that_
     eprintln!("wedged: {}", written(&wedged));
     let got = run.ask(
         "grit_world_read",
-        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":700}}"),
+        &format!(
+            "{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":{}}}",
+            short.as_millis()
+        ),
     );
-    eprintln!("rebuild after one held-up build: {}", written(&got));
+    eprintln!(
+        "a first build took {plain:?}; rebuild after one held-up build with {short:?}: {}",
+        written(&got)
+    );
     let read = answer(&got);
     assert_eq!(read.int_at("frame"), 10);
     assert!(read.get("restored").is_some(), "{}", written(&read));
