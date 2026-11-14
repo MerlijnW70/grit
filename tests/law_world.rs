@@ -1715,11 +1715,13 @@ mod faulted {
         let first = worlds[0].0;
         let mut seed = 0x5_u64;
         let mut writes = 0;
-        while !std::fs::read_dir(scratch.dir().join("kept"))
-            .unwrap()
-            .flatten()
-            .any(|one| one.file_name().to_string_lossy().starts_with("snap-"))
-        {
+        let kept = |prefix: &str| {
+            std::fs::read_dir(scratch.dir().join("kept"))
+                .unwrap()
+                .flatten()
+                .any(|one| one.file_name().to_string_lossy().starts_with(prefix))
+        };
+        while !kept("snap-") && !kept("pending-") {
             assert!(writes < 64, "no snapshot after {writes} writes");
             let cells: Vec<u32> = worlds[0]
                 .1
@@ -1736,6 +1738,15 @@ mod faulted {
             write_by(&mut run, first, &cells);
             worlds[0].1.cells = cells;
             writes += 1;
+        }
+        let landing = std::time::Instant::now();
+        while kept("pending-") || !kept("snap-") {
+            assert!(
+                landing.elapsed() < Duration::from_secs(120),
+                "the snapshot begun after {writes} writes never landed"
+            );
+            answer(&run.ask("grit_world_rules", "{}"));
+            std::thread::sleep(Duration::from_millis(20));
         }
         step_by(&mut run, first, 6);
         worlds[0].1.step(6);
