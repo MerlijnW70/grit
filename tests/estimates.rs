@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+#[cfg(feature = "faults")]
 mod common;
 
 use std::time::Duration;
