@@ -76,3 +76,43 @@ The class is decided at create from the background, and at every `grit_world_par
 The class promises cells, not tallies. A frame's tally is the sum of the law's counts over the octs the frame steps. A `whole` world steps every oct of the frame's phase. A `proved` world steps only the octs it lists, and an unlisted oct adds nothing, so its tally equals the sum over every oct only for counts that are 0 on an oct the step leaves unchanged (a count of changed cells, say). A law that counts 1 for every oct tallies the whole phase on the frames after a seed and 0 once the world is quiet; stepped whole it tallies the whole phase every frame. `grit_describe` says this under `limits.law_tally`.
 
 Laws in `tests/law/`: `code` is `proved`; `sand` and `embed` read `frame`, and `heat`, `nature` and `evo` read `noise`, so they are `whole` and run dense.
+
+## From a learned chip to a world
+
+`grit_law_from_chip` turns a chip that `grit_machine` or `grit_synthesise` found into a law. It takes the chip as those tools do (`inputs`, `outputs`, `state`, and `gates` as their answers list them) and a binding for each of its bits:
+
+| Field | Each item | Meaning |
+|---|---|---|
+| `bind_inputs` | `{plane, dx, dy, dz, bit}` | chip input `j` is `bit` of `plane` at the cell plus `(dx, dy, dz)`, each -1, 0 or 1, wrapped on the torus |
+| `bind_outputs` | `{plane, bit}` | chip output `j` is written to `bit` of `plane` at the cell |
+| `bind_state` | `{plane, bit}` | state bit `j` is read from and written back to `bit` of `plane` at the cell |
+| `channels` | | the planes of the world |
+| `rest` | | `kept` or `cleared`: the other bits of a word an output or state bit is on; planes no binding writes are left as they are |
+
+Chip source `i` is state bit `i` for `i` below `state`, then input `i - state`, then the gates, as in `grit_machine`. The answer holds the law's text (`law`, for `grit_world_create`), its `hash`, `halo` (1 exactly when an input leaves the cell), `quiet` and `stepping` as a dense world decides them, and `nodes`. Each gate becomes at most two word operations per cell.
+
+Refusals, each at the path of the binding or gate:
+
+| Code | When |
+|---|---|
+| `unbound` | fewer bindings than chip inputs, outputs or state bits |
+| `overbound` | more bindings than the chip has |
+| `bit_past` | a bit past 31 |
+| `plane_past` | a plane past `channels` |
+| `offset_past` | an offset outside -1..1 |
+| `bit_shared` | two outputs or state bits on one bit |
+| `halo_written` | an input at a non-zero offset on a plane an output or state bit is on |
+| `chip_refused` | the chip does not parse |
+| `law_refused` | the law it makes passes a law limit, such as `nodes` |
+
+`grit_world_read` and `grit_world_slice` take `plane` to read a law world's other planes.
+
+The X0 edge task, a 24-gate chip that `grit_machine` learned from 3x3 neighbourhoods (input `k` is row `k / 3`, column `k % 3`, from the top left):
+
+1. `grit_law_from_chip` with `inputs` 9, `outputs` 1, the chip's `gates`, `bind_inputs` `{"plane":0,"dx":k%3-1,"dy":k/3-1,"dz":0,"bit":0}` for `k` 0 to 8, `bind_outputs` `[{"plane":1,"bit":0}]`, `channels` 2: `halo` 1, `quiet` `proved`.
+2. `grit_world_create` with `wide` 32, `deep` 32, `tall` 2 and `law` from step 1.
+3. `grit_world_write` the image to plane 0, `[x, y, 0, pixel]`.
+4. `grit_world_step` one frame.
+5. `grit_world_read` from `[0,0,0]` to `[31,31,0]` with `plane` 1: each cell is the chip's answer on its 3x3 neighbourhood.
+
+The world is a torus, so a 32-wide world reads row 0 next to row 31. For the task's border (outside the image reads 0), make the world 64 by 64 and write the image at the origin.

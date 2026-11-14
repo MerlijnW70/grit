@@ -5,6 +5,7 @@ use crate::rule3::{CORNERS, Declared, Oct, OneStep, Planed, Ruled, Tally};
 use crate::wire::{self, Json};
 
 pub mod adjoint;
+pub mod chip;
 pub mod dag;
 pub mod expand;
 pub mod learn;
