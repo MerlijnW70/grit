@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::host::Host;
-use crate::marking::{SCORE, TRIAL, VALUES, WANTED, column, marked, rows_of, words_of};
+use crate::marking::{SCORE, TRIAL, VALUES, WANTED, column, marked_by, rows_of, words_of};
 use crate::netlist::{Exam, Gate, Netlist};
 use crate::resident::{Groups, Resident};
 use crate::serve::Pace;
@@ -77,6 +77,8 @@ pub struct Board {
     wide: usize,
     rows: Vec<u32>,
     want: Vec<u32>,
+    partial: bool,
+    cared: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,9 +179,16 @@ impl Board {
     pub fn of(exam: &Exam) -> Self {
         let shape = exam.shape();
         let wide = words_of(shape) as usize;
-        let rows = (0..wide as u32).map(|word| rows_of(shape, word)).collect();
+        let mut rows: Vec<u32> = (0..wide as u32).map(|word| rows_of(shape, word)).collect();
         let mut want = vec![0_u32; shape.outputs as usize * wide];
-        for row in 0..shape.words() {
+        if exam.is_partial() {
+            for (word, mask) in rows.iter_mut().enumerate() {
+                *mask = (0..32_u32)
+                    .filter(|bit| exam.cares(word as u32 * 32 + bit))
+                    .fold(0, |held, bit| held | (1 << bit));
+            }
+        }
+        for row in (0..shape.words()).filter(|row| exam.cares(*row)) {
             let asked = exam.asked(row);
             for output in 0..shape.outputs {
                 if (asked >> output) & 1 == 1
@@ -194,7 +203,28 @@ impl Board {
             wide,
             rows,
             want,
+            partial: exam.is_partial(),
+            cared: exam.cared(),
         }
+    }
+
+    #[must_use]
+    pub const fn partial(&self) -> bool {
+        self.partial
+    }
+
+    #[must_use]
+    pub const fn cared(&self) -> u32 {
+        self.cared
+    }
+
+    #[must_use]
+    pub fn wanted(&self) -> Vec<u32> {
+        let mut held = self.want.clone();
+        if self.partial {
+            held.extend_from_slice(&self.rows);
+        }
+        held
     }
 
     #[must_use]
@@ -209,7 +239,7 @@ impl Board {
 
     #[must_use]
     pub fn full(&self) -> u32 {
-        self.shape.words() * self.shape.outputs
+        self.cared * self.shape.outputs
     }
 
     fn first(&self) -> usize {
@@ -410,13 +440,18 @@ pub fn room(shape: Netlist, most: u32) -> u32 {
 
 #[must_use]
 pub fn sizes(shape: Netlist, room: u32) -> [usize; 8] {
+    sizes_by(shape, room, false)
+}
+
+#[must_use]
+pub fn sizes_by(shape: Netlist, room: u32, partial: bool) -> [usize; 8] {
     let room = room as usize;
     let wide = words_of(shape) as usize;
     [
         1,
         room * shape.gates as usize,
         room * shape.sources() as usize * wide,
-        shape.outputs as usize * wide,
+        (shape.outputs as usize + usize::from(partial)) * wide,
         room,
         1,
         1,
@@ -429,10 +464,10 @@ pub fn opened<'host>(
     board: &Board,
     room: u32,
 ) -> Result<Resident<'host>, Box<dyn std::error::Error>> {
-    let mark = marked(host.width(), board.shape)?;
+    let mark = marked_by(host.width(), board.shape, board.partial)?;
     let modules: Vec<&[u32]> = vec![&mark];
-    let mut resident = host.resident(&sizes(board.shape, room), &modules)?;
-    resident.write(WANTED as usize, &board.want)?;
+    let mut resident = host.resident(&sizes_by(board.shape, room, board.partial), &modules)?;
+    resident.write(WANTED as usize, &board.wanted())?;
     Ok(resident)
 }
 
