@@ -583,7 +583,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         "building the world",
     )?;
     let began = Instant::now();
-    server.build_slowly();
+    server.slowly(Work::build(sparse));
     let world = match rule.lawful() {
         None => World::create(host, &made.branch())?,
         Some(lawful) => World::create_law_stepped(
