@@ -8,9 +8,11 @@ use crate::bricks::Bricks;
 use crate::compact::Plan;
 use crate::host::Host;
 use crate::law::Law;
+use crate::law::chip::{self, Circuit, Read, Rest, Spot, Wired, Wiring};
 use crate::law::quiet::{self, Class};
 use crate::layout::BINDINGS;
 use crate::live::{self, Loop};
+use crate::netlist::{Gate, SOURCES};
 use crate::rule3::Declared;
 use crate::sand::Grid;
 use crate::sand3::Grid3;
@@ -18,15 +20,22 @@ use crate::wire::{Json, counted, map, text};
 
 use super::errors::{Code, Refusal};
 use super::journal::{Entry, Made};
-use super::schema::word;
+use super::schema::{choice, object, property, whole, with, word};
 use super::tools::{int, ints, limited, tool, unread, world_number};
 use super::{Failed, Listed, Server, Tool};
 
-pub const TOOLS: &[Tool] = &[Tool {
-    name: "grit_world_params",
-    shown: params_shown,
-    run: params_written,
-}];
+pub const TOOLS: &[Tool] = &[
+    Tool {
+        name: "grit_world_params",
+        shown: params_shown,
+        run: params_written,
+    },
+    Tool {
+        name: "grit_law_from_chip",
+        shown: chip_shown,
+        run: from_chip,
+    },
+];
 
 pub const KINDS: u32 = 15;
 
@@ -125,7 +134,7 @@ impl Listed for Lawful {
 }
 
 #[derive(Debug)]
-pub struct Refused(pub crate::law::Refusal);
+pub struct Refused(pub crate::law::Refusal, pub &'static str);
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -139,14 +148,14 @@ impl Refused {
     #[must_use]
     pub fn refusal(&self) -> (Refusal, Vec<(&'static str, Json)>) {
         (
-            Refusal::new(Code::LawRefused, "$.law", self.to_string()),
+            Refusal::new(Code::LawRefused, self.1, self.to_string()),
             vec![("law", self.0.json())],
         )
     }
 }
 
 pub fn compiled(held: &str) -> Result<Law, Failed> {
-    Law::compile(held).map_err(|why| Box::new(Refused(why)) as Failed)
+    Law::compile(held).map_err(|why| Box::new(Refused(why, "$.law")) as Failed)
 }
 
 #[must_use]
@@ -340,4 +349,291 @@ fn params_written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> 
         answer.push(("journal", note));
     }
     super::tools::reported(live, answer)
+}
+
+pub const FROM_CHIP: &str = "grit_law_from_chip turns a chip into a law: chip source i is state bit i below state, then input i - state, then the gates; input j reads bind_inputs[j].bit of plane bind_inputs[j].plane at the cell plus (dx, dy, dz), wrapped on the torus; output j sets bind_outputs[j].bit; state bit j is read from and written back to bind_state[j].bit at the cell itself; the other bits of a written word are kept or cleared as rest says, and a plane the chip does not write is left as it is. Each gate becomes at most two word operations per cell. A binding reads a plane the chip writes only at offset 0";
+
+fn bits_shown(what: &str) -> Json {
+    whole(what, 0, i64::from(chip::BITS - 1))
+}
+
+fn plane_shown() -> Json {
+    whole(
+        "the plane, below channels",
+        0,
+        i64::from(crate::law::limits::CHANNELS - 1),
+    )
+}
+
+fn offset_shown(axis: &str) -> Json {
+    with(
+        whole(
+            &format!("the step along {axis} from the cell, -1, 0 or 1; 0 if left out"),
+            -1,
+            1,
+        ),
+        vec![("default", Json::Int(0))],
+    )
+}
+
+fn list_shown(items: Json, what: &str, most: i64) -> Json {
+    map(vec![
+        ("type", text("array")),
+        ("items", items),
+        ("description", text(what)),
+        ("maxItems", Json::Int(most)),
+    ])
+}
+
+fn spot_shown() -> Json {
+    object(
+        vec![
+            ("plane", plane_shown()),
+            ("bit", bits_shown("the bit of that plane's word")),
+        ],
+        &["plane", "bit"],
+    )
+}
+
+fn chip_shown() -> Json {
+    let source = i64::from(SOURCES) - 2;
+    let gate = object(
+        vec![
+            (
+                "kind",
+                whole(
+                    "which of the 16 two-input functions, as its truth table: bit left + 2 right of kind is the answer",
+                    0,
+                    i64::from(chip::KINDS - 1),
+                ),
+            ),
+            (
+                "left",
+                whole(
+                    "the source it reads first: the state bits, then the inputs, then the gates before it",
+                    0,
+                    source,
+                ),
+            ),
+            ("right", whole("the source it reads second", 0, source)),
+        ],
+        &["kind", "left", "right"],
+    );
+    let read = object(
+        vec![
+            ("plane", plane_shown()),
+            ("dx", offset_shown("x")),
+            ("dy", offset_shown("y")),
+            ("dz", offset_shown("z")),
+            ("bit", bits_shown("the bit of that cell's word")),
+        ],
+        &["plane", "bit"],
+    );
+    let chip_inputs = i64::from(crate::netlist::INPUTS);
+    super::tools::tool(
+        "grit_law_from_chip",
+        "Turn a chip from grit_machine or grit_synthesise into a law a world runs: each input reads a bit of a cell at most one step away, each output and state bit a bit of the cell.",
+        vec![
+            (
+                "inputs",
+                whole(
+                    "the chip's inputs, as grit_machine and grit_synthesise take them",
+                    0,
+                    chip_inputs,
+                ),
+            ),
+            (
+                "outputs",
+                whole("the chip's outputs", 1, i64::from(crate::netlist::OUTPUTS)),
+            ),
+            (
+                "state",
+                with(
+                    whole(
+                        "the chip's state bits, as grit_machine takes them; 0 if left out",
+                        0,
+                        chip_inputs,
+                    ),
+                    vec![("default", Json::Int(0))],
+                ),
+            ),
+            (
+                "gates",
+                list_shown(
+                    gate,
+                    "the chip's gates, as grit_machine and grit_synthesise answer them; the last state plus outputs gates are the state bits, then the outputs",
+                    source + 1,
+                ),
+            ),
+            (
+                chip::READS,
+                list_shown(
+                    read,
+                    "one binding for each chip input, in order",
+                    chip_inputs,
+                ),
+            ),
+            (
+                chip::WRITES,
+                list_shown(
+                    spot_shown(),
+                    "one binding for each chip output, in order",
+                    i64::from(crate::netlist::OUTPUTS),
+                ),
+            ),
+            (
+                chip::KEEPS,
+                with(
+                    list_shown(
+                        spot_shown(),
+                        "one binding for each state bit, in order, read and written at the cell itself; none if left out",
+                        chip_inputs,
+                    ),
+                    vec![("default", Json::List(Vec::new()))],
+                ),
+            ),
+            (
+                "channels",
+                whole(
+                    "the planes of the world the law runs on",
+                    1,
+                    i64::from(crate::law::limits::CHANNELS),
+                ),
+            ),
+            (
+                "rest",
+                with(
+                    choice(
+                        "what the bits of a written word that no output or state bit is on become; kept if left out",
+                        &["kept", "cleared"],
+                    ),
+                    vec![("default", text("kept"))],
+                ),
+            ),
+            (
+                "name",
+                with(
+                    property("string", "the law's name; chip if left out"),
+                    vec![("default", text("chip"))],
+                ),
+            ),
+        ],
+        &[
+            "inputs",
+            "outputs",
+            "gates",
+            chip::READS,
+            chip::WRITES,
+            "channels",
+        ],
+    )
+}
+
+fn number_at(held: &Json, key: &str) -> i64 {
+    held.get(key).and_then(Json::int).unwrap_or(0)
+}
+
+fn word_at(held: &Json, key: &str) -> u32 {
+    u32::try_from(number_at(held, key)).unwrap_or(u32::MAX)
+}
+
+fn items<'held>(held: &'held Json, key: &str) -> &'held [Json] {
+    held.get(key).and_then(Json::list).unwrap_or(&[])
+}
+
+fn spots_of(held: &Json, key: &str) -> Vec<Spot> {
+    items(held, key)
+        .iter()
+        .map(|one| Spot {
+            plane: word_at(one, "plane"),
+            bit: word_at(one, "bit"),
+        })
+        .collect()
+}
+
+fn chip_refused(why: &chip::Refused) -> Failed {
+    let code = match why.fault {
+        chip::Fault::Chip => Code::ChipRefused,
+        chip::Fault::Channels => Code::Malformed,
+        chip::Fault::Unbound => Code::Unbound,
+        chip::Fault::Overbound => Code::Overbound,
+        chip::Fault::Plane => Code::PlanePast,
+        chip::Fault::Bit => Code::BitPast,
+        chip::Fault::Offset => Code::OffsetPast,
+        chip::Fault::Shared => Code::BitShared,
+        chip::Fault::Written => Code::HaloWritten,
+    };
+    Box::new(Refusal::new(code, &why.path, why.message.clone()))
+}
+
+fn from_chip(_: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
+    let circuit = Circuit {
+        state: word_at(held, "state"),
+        inputs: word_at(held, "inputs"),
+        outputs: word_at(held, "outputs"),
+        gates: items(held, "gates")
+            .iter()
+            .map(|one| Gate {
+                kind: word_at(one, "kind"),
+                left: word_at(one, "left"),
+                right: word_at(one, "right"),
+            })
+            .collect(),
+    };
+    let rest = match held.get("rest").and_then(Json::text) {
+        Some("cleared") => Rest::Cleared,
+        _ => Rest::Kept,
+    };
+    let wiring = Wiring {
+        name: held
+            .get("name")
+            .and_then(Json::text)
+            .unwrap_or("chip")
+            .to_owned(),
+        channels: word_at(held, "channels"),
+        reads: items(held, chip::READS)
+            .iter()
+            .map(|one| Read {
+                plane: word_at(one, "plane"),
+                at: [
+                    number_at(one, "dx"),
+                    number_at(one, "dy"),
+                    number_at(one, "dz"),
+                ],
+                bit: word_at(one, "bit"),
+            })
+            .collect(),
+        writes: spots_of(held, chip::WRITES),
+        keeps: spots_of(held, chip::KEEPS),
+        rest,
+    };
+    let wired = Wired::new(circuit, wiring).map_err(|why| chip_refused(&why))?;
+    let written = wired.text();
+    let law = Law::compile(&written).map_err(|why| Box::new(Refused(why, "$")) as Failed)?;
+    let class = background_class(&law, &[]);
+    let mut answer = vec![
+        ("law", text(&written)),
+        ("hash", text(&law.hex())),
+        ("name", text(law.name())),
+        ("channels", counted(law.channels())),
+        ("halo", counted(law.halo())),
+        ("quiet", text(class.name())),
+        (
+            "stepping",
+            text(if class.proved() { "listed" } else { "whole" }),
+        ),
+        ("rest", text(wired.wiring().rest.name())),
+        (
+            "nodes",
+            counted(u32::try_from(law.nodes()).unwrap_or(u32::MAX)),
+        ),
+        (
+            "gates",
+            counted(u32::try_from(wired.circuit().gates.len()).unwrap_or(u32::MAX)),
+        ),
+    ];
+    if let Some(why) = class.why() {
+        answer.insert(6, ("quiet_why", text(&why)));
+    }
+    Ok(map(answer))
 }

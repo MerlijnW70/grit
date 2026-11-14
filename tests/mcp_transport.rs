@@ -819,6 +819,17 @@ fn code_of(tool: &str, path: &str, wrong: Wrong) -> &'static str {
         }
         ("grit_world_step", "$.frames", Wrong::Range) => "frames",
         ("grit_world_slice", "$.axis", Wrong::Type | Wrong::Choice) => "axis",
+        ("grit_law_from_chip", _, Wrong::Range) => match path.rsplit('.').next() {
+            Some("bit") => "bit_past",
+            Some("plane") => "plane_past",
+            Some("dx" | "dy" | "dz") => "offset_past",
+            _ if path.starts_with("$.gates")
+                || matches!(path, "$.inputs" | "$.outputs" | "$.state") =>
+            {
+                "chip_refused"
+            }
+            _ => "malformed",
+        },
         (_, _, Wrong::Unknown) => "unknown_key",
         (_, _, Wrong::Duplicate) => "duplicate_key",
         (_, _, Wrong::Long) => "too_many",

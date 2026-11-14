@@ -47,9 +47,17 @@ pub enum Code {
     LawRefused,
     QuietRefused,
     HaloSparse,
+    ChipRefused,
+    Unbound,
+    Overbound,
+    PlanePast,
+    BitPast,
+    OffsetPast,
+    BitShared,
+    HaloWritten,
 }
 
-pub const CODES: [Code; 43] = [
+pub const CODES: [Code; 51] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -93,6 +101,14 @@ pub const CODES: [Code; 43] = [
     Code::LawRefused,
     Code::QuietRefused,
     Code::HaloSparse,
+    Code::ChipRefused,
+    Code::Unbound,
+    Code::Overbound,
+    Code::PlanePast,
+    Code::BitPast,
+    Code::OffsetPast,
+    Code::BitShared,
+    Code::HaloWritten,
 ];
 
 impl Code {
@@ -142,6 +158,14 @@ impl Code {
             Self::LawRefused => "law_refused",
             Self::QuietRefused => "quiet_refused",
             Self::HaloSparse => "halo_sparse",
+            Self::ChipRefused => "chip_refused",
+            Self::Unbound => "unbound",
+            Self::Overbound => "overbound",
+            Self::PlanePast => "plane_past",
+            Self::BitPast => "bit_past",
+            Self::OffsetPast => "offset_past",
+            Self::BitShared => "bit_shared",
+            Self::HaloWritten => "halo_written",
         }
     }
 
@@ -254,6 +278,22 @@ impl Code {
             }
             Self::HaloSparse => {
                 "Make the world dense: a law that looks (halo 1) runs only on dense worlds."
+            }
+            Self::ChipRefused => {
+                "Give a chip as grit_machine takes it: inputs plus state at most 31, at least state plus outputs gates, each gate reading an input or a gate before it, kinds 0 to 15."
+            }
+            Self::Unbound => {
+                "Give one binding for every chip input in bind_inputs, every output in bind_outputs and every state bit in bind_state, in the chip's order."
+            }
+            Self::Overbound => {
+                "Give exactly one binding for each chip input, output and state bit; remove the bindings past the chip's count."
+            }
+            Self::PlanePast => "Name a plane below channels.",
+            Self::BitPast => "Name a bit from 0 to 31.",
+            Self::OffsetPast => "Give dx, dy and dz each as -1, 0 or 1.",
+            Self::BitShared => "Give every output and state bit its own bit of its plane.",
+            Self::HaloWritten => {
+                "Read a plane an output or state bit is on only at offset 0; put the inputs that read neighbours on a plane the chip does not write, such as plane 0 with the outputs on plane 1."
             }
         }
     }
