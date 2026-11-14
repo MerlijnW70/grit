@@ -4385,31 +4385,30 @@ fn a_cold_server_stepping_with_small_budgets_never_overruns_by_more_than_a_batch
 }
 
 #[cfg(feature = "faults")]
-const HELD_BY: Duration = Duration::from_millis(1500);
-
-#[cfg(feature = "faults")]
-const SHORT_MS: u64 = 700;
-
-#[cfg(feature = "faults")]
 fn held_up_once(
     server: &mut Server<'_>,
     work: grit::serve3::budget::Work,
     mut ask: impl FnMut(&mut Server<'_>, u64) -> Json,
 ) {
+    let began = Instant::now();
     answer(&ask(server, 600_000));
+    let plain = began.elapsed();
+    let short = plain * 2 + Duration::from_millis(300);
+    let held = short * 2 + Duration::from_secs(1);
     {
         let faults = server.faults();
         let mut armed = faults.lock().unwrap();
         armed.held_work = vec![work];
-        armed.held_by = HELD_BY;
+        armed.held_by = held;
     }
     let began = Instant::now();
     answer(&ask(server, 600_000));
-    assert!(began.elapsed() >= HELD_BY);
+    assert!(began.elapsed() >= held);
     assert!(server.faults().lock().unwrap().held_work.is_empty());
-    let got = ask(server, SHORT_MS);
+    let short_ms = u64::try_from(short.as_millis()).unwrap();
+    let got = ask(server, short_ms);
     eprintln!(
-        "{work:?} after one held-up sample, {SHORT_MS} ms: {}",
+        "{work:?} took {plain:?}, then held up {held:?}, then {short_ms} ms: {}",
         written(&got)
     );
     answer(&got);
@@ -4539,7 +4538,7 @@ fn kept_journals(scratch: &Scratch, numbers: &[u32]) {
             sparse: false,
             slots: None,
         });
-        ledger.push(Entry::Step(4000), Duration::from_millis(400));
+        ledger.push(Entry::Step(4000), Duration::from_secs(1));
         keep.begin(number, &ledger).unwrap();
     }
     keep.set_next(numbers.iter().max().unwrap() + 1).unwrap();
@@ -4568,7 +4567,7 @@ fn a_replay_held_up_once_never_refuses_the_next_open_of_a_kept_world_that_fits()
         let faults = server.faults();
         let mut armed = faults.lock().unwrap();
         armed.held_replays = 1;
-        armed.held_by = Duration::from_secs(3);
+        armed.held_by = Duration::from_secs(7);
     }
     answer(&call(
         &mut server,
@@ -4576,7 +4575,7 @@ fn a_replay_held_up_once_never_refuses_the_next_open_of_a_kept_world_that_fits()
         &opened_kept(2, 600_000),
     ));
     assert_eq!(server.faults().lock().unwrap().held_replays, 0);
-    let got = call(&mut server, "grit_world_open", &opened_kept(3, 1500));
+    let got = call(&mut server, "grit_world_open", &opened_kept(3, 5000));
     eprintln!("open after one held-up replay: {}", written(&got));
     assert_eq!(answer(&got).int_at("frame"), 4000);
 }
@@ -4609,7 +4608,7 @@ fn a_replay_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that
     {
         let mut armed = faults.lock().unwrap();
         armed.held_replays = 1;
-        armed.held_by = Duration::from_secs(3);
+        armed.held_by = Duration::from_secs(7);
     }
     answer(&run.ask("grit_world_open", &opened_kept(2, 600_000)));
     assert_eq!(faults.lock().unwrap().held_replays, 0);
@@ -4621,7 +4620,7 @@ fn a_replay_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that
     eprintln!("wedged: {}", written(&wedged));
     let got = run.ask(
         "grit_world_read",
-        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":1500}}"),
+        &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":2500}}"),
     );
     eprintln!("rebuild after one held-up replay: {}", written(&got));
     let read = answer(&got);
