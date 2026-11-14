@@ -69,7 +69,7 @@ pub mod faults {
 
     thread_local! {
         static BATCH: Cell<Option<u32>> = const { Cell::new(None) };
-        static STALL: Cell<Option<(u32, Duration)>> = const { Cell::new(None) };
+        static STALL: Cell<Option<(u32, Duration, bool)>> = const { Cell::new(None) };
     }
 
     pub fn fail_batch(nth: u32) {
@@ -77,16 +77,24 @@ pub mod faults {
     }
 
     pub fn stall_batch(nth: u32, by: Duration) {
-        STALL.set(Some((nth, by)));
+        STALL.set(Some((nth, by, false)));
     }
 
-    pub(super) fn stall() {
+    pub fn stall_every(by: Duration) {
+        STALL.set(Some((0, by, true)));
+    }
+
+    pub(crate) fn stall(frames: u32) {
         match STALL.get() {
-            Some((0, by)) => {
-                STALL.set(None);
-                std::thread::sleep(by);
+            Some((0, by, every)) => {
+                if every {
+                    std::thread::sleep(by.saturating_mul(frames));
+                } else {
+                    STALL.set(None);
+                    std::thread::sleep(by);
+                }
             }
-            Some((nth, by)) => STALL.set(Some((nth - 1, by))),
+            Some((nth, by, every)) => STALL.set(Some((nth - 1, by, every))),
             None => {}
         }
     }
@@ -116,14 +124,14 @@ pub mod faults {
 }
 
 #[cfg(not(feature = "faults"))]
-mod faults {
+pub(crate) mod faults {
     use super::Failed;
 
     pub(super) const fn batch() -> Result<(), Failed> {
         Ok(())
     }
 
-    pub(super) const fn stall() {}
+    pub(crate) const fn stall(_: u32) {}
 }
 
 pub(super) fn refused(code: Code, field: &str, message: String) -> Failed {
@@ -784,7 +792,11 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             stopped = Some(stop);
             break;
         }
-        let step = pace.batch(frames - done, server.clock.left());
+        let step = if batch == 0 {
+            pace.opening(frames - done, server.clock.left())
+        } else {
+            pace.batch(frames - done, server.clock.left())
+        };
         if step == 0 {
             stopped = Some(Stop::Budget);
             break;
@@ -794,7 +806,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             break;
         }
         let began = Instant::now();
-        faults::stall();
+        faults::stall(step);
         let ran = server.world(held)?.world.step(step);
         let took = began.elapsed();
         if let Err(why) = ran {
@@ -1181,7 +1193,7 @@ pub fn describe(status: &Status) -> Json {
                 (
                     "budget_late",
                     text(
-                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait",
+                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait. A step or rebuild that would be refused at its start because the world's last measured frame did not fit runs one frame to measure again, so its answer can come after its budget by up to one frame of that world; after such a frame still does not fit, the next calls are refused at once, twice as many each time it stays so",
                     ),
                 ),
                 (

@@ -1795,11 +1795,16 @@ fn paced(
         if let Some(stop) = guard.stop() {
             return Err(Box::new(budget::Cut(stop)));
         }
-        let step = pace.batch(frames - done, guard.left());
+        let step = if done == 0 {
+            pace.opening(frames - done, guard.left())
+        } else {
+            pace.batch(frames - done, guard.left())
+        };
         if step == 0 {
             return Err(Box::new(budget::Cut(Stop::Budget)));
         }
         let began = Instant::now();
+        tools::faults::stall(step);
         world.step(step)?;
         pace.ran(step, began.elapsed());
         done += step;

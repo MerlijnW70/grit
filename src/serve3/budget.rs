@@ -49,9 +49,11 @@ impl Stop {
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {
     per_frame: Duration,
-    steady: Duration,
     measured: bool,
     last: u32,
+    probe: Option<Duration>,
+    doubt: u32,
+    patience: u32,
 }
 
 impl Pace {
@@ -63,9 +65,11 @@ impl Pace {
             .saturating_add(WORST_PER_SUBMIT);
         Self {
             per_frame: guess,
-            steady: guess,
             measured: false,
             last: BATCH_MOST,
+            probe: None,
+            doubt: 0,
+            patience: 0,
         }
     }
 
@@ -76,9 +80,24 @@ impl Pace {
         }
         let aimed = frames_in(AIM, self.per_frame).max(1);
         let grown = self.last.saturating_mul(2).max(1);
-        let fits = frames_in(time, self.per_frame).max(frames_in(time, self.steady).min(1));
+        let fits = frames_in(time, self.per_frame);
         let fits = if self.measured { fits } else { fits.max(1) };
         aimed.min(grown).min(BATCH_MOST).min(left).min(fits)
+    }
+
+    pub fn opening(&mut self, left: u32, time: Duration) -> u32 {
+        self.probe = None;
+        let step = self.batch(left, time);
+        if step > 0 || left == 0 || time.is_zero() {
+            return step;
+        }
+        if self.doubt < self.patience {
+            self.doubt = self.doubt.saturating_add(1);
+            return 0;
+        }
+        self.doubt = 0;
+        self.probe = Some(time);
+        1
     }
 
     pub fn ran(&mut self, frames: u32, spent: Duration) {
@@ -86,14 +105,11 @@ impl Pace {
             return;
         }
         self.per_frame = spent / frames;
-        self.steady = if self.measured && frames < BATCH_MOST {
-            self.steady
-                .saturating_mul(BATCH_MOST - frames)
-                .saturating_add(spent)
-                / BATCH_MOST
-        } else {
-            self.per_frame
+        self.patience = match self.probe.take() {
+            Some(time) if spent > time => self.patience.saturating_mul(2).max(1),
+            _ => 0,
         };
+        self.doubt = 0;
         self.measured = true;
         self.last = frames;
     }
