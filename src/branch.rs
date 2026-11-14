@@ -563,6 +563,7 @@ impl<'host> World<'host> {
             }));
         }
         listed_if_sparse(made.sparse, stepping)?;
+        looks_dense(law, made.sparse)?;
         let rule = lawful(law, made.params, stepping)?;
         Self::made(host, rule, made)
     }
@@ -634,6 +635,9 @@ impl<'host> World<'host> {
     ) -> Result<Self, Failed> {
         listed_if_sparse(matches!(image.state, State::Sparse { .. }), stepping)?;
         let rule = stepper_of(host, &image.law, &image.params, stepping)?;
+        if let Stepper::Law(law, _) = &rule {
+            looks_dense(law, matches!(image.state, State::Sparse { .. }))?;
+        }
         if rule.planes() != image.channels() {
             return Err(Box::new(Refused::Sizes {
                 what: "channels",

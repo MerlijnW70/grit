@@ -925,7 +925,7 @@ fn a_sparse_world_refuses_a_law_that_looks() {
     let refused = why.downcast_ref::<branch::Refused>().unwrap();
     assert_eq!(refused.name(), "halo_sparse", "{refused}");
     let width = host.width();
-    let (grid, _) = grids((16, 16, 16));
+    let (grid, _) = grids((32, 32, 32));
     let plan = Plan::over_in(
         width,
         grid.blocks().div_ceil(sweep::cells(width)),
@@ -1305,7 +1305,16 @@ fn a_sparse_world_and_a_sparse_file_refuse_a_halo_law_through_the_tools() {
     let flat = "{\"law\":1,\"name\":\"edge2d\",\"params\":1,\"channels\":2,\"halo\":0,\"tally\":{\"counts\":1,\"weighted\":false},\"consts\":{},\"defs\":{},\"step\":[\"vec\",\"cells\",[\"vec\",[\"param\",0]]]}";
     let world = int_at(
         &result(
-            &server.asked("grit_world_create", &making(flat, &[0], true)),
+            &server.asked(
+                "grit_world_create",
+                &making(flat, &[0], true).replace(
+                    &format!(
+                        "\"wide\":{},\"deep\":{},\"tall\":{}",
+                        SHAPE.0, SHAPE.1, SHAPE.2
+                    ),
+                    "\"wide\":32,\"deep\":32,\"tall\":32",
+                ),
+            ),
             false,
         ),
         "world",
