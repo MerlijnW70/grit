@@ -9,6 +9,10 @@ pub const KINDS: u32 = 16;
 
 pub const BITS: u32 = 32;
 
+pub const GATES_SURE: u32 = 600;
+
+pub const NODES_PER_GATE: u32 = 24;
+
 pub const READS: &str = "bind_inputs";
 
 pub const WRITES: &str = "bind_outputs";

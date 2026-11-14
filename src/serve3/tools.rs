@@ -1214,6 +1214,16 @@ pub fn describe(status: &Status) -> Json {
                 ("law_tally", text(super::law::TALLIED)),
                 ("law_look", text(super::law::LOOK)),
                 ("law_from_chip", text(super::law::FROM_CHIP)),
+                ("law_from_chip_gates", number(crate::law::chip::GATES_SURE)),
+                (
+                    "law_from_chip_nodes",
+                    text(&format!(
+                        "a law holds {} nodes; a chip costs up to {} a gate (3 in each of the 8 cells of an oct) plus up to 1600 for its bindings, so {} gates always fit, and more fit when gates are copies or constants; the answer names the nodes used",
+                        crate::law::limits::NODES,
+                        crate::law::chip::NODES_PER_GATE,
+                        crate::law::chip::GATES_SURE
+                    )),
+                ),
                 (
                     "budget_late",
                     text(

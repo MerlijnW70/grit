@@ -89,7 +89,11 @@ Laws in `tests/law/`: `code` is `proved`; `sand` and `embed` read `frame`, and `
 | `channels` | | the planes of the world |
 | `rest` | | `kept` or `cleared`: the other bits of a word an output or state bit is on; planes no binding writes are left as they are |
 
-Chip source `i` is state bit `i` for `i` below `state`, then input `i - state`, then the gates, as in `grit_machine`. The answer holds the law's text (`law`, for `grit_world_create`), its `hash`, `halo` (1 exactly when an input leaves the cell), `quiet` and `stepping` as a dense world decides them, and `nodes`. Each gate becomes at most two word operations per cell.
+Chip source `i` is state bit `i` for `i` below `state`, then input `i - state`, then the gates, as in `grit_machine`. State bits start from what the world holds, 0 in a new world, as `grit_machine` starts from 0.
+
+A gate costs up to 24 nodes (3 in each of the 8 cells of an oct) and the bindings up to 1600, so a chip of at most 600 gates (`limits.law_from_chip_gates`) always fits a law's 16384 nodes; copies and constants cost less, and the answer's `nodes` says how much is used.
+
+A look wraps at the world's size as `grit_world_create` answers it: each side is rounded up to a power of two, so a world asked for at 8 by 6 by 10 is 8 by 8 by 16 and wraps there. The answer holds the law's text (`law`, for `grit_world_create`), its `hash`, `halo` (1 exactly when an input leaves the cell), `quiet` and `stepping` as a dense world decides them, and `nodes`. Each gate becomes at most two word operations per cell.
 
 Refusals, each at the path of the binding or gate:
 
@@ -103,7 +107,8 @@ Refusals, each at the path of the binding or gate:
 | `bit_shared` | two outputs or state bits on one bit |
 | `halo_written` | an input at a non-zero offset on a plane an output or state bit is on |
 | `chip_refused` | the chip does not parse |
-| `law_refused` | the law it makes passes a law limit, such as `nodes` |
+| `chip_too_big` | at `$.gates`: the chip compiles to more than the 16384 nodes a law holds; search with fewer gates |
+| `law_refused` | the law it makes passes another law limit |
 
 `grit_world_read` and `grit_world_slice` take `plane` to read a law world's other planes.
 
@@ -115,4 +120,4 @@ The X0 edge task, a 24-gate chip that `grit_machine` learned from 3x3 neighbourh
 4. `grit_world_step` one frame.
 5. `grit_world_read` from `[0,0,0]` to `[31,31,0]` with `plane` 1: each cell is the chip's answer on its 3x3 neighbourhood.
 
-The world is a torus, so a 32-wide world reads row 0 next to row 31. For the task's border (outside the image reads 0), make the world 64 by 64 and write the image at the origin.
+The world is a torus, so a 32-wide world reads row 0 next to row 31: on X0's held images 24 of 8192 cells then differ from the chip on X0's zero border. For a border that reads 0, make the world at least twice the image on each side and write the image at the origin: a 64 by 64 world gives X0's answers on all 8192 cells.

@@ -55,9 +55,10 @@ pub enum Code {
     OffsetPast,
     BitShared,
     HaloWritten,
+    ChipTooBig,
 }
 
-pub const CODES: [Code; 51] = [
+pub const CODES: [Code; 52] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -109,6 +110,7 @@ pub const CODES: [Code; 51] = [
     Code::OffsetPast,
     Code::BitShared,
     Code::HaloWritten,
+    Code::ChipTooBig,
 ];
 
 impl Code {
@@ -166,6 +168,7 @@ impl Code {
             Self::OffsetPast => "offset_past",
             Self::BitShared => "bit_shared",
             Self::HaloWritten => "halo_written",
+            Self::ChipTooBig => "chip_too_big",
         }
     }
 
@@ -292,6 +295,9 @@ impl Code {
             Self::BitPast => "Name a bit from 0 to 31.",
             Self::OffsetPast => "Give dx, dy and dz each as -1, 0 or 1.",
             Self::BitShared => "Give every output and state bit its own bit of its plane.",
+            Self::ChipTooBig => {
+                "Search again with fewer gates; a chip of at most limits.law_from_chip_gates gates always fits one law."
+            }
             Self::HaloWritten => {
                 "Read a plane an output or state bit is on only at offset 0; put the inputs that read neighbours on a plane the chip does not write, such as plane 0 with the outputs on plane 1."
             }

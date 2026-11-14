@@ -9,7 +9,7 @@ use common::device;
 use grit::compact::Plan;
 use grit::halo::{self, BOX};
 use grit::law::Law;
-use grit::law::chip::{Circuit, Read, Rest, Spot, Wired, Wiring};
+use grit::law::chip::{Circuit, GATES_SURE, NODES_PER_GATE, Read, Rest, Spot, Wired, Wiring};
 use grit::law::quiet::{self, Class};
 use grit::layout::{DENSE, Dimension, GRAND, PARAMS, PIXELS, STATE, Windows};
 use grit::live::{self, Placed3};
@@ -1386,8 +1386,8 @@ fn every_refusal_of_the_chip_tool_is_named_with_its_path() {
         (
             "a chip too large for a law",
             chip_arguments(&many, &many_wiring),
-            "law_refused",
-            "$",
+            "chip_too_big",
+            "$.gates",
         ),
     ];
     for (what, arguments, code, field) in cases {
@@ -1395,9 +1395,12 @@ fn every_refusal_of_the_chip_tool_is_named_with_its_path() {
         assert_eq!(text_at(&got, "refused"), code, "{what}: {}", written(&got));
         assert_eq!(text_at(&got, "field"), field, "{what}: {}", written(&got));
         assert!(text_at(&got, "hint").ends_with('.'), "{what}");
-        if code == "law_refused" {
-            let inner = got.get("law").unwrap();
-            assert_eq!(text_at(inner, "code"), "nodes", "{what}: {}", written(&got));
+        if code == "chip_too_big" {
+            assert_eq!(int_at(&got, "limit"), i64::from(GATES_SURE));
+            assert!(
+                text_at(&got, "message").contains("too many gates"),
+                "{what}"
+            );
         }
     }
 }
@@ -1503,4 +1506,113 @@ fn the_cost_of_a_chip_law_against_the_edge_law() {
         chip_law.nodes(),
         edge.nodes()
     );
+}
+
+fn chain(held: u32, inputs: u32, outputs: u32, gates: u32, kinds: &[u32]) -> Circuit {
+    Circuit {
+        state: held,
+        inputs,
+        outputs,
+        gates: (0..gates)
+            .map(|at| {
+                let sources = held + inputs + at;
+                Gate {
+                    kind: kinds[at as usize % kinds.len()],
+                    left: sources - 1,
+                    right: (at * 7 + 3) % sources,
+                }
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn a_chip_of_the_sure_gate_count_always_fits_one_law() {
+    let mut state = 0xB2_5E7E_u64;
+    let mut most = 0;
+    for (held, inputs, outputs) in [
+        (0, 31, 1),
+        (0, 31, 32),
+        (16, 15, 16),
+        (31, 0, 1),
+        (1, 30, 31),
+    ] {
+        for rest in [Rest::Kept, Rest::Cleared] {
+            let circuit = chain(held, inputs, outputs, GATES_SURE, &[1, 7, 9, 11, 13, 2, 4]);
+            let wiring = drawn_wiring(&mut state, &circuit, 4, true, rest);
+            let wired = Wired::new(circuit, wiring).unwrap();
+            let law = compiled(&wired.text());
+            let bindings = law.nodes() as i64 - i64::from(NODES_PER_GATE * GATES_SURE);
+            assert!(
+                bindings <= 1600,
+                "state {held} inputs {inputs} outputs {outputs}: {} nodes",
+                law.nodes()
+            );
+            most = most.max(law.nodes());
+        }
+    }
+    println!("{GATES_SURE} gates of two operations: at most {most} nodes of 16384");
+}
+
+#[test]
+fn a_search_sized_chip_is_a_law_or_too_big_with_its_cause() {
+    let mut server = Server::new(None);
+    let mut fits = 0;
+    let mut big = 0;
+    for gates in [8_u32, 64, 256, 512, 768, 1024, 2048, 4065] {
+        let inputs = 31;
+        let circuit = Circuit {
+            state: 0,
+            inputs,
+            outputs: 1,
+            gates: (0..gates)
+                .map(|at| Gate {
+                    kind: if at % 2 == 0 { 6 } else { 2 },
+                    left: inputs + at - 1,
+                    right: at % inputs,
+                })
+                .collect(),
+        };
+        let wiring = Wiring {
+            name: String::from("big"),
+            channels: 2,
+            reads: (0..inputs)
+                .map(|bit| Read {
+                    plane: 0,
+                    at: [0, 0, 0],
+                    bit,
+                })
+                .collect(),
+            writes: vec![Spot { plane: 1, bit: 0 }],
+            keeps: Vec::new(),
+            rest: Rest::Kept,
+        };
+        let got = asked(
+            &mut server,
+            "grit_law_from_chip",
+            &chip_arguments(&circuit, &wiring),
+        );
+        let result = got.get("result").unwrap();
+        if result.get("isError") == Some(&Json::Bool(false)) {
+            let told = answered(&got);
+            assert!(int_at(&told, "nodes") <= 16384);
+            fits += 1;
+            assert!(
+                big == 0,
+                "{gates} gates fit after a smaller chip was too big"
+            );
+        } else {
+            let told = refused(&got);
+            assert_eq!(
+                text_at(&told, "refused"),
+                "chip_too_big",
+                "{gates}: {}",
+                written(&told)
+            );
+            assert_eq!(text_at(&told, "field"), "$.gates");
+            assert!(gates > GATES_SURE);
+            big += 1;
+        }
+    }
+    assert!(fits >= 4 && big >= 3, "{fits} fit, {big} too big");
 }

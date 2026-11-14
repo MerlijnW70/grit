@@ -351,7 +351,7 @@ fn params_written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> 
     super::tools::reported(live, answer)
 }
 
-pub const FROM_CHIP: &str = "grit_law_from_chip turns a chip into a law: chip source i is state bit i below state, then input i - state, then the gates; input j reads bind_inputs[j].bit of plane bind_inputs[j].plane at the cell plus (dx, dy, dz), wrapped on the torus; output j sets bind_outputs[j].bit; state bit j is read from and written back to bind_state[j].bit at the cell itself; the other bits of a written word are kept or cleared as rest says, and a plane the chip does not write is left as it is. Each gate becomes at most two word operations per cell. A binding reads a plane the chip writes only at offset 0";
+pub const FROM_CHIP: &str = "grit_law_from_chip turns a chip into a law: chip source i is state bit i below state, then input i - state, then the gates; input j reads bind_inputs[j].bit of plane bind_inputs[j].plane at the cell plus (dx, dy, dz), wrapped on the torus at the world's size as grit_world_create answers it, each side rounded up to a power of two; output j sets bind_outputs[j].bit; state bit j is read from and written back to bind_state[j].bit at the cell itself, and starts from what the world holds there, 0 in a new world, as grit_machine starts from 0; the other bits of a written word are kept or cleared as rest says, and a plane the chip does not write is left as it is. Each gate becomes at most two word operations per cell. A binding reads a plane the chip writes only at offset 0. For a border that reads 0, make the world at least twice the image and write the image at the origin";
 
 fn bits_shown(what: &str) -> Json {
     whole(what, 0, i64::from(chip::BITS - 1))
@@ -566,6 +566,26 @@ fn chip_refused(why: &chip::Refused) -> Failed {
     Box::new(Refusal::new(code, &why.path, why.message.clone()))
 }
 
+fn too_big(why: &crate::law::Refusal, circuit: &Circuit) -> Failed {
+    if why.code != crate::law::Code::Nodes {
+        return Box::new(Refused(why.clone(), "$"));
+    }
+    let most = crate::law::limits::NODES;
+    Box::new(
+        Refusal::new(
+            Code::ChipTooBig,
+            "$.gates",
+            format!(
+                "the chip has too many gates for one law: its {} gates compile to more than the {most} nodes a law holds, about {} a gate; a chip of at most {} gates always fits",
+                circuit.gates.len(),
+                chip::NODES_PER_GATE,
+                chip::GATES_SURE
+            ),
+        )
+        .limited(counted(chip::GATES_SURE)),
+    )
+}
+
 fn from_chip(_: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let circuit = Circuit {
         state: word_at(held, "state"),
@@ -609,7 +629,7 @@ fn from_chip(_: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     };
     let wired = Wired::new(circuit, wiring).map_err(|why| chip_refused(&why))?;
     let written = wired.text();
-    let law = Law::compile(&written).map_err(|why| Box::new(Refused(why, "$")) as Failed)?;
+    let law = Law::compile(&written).map_err(|why| too_big(&why, wired.circuit()))?;
     let class = background_class(&law, &[]);
     let mut answer = vec![
         ("law", text(&written)),
