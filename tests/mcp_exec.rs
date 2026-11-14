@@ -3586,10 +3586,48 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
     let slow = Duration::from_millis(3000);
     faults.lock().unwrap().slow_write = slow;
     let budget = 1000;
+    let due = Ledger::created(Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [64, 64, 64],
+        sparse: false,
+        slots: None,
+    })
+    .replay_most();
+    let snaps = |scratch: &Scratch| -> Vec<String> {
+        kept_files(scratch)
+            .into_iter()
+            .filter(|one| one.starts_with("snap-"))
+            .collect()
+    };
     let mut worst = Duration::ZERO;
     let mut frame = 0;
     let mut began = Vec::new();
-    for call in 0..10 {
+    let mut owed = Some(due);
+    let mut stepping = Duration::ZERO;
+    let mut writing: Option<(Instant, Vec<String>)> = None;
+    let mut call = 0;
+    while call < 10 || began.len() < 2 {
+        if let Some((from, before)) = writing.as_ref()
+            && snaps(&scratch) != *before
+        {
+            owed = Some(due.max(from.elapsed() * 4));
+            writing = None;
+        }
+        match (owed, writing.as_ref()) {
+            (Some(owed), _) => assert!(
+                stepping <= owed * 2,
+                "snapshot {} did not begin after {stepping:?} of steps, twice the replay of {owed:?} that makes it due",
+                began.len() + 1
+            ),
+            (None, Some((from, _))) => assert!(
+                from.elapsed() <= slow * 4,
+                "the write of {slow:?} begun by call {:?} had not landed after {:?}",
+                began.last(),
+                from.elapsed()
+            ),
+            (None, None) => {}
+        }
         let asked = Instant::now();
         let got = run.ask(
             "grit_world_step",
@@ -3609,14 +3647,19 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
             "call {call} took {took:?}, more than {most:?}"
         );
         worst = worst.max(took);
+        stepping += took;
         let slowed = faults.lock().unwrap().slowed;
         if usize::try_from(slowed).unwrap() > began.len() {
             began.push(call);
+            writing = Some((asked, snaps(&scratch)));
+            owed = None;
+            stepping = Duration::ZERO;
         }
+        call += 1;
     }
     let slowed = faults.lock().unwrap().slowed;
     eprintln!(
-        "10 steps of {budget} ms beside {slowed} snapshot writes of {slow:?}, begun by calls {began:?}; the slowest took {worst:?}"
+        "{call} steps of {budget} ms beside {slowed} snapshot writes of {slow:?}, begun by calls {began:?}; the slowest took {worst:?}"
     );
     assert!(slowed >= 2, "{slowed}");
     let idle = idle_longest(&mut run);
