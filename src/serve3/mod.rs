@@ -903,8 +903,8 @@ impl<'host> Server<'host> {
         )?;
         let built = self
             .replayed_world(host, &ledger, &mut pace, bytes)
-            .and_then(|mut world| {
-                let rule = law::listed(host, &mut world)?;
+            .and_then(|world| {
+                let rule = law::listed(host, &world)?;
                 Ok(Live { world, rule })
             });
         let mut note = vec![

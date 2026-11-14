@@ -191,12 +191,11 @@ pub fn reparam(world: &mut World<'_>, params: &[u32]) -> Result<(), Failed> {
     world.set_params(params, stepping)
 }
 
-pub fn listed(host: &Host, world: &mut World<'_>) -> Result<Box<dyn Listed>, Failed> {
+pub fn listed(host: &Host, world: &World<'_>) -> Result<Box<dyn Listed>, Failed> {
     let Some(law) = world.law().cloned() else {
         return super::rule_of(host, world.rule());
     };
-    let uniforms = world.uniforms()?;
-    let class = quiet::class(&law, world.params(), &uniforms);
+    let class = background_class(&law, world.params());
     Ok(Box::new(Lawful::new(law, class)))
 }
 

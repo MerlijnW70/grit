@@ -43,6 +43,6 @@ A listed world steps an oct only while it, or an oct around it, changed in the t
 | `proved` | no cell output depends on `frame` or `at` in the law's node graph, and the background (0 on every plane) and every uniform brick value the world holds step to themselves under its params, by evaluating the law | both conditions hold | listed, dense or sparse |
 | `whole` | anything else | | dense only, every oct every frame |
 
-The class is decided at create from the background, and at every `grit_world_params` from the background and every uniform brick value in the sparse world's table. The check reads the graph, not the text: a `let` the result never uses does not count, and an `["and","frame",0]` the result does use does.
+The class is decided at create from the background, and at every `grit_world_params` from the background and every uniform brick value in the sparse world's table. Opening a file decides it as a create does; a fork, a restore, a kept world and a rebuild keep the class last decided. A uniform brick value that is not a fixed point of a `proved` law can only be in a world's table when the world steps every brick on its next frame (after a create, an open or a params write), so such a brick takes a slot then and is never kept cold. The check reads the graph, not the text: a `let` the result never uses does not count, and an `["and","frame",0]` the result does use does.
 
 Laws in `tests/law/`: `code` is `proved`; `sand` and `embed` read `frame`, and `heat`, `nature` and `evo` read `noise`, so they are `whole` and run dense.

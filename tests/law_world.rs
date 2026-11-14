@@ -967,6 +967,32 @@ fn a_param_write_that_breaks_a_fixed_point_on_a_sparse_world_is_refused_and_chan
     );
     assert_eq!(state(&mut server, full, "full-after"), before);
     assert_eq!(read_all(&mut server, full), vec![7_u32; grid().cells()]);
+
+    let held = answer(&call(
+        &mut server,
+        "grit_world_create",
+        &making_law(BIAS, &[0, 9], true),
+    ))
+    .int_at("world");
+    let sevens = vec![7_u32; grid().cells()];
+    write_all(&mut server, held, &sevens);
+    let saved = state(&mut server, held, "held-sevens");
+    let opened = answer(&call(
+        &mut server,
+        "grit_world_open",
+        "{\"name\":\"held-sevens\"}",
+    ));
+    assert_eq!(opened.text_at("quiet"), "proved", "{}", written(&opened));
+    let reopened = opened.int_at("world");
+    assert_eq!(state(&mut server, reopened, "held-sevens-again"), saved);
+    for world in [held, reopened] {
+        stepped(&mut server, world, 2);
+        assert_eq!(
+            read_all(&mut server, world),
+            replay(&bias, &sevens, 0, 2, &[0, 9]),
+            "world {world}"
+        );
+    }
 }
 
 #[test]

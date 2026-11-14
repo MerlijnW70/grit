@@ -264,12 +264,12 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
             "building the world from the file",
         )?;
         let began = Instant::now();
-        let mut world = super::law::opened(host, &image)?;
+        let world = super::law::opened(host, &image)?;
         server
             .book
             .rates
             .measure(Work::Build, bytes, began.elapsed());
-        let rule = super::law::listed(host, &mut world)?;
+        let rule = super::law::listed(host, &world)?;
         if let Some(lawful) = rule.lawful()
             && world.pool().is_some()
             && !lawful.class().proved()
@@ -364,7 +364,7 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
         &format!("rebuilding world {number} from its journal"),
     )?;
     let mut pace = super::budget::Pace::first(0);
-    let mut world = match server.replayed_world(host, &ledger, &mut pace, bytes) {
+    let world = match server.replayed_world(host, &ledger, &mut pace, bytes) {
         Ok(world) => world,
         Err(why) => {
             let stopped = why.downcast_ref::<super::budget::Halted>().is_some();
@@ -375,7 +375,7 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
             return Err(why);
         }
     };
-    let rule = super::law::listed(host, &mut world)?;
+    let rule = super::law::listed(host, &world)?;
     let mut live = Live { world, rule };
     let bytes = super::world_bytes(host, &live);
     let replayed = u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX);
@@ -522,8 +522,7 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .book
         .rates
         .measure(Work::Fork, source.bytes, began.elapsed());
-    let mut fork = fork;
-    let rule = super::law::listed(host, &mut fork)?;
+    let rule = super::law::listed(host, &fork)?;
     let id = server.number()?;
     let mut live = Live { world: fork, rule };
     let listed = live.world.listed()?;
@@ -607,7 +606,7 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server.book.release(old);
     let host = server.host.ok_or(crate::host::Error::NoComputeDevice)?;
     let live = server.world(held)?;
-    live.rule = super::law::listed(host, &mut live.world)?;
+    live.rule = super::law::listed(host, &live.world)?;
     let listed = live.world.listed()?;
     let mut answer = vec![
         ("world", counted(number)),
