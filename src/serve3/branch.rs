@@ -170,7 +170,7 @@ fn saved(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server.world(held)?;
     let size = server.book.held.get(&number).map_or(0, |held| held.bytes);
     server.fits(
-        server.book.rates.estimate(Work::Save, size),
+        server.book.rates.least(Work::Save, size),
         &format!("writing world {number} to a file"),
     )?;
     let began = Instant::now();
@@ -233,7 +233,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         }));
     }
     server.fits(
-        server.book.rates.estimate(Work::File, length),
+        server.book.rates.least(Work::File, length),
         &format!("reading the file {name}{}", journal::SUFFIX),
     )?;
     let began = Instant::now();
@@ -260,7 +260,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         let sizes = image_shaped(host, planned.as_ref(), &image)?;
         let bytes = admitted(server, host, &sizes, "the world")?;
         server.fits(
-            server.book.rates.estimate(Work::Build, bytes),
+            server.book.rates.least(Work::Build, bytes),
             "building the world from the file",
         )?;
         let began = Instant::now();
@@ -360,7 +360,7 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
     let (_, sizes) = shaped(host, planned.as_ref(), ledger.made())?;
     let bytes = admitted(server, host, &sizes, "the world")?;
     server.fits(
-        server.replay_estimate(&ledger, bytes),
+        server.replay_least(&ledger, bytes),
         &format!("rebuilding world {number} from its journal"),
     )?;
     let mut pace = super::budget::Pace::first(0);
@@ -512,7 +512,7 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .ok_or_else(|| unread("world"))?;
     server.book.memory.admits(source.bytes, "the fork")?;
     server.fits(
-        server.book.rates.estimate(Work::Fork, source.bytes),
+        server.book.rates.least(Work::Fork, source.bytes),
         &format!("copying world {number}"),
     )?;
     let began = Instant::now();
@@ -568,7 +568,7 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     let size = server.book.held.get(&from).map_or(0, |held| held.bytes);
     server.fits(
-        server.book.rates.estimate(Work::Fork, size),
+        server.book.rates.least(Work::Fork, size),
         &format!("copying world {from} into world {number}"),
     )?;
     let began = Instant::now();
