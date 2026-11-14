@@ -304,7 +304,6 @@ fn stresses(op: &str) -> Vec<(String, Stress)> {
         ),
         "param" => add("param", Box::new(folded("0", "[\"param\",0]"))),
         "noise" => add("noise", Box::new(folded("0", "[\"noise\"]"))),
-        "look" => {}
         "shl" | "shr" => {
             add(
                 op,
@@ -383,6 +382,24 @@ fn stresses(op: &str) -> Vec<(String, Stress)> {
                 )),
             );
         }
+        "look" => {
+            for (name, body) in [
+                (
+                    "look",
+                    "[\"add\",\"a\",[\"look\",0,1,0,0,[\"and\",\"i\",7]]]",
+                ),
+                (
+                    "look moving",
+                    "[\"add\",\"a\",[\"look\",0,[\"and\",\"i\",1],[\"and\",[\"shr\",\"i\",1],1],[\"and\",[\"shr\",\"i\",2],1],[\"and\",\"i\",7]]]",
+                ),
+            ] {
+                let make = folded("0", body);
+                add(
+                    name,
+                    Box::new(move |rounds| make(rounds).replacen("\"halo\":0", "\"halo\":1", 1)),
+                );
+            }
+        }
         "sel" => {
             add(
                 "sel",
@@ -439,11 +456,6 @@ fn every_operation_costs_bounded_time_per_unit_it_charges() {
     let mut table = Vec::new();
     for op in ops() {
         let cases = stresses(op);
-        if op == "look" {
-            let why = refused(&probe(&junk("[\"look\",0,0,0,0,0]")));
-            assert_eq!(why.code, Code::Unsupported, "{why}");
-            continue;
-        }
         assert!(!cases.is_empty(), "no stress case for the operation {op}");
         for (name, make) in cases {
             let (rounds, law) = widest(&make);

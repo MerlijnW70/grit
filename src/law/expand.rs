@@ -683,7 +683,9 @@ impl<'p> Expander<'_, 'p> {
                 u64::from(corners),
             ));
         };
-        self.looks.push((plane, path.shown()));
+        if !self.looks.iter().any(|(seen, _)| *seen == plane) {
+            self.looks.push((plane, path.shown()));
+        }
         if let Some(own) = halo::own(cell) {
             let own = u32::try_from(own).unwrap_or(0);
             return Ok(Value::Word(match plane {

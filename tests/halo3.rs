@@ -1354,7 +1354,7 @@ fn a_sparse_world_and_a_sparse_file_refuse_a_halo_law_through_the_tools() {
 fn halo_free_laws_emit_the_kernels_on_record() {
     let mut want = std::collections::BTreeMap::new();
     for line in KERNELS.lines().filter(|line| !line.trim().is_empty()) {
-        let (name, hash) = line.rsplit_once(' ').unwrap();
+        let (name, hash) = line.trim_end().rsplit_once(' ').unwrap();
         want.insert(name.to_owned(), hash.to_owned());
     }
     let mut got = std::collections::BTreeMap::new();

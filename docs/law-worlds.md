@@ -34,6 +34,29 @@ Refusals:
 
 The law, its hash and its params come back after `grit_world_save` and `grit_world_open`, `grit_world_fork`, `grit_world_restore`, a restart of the server (the journal's `LAW` and `PARAMS` records) and a lost device. `grit_world_list` names each law world's `law` hash, and for an open world its `quiet`; `grit_describe` lists the open law worlds under `worlds.laws`.
 
+## Looking at neighbours
+
+`["look", plane, dx, dy, dz, corner]` is the word of `plane` at the corner's cell plus `(dx, dy, dz)`, wrapped on the torus. Each offset is -1, 0 or 1; `plane`, the offsets and `corner` are ints known when the law compiles. A look inside the oct is the corner's own word.
+
+```json
+["map", "c", ["range", 8], ["vec", ["at", ["at", "cells", "c"], 0], ["look", 0, -1, 0, 0, "c"]]]
+```
+
+Rules, each refused by its own code at the path of the look or of `halo`:
+
+| Code | When |
+|---|---|
+| `halo_declared` | `halo` is not 1 for a law that looks, or not 0 for one that does not |
+| `halo_radius` | an offset outside -1..1 |
+| `halo_constant` | a plane, offset or corner known only when the law runs |
+| `halo_plane` | a plane past `channels` |
+| `halo_written` | a look at a plane the law writes: only a frozen plane, whose 8 out words are its input words unchanged, may be looked at |
+| `halo_sparse` | (world) a sparse world, at create (`$.sparse`) or open (`$.name`); make it dense |
+
+A host write to a world whose law looks wakes the 27 octs around the oct of each phase that holds the cell, so every oct whose 4x4x4 box holds the cell steps next frame. The quiet class is decided as below, with the looked cells part of the oct's input: a law that reads neither `frame` nor `at` gives the same output for the same box, so it keeps the box contract and steps listed; any other law steps whole.
+
+`tests/halo3/` holds three laws that look: a 2D Sobel edge detector, a 3D 3x3x3 Sobel and a blur over two planes.
+
 ## The quiet class
 
 A listed world steps an oct only while it, or an oct around it, changed in the two frames before; a sparse world also keeps an all-one-value brick as a single word and steps it only while it is hot. That gives the cells of stepping every oct only when:
