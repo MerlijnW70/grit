@@ -170,10 +170,11 @@ fn saved(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server.world(held)?;
     let size = server.book.held.get(&number).map_or(0, |held| held.bytes);
     server.fits(
-        server.book.rates.estimate(Work::Save, size),
+        server.book.rates.least(Work::Save, size),
         &format!("writing world {number} to a file"),
     )?;
     let began = Instant::now();
+    server.slowly(Work::Save);
     let live = server.world(held)?;
     let image = live.world.image()?;
     let bytes = format::store(&path, &image).map_err(|why| file_refusal(&why, &name))?;
@@ -233,10 +234,11 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         }));
     }
     server.fits(
-        server.book.rates.estimate(Work::File, length),
+        server.book.rates.least(Work::File, length),
         &format!("reading the file {name}{}", journal::SUFFIX),
     )?;
     let began = Instant::now();
+    server.slowly(Work::File);
     let pending = keep
         .copied(&path, server.book.next)
         .map_err(|why| super::io_refusal(&why))?;
@@ -259,16 +261,15 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         let planned = super::law::planned(host, image.law.name(), law.as_deref(), &image.params)?;
         let sizes = image_shaped(host, planned.as_ref(), &image)?;
         let bytes = admitted(server, host, &sizes, "the world")?;
+        let work = Work::build(matches!(image.state, crate::branch::State::Sparse { .. }));
         server.fits(
-            server.book.rates.estimate(Work::Build, bytes),
+            server.book.rates.least(work, bytes),
             "building the world from the file",
         )?;
         let began = Instant::now();
+        server.slowly(work);
         let world = super::law::opened(host, &image)?;
-        server
-            .book
-            .rates
-            .measure(Work::Build, bytes, began.elapsed());
+        server.book.rates.measure(work, bytes, began.elapsed());
         let rule = super::law::listed(host, &world)?;
         if let Some(lawful) = rule.lawful()
             && world.pool().is_some()
@@ -360,7 +361,7 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
     let (_, sizes) = shaped(host, planned.as_ref(), ledger.made())?;
     let bytes = admitted(server, host, &sizes, "the world")?;
     server.fits(
-        server.replay_estimate(&ledger, bytes),
+        server.replay_least(&ledger, bytes),
         &format!("rebuilding world {number} from its journal"),
     )?;
     let mut pace = super::budget::Pace::first(0);
@@ -512,10 +513,11 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .ok_or_else(|| unread("world"))?;
     server.book.memory.admits(source.bytes, "the fork")?;
     server.fits(
-        server.book.rates.estimate(Work::Fork, source.bytes),
+        server.book.rates.least(Work::Fork, source.bytes),
         &format!("copying world {number}"),
     )?;
     let began = Instant::now();
+    server.slowly(Work::Fork);
     let live = server.world(held)?;
     let fork = live.world.fork()?;
     server
@@ -568,10 +570,11 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     let size = server.book.held.get(&from).map_or(0, |held| held.bytes);
     server.fits(
-        server.book.rates.estimate(Work::Fork, size),
+        server.book.rates.least(Work::Fork, size),
         &format!("copying world {from} into world {number}"),
     )?;
     let began = Instant::now();
+    server.slowly(Work::Fork);
     let mut source = server.live.remove(&from).ok_or_else(|| unread("from"))?;
     let done = server
         .live

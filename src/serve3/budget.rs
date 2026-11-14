@@ -46,11 +46,15 @@ impl Stop {
     }
 }
 
+pub const REFUSED_MOST: u32 = 2;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {
     per_frame: Duration,
+    previous: Duration,
     measured: bool,
     last: u32,
+    refused: u32,
 }
 
 impl Pace {
@@ -62,8 +66,10 @@ impl Pace {
             .saturating_add(WORST_PER_SUBMIT);
         Self {
             per_frame: guess,
+            previous: guess,
             measured: false,
             last: BATCH_MOST,
+            refused: 0,
         }
     }
 
@@ -79,11 +85,37 @@ impl Pace {
         aimed.min(grown).min(BATCH_MOST).min(left).min(fits)
     }
 
+    pub fn opening(&mut self, left: u32, time: Duration) -> u32 {
+        let step = self.batch(left, time);
+        if step > 0 || left == 0 || time.is_zero() {
+            return step;
+        }
+        if frames_in(time, self.per_frame.min(self.previous)) > 0 {
+            return 1;
+        }
+        if self.refused < REFUSED_MOST {
+            self.refused += 1;
+            return 0;
+        }
+        1
+    }
+
+    #[must_use]
+    pub fn resumed(&self, left: u32, time: Duration) -> u32 {
+        let step = self.batch(left, time);
+        if step > 0 || left == 0 || time.is_zero() {
+            return step;
+        }
+        1
+    }
+
     pub fn ran(&mut self, frames: u32, spent: Duration) {
         if frames == 0 {
             return;
         }
+        self.previous = self.per_frame;
         self.per_frame = spent / frames;
+        self.refused = 0;
         self.measured = true;
         self.last = frames;
     }
@@ -348,29 +380,50 @@ const RATIO_MOST: f64 = 8.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
     Build,
+    BuildSparse,
     Fork,
     Save,
+    Snap,
     File,
     Write,
 }
 
 impl Work {
-    pub const ALL: [Self; 5] = [Self::Build, Self::Fork, Self::Save, Self::File, Self::Write];
+    pub const ALL: [Self; 7] = [
+        Self::Build,
+        Self::BuildSparse,
+        Self::Fork,
+        Self::Save,
+        Self::Snap,
+        Self::File,
+        Self::Write,
+    ];
+
+    #[must_use]
+    pub const fn build(sparse: bool) -> Self {
+        if sparse {
+            Self::BuildSparse
+        } else {
+            Self::Build
+        }
+    }
 
     const fn index(self) -> usize {
         match self {
             Self::Build => 0,
-            Self::Fork => 1,
-            Self::Save => 2,
-            Self::File => 3,
-            Self::Write => 4,
+            Self::BuildSparse => 1,
+            Self::Fork => 2,
+            Self::Save => 3,
+            Self::Snap => 4,
+            Self::File => 5,
+            Self::Write => 6,
         }
     }
 
     const fn prior(self) -> f64 {
         match self {
-            Self::Build | Self::Fork => 1e-8,
-            Self::Save => 5e-8,
+            Self::Build | Self::BuildSparse | Self::Fork => 1e-8,
+            Self::Save | Self::Snap => 5e-8,
             Self::File => 2e-8,
             Self::Write => 2e-4,
         }
@@ -387,8 +440,10 @@ impl Work {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Build => "build",
+            Self::BuildSparse => "build_sparse",
             Self::Fork => "fork",
             Self::Save => "save",
+            Self::Snap => "snapshot_in_memory",
             Self::File => "file",
             Self::Write => "write",
         }
@@ -401,6 +456,13 @@ struct Kept {
 }
 
 pub const PADDED: usize = 3;
+
+pub const LOW_SHARE: usize = 3;
+
+fn low(mut held: Vec<f64>) -> Option<f64> {
+    held.sort_by(f64::total_cmp);
+    held.get(held.len().checked_sub(1)? / LOW_SHARE).copied()
+}
 
 fn median(mut held: Vec<f64>, prior: f64) -> f64 {
     while held.len() < PADDED {
@@ -424,6 +486,22 @@ impl Kept {
 
     fn middle(&self, prior: f64, bytes: f64) -> f64 {
         median(self.chosen(bytes), prior)
+    }
+
+    fn least(&self, prior: f64, fixed: f64, bytes: f64) -> Option<f64> {
+        let costs: Vec<(f64, f64)> = self
+            .seen
+            .iter()
+            .map(|(size, rate)| ((size - fixed).max(0.0), size * rate))
+            .collect();
+        let marginal = costs
+            .iter()
+            .map(|(held, spent)| spent / held.max(1.0))
+            .fold(prior, f64::min);
+        low(costs
+            .iter()
+            .map(|(held, spent)| spent + marginal * (bytes - held).max(0.0))
+            .collect())
     }
 
     fn chosen(&self, bytes: f64) -> Vec<f64> {
@@ -450,7 +528,7 @@ impl Kept {
 
 #[derive(Debug, Clone, Default)]
 pub struct Rates {
-    kinds: [Kept; 5],
+    kinds: [Kept; 7],
     replay: Kept,
 }
 
@@ -483,6 +561,15 @@ impl Rates {
         Duration::try_from_secs_f64(size * self.rate(work, bytes)).unwrap_or(Duration::MAX)
     }
 
+    #[must_use]
+    pub fn least(&self, work: Work, bytes: u64) -> Duration {
+        let most = self.estimate(work, bytes);
+        self.kept(work)
+            .and_then(|kept| kept.least(work.prior(), work.fixed(), bytes as f64))
+            .and_then(|spent| Duration::try_from_secs_f64(spent).ok())
+            .map_or(most, |least| least.min(most))
+    }
+
     pub fn measure(&mut self, work: Work, bytes: u64, spent: Duration) {
         let size = bytes as f64 + work.fixed();
         let sample = spent.as_secs_f64() / size;
@@ -506,6 +593,18 @@ impl Rates {
     #[must_use]
     pub fn replaying(&self, recorded: Duration) -> Duration {
         recorded.mul_f64(self.replay())
+    }
+
+    #[must_use]
+    pub fn replay_least(&self) -> f64 {
+        let most = self.replay();
+        low(self.replay.seen.iter().map(|(_, ratio)| *ratio).collect())
+            .map_or(most, |least| least.clamp(RATIO_LEAST, RATIO_MOST).min(most))
+    }
+
+    #[must_use]
+    pub fn replaying_least(&self, recorded: Duration) -> Duration {
+        recorded.mul_f64(self.replay_least())
     }
 
     pub fn measure_replay(&mut self, recorded: Duration, spent: Duration) {
@@ -558,7 +657,7 @@ pub fn too_slow(needs: Duration, left: Duration, what: &str) -> Refusal {
         Code::Budget,
         "$.budget_ms",
         format!(
-            "{what} needs about {} ms on this device, by the rates the server has measured, and the call has {} ms left; nothing ran",
+            "{what} needs at least {} ms on this device, by the lowest third of the server's recent measurements of such work, and the call has {} ms left; nothing ran",
             needs.as_millis(),
             left.as_millis()
         ),
