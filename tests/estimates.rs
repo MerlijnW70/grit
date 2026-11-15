@@ -547,7 +547,7 @@ mod served {
         };
         let mut server = Server::new(Some(&host));
         let faults = server.faults();
-        let slow = Duration::from_millis(1500);
+        let slow = Duration::from_millis(3000);
         {
             let mut armed = faults.lock().unwrap();
             armed.slow_builds = 1;
@@ -555,7 +555,8 @@ mod served {
         }
         let first = built(&mut server, 16, None);
         assert!(first >= slow, "{first:?}");
-        let short = Duration::from_millis(1000);
+        let short = ((first - slow) * 3).max(Duration::from_millis(1000));
+        assert!(short < first, "setup: {first:?} {short:?}");
         for refusal in 0..grit::serve3::budget::REMEASURE_AFTER {
             let told = result(
                 &call(&mut server, "grit_world_create", &cube(16, Some(short))),
@@ -568,7 +569,9 @@ mod served {
             );
         }
         let again = built(&mut server, 16, Some(short));
-        eprintln!("a held-up 16^3 build {first:?}, 8 refusals, then it ran in {again:?}");
+        eprintln!(
+            "a held-up 16^3 build {first:?}, 8 refusals at {short:?}, then it ran in {again:?}"
+        );
         assert!(again < short, "{again:?}");
         let fits = built(&mut server, 16, Some(short));
         assert!(fits < short, "{fits:?}");
@@ -838,14 +841,20 @@ mod served {
             memory: None,
         };
         let mut server = Server::with(Some(&host), &options).unwrap();
-        let budget = Duration::from_millis(600);
-        grit::serve3::tools::faults::stall_every(Duration::from_millis(2));
+        let builds: Vec<Duration> = (0..grit::serve3::budget::RECENT)
+            .map(|_| built(&mut server, 32, None))
+            .collect();
+        let slowest = builds.iter().copied().max().unwrap();
+        let budget = (slowest * 2 + Duration::from_millis(300)).max(Duration::from_millis(600));
+        eprintln!("32^3 builds {builds:?}; budget {budget:?}");
+        grit::serve3::tools::faults::stall_every(Duration::from_millis(20));
         for call in 0..=grit::serve3::budget::RECENT {
             let before = replays_measured(&mut server);
             let began = Instant::now();
             let told = result(&opened(&mut server, 1, budget), true);
             let took = began.elapsed();
             let message = told.get("message").and_then(Json::text).unwrap().to_owned();
+            eprintln!("call {call} with {budget:?}: {took:?}");
             assert!(
                 message.contains("nothing was opened"),
                 "call {call}: {message}"
