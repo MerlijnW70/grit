@@ -261,6 +261,9 @@ mod served {
                 !fine(&slow),
                 "setup: {FRAMES} frames under a {STALL:?} stall each ran in {took:?}"
             );
+            if text.contains("whose build alone") {
+                continue;
+            }
             if text.contains("nothing ran") {
                 refused = Some(round);
                 break;

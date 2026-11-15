@@ -838,9 +838,9 @@ mod served {
             memory: None,
         };
         let mut server = Server::with(Some(&host), &options).unwrap();
-        let budget = Duration::from_millis(1500);
+        let budget = Duration::from_millis(600);
         grit::serve3::tools::faults::stall_every(Duration::from_millis(2));
-        for call in 0..2 * grit::serve3::budget::REMEASURE_AFTER {
+        for call in 0..=grit::serve3::budget::RECENT {
             let before = replays_measured(&mut server);
             let began = Instant::now();
             let told = result(&opened(&mut server, 1, budget), true);

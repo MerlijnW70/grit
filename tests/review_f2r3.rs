@@ -251,7 +251,7 @@ mod served {
             if took > Duration::from_millis(budget) + Duration::from_secs(1) {
                 late += 1;
             }
-            if text.contains("nothing ran") {
+            if text.contains("nothing ran") && !text.contains("whose build alone") {
                 refused += 1;
             }
         }

@@ -832,11 +832,18 @@ impl<'host> Server<'host> {
         (server, restored)
     }
 
-    fn replay_least(&self, ledger: &Ledger, bytes: u64) -> (Duration, budget::Basis) {
-        let rates = &self.book.rates;
-        if let Some(least) = rates.journal_least(ledger.journal()) {
-            return (least, budget::Basis::Measured);
+    fn fits(&mut self, work: budget::Work, bytes: u64, what: &str) -> Result<(), Failed> {
+        let (needs, basis) = self.book.rates.least_of(work, bytes);
+        let left = self.clock.left();
+        if needs > left && self.book.rates.refuses(work, bytes) {
+            return Err(Box::new(budget::too_slow(needs, left, what, basis)));
         }
+        self.book.rates.admitted(work, bytes);
+        Ok(())
+    }
+
+    fn build_least(&self, ledger: &Ledger, bytes: u64) -> (Duration, budget::Basis) {
+        let rates = &self.book.rates;
         let (build, basis) = rates.least_of(budget::Work::build(ledger.made().sparse), bytes);
         let snapshot = match (&ledger.base, self.book.keep.as_ref()) {
             (Base::Snapshot(snap), Some(keep)) if snap.image.is_none() => {
@@ -851,22 +858,18 @@ impl<'host> Server<'host> {
         (build.saturating_add(file), basis.with(filed))
     }
 
-    fn fits(&mut self, work: budget::Work, bytes: u64, what: &str) -> Result<(), Failed> {
-        let (needs, basis) = self.book.rates.least_of(work, bytes);
-        let left = self.clock.left();
-        if needs > left && self.book.rates.refuses(work, bytes) {
-            return Err(Box::new(budget::too_slow(needs, left, what, basis)));
-        }
-        self.book.rates.admitted(work, bytes);
-        Ok(())
-    }
-
     fn admits_replay(&mut self, ledger: &Ledger, bytes: u64, what: &str) -> Result<(), Failed> {
-        let (needs, basis) = self.replay_least(ledger, bytes);
         let journal = ledger.journal();
+        let (needs, basis, what) = match self.book.rates.journal_least(journal) {
+            Some(least) => (least, budget::Basis::Measured, what.to_owned()),
+            None => {
+                let (needs, basis) = self.build_least(ledger, bytes);
+                (needs, basis, format!("{what}, whose build alone"))
+            }
+        };
         let left = self.clock.left();
         if needs > left && self.book.rates.refuses_replay(journal) {
-            return Err(Box::new(budget::too_slow(needs, left, what, basis)));
+            return Err(Box::new(budget::too_slow(needs, left, &what, basis)));
         }
         self.book.rates.admitted_replay(journal);
         Ok(())
