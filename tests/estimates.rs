@@ -575,7 +575,8 @@ mod served {
         ledger.push(Entry::Step(8), Duration::from_millis(100));
         ledger.push(Entry::Write(cells), Duration::from_millis(1));
         keep.begin(1, &ledger).unwrap();
-        keep.set_next(2).unwrap();
+        keep.begin(2, &ledger).unwrap();
+        keep.set_next(3).unwrap();
         drop(keep);
         let options = Options {
             dir: Some(dir),
@@ -592,10 +593,13 @@ mod served {
                 "observations",
             )
         };
+        let began = Instant::now();
+        result(&opened(&mut server, 2, Duration::from_secs(600)), false);
+        let budget = began.elapsed() + Duration::from_millis(200);
         let ratios = replays_measured(&mut server);
         let before = writes(&mut server);
-        grit::serve3::tools::faults::stall_batch(0, Duration::from_millis(800));
-        let told = result(&opened(&mut server, 1, Duration::from_millis(400)), true);
+        grit::serve3::tools::faults::stall_batch(0, budget + Duration::from_millis(500));
+        let told = result(&opened(&mut server, 1, budget), true);
         grit::serve3::tools::faults::disarm();
         let message = told.get("message").and_then(Json::text).unwrap().to_owned();
         eprintln!("a [write, step, write] journal with its step held up: {message}");
