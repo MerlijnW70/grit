@@ -879,7 +879,7 @@ impl<'host> Server<'host> {
         what: &str,
     ) -> Result<(), Failed> {
         let left = self.clock.left();
-        if needs > left && self.book.rates.refuses(work, bytes, basis) {
+        if needs > left && self.book.rates.refuses(work, bytes) {
             return Err(Box::new(budget::too_slow(needs, left, what, basis)));
         }
         self.book.rates.admitted(work, bytes);
@@ -893,7 +893,6 @@ impl<'host> Server<'host> {
         pace: &mut Pace,
         bytes: u64,
     ) -> Result<World<'host>, Failed> {
-        let had = self.clock.left();
         let write = budget::Work::write(ledger.made().sparse);
         let guard = self.guard();
         let mut held = self.held_replay();
@@ -925,21 +924,24 @@ impl<'host> Server<'host> {
             .err()
             .and_then(|why| why.downcast_ref::<budget::Halted>())
             .is_some_and(|halted| halted.stop == Stop::Budget);
-        let failed = had.saturating_add(budget::CUT_MARGIN);
         if taught && timings.write_cut && !timings.writes.is_zero() {
             let total = ledger.write_bytes();
             let share = total as f64 / timings.write_bytes.max(1) as f64;
             rates.measure_cut(
                 write,
                 total,
-                budget::scaled(timings.writes, share).max(failed),
+                budget::scaled(timings.writes, share)
+                    .max(timings.writes.saturating_add(budget::CUT_MARGIN)),
             );
         } else {
             if timings.write_bytes > 0 {
                 rates.measure(write, timings.write_bytes, timings.writes);
             }
             if taught && timings.step_cut {
-                let floor = budget::ratio(failed, ledger.step_recorded());
+                let floor = budget::ratio(
+                    timings.steps.saturating_add(budget::CUT_MARGIN),
+                    ledger.step_recorded(),
+                );
                 let bound = budget::ratio(
                     timings.steps,
                     timings.recorded.saturating_add(timings.stepping),
@@ -1293,7 +1295,7 @@ impl<'host> Server<'host> {
         let size = self.book.held.get(&number).map_or(0, |held| held.bytes);
         let work = self.snap_work();
         let (needs, basis) = self.book.rates.least_of(work, size);
-        if self.clock.left() < needs && self.book.rates.refuses(work, size, basis) {
+        if self.clock.left() < needs && self.book.rates.refuses(work, size) {
             return Err(Box::new(
                 Refusal::new(
                     errors::Code::Budget,

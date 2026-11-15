@@ -53,7 +53,7 @@ fn extreme_samples_never_panic_any_least_or_refusal() {
             let (least, basis) = rates.least_of(work, bytes);
             assert!(least <= Duration::MAX);
             let _ = rates.estimate(work, bytes);
-            let _ = rates.refuses(work, bytes, basis);
+            let _ = (basis, rates.refuses(work, bytes));
             rates.admitted(work, bytes);
         }
     }
@@ -253,22 +253,55 @@ fn with_nothing_measured_only_the_fastest_per_byte_refuses() {
 }
 
 #[test]
-fn eight_refusals_by_evidence_in_a_row_let_the_next_call_run() {
+fn eight_refusals_in_a_row_let_the_next_call_run_whatever_decided_them() {
     let mut rates = Rates::default();
     for round in 0..3 {
         for refusal in 0..REMEASURE_AFTER {
             assert!(
-                rates.refuses(Work::Build, TWO_FIFTY_SIX, Basis::Measured),
+                rates.refuses(Work::Build, TWO_FIFTY_SIX),
                 "round {round}, refusal {refusal}"
             );
         }
-        assert!(!rates.refuses(Work::Build, TWO_FIFTY_SIX, Basis::Measured));
-    }
-    for _ in 0..3 * REMEASURE_AFTER {
-        assert!(rates.refuses(Work::Build, TWO_FIFTY_SIX, Basis::Fastest));
+        assert!(!rates.refuses(Work::Build, TWO_FIFTY_SIX));
     }
     rates.admitted(Work::Build, TWO_FIFTY_SIX);
-    assert!(rates.refuses(Work::Fork, TWO_FIFTY_SIX, Basis::Measured));
+    assert!(rates.refuses(Work::Fork, TWO_FIFTY_SIX));
+}
+
+#[test]
+fn a_finished_sample_of_the_same_size_outranks_the_fastest_per_byte() {
+    let quick = Duration::from_millis(5);
+    let mut rates = Rates::default();
+    rates.measure(Work::Build, TWO_FIFTY_SIX, quick);
+    let fastest = Duration::from_secs_f64(Work::Build.fastest().unwrap() * TWO_FIFTY_SIX as f64);
+    assert!(fastest > quick);
+    assert_eq!(
+        rates.least_of(Work::Build, TWO_FIFTY_SIX),
+        (quick, Basis::Measured)
+    );
+    assert_eq!(
+        rates.least_of(Work::Build, TWO_FIFTY_SIX + 1),
+        (fastest, Basis::Fastest),
+        "past every measured size the per-byte figure still applies"
+    );
+}
+
+#[test]
+fn cut_samples_alone_take_their_largest_and_one_finished_sample_takes_the_smallest() {
+    let mut rates = Rates::default();
+    for spent in [3, 5, 4] {
+        rates.measure_cut(Work::Write, 4096, Duration::from_secs(spent));
+    }
+    assert_eq!(rates.least(Work::Write, 4096), Duration::from_secs(5));
+    rates.measure(Work::Write, 4096, Duration::from_secs(1));
+    assert_eq!(rates.least(Work::Write, 4096), Duration::from_secs(1));
+    let mut ratios = Rates::default();
+    for spent in [3, 5, 4] {
+        ratios.measure_cut_replay(Duration::from_secs(1), Duration::from_secs(spent), 0.0);
+    }
+    assert!((ratios.replay_least() - 5.0).abs() < 1e-9);
+    ratios.measure_replay(Duration::from_secs(1), Duration::from_secs(1));
+    assert!((ratios.replay_least() - 1.0).abs() < 1e-9);
 }
 
 #[test]
@@ -682,6 +715,72 @@ mod served {
         let probe = result(&opened(&mut server, 5, Duration::from_millis(1)), true);
         eprintln!("after one open and three cancels: {}", written(&probe));
         result(&opened(&mut server, 5, Duration::from_secs(600)), false);
+    }
+
+    #[test]
+    fn a_step_cut_charges_only_its_own_time_never_the_writes_before_it() {
+        let Some(host) = device("step cut floor") else {
+            return;
+        };
+        let held = scratch("step-floor");
+        let dir = held.0.join("worlds");
+        let keep = Keep::at(&dir).unwrap();
+        let cells: Vec<([u32; 3], u32)> = (0..2048_u32)
+            .map(|at| ([at % 32, (at / 32) % 32, at / 1024], 1 + at % 2))
+            .collect();
+        for number in 1..=6 {
+            let mut ledger = Ledger::created(Made {
+                rule: "sand".to_owned(),
+                params: Vec::new(),
+                size: [32, 32, 32],
+                sparse: false,
+                slots: None,
+            });
+            ledger.push(Entry::Write(cells.clone()), Duration::from_millis(1));
+            ledger.push(Entry::Step(40), Duration::from_secs(1));
+            keep.begin(number, &ledger).unwrap();
+        }
+        keep.set_next(7).unwrap();
+        drop(keep);
+        let options = Options {
+            dir: Some(dir),
+            memory: None,
+        };
+        let mut server = Server::with(Some(&host), &options).unwrap();
+        let began = Instant::now();
+        result(&opened(&mut server, 1, Duration::from_secs(600)), false);
+        let whole = began.elapsed();
+        let cut = whole * 2;
+        let enough = cut + whole / 2;
+        for number in 2..=4 {
+            let before = replays_measured(&mut server);
+            {
+                let faults = server.faults();
+                let mut armed = faults.lock().unwrap();
+                armed.held_replays = 1;
+                armed.held_by = cut.saturating_sub(whole) + Duration::from_millis(30);
+            }
+            let told = result(&opened(&mut server, number, cut), true);
+            let message = told.get("message").and_then(Json::text).unwrap();
+            assert!(message.contains("stopped on budget"), "{message}");
+            assert_eq!(replays_measured(&mut server), before + 1);
+        }
+        let probe = result(&opened(&mut server, 5, Duration::from_millis(1)), true);
+        eprintln!(
+            "an open took {whole:?}; after three cuts at {cut:?}: {}",
+            probe.get("message").and_then(Json::text).unwrap()
+        );
+        let began = Instant::now();
+        let got = call(
+            &mut server,
+            "grit_world_open",
+            &format!(
+                "{{\"name\":\"world-6\",\"budget_ms\":{}}}",
+                enough.as_millis()
+            ),
+        );
+        eprintln!("open with {enough:?}: {:?}", began.elapsed());
+        result(&got, false);
     }
 
     struct Scratch(std::path::PathBuf);

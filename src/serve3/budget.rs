@@ -538,31 +538,43 @@ impl Basis {
 
 #[derive(Debug, Clone, Default)]
 struct Samples {
-    seen: std::collections::VecDeque<(u64, f64)>,
+    seen: std::collections::VecDeque<(u64, f64, bool)>,
+}
+
+fn recent(held: impl Iterator<Item = (f64, bool)>) -> Option<f64> {
+    let last: Vec<(f64, bool)> = held.take(RECENT).collect();
+    let finished = last.iter().any(|(_, cut)| !cut);
+    let values = last.iter().map(|(value, _)| *value);
+    if finished {
+        values.reduce(f64::min)
+    } else {
+        values.reduce(f64::max)
+    }
 }
 
 impl Samples {
-    fn push(&mut self, bytes: u64, spent: f64) {
+    fn push(&mut self, bytes: u64, spent: f64, cut: bool) {
         if self.seen.len() == SAMPLES_KEPT {
             self.seen.pop_front();
         }
-        self.seen.push_back((bytes, spent));
+        self.seen.push_back((bytes, spent, cut));
     }
 
-    fn evidence(&self, bytes: u64) -> Option<f64> {
+    fn evidence(&self, bytes: u64) -> Option<(f64, u64)> {
         let class = self
             .seen
             .iter()
-            .map(|(size, _)| *size)
+            .map(|(size, _, _)| *size)
             .filter(|size| *size <= bytes)
             .max()?;
-        self.seen
-            .iter()
-            .rev()
-            .filter(|(size, _)| *size == class)
-            .take(RECENT)
-            .map(|(_, spent)| *spent)
-            .reduce(f64::min)
+        recent(
+            self.seen
+                .iter()
+                .rev()
+                .filter(|(size, _, _)| *size == class)
+                .map(|(_, spent, cut)| (*spent, *cut)),
+        )
+        .map(|spent| (spent, class))
     }
 }
 
@@ -624,7 +636,7 @@ pub struct Rates {
     kinds: [Kept; 10],
     replay: Kept,
     samples: [Samples; 10],
-    ratios: std::collections::VecDeque<f64>,
+    ratios: std::collections::VecDeque<(f64, bool)>,
     refused: BTreeMap<(usize, u64), u32>,
 }
 
@@ -665,12 +677,13 @@ impl Rates {
     #[must_use]
     pub fn least_of(&self, work: Work, bytes: u64) -> (Duration, Basis) {
         let fastest = work.fastest().unwrap_or(0.0) * bytes as f64;
-        let measured = self
+        let evidence = self
             .samples
             .get(work.index())
-            .and_then(|samples| samples.evidence(bytes))
-            .unwrap_or(0.0);
-        let (least, basis) = if measured > 0.0 && measured >= fastest {
+            .and_then(|samples| samples.evidence(bytes));
+        let measured = evidence.map_or(0.0, |(spent, _)| spent);
+        let same_size = evidence.is_some_and(|(_, class)| class == bytes);
+        let (least, basis) = if same_size || (measured > 0.0 && measured >= fastest) {
             (measured, Basis::Measured)
         } else {
             (fastest, Basis::Fastest)
@@ -681,9 +694,9 @@ impl Rates {
         )
     }
 
-    pub fn refuses(&mut self, work: Work, bytes: u64, basis: Basis) -> bool {
+    pub fn refuses(&mut self, work: Work, bytes: u64) -> bool {
         let refused = self.refused.entry((work.index(), bytes)).or_insert(0);
-        if basis != Basis::Fastest && *refused >= REMEASURE_AFTER {
+        if *refused >= REMEASURE_AFTER {
             *refused = 0;
             return false;
         }
@@ -696,10 +709,14 @@ impl Rates {
     }
 
     pub fn measure_cut(&mut self, work: Work, bytes: u64, spent: Duration) {
+        self.sampled(work, bytes, spent, true);
+    }
+
+    fn sampled(&mut self, work: Work, bytes: u64, spent: Duration, cut: bool) {
         if let Some(samples) = self.samples.get_mut(work.index())
             && !spent.is_zero()
         {
-            samples.push(bytes, spent.as_secs_f64());
+            samples.push(bytes, spent.as_secs_f64(), cut);
         }
     }
 
@@ -716,7 +733,7 @@ impl Rates {
         if let Some(kept) = self.kinds.get_mut(work.index()) {
             kept.push(size, taken);
         }
-        self.measure_cut(work, bytes, spent);
+        self.sampled(work, bytes, spent, false);
     }
 
     #[must_use]
@@ -731,13 +748,7 @@ impl Rates {
 
     #[must_use]
     pub fn replay_least(&self) -> f64 {
-        self.ratios
-            .iter()
-            .rev()
-            .take(RECENT)
-            .copied()
-            .reduce(f64::min)
-            .unwrap_or(0.0)
+        recent(self.ratios.iter().rev().copied()).unwrap_or(0.0)
     }
 
     #[must_use]
@@ -749,24 +760,24 @@ impl Rates {
         if recorded < RATIO_LEAST_RECORDED {
             return;
         }
-        self.replayed(spent.as_secs_f64() / recorded.as_secs_f64());
+        self.replayed(spent.as_secs_f64() / recorded.as_secs_f64(), false);
     }
 
     pub fn measure_cut_replay(&mut self, recorded: Duration, spent: Duration, least: f64) {
         if spent.is_zero() {
             return;
         }
-        self.replayed(ratio(spent, recorded).max(least));
+        self.replayed(ratio(spent, recorded).max(least), true);
     }
 
-    fn replayed(&mut self, sample: f64) {
+    fn replayed(&mut self, sample: f64, cut: bool) {
         if !sample.is_finite() || sample <= 0.0 {
             return;
         }
         if self.ratios.len() == SAMPLES_KEPT {
             self.ratios.pop_front();
         }
-        self.ratios.push_back(sample);
+        self.ratios.push_back((sample, cut));
         let around = self.replay.middle(2.0, 1.0).clamp(RATIO_LEAST, RATIO_MOST);
         let taken = bounded(sample, around, RATIO_LEAST, RATIO_MOST);
         self.replay.push(1.0, taken);
