@@ -144,7 +144,14 @@ mod served {
         };
         let mut server = Server::new(Some(&host));
         let (_, warm) = create(&mut server, 16, None);
-        let (_, first) = create(&mut server, 256, None);
+        let (made, first) = create(&mut server, 256, None);
+        if made.get("isError") != Some(&Json::Bool(false)) {
+            eprintln!(
+                "this device cannot make a dense 256^3 world: {}",
+                written(&made)
+            );
+            return;
+        }
         let budget = (first.as_millis() * 4).max(100);
         let (told, took) = create(&mut server, 256, Some(budget));
         eprintln!(
