@@ -359,10 +359,8 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
     )?;
     let (_, sizes) = shaped(host, planned.as_ref(), ledger.made())?;
     let bytes = admitted(server, host, &sizes, "the world")?;
-    let needs = server.replay_least(&ledger, bytes);
-    server.admits(
-        needs,
-        Work::build(ledger.made().sparse),
+    server.admits_replay(
+        &ledger,
         bytes,
         &format!("rebuilding world {number} from its journal"),
     )?;

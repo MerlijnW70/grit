@@ -3,26 +3,21 @@
 #[cfg(feature = "faults")]
 mod common;
 
-use std::time::Duration;
-
 use grit::serve3::budget::Rates;
 
 #[test]
 fn r4a_a_replay_cut_before_its_first_frame_must_not_break_every_later_least() {
-    let mut rates = Rates::default();
-    let had = Duration::from_millis(500);
-    let recorded_total = Duration::from_secs(1);
-    let least = had.as_secs_f64() / recorded_total.as_secs_f64();
-    rates.measure_cut_replay(Duration::ZERO, Duration::from_millis(600), least);
+    let rates = Rates::default();
+    let journal = 1;
     eprintln!(
-        "replay_least ratio after a zero-frame cut: {:e}",
-        rates.replay_least()
+        "journal least after a zero-frame cut, which records nothing: {:?}",
+        rates.journal_least(journal)
     );
-    let got = std::panic::catch_unwind(|| rates.replaying_least(recorded_total));
+    let got = std::panic::catch_unwind(|| rates.journal_least(journal));
     assert!(
         got.is_ok(),
-        "replaying_least panicked after one replay cut before any frame ran (ratio {:e})",
-        rates.replay_least()
+        "journal_least panicked after one replay cut before any frame ran ({:?})",
+        rates.journal_least(journal)
     );
 }
 

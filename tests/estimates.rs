@@ -34,18 +34,17 @@ fn extreme_samples_never_panic_any_least_or_refusal() {
             (0, Duration::ZERO),
         ] {
             rates.measure(work, bytes, spent);
-            rates.measure_cut(work, bytes, spent);
         }
     }
-    for (recorded, spent, least) in [
-        (Duration::ZERO, Duration::MAX, f64::MAX),
-        (tiny, Duration::MAX, 0.0),
-        (Duration::MAX, Duration::MAX, f64::INFINITY),
-        (Duration::ZERO, tiny, f64::NAN),
-        (Duration::MAX, tiny, 0.0),
-        (Duration::ZERO, Duration::from_millis(600), 0.0),
+    for (journal, recorded, spent) in [
+        (0, Duration::ZERO, Duration::MAX),
+        (u64::MAX, tiny, Duration::MAX),
+        (1, Duration::MAX, Duration::MAX),
+        (0, Duration::ZERO, tiny),
+        (u64::MAX, Duration::MAX, tiny),
+        (2, Duration::ZERO, Duration::ZERO),
     ] {
-        rates.measure_cut_replay(recorded, spent, least);
+        rates.measure_journal(journal, spent);
         rates.measure_replay(recorded, spent);
     }
     for work in Work::ALL {
@@ -57,28 +56,21 @@ fn extreme_samples_never_panic_any_least_or_refusal() {
             rates.admitted(work, bytes);
         }
     }
+    for journal in [0, 1, 2, u64::MAX] {
+        assert!(
+            rates
+                .journal_least(journal)
+                .is_none_or(|least| least <= Duration::MAX)
+        );
+        let _ = rates.refuses_replay(journal);
+        rates.admitted_replay(journal);
+    }
     for recorded in [Duration::ZERO, tiny, Duration::from_secs(1), Duration::MAX] {
-        let _ = rates.replaying_least(recorded);
         let _ = rates.replaying(recorded);
     }
     let _ = rates.shown();
     let told = grit::serve3::budget::too_slow(Duration::MAX, Duration::ZERO, "work", Basis::Both);
     assert!(told.message.contains("needs at least"), "{}", told.message);
-}
-
-#[test]
-fn a_replay_cut_before_its_first_frame_records_a_finite_lower_bound() {
-    let mut rates = Rates::default();
-    let entry = Duration::from_secs(1);
-    let spent = Duration::from_millis(1500);
-    let bound = spent.as_secs_f64() / entry.as_secs_f64();
-    rates.measure_cut_replay(Duration::ZERO, spent, bound);
-    assert!(
-        (rates.replay_least() - 1.5).abs() < 1e-9,
-        "{}",
-        rates.replay_least()
-    );
-    assert_eq!(rates.replaying_least(entry), spent);
 }
 
 #[test]
@@ -146,7 +138,12 @@ fn one_fast_replay_never_hides_slow_ones_from_the_refusal() {
     }
     let recorded = Duration::from_secs(10);
     assert!(rates.replaying(recorded) > budget());
-    let least = rates.replaying_least(recorded);
+    let journal = 7;
+    rates.measure_journal(journal, recorded);
+    for _ in 0..WINDOW - 1 {
+        rates.measure_journal(journal, recorded * 4);
+    }
+    let least = rates.journal_least(journal).unwrap();
     assert!(least > budget(), "{least:?}");
 }
 
@@ -242,7 +239,7 @@ fn with_nothing_measured_only_the_fastest_per_byte_refuses() {
             );
         }
     }
-    assert_eq!(Rates::default().replay_least(), 0.0);
+    assert_eq!(Rates::default().journal_least(0), None);
     let slow = Duration::from_millis(3000);
     let mut rates = Rates::default();
     rates.measure(Work::Build, SIXTY_FOUR, slow);
@@ -287,21 +284,35 @@ fn a_finished_sample_of_the_same_size_outranks_the_fastest_per_byte() {
 }
 
 #[test]
-fn cut_samples_alone_take_their_largest_and_one_finished_sample_takes_the_smallest() {
+fn a_journal_least_is_the_fastest_of_its_own_last_three_finished_replays() {
+    let secs = Duration::from_secs;
     let mut rates = Rates::default();
     for spent in [3, 5, 4] {
-        rates.measure_cut(Work::Write, 4096, Duration::from_secs(spent));
+        rates.measure_journal(1, secs(spent));
     }
-    assert_eq!(rates.least(Work::Write, 4096), Duration::from_secs(5));
-    rates.measure(Work::Write, 4096, Duration::from_secs(1));
-    assert_eq!(rates.least(Work::Write, 4096), Duration::from_secs(1));
-    let mut ratios = Rates::default();
-    for spent in [3, 5, 4] {
-        ratios.measure_cut_replay(Duration::from_secs(1), Duration::from_secs(spent), 0.0);
+    assert_eq!(rates.journal_least(1), Some(secs(3)));
+    for _ in 0..2 {
+        rates.measure_journal(1, secs(6));
     }
-    assert!((ratios.replay_least() - 5.0).abs() < 1e-9);
-    ratios.measure_replay(Duration::from_secs(1), Duration::from_secs(1));
-    assert!((ratios.replay_least() - 1.0).abs() < 1e-9);
+    assert_eq!(rates.journal_least(1), Some(secs(4)));
+    rates.measure_journal(2, Duration::from_millis(1));
+    assert_eq!(rates.journal_least(1), Some(secs(4)));
+    assert_eq!(rates.journal_least(2), Some(Duration::from_millis(1)));
+    assert_eq!(rates.journal_least(3), None);
+}
+
+#[test]
+fn admitting_a_build_never_clears_the_count_of_a_replay_refusal() {
+    let mut rates = Rates::default();
+    for refusal in 0..REMEASURE_AFTER {
+        assert!(rates.refuses_replay(9), "refusal {refusal}");
+        rates.admitted(Work::Build, 9);
+        rates.admitted(Work::Build, TWO_FIFTY_SIX);
+    }
+    assert!(!rates.refuses_replay(9));
+    assert!(rates.refuses_replay(9));
+    rates.admitted_replay(9);
+    assert!(rates.refuses(Work::Build, 9));
 }
 
 #[test]
@@ -319,7 +330,7 @@ fn a_held_up_one_cell_write_never_refuses_a_rebuild_whose_writes_fit() {
 }
 
 #[test]
-fn the_prior_never_outvotes_one_measured_write_and_a_cut_tail_is_refused() {
+fn the_prior_never_outvotes_one_measured_write_and_a_finished_slow_tail_is_refused() {
     let tail: u64 = 168_632;
     let chunk: u64 = 16 * 659;
     let per_byte = 2.8e-5;
@@ -343,60 +354,36 @@ fn the_prior_never_outvotes_one_measured_write_and_a_cut_tail_is_refused() {
     );
     assert!(scaled > budget(), "{scaled:?}");
     assert!(least < budget(), "{least:?}");
-    rates.measure_cut(
+    rates.measure(
         Work::Write,
         tail,
         Duration::from_secs_f64(2e-4 * tail as f64),
     );
     assert!(
         rates.least(Work::Write, tail) > budget(),
-        "a tail one cut replay measured as too slow is refused"
-    );
-}
-
-#[test]
-fn a_cut_replay_that_ran_few_frames_is_still_measured() {
-    let mut rates = Rates::default();
-    rates.measure_replay(Duration::from_secs(1), Duration::from_secs(1));
-    let recorded = Duration::from_millis(30);
-    let spent = Duration::from_millis(1500);
-    rates.measure_replay(recorded, spent);
-    assert!(
-        (rates.replay_least() - 1.0).abs() < 1e-9,
-        "a finished replay below the floor is noise"
-    );
-    for _ in 0..RECENT {
-        rates.measure_cut_replay(recorded, spent, 0.0);
-    }
-    assert!(
-        rates.replay_least() >= 8.0 - 1e-9,
-        "three cut replays that ran 30 ms of recorded steps in 1.5 s: {}",
-        rates.replay_least()
+        "a tail one finished replay measured as too slow is refused"
     );
 }
 
 #[test]
 fn a_slow_replay_never_raises_the_least_replay_ratio_while_a_faster_one_is_recent() {
     let mut rates = Rates::default();
-    assert!(rates.replay_least().abs() < 1e-9);
+    let journal = 5;
+    assert_eq!(rates.journal_least(journal), None);
     for _ in 0..2 {
         rates.measure_replay(Duration::from_secs(1), Duration::from_millis(1500));
+        rates.measure_journal(journal, Duration::from_millis(1500));
     }
-    assert!(
-        (rates.replay_least() - 1.5).abs() < 1e-9,
-        "{}",
-        rates.replay_least()
+    assert_eq!(
+        rates.journal_least(journal),
+        Some(Duration::from_millis(1500))
     );
     rates.measure_replay(Duration::from_secs(1), Duration::from_secs(6));
+    rates.measure_journal(journal, Duration::from_secs(6));
     assert!(rates.replay() >= 6.0 - 1e-9, "{}", rates.replay());
-    assert!(
-        (rates.replay_least() - 1.5).abs() < 1e-9,
-        "{}",
-        rates.replay_least()
-    );
     assert_eq!(
-        rates.replaying_least(Duration::from_secs(2)),
-        Duration::from_secs(3)
+        rates.journal_least(journal),
+        Some(Duration::from_millis(1500))
     );
 }
 
@@ -588,7 +575,7 @@ mod served {
     }
 
     #[test]
-    fn a_step_that_uses_up_the_budget_before_a_write_is_recorded_as_a_step() {
+    fn a_cut_replay_records_only_the_write_entries_that_ran_whole() {
         let Some(host) = device("cut attribution") else {
             return;
         };
@@ -639,8 +626,8 @@ mod served {
         assert!(message.contains("nothing was opened"), "{message}");
         assert_eq!(
             replays_measured(&mut server),
-            ratios + 1,
-            "the cut was not recorded as a step"
+            ratios,
+            "a cut replay taught a replay sample"
         );
         assert_eq!(
             writes(&mut server),
@@ -718,11 +705,11 @@ mod served {
     }
 
     #[test]
-    fn a_step_cut_charges_only_its_own_time_never_the_writes_before_it() {
-        let Some(host) = device("step cut floor") else {
+    fn cut_replays_teach_nothing_and_never_refuse_an_identical_open_that_fits() {
+        let Some(host) = device("cuts teach nothing") else {
             return;
         };
-        let held = scratch("step-floor");
+        let held = scratch("cuts-teach-nothing");
         let dir = held.0.join("worlds");
         let keep = Keep::at(&dir).unwrap();
         let cells: Vec<([u32; 3], u32)> = (0..2048_u32)
@@ -756,10 +743,9 @@ mod served {
             );
             whole = whole.min(began.elapsed());
         }
+        let measured = replays_measured(&mut server);
         let cut = whole * 2;
-        let enough = cut + whole / 4;
         for number in 2..=4 {
-            let before = replays_measured(&mut server);
             {
                 let faults = server.faults();
                 let mut armed = faults.lock().unwrap();
@@ -769,22 +755,18 @@ mod served {
             let told = result(&opened(&mut server, number, cut), true);
             let message = told.get("message").and_then(Json::text).unwrap();
             assert!(message.contains("stopped on budget"), "{message}");
-            assert_eq!(replays_measured(&mut server), before + 1);
+            assert_eq!(
+                replays_measured(&mut server),
+                measured,
+                "a cut replay taught a sample"
+            );
         }
         let probe = result(&opened(&mut server, 5, Duration::from_millis(1)), true);
-        eprintln!(
-            "an open took {whole:?}; after three cuts at {cut:?}: {}",
-            probe.get("message").and_then(Json::text).unwrap()
-        );
+        let message = probe.get("message").and_then(Json::text).unwrap();
+        eprintln!("an open took {whole:?}; after three cuts at {cut:?}: {message}");
+        let enough = cut + whole / 4;
         let began = Instant::now();
-        let got = call(
-            &mut server,
-            "grit_world_open",
-            &format!(
-                "{{\"name\":\"world-7\",\"budget_ms\":{}}}",
-                enough.as_millis()
-            ),
-        );
+        let got = opened(&mut server, 7, enough);
         eprintln!("open with {enough:?}: {:?}", began.elapsed());
         result(&got, false);
     }
@@ -830,15 +812,55 @@ mod served {
         )
     }
 
+    const LATENESS: Duration = Duration::from_secs(1);
+
     #[test]
-    fn a_replay_too_slow_for_its_budget_is_refused_up_front_after_few_cut_calls() {
+    fn a_replay_that_never_finished_is_never_refused_and_each_cut_ends_within_its_budget() {
         let Some(host) = device("cut replays") else {
             return;
         };
         let held = scratch("cut-replay");
         let dir = held.0.join("worlds");
         let keep = Keep::at(&dir).unwrap();
-        for number in [1, 2] {
+        let mut ledger = Ledger::created(Made {
+            rule: "sand".to_owned(),
+            params: Vec::new(),
+            size: [32, 32, 32],
+            sparse: false,
+            slots: None,
+        });
+        ledger.push(Entry::Step(4000), Duration::from_millis(400));
+        keep.begin(1, &ledger).unwrap();
+        keep.set_next(2).unwrap();
+        drop(keep);
+        let options = Options {
+            dir: Some(dir),
+            memory: None,
+        };
+        let mut server = Server::with(Some(&host), &options).unwrap();
+        let budget = Duration::from_millis(1500);
+        grit::serve3::tools::faults::stall_every(Duration::from_millis(2));
+        for call in 0..2 * grit::serve3::budget::REMEASURE_AFTER {
+            let before = replays_measured(&mut server);
+            let began = Instant::now();
+            let told = result(&opened(&mut server, 1, budget), true);
+            let took = began.elapsed();
+            let message = told.get("message").and_then(Json::text).unwrap().to_owned();
+            assert!(
+                message.contains("nothing was opened"),
+                "call {call}: {message}"
+            );
+            assert!(took < budget + LATENESS, "call {call}: {took:?}");
+            assert_eq!(replays_measured(&mut server), before, "call {call}");
+        }
+        grit::serve3::tools::faults::disarm();
+    }
+
+    fn two_journals(label: &str) -> (Scratch, Options) {
+        let held = scratch(label);
+        let dir = held.0.join("worlds");
+        let keep = Keep::at(&dir).unwrap();
+        for (number, frames) in [(1, 400), (2, 400), (3, 40), (4, 40), (5, 40)] {
             let mut ledger = Ledger::created(Made {
                 rule: "sand".to_owned(),
                 params: Vec::new(),
@@ -846,52 +868,97 @@ mod served {
                 sparse: false,
                 slots: None,
             });
-            ledger.push(Entry::Step(4000), Duration::from_millis(400));
+            ledger.push(Entry::Step(frames), Duration::from_millis(100));
             keep.begin(number, &ledger).unwrap();
         }
-        keep.set_next(3).unwrap();
+        keep.set_next(6).unwrap();
         drop(keep);
         let options = Options {
             dir: Some(dir),
             memory: None,
         };
+        (held, options)
+    }
+
+    #[test]
+    fn a_journal_that_finished_too_slow_is_refused_whatever_other_journals_finished() {
+        let Some(host) = device("journal refusal") else {
+            return;
+        };
+        let (_held, options) = two_journals("journal-refusal");
         let mut server = Server::with(Some(&host), &options).unwrap();
+        grit::serve3::tools::faults::stall_every(Duration::from_millis(1));
+        let began = Instant::now();
         result(&opened(&mut server, 1, Duration::from_secs(600)), false);
-        let fast = replays_measured(&mut server);
-        let bound = grit::serve3::budget::RECENT;
-        let budget = Duration::from_millis(1500);
-        grit::serve3::tools::faults::stall_every(Duration::from_millis(2));
-        let mut cut = 0;
-        let mut refused = None;
-        for _ in 0..=bound + 1 {
-            let before = replays_measured(&mut server);
+        let slow = began.elapsed();
+        let mut fast = Duration::ZERO;
+        for number in 3..=5 {
             let began = Instant::now();
+            result(
+                &opened(&mut server, number, Duration::from_secs(600)),
+                false,
+            );
+            fast = fast.max(began.elapsed());
+        }
+        let budget = (slow + fast) / 2;
+        eprintln!(
+            "400 frames finished in {slow:?}, 40 frames in at most {fast:?}; budget {budget:?}"
+        );
+        assert!(
+            fast + Duration::from_millis(20) < budget,
+            "setup: {fast:?} {budget:?}"
+        );
+        let began = Instant::now();
+        let told = result(&opened(&mut server, 2, budget), true);
+        let took = began.elapsed();
+        grit::serve3::tools::faults::disarm();
+        let message = told.get("message").and_then(Json::text).unwrap();
+        assert!(
+            message.contains("nothing ran"),
+            "an identical journal finished whole in {slow:?}, so {budget:?} cannot fit it; three other journals finished in at most {fast:?}; the open was run instead of refused (answered in {took:?}): {message}"
+        );
+    }
+
+    #[test]
+    fn a_replay_refused_by_its_journal_runs_by_the_remeasure_whatever_builds_ran_between() {
+        let Some(host) = device("replay remeasure") else {
+            return;
+        };
+        let (_held, options) = two_journals("replay-remeasure");
+        let mut server = Server::with(Some(&host), &options).unwrap();
+        grit::serve3::tools::faults::stall_every(Duration::from_millis(1));
+        let began = Instant::now();
+        result(&opened(&mut server, 1, Duration::from_secs(600)), false);
+        let slow = began.elapsed();
+        let budget = slow / 2;
+        let mut refused = 0;
+        let mut answer = None;
+        for _ in 0..=grit::serve3::budget::REMEASURE_AFTER {
             let told = result(&opened(&mut server, 2, budget), true);
-            let took = began.elapsed();
             let message = told.get("message").and_then(Json::text).unwrap().to_owned();
-            eprintln!("open with a {budget:?} budget answered in {took:?}: {message}");
-            assert_eq!(told.get("code").and_then(Json::text), Some("budget"));
-            assert!(took < budget + Duration::from_secs(1), "{took:?}");
-            if message.contains("nothing was opened") {
-                assert_eq!(
-                    replays_measured(&mut server),
-                    before + 1,
-                    "a cut replay was not measured"
-                );
-                cut += 1;
-                continue;
+            if !message.contains("nothing ran") {
+                answer = Some(message);
+                break;
             }
-            assert!(message.contains("rebuilding world 2"), "{message}");
-            assert!(message.contains("nothing ran"), "{message}");
-            refused = Some(took);
-            break;
+            refused += 1;
+            let made = result(
+                &call(&mut server, "grit_world_create", &cube(32, None)),
+                false,
+            );
+            result(
+                &call(
+                    &mut server,
+                    "grit_world_close",
+                    &format!("{{\"world\":{}}}", int_at(&made, "world")),
+                ),
+                false,
+            );
         }
         grit::serve3::tools::faults::disarm();
-        let refused = refused.expect("a replay that never fits was never refused up front");
-        assert!(refused < Duration::from_millis(500), "{refused:?}");
-        assert!(
-            cut <= bound,
-            "{cut} calls were cut before the refusal; with {fast} fast ratios kept, the fastest of the last {bound} ratios needs at most {bound} cut calls"
-        );
+        let answer = answer.unwrap_or_else(|| {
+            panic!("refused {refused} times in a row with a same-size create between each")
+        });
+        assert_eq!(refused, grit::serve3::budget::REMEASURE_AFTER, "{answer}");
+        assert!(answer.contains("stopped on budget"), "{answer}");
     }
 }

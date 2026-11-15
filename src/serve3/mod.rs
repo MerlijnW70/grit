@@ -834,55 +834,41 @@ impl<'host> Server<'host> {
 
     fn replay_least(&self, ledger: &Ledger, bytes: u64) -> (Duration, budget::Basis) {
         let rates = &self.book.rates;
-        let sparse = ledger.made().sparse;
+        if let Some(least) = rates.journal_least(ledger.journal()) {
+            return (least, budget::Basis::Measured);
+        }
+        let (build, basis) = rates.least_of(budget::Work::build(ledger.made().sparse), bytes);
         let snapshot = match (&ledger.base, self.book.keep.as_ref()) {
             (Base::Snapshot(snap), Some(keep)) if snap.image.is_none() => {
                 std::fs::metadata(keep.snapshot(&snap.sum)).map_or(0, |found| found.len())
             }
             _ => 0,
         };
-        let mut parts = vec![rates.least_of(budget::Work::build(sparse), bytes)];
-        if snapshot > 0 {
-            parts.push(rates.least_of(budget::Work::File, snapshot));
+        if snapshot == 0 {
+            return (build, basis);
         }
-        if ledger.write_bytes() > 0 {
-            parts.push(rates.least_of(budget::Work::write(sparse), ledger.write_bytes()));
-        }
-        let steps = rates.replaying_least(ledger.step_recorded());
-        if !steps.is_zero() {
-            parts.push((steps, budget::Basis::Measured));
-        }
-        parts
-            .into_iter()
-            .filter(|(needs, _)| !needs.is_zero())
-            .fold(
-                None,
-                |all: Option<(Duration, budget::Basis)>, (needs, basis)| {
-                    Some(all.map_or((needs, basis), |(sum, was)| {
-                        (sum.saturating_add(needs), was.with(basis))
-                    }))
-                },
-            )
-            .unwrap_or((Duration::ZERO, budget::Basis::Fastest))
+        let (file, filed) = rates.least_of(budget::Work::File, snapshot);
+        (build.saturating_add(file), basis.with(filed))
     }
 
     fn fits(&mut self, work: budget::Work, bytes: u64, what: &str) -> Result<(), Failed> {
-        let needs = self.book.rates.least_of(work, bytes);
-        self.admits(needs, work, bytes, what)
-    }
-
-    fn admits(
-        &mut self,
-        (needs, basis): (Duration, budget::Basis),
-        work: budget::Work,
-        bytes: u64,
-        what: &str,
-    ) -> Result<(), Failed> {
+        let (needs, basis) = self.book.rates.least_of(work, bytes);
         let left = self.clock.left();
         if needs > left && self.book.rates.refuses(work, bytes) {
             return Err(Box::new(budget::too_slow(needs, left, what, basis)));
         }
         self.book.rates.admitted(work, bytes);
+        Ok(())
+    }
+
+    fn admits_replay(&mut self, ledger: &Ledger, bytes: u64, what: &str) -> Result<(), Failed> {
+        let (needs, basis) = self.replay_least(ledger, bytes);
+        let journal = ledger.journal();
+        let left = self.clock.left();
+        if needs > left && self.book.rates.refuses_replay(journal) {
+            return Err(Box::new(budget::too_slow(needs, left, what, basis)));
+        }
+        self.book.rates.admitted_replay(journal);
         Ok(())
     }
 
@@ -893,10 +879,10 @@ impl<'host> Server<'host> {
         pace: &mut Pace,
         bytes: u64,
     ) -> Result<World<'host>, Failed> {
-        let write = budget::Work::write(ledger.made().sparse);
         let guard = self.guard();
         let mut held = self.held_replay();
         let mut timings = journal::Timings::default();
+        let began = Instant::now();
         let built = journal::rebuilt(
             host,
             ledger,
@@ -908,6 +894,7 @@ impl<'host> Server<'host> {
                 paced(world, frames, pace, &guard)
             },
         );
+        let took = began.elapsed();
         let rates = &mut self.book.rates;
         if !timings.build.is_zero() {
             rates.measure(
@@ -919,35 +906,16 @@ impl<'host> Server<'host> {
         if timings.file_bytes > 0 {
             rates.measure(budget::Work::File, timings.file_bytes, timings.file);
         }
-        let taught = built
-            .as_ref()
-            .err()
-            .and_then(|why| why.downcast_ref::<budget::Halted>())
-            .is_some_and(|halted| halted.stop == Stop::Budget);
-        if taught && timings.write_cut && !timings.writes.is_zero() {
-            let total = ledger.write_bytes();
-            let share = total as f64 / timings.write_bytes.max(1) as f64;
-            let had = timings.writes.saturating_sub(timings.overran);
-            rates.measure_cut(
-                write,
-                total,
-                budget::scaled(had, share).max(had.saturating_add(budget::CUT_MARGIN)),
+        if timings.write_bytes > 0 {
+            rates.measure(
+                budget::Work::write(ledger.made().sparse),
+                timings.write_bytes,
+                timings.writes,
             );
-        } else {
-            if timings.write_bytes > 0 {
-                rates.measure(write, timings.write_bytes, timings.writes);
-            }
-            if taught && timings.step_cut {
-                let had = timings.steps.saturating_sub(timings.overran);
-                let floor = budget::ratio(
-                    had.saturating_add(budget::CUT_MARGIN),
-                    ledger.step_recorded(),
-                );
-                let bound = budget::ratio(had, timings.recorded.saturating_add(timings.stepping));
-                rates.measure_cut_replay(timings.recorded, had, floor.max(bound));
-            } else if built.is_ok() {
-                rates.measure_replay(timings.recorded, timings.steps);
-            }
+        }
+        if built.is_ok() {
+            rates.measure_journal(ledger.journal(), took);
+            rates.measure_replay(timings.recorded, timings.steps);
         }
         built
     }
@@ -965,10 +933,8 @@ impl<'host> Server<'host> {
         };
         let replayed = u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX);
         let host = self.host.ok_or(crate::host::Error::NoComputeDevice)?;
-        let needs = self.replay_least(&ledger, bytes);
-        self.admits(
-            needs,
-            budget::Work::build(ledger.made().sparse),
+        self.admits_replay(
+            &ledger,
             bytes,
             &format!("rebuilding world {number} after the lost device"),
         )?;

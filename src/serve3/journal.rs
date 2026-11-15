@@ -54,7 +54,7 @@ const PARAMS: u32 = 6;
 
 const RECORD_WORDS_MOST: usize = 1 << 24;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Made {
     pub rule: String,
     pub params: Vec<u32>,
@@ -105,7 +105,7 @@ pub enum Base {
     Snapshot(Arc<Snap>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Entry {
     Write(Vec<([u32; 3], u32)>),
     Step(u32),
@@ -171,6 +171,18 @@ impl Ledger {
     pub fn with_law(mut self, law: Option<Arc<str>>) -> Self {
         self.law = law;
         self
+    }
+
+    #[must_use]
+    pub fn journal(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        match &self.base {
+            Base::Created(made) => (0_u8, made).hash(&mut hasher),
+            Base::Snapshot(snap) => (1_u8, snap.sum, snap.frame).hash(&mut hasher),
+        }
+        (&self.law, &self.entries, &self.recorded, self.frame).hash(&mut hasher);
+        hasher.finish()
     }
 
     #[must_use]
@@ -1033,10 +1045,6 @@ pub struct Timings {
     pub writes: Duration,
     pub recorded: Duration,
     pub steps: Duration,
-    pub write_cut: bool,
-    pub step_cut: bool,
-    pub stepping: Duration,
-    pub overran: Duration,
 }
 
 pub fn rebuilt<'host>(
@@ -1093,7 +1101,6 @@ pub fn rebuilt<'host>(
     };
     timings.build = began.elapsed().saturating_sub(timings.file);
     let of = ledger.entries.len();
-    let mut last = None;
     for (at, entry) in ledger.entries.iter().enumerate() {
         let halted = |stop, frame| {
             Box::new(super::budget::Halted {
@@ -1105,68 +1112,37 @@ pub fn rebuilt<'host>(
             }) as super::Failed
         };
         if let Some(stop) = guard.stop() {
-            timings.write_cut = last == Some(true);
-            timings.step_cut = last == Some(false);
             return Err(halted(stop, world.frame()));
         }
         match entry {
             Entry::Write(cells) => {
-                let had = guard.left();
                 let writing = std::time::Instant::now();
                 let chunk = if world.pool().is_some() {
                     cells.len().max(1)
                 } else {
                     WRITE_CHUNK
                 };
-                let mut written = 0_usize;
-                let mut stopped = None;
                 for piece in cells.chunks(chunk) {
                     if let Some(stop) = guard.stop() {
-                        stopped = Some(stop);
-                        break;
+                        return Err(halted(stop, world.frame()));
                     }
                     world.write(piece)?;
-                    written += piece.len();
                 }
-                let share = written as f64 / cells.len().max(1) as f64;
-                let took = writing.elapsed();
-                timings.writes = timings.writes.saturating_add(took);
-                timings.overran = took.saturating_sub(had);
-                timings.write_bytes = timings
-                    .write_bytes
-                    .saturating_add((entry.bytes() as f64 * share) as u64);
-                if let Some(stop) = stopped {
-                    timings.write_cut = true;
-                    return Err(halted(stop, world.frame()));
-                }
-                last = Some(true);
+                timings.writes = timings.writes.saturating_add(writing.elapsed());
+                timings.write_bytes = timings.write_bytes.saturating_add(entry.bytes() as u64);
             }
             Entry::Params(params) => super::law::reparam(&mut world, params)?,
             Entry::Step(frames) => {
-                let had = guard.left();
                 let stepped = std::time::Instant::now();
-                let from = world.frame();
-                let ran = stepping(&mut world, *frames);
-                let took = stepped.elapsed();
-                timings.steps = timings.steps.saturating_add(took);
-                timings.overran = took.saturating_sub(had);
-                let share =
-                    f64::from(world.frame().saturating_sub(from)) / f64::from((*frames).max(1));
-                let recorded = ledger.recorded.get(at).copied().unwrap_or_default();
-                timings.recorded = timings
-                    .recorded
-                    .saturating_add(super::budget::scaled(recorded, share.min(1.0)));
-                if let Err(why) = ran {
+                if let Err(why) = stepping(&mut world, *frames) {
                     return Err(match why.downcast_ref::<super::budget::Cut>() {
-                        Some(cut) => {
-                            timings.step_cut = true;
-                            timings.stepping = recorded;
-                            halted(cut.0, world.frame())
-                        }
+                        Some(cut) => halted(cut.0, world.frame()),
                         None => why,
                     });
                 }
-                last = Some(false);
+                timings.steps = timings.steps.saturating_add(stepped.elapsed());
+                let recorded = ledger.recorded.get(at).copied().unwrap_or_default();
+                timings.recorded = timings.recorded.saturating_add(recorded);
             }
         }
     }

@@ -505,7 +505,9 @@ pub const SAMPLES_KEPT: usize = 32;
 
 pub const REMEASURE_AFTER: u32 = 8;
 
-pub const CUT_MARGIN: Duration = Duration::from_millis(1);
+pub const JOURNALS_KEPT: usize = 256;
+
+const REPLAY_KEY: usize = Work::ALL.len();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Basis {
@@ -538,41 +540,34 @@ impl Basis {
 
 #[derive(Debug, Clone, Default)]
 struct Samples {
-    seen: std::collections::VecDeque<(u64, f64, bool)>,
+    seen: std::collections::VecDeque<(u64, f64)>,
 }
 
-fn recent(held: impl Iterator<Item = (f64, bool)>) -> Option<f64> {
-    let last: Vec<(f64, bool)> = held.take(RECENT).collect();
-    let finished = last.iter().any(|(_, cut)| !cut);
-    let values = last.iter().map(|(value, _)| *value);
-    if finished {
-        values.reduce(f64::min)
-    } else {
-        values.reduce(f64::max)
-    }
+fn recent(held: impl Iterator<Item = f64>) -> Option<f64> {
+    held.take(RECENT).reduce(f64::min)
 }
 
 impl Samples {
-    fn push(&mut self, bytes: u64, spent: f64, cut: bool) {
+    fn push(&mut self, bytes: u64, spent: f64) {
         if self.seen.len() == SAMPLES_KEPT {
             self.seen.pop_front();
         }
-        self.seen.push_back((bytes, spent, cut));
+        self.seen.push_back((bytes, spent));
     }
 
     fn evidence(&self, bytes: u64) -> Option<(f64, u64)> {
         let class = self
             .seen
             .iter()
-            .map(|(size, _, _)| *size)
+            .map(|(size, _)| *size)
             .filter(|size| *size <= bytes)
             .max()?;
         recent(
             self.seen
                 .iter()
                 .rev()
-                .filter(|(size, _, _)| *size == class)
-                .map(|(_, spent, cut)| (*spent, *cut)),
+                .filter(|(size, _)| *size == class)
+                .map(|(_, spent)| *spent),
         )
         .map(|spent| (spent, class))
     }
@@ -636,7 +631,9 @@ pub struct Rates {
     kinds: [Kept; 10],
     replay: Kept,
     samples: [Samples; 10],
-    ratios: std::collections::VecDeque<(f64, bool)>,
+    journals: BTreeMap<u64, std::collections::VecDeque<f64>>,
+    journal_order: std::collections::VecDeque<u64>,
+    replays_seen: u64,
     refused: BTreeMap<(usize, u64), u32>,
 }
 
@@ -695,7 +692,23 @@ impl Rates {
     }
 
     pub fn refuses(&mut self, work: Work, bytes: u64) -> bool {
-        let refused = self.refused.entry((work.index(), bytes)).or_insert(0);
+        self.refused_at((work.index(), bytes))
+    }
+
+    pub fn admitted(&mut self, work: Work, bytes: u64) {
+        self.refused.remove(&(work.index(), bytes));
+    }
+
+    pub fn refuses_replay(&mut self, journal: u64) -> bool {
+        self.refused_at((REPLAY_KEY, journal))
+    }
+
+    pub fn admitted_replay(&mut self, journal: u64) {
+        self.refused.remove(&(REPLAY_KEY, journal));
+    }
+
+    fn refused_at(&mut self, key: (usize, u64)) -> bool {
+        let refused = self.refused.entry(key).or_insert(0);
         if *refused >= REMEASURE_AFTER {
             *refused = 0;
             return false;
@@ -704,19 +717,11 @@ impl Rates {
         true
     }
 
-    pub fn admitted(&mut self, work: Work, bytes: u64) {
-        self.refused.remove(&(work.index(), bytes));
-    }
-
-    pub fn measure_cut(&mut self, work: Work, bytes: u64, spent: Duration) {
-        self.sampled(work, bytes, spent, true);
-    }
-
-    fn sampled(&mut self, work: Work, bytes: u64, spent: Duration, cut: bool) {
+    fn sampled(&mut self, work: Work, bytes: u64, spent: Duration) {
         if let Some(samples) = self.samples.get_mut(work.index())
             && !spent.is_zero()
         {
-            samples.push(bytes, spent.as_secs_f64(), cut);
+            samples.push(bytes, spent.as_secs_f64());
         }
     }
 
@@ -733,7 +738,7 @@ impl Rates {
         if let Some(kept) = self.kinds.get_mut(work.index()) {
             kept.push(size, taken);
         }
-        self.sampled(work, bytes, spent, false);
+        self.sampled(work, bytes, spent);
     }
 
     #[must_use]
@@ -747,37 +752,40 @@ impl Rates {
     }
 
     #[must_use]
-    pub fn replay_least(&self) -> f64 {
-        recent(self.ratios.iter().rev().copied()).unwrap_or(0.0)
+    pub fn journal_least(&self, journal: u64) -> Option<Duration> {
+        let held = self.journals.get(&journal)?;
+        recent(held.iter().rev().copied())
+            .map(|spent| Duration::try_from_secs_f64(spent).unwrap_or(Duration::MAX))
     }
 
-    #[must_use]
-    pub fn replaying_least(&self, recorded: Duration) -> Duration {
-        scaled(recorded, self.replay_least())
+    pub fn measure_journal(&mut self, journal: u64, spent: Duration) {
+        if spent.is_zero() {
+            return;
+        }
+        if !self.journals.contains_key(&journal) {
+            if self.journal_order.len() == JOURNALS_KEPT
+                && let Some(oldest) = self.journal_order.pop_front()
+            {
+                self.journals.remove(&oldest);
+            }
+            self.journal_order.push_back(journal);
+        }
+        let held = self.journals.entry(journal).or_default();
+        if held.len() == RECENT {
+            held.pop_front();
+        }
+        held.push_back(spent.as_secs_f64());
+        self.replays_seen = self.replays_seen.saturating_add(1);
     }
 
     pub fn measure_replay(&mut self, recorded: Duration, spent: Duration) {
         if recorded < RATIO_LEAST_RECORDED {
             return;
         }
-        self.replayed(spent.as_secs_f64() / recorded.as_secs_f64(), false);
-    }
-
-    pub fn measure_cut_replay(&mut self, recorded: Duration, spent: Duration, least: f64) {
-        if spent.is_zero() {
-            return;
-        }
-        self.replayed(ratio(spent, recorded).max(least), true);
-    }
-
-    fn replayed(&mut self, sample: f64, cut: bool) {
+        let sample = spent.as_secs_f64() / recorded.as_secs_f64();
         if !sample.is_finite() || sample <= 0.0 {
             return;
         }
-        if self.ratios.len() == SAMPLES_KEPT {
-            self.ratios.pop_front();
-        }
-        self.ratios.push_back((sample, cut));
         let around = self.replay.middle(2.0, 1.0).clamp(RATIO_LEAST, RATIO_MOST);
         let taken = bounded(sample, around, RATIO_LEAST, RATIO_MOST);
         self.replay.push(1.0, taken);
@@ -806,7 +814,7 @@ impl Rates {
             "replay_per_recorded_percent",
             counted64((self.replay() * 100.0) as u64),
         ));
-        shown.push(("replay_observations", counted64(self.ratios.len() as u64)));
+        shown.push(("replay_observations", counted64(self.replays_seen)));
         map(shown)
     }
 }
@@ -817,14 +825,6 @@ pub fn scaled(time: Duration, by: f64) -> Duration {
         return Duration::ZERO;
     }
     Duration::try_from_secs_f64(time.as_secs_f64() * by).unwrap_or(Duration::MAX)
-}
-
-#[must_use]
-pub fn ratio(time: Duration, of: Duration) -> f64 {
-    if of.is_zero() {
-        return 0.0;
-    }
-    time.as_secs_f64() / of.as_secs_f64()
 }
 
 #[must_use]

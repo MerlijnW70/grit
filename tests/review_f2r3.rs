@@ -234,6 +234,8 @@ mod served {
         };
         let budget = 150_u64;
         let mut burned = 0;
+        let mut late = 0;
+        let mut refused = 0;
         let mut opened = false;
         for call in 0..8 {
             let (got, took) = ask(&mut server, budget);
@@ -246,6 +248,12 @@ mod served {
             if took >= Duration::from_millis(budget) {
                 burned += 1;
             }
+            if took > Duration::from_millis(budget) + Duration::from_secs(1) {
+                late += 1;
+            }
+            if text.contains("nothing ran") {
+                refused += 1;
+            }
         }
         let rates = written(&server.heard("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"grit_describe\",\"arguments\":{}}}").unwrap());
         let at = rates.find("\"rates\"").unwrap_or(0);
@@ -256,8 +264,8 @@ mod served {
             return;
         }
         assert!(
-            burned <= 3,
-            "a sparse replay that never fits {budget} ms ran its whole budget {burned} of 8 calls"
+            late == 0 && refused == 0,
+            "a sparse replay that never fits {budget} ms ran its whole budget {burned} of 8 calls, {late} of them past it by more than 1 s, and was refused {refused} times without a finished replay"
         );
     }
 }

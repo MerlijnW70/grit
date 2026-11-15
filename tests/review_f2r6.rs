@@ -173,15 +173,15 @@ mod served {
                     "setup: not cut by budget: {}",
                     written(&stopped)
                 );
-                if ratios(&mut server) == before + 1 {
+                if ratios(&mut server) == before {
                     break;
                 }
             }
             server.faults().lock().unwrap().held_replays = 0;
             assert_eq!(
                 ratios(&mut server),
-                before + 1,
-                "setup: no cut landed in the step in four attempts"
+                before,
+                "setup: a cut taught a replay sample"
             );
         }
         let enough = enough.max(worst + build * 3 / 4);
