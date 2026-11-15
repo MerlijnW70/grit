@@ -244,8 +244,8 @@ impl Ledger {
             .replay_most()
             .max(elapsed.saturating_mul(4))
             .saturating_mul(HARD);
-        let tail = tail_replay.saturating_add(extra).mul_f64(ratio);
-        let whole = self.replay.saturating_add(extra).mul_f64(ratio);
+        let tail = super::budget::scaled(tail_replay.saturating_add(extra), ratio);
+        let whole = super::budget::scaled(self.replay.saturating_add(extra), ratio);
         tail_bytes > bound.saturating_mul(HARD as usize)
             || tail > tail_most
             || self.bytes > bound.saturating_mul(WRITING_BYTES_FACTOR)
@@ -257,7 +257,7 @@ impl Ledger {
             .unwrap_or(usize::MAX)
             .max(JOURNAL_LEAST)
             .saturating_mul(times as usize);
-        let replaying = self.replay.saturating_add(extra).mul_f64(ratio.max(1.0));
+        let replaying = super::budget::scaled(self.replay.saturating_add(extra), ratio.max(1.0));
         self.bytes > bytes || replaying > self.replay_most().saturating_mul(times)
     }
 
@@ -1034,6 +1034,8 @@ pub struct Timings {
     pub recorded: Duration,
     pub steps: Duration,
     pub write_cut: bool,
+    pub step_cut: bool,
+    pub stepping: Duration,
 }
 
 pub fn rebuilt<'host>(
@@ -1090,6 +1092,7 @@ pub fn rebuilt<'host>(
     };
     timings.build = began.elapsed().saturating_sub(timings.file);
     let of = ledger.entries.len();
+    let mut last = None;
     for (at, entry) in ledger.entries.iter().enumerate() {
         let halted = |stop, frame| {
             Box::new(super::budget::Halted {
@@ -1101,7 +1104,8 @@ pub fn rebuilt<'host>(
             }) as super::Failed
         };
         if let Some(stop) = guard.stop() {
-            timings.write_cut = matches!(entry, Entry::Write(_));
+            timings.write_cut = last == Some(true);
+            timings.step_cut = last == Some(false);
             return Err(halted(stop, world.frame()));
         }
         match entry {
@@ -1131,6 +1135,7 @@ pub fn rebuilt<'host>(
                     timings.write_cut = true;
                     return Err(halted(stop, world.frame()));
                 }
+                last = Some(true);
             }
             Entry::Params(params) => super::law::reparam(&mut world, params)?,
             Entry::Step(frames) => {
@@ -1140,20 +1145,21 @@ pub fn rebuilt<'host>(
                 timings.steps = timings.steps.saturating_add(stepped.elapsed());
                 let share =
                     f64::from(world.frame().saturating_sub(from)) / f64::from((*frames).max(1));
-                timings.recorded = timings.recorded.saturating_add(
-                    ledger
-                        .recorded
-                        .get(at)
-                        .copied()
-                        .unwrap_or_default()
-                        .mul_f64(share.min(1.0)),
-                );
+                let recorded = ledger.recorded.get(at).copied().unwrap_or_default();
+                timings.recorded = timings
+                    .recorded
+                    .saturating_add(super::budget::scaled(recorded, share.min(1.0)));
                 if let Err(why) = ran {
                     return Err(match why.downcast_ref::<super::budget::Cut>() {
-                        Some(cut) => halted(cut.0, world.frame()),
+                        Some(cut) => {
+                            timings.step_cut = true;
+                            timings.stepping = recorded;
+                            halted(cut.0, world.frame())
+                        }
                         None => why,
                     });
                 }
+                last = Some(false);
             }
         }
     }

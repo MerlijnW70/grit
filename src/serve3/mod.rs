@@ -893,7 +893,10 @@ impl<'host> Server<'host> {
         pace: &mut Pace,
         bytes: u64,
     ) -> Result<World<'host>, Failed> {
-        let had = self.clock.left();
+        let call = self
+            .clock
+            .deadline
+            .saturating_duration_since(self.clock.began);
         let (whole, _) = self.replay_least(ledger, bytes);
         let write = budget::Work::write(ledger.made().sparse);
         let writes_least = self.book.rates.least(write, ledger.write_bytes());
@@ -934,20 +937,20 @@ impl<'host> Server<'host> {
             rates.measure_cut(
                 write,
                 total,
-                timings
-                    .writes
-                    .mul_f64(share)
-                    .max(had.saturating_sub(others)),
+                budget::scaled(timings.writes, share).max(call.saturating_sub(others)),
             );
         } else {
             if timings.write_bytes > 0 {
                 rates.measure(write, timings.write_bytes, timings.writes);
             }
-            if cut {
+            if cut && timings.step_cut {
                 let others = whole.saturating_sub(steps_least);
-                let recorded = ledger.step_recorded().as_secs_f64().max(f64::MIN_POSITIVE);
-                let least = had.saturating_sub(others).as_secs_f64() / recorded;
-                rates.measure_cut_replay(timings.recorded, timings.steps, least);
+                let floor = budget::ratio(call.saturating_sub(others), ledger.step_recorded());
+                let bound = budget::ratio(
+                    timings.steps,
+                    timings.recorded.saturating_add(timings.stepping),
+                );
+                rates.measure_cut_replay(timings.recorded, timings.steps, floor.max(bound));
             } else if built.is_ok() {
                 rates.measure_replay(timings.recorded, timings.steps);
             }
@@ -1313,6 +1316,7 @@ impl<'host> Server<'host> {
                 )),
             ));
         }
+        self.book.rates.admitted(work, size);
         self.snap_now(number)
     }
 

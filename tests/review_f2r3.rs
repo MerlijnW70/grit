@@ -145,7 +145,11 @@ mod served {
         let mut server = Server::new(Some(&host));
         let (_, warm) = create(&mut server, 16, None);
         let (made, first) = create(&mut server, 256, None);
-        if made.get("isError") != Some(&Json::Bool(false)) {
+        let refused = made
+            .get("structuredContent")
+            .and_then(|told| told.get("code"))
+            .and_then(Json::text);
+        if refused == Some("too_big") {
             eprintln!(
                 "this device cannot make a dense 256^3 world: {}",
                 written(&made)

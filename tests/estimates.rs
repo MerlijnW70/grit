@@ -22,6 +22,66 @@ fn budget() -> Duration {
 }
 
 #[test]
+fn extreme_samples_never_panic_any_least_or_refusal() {
+    let tiny = Duration::from_nanos(1);
+    let mut rates = Rates::default();
+    for work in Work::ALL {
+        for (bytes, spent) in [
+            (0, Duration::MAX),
+            (u64::MAX, Duration::MAX),
+            (1, tiny),
+            (u64::MAX, Duration::ZERO),
+            (0, Duration::ZERO),
+        ] {
+            rates.measure(work, bytes, spent);
+            rates.measure_cut(work, bytes, spent);
+        }
+    }
+    for (recorded, spent, least) in [
+        (Duration::ZERO, Duration::MAX, f64::MAX),
+        (tiny, Duration::MAX, 0.0),
+        (Duration::MAX, Duration::MAX, f64::INFINITY),
+        (Duration::ZERO, tiny, f64::NAN),
+        (Duration::MAX, tiny, 0.0),
+        (Duration::ZERO, Duration::from_millis(600), 0.0),
+    ] {
+        rates.measure_cut_replay(recorded, spent, least);
+        rates.measure_replay(recorded, spent);
+    }
+    for work in Work::ALL {
+        for bytes in [0, 1, WORLD_LEAST, u64::MAX] {
+            let (least, basis) = rates.least_of(work, bytes);
+            assert!(least <= Duration::MAX);
+            let _ = rates.estimate(work, bytes);
+            let _ = rates.refuses(work, bytes, basis);
+            rates.admitted(work, bytes);
+        }
+    }
+    for recorded in [Duration::ZERO, tiny, Duration::from_secs(1), Duration::MAX] {
+        let _ = rates.replaying_least(recorded);
+        let _ = rates.replaying(recorded);
+    }
+    let _ = rates.shown();
+    let told = grit::serve3::budget::too_slow(Duration::MAX, Duration::ZERO, "work", Basis::Both);
+    assert!(told.message.contains("needs at least"), "{}", told.message);
+}
+
+#[test]
+fn a_replay_cut_before_its_first_frame_records_a_finite_lower_bound() {
+    let mut rates = Rates::default();
+    let entry = Duration::from_secs(1);
+    let spent = Duration::from_millis(1500);
+    let bound = spent.as_secs_f64() / entry.as_secs_f64();
+    rates.measure_cut_replay(Duration::ZERO, spent, bound);
+    assert!(
+        (rates.replay_least() - 1.5).abs() < 1e-9,
+        "{}",
+        rates.replay_least()
+    );
+    assert_eq!(rates.replaying_least(entry), spent);
+}
+
+#[test]
 fn one_held_up_build_never_refuses_a_larger_world_the_device_builds_in_time() {
     let held = Duration::from_millis(2200);
     let mut rates = Rates::default();
@@ -492,6 +552,64 @@ mod served {
         assert!(again < short, "{again:?}");
         let fits = built(&mut server, 16, Some(short));
         assert!(fits < short, "{fits:?}");
+    }
+
+    #[test]
+    fn a_step_that_uses_up_the_budget_before_a_write_is_recorded_as_a_step() {
+        let Some(host) = device("cut attribution") else {
+            return;
+        };
+        let held = scratch("cut-attribution");
+        let dir = held.0.join("worlds");
+        let keep = Keep::at(&dir).unwrap();
+        let cells: Vec<([u32; 3], u32)> =
+            (0..64_u32).map(|at| ([at % 32, at / 32, 0], 1)).collect();
+        let mut ledger = Ledger::created(Made {
+            rule: "sand".to_owned(),
+            params: Vec::new(),
+            size: [32, 32, 32],
+            sparse: false,
+            slots: None,
+        });
+        ledger.push(Entry::Write(cells.clone()), Duration::from_millis(1));
+        ledger.push(Entry::Step(8), Duration::from_millis(100));
+        ledger.push(Entry::Write(cells), Duration::from_millis(1));
+        keep.begin(1, &ledger).unwrap();
+        keep.set_next(2).unwrap();
+        drop(keep);
+        let options = Options {
+            dir: Some(dir),
+            memory: None,
+        };
+        let mut server = Server::with(Some(&host), &options).unwrap();
+        let writes = |server: &mut Server<'_>| {
+            let told = result(&call(server, "grit_describe", "{}"), false);
+            int_at(
+                told.get("submissions")
+                    .and_then(|one| one.get("rates"))
+                    .and_then(|one| one.get("write"))
+                    .unwrap(),
+                "observations",
+            )
+        };
+        let ratios = replays_measured(&mut server);
+        let before = writes(&mut server);
+        grit::serve3::tools::faults::stall_batch(0, Duration::from_millis(800));
+        let told = result(&opened(&mut server, 1, Duration::from_millis(400)), true);
+        grit::serve3::tools::faults::disarm();
+        let message = told.get("message").and_then(Json::text).unwrap().to_owned();
+        eprintln!("a [write, step, write] journal with its step held up: {message}");
+        assert!(message.contains("nothing was opened"), "{message}");
+        assert_eq!(
+            replays_measured(&mut server),
+            ratios + 1,
+            "the cut was not recorded as a step"
+        );
+        assert_eq!(
+            writes(&mut server),
+            before + 1,
+            "only the first write entry, which ran whole, is a write sample"
+        );
     }
 
     struct Scratch(std::path::PathBuf);

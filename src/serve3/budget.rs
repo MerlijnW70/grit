@@ -724,7 +724,7 @@ impl Rates {
 
     #[must_use]
     pub fn replaying(&self, recorded: Duration) -> Duration {
-        recorded.mul_f64(self.replay())
+        scaled(recorded, self.replay())
     }
 
     #[must_use]
@@ -740,7 +740,7 @@ impl Rates {
 
     #[must_use]
     pub fn replaying_least(&self, recorded: Duration) -> Duration {
-        recorded.mul_f64(self.replay_least())
+        scaled(recorded, self.replay_least())
     }
 
     pub fn measure_replay(&mut self, recorded: Duration, spent: Duration) {
@@ -754,8 +754,7 @@ impl Rates {
         if spent.is_zero() {
             return;
         }
-        let ratio = spent.as_secs_f64() / recorded.as_secs_f64().max(f64::MIN_POSITIVE);
-        self.replayed(ratio.max(least));
+        self.replayed(ratio(spent, recorded).max(least));
     }
 
     fn replayed(&mut self, sample: f64) {
@@ -797,6 +796,22 @@ impl Rates {
         shown.push(("replay_observations", counted64(self.ratios.len() as u64)));
         map(shown)
     }
+}
+
+#[must_use]
+pub fn scaled(time: Duration, by: f64) -> Duration {
+    if by.is_nan() || by <= 0.0 {
+        return Duration::ZERO;
+    }
+    Duration::try_from_secs_f64(time.as_secs_f64() * by).unwrap_or(Duration::MAX)
+}
+
+#[must_use]
+pub fn ratio(time: Duration, of: Duration) -> f64 {
+    if of.is_zero() {
+        return 0.0;
+    }
+    time.as_secs_f64() / of.as_secs_f64()
 }
 
 #[must_use]
