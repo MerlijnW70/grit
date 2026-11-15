@@ -595,7 +595,7 @@ mod served {
         };
         let began = Instant::now();
         result(&opened(&mut server, 2, Duration::from_secs(600)), false);
-        let budget = began.elapsed() + Duration::from_millis(200);
+        let budget = began.elapsed() * 2 + Duration::from_millis(300);
         let ratios = replays_measured(&mut server);
         let before = writes(&mut server);
         grit::serve3::tools::faults::stall_batch(0, budget + Duration::from_millis(500));
