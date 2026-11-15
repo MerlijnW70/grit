@@ -927,26 +927,24 @@ impl<'host> Server<'host> {
         if taught && timings.write_cut && !timings.writes.is_zero() {
             let total = ledger.write_bytes();
             let share = total as f64 / timings.write_bytes.max(1) as f64;
+            let had = timings.writes.saturating_sub(timings.overran);
             rates.measure_cut(
                 write,
                 total,
-                budget::scaled(timings.writes, share)
-                    .max(timings.writes.saturating_add(budget::CUT_MARGIN)),
+                budget::scaled(had, share).max(had.saturating_add(budget::CUT_MARGIN)),
             );
         } else {
             if timings.write_bytes > 0 {
                 rates.measure(write, timings.write_bytes, timings.writes);
             }
             if taught && timings.step_cut {
+                let had = timings.steps.saturating_sub(timings.overran);
                 let floor = budget::ratio(
-                    timings.steps.saturating_add(budget::CUT_MARGIN),
+                    had.saturating_add(budget::CUT_MARGIN),
                     ledger.step_recorded(),
                 );
-                let bound = budget::ratio(
-                    timings.steps,
-                    timings.recorded.saturating_add(timings.stepping),
-                );
-                rates.measure_cut_replay(timings.recorded, timings.steps, floor.max(bound));
+                let bound = budget::ratio(had, timings.recorded.saturating_add(timings.stepping));
+                rates.measure_cut_replay(timings.recorded, had, floor.max(bound));
             } else if built.is_ok() {
                 rates.measure_replay(timings.recorded, timings.steps);
             }

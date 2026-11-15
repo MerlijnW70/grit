@@ -1036,6 +1036,7 @@ pub struct Timings {
     pub write_cut: bool,
     pub step_cut: bool,
     pub stepping: Duration,
+    pub overran: Duration,
 }
 
 pub fn rebuilt<'host>(
@@ -1110,6 +1111,7 @@ pub fn rebuilt<'host>(
         }
         match entry {
             Entry::Write(cells) => {
+                let had = guard.left();
                 let writing = std::time::Instant::now();
                 let chunk = if world.pool().is_some() {
                     cells.len().max(1)
@@ -1127,7 +1129,9 @@ pub fn rebuilt<'host>(
                     written += piece.len();
                 }
                 let share = written as f64 / cells.len().max(1) as f64;
-                timings.writes = timings.writes.saturating_add(writing.elapsed());
+                let took = writing.elapsed();
+                timings.writes = timings.writes.saturating_add(took);
+                timings.overran = took.saturating_sub(had);
                 timings.write_bytes = timings
                     .write_bytes
                     .saturating_add((entry.bytes() as f64 * share) as u64);
@@ -1139,10 +1143,13 @@ pub fn rebuilt<'host>(
             }
             Entry::Params(params) => super::law::reparam(&mut world, params)?,
             Entry::Step(frames) => {
+                let had = guard.left();
                 let stepped = std::time::Instant::now();
                 let from = world.frame();
                 let ran = stepping(&mut world, *frames);
-                timings.steps = timings.steps.saturating_add(stepped.elapsed());
+                let took = stepped.elapsed();
+                timings.steps = timings.steps.saturating_add(took);
+                timings.overran = took.saturating_sub(had);
                 let share =
                     f64::from(world.frame().saturating_sub(from)) / f64::from((*frames).max(1));
                 let recorded = ledger.recorded.get(at).copied().unwrap_or_default();

@@ -757,14 +757,14 @@ mod served {
             whole = whole.min(began.elapsed());
         }
         let cut = whole * 2;
-        let enough = cut + whole / 2;
+        let enough = cut + whole / 4;
         for number in 2..=4 {
             let before = replays_measured(&mut server);
             {
                 let faults = server.faults();
                 let mut armed = faults.lock().unwrap();
                 armed.held_replays = 1;
-                armed.held_by = cut.saturating_sub(whole) + Duration::from_millis(30);
+                armed.held_by = cut;
             }
             let told = result(&opened(&mut server, number, cut), true);
             let message = told.get("message").and_then(Json::text).unwrap();
