@@ -893,6 +893,11 @@ impl<'host> Server<'host> {
         pace: &mut Pace,
         bytes: u64,
     ) -> Result<World<'host>, Failed> {
+        let had = self.clock.left();
+        let (whole, _) = self.replay_least(ledger, bytes);
+        let write = budget::Work::write(ledger.made().sparse);
+        let writes_least = self.book.rates.least(write, ledger.write_bytes());
+        let steps_least = self.book.rates.replaying_least(ledger.step_recorded());
         let guard = self.guard();
         let mut held = self.held_replay();
         let mut timings = journal::Timings::default();
@@ -918,7 +923,6 @@ impl<'host> Server<'host> {
         if timings.file_bytes > 0 {
             rates.measure(budget::Work::File, timings.file_bytes, timings.file);
         }
-        let write = budget::Work::write(ledger.made().sparse);
         let cut = built
             .as_ref()
             .err()
@@ -926,13 +930,24 @@ impl<'host> Server<'host> {
         if timings.write_cut && !timings.writes.is_zero() {
             let total = ledger.write_bytes();
             let share = total as f64 / timings.write_bytes.max(1) as f64;
-            rates.measure_cut(write, total, timings.writes.mul_f64(share));
+            let others = whole.saturating_sub(writes_least);
+            rates.measure_cut(
+                write,
+                total,
+                timings
+                    .writes
+                    .mul_f64(share)
+                    .max(had.saturating_sub(others)),
+            );
         } else {
             if timings.write_bytes > 0 {
                 rates.measure(write, timings.write_bytes, timings.writes);
             }
             if cut {
-                rates.measure_cut_replay(timings.recorded, timings.steps);
+                let others = whole.saturating_sub(steps_least);
+                let recorded = ledger.step_recorded().as_secs_f64().max(f64::MIN_POSITIVE);
+                let least = had.saturating_sub(others).as_secs_f64() / recorded;
+                rates.measure_cut_replay(timings.recorded, timings.steps, least);
             } else if built.is_ok() {
                 rates.measure_replay(timings.recorded, timings.steps);
             }

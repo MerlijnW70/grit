@@ -750,22 +750,22 @@ impl Rates {
         self.replayed(spent.as_secs_f64() / recorded.as_secs_f64());
     }
 
-    pub fn measure_cut_replay(&mut self, recorded: Duration, spent: Duration) {
+    pub fn measure_cut_replay(&mut self, recorded: Duration, spent: Duration, least: f64) {
         if spent.is_zero() {
             return;
         }
-        self.replayed(spent.as_secs_f64() / recorded.as_secs_f64().max(f64::MIN_POSITIVE));
+        let ratio = spent.as_secs_f64() / recorded.as_secs_f64().max(f64::MIN_POSITIVE);
+        self.replayed(ratio.max(least));
     }
 
     fn replayed(&mut self, sample: f64) {
         if !sample.is_finite() || sample <= 0.0 {
             return;
         }
-        let ratio = sample.clamp(RATIO_LEAST, RATIO_MOST);
         if self.ratios.len() == SAMPLES_KEPT {
             self.ratios.pop_front();
         }
-        self.ratios.push_back(ratio);
+        self.ratios.push_back(sample);
         let around = self.replay.middle(2.0, 1.0).clamp(RATIO_LEAST, RATIO_MOST);
         let taken = bounded(sample, around, RATIO_LEAST, RATIO_MOST);
         self.replay.push(1.0, taken);

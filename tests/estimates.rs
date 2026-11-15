@@ -273,7 +273,7 @@ fn a_cut_replay_that_ran_few_frames_is_still_measured() {
         "a finished replay below the floor is noise"
     );
     for _ in 0..RECENT {
-        rates.measure_cut_replay(recorded, spent);
+        rates.measure_cut_replay(recorded, spent, 0.0);
     }
     assert!(
         rates.replay_least() >= 8.0 - 1e-9,
