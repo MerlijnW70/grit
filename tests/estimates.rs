@@ -728,7 +728,7 @@ mod served {
         let cells: Vec<([u32; 3], u32)> = (0..2048_u32)
             .map(|at| ([at % 32, (at / 32) % 32, at / 1024], 1 + at % 2))
             .collect();
-        for number in 1..=6 {
+        for number in 1..=7 {
             let mut ledger = Ledger::created(Made {
                 rule: "sand".to_owned(),
                 params: Vec::new(),
@@ -740,16 +740,22 @@ mod served {
             ledger.push(Entry::Step(40), Duration::from_secs(1));
             keep.begin(number, &ledger).unwrap();
         }
-        keep.set_next(7).unwrap();
+        keep.set_next(8).unwrap();
         drop(keep);
         let options = Options {
             dir: Some(dir),
             memory: None,
         };
         let mut server = Server::with(Some(&host), &options).unwrap();
-        let began = Instant::now();
-        result(&opened(&mut server, 1, Duration::from_secs(600)), false);
-        let whole = began.elapsed();
+        let mut whole = Duration::MAX;
+        for number in [1, 6] {
+            let began = Instant::now();
+            result(
+                &opened(&mut server, number, Duration::from_secs(600)),
+                false,
+            );
+            whole = whole.min(began.elapsed());
+        }
         let cut = whole * 2;
         let enough = cut + whole / 2;
         for number in 2..=4 {
@@ -775,7 +781,7 @@ mod served {
             &mut server,
             "grit_world_open",
             &format!(
-                "{{\"name\":\"world-6\",\"budget_ms\":{}}}",
+                "{{\"name\":\"world-7\",\"budget_ms\":{}}}",
                 enough.as_millis()
             ),
         );

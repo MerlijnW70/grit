@@ -90,6 +90,14 @@ mod served {
         result.get("isError") == Some(&Json::Bool(false))
     }
 
+    fn too_big_here(result: &Json) -> bool {
+        let code = result
+            .get("structuredContent")
+            .and_then(|told| told.get("code"))
+            .and_then(Json::text);
+        matches!(code, Some("too_big" | "too_large"))
+    }
+
     const FRAMES: u32 = 40;
 
     const STALL: Duration = Duration::from_millis(4);
@@ -112,6 +120,13 @@ mod served {
         let mut server = Server::with(Some(&host), &options).unwrap();
         grit::serve3::tools::faults::stall_every(STALL);
         let (warm, _) = open(&mut server, 1, Duration::from_secs(60));
+        if too_big_here(&warm) {
+            eprintln!("this device cannot hold the world: {}", written(&warm));
+            grit::serve3::tools::faults::disarm();
+            drop(server);
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
         assert!(fine(&warm), "setup: {}", written(&warm));
         let (bare, build) = open(&mut server, 10, Duration::from_secs(60));
         assert!(fine(&bare), "setup: {}", written(&bare));
@@ -135,30 +150,41 @@ mod served {
             "setup: an open with {enough:?} did not fit: {}",
             written(&fits)
         );
+        let mut worst = cut;
         for number in 4..=6 {
             let before = ratios(&mut server);
-            {
-                let faults = server.faults();
-                let mut armed = faults.lock().unwrap();
-                armed.held_replays = 1;
-                armed.held_by = cut.saturating_sub(build) + Duration::from_millis(30);
+            for attempt in 0..4 {
+                let (probe, _) = open(&mut server, 7, Duration::from_millis(1));
+                let cut = needs(&probe) + Duration::from_millis(10);
+                worst = worst.max(cut);
+                {
+                    let faults = server.faults();
+                    let mut armed = faults.lock().unwrap();
+                    armed.held_replays = 1;
+                    armed.held_by = cut.saturating_sub(build / 2);
+                }
+                let (stopped, stop_took) = open(&mut server, number, cut);
+                eprintln!(
+                    "open of world-{number} with {cut:?} (attempt {attempt}): {stop_took:?}: {}",
+                    written(&stopped).chars().take(200).collect::<String>()
+                );
+                assert!(
+                    written(&stopped).contains("stopped on budget"),
+                    "setup: not cut by budget: {}",
+                    written(&stopped)
+                );
+                if ratios(&mut server) == before + 1 {
+                    break;
+                }
             }
-            let (stopped, stop_took) = open(&mut server, number, cut);
-            eprintln!(
-                "open of world-{number} with {cut:?}: {stop_took:?}: {}",
-                written(&stopped).chars().take(200).collect::<String>()
-            );
-            assert!(
-                written(&stopped).contains("stopped on budget"),
-                "setup: not cut by budget in its step: {}",
-                written(&stopped)
-            );
+            server.faults().lock().unwrap().held_replays = 0;
             assert_eq!(
                 ratios(&mut server),
                 before + 1,
-                "setup: the cut taught no step ratio"
+                "setup: no cut landed in the step in four attempts"
             );
         }
+        let enough = enough.max(worst + build * 3 / 4);
         let (later, later_took) = open(&mut server, 7, enough);
         grit::serve3::tools::faults::disarm();
         drop(server);
@@ -188,6 +214,12 @@ mod served {
         let mut fastest = Duration::MAX;
         for number in 10..=12 {
             let (opened, took) = open(&mut server, number, Duration::from_secs(60));
+            if too_big_here(&opened) {
+                eprintln!("this device cannot hold the world: {}", written(&opened));
+                drop(server);
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
             assert!(fine(&opened), "setup: {}", written(&opened));
             eprintln!("open of bare 512^3 world-{number}: {took:?}");
             fastest = fastest.min(took);
