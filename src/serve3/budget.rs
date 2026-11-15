@@ -505,6 +505,8 @@ pub const SAMPLES_KEPT: usize = 32;
 
 pub const REMEASURE_AFTER: u32 = 8;
 
+pub const CUT_MARGIN: Duration = Duration::from_millis(1);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Basis {
     Measured,

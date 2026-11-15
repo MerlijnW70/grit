@@ -616,6 +616,74 @@ mod served {
         );
     }
 
+    fn cancelled_open(server: &mut Server<'_>, number: u32) {
+        let faults = server.faults();
+        {
+            let mut armed = faults.lock().unwrap();
+            armed.held_replays = 1;
+            armed.held_by = Duration::from_secs(3);
+        }
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setter = {
+            let flag = std::sync::Arc::clone(&flag);
+            let faults = std::sync::Arc::clone(&faults);
+            std::thread::spawn(move || {
+                while faults.lock().unwrap().held_replays > 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        server.arriving(None, Some(std::sync::Arc::clone(&flag)));
+        let told = result(&opened(server, number, Duration::from_secs(600)), true);
+        server.arriving(None, None);
+        setter.join().unwrap();
+        let message = told.get("message").and_then(Json::text).unwrap();
+        assert!(message.contains("cancelled"), "{message}");
+    }
+
+    #[test]
+    fn cancelled_replays_teach_no_ratio_and_never_refuse_an_open_that_fits() {
+        let Some(host) = device("cancelled replays") else {
+            return;
+        };
+        let held = scratch("cancelled");
+        let dir = held.0.join("worlds");
+        let keep = Keep::at(&dir).unwrap();
+        for number in 1..=5 {
+            let mut ledger = Ledger::created(Made {
+                rule: "sand".to_owned(),
+                params: Vec::new(),
+                size: [32, 32, 32],
+                sparse: false,
+                slots: None,
+            });
+            ledger.push(Entry::Step(400), Duration::from_secs(1));
+            keep.begin(number, &ledger).unwrap();
+        }
+        keep.set_next(6).unwrap();
+        drop(keep);
+        let options = Options {
+            dir: Some(dir),
+            memory: None,
+        };
+        let mut server = Server::with(Some(&host), &options).unwrap();
+        result(&opened(&mut server, 1, Duration::from_secs(600)), false);
+        let ratios = replays_measured(&mut server);
+        for number in 2..=4 {
+            cancelled_open(&mut server, number);
+            assert_eq!(
+                replays_measured(&mut server),
+                ratios,
+                "a cancelled replay taught a ratio"
+            );
+        }
+        let probe = result(&opened(&mut server, 5, Duration::from_millis(1)), true);
+        eprintln!("after one open and three cancels: {}", written(&probe));
+        result(&opened(&mut server, 5, Duration::from_secs(600)), false);
+    }
+
     struct Scratch(std::path::PathBuf);
 
     impl Drop for Scratch {

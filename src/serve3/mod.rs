@@ -893,14 +893,8 @@ impl<'host> Server<'host> {
         pace: &mut Pace,
         bytes: u64,
     ) -> Result<World<'host>, Failed> {
-        let call = self
-            .clock
-            .deadline
-            .saturating_duration_since(self.clock.began);
-        let (whole, _) = self.replay_least(ledger, bytes);
+        let had = self.clock.left();
         let write = budget::Work::write(ledger.made().sparse);
-        let writes_least = self.book.rates.least(write, ledger.write_bytes());
-        let steps_least = self.book.rates.replaying_least(ledger.step_recorded());
         let guard = self.guard();
         let mut held = self.held_replay();
         let mut timings = journal::Timings::default();
@@ -926,26 +920,26 @@ impl<'host> Server<'host> {
         if timings.file_bytes > 0 {
             rates.measure(budget::Work::File, timings.file_bytes, timings.file);
         }
-        let cut = built
+        let taught = built
             .as_ref()
             .err()
-            .is_some_and(|why| why.downcast_ref::<budget::Halted>().is_some());
-        if timings.write_cut && !timings.writes.is_zero() {
+            .and_then(|why| why.downcast_ref::<budget::Halted>())
+            .is_some_and(|halted| halted.stop == Stop::Budget);
+        let failed = had.saturating_add(budget::CUT_MARGIN);
+        if taught && timings.write_cut && !timings.writes.is_zero() {
             let total = ledger.write_bytes();
             let share = total as f64 / timings.write_bytes.max(1) as f64;
-            let others = whole.saturating_sub(writes_least);
             rates.measure_cut(
                 write,
                 total,
-                budget::scaled(timings.writes, share).max(call.saturating_sub(others)),
+                budget::scaled(timings.writes, share).max(failed),
             );
         } else {
             if timings.write_bytes > 0 {
                 rates.measure(write, timings.write_bytes, timings.writes);
             }
-            if cut && timings.step_cut {
-                let others = whole.saturating_sub(steps_least);
-                let floor = budget::ratio(call.saturating_sub(others), ledger.step_recorded());
+            if taught && timings.step_cut {
+                let floor = budget::ratio(failed, ledger.step_recorded());
                 let bound = budget::ratio(
                     timings.steps,
                     timings.recorded.saturating_add(timings.stepping),
