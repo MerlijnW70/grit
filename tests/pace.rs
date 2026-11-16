@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use grit::serve3::budget::{BATCH_MOST, FIXED_KEPT, FIXED_MOVES_AFTER, Pace, REFUSED_MOST};
+use grit::serve3::budget::{BATCH_MOST, FIXED_KEPT, Pace, REFUSED_MOST};
 
 #[derive(Debug, Clone, Copy)]
 struct Device {
@@ -79,7 +79,7 @@ fn a_world_whose_one_frame_outlasts_a_short_budget_is_refused_up_front_however_a
             }
         }
         assert!(
-            late.iter().all(|call_at| *call_at < FIXED_MOVES_AFTER),
+            late.iter().all(|call_at| *call_at < FIXED_KEPT),
             "a world whose one frame costs {:?} against a {SHORT:?} budget, a long client stepping {shape:?}: short calls {late:?} of 24 ran late; {pace:?}",
             slow.cost(1)
         );
@@ -136,7 +136,7 @@ fn a_world_whose_one_frame_fits_is_never_refused_however_large_the_long_clients_
             called(&mut pace, heavy, frames, LONG);
             let (ran, spent) = called(&mut pace, heavy, 65536, SHORT);
             assert!(
-                ran > 0 && (spent <= SHORT || call_at < FIXED_MOVES_AFTER),
+                ran > 0 && (spent <= SHORT || call_at < FIXED_KEPT),
                 "a world whose one frame costs {:?}, a long client stepping {shape:?}: short call {call_at} ran {ran} frames in {spent:?} of {SHORT:?}; {pace:?}",
                 heavy.cost(1)
             );
@@ -241,14 +241,14 @@ fn the_fixed_cost_is_split_only_from_batches_whose_sizes_differ_by_twice() {
 }
 
 #[test]
-fn the_fixed_cost_follows_the_device_after_a_majority_of_the_splits_it_keeps() {
+fn the_fixed_cost_follows_the_device_once_every_split_it_keeps_is_new() {
     let fast = Device::new(300, 20);
     let slow = Device::new(20_000, 30_000);
     let mut pace = Pace::first(0);
     called(&mut pace, fast, 4096, LONG);
     assert_eq!(pace.fixed(), fast.fixed, "{pace:?}");
     let mut sizes = [1_u32, 2].into_iter().cycle();
-    for _ in 0..FIXED_MOVES_AFTER {
+    for _ in 0..FIXED_KEPT {
         assert!(pace.fixed() < slow.fixed, "{pace:?}");
         let frames = sizes.next().unwrap();
         pace.ran(frames, slow.cost(frames));
@@ -298,6 +298,79 @@ fn a_fixed_cost_split_from_jittered_batches_keeps_a_world_too_slow_for_a_short_b
     assert!(
         late.is_empty(),
         "a frame of {:?} with up to 1 ms of jitter per batch against a {budget:?} budget: short calls {late:?} of 48 ran; {pace:?}",
+        device.cost(1)
+    );
+}
+
+#[test]
+fn the_fixed_cost_comes_from_the_most_precise_split_it_keeps() {
+    let device = Device::new(4_600, 2_250);
+    let off = Duration::from_millis(3);
+    let mut noisy = Pace::first(0);
+    noisy.ran(32, device.cost(32) + off);
+    noisy.ran(64, device.cost(64) - off);
+    let mut pace = Pace::first(0);
+    pace.ran(1, device.cost(1));
+    pace.ran(2, device.cost(2));
+    pace.ran(32, device.cost(32) + off);
+    pace.ran(64, device.cost(64) - off);
+    let close = Duration::from_micros(250);
+    assert!(
+        noisy.fixed().abs_diff(device.fixed) > off,
+        "batches of 32 and 64 frames, {off:?} off each, split far from the truth: {noisy:?}"
+    );
+    assert!(
+        pace.fixed().abs_diff(device.fixed) <= close,
+        "a split with a batch of 1 or 2 frames outranks one of 32 and 64: {pace:?}"
+    );
+}
+
+#[test]
+fn a_fixed_cost_split_from_batches_with_proportional_jitter_runs_late_on_few_calls() {
+    let device = Device::new(4_600, 2_250);
+    let budget = Duration::from_millis(5);
+    let seeds = 40_u64;
+    let calls = 96;
+    let mut late = 0;
+    for seed in 1..=seeds {
+        let mut state = seed;
+        let mut jittered = move |cost: Duration| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let parts = (state >> 33) % 61;
+            cost * u32::try_from(970 + parts).unwrap() / 1000
+        };
+        let mut pace = Pace::first(128 * 128 * 128);
+        for call_at in 0..calls {
+            let long = [96, 65536, 64, 3][call_at % 4];
+            for (frames, room) in [(long, LONG), (65536, budget)] {
+                let mut left = room;
+                let mut done = 0;
+                while done < frames {
+                    let step = if done == 0 {
+                        pace.opening(frames - done, left)
+                    } else {
+                        pace.batch(frames - done, left)
+                    };
+                    if step == 0 {
+                        break;
+                    }
+                    let took = jittered(device.cost(step));
+                    pace.ran(step, took);
+                    left = left.saturating_sub(took);
+                    done += step;
+                }
+                if room == budget && done > 0 {
+                    late += 1;
+                }
+            }
+        }
+    }
+    let all = seeds * u64::try_from(calls).unwrap();
+    assert!(
+        late * 50 <= all,
+        "a frame of {:?} with up to 3% jitter per batch against a {budget:?} budget: {late} of {all} short calls ran",
         device.cost(1)
     );
 }

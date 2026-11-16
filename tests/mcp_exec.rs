@@ -3858,7 +3858,7 @@ fn a_frame_held_up_while_a_world_is_rebuilt_never_refuses_a_journal_that_fits() 
 #[test]
 fn a_world_whose_one_frame_outlasts_a_short_budget_by_its_fixed_cost_is_refused_however_a_long_client_batches()
  {
-    use grit::serve3::budget::{FIXED_MOVES_AFTER, SUBMIT_MOST_MS};
+    use grit::serve3::budget::{FIXED_KEPT, SUBMIT_MOST_MS};
     let Some(host) = device("fixed cost too slow") else {
         return;
     };
@@ -3906,7 +3906,7 @@ fn a_world_whose_one_frame_outlasts_a_short_budget_by_its_fixed_cost_is_refused_
     }
     grit::serve3::tools::faults::disarm();
     assert!(
-        probed.iter().all(|call_at| *call_at < FIXED_MOVES_AFTER),
+        probed.iter().all(|call_at| *call_at < FIXED_KEPT),
         "a frame of {frame:?} ({fixed:?} per batch and {each:?} per frame) against a {budget:?} budget: short calls {probed:?} of 12 ran a frame"
     );
 }
