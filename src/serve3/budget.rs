@@ -63,7 +63,7 @@ pub struct Pace {
     last: Batch,
     previous: Batch,
     fixed: [Option<Duration>; FIXED_KEPT],
-    measured: bool,
+    measured: u32,
     refused: u32,
 }
 
@@ -81,7 +81,7 @@ impl Pace {
             last: guess,
             previous: guess,
             fixed: [None; FIXED_KEPT],
-            measured: false,
+            measured: 0,
             refused: 0,
         }
     }
@@ -105,12 +105,16 @@ impl Pace {
         if time.is_zero() {
             return 0;
         }
-        if !self.measured {
+        if self.measured == 0 {
             return left.min(1);
         }
         let fixed = self.fixed();
         let aimed = within(self.last, fixed, AIM).max(1);
-        let grown = self.last.frames.saturating_mul(2);
+        let grown = if self.measured == 1 {
+            BATCH_MOST
+        } else {
+            self.last.frames.saturating_mul(2)
+        };
         let fits = within(self.last, fixed, time);
         aimed.min(grown).min(BATCH_MOST).min(left).min(fits)
     }
@@ -145,7 +149,7 @@ impl Pace {
             return;
         }
         let now = Batch { frames, spent };
-        if self.measured
+        if self.measured > 0
             && let Some(fixed) = split(self.last, now)
         {
             self.fixed.rotate_right(1);
@@ -156,7 +160,7 @@ impl Pace {
         self.previous = self.last;
         self.last = now;
         self.refused = 0;
-        self.measured = true;
+        self.measured = self.measured.saturating_add(1);
     }
 }
 
@@ -166,7 +170,7 @@ fn split(one: Batch, other: Batch) -> Option<Duration> {
     } else {
         (other, one)
     };
-    if u64::from(large.frames) < 2 * u64::from(small.frames) || large.spent < small.spent {
+    if 2 * u64::from(large.frames) < 3 * u64::from(small.frames) || large.spent < small.spent {
         return None;
     }
     let (n_small, n_large) = (u128::from(small.frames), u128::from(large.frames));
