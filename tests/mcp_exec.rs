@@ -2460,8 +2460,8 @@ fn after_a_lost_device_only_the_worlds_a_call_touches_are_rebuilt_inside_its_bud
     assert_eq!(note.int_at("frame"), 20);
     let now = worlds(&mut run);
     assert_eq!((now.int_at("open"), now.int_at("lost")), (1, 2));
-    let budget = Duration::from_millis(1);
-    let held = budget * 100;
+    let held = Duration::from_secs(1);
+    let budget = held / 2;
     built_slower_than(&mut run, held);
     let third = models[2].0;
     let told = refused(&run.ask(
