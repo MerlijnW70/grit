@@ -62,9 +62,12 @@ pub enum Code {
     NoGradient,
     TargetSize,
     Overflow,
+    Start,
+    Aim,
+    WalkLimit,
 }
 
-pub const CODES: [Code; 58] = [
+pub const CODES: [Code; 61] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -123,6 +126,9 @@ pub const CODES: [Code; 58] = [
     Code::NoGradient,
     Code::TargetSize,
     Code::Overflow,
+    Code::Start,
+    Code::Aim,
+    Code::WalkLimit,
 ];
 
 impl Code {
@@ -187,6 +193,9 @@ impl Code {
             Self::NoGradient => "no_gradient",
             Self::TargetSize => "target_size",
             Self::Overflow => "overflow",
+            Self::Start => "start",
+            Self::Aim => "aim",
+            Self::WalkLimit => "walk_limit",
         }
     }
 
@@ -334,6 +343,15 @@ impl Code {
             }
             Self::Overflow => {
                 "Take the gradient over fewer frames or a smaller box; it passed the 128-bit fixed point it is carried in."
+            }
+            Self::Start => {
+                "Give a world, or a law with size, each side a power of two from 2, and cells, size times channels words plane by plane; not both."
+            }
+            Self::Aim => {
+                "Give the aim exactly one of target, the box's wanted cells, and world, a world to take them from."
+            }
+            Self::WalkLimit => {
+                "Take gradients on a smaller start or over fewer frames; grit_describe names walk_cells and walk_work."
             }
         }
     }

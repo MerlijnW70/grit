@@ -31,11 +31,13 @@ pub const FRAMES_MOST: u32 = 512;
 
 pub const STEPS_MOST: u32 = 256;
 
-pub const WORK_MOST: u64 = 1 << 28;
+pub const WORK_MOST: u64 = 1 << 26;
+
+pub const OCT_UNITS: u64 = 128;
 
 pub const SIDE_MOST: u32 = 1024;
 
-pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU twin, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline, from frame first. The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string, from the walk back that recomputes every frame and must come home bit for bit. A descent walks, steps the params by the projected gradient planes and walks again, keeping its trail; best is the earliest lowest objective on it. Both are refused before any work for: a law that is not reversible (not_reversible, with the lifting refusal), a law that looks (no_gradient), params of the wrong count, a box outside the world, a target of the wrong size, a start past walk_cells or a walk past walk_work, and a walk the budget cannot fit by the fastest of the last three walks the server measured at the largest size not above this one. They never write a world or its journal";
+pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string, carried back by recomputing every frame with the inverse; a walk that does not come home answers strayed. A descent walks, moves the params by the step Reversible::descend takes and walks again; it stops converged (objective 0, or no step moves), on steps, or on budget or cancelled before a walk, and answers the earliest lowest objective on its trail with its params. A walk costs its octs times frames times the nodes of the law and its inverse plus 128; it may cost at most walk_work, on a start of at most walk_cells words, and cannot stop part way, so an answer can come one walk late. Refused before any walk: not_reversible (with the lifting refusal as law), no_gradient for a law that looks, params, outside, reversed, target_size, aim, start, walk_limit, and budget when the fastest of the last three walks the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -150,13 +152,10 @@ fn posed_shown() -> Vec<(&'static str, Json)> {
         ),
         (
             "first",
-            with(
-                whole(
-                    "with law: the frame the start is at; 0 if left out",
-                    0,
-                    i64::from(u32::MAX),
-                ),
-                vec![("default", Json::Int(0))],
+            whole(
+                "with law: the frame the start is at; 0 if left out",
+                0,
+                i64::from(u32::MAX),
             ),
         ),
         (
@@ -285,10 +284,10 @@ struct Start {
 fn started(server: &mut Server<'_>, held: &Json) -> Result<Start, Failed> {
     match (held.get("world"), held.get("law")) {
         (Some(_), None) => {
-            for key in ["size", "cells"] {
+            for key in ["size", "cells", "first"] {
                 if held.get(key).is_some() {
                     return Err(refused(
-                        Code::Malformed,
+                        Code::Start,
                         &format!("$.{key}"),
                         format!("{key} goes with law; a world's start is its own cells"),
                     ));
@@ -328,7 +327,7 @@ fn started(server: &mut Server<'_>, held: &Json) -> Result<Start, Failed> {
             })?;
             let size = held.get("size").ok_or_else(|| {
                 refused(
-                    Code::Malformed,
+                    Code::Start,
                     "$.size",
                     "a start given inline needs size and cells".to_owned(),
                 )
@@ -340,7 +339,7 @@ fn started(server: &mut Server<'_>, held: &Json) -> Result<Start, Failed> {
                 .filter(|grid| [grid.wide, grid.deep, grid.tall] == [wide, deep, tall])
                 .ok_or_else(|| {
                     refused(
-                        Code::Malformed,
+                        Code::Start,
                         "$.size",
                         format!(
                             "size {:?} has a side that is not a power of two from 2",
@@ -353,14 +352,17 @@ fn started(server: &mut Server<'_>, held: &Json) -> Result<Start, Failed> {
                 law,
                 grid,
                 planes: u32::try_from(planes).unwrap_or(u32::MAX),
-                first: int(held, "first")?,
+                first: match held.get("first") {
+                    None => 0,
+                    Some(_) => int(held, "first")?,
+                },
                 params: None,
                 world: None,
                 field: "$.law",
             })
         }
         (given, _) => Err(refused(
-            Code::Malformed,
+            Code::Start,
             "$",
             if given.is_some() {
                 "give a world or a law, and not both".to_owned()
@@ -430,10 +432,12 @@ fn points_of(region: Region) -> Vec<[u32; 3]> {
 }
 
 fn units_of(reversible: &Reversible, grid: Grid3, frames: u32) -> u64 {
-    let nodes = reversible.forward().len() + reversible.inverse().len();
+    let nodes = u64::try_from(reversible.forward().len() + reversible.inverse().len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(OCT_UNITS);
     u64::from(grid.octs())
         .saturating_mul(u64::from(frames))
-        .saturating_mul(u64::try_from(nodes).unwrap_or(u64::MAX))
+        .saturating_mul(nodes)
 }
 
 fn posed(server: &mut Server<'_>, held: &Json) -> Result<Posed, Failed> {
@@ -446,7 +450,7 @@ fn posed(server: &mut Server<'_>, held: &Json) -> Result<Posed, Failed> {
         .saturating_mul(u64::from(start.planes));
     if cells > CELLS_MOST {
         return Err(limited(
-            Code::TooMany,
+            Code::WalkLimit,
             start.field,
             format!(
                 "the start holds {cells} words ({} cells on {} planes), more than the {CELLS_MOST} a walk on the CPU takes",
@@ -482,7 +486,7 @@ fn posed(server: &mut Server<'_>, held: &Json) -> Result<Posed, Failed> {
         let length = given.as_ref().map_or(0, Vec::len) as u64;
         if length != cells {
             return Err(limited(
-                Code::Malformed,
+                Code::Start,
                 "$.cells",
                 format!(
                     "a start of size {size:?} on {} planes holds {cells} words, and {length} were given",
@@ -534,7 +538,7 @@ fn posed(server: &mut Server<'_>, held: &Json) -> Result<Posed, Failed> {
         }
         (given, _) => {
             return Err(refused(
-                Code::Malformed,
+                Code::Aim,
                 "$.aim",
                 if given.is_some() {
                     "give the aim a target or a world, and not both".to_owned()
@@ -550,10 +554,10 @@ fn posed(server: &mut Server<'_>, held: &Json) -> Result<Posed, Failed> {
         let each = units / u64::from(frames.max(1));
         let fits = u32::try_from(WORK_MOST / each.max(1)).unwrap_or(u32::MAX);
         return Err(limited(
-            Code::TooMany,
-            "$.frames",
+            Code::WalkLimit,
+            if fits == 0 { start.field } else { "$.frames" },
             format!(
-                "a walk of {frames} frames over {} octs of a law of {} nodes and an inverse of {} is {units} units of work, more than the {WORK_MOST} one walk may take; at most {fits} frames fit",
+                "a walk of {frames} frames over {} octs of a law of {} nodes with an inverse of {} is {units} units of work (octs times frames times the nodes of both plus {OCT_UNITS}), more than the {WORK_MOST} one walk may take; at most {fits} frames fit",
                 grid.octs(),
                 reversible.forward().len(),
                 reversible.inverse().len()
