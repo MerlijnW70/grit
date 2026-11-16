@@ -108,7 +108,7 @@ fn a_world_too_slow_for_a_short_budget_from_its_first_frame_runs_late_on_its_fir
 }
 
 #[test]
-fn a_single_client_on_a_world_too_slow_for_it_measures_one_frame_every_third_call() {
+fn a_single_client_on_a_world_too_slow_for_it_measures_one_frame_every_third_call_once_settled() {
     let slow = Device::new(20_000, 30_000);
     let mut pace = warm();
     called(&mut pace, slow, 64, LONG);
@@ -121,8 +121,19 @@ fn a_single_client_on_a_world_too_slow_for_it_measures_one_frame_every_third_cal
         }
     }
     let every = usize::try_from(REFUSED_MOST).unwrap() + 1;
-    let wanted: Vec<usize> = (0..12).filter(|at| at % every == 0).collect();
-    assert_eq!(probed, wanted, "{pace:?}");
+    let settled = probed
+        .iter()
+        .position(|at| *at >= FIXED_MOVES_AFTER)
+        .unwrap();
+    assert!(
+        probed.first() == Some(&0)
+            && probed
+                .get(settled..)
+                .unwrap()
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] == every),
+        "short calls {probed:?} of 12 measured a frame; {pace:?}"
+    );
 }
 
 #[test]
@@ -191,7 +202,12 @@ fn a_first_batch_runs_one_frame_whatever_the_guess() {
             slow.cost(1)
         );
         pace.ran(1, slow.cost(1));
-        assert_eq!(pace.batch(65536, Duration::from_secs(1)), 2, "{pace:?}");
+        let aim = Duration::from_millis(grit::serve3::budget::SUBMIT_MOST_MS / 2);
+        let second = pace.batch(65536, Duration::from_secs(1));
+        assert!(
+            second > 1 && pace.cost(second) <= aim && pace.cost(second + 1) > aim,
+            "the second batch is the most the measured frame predicts fits {aim:?}: {second}, {pace:?}"
+        );
     }
 }
 
