@@ -48,29 +48,55 @@ impl Stop {
 
 pub const REFUSED_MOST: u32 = 2;
 
+pub const FIXED_KEPT: usize = 3;
+
+#[derive(Debug, Clone, Copy)]
+struct Batch {
+    frames: u32,
+    spent: Duration,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {
-    per_frame: Duration,
-    previous: Duration,
+    last: Batch,
+    previous: Batch,
+    fixed: [Option<Duration>; FIXED_KEPT],
     measured: bool,
-    last: u32,
     refused: u32,
 }
 
 impl Pace {
     #[must_use]
     pub fn first(cells: u64) -> Self {
-        let guess = WORST_PER_CELL
-            .checked_mul(u32::try_from(cells).unwrap_or(u32::MAX))
-            .unwrap_or(Duration::MAX)
-            .saturating_add(WORST_PER_SUBMIT);
+        let guess = Batch {
+            frames: 1,
+            spent: WORST_PER_CELL
+                .checked_mul(u32::try_from(cells).unwrap_or(u32::MAX))
+                .unwrap_or(Duration::MAX)
+                .saturating_add(WORST_PER_SUBMIT),
+        };
         Self {
-            per_frame: guess,
+            last: guess,
             previous: guess,
+            fixed: [None; FIXED_KEPT],
             measured: false,
-            last: BATCH_MOST,
             refused: 0,
         }
+    }
+
+    #[must_use]
+    pub fn fixed(&self) -> Duration {
+        self.fixed
+            .iter()
+            .flatten()
+            .min()
+            .copied()
+            .unwrap_or(WORST_PER_SUBMIT)
+    }
+
+    #[must_use]
+    pub fn cost(&self, frames: u32) -> Duration {
+        predicted(self.last, self.fixed(), frames)
     }
 
     #[must_use]
@@ -78,10 +104,13 @@ impl Pace {
         if time.is_zero() {
             return 0;
         }
-        let aimed = frames_in(AIM, self.per_frame).max(1);
-        let grown = self.last.saturating_mul(2).max(1);
-        let fits = frames_in(time, self.per_frame);
-        let fits = if self.measured { fits } else { fits.max(1) };
+        if !self.measured {
+            return left.min(1);
+        }
+        let fixed = self.fixed();
+        let aimed = within(self.last, fixed, AIM).max(1);
+        let grown = self.last.frames.saturating_mul(2);
+        let fits = within(self.last, fixed, time);
         aimed.min(grown).min(BATCH_MOST).min(left).min(fits)
     }
 
@@ -90,7 +119,8 @@ impl Pace {
         if step > 0 || left == 0 || time.is_zero() {
             return step;
         }
-        if frames_in(time, self.per_frame.min(self.previous)) > 0 {
+        let fixed = self.fixed();
+        if within(self.last, fixed, time) > 0 || within(self.previous, fixed, time) > 0 {
             return 1;
         }
         if self.refused < REFUSED_MOST {
@@ -113,24 +143,58 @@ impl Pace {
         if frames == 0 {
             return;
         }
-        self.previous = self.per_frame;
-        self.per_frame = spent / frames;
+        let now = Batch { frames, spent };
+        if self.measured
+            && let Some(fixed) = split(self.last, now)
+        {
+            self.fixed.rotate_right(1);
+            if let Some(newest) = self.fixed.first_mut() {
+                *newest = Some(fixed);
+            }
+        }
+        self.previous = self.last;
+        self.last = now;
         self.refused = 0;
         self.measured = true;
-        self.last = frames;
-    }
-
-    #[must_use]
-    pub const fn per_frame(&self) -> Duration {
-        self.per_frame
     }
 }
 
-fn frames_in(time: Duration, per_frame: Duration) -> u32 {
-    if per_frame.is_zero() {
+fn split(one: Batch, other: Batch) -> Option<Duration> {
+    let (small, large) = if one.frames <= other.frames {
+        (one, other)
+    } else {
+        (other, one)
+    };
+    if u64::from(large.frames) < 2 * u64::from(small.frames) || large.spent < small.spent {
+        return None;
+    }
+    let (n_small, n_large) = (u128::from(small.frames), u128::from(large.frames));
+    let crossed = n_large.checked_mul(small.spent.as_nanos())?;
+    let rising = n_small.checked_mul(large.spent.as_nanos())?;
+    let fixed = crossed.checked_sub(rising)? / (n_large - n_small);
+    u64::try_from(fixed).ok().map(Duration::from_nanos)
+}
+
+fn predicted(batch: Batch, fixed: Duration, frames: u32) -> Duration {
+    let fixed = fixed.min(batch.spent);
+    let each = batch.spent.saturating_sub(fixed).as_nanos();
+    let more = each.saturating_mul(u128::from(frames)) / u128::from(batch.frames.max(1));
+    fixed.saturating_add(Duration::from_nanos(
+        u64::try_from(more).unwrap_or(u64::MAX),
+    ))
+}
+
+fn within(batch: Batch, fixed: Duration, time: Duration) -> u32 {
+    let fixed = fixed.min(batch.spent);
+    let Some(room) = time.checked_sub(fixed) else {
+        return 0;
+    };
+    let each = batch.spent.saturating_sub(fixed).as_nanos();
+    if each == 0 {
         return u32::MAX;
     }
-    u32::try_from(time.as_nanos() / per_frame.as_nanos()).unwrap_or(u32::MAX)
+    let frames = room.as_nanos().saturating_mul(u128::from(batch.frames)) / each;
+    u32::try_from(frames).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Clone)]
