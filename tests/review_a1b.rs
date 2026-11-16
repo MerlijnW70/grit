@@ -125,9 +125,9 @@ fn cases() -> Vec<(&'static str, String)> {
             "dot_u lane 0",
             law_text(
                 "dotted",
-                &[&format!(
-                    "[\"w1v1\",[\"add\",\"w1v0\",[\"dot_u\",[\"shr\",[\"mul\",[\"shr\",\"w0v0\",14],[\"param\",0]],12],200]]]"
-                )],
+                &[
+                    "[\"w1v1\",[\"add\",\"w1v0\",[\"dot_u\",[\"shr\",[\"mul\",[\"shr\",\"w0v0\",14],[\"param\",0]],12],200]]]",
+                ],
             ),
         ),
     ]
