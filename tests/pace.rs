@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use grit::serve3::budget::{BATCH_MOST, FIXED_MOVES_AFTER, Pace, REFUSED_MOST};
+use grit::serve3::budget::{BATCH_MOST, BORNE_LEAST, FIXED_MOVES_AFTER, Pace, REFUSED_MOST};
 
 #[derive(Debug, Clone, Copy)]
 struct Device {
@@ -710,4 +710,269 @@ fn a_batch_before_any_split_never_outlasts_the_time_left() {
             device.cost(step)
         );
     }
+}
+
+#[test]
+fn a_batch_that_fit_predicts_that_it_fits_again_whatever_fixed_cost_the_splits_keep() {
+    let slow = Device::new(20_000, 1_000);
+    let fast = Device::new(4_000, 1_000);
+    let mut pace = Pace::first(0);
+    for _ in 0..3 {
+        pace.ran(1, slow.cost(1));
+        pace.ran(4, slow.cost(4));
+    }
+    pace.ran(2, fast.cost(2));
+    assert!(
+        pace.fixed() == slow.fixed && pace.fixed() > fast.cost(2),
+        "the splits keep a fixed cost above the last batch's time: {pace:?}"
+    );
+    assert_eq!(pace.cost(2), fast.cost(2), "{pace:?}");
+    assert!(pace.cost(1) <= fast.cost(2), "{pace:?}");
+}
+
+#[test]
+fn a_call_with_more_time_than_the_last_batch_took_runs_whatever_fixed_cost_the_splits_keep() {
+    let slow = Device::new(20_000, 1_000);
+    let fast = Device::new(4_000, 1_000);
+    let budget = Duration::from_millis(10);
+    let mut pace = Pace::first(0);
+    for _ in 0..3 {
+        pace.ran(1, slow.cost(1));
+        pace.ran(4, slow.cost(4));
+    }
+    pace.ran(2, fast.cost(2));
+    assert!(
+        pace.fixed() > budget && fast.cost(2) < budget,
+        "the splits keep a fixed cost above the budget: {pace:?}"
+    );
+    let step = pace.batch(65536, budget);
+    assert!(
+        step > 0 && fast.cost(step) <= budget,
+        "a batch of 2 took {:?}: {step} frames on {budget:?}; {pace:?}",
+        fast.cost(2)
+    );
+    let opened = pace.opening(65536, budget);
+    assert!(
+        opened > 0 && fast.cost(opened) <= budget,
+        "a batch of 2 took {:?}: the call opened with {opened} frames on {budget:?}; {pace:?}",
+        fast.cost(2)
+    );
+}
+
+#[test]
+fn a_call_whose_frames_rose_up_to_eightfold_since_the_last_call_runs_within_its_budget_or_its_least_opening()
+ {
+    let before = Device::new(2_000, 1_000);
+    let mut late = Vec::new();
+    for shape in SHAPES {
+        for rise in [1_u32, 2, 4, 8] {
+            let after = Device {
+                fixed: before.fixed,
+                each: before.each * rise,
+            };
+            for budget_ms in [20_u64, 50, 100, 300] {
+                let budget = Duration::from_millis(budget_ms);
+                let mut pace = Pace::first(64 * 64 * 64);
+                for call_at in 0..6 {
+                    called(&mut pace, before, shape[call_at % shape.len()], LONG);
+                }
+                let (_, spent) = called(&mut pace, after, 65536, budget);
+                if spent > budget.max(after.cost(BORNE_LEAST)) {
+                    late.push(format!(
+                        "{shape:?}, frames {rise}x slower, {budget:?}: {spent:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(late.is_empty(), "{late:#?}");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turns {
+    Both,
+    FixedFaster,
+    FixedSlower,
+    Steady,
+    EachFaster,
+    EachSlower,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Seen {
+    late: u64,
+    over_us: u64,
+    refused: u64,
+}
+
+fn wide(turns: Turns, ramp_on: bool, seeds: &[u64]) -> Seen {
+    let mut seen = Seen::default();
+    for &seed in seeds {
+        let mut rng = Rng(seed);
+        for _ in 0..400 {
+            let mut pace = Pace::first(rng.next(1 << 24));
+            let mut device = Device::new(rng.next(30_000), 1 + rng.next(10_000));
+            let ramp = if ramp_on {
+                Duration::from_micros(rng.next(10_000))
+            } else {
+                Duration::ZERO
+            };
+            let short = Duration::from_micros(1 + rng.next(60_000));
+            for _ in 0..80 {
+                if rng.next(20) == 0 {
+                    let other = Device::new(rng.next(30_000), 1 + rng.next(10_000));
+                    match turns {
+                        Turns::Both => device = other,
+                        Turns::FixedFaster if other.fixed < device.fixed => {
+                            device.fixed = other.fixed;
+                        }
+                        Turns::FixedSlower if other.fixed > device.fixed => {
+                            device.fixed = other.fixed;
+                        }
+                        Turns::EachFaster if other.each < device.each => {
+                            device.each = other.each;
+                        }
+                        Turns::EachSlower if other.each > device.each => {
+                            device.each = other.each;
+                        }
+                        _ => {}
+                    }
+                }
+                let is_short = rng.next(2) == 0;
+                let (frames, budget) = if is_short {
+                    (
+                        [1_u32, 65536, 3][usize::try_from(rng.next(3)).unwrap()],
+                        short,
+                    )
+                } else {
+                    (
+                        [65536_u32, 64, 3, 7, 200, 1][usize::try_from(rng.next(6)).unwrap()],
+                        LONG,
+                    )
+                };
+                let (mut left, mut done, mut spent) = (budget, 0_u32, Duration::ZERO);
+                while done < frames {
+                    let step = if done == 0 {
+                        pace.opening(frames - done, left)
+                    } else {
+                        pace.batch(frames - done, left)
+                    };
+                    if step == 0 {
+                        break;
+                    }
+                    let took = device.cost(step) + if done == 0 { ramp } else { Duration::ZERO };
+                    pace.ran(step, took);
+                    left = left.saturating_sub(took);
+                    spent += took;
+                    done += step;
+                }
+                let one = device.cost(1) + ramp;
+                if is_short && one <= budget && done == 0 {
+                    seen.refused += 1;
+                }
+                if spent > budget + one {
+                    seen.late += 1;
+                    seen.over_us += u64::try_from((spent - budget - one).as_micros()).unwrap();
+                }
+            }
+        }
+    }
+    seen
+}
+
+struct Bound {
+    turns: Turns,
+    ramp: bool,
+    before_f3: (u64, u64),
+    f3: Seen,
+}
+
+const fn bound(turns: Turns, ramp: bool, before_f3: (u64, u64), f3: (u64, u64, u64)) -> Bound {
+    Bound {
+        turns,
+        ramp,
+        before_f3,
+        f3: Seen {
+            late: f3.0,
+            over_us: f3.1,
+            refused: f3.2,
+        },
+    }
+}
+
+fn held_to(bounds: &[Bound], seeds: &[u64]) {
+    let mut worse = Vec::new();
+    for one in bounds {
+        let seen = wide(one.turns, one.ramp, seeds);
+        println!(
+            "{:?} ramp {}: late {} over {} us refused {}; before F3 {:?}, F3 {:?}",
+            one.turns, one.ramp, seen.late, seen.over_us, seen.refused, one.before_f3, one.f3
+        );
+        if seen.late > one.before_f3.0.min(one.f3.late)
+            || seen.over_us > one.before_f3.1.min(one.f3.over_us)
+            || seen.refused > one.f3.refused
+        {
+            worse.push(format!(
+                "costs turning {:?}, ramp {}: {seen:?}; before F3 late {} over {} us; F3 {:?}",
+                one.turns, one.ramp, one.before_f3.0, one.before_f3.1, one.f3
+            ));
+        }
+    }
+    assert!(worse.is_empty(), "{worse:#?}");
+}
+
+#[test]
+fn the_reviews_fuzz_runs_no_more_calls_late_than_before_f3_or_f3_and_refuses_no_more_than_f3() {
+    held_to(
+        &[
+            bound(Turns::Both, false, (18, 814_197), (27, 1_803_413, 48)),
+            bound(Turns::Both, true, (21, 1_473_526), (17, 1_933_968, 35)),
+            bound(Turns::FixedFaster, false, (0, 0), (0, 0, 25)),
+            bound(Turns::FixedFaster, true, (0, 0), (0, 0, 22)),
+            bound(Turns::FixedSlower, false, (0, 0), (0, 0, 0)),
+            bound(Turns::FixedSlower, true, (0, 0), (0, 0, 0)),
+            bound(Turns::Steady, false, (0, 0), (0, 0, 0)),
+            bound(Turns::Steady, true, (0, 0), (0, 0, 0)),
+        ],
+        &[12_345],
+    );
+}
+
+const TEN: [u64; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+#[test]
+fn a_wide_fuzz_whose_fixed_cost_turns_runs_no_more_calls_late_than_before_f3_or_f3_and_refuses_no_more_than_f3()
+ {
+    held_to(
+        &[
+            bound(Turns::Both, false, (219, 9_982_679), (276, 16_440_455, 460)),
+            bound(Turns::Both, true, (183, 9_922_767), (175, 15_997_944, 383)),
+            bound(Turns::FixedFaster, false, (2, 329_579), (0, 0, 206)),
+            bound(Turns::FixedFaster, true, (0, 0), (0, 0, 156)),
+            bound(Turns::FixedSlower, false, (2, 329_579), (0, 0, 0)),
+            bound(Turns::FixedSlower, true, (0, 0), (0, 0, 0)),
+            bound(Turns::Steady, false, (2, 329_579), (0, 0, 0)),
+            bound(Turns::Steady, true, (0, 0), (0, 0, 0)),
+        ],
+        &TEN,
+    );
+}
+
+#[test]
+fn a_wide_fuzz_whose_cost_per_frame_turns_runs_no_more_calls_late_than_before_f3_or_f3_and_refuses_no_more_than_f3()
+ {
+    held_to(
+        &[
+            bound(Turns::EachFaster, false, (2, 329_579), (0, 0, 73)),
+            bound(Turns::EachFaster, true, (0, 0), (0, 0, 70)),
+            bound(
+                Turns::EachSlower,
+                false,
+                (75, 3_048_943),
+                (99, 4_813_713, 0),
+            ),
+            bound(Turns::EachSlower, true, (71, 2_604_976), (64, 5_231_353, 0)),
+        ],
+        &TEN,
+    );
 }
