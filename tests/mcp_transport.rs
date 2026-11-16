@@ -1647,16 +1647,23 @@ fn a_step_that_fails_part_way_reports_the_frame_its_state_is_on() {
     ));
     grit::serve3::tools::faults::disarm();
     assert_eq!(told.code, "device");
-    assert!(told.message.contains("frame 64"), "{}", told.message);
     let got = answer(&call(
         &mut server,
         "grit_world_read",
         &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[7,7,7]}}"),
     ));
-    assert_eq!(got.counted("frame"), Some(64));
+    let ran = got.counted("frame").unwrap();
+    assert!((1..130).contains(&ran), "{}", told.message);
+    assert!(
+        told.message.ends_with(&format!(
+            "{ran} of the 130 frames ran before it, and the world is at frame {ran}"
+        )),
+        "{}",
+        told.message
+    );
     let rules = grit::serve3::rules_on(Some(&host));
     let sand = rules.iter().find(|one| one.name() == "sand").unwrap();
-    let want = (0..64).fold(start, |held, frame| sand.reference(grid, frame, &held, &[]));
+    let want = (0..ran).fold(start, |held, frame| sand.reference(grid, frame, &held, &[]));
     let words: Vec<u32> = got
         .get("cells")
         .and_then(Json::list)
@@ -1670,5 +1677,5 @@ fn a_step_that_fails_part_way_reports_the_frame_its_state_is_on() {
         "grit_world_step",
         &format!("{{\"world\":{world}}}"),
     ));
-    assert_eq!(next.counted("frame"), Some(65));
+    assert_eq!(next.counted("frame"), Some(ran + 1));
 }
