@@ -844,7 +844,7 @@ impl<'host> Server<'host> {
 
     fn build_least(&self, ledger: &Ledger, bytes: u64) -> (Duration, budget::Basis) {
         let rates = &self.book.rates;
-        let (build, basis) = rates.least_of(budget::Work::build(ledger.made().sparse), bytes);
+        let (build, basis) = rates.least_of(base_work(ledger), bytes);
         let snapshot = match (&ledger.base, self.book.keep.as_ref()) {
             (Base::Snapshot(snap), Some(keep)) if snap.image.is_none() => {
                 std::fs::metadata(keep.snapshot(&snap.sum)).map_or(0, |found| found.len())
@@ -900,11 +900,7 @@ impl<'host> Server<'host> {
         let took = began.elapsed();
         let rates = &mut self.book.rates;
         if !timings.build.is_zero() {
-            rates.measure(
-                budget::Work::build(ledger.made().sparse),
-                bytes,
-                timings.build,
-            );
+            rates.measure(base_work(ledger), bytes, timings.build);
         }
         if timings.file_bytes > 0 {
             rates.measure(budget::Work::File, timings.file_bytes, timings.file);
@@ -1910,6 +1906,14 @@ fn paced(
         done += step;
     }
     Ok(())
+}
+
+fn base_work(ledger: &Ledger) -> budget::Work {
+    let sparse = ledger.made().sparse;
+    match ledger.base {
+        Base::Created(_) => budget::Work::build(sparse),
+        Base::Snapshot(_) => budget::Work::build_image(sparse),
+    }
 }
 
 fn stored(keep: &Keep, number: u32, image: &crate::branch::Image) -> Result<[u8; 32], Failed> {
