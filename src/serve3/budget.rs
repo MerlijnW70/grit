@@ -52,6 +52,10 @@ pub const FIXED_MOVES_AFTER: usize = 3;
 
 pub const FIXED_KEPT: usize = 2 * FIXED_MOVES_AFTER - 1;
 
+pub const RISE_BORNE: u32 = 8;
+
+pub const BORNE_LEAST: u32 = 3;
+
 #[derive(Debug, Clone, Copy)]
 struct Batch {
     frames: u32,
@@ -142,9 +146,21 @@ impl Pace {
         step
     }
 
+    fn borne(&self, time: Duration) -> u32 {
+        if self.measured == 0 {
+            return u32::MAX;
+        }
+        let fixed = self.known();
+        let kept = fixed.map_or(Duration::ZERO, |fixed| fixed.min(self.last.spent));
+        let room = kept.saturating_add(time.saturating_sub(kept) / RISE_BORNE);
+        let grown =
+            within(self.last, None, time / RISE_BORNE).max(self.last.frames.saturating_mul(2));
+        within(self.last, fixed, room).min(grown).max(BORNE_LEAST)
+    }
+
     pub fn opening(&mut self, left: u32, time: Duration) -> u32 {
         self.calls = self.calls.saturating_add(1);
-        let step = self.batch(left, time);
+        let step = self.batch(left, time).min(self.borne(time));
         if left == 0 || time.is_zero() {
             return step;
         }
