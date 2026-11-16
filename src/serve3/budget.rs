@@ -48,13 +48,9 @@ impl Stop {
 
 pub const REFUSED_MOST: u32 = 2;
 
-pub const FIXED_KEPT: usize = 5;
+pub const FIXED_MOVES_AFTER: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Split {
-    spread: u128,
-    fixed: Duration,
-}
+pub const FIXED_KEPT: usize = 2 * FIXED_MOVES_AFTER - 1;
 
 #[derive(Debug, Clone, Copy)]
 struct Batch {
@@ -66,7 +62,7 @@ struct Batch {
 pub struct Pace {
     last: Batch,
     previous: Batch,
-    fixed: [Option<Split>; FIXED_KEPT],
+    fixed: [Option<Duration>; FIXED_KEPT],
     measured: bool,
     refused: u32,
 }
@@ -92,11 +88,11 @@ impl Pace {
 
     #[must_use]
     pub fn fixed(&self) -> Duration {
-        self.fixed
-            .iter()
-            .flatten()
-            .min()
-            .map_or(WORST_PER_SUBMIT, |split| split.fixed)
+        let mut kept = self.fixed;
+        kept.sort_unstable();
+        let filled = kept.iter().flatten().count();
+        let at = FIXED_KEPT - filled + filled.saturating_sub(FIXED_MOVES_AFTER);
+        kept.get(at).copied().flatten().unwrap_or(WORST_PER_SUBMIT)
     }
 
     #[must_use]
@@ -164,7 +160,7 @@ impl Pace {
     }
 }
 
-fn split(one: Batch, other: Batch) -> Option<Split> {
+fn split(one: Batch, other: Batch) -> Option<Duration> {
     let (small, large) = if one.frames <= other.frames {
         (one, other)
     } else {
@@ -176,12 +172,8 @@ fn split(one: Batch, other: Batch) -> Option<Split> {
     let (n_small, n_large) = (u128::from(small.frames), u128::from(large.frames));
     let crossed = n_large.checked_mul(small.spent.as_nanos())?;
     let rising = n_small.checked_mul(large.spent.as_nanos())?;
-    let apart = n_large - n_small;
-    let fixed = crossed.checked_sub(rising)? / apart;
-    Some(Split {
-        spread: crossed.checked_add(rising)? / apart,
-        fixed: Duration::from_nanos(u64::try_from(fixed).ok()?),
-    })
+    let fixed = crossed.checked_sub(rising)? / (n_large - n_small);
+    u64::try_from(fixed).ok().map(Duration::from_nanos)
 }
 
 fn predicted(batch: Batch, fixed: Duration, frames: u32) -> Duration {
