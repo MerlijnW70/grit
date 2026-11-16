@@ -75,6 +75,21 @@ A law with `"reversible": true` must be a sequence of lifting steps over its wor
 
 Refusals: `not_reversible` at `$.world` for a world whose law is not reversible, or a rule; `past_start` at `$.frames` for more frames than the world's frame. Walked-back worlds save, open, fork, restore, replay their journal and rebuild after a lost device at their frame.
 
+## Learning a law's params by gradient
+
+`grit_law_gradient` answers, for a reversible law, how the objective after `frames` frames moves with each param. The objective is the sum over the `aim` box, on plane 0, of `|cell - target|`; `aim` is `from` and `to` (corners included) with `target` (the box's words, x fastest) or `world` (take them from that world's box). The start is a world (`world`: its cells on every plane at its frame, its params unless `params` is given) or an inline start (`law`, `size` with sides powers of two, `cells` plane by plane, `first`). `gradient[i]` is d objective / d `params[i]` times 2^64, a decimal string; `home` is true.
+
+The answers equal the library's `Reversible::walk` and `Reversible::descend` exactly, on the CPU.
+
+`grit_law_descend` takes the same and `steps`; it answers the best `params` and their `objective` (the earliest lowest on its `trail`), `steps` and `stopped`: `converged` (objective 0, or no step moves), `steps`, `budget` or `cancelled` (the best so far).
+
+1. `grit_world_create` with `law` mix (`tests/law/mix.law.json`) and the hidden `params` `[3000,1700]`, `grit_world_write` the start, `grit_world_step` 8 frames: the target world.
+2. `grit_world_create` the same law with a guess, `params` `[2100,2250]`, and `grit_world_write` the same start: the learner.
+3. `grit_law_descend` with `world` the learner, `frames` 8, `aim` `{"from":[0,0,0],"to":[15,15,15],"world":<target>}`, `steps` 16: `params` `[3000,1700]`, `objective` 0, `stopped` `converged`, after 3 steps.
+4. `grit_world_params` the learner with them and `grit_world_step` 8 frames: its cells equal the target's.
+
+Neither tool writes a world or its journal. Refused before any walk: `not_reversible` (with the lifting refusal as `law`), `no_gradient` for a law that looks, `params`, `outside`, `reversed`, `target_size`, `aim`, `start`, `walk_limit` (a start past `walk_cells` words, a walk past `walk_work`), `budget`. A walk that does not come home answers `strayed` with the cell; one past 128 bits answers `overflow`. `grit_describe` names the limits under `law_gradient`.
+
 ## The quiet class
 
 A listed world steps an oct only while it, or an oct around it, changed in the two frames before; a sparse world also keeps an all-one-value brick as a single word and steps it only while it is hot. That gives the cells of stepping every oct only when:
