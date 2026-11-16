@@ -334,24 +334,29 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         held.pace = pace;
     }
     if let Some(why) = failure {
-        if !home && done > 0 {
-            server.journaled(number, Entry::Back(done), spent);
-        }
         let frame = server
             .book
             .held
             .get(&number)
             .map_or(0, |held| held.ledger.frame);
         let (mut refusal, _) = super::refused_with(why.as_ref());
-        refusal.message = format!(
-            "{}; {} of the {frames} frames were walked back before it, and the world is at frame {frame}",
-            refusal.message,
-            if home { 0 } else { done }
-        );
         if super::lost_device(why.as_ref()) {
+            refusal.message = format!(
+                "{}; the walk was not kept: 0 of the {frames} frames were walked back, nothing was journaled, and the world is at frame {frame}",
+                refusal.message
+            );
             refusal.code = Code::DeviceLost;
             return Err(Box::new(super::tools::Lost(refusal)));
         }
+        server.live.remove(&number);
+        let rebuilt = match server.world_at(number, "$.world") {
+            Ok(_) => String::from("rebuilt from its journal"),
+            Err(_) => String::from("rebuilt from its journal on its next call"),
+        };
+        refusal.message = format!(
+            "{}; the walk was not kept: 0 of the {frames} frames were walked back, nothing was journaled, and the world is at frame {frame}, {rebuilt}",
+            refusal.message
+        );
         return Err(Box::new(refusal));
     }
     if let Some(start) = start.as_ref()

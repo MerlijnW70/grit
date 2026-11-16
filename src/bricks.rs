@@ -1047,6 +1047,18 @@ impl Bricks {
         held.write(INDIRECT as usize, &[groups, 1, 1])
     }
 
+    pub fn unstamp(&self, held: &mut Resident<'_>) -> Result<(), Error> {
+        let mut table = held.read(self.table() as usize, self.table_words())?;
+        for entry in table.chunks_mut(ENTRY).take(self.count() as usize) {
+            for at in [TOUCHED, WANTED] {
+                if let Some(word) = entry.get_mut(at) {
+                    *word = 0;
+                }
+            }
+        }
+        held.write(self.table() as usize, &table)
+    }
+
     pub fn seed(&self, held: &mut Resident<'_>, plan: &Plan) -> Result<(), Error> {
         use crate::layout::{AWAKE, HOT, HOT_COUNTS, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, TALLY};
 
@@ -1802,6 +1814,48 @@ fn wanting<const LANES: u32>(bricks: &Bricks, plan: &Plan) -> Result<Vec<u32>, L
         lanes.mul(flag, inside)?
     };
     kernel.store_at(tier.flags, flag_at.id(), flag.id())?;
+    kernel.finish()
+}
+
+pub fn restamp(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
+    let subgroup = bricks.subgroup;
+    widths!(subgroup, restamped, [], (bricks))
+}
+
+fn restamped<const LANES: u32>(bricks: &Bricks) -> Result<Vec<u32>, LaneError> {
+    let subgroup = bricks.subgroup;
+    let table = bricks.table();
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, bricks.bindings()))?;
+    let brick = per_brick(&mut kernel, subgroup)?;
+    let head = kernel.module().constant_u32(0)?;
+    let frame = kernel.load_at(PARAMS, head)?;
+    let (touched_at, inside) = {
+        let mut lanes = kernel.lanes()?;
+        let here = lanes.splat_id::<U32, LANES>(brick)?;
+        let bricks_held = lanes.splat_bits::<U32, LANES>(bricks.count())?;
+        let four = lanes.splat_bits::<U32, LANES>(ENTRY as u32)?;
+        let by = lanes.splat_bits::<U32, LANES>(TOUCHED as u32)?;
+        let inside = lanes.greater_than(bricks_held, here)?;
+        let clamped = lanes.select(inside, here, bricks_held)?;
+        let at = lanes.mul(clamped, four)?;
+        (lanes.add(at, by)?, ones(&mut lanes, inside)?)
+    };
+    let touched = kernel.load_at(table, touched_at.id())?;
+    let (when, earlier) = {
+        let mut lanes = kernel.lanes()?;
+        let touched = lanes.splat_id::<U32, LANES>(touched)?;
+        let now = lanes.splat_id::<U32, LANES>(frame)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let back = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
+        let stamp = lanes.add(now, one)?;
+        let stamp = lanes.max(stamp, one)?;
+        let before = lanes.add(now, back)?;
+        let earlier = lanes.max(before, one)?;
+        let fresh = lanes.equal(touched, stamp)?;
+        let fresh = ones(&mut lanes, fresh)?;
+        (lanes.mul(fresh, inside)?, earlier)
+    };
+    store_if::<LANES>(&mut kernel, when, table, touched_at.id(), earlier.id())?;
     kernel.finish()
 }
 

@@ -526,11 +526,18 @@ impl<'host> World<'host> {
         };
         let (passes, stages, back) = match rule.inverse()? {
             Some(inverse) => {
-                let undone = match pool.as_ref() {
-                    Some(bricks) => inverse.bricked(bricks, &plan)?,
-                    None => inverse.wired(host.width(), grid, &plan)?,
+                let (undone, after) = match pool.as_ref() {
+                    Some(bricks) => (
+                        inverse.bricked(bricks, &plan)?,
+                        vec![(
+                            bricks::restamp(bricks)?,
+                            Groups::Fixed(bricks.count().div_ceil(plan.subgroup)),
+                        )],
+                    ),
+                    None => (inverse.wired(host.width(), grid, &plan)?, Vec::new()),
                 };
-                let (passes, stages, back) = back::merged((passes, stages), undone, plan.subgroup)?;
+                let (passes, stages, back) =
+                    back::merged((passes, stages), undone, plan.subgroup, after)?;
                 (passes, stages, Some(back))
             }
             None => (passes, stages, None),

@@ -46,7 +46,12 @@ fn unlike() -> LaneError {
 
 pub(crate) type Merged = (Vec<Vec<u32>>, Vec<Vec<Groups>>, Vec<Vec<Groups>>);
 
-pub(crate) fn merged(forward: Loop, inverse: Loop, subgroup: u32) -> Result<Merged, LaneError> {
+pub(crate) fn merged(
+    forward: Loop,
+    inverse: Loop,
+    subgroup: u32,
+    after: Vec<(Vec<u32>, Groups)>,
+) -> Result<Merged, LaneError> {
     let (ahead, ahead_stages) = forward;
     let (behind, behind_stages) = inverse;
     let shaped = |stages: &[Vec<Groups>]| stages.iter().map(Vec::len).collect::<Vec<_>>();
@@ -88,6 +93,11 @@ pub(crate) fn merged(forward: Loop, inverse: Loop, subgroup: u32) -> Result<Merg
         onward.push(on);
         backward.push(back);
     }
+    for (pass, groups) in after {
+        passes.push(pass);
+        onward.push(vec![Groups::Fixed(0)]);
+        backward.push(vec![groups]);
+    }
     passes.push(untick(subgroup)?);
     onward.push(vec![Groups::Fixed(0)]);
     backward.push(vec![Groups::Fixed(1)]);
@@ -105,6 +115,9 @@ impl World<'_> {
             return Ok(());
         }
         self.reseed()?;
+        if let Some(bricks) = self.pool {
+            bricks.unstamp(&mut self.live)?;
+        }
         self.live
             .write(PARAMS as usize, &[self.frame.wrapping_sub(1)])?;
         self.backward = backward;
@@ -126,6 +139,9 @@ impl World<'_> {
             self.live.staged_frames(&groups, step)?;
             done += step;
             self.frame = self.frame.wrapping_sub(step);
+            if let Some(bricks) = self.pool {
+                bricks.check(&mut self.live)?;
+            }
         }
         Ok(())
     }
