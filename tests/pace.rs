@@ -340,6 +340,7 @@ fn a_fixed_cost_split_from_batches_with_proportional_jitter_runs_late_on_few_cal
     let seeds = 40_u64;
     let calls = 96;
     let mut late = 0;
+    let mut settling = 0;
     for seed in 1..=seeds {
         let mut state = seed;
         let mut jittered = move |cost: Duration| {
@@ -370,15 +371,127 @@ fn a_fixed_cost_split_from_batches_with_proportional_jitter_runs_late_on_few_cal
                     done += step;
                 }
                 if room == budget && done > 0 {
-                    late += 1;
+                    if call_at < FIXED_MOVES_AFTER {
+                        settling += 1;
+                    } else {
+                        late += 1;
+                    }
                 }
             }
         }
     }
-    let all = seeds * u64::try_from(calls).unwrap();
+    let settled = (seeds * u64::try_from(calls - FIXED_MOVES_AFTER).unwrap()).max(1);
+    let first = seeds * u64::try_from(FIXED_MOVES_AFTER).unwrap();
     assert!(
-        late * 50 <= all,
-        "a frame of {:?} with up to 3% jitter per batch against a {budget:?} budget: {late} of {all} short calls ran",
+        late * 50 <= settled && settling < first,
+        "a frame of {:?} with up to 3% jitter per batch against a {budget:?} budget: {late} of {settled} settled short calls ran, and {settling} of the first {first}",
         device.cost(1)
     );
+}
+
+#[test]
+fn a_call_is_refused_only_when_both_of_the_last_two_batches_outlasted_its_budget() {
+    let mut state = 3_u64;
+    let mut next = move |most: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % most
+    };
+    let mut refusals = 0;
+    for _ in 0..200 {
+        let mut pace = Pace::first(next(1 << 24));
+        let mut recent = [Duration::MAX; 2];
+        let mut device = Device::new(next(30_000), next(30_000));
+        for _ in 0..60 {
+            if next(10) == 0 {
+                device = Device::new(next(30_000), next(30_000));
+            }
+            let budget = Duration::from_micros(1 + next(200_000));
+            let frames = 1 + u32::try_from(next(70_000)).unwrap();
+            let mut left = budget;
+            let mut done = 0;
+            while done < frames {
+                let step = if done == 0 {
+                    pace.opening(frames - done, left)
+                } else {
+                    pace.batch(frames - done, left)
+                };
+                if step == 0 {
+                    if done == 0 {
+                        refusals += 1;
+                        assert!(
+                            recent.iter().all(|spent| *spent > left),
+                            "refused with {left:?} left after batches of {recent:?}; {pace:?}"
+                        );
+                    }
+                    break;
+                }
+                let held = if next(8) == 0 {
+                    Duration::from_micros(next(300_000))
+                } else {
+                    Duration::ZERO
+                };
+                let took = device.cost(step) + held;
+                pace.ran(step, took);
+                recent = [took, recent[0]];
+                left = left.saturating_sub(took);
+                done += step;
+            }
+        }
+    }
+    assert!(refusals > 100, "{refusals}");
+}
+
+#[test]
+fn a_world_that_turns_fast_refuses_a_short_budget_only_a_bounded_number_of_times() {
+    let slow = Device::new(50_000, 1_000);
+    let fast = Device::new(100, 1_000);
+    assert!(fast.cost(BATCH_MOST) > SHORT && fast.cost(1) < SHORT);
+    for shape in SHAPES {
+        let mut pace = Pace::first(32 * 32 * 32);
+        for _ in 0..8 {
+            called(&mut pace, slow, 4096, LONG);
+        }
+        let mut refused = Vec::new();
+        for call_at in 0..48 {
+            let frames = shape[call_at % shape.len()];
+            called(&mut pace, fast, frames, LONG);
+            let (ran, _) = called(&mut pace, fast, 65536, SHORT);
+            if ran == 0 {
+                refused.push(call_at);
+            }
+        }
+        let most = usize::try_from(REFUSED_MOST).unwrap() * FIXED_MOVES_AFTER;
+        assert!(
+            refused.len() <= most,
+            "a world whose fixed cost fell from {:?} to {:?}, a long client stepping {shape:?}: short calls {refused:?} of 48 were refused; {pace:?}",
+            slow.fixed,
+            fast.fixed
+        );
+    }
+}
+
+#[test]
+fn a_cold_world_runs_its_first_call_within_its_budget_and_one_frame() {
+    for (fixed_us, each_us) in [
+        (0_u64, 900_u64),
+        (100, 800),
+        (100, 1_300),
+        (300, 20),
+        (1_000, 0),
+        (4_600, 2_250),
+        (20_000, 30_000),
+    ] {
+        let device = Device::new(fixed_us, each_us);
+        for budget_ms in [2_u64, 5, 30, 97, 511] {
+            let budget = Duration::from_millis(budget_ms);
+            let mut pace = Pace::first(32 * 32 * 32);
+            let (_, spent) = called(&mut pace, device, 65536, budget);
+            assert!(
+                spent <= budget + device.cost(1),
+                "{device:?}, {budget:?}: a cold world's first call spent {spent:?}; {pace:?}"
+            );
+        }
+    }
 }
