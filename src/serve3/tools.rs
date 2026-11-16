@@ -104,7 +104,7 @@ pub mod faults {
         STALL.set(None);
     }
 
-    pub(super) fn batch() -> Result<(), Failed> {
+    pub(in crate::serve3) fn batch() -> Result<(), Failed> {
         match BATCH.get() {
             Some(0) => {
                 BATCH.set(None);
@@ -127,7 +127,7 @@ pub mod faults {
 pub(crate) mod faults {
     use super::Failed;
 
-    pub(super) const fn batch() -> Result<(), Failed> {
+    pub(in crate::serve3) const fn batch() -> Result<(), Failed> {
         Ok(())
     }
 
@@ -768,7 +768,7 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
 const AIM_WRITE: Duration = Duration::from_millis(budget::SUBMIT_MOST_MS / 2);
 
 #[cfg(feature = "faults")]
-fn wedged_after(server: &Server<'_>, batch: u32) -> bool {
+pub(super) fn wedged_after(server: &Server<'_>, batch: u32) -> bool {
     let armed = server
         .book
         .faults
@@ -789,7 +789,7 @@ fn wedged_after(server: &Server<'_>, batch: u32) -> bool {
 }
 
 #[cfg(not(feature = "faults"))]
-const fn wedged_after(_: &Server<'_>, _: u32) -> bool {
+pub(super) const fn wedged_after(_: &Server<'_>, _: u32) -> bool {
     false
 }
 
@@ -1213,6 +1213,7 @@ pub fn describe(status: &Status) -> Json {
                 ("queue_calls", number(super::exec::QUEUE_MOST)),
                 ("law_tally", text(super::law::TALLIED)),
                 ("law_look", text(super::law::LOOK)),
+                ("law_reversible", text(super::back::REVERSIBLE)),
                 ("law_from_chip", text(super::law::FROM_CHIP)),
                 ("law_from_chip_gates", number(crate::law::chip::GATES_SURE)),
                 (

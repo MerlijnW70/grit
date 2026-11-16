@@ -30,6 +30,7 @@ use crate::sweep;
 use crate::wire::{Json, counted, map, text};
 
 pub mod ask;
+pub mod back;
 pub mod branch;
 pub mod budget;
 pub mod errors;
@@ -294,6 +295,7 @@ pub struct Faults {
     pub held_work: Vec<budget::Work>,
     pub held_replays: u32,
     pub held_by: Duration,
+    pub stray_walk: bool,
 }
 
 impl Book {
@@ -574,7 +576,7 @@ pub struct Server<'host> {
 }
 
 /// The names of the world tools, in the order `tools/list` gives them.
-pub const WORLD_TOOLS: [&str; 15] = [
+pub const WORLD_TOOLS: [&str; 16] = [
     "grit_world_rules",
     "grit_world_create",
     "grit_world_write",
@@ -590,6 +592,7 @@ pub const WORLD_TOOLS: [&str; 15] = [
     "grit_world_list",
     "grit_world_fork",
     "grit_world_restore",
+    "grit_world_back",
 ];
 
 fn served() -> impl Iterator<Item = &'static Tool> {
@@ -599,6 +602,7 @@ fn served() -> impl Iterator<Item = &'static Tool> {
         .chain(ask::TOOLS)
         .chain(branch::TOOLS)
         .chain(learn::TOOLS)
+        .chain(back::TOOLS)
 }
 
 fn shut(tool: Json) -> Json {
@@ -765,6 +769,9 @@ fn refused_with(why: &(dyn std::error::Error + 'static)) -> (Refusal, Vec<(&'sta
     }
     if let Some(halted) = why.downcast_ref::<budget::Halted>() {
         return (halted.refusal(), Vec::new());
+    }
+    if let Some(strayed) = why.downcast_ref::<back::Strayed>() {
+        return (strayed.refusal(), strayed.told());
     }
     if let Some(tools::Lost(refusal)) = why.downcast_ref::<tools::Lost>() {
         return (refusal.clone(), Vec::new());
