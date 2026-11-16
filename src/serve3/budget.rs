@@ -126,11 +126,7 @@ impl Pace {
         }
         let fixed = self.known();
         let aimed = within(self.last, fixed, AIM).max(1);
-        let grown = if self.measured == 1 {
-            BATCH_MOST
-        } else {
-            self.last.frames.saturating_mul(2)
-        };
+        let grown = within(self.last, None, AIM).max(self.last.frames);
         let fits = within(self.last, fixed, time);
         let step = aimed.min(grown).min(BATCH_MOST).min(left).min(fits);
         let last = u64::from(self.last.frames);

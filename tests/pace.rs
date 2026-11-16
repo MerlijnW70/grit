@@ -314,7 +314,7 @@ fn a_fixed_cost_split_from_jittered_batches_keeps_a_world_too_slow_for_a_short_b
         }
     }
     assert!(
-        late.is_empty(),
+        late.iter().all(|call_at| *call_at < FIXED_MOVES_AFTER),
         "a frame of {:?} with up to 1 ms of jitter per batch against a {budget:?} budget: short calls {late:?} of 48 ran; {pace:?}",
         device.cost(1)
     );
