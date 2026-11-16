@@ -387,6 +387,184 @@ fn a_slow_replay_never_raises_the_least_replay_ratio_while_a_faster_one_is_recen
     );
 }
 
+fn sparse_image(capacity: u32, upper: Option<u32>) -> grit::branch::Image {
+    use grit::branch::{Image, Law, State};
+    let mut table: Vec<u32> = (0..8).flat_map(|_| [u32::MAX, 0]).collect();
+    if let Some(value) = upper {
+        table.extend(std::iter::repeat_n(value, 8));
+    }
+    Image {
+        law: Law::Rule {
+            name: "sand".to_owned(),
+        },
+        params: Vec::new(),
+        frame: 1,
+        size: [4, 4, 4],
+        state: State::Sparse {
+            capacity,
+            sides: [2, 2, 2],
+            table,
+            pool: Vec::new(),
+        },
+    }
+}
+
+fn snapped_in_memory(image: grit::branch::Image) -> grit::serve3::journal::Ledger {
+    use grit::serve3::journal::{Ledger, Made, Snap, state_of};
+    Ledger::snapped(std::sync::Arc::new(Snap {
+        sum: state_of(&image),
+        frame: image.frame,
+        made: Made::of_image(&image),
+        image: Some(image),
+    }))
+}
+
+fn made(sparse: bool, slots: Option<u32>) -> grit::serve3::journal::Made {
+    grit::serve3::journal::Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [32, 32, 32],
+        sparse,
+        slots,
+    }
+}
+
+#[test]
+fn ledgers_whose_replays_differ_in_cost_or_result_never_share_a_journal_key() {
+    use grit::serve3::journal::{Entry, Ledger, state_of};
+    let small = sparse_image(1, None);
+    let large = sparse_image(8, None);
+    assert_eq!(
+        state_of(&small),
+        state_of(&large),
+        "setup: the state hash reads cells, not capacity"
+    );
+    let mut keys = vec![
+        (
+            "sparse snapshot, 1 slot",
+            snapped_in_memory(small).journal(),
+        ),
+        (
+            "sparse snapshot, 8 slots",
+            snapped_in_memory(large).journal(),
+        ),
+        (
+            "two-plane snapshot, plane 1 at 0",
+            snapped_in_memory(sparse_image(8, Some(0))).journal(),
+        ),
+        (
+            "two-plane snapshot, plane 1 at 5",
+            snapped_in_memory(sparse_image(8, Some(5))).journal(),
+        ),
+        ("dense", Ledger::created(made(false, None)).journal()),
+        ("sparse", Ledger::created(made(true, None)).journal()),
+        (
+            "sparse, 1 slot",
+            Ledger::created(made(true, Some(1))).journal(),
+        ),
+        (
+            "sparse, 2 slots",
+            Ledger::created(made(true, Some(2))).journal(),
+        ),
+        (
+            "law a",
+            Ledger::created(made(false, None))
+                .with_law(Some("a".into()))
+                .journal(),
+        ),
+        (
+            "law b",
+            Ledger::created(made(false, None))
+                .with_law(Some("b".into()))
+                .journal(),
+        ),
+        (
+            "rule wire",
+            Ledger::created(grit::serve3::journal::Made {
+                rule: "wire".to_owned(),
+                ..made(false, None)
+            })
+            .journal(),
+        ),
+    ];
+    let pushed = |entry: Entry, spent: Duration| {
+        let mut ledger = Ledger::created(made(false, None));
+        ledger.push(entry, spent);
+        ledger.journal()
+    };
+    let millis = Duration::from_millis;
+    keys.extend([
+        ("step 1", pushed(Entry::Step(1), millis(5))),
+        ("step 2", pushed(Entry::Step(2), millis(5))),
+        ("step 1, recorded longer", pushed(Entry::Step(1), millis(6))),
+        (
+            "write 1",
+            pushed(Entry::Write(vec![([0, 0, 0], 1)]), millis(5)),
+        ),
+        (
+            "write 2",
+            pushed(Entry::Write(vec![([0, 0, 0], 2)]), millis(5)),
+        ),
+        ("params", pushed(Entry::Params(vec![1]), millis(5))),
+    ]);
+    for (at, (one, key)) in keys.iter().enumerate() {
+        for (other, held) in keys.iter().skip(at + 1) {
+            assert_ne!(key, held, "{one} and {other} share a journal key");
+        }
+    }
+}
+
+#[test]
+fn one_ledger_keeps_its_journal_key_through_its_kept_journal_and_a_copy() {
+    use grit::serve3::journal::{Entry, Keep, Ledger, Snap};
+    struct Gone(std::path::PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let held =
+        Gone(std::env::temp_dir().join(format!("grit-f2b-key-{}-{nanos}", std::process::id())));
+    let keep = Keep::at(&held.0).unwrap();
+    let image = sparse_image(1, None);
+    let snapped = Ledger::snapped(std::sync::Arc::new(Snap {
+        sum: [7; 32],
+        frame: image.frame,
+        made: grit::serve3::journal::Made::of_image(&image),
+        image: None,
+    }));
+    let mut ledgers = vec![
+        Ledger::created(made(true, Some(3))).with_law(Some("law".into())),
+        snapped,
+    ];
+    for ledger in &mut ledgers {
+        ledger.push(
+            Entry::Write(vec![([1, 2, 3], 4)]),
+            Duration::new(0, 1_234_567),
+        );
+        ledger.push(Entry::Step(9), Duration::new(1, 999_999_999));
+        ledger.push(Entry::Params(vec![2]), Duration::from_secs(86_400));
+    }
+    for (number, ledger) in (1..).zip(&ledgers) {
+        keep.begin(number, ledger).unwrap();
+    }
+    let (scanned, ignored) = keep.scan();
+    assert!(ignored.is_empty(), "{ignored:?}");
+    assert_eq!(scanned.len(), ledgers.len());
+    for ((number, read), ledger) in scanned.iter().zip(&ledgers) {
+        assert_eq!(
+            read.journal(),
+            ledger.journal(),
+            "world {number}: its kept journal reads back under another key"
+        );
+        assert_eq!(ledger.clone().journal(), ledger.journal());
+    }
+}
+
 #[cfg(feature = "faults")]
 mod served {
     use std::time::{Duration, Instant};
@@ -863,6 +1041,89 @@ mod served {
             assert_eq!(replays_measured(&mut server), before, "call {call}");
         }
         grit::serve3::tools::faults::disarm();
+    }
+
+    fn lost(mut server: Server<'_>) -> grit::serve3::Book {
+        server.faults().lock().unwrap().wedge_before_call = true;
+        let _ = call(&mut server, "grit_describe", "{}");
+        assert!(server.lost(), "setup: the device was not lost");
+        server.into_book()
+    }
+
+    fn read(server: &mut Server<'_>, world: i64, budget: Duration) -> Json {
+        call(
+            server,
+            "grit_world_read",
+            &format!(
+                "{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":{}}}",
+                budget.as_millis()
+            ),
+        )
+    }
+
+    fn refused_by_its_journal(told: &Json, what: &str) {
+        let message = told.get("message").and_then(Json::text).unwrap();
+        assert!(
+            message.contains("nothing ran") && !message.contains("whose build alone"),
+            "{what}: {message}"
+        );
+    }
+
+    #[test]
+    fn a_fork_and_a_lost_device_keep_the_journal_key_their_rebuilds_are_decided_by() {
+        let Some(host) = device("journal key kept") else {
+            return;
+        };
+        let mut server = Server::new(Some(&host));
+        let made = result(
+            &call(&mut server, "grit_world_create", &cube(32, None)),
+            false,
+        );
+        let world = int_at(&made, "world");
+        grit::serve3::tools::faults::stall_every(Duration::from_millis(20));
+        result(
+            &call(
+                &mut server,
+                "grit_world_step",
+                &format!("{{\"world\":{world},\"frames\":40,\"budget_ms\":600000}}"),
+            ),
+            false,
+        );
+        let forked = result(
+            &call(
+                &mut server,
+                "grit_world_fork",
+                &format!("{{\"world\":{world}}}"),
+            ),
+            false,
+        );
+        let fork = int_at(&forked, "world");
+        let book = lost(server);
+        drop(host);
+        let host = device("journal key kept, again").unwrap();
+        let (mut server, _) = Server::resumed(Some(&host), book);
+        let began = Instant::now();
+        result(&read(&mut server, world, Duration::from_secs(600)), false);
+        let whole = began.elapsed();
+        let budget = whole / 2;
+        let told = result(&read(&mut server, fork, budget), true);
+        refused_by_its_journal(
+            &told,
+            &format!(
+                "the fork's rebuild given {budget:?}, after its source's rebuild took {whole:?}"
+            ),
+        );
+        let book = lost(server);
+        drop(host);
+        let host = device("journal key kept, third").unwrap();
+        let (mut server, _) = Server::resumed(Some(&host), book);
+        let told = result(&read(&mut server, world, budget), true);
+        refused_by_its_journal(
+            &told,
+            &format!("the second rebuild given {budget:?}, after the first took {whole:?}"),
+        );
+        grit::serve3::tools::faults::disarm();
+        result(&read(&mut server, fork, Duration::from_secs(600)), false);
     }
 
     fn two_journals(label: &str) -> (Scratch, Options) {

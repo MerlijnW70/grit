@@ -179,9 +179,10 @@ impl Ledger {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         match &self.base {
             Base::Created(made) => (0_u8, made).hash(&mut hasher),
-            Base::Snapshot(snap) => (1_u8, snap.sum, snap.frame).hash(&mut hasher),
+            Base::Snapshot(snap) => (1_u8, snap.sum, snap.frame, &snap.made).hash(&mut hasher),
         }
-        (&self.law, &self.entries, &self.recorded, self.frame).hash(&mut hasher);
+        let recorded: Vec<u32> = self.recorded.iter().copied().map(micros).collect();
+        (&self.law, &self.entries, recorded, self.frame).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -936,8 +937,12 @@ fn base_of(tag: u32, payload: &[u32]) -> Option<Base> {
     }
 }
 
+fn micros(spent: Duration) -> u32 {
+    u32::try_from(spent.as_micros()).unwrap_or(u32::MAX)
+}
+
 fn entry_record(entry: &Entry, spent: Duration) -> (u32, Vec<u32>) {
-    let micros = u32::try_from(spent.as_micros()).unwrap_or(u32::MAX);
+    let micros = micros(spent);
     match entry {
         Entry::Write(cells) => {
             let mut words = Vec::with_capacity(cells.len() * 4);
