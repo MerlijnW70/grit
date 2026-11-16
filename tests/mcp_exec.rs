@@ -3815,6 +3815,113 @@ fn a_frame_held_up_while_a_world_is_rebuilt_never_refuses_a_journal_that_fits() 
 }
 
 #[cfg(feature = "faults")]
+#[test]
+fn a_world_whose_one_frame_outlasts_a_short_budget_by_its_fixed_cost_is_refused_however_a_long_client_batches()
+ {
+    use grit::serve3::budget::{FIXED_KEPT, SUBMIT_MOST_MS};
+    let Some(host) = device("fixed cost too slow") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = sand_server_world(&mut server);
+    answer(&call(
+        &mut server,
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":64}}"),
+    ));
+    let budget = Duration::from_millis(40);
+    let fixed = Duration::from_millis(20);
+    let each = Duration::from_millis(30);
+    let frame = fixed + each;
+    grit::serve3::tools::faults::stall_submission(fixed);
+    grit::serve3::tools::faults::stall_every(each);
+    let short = format!(
+        "{{\"world\":{world},\"frames\":65536,\"budget_ms\":{}}}",
+        budget.as_millis()
+    );
+    let shapes = [65536, 3, 2, 7, 1, 64];
+    let mut probed = Vec::new();
+    for call_at in 0..12 {
+        let long = format!(
+            "{{\"world\":{world},\"frames\":{},\"budget_ms\":1000}}",
+            shapes[call_at % shapes.len()]
+        );
+        answer(&call(&mut server, "grit_world_step", &long));
+        let submitted = batches(&mut server);
+        let began = Instant::now();
+        let got = call(&mut server, "grit_world_step", &short);
+        let took = began.elapsed();
+        let ran = got_frames(&got);
+        let since = batches(&mut server) - submitted;
+        eprintln!("short call {call_at}: {ran} frames in {since} batches, {took:?}");
+        if ran > 0 {
+            probed.push(call_at);
+        } else {
+            assert_eq!(since, 0, "refused call {call_at}: {}", written(&got));
+        }
+        assert!(
+            took <= budget + frame + Duration::from_millis(SUBMIT_MOST_MS),
+            "short call {call_at} took {took:?}"
+        );
+    }
+    grit::serve3::tools::faults::disarm();
+    assert!(
+        probed.iter().all(|call_at| *call_at < FIXED_KEPT),
+        "a frame of {frame:?} ({fixed:?} per batch and {each:?} per frame) against a {budget:?} budget: short calls {probed:?} of 12 ran a frame"
+    );
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_world_whose_one_frame_fits_a_short_budget_is_never_refused_however_large_the_long_clients_batches()
+ {
+    use grit::serve3::budget::SUBMIT_MOST_MS;
+    let Some(host) = device("fixed cost fits") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = sand_server_world(&mut server);
+    answer(&call(
+        &mut server,
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":64}}"),
+    ));
+    let budget = Duration::from_millis(60);
+    let fixed = Duration::from_millis(15);
+    grit::serve3::tools::faults::stall_submission(fixed);
+    let long = format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":1000}}");
+    let short = format!(
+        "{{\"world\":{world},\"frames\":65536,\"budget_ms\":{}}}",
+        budget.as_millis()
+    );
+    let mut refused = Vec::new();
+    for call_at in 0..8 {
+        let (ran, _) = {
+            let got = call(&mut server, "grit_world_step", &long);
+            (got_frames(&got), got)
+        };
+        assert!(ran > 64, "long call {call_at} ran {ran} frames");
+        let began = Instant::now();
+        let got = call(&mut server, "grit_world_step", &short);
+        let took = began.elapsed();
+        let ran = got_frames(&got);
+        eprintln!("short call {call_at}: {ran} frames in {took:?}");
+        if ran == 0 {
+            refused.push(call_at);
+        }
+        assert!(
+            took <= budget + Duration::from_millis(SUBMIT_MOST_MS),
+            "short call {call_at} took {took:?}"
+        );
+    }
+    grit::serve3::tools::faults::disarm();
+    assert!(
+        refused.is_empty(),
+        "a batch costs {fixed:?} plus a frame of this world, against a {budget:?} budget, after batches of up to 64 frames by a long client: short calls {refused:?} of 8 ran nothing"
+    );
+}
+
+#[cfg(feature = "faults")]
 fn behind_idle_work(dir: bool) {
     let Some(host) = device("slow idle work") else {
         return;
