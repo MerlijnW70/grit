@@ -4028,6 +4028,7 @@ fn a_write_in_flight_bounds_the_journal_after_it_and_caps_the_whole() {
     assert_eq!(journal::WRITING_REPLAY_MOST, Duration::from_secs(120));
 }
 
+#[cfg(feature = "faults")]
 #[test]
 fn a_call_queued_behind_another_is_charged_that_wait_once() {
     let Some(host) = device("charged once") else {
@@ -4038,11 +4039,17 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
     let world = sand_world(&mut run, 128);
     let first = 600;
     let second = 1500;
-    let sent = Instant::now();
+    let held = Duration::from_millis(second) / 2;
+    let faults = run.exec.faults();
+    faults.lock().unwrap().queued_hold = held;
     let ahead = run.send(
         "grit_world_step",
         &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{first}}}"),
     );
+    while !faults.lock().unwrap().queued_hold.is_zero() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let sent = Instant::now();
     let behind = run.send(
         "grit_world_step",
         &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{second}}}"),
@@ -4056,7 +4063,7 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
     let most = late_most(&mut run, second);
     let least = Duration::from_millis(second - grit::serve3::budget::SUBMIT_MOST_MS);
     eprintln!(
-        "a call of {second} ms behind one of {first} ms answered {took:?} after both were sent (between {least:?} and {most:?})"
+        "a call of {second} ms behind one of {first} ms held {held:?} after its work answered {took:?} after it was sent (between {least:?} and {most:?})"
     );
     assert!(took <= most, "{took:?}, more than {most:?}");
     assert!(took >= least, "{took:?}, less than {least:?}");

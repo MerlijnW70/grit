@@ -137,6 +137,19 @@ impl Shared {
         }
     }
 
+    #[cfg(feature = "faults")]
+    fn queued_beside(&self, cancel: &Arc<AtomicBool>) -> bool {
+        self.flights
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .list
+            .iter()
+            .any(|flight| {
+                !Arc::ptr_eq(&flight.cancel, cancel)
+                    && flight.state.load(Ordering::SeqCst) == QUEUED
+            })
+    }
+
     fn behind(&self, cancel: &Arc<AtomicBool>) -> Duration {
         self.flights
             .lock()
@@ -375,7 +388,12 @@ fn work(
             let now = Instant::now();
             let arrived = now.checked_sub(shared.behind(&job.cancel)).unwrap_or(now);
             server.arriving(Some(arrived), Some(Arc::clone(&job.cancel)));
-            let answer = shared.running(|| server.handle(&job.request).unwrap_or(Json::Null));
+            let answer = shared.running(|| {
+                let answer = server.handle(&job.request).unwrap_or(Json::Null);
+                #[cfg(feature = "faults")]
+                held_for_queued(&server, shared, &job.cancel);
+                answer
+            });
             server.arriving(None, None);
             shared.publish(&server);
             if server.lost() {
@@ -403,6 +421,22 @@ fn work(
             return;
         }
     }
+}
+
+#[cfg(feature = "faults")]
+fn held_for_queued(server: &Server<'_>, shared: &Shared, cancel: &Arc<AtomicBool>) {
+    let held = server
+        .faults()
+        .lock()
+        .map(|mut faults| std::mem::take(&mut faults.queued_hold))
+        .unwrap_or_default();
+    if held.is_zero() {
+        return;
+    }
+    while !shared.queued_beside(cancel) {
+        std::thread::sleep(WATCH);
+    }
+    std::thread::sleep(held);
 }
 
 impl Exec {

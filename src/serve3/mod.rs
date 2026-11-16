@@ -290,6 +290,7 @@ pub struct Faults {
     pub idle_works: u32,
     pub pause_after_answer: Duration,
     pub slow_wake: Duration,
+    pub queued_hold: Duration,
     pub slow_builds: u32,
     pub slow_build: Duration,
     pub held_work: Vec<budget::Work>,
