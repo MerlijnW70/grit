@@ -757,7 +757,7 @@ fn every_refused_look_is_named_by_its_code_and_path() {
     .replacen("\"halo\":1,", "\"halo\":1,\"reversible\":true,", 1);
     let law = compiled(&lifted);
     assert!(law.reversible());
-    assert_eq!(law.inverse().map(Law::halo), Some(1));
+    assert_eq!(law.inverse().unwrap().map(Law::halo), Some(1));
 }
 
 #[test]

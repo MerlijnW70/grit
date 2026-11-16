@@ -248,13 +248,10 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let home = matches!(held.get("home"), Some(Json::Bool(true)));
     let live = server.world(held)?;
     let rule = live.world.rule().to_owned();
-    let Some(inverse) = live.world.law().and_then(crate::law::Law::inverse) else {
-        return Err(not_reversible(&rule));
+    let inverse = match live.world.law().map(crate::law::Law::inverse) {
+        Some(Ok(Some(inverse))) if live.world.reversible() => inverse.hex(),
+        _ => return Err(not_reversible(&rule)),
     };
-    if !live.world.reversible() {
-        return Err(not_reversible(&rule));
-    }
-    let inverse = inverse.hex();
     let frame = live.world.frame();
     if frames > frame {
         return Err(limited(

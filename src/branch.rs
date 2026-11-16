@@ -274,12 +274,12 @@ impl Stepper {
         }
     }
 
-    fn inverse(&self) -> Option<Self> {
+    fn inverse(&self) -> Result<Option<Self>, crate::law::Refusal> {
         match self {
-            Self::Named(_) => None,
-            Self::Law(law, stepping) => law
-                .inverse()
-                .map(|inverse| Self::Law(Box::new(inverse.clone()), *stepping)),
+            Self::Named(_) => Ok(None),
+            Self::Law(law, stepping) => Ok(law
+                .inverse()?
+                .map(|inverse| Self::Law(Box::new(inverse.clone()), *stepping))),
         }
     }
 
@@ -524,7 +524,7 @@ impl<'host> World<'host> {
             ),
             None => (rule.wired(host.width(), grid, &plan)?, rule.laid(&plan)),
         };
-        let (passes, stages, back) = match rule.inverse() {
+        let (passes, stages, back) = match rule.inverse()? {
             Some(inverse) => {
                 let undone = match pool.as_ref() {
                     Some(bricks) => inverse.bricked(bricks, &plan)?,
