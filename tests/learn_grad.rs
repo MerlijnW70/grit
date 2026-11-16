@@ -1245,6 +1245,8 @@ fn g3_every_refusal_names_its_code_and_path_before_any_work() {
     );
     let heat = create(&mut server, HEAT, &[300, 4, 7], SIDE);
     let looks = create(&mut server, &look_law(), &[3], SIDE);
+    let notted = cut_laws().remove(0).1;
+    let cutter = create(&mut server, &notted, &[3_000], SIDE);
     let small = create(&mut server, MIX, &MIX_TRUTH, 8);
     let wide = create(&mut server, MIX, &MIX_TRUTH, 32);
     let large = int_at(
@@ -1258,7 +1260,7 @@ fn g3_every_refusal_names_its_code_and_path_before_any_work() {
         "world",
     );
     let before = state(&mut server, mix, 1);
-    let worlds = [sand, heat, looks, small, wide, large];
+    let worlds = [sand, heat, looks, cutter, small, wide, large];
     let frames_before: Vec<i64> = worlds
         .iter()
         .map(|world| frame_only(&mut server, *world))
@@ -1302,6 +1304,16 @@ fn g3_every_refusal_names_its_code_and_path_before_any_work() {
         ),
         refused_as(
             inline(&looking, "[8,8,8]", &[CALM; 1024], "[3]", aim),
+            "no_gradient",
+            "$.law",
+        ),
+        refused_as(
+            format!("{{\"world\":{cutter},\"frames\":2,\"aim\":{aim}}}"),
+            "no_gradient",
+            "$.world",
+        ),
+        refused_as(
+            inline(&notted, "[8,8,8]", &tiny, "[3000]", aim),
             "no_gradient",
             "$.law",
         ),
@@ -1437,6 +1449,14 @@ fn g3_every_refusal_names_its_code_and_path_before_any_work() {
                 case.arguments,
                 written(&told)
             );
+            if case.arguments.contains(&format!("\"world\":{cutter},"))
+                || case.code == "no_gradient" && case.arguments.contains("notted")
+            {
+                let law = told.get("law").unwrap();
+                assert_eq!(text_at(law, "found"), "not", "{}", written(&told));
+                let node = located(&grit::wire::read(&notted).unwrap(), &text_at(law, "path"));
+                assert_eq!(node.list().unwrap()[0].text(), Some("not"));
+            }
             if case.code == "not_reversible" && case.arguments.contains("\"law\"")
                 || case.arguments.contains(&format!("\"world\":{heat},"))
             {
