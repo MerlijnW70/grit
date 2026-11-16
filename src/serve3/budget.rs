@@ -103,9 +103,8 @@ impl Pace {
     }
 
     fn doubted(&self, time: Duration) -> bool {
-        let filled = self.fixed.iter().flatten().count();
         let fixed = self.known();
-        filled >= FIXED_MOVES_AFTER
+        fixed.is_some()
             && within(self.last, fixed, time) == 0
             && within(self.previous, fixed, time) == 0
     }
