@@ -4608,6 +4608,9 @@ const KEPT_RECORDED: Duration = Duration::from_secs(2);
 const FIRST_OPEN_HELD: Duration = Duration::from_secs(2);
 
 #[cfg(feature = "faults")]
+const FIRST_BUILD_HELD: Duration = Duration::from_secs(2);
+
+#[cfg(feature = "faults")]
 fn replays_held(server: &Server<'_>, by: Duration) {
     let faults = server.faults();
     let mut armed = faults.lock().unwrap();
@@ -4669,15 +4672,21 @@ fn a_build_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that_
         dir: Some(scratch.dir()),
         memory: None,
     });
+    let faults = run.exec.faults();
+    {
+        let mut armed = faults.lock().unwrap();
+        armed.held_work = vec![grit::serve3::budget::Work::Build];
+        armed.held_by = FIRST_BUILD_HELD;
+    }
     let began = Instant::now();
     let world = sand_world(&mut run, 32);
     let plain = began.elapsed();
+    assert!(faults.lock().unwrap().held_work.is_empty());
     answer(&run.ask(
         "grit_world_step",
         &format!("{{\"world\":{world},\"frames\":10}}"),
     ));
     let short = plain * 2 + Duration::from_millis(300);
-    let faults = run.exec.faults();
     {
         let mut armed = faults.lock().unwrap();
         armed.held_work = vec![grit::serve3::budget::Work::Build];
@@ -4692,6 +4701,7 @@ fn a_build_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that_
         &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0]}}"),
     );
     eprintln!("wedged: {}", written(&wedged));
+    let asked = Instant::now();
     let got = run.ask(
         "grit_world_read",
         &format!(
@@ -4700,7 +4710,8 @@ fn a_build_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that_
         ),
     );
     eprintln!(
-        "a first build took {plain:?}; rebuild after one held-up build with {short:?}: {}",
+        "a first build held up {FIRST_BUILD_HELD:?} took {plain:?}; rebuild after one held-up build with {short:?} in {:?}: {}",
+        asked.elapsed(),
         written(&got)
     );
     let read = answer(&got);
