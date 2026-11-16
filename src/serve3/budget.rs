@@ -529,6 +529,8 @@ pub const REMEASURE_AFTER: u32 = 8;
 
 pub const JOURNALS_KEPT: usize = 256;
 
+pub const REFUSALS_KEPT: usize = JOURNALS_KEPT;
+
 const REPLAY_KEY: usize = Work::ALL.len();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -656,7 +658,8 @@ pub struct Rates {
     journals: BTreeMap<u64, std::collections::VecDeque<f64>>,
     journal_order: std::collections::VecDeque<u64>,
     replays_seen: u64,
-    refused: BTreeMap<(usize, u64), u32>,
+    refused: BTreeMap<(usize, u64), (u32, u64)>,
+    refusal_tick: u64,
 }
 
 pub const RECENT: usize = 3;
@@ -717,6 +720,11 @@ impl Rates {
         self.refused_at((work.index(), bytes))
     }
 
+    #[must_use]
+    pub fn refusals_kept(&self) -> usize {
+        self.refused.len()
+    }
+
     pub fn admitted(&mut self, work: Work, bytes: u64) {
         self.refused.remove(&(work.index(), bytes));
     }
@@ -730,7 +738,20 @@ impl Rates {
     }
 
     fn refused_at(&mut self, key: (usize, u64)) -> bool {
-        let refused = self.refused.entry(key).or_insert(0);
+        self.refusal_tick = self.refusal_tick.wrapping_add(1);
+        if !self.refused.contains_key(&key)
+            && self.refused.len() >= REFUSALS_KEPT
+            && let Some(stalest) = self
+                .refused
+                .iter()
+                .min_by_key(|(_, (_, touched))| *touched)
+                .map(|(stalest, _)| *stalest)
+        {
+            self.refused.remove(&stalest);
+        }
+        let tick = self.refusal_tick;
+        let (refused, touched) = self.refused.entry(key).or_insert((0, tick));
+        *touched = tick;
         if *refused >= REMEASURE_AFTER {
             *refused = 0;
             return false;

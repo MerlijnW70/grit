@@ -565,6 +565,36 @@ fn one_ledger_keeps_its_journal_key_through_its_kept_journal_and_a_copy() {
     }
 }
 
+#[test]
+fn the_refusal_counts_stay_bounded_under_a_stream_of_distinct_refused_journals() {
+    use grit::serve3::budget::REFUSALS_KEPT;
+    let mut rates = Rates::default();
+    for journal in 0..(REFUSALS_KEPT as u64) * 16 {
+        assert!(rates.refuses_replay(journal));
+        assert!(rates.refuses(Work::Build, journal));
+        assert!(rates.refusals_kept() <= REFUSALS_KEPT);
+    }
+    assert_eq!(rates.refusals_kept(), REFUSALS_KEPT);
+}
+
+#[test]
+fn a_refusal_count_touched_while_others_stream_past_still_reaches_its_remeasure() {
+    use grit::serve3::budget::REFUSALS_KEPT;
+    let mut rates = Rates::default();
+    let mut stream = 1_000_u64;
+    for refusal in 0..REMEASURE_AFTER {
+        assert!(rates.refuses_replay(1), "refusal {refusal}");
+        for _ in 0..REFUSALS_KEPT - 1 {
+            assert!(rates.refuses_replay(stream));
+            stream += 1;
+        }
+    }
+    assert!(
+        !rates.refuses_replay(1),
+        "a journal refused {REMEASURE_AFTER} times in a row lost its count to journals refused between"
+    );
+}
+
 #[cfg(feature = "faults")]
 mod served {
     use std::time::{Duration, Instant};
