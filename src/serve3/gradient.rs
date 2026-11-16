@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use crate::law::Law;
 use crate::law::adjoint::{self, Aim, Fault, Plane, Reversible, stepped};
+use crate::law::dag::{FIRST_PARAM, Node};
 use crate::question::Region;
 use crate::sand3::Grid3;
 use crate::wire::{Json, counted, map, text};
@@ -37,7 +38,7 @@ pub const OCT_UNITS: u64 = 128;
 
 pub const SIDE_MOST: u32 = 1024;
 
-pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string, carried back by recomputing every frame with the inverse; a walk that does not come home answers strayed. A descent walks, moves the params by the step Reversible::descend takes and walks again; it stops converged (objective 0, or no step moves), on steps, or on budget or cancelled before a walk, and answers the earliest lowest objective on its trail with its params. A walk costs its octs times frames times the nodes of the law and its inverse plus 128; it may cost at most walk_work, on a start of at most walk_cells words, and cannot stop part way, so an answer can come one walk late. Refused before any walk: not_reversible (with the lifting refusal as law), no_gradient for a law that looks, params, outside, reversed, target_size, aim, start, walk_limit, and budget when the fastest of the last three walks the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
+pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string: the derivative of every add, sub, mul, div, shift and sel arm on the way from params[i] to a cell, carried back by recomputing every frame with the inverse, where a compare (and so a sel's choice) counts as constant; a walk that does not come home answers strayed. A law is refused no_gradient, at the path of the first such node, when a not, and, or, xor, dot_s or dot_u takes a value that moves with a param (directly or through a cell an earlier frame moved) and its result reaches a cell other than through a compare, and when it looks (halo 1). A descent walks, moves the params by the step Reversible::descend takes and walks again; it stops converged (objective 0, or no step moves), on steps, or on budget or cancelled before a walk, and answers the earliest lowest objective on its trail with its params. A walk costs its octs times frames times the nodes of the law and its inverse plus 128; it may cost at most walk_work, on a start of at most walk_cells words, and cannot stop part way, so an answer can come one walk late. Refused before any walk: not_reversible (with the lifting refusal as law), no_gradient (with its path as law), params, outside, reversed, target_size, aim, start, walk_limit, and budget when the fastest of the last three walks the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -385,7 +386,156 @@ fn reversible_of(start: &Start) -> Result<Reversible, Failed> {
             ),
         ));
     }
+    if let Some((node, op)) = cut(reversible.forward()) {
+        let path = start
+            .law
+            .places()
+            .path(node)
+            .unwrap_or_else(|| String::from("$.step"));
+        return Err(Box::new(Told(
+            Refusal::new(
+                Code::NoGradient,
+                start.field,
+                format!(
+                    "the law {} takes {op} of a value that moves with its params, at {path}, on the way to a cell; the adjoint carries no gradient through {op}, so the gradient would be wrong, and nothing ran",
+                    start.law.name()
+                ),
+            ),
+            vec![(
+                "law",
+                map(vec![
+                    ("code", text("no_gradient")),
+                    ("path", text(&path)),
+                    ("found", text(op)),
+                ]),
+            )],
+        )));
+    }
     Ok(reversible)
+}
+
+enum Edges {
+    Carried(Vec<u32>),
+    Flat,
+    Cut(&'static str, Vec<u32>),
+}
+
+fn edges(node: Node) -> Edges {
+    match node {
+        Node::Input(_) | Node::Const(_) => Edges::Carried(Vec::new()),
+        Node::Add(one, other)
+        | Node::Sub(one, other)
+        | Node::Mul(one, other)
+        | Node::Div(one, other) => Edges::Carried(vec![one, other]),
+        Node::Shl(one, _) | Node::Shr(one, _) => Edges::Carried(vec![one]),
+        Node::Select(_, then, otherwise) => Edges::Carried(vec![then, otherwise]),
+        Node::Eq(..) | Node::Ne(..) | Node::Lt(..) | Node::Le(..) | Node::Gt(..) | Node::Ge(..) => {
+            Edges::Flat
+        }
+        Node::Not(one) => Edges::Cut("not", vec![one]),
+        Node::And(one, other) => Edges::Cut("and", vec![one, other]),
+        Node::Or(one, other) => Edges::Cut("or", vec![one, other]),
+        Node::Xor(one, other) => Edges::Cut("xor", vec![one, other]),
+        Node::DotS(one, other) => Edges::Cut("dot_s", vec![one, other]),
+        Node::DotU(one, other) => Edges::Cut("dot_u", vec![one, other]),
+    }
+}
+
+fn outputs(dag: &crate::law::dag::Dag) -> Vec<u32> {
+    let mut outs = dag.out().to_vec();
+    for plane in dag.planes() {
+        outs.extend(plane.iter().copied());
+    }
+    outs
+}
+
+fn word_input(dag: &crate::law::dag::Dag, which: u32) -> Option<usize> {
+    if which < 8 {
+        return usize::try_from(which).ok();
+    }
+    let above = usize::try_from(which.checked_sub(dag.first_plane())?).ok()?;
+    (above < 8 * dag.planes().len()).then_some(8 + above)
+}
+
+fn param_input(dag: &crate::law::dag::Dag, which: u32) -> bool {
+    (FIRST_PARAM..dag.first_plane()).contains(&which)
+}
+
+fn moved(dag: &crate::law::dag::Dag, words: &[bool]) -> Vec<bool> {
+    let held = |id: u32, made: &[bool]| made.get(id as usize).copied().unwrap_or(false);
+    let mut made: Vec<bool> = Vec::with_capacity(dag.len());
+    for &node in dag.nodes() {
+        let one = match (node, edges(node)) {
+            (Node::Input(which), _) => {
+                param_input(dag, which)
+                    || word_input(dag, which)
+                        .and_then(|word| words.get(word).copied())
+                        .unwrap_or(false)
+            }
+            (_, Edges::Carried(from) | Edges::Cut(_, from)) => {
+                from.iter().any(|&id| held(id, &made))
+            }
+            (_, Edges::Flat) => false,
+        };
+        made.push(one);
+    }
+    made
+}
+
+#[must_use]
+pub fn cut(dag: &crate::law::dag::Dag) -> Option<(u32, &'static str)> {
+    let outs = outputs(dag);
+    let mut words = vec![false; outs.len()];
+    let made = loop {
+        let made = moved(dag, &words);
+        let mut next = words.clone();
+        for (word, &out) in outs.iter().enumerate() {
+            if made.get(out as usize).copied().unwrap_or(false) {
+                let plane = word / 8 * 8;
+                let corner = word % 8;
+                for one in [plane + corner, plane + 7 - corner] {
+                    if let Some(slot) = next.get_mut(one) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        if next == words {
+            break made;
+        }
+        words = next;
+    };
+    let mut live = vec![false; dag.len()];
+    for &out in &outs {
+        if let Some(slot) = live.get_mut(out as usize) {
+            *slot = true;
+        }
+    }
+    let mut found = None;
+    for (index, &node) in dag.nodes().iter().enumerate().rev() {
+        if !live.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        match edges(node) {
+            Edges::Carried(from) => {
+                for id in from {
+                    if let Some(slot) = live.get_mut(id as usize) {
+                        *slot = true;
+                    }
+                }
+            }
+            Edges::Flat => {}
+            Edges::Cut(op, from) => {
+                if from
+                    .iter()
+                    .any(|&id| made.get(id as usize).copied().unwrap_or(false))
+                {
+                    found = Some((u32::try_from(index).unwrap_or(u32::MAX), op));
+                }
+            }
+        }
+    }
+    found
 }
 
 fn corner_of(held: &Json, key: &str) -> Result<[u32; 3], Failed> {

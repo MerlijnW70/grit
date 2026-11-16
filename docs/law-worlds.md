@@ -77,7 +77,7 @@ Refusals: `not_reversible` at `$.world` for a world whose law is not reversible,
 
 ## Learning a law's params by gradient
 
-`grit_law_gradient` answers, for a reversible law, how the objective after `frames` frames moves with each param. The objective is the sum over the `aim` box, on plane 0, of `|cell - target|`; `aim` is `from` and `to` (corners included) with `target` (the box's words, x fastest) or `world` (take them from that world's box). The start is a world (`world`: its cells on every plane at its frame, its params unless `params` is given) or an inline start (`law`, `size` with sides powers of two, `cells` plane by plane, `first`). `gradient[i]` is d objective / d `params[i]` times 2^64, a decimal string; `home` is true.
+`grit_law_gradient` answers, for a reversible law, how the objective after `frames` frames moves with each param. The objective is the sum over the `aim` box, on plane 0, of `|cell - target|`; `aim` is `from` and `to` (corners included) with `target` (the box's words, x fastest) or `world` (take them from that world's box). The start is a world (`world`: its cells on every plane at its frame, its params unless `params` is given) or an inline start (`law`, `size` with sides powers of two, `cells` plane by plane, `first`). `gradient[i]` is d objective / d `params[i]` times 2^64, a decimal string; `home` is true. It is the derivative through every `add`, `sub`, `mul`, `div`, shift and `sel` arm from the param to a cell; a compare, and so a `sel`'s choice, counts as constant. A law in which `not`, `and`, `or`, `xor`, `dot_s` or `dot_u` takes a value that moves with a param (also through a cell an earlier frame moved) and passes it on to a cell other than through a compare is refused `no_gradient`, with that node's path as `law.path`; so is a law that looks.
 
 The answers equal the library's `Reversible::walk` and `Reversible::descend` exactly, on the CPU.
 
@@ -88,7 +88,7 @@ The answers equal the library's `Reversible::walk` and `Reversible::descend` exa
 3. `grit_law_descend` with `world` the learner, `frames` 8, `aim` `{"from":[0,0,0],"to":[15,15,15],"world":<target>}`, `steps` 16: `params` `[3000,1700]`, `objective` 0, `stopped` `converged`, after 3 steps.
 4. `grit_world_params` the learner with them and `grit_world_step` 8 frames: its cells equal the target's.
 
-Neither tool writes a world or its journal. Refused before any walk: `not_reversible` (with the lifting refusal as `law`), `no_gradient` for a law that looks, `params`, `outside`, `reversed`, `target_size`, `aim`, `start`, `walk_limit` (a start past `walk_cells` words, a walk past `walk_work`), `budget`. A walk that does not come home answers `strayed` with the cell; one past 128 bits answers `overflow`. `grit_describe` names the limits under `law_gradient`.
+Neither tool writes a world or its journal. Refused before any walk: `not_reversible` (with the lifting refusal as `law`), `no_gradient` (above), `params`, `outside`, `reversed`, `target_size`, `aim`, `start`, `walk_limit` (a start past `walk_cells` words, a walk past `walk_work`), `budget`. A walk that does not come home answers `strayed` with the cell; one past 128 bits answers `overflow`. `grit_describe` names the limits under `law_gradient`.
 
 ## The quiet class
 

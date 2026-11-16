@@ -432,6 +432,48 @@ fn fault_code(why: Fault) -> &'static str {
     }
 }
 
+const CUT: [&str; 6] = ["not", "and", "or", "xor", "dot_s", "dot_u"];
+
+fn located(json: &Json, path: &str) -> Json {
+    let mut here = json.clone();
+    let mut rest = path.strip_prefix('$').unwrap();
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('.') {
+            let end = after.find(['.', '[']).unwrap_or(after.len());
+            here = here.get(&after[..end]).unwrap().clone();
+            rest = &after[end..];
+        } else {
+            let after = rest.strip_prefix('[').unwrap();
+            let end = after.find(']').unwrap();
+            let index: usize = after[..end].parse().unwrap();
+            here = here.list().unwrap()[index].clone();
+            rest = &after[end + 1..];
+        }
+    }
+    here
+}
+
+fn cut_refused(label: &str, got: &Json, text: &str) -> bool {
+    let held = got.get("result").unwrap();
+    if held.get("isError") != Some(&Json::Bool(true)) {
+        return false;
+    }
+    let told = refusal(got);
+    if text_at(&told, "code") != "no_gradient" {
+        return false;
+    }
+    let law = told.get("law").unwrap();
+    let found = text_at(law, "found");
+    let node = located(&grit::wire::read(text).unwrap(), &text_at(law, "path"));
+    let op = node.list().and_then(|one| one.first()).and_then(Json::text);
+    assert!(
+        CUT.contains(&found.as_str()) && op == Some(found.as_str()),
+        "{label}: refused at {} ({op:?}) for {found}",
+        text_at(law, "path")
+    );
+    true
+}
+
 fn same_gradient(label: &str, got: &Json, walked: &Result<Walked, Fault>) {
     match walked {
         Ok(walked) => {
@@ -493,6 +535,7 @@ fn g1_the_gradient_through_the_mcp_is_the_walk_exactly_on_random_laws_and_aims()
     let mut server = Server::new(None);
     let mut overflowed = 0;
     let mut moved = 0;
+    let mut cut = 0;
     for seed in 0..RANDOM_LAWS {
         let (text, values) = if seed % 2 == 0 {
             random_law(0xA1B0 + seed)
@@ -521,14 +564,24 @@ fn g1_the_gradient_through_the_mcp_is_the_walk_exactly_on_random_laws_and_aims()
             target: &target,
         };
         let walked = posed.walked(&law);
+        let most = 1 + u32::try_from(below(&mut state, 4)).unwrap();
+        let got = call(&mut server, "grit_law_gradient", &posed.arguments(""));
+        if cut_refused(&format!("law {seed}"), &got, &text) {
+            let again = call(
+                &mut server,
+                "grit_law_descend",
+                &posed.arguments(&format!(",\"steps\":{most}")),
+            );
+            assert!(cut_refused(&format!("law {seed}"), &again, &text));
+            cut += 1;
+            continue;
+        }
         match &walked {
             Err(_) => overflowed += 1,
             Ok(walked) if walked.told.iter().any(|one| *one != 0) => moved += 1,
             Ok(_) => {}
         }
-        let got = call(&mut server, "grit_law_gradient", &posed.arguments(""));
         same_gradient(&format!("law {seed}"), &got, &walked);
-        let most = 1 + u32::try_from(below(&mut state, 4)).unwrap();
         let got = call(
             &mut server,
             "grit_law_descend",
@@ -542,9 +595,10 @@ fn g1_the_gradient_through_the_mcp_is_the_walk_exactly_on_random_laws_and_aims()
         );
     }
     println!(
-        "{RANDOM_LAWS} random laws and aims: every gradient and descent equal to the library; {moved} with a gradient that is not zero, {overflowed} past 128 bits"
+        "{RANDOM_LAWS} random laws and aims: {cut} refused no_gradient at a cut node, every other gradient and descent equal to the library; {moved} with a gradient that is not zero, {overflowed} past 128 bits"
     );
-    assert!(moved >= RANDOM_LAWS / 2, "{moved}");
+    assert!(moved >= RANDOM_LAWS / 3, "{moved}");
+    assert!(cut >= RANDOM_LAWS / 8, "{cut}");
 }
 
 const STEP: u32 = 4;
@@ -711,6 +765,9 @@ fn g2_the_gradient_through_the_mcp_agrees_with_finite_differences_in_sign_and_to
             HIGH,
         ));
     }
+    for (label, text, values) in op_laws() {
+        cases.push((label, text, values, far_start(0x0B), HIGH));
+    }
     let mut worst = 0.0_f64;
     let mut checked = 0;
     for (case, (label, text, values, start, high)) in cases.iter().enumerate() {
@@ -741,8 +798,210 @@ fn g2_the_gradient_through_the_mcp_agrees_with_finite_differences_in_sign_and_to
         }
     }
     println!(
-        "mix, stir and {SMOOTH_LAWS} random smooth laws, whole boxes of targets all past one side, {checked} params: the gradient through the MCP is at most {worst:.3} % from the central finite difference of step {STEP}"
+        "mix, stir, {SMOOTH_LAWS} random smooth laws and {} laws of one op each, whole boxes of targets all past one side, {checked} params: the gradient through the MCP is at most {worst:.3} % from the central finite difference of step {STEP}",
+        op_laws().len()
     );
+    let mut refused = 0;
+    for (label, text) in cut_laws() {
+        let law = reversible(&text);
+        let start = far_start(0x0C);
+        let mut state = 0xC07;
+        let region = Region::whole([SIDE, SIDE, SIDE]);
+        let target = far_target(&mut state, region);
+        let params = [3_000_u32];
+        let posed = Inline {
+            text: &text,
+            start: &start,
+            first: 0,
+            params: &params,
+            frames: SMOOTH_FRAMES,
+            region,
+            target: &target,
+        };
+        let got = call(&mut server, "grit_law_gradient", &posed.arguments(""));
+        if cut_refused(&label, &got, &text) {
+            refused += 1;
+            continue;
+        }
+        for moved in [0_u32, STEP, 2 * STEP] {
+            inside_band(&label, &law, &start, &[params[0] + moved - STEP], HIGH);
+        }
+        agrees(&mut server, &label, &law, &posed);
+    }
+    println!(
+        "{} laws with a cut op on a param's path: {refused} refused no_gradient, the rest agree with finite differences",
+        cut_laws().len()
+    );
+}
+
+const SHARE: &str = "[\"shr\",[\"mul\",[\"shr\",\"w0v0\",7],[\"param\",0]],13]";
+
+fn one_lift(name: &str, params: u32, lifts: &[(usize, &str, String)]) -> String {
+    let mut lifter = Lifter::new();
+    for (word, op, by) in lifts {
+        lifter.lift(*word, op, by);
+    }
+    lifter.text(name, params)
+}
+
+fn op_laws() -> Vec<(String, String, Vec<u32>)> {
+    let shared = |by: &str| {
+        vec![
+            (1, "add", by.to_owned()),
+            (
+                2,
+                "add",
+                "[\"shr\",[\"mul\",[\"shr\",\"w4v0\",7],[\"param\",0]],12]".to_owned(),
+            ),
+        ]
+    };
+    vec![
+        (
+            "shl".to_owned(),
+            one_lift(
+                "shl",
+                1,
+                &shared("[\"shl\",[\"shr\",[\"mul\",[\"shr\",\"w0v0\",7],[\"param\",0]],16],3]"),
+            ),
+            vec![3_000],
+        ),
+        (
+            "div by a constant".to_owned(),
+            one_lift(
+                "divided",
+                1,
+                &shared("[\"div\",[\"mul\",[\"shr\",\"w0v0\",7],[\"param\",0]],9000]"),
+            ),
+            vec![3_000],
+        ),
+        (
+            "div by a param".to_owned(),
+            one_lift(
+                "over",
+                1,
+                &shared("[\"div\",[\"mul\",[\"shr\",\"w0v0\",7],2000],[\"param\",0]]"),
+            ),
+            vec![3_000],
+        ),
+        (
+            "mul of two params".to_owned(),
+            one_lift(
+                "squared",
+                2,
+                &[(
+                    1,
+                    "add",
+                    "[\"shr\",[\"mul\",[\"shr\",\"w0v0\",12],[\"mul\",[\"param\",0],[\"param\",1]]],12]".to_owned(),
+                )],
+            ),
+            vec![60, 50],
+        ),
+        (
+            "sel arms on at".to_owned(),
+            one_lift(
+                "chosen",
+                2,
+                &[(
+                    1,
+                    "add",
+                    "[\"sel\",[\"lt\",[\"at\",\"at\",0],4],[\"shr\",[\"mul\",[\"shr\",\"w0v0\",7],[\"param\",0]],13],[\"shr\",[\"mul\",[\"shr\",\"w2v0\",7],[\"param\",1]],12]]".to_owned(),
+                )],
+            ),
+            vec![3_000, 2_000],
+        ),
+        (
+            "a compare of a param".to_owned(),
+            one_lift(
+                "gated",
+                1,
+                &[(
+                    1,
+                    "add",
+                    format!("[\"sel\",[\"gt\",[\"param\",0],100],{SHARE},0]"),
+                )],
+            ),
+            vec![3_000],
+        ),
+        (
+            "at, frame and noise beside a param".to_owned(),
+            one_lift(
+                "placed",
+                1,
+                &[(
+                    1,
+                    "add",
+                    "[\"shr\",[\"mul\",[\"add\",[\"add\",[\"shr\",\"w0v0\",7],[\"shl\",[\"at\",\"at\",0],10]],[\"add\",[\"shl\",\"frame\",8],[\"shr\",[\"noise\"],18]]],[\"param\",0]],13]".to_owned(),
+                )],
+            ),
+            vec![3_000],
+        ),
+    ]
+}
+
+fn cut_laws() -> Vec<(String, String)> {
+    vec![
+        (
+            "sub of not".to_owned(),
+            one_lift("notted", 1, &[(1, "sub", format!("[\"not\",{SHARE}]"))]),
+        ),
+        (
+            "xor 1 after the add".to_owned(),
+            one_lift(
+                "xored",
+                1,
+                &[(1, "add", SHARE.to_owned()), (1, "xor", "1".to_owned())],
+            ),
+        ),
+        (
+            "and with a high mask".to_owned(),
+            one_lift(
+                "anded",
+                1,
+                &[(1, "add", format!("[\"and\",{SHARE},4294967040]"))],
+            ),
+        ),
+        (
+            "or with a low bit".to_owned(),
+            one_lift("ored", 1, &[(1, "add", format!("[\"or\",{SHARE},1]"))]),
+        ),
+        (
+            "dot_u lane 0".to_owned(),
+            one_lift(
+                "dotted",
+                1,
+                &[(
+                    1,
+                    "add",
+                    "[\"dot_u\",[\"shr\",[\"mul\",[\"shr\",\"w0v0\",14],[\"param\",0]],12],200]"
+                        .to_owned(),
+                )],
+            ),
+        ),
+        (
+            "dot_s lane 0".to_owned(),
+            one_lift(
+                "signed",
+                1,
+                &[(
+                    1,
+                    "add",
+                    "[\"dot_s\",[\"shr\",[\"mul\",[\"shr\",\"w0v0\",14],[\"param\",0]],12],100]"
+                        .to_owned(),
+                )],
+            ),
+        ),
+        (
+            "xor of a cell a param moved a frame before".to_owned(),
+            one_lift(
+                "later",
+                1,
+                &[
+                    (1, "add", SHARE.to_owned()),
+                    (3, "add", "[\"shr\",[\"xor\",\"w6v0\",5],8]".to_owned()),
+                ],
+            ),
+        ),
+    ]
 }
 
 trait Ask {
@@ -837,6 +1096,8 @@ fn g1_a_world_start_and_a_target_world_answer_the_walk_exactly() {
         return;
     };
     let mut server = Server::new(Some(&host));
+    let mut refused = 0;
+    let mut accepted = 0;
     for seed in 0..6_u64 {
         let planes = 1 + usize::try_from(seed % 2).unwrap();
         let (text, values) = if seed < 4 {
@@ -879,6 +1140,11 @@ fn g1_a_world_start_and_a_target_world_answer_the_walk_exactly() {
                 "{{\"world\":{start_world},\"frames\":{frames},\"aim\":{aim_text},\"budget_ms\":{LONG}}}"
             ),
         );
+        if cut_refused(&format!("world law {seed}"), &got, &text) {
+            refused += 1;
+            println!("world law {seed}: refused no_gradient");
+            continue;
+        }
         same_gradient(&format!("world law {seed}"), &got, &walked);
         let most = 3;
         let descent = law.descend(
@@ -913,10 +1179,13 @@ fn g1_a_world_start_and_a_target_world_answer_the_walk_exactly() {
                 "world law {seed}: the walk's forward run is the world's own"
             );
         }
+        accepted += 1;
         println!(
             "world law {seed} on {planes} planes, sparse {sparse}: gradient and descent equal the library"
         );
     }
+    println!("{accepted} world laws answered, {refused} refused no_gradient");
+    assert!(accepted >= 4, "{accepted}");
 }
 
 fn look_law() -> String {
