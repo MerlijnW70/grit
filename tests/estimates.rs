@@ -919,7 +919,7 @@ mod served {
         result(&opened(&mut server, 5, Duration::from_secs(600)), false);
     }
 
-    const OPEN_SLACK: Duration = Duration::from_secs(10);
+    const OPEN_STALL: Duration = Duration::from_millis(50);
 
     #[test]
     fn cut_replays_teach_nothing_and_never_refuse_an_identical_open_that_fits() {
@@ -929,9 +929,8 @@ mod served {
         let held = scratch("cuts-teach-nothing");
         let dir = held.0.join("worlds");
         let keep = Keep::at(&dir).unwrap();
-        let cells: Vec<([u32; 3], u32)> = (0..2048_u32)
-            .map(|at| ([at % 32, (at / 32) % 32, at / 1024], 1 + at % 2))
-            .collect();
+        let chunk = u32::try_from(grit::serve3::journal::WRITE_CHUNK).unwrap();
+        let cells: Vec<([u32; 3], u32)> = (0..chunk).map(|at| ([at, 0, 0], 1 + at % 2)).collect();
         for number in 1..=7 {
             let mut ledger = Ledger::created(Made {
                 rule: "sand".to_owned(),
@@ -951,6 +950,7 @@ mod served {
             memory: None,
         };
         let mut server = Server::with(Some(&host), &options).unwrap();
+        grit::serve3::tools::faults::stall_every(OPEN_STALL);
         let mut whole = Duration::MAX;
         for number in [1, 6] {
             let began = Instant::now();
@@ -981,9 +981,10 @@ mod served {
         let probe = result(&opened(&mut server, 5, Duration::from_millis(1)), true);
         let message = probe.get("message").and_then(Json::text).unwrap();
         eprintln!("an open took {whole:?}; after three cuts at {cut:?}: {message}");
-        let enough = cut + whole / 4 + OPEN_SLACK;
+        let enough = cut - whole / 2;
         let began = Instant::now();
         let got = opened(&mut server, 7, enough);
+        grit::serve3::tools::faults::disarm();
         eprintln!("open with {enough:?}: {:?}", began.elapsed());
         result(&got, false);
     }
