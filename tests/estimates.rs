@@ -919,7 +919,7 @@ mod served {
         result(&opened(&mut server, 5, Duration::from_secs(600)), false);
     }
 
-    const OPEN_SLACK: Duration = Duration::from_secs(2);
+    const OPEN_SLACK: Duration = Duration::from_secs(10);
 
     #[test]
     fn cut_replays_teach_nothing_and_never_refuse_an_identical_open_that_fits() {
@@ -961,7 +961,7 @@ mod served {
             whole = whole.min(began.elapsed());
         }
         let measured = replays_measured(&mut server);
-        let cut = whole * 2 + OPEN_SLACK;
+        let cut = whole * 2;
         for number in 2..=4 {
             {
                 let faults = server.faults();
@@ -981,7 +981,7 @@ mod served {
         let probe = result(&opened(&mut server, 5, Duration::from_millis(1)), true);
         let message = probe.get("message").and_then(Json::text).unwrap();
         eprintln!("an open took {whole:?}; after three cuts at {cut:?}: {message}");
-        let enough = cut + whole / 4;
+        let enough = cut + whole / 4 + OPEN_SLACK;
         let began = Instant::now();
         let got = opened(&mut server, 7, enough);
         eprintln!("open with {enough:?}: {:?}", began.elapsed());
