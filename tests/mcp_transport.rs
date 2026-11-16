@@ -1653,7 +1653,7 @@ fn a_step_that_fails_part_way_reports_the_frame_its_state_is_on() {
         &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[7,7,7]}}"),
     ));
     let ran = got.counted("frame").unwrap();
-    assert!((1..130).contains(&ran), "{}", told.message);
+    assert_eq!(ran, 1, "{}", told.message);
     assert!(
         told.message.ends_with(&format!(
             "{ran} of the 130 frames ran before it, and the world is at frame {ran}"
