@@ -50,6 +50,8 @@ impl<'host> World<'host> {
             frame: self.frame,
             live,
             words_read: 0,
+            back: self.back.clone(),
+            backward: self.backward,
         })
     }
 
@@ -73,6 +75,7 @@ impl<'host> World<'host> {
         copied(&mut from.live, &mut self.live, &self.sizes, reach)?;
         self.params.clone_from(&from.params);
         self.frame = from.frame;
+        self.backward = from.backward;
         if let (super::Stepper::Law(_, into), super::Stepper::Law(_, taken)) =
             (&mut self.rule, &from.rule)
         {
