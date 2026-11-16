@@ -52,6 +52,8 @@ pub const FIXED_MOVES_AFTER: usize = 3;
 
 pub const FIXED_KEPT: usize = 2 * FIXED_MOVES_AFTER - 1;
 
+pub const SPLIT_EVERY: u32 = 8;
+
 #[derive(Debug, Clone, Copy)]
 struct Batch {
     frames: u32,
@@ -65,6 +67,7 @@ pub struct Pace {
     fixed: [Option<Duration>; FIXED_KEPT],
     measured: u32,
     refused: u32,
+    since: u32,
 }
 
 impl Pace {
@@ -83,21 +86,34 @@ impl Pace {
             fixed: [None; FIXED_KEPT],
             measured: 0,
             refused: 0,
+            since: 0,
         }
     }
 
-    #[must_use]
-    pub fn fixed(&self) -> Duration {
+    fn known(&self) -> Option<Duration> {
         let mut kept = self.fixed;
         kept.sort_unstable();
         let filled = kept.iter().flatten().count();
         let at = FIXED_KEPT - filled + filled.saturating_sub(FIXED_MOVES_AFTER);
-        kept.get(at).copied().flatten().unwrap_or(WORST_PER_SUBMIT)
+        kept.get(at).copied().flatten()
+    }
+
+    fn refusing(&self) -> Duration {
+        let filled = self.fixed.iter().flatten().count();
+        if filled < FIXED_MOVES_AFTER {
+            return Duration::ZERO;
+        }
+        self.known().unwrap_or(Duration::ZERO)
+    }
+
+    #[must_use]
+    pub fn fixed(&self) -> Duration {
+        self.known().unwrap_or(WORST_PER_SUBMIT)
     }
 
     #[must_use]
     pub fn cost(&self, frames: u32) -> Duration {
-        predicted(self.last, self.fixed(), frames)
+        predicted(self.last, self.known(), frames)
     }
 
     #[must_use]
@@ -108,7 +124,7 @@ impl Pace {
         if self.measured == 0 {
             return left.min(1);
         }
-        let fixed = self.fixed();
+        let fixed = self.known();
         let aimed = within(self.last, fixed, AIM).max(1);
         let grown = if self.measured == 1 {
             BATCH_MOST
@@ -116,7 +132,13 @@ impl Pace {
             self.last.frames.saturating_mul(2)
         };
         let fits = within(self.last, fixed, time);
-        aimed.min(grown).min(BATCH_MOST).min(left).min(fits)
+        let step = aimed.min(grown).min(BATCH_MOST).min(left).min(fits);
+        let last = u64::from(self.last.frames);
+        let alike = 2 * u64::from(step) < 3 * last && 3 * u64::from(step) > 2 * last;
+        if self.since >= SPLIT_EVERY && alike && last >= 2 {
+            return step.min(self.last.frames.saturating_mul(2) / 3);
+        }
+        step
     }
 
     pub fn opening(&mut self, left: u32, time: Duration) -> u32 {
@@ -124,12 +146,13 @@ impl Pace {
         if step > 0 || left == 0 || time.is_zero() {
             return step;
         }
-        let fixed = self.fixed();
+        let fixed = Some(self.refusing());
         if within(self.last, fixed, time) > 0 || within(self.previous, fixed, time) > 0 {
             return 1;
         }
         if self.refused < REFUSED_MOST {
             self.refused += 1;
+            self.since = self.since.max(SPLIT_EVERY);
             return 0;
         }
         1
@@ -149,6 +172,7 @@ impl Pace {
             return;
         }
         let now = Batch { frames, spent };
+        self.since = self.since.saturating_add(1);
         if self.measured > 0
             && let Some(fixed) = split(self.last, now)
         {
@@ -156,6 +180,7 @@ impl Pace {
             if let Some(newest) = self.fixed.first_mut() {
                 *newest = Some(fixed);
             }
+            self.since = 0;
         }
         self.previous = self.last;
         self.last = now;
@@ -180,7 +205,13 @@ fn split(one: Batch, other: Batch) -> Option<Duration> {
     u64::try_from(fixed).ok().map(Duration::from_nanos)
 }
 
-fn predicted(batch: Batch, fixed: Duration, frames: u32) -> Duration {
+fn predicted(batch: Batch, fixed: Option<Duration>, frames: u32) -> Duration {
+    let Some(fixed) = fixed else {
+        if frames < batch.frames {
+            return batch.spent;
+        }
+        return predicted(batch, Some(Duration::ZERO), frames);
+    };
     let fixed = fixed.min(batch.spent);
     let each = batch.spent.saturating_sub(fixed).as_nanos();
     let more = each.saturating_mul(u128::from(frames)) / u128::from(batch.frames.max(1));
@@ -189,7 +220,13 @@ fn predicted(batch: Batch, fixed: Duration, frames: u32) -> Duration {
     ))
 }
 
-fn within(batch: Batch, fixed: Duration, time: Duration) -> u32 {
+fn within(batch: Batch, fixed: Option<Duration>, time: Duration) -> u32 {
+    let Some(fixed) = fixed else {
+        if batch.spent > time {
+            return 0;
+        }
+        return within(batch, Some(Duration::ZERO), time);
+    };
     let fixed = fixed.min(batch.spent);
     let Some(room) = time.checked_sub(fixed) else {
         return 0;
