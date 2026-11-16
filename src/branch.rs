@@ -1,3 +1,4 @@
+pub mod back;
 pub mod fork;
 pub mod format;
 
@@ -273,6 +274,15 @@ impl Stepper {
         }
     }
 
+    fn inverse(&self) -> Option<Self> {
+        match self {
+            Self::Named(_) => None,
+            Self::Law(law, stepping) => law
+                .inverse()
+                .map(|inverse| Self::Law(Box::new(inverse.clone()), *stepping)),
+        }
+    }
+
     pub(crate) fn again(&self, host: &Host, params: &[u32]) -> Result<Self, Refused> {
         match self {
             Self::Named(rule) => Ok(Self::Named(ruled(host, rule.name(), params)?)),
@@ -408,6 +418,8 @@ pub struct World<'host> {
     frame: u32,
     live: Resident<'host>,
     words_read: u64,
+    back: Option<Vec<Vec<Groups>>>,
+    backward: bool,
 }
 
 pub(crate) fn ruled(host: &Host, name: &str, params: &[u32]) -> Result<Box<dyn Listed>, Refused> {
@@ -512,6 +524,17 @@ impl<'host> World<'host> {
             ),
             None => (rule.wired(host.width(), grid, &plan)?, rule.laid(&plan)),
         };
+        let (passes, stages, back) = match rule.inverse() {
+            Some(inverse) => {
+                let undone = match pool.as_ref() {
+                    Some(bricks) => inverse.bricked(bricks, &plan)?,
+                    None => inverse.wired(host.width(), grid, &plan)?,
+                };
+                let (passes, stages, back) = back::merged((passes, stages), undone, plan.subgroup)?;
+                (passes, stages, Some(back))
+            }
+            None => (passes, stages, None),
+        };
         host.limits()
             .admits_on(&sizes, None, host.heap())
             .map_err(fitted)?;
@@ -530,6 +553,8 @@ impl<'host> World<'host> {
             frame: 0,
             live,
             words_read: 0,
+            back,
+            backward: false,
         })
     }
 
@@ -865,6 +890,7 @@ impl<'host> World<'host> {
     }
 
     pub fn step(&mut self, frames: u32) -> Result<(), Failed> {
+        self.turned(false)?;
         let groups: Vec<&[Groups]> = self.stages.iter().map(Vec::as_slice).collect();
         let mut done = 0_u32;
         while done < frames {
