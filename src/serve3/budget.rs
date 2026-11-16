@@ -52,8 +52,6 @@ pub const FIXED_MOVES_AFTER: usize = 3;
 
 pub const FIXED_KEPT: usize = 2 * FIXED_MOVES_AFTER - 1;
 
-pub const SPLIT_EVERY: u32 = 8;
-
 #[derive(Debug, Clone, Copy)]
 struct Batch {
     frames: u32,
@@ -67,7 +65,10 @@ pub struct Pace {
     fixed: [Option<Duration>; FIXED_KEPT],
     measured: u32,
     refused: u32,
-    since: u32,
+    one_frame: [Option<Duration>; 2],
+    wanted: bool,
+    probing: bool,
+    calls: u32,
 }
 
 impl Pace {
@@ -86,7 +87,10 @@ impl Pace {
             fixed: [None; FIXED_KEPT],
             measured: 0,
             refused: 0,
-            since: 0,
+            one_frame: [None; 2],
+            wanted: false,
+            probing: false,
+            calls: 0,
         }
     }
 
@@ -98,12 +102,12 @@ impl Pace {
         kept.get(at).copied().flatten()
     }
 
-    fn refusing(&self) -> Duration {
+    fn doubted(&self, time: Duration) -> bool {
         let filled = self.fixed.iter().flatten().count();
-        if filled < FIXED_MOVES_AFTER {
-            return Duration::ZERO;
-        }
-        self.known().unwrap_or(Duration::ZERO)
+        let fixed = self.known();
+        filled >= FIXED_MOVES_AFTER
+            && within(self.last, fixed, time) == 0
+            && within(self.previous, fixed, time) == 0
     }
 
     #[must_use]
@@ -113,11 +117,21 @@ impl Pace {
 
     #[must_use]
     pub fn cost(&self, frames: u32) -> Duration {
+        if frames > self.last.frames {
+            return predicted(self.last, None, frames);
+        }
         predicted(self.last, self.known(), frames)
     }
 
     #[must_use]
     pub fn batch(&self, left: u32, time: Duration) -> u32 {
+        if self.wanted && !time.is_zero() {
+            return left.min(1);
+        }
+        self.sized(left, time)
+    }
+
+    fn sized(&self, left: u32, time: Duration) -> u32 {
         if time.is_zero() {
             return 0;
         }
@@ -126,31 +140,42 @@ impl Pace {
         }
         let fixed = self.known();
         let aimed = within(self.last, fixed, AIM).max(1);
-        let grown = within(self.last, None, AIM).max(self.last.frames);
         let fits = within(self.last, fixed, time);
-        let step = aimed.min(grown).min(BATCH_MOST).min(left).min(fits);
-        let last = u64::from(self.last.frames);
-        let alike = 2 * u64::from(step) < 3 * last && 3 * u64::from(step) > 2 * last;
-        if self.since >= SPLIT_EVERY && alike && last >= 2 {
-            return step.min(self.last.frames.saturating_mul(2) / 3);
+        let mut step = aimed.min(fits).min(BATCH_MOST).min(left);
+        if step > self.last.frames {
+            let proven = within(self.last, None, time);
+            let grown = within(self.last, None, AIM).max(self.last.frames);
+            step = step.min(proven).min(grown);
         }
         step
     }
 
     pub fn opening(&mut self, left: u32, time: Duration) -> u32 {
-        let step = self.batch(left, time);
-        if step > 0 || left == 0 || time.is_zero() {
+        self.calls = self.calls.saturating_add(1);
+        let step = self.sized(left, time);
+        if left == 0 || time.is_zero() {
             return step;
         }
-        let fixed = Some(self.refusing());
-        if within(self.last, fixed, time) > 0 || within(self.previous, fixed, time) > 0 {
-            return 1;
+        if step > 0 {
+            return if self.wanted { 1 } else { step };
         }
-        if self.refused < REFUSED_MOST {
+        let bound = Some(Duration::ZERO);
+        let shown = within(self.last, bound, time) == 0 && within(self.previous, bound, time) == 0;
+        let doubted = !shown && self.doubted(time);
+        if doubted || shown {
+            self.wanted = true;
+        }
+        let vouched = doubted
+            && self.calls <= 1
+            && self
+                .one_frame
+                .iter()
+                .all(|one| one.is_some_and(|one| one > time));
+        if self.measured >= 2 && (shown || vouched) && self.refused < REFUSED_MOST {
             self.refused += 1;
-            self.since = self.since.max(SPLIT_EVERY);
             return 0;
         }
+        self.probing = doubted || shown;
         1
     }
 
@@ -168,7 +193,6 @@ impl Pace {
             return;
         }
         let now = Batch { frames, spent };
-        self.since = self.since.saturating_add(1);
         if self.measured > 0
             && let Some(fixed) = split(self.last, now)
         {
@@ -176,13 +200,27 @@ impl Pace {
             if let Some(newest) = self.fixed.first_mut() {
                 *newest = Some(fixed);
             }
-            self.since = 0;
+        }
+        if frames == 1 {
+            self.one_frame = [Some(spent), self.one_frame[0]];
+            self.wanted = self.wanted && self.probing;
+            self.calls = 0;
         }
         self.previous = self.last;
         self.last = now;
         self.refused = 0;
+        self.probing = false;
         self.measured = self.measured.saturating_add(1);
     }
+}
+
+fn apart(one: Batch, other: Batch) -> bool {
+    let (small, large) = if one.frames <= other.frames {
+        (one, other)
+    } else {
+        (other, one)
+    };
+    2 * u64::from(large.frames) >= 3 * u64::from(small.frames)
 }
 
 fn split(one: Batch, other: Batch) -> Option<Duration> {
@@ -191,7 +229,7 @@ fn split(one: Batch, other: Batch) -> Option<Duration> {
     } else {
         (other, one)
     };
-    if 2 * u64::from(large.frames) < 3 * u64::from(small.frames) || large.spent < small.spent {
+    if !apart(one, other) || large.spent < small.spent {
         return None;
     }
     let (n_small, n_large) = (u128::from(small.frames), u128::from(large.frames));
