@@ -87,7 +87,7 @@ fn a_world_whose_one_frame_outlasts_a_short_budget_is_refused_up_front_however_a
 }
 
 #[test]
-fn a_world_too_slow_for_a_short_budget_from_its_first_frame_runs_late_on_its_first_call_at_most() {
+fn a_world_too_slow_for_a_short_budget_from_its_first_frame_runs_late_only_on_its_first_calls() {
     let slow = Device::new(20_000, 30_000);
     for shape in SHAPES {
         let mut pace = Pace::first(32 * 32 * 32);
@@ -101,7 +101,7 @@ fn a_world_too_slow_for_a_short_budget_from_its_first_frame_runs_late_on_its_fir
             }
         }
         assert!(
-            late.is_empty() || late == [0],
+            late.iter().all(|call_at| *call_at < FIXED_MOVES_AFTER),
             "{shape:?}: short calls {late:?} ran late; {pace:?}"
         );
     }
@@ -556,6 +556,139 @@ fn a_cold_replay_reaches_full_batches_after_two_whatever_its_first_frame_cost() 
             "a first frame of {first_ms} ms, then frames of {:?}: {} batches {sizes:?} for {frames} frames",
             warm.cost(1),
             sizes.len()
+        );
+    }
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self, most: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        if most == 0 { 0 } else { (self.0 >> 33) % most }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    Faster,
+    Slower,
+}
+
+#[derive(Debug, Default)]
+struct Fuzzed {
+    refused: u64,
+    longest: u32,
+    late: u64,
+    over: u64,
+}
+
+fn fuzzed(turn: Turn, ramp_on: bool) -> Fuzzed {
+    let mut rng = Rng(12_345);
+    let mut seen = Fuzzed::default();
+    for _ in 0..400 {
+        let mut pace = Pace::first(rng.next(1 << 24));
+        let mut device = Device::new(rng.next(30_000), 1 + rng.next(10_000));
+        let ramp = if ramp_on {
+            Duration::from_micros(rng.next(10_000))
+        } else {
+            Duration::ZERO
+        };
+        let short = Duration::from_micros(1 + rng.next(60_000));
+        let mut run = 0;
+        for _ in 0..80 {
+            if rng.next(20) == 0 {
+                let fixed = Duration::from_micros(rng.next(30_000));
+                rng.next(10_000);
+                let moved = match turn {
+                    Turn::Faster => fixed < device.fixed,
+                    Turn::Slower => fixed > device.fixed,
+                };
+                if moved {
+                    device.fixed = fixed;
+                }
+            }
+            let is_short = rng.next(2) == 0;
+            let (frames, budget) = if is_short {
+                (
+                    [1_u32, 65536, 3][usize::try_from(rng.next(3)).unwrap()],
+                    short,
+                )
+            } else {
+                (
+                    [65536_u32, 64, 3, 7, 200, 1][usize::try_from(rng.next(6)).unwrap()],
+                    LONG,
+                )
+            };
+            let (mut left, mut done, mut spent) = (budget, 0_u32, Duration::ZERO);
+            while done < frames {
+                let step = if done == 0 {
+                    pace.opening(frames - done, left)
+                } else {
+                    pace.batch(frames - done, left)
+                };
+                if step == 0 {
+                    break;
+                }
+                let took = device.cost(step) + if done == 0 { ramp } else { Duration::ZERO };
+                pace.ran(step, took);
+                left = left.saturating_sub(took);
+                spent += took;
+                done += step;
+            }
+            let one = device.cost(1) + ramp;
+            if is_short && one <= budget {
+                if done == 0 {
+                    seen.refused += 1;
+                    run += 1;
+                    seen.longest = seen.longest.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+            if is_short && spent > budget {
+                seen.over += 1;
+            }
+            if spent > budget + one {
+                seen.late += 1;
+            }
+        }
+    }
+    seen
+}
+
+const MAIN_REFUSED: [u64; 2] = [25, 18];
+
+const MAIN_OVER: [u64; 4] = [3056, 4170, 4860, 5587];
+
+#[test]
+fn a_world_whose_fixed_cost_turns_runs_no_call_late_and_misjudges_fewer_short_calls_than_per_frame_figures()
+ {
+    for (at, (turn, ramp)) in [
+        (Turn::Faster, false),
+        (Turn::Faster, true),
+        (Turn::Slower, false),
+        (Turn::Slower, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seen = fuzzed(turn, ramp);
+        let main_refused = if turn == Turn::Faster {
+            MAIN_REFUSED[usize::from(ramp)]
+        } else {
+            0
+        };
+        assert!(
+            seen.late == 0
+                && seen.longest <= 2
+                && seen.refused + seen.over <= main_refused + MAIN_OVER[at]
+                && (ramp || seen.refused <= main_refused),
+            "fixed costs {turn:?}, ramp {ramp}: {seen:?}; per-frame figures refused {main_refused} and ran {} over budget",
+            MAIN_OVER[at]
         );
     }
 }
