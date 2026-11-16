@@ -4686,7 +4686,7 @@ fn a_build_held_up_once_never_refuses_the_next_rebuild_after_a_lost_device_that_
         "grit_world_step",
         &format!("{{\"world\":{world},\"frames\":10}}"),
     ));
-    let short = plain * 2 + Duration::from_millis(300);
+    let short = plain + Duration::from_millis(300);
     {
         let mut armed = faults.lock().unwrap();
         armed.held_work = vec![grit::serve3::budget::Work::Build];
