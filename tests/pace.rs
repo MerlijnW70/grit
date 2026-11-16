@@ -232,18 +232,20 @@ fn one_held_up_batch_never_raises_the_fixed_cost_past_a_frame_that_fits() {
 }
 
 #[test]
-fn the_fixed_cost_is_split_only_from_batches_whose_sizes_differ_by_twice() {
+fn the_fixed_cost_is_split_only_from_batches_at_least_half_again_apart_in_size() {
     let device = Device::new(4_000, 2_000);
     let mut pace = Pace::first(0);
     pace.ran(40, device.cost(40));
     pace.ran(41, device.cost(41) - Duration::from_millis(1));
     pace.ran(39, device.cost(39));
+    pace.ran(58, device.cost(58));
     assert_eq!(
         pace.fixed(),
         Pace::first(0).fixed(),
-        "batches of nearly one size split no fixed cost: {pace:?}"
+        "batches less than half again apart split no fixed cost: {pace:?}"
     );
-    pace.ran(80, device.cost(80));
+    pace.ran(87, device.cost(87));
+    assert_eq!(pace.fixed(), device.fixed, "{pace:?}");
     pace.ran(20, device.cost(20));
     assert_eq!(pace.fixed(), device.fixed, "{pace:?}");
     assert_eq!(pace.cost(1), device.cost(1), "{pace:?}");
