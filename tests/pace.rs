@@ -495,3 +495,34 @@ fn a_cold_world_runs_its_first_call_within_its_budget_and_one_frame() {
         }
     }
 }
+
+#[test]
+fn a_held_up_batch_in_every_split_so_far_never_refuses_a_frame_that_fits() {
+    let device = Device::new(100, 500);
+    let short = Duration::from_millis(2);
+    let held = Duration::from_millis(5);
+    assert!(device.cost(1) < short && held > short && device.cost(31) > short);
+    for sizes in [&[1_u32, 31][..], &[31, 1, 31][..]] {
+        let mut pace = Pace::first(512 * 512 * 512);
+        for &frames in sizes {
+            let took = if frames == 1 {
+                held
+            } else {
+                device.cost(frames)
+            };
+            pace.ran(frames, took);
+        }
+        assert!(
+            pace.fixed() > short,
+            "the held-up frame is in every split: {pace:?}"
+        );
+        for call in 0..3 {
+            let step = pace.opening(1, short);
+            assert!(
+                step > 0,
+                "batches {sizes:?} with the one frame held up to {held:?}: short call {call} refused; {pace:?}"
+            );
+            pace.ran(step, device.cost(step));
+        }
+    }
+}
