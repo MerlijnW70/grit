@@ -8,7 +8,7 @@ use crate::wire::{Json, counted, map, text};
 
 use super::budget::{Stop, Work};
 use super::errors::{Code, Refusal};
-use super::schema::{object, property, whole, with, word};
+use super::schema::{object, property, whole, word};
 use super::tools::{exactly, int, ints, limited, refused, tool, unread, words_of};
 use super::{Failed, READ_MOST, Server, Tool};
 

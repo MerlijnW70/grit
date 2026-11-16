@@ -4,17 +4,12 @@ mod common;
 
 use common::device;
 
-use std::sync::mpsc::Receiver;
-use std::time::Duration;
-
-use grit::Host;
 use grit::law::Law;
 use grit::law::adjoint::{self, Aim, Descent, Fault, Posed, Reversible, Walked};
 use grit::question::Region;
 use grit::sand3::{Grid3, reference};
-use grit::serve3::exec::Exec;
+use grit::serve3::Server;
 use grit::serve3::gradient::{CELLS_MOST, FRAMES_MOST, STEPS_MOST, WORK_MOST};
-use grit::serve3::{Options, Server};
 use grit::wire::{Json, written};
 
 const MIX: &str = include_str!("law/mix.law.json");
@@ -526,10 +521,10 @@ fn g1_the_gradient_through_the_mcp_is_the_walk_exactly_on_random_laws_and_aims()
             target: &target,
         };
         let walked = posed.walked(&law);
-        if walked.is_err() {
-            overflowed += 1;
-        } else if walked.as_ref().unwrap().told.iter().any(|one| *one != 0) {
-            moved += 1;
+        match &walked {
+            Err(_) => overflowed += 1,
+            Ok(walked) if walked.told.iter().any(|one| *one != 0) => moved += 1,
+            Ok(_) => {}
         }
         let got = call(&mut server, "grit_law_gradient", &posed.arguments(""));
         same_gradient(&format!("law {seed}"), &got, &walked);
@@ -686,10 +681,12 @@ fn far_target(state: &mut u64, region: Region) -> Vec<u32> {
 
 const MIX_HIGH: u32 = 1 << 24;
 
+type Smooth = (String, String, Vec<u32>, Vec<u32>, u32);
+
 #[test]
 fn g2_the_gradient_through_the_mcp_agrees_with_finite_differences_in_sign_and_to_one_percent() {
     let mut server = Server::new(None);
-    let mut cases: Vec<(String, String, Vec<u32>, Vec<u32>, u32)> = Vec::new();
+    let mut cases: Vec<Smooth> = Vec::new();
     for (name, text, truth) in [
         ("mix", MIX, MIX_TRUTH.to_vec()),
         ("stir", STIR, STIR_TRUTH.to_vec()),
@@ -758,48 +755,15 @@ impl Ask for Server<'_> {
     }
 }
 
-struct Run {
-    exec: Exec,
-    answers: Receiver<Json>,
-    id: i64,
-}
-
-impl Run {
-    fn new() -> Self {
-        let pattern = std::env::var("GRIT_DEVICE")
-            .ok()
-            .filter(|one| !one.is_empty());
-        let (exec, answers) = Exec::spawn(
-            Box::new(move || Host::matching(pattern.as_deref())),
-            &Options::default(),
-        )
-        .unwrap();
-        Self {
-            exec,
-            answers,
-            id: 100,
-        }
-    }
-}
-
-impl Ask for Run {
-    fn ask(&mut self, name: &str, arguments: &str) -> Json {
-        self.id += 1;
-        self.exec.line(&line(self.id, name, arguments));
-        loop {
-            let got = self.answers.recv_timeout(Duration::from_secs(300)).unwrap();
-            if got.get("id").and_then(Json::int) == Some(self.id) {
-                return got;
-            }
-        }
-    }
-}
-
 fn create(asker: &mut dyn Ask, text: &str, params: &[u32], side: u32) -> i64 {
+    created(asker, text, params, side, false)
+}
+
+fn created(asker: &mut dyn Ask, text: &str, params: &[u32], side: u32, sparse: bool) -> i64 {
     let made = answer(&asker.ask(
         "grit_world_create",
         &format!(
-            "{{\"wide\":{side},\"deep\":{side},\"tall\":{side},\"law\":{},\"params\":{}}}",
+            "{{\"wide\":{side},\"deep\":{side},\"tall\":{side},\"law\":{},\"params\":{},\"sparse\":{sparse}}}",
             quoted(text),
             listed(params)
         ),
@@ -890,7 +854,8 @@ fn g1_a_world_start_and_a_target_world_answer_the_walk_exactly() {
         };
         let ahead = 3;
         let frames = 1 + u32::try_from(below(&mut state_of, 5)).unwrap();
-        let start_world = create(&mut server, &text, &values, SIDE);
+        let sparse = seed >= 4;
+        let start_world = created(&mut server, &text, &values, SIDE, sparse);
         write_all(&mut server, start_world, &written);
         step(&mut server, start_world, ahead);
         let other: Vec<u32> = values.iter().map(|one| one ^ 0x55).collect();
@@ -948,7 +913,9 @@ fn g1_a_world_start_and_a_target_world_answer_the_walk_exactly() {
                 "world law {seed}: the walk's forward run is the world's own"
             );
         }
-        println!("world law {seed} on {planes} planes: gradient and descent equal the library");
+        println!(
+            "world law {seed} on {planes} planes, sparse {sparse}: gradient and descent equal the library"
+        );
     }
 }
 
@@ -1448,10 +1415,52 @@ mod faulted {
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
+    use std::sync::mpsc::Receiver;
+    use std::time::{Duration, Instant};
+
+    use grit::Host;
+    use grit::serve3::Options;
+    use grit::serve3::exec::Exec;
 
     use grit::serve3::gradient::faults::{cancel_after, disarm};
     use grit::serve3::tools::faults::{disarm as unstall, stall_every};
+
+    struct Run {
+        exec: Exec,
+        answers: Receiver<Json>,
+        id: i64,
+    }
+
+    impl Run {
+        fn new() -> Self {
+            let pattern = std::env::var("GRIT_DEVICE")
+                .ok()
+                .filter(|one| !one.is_empty());
+            let (exec, answers) = Exec::spawn(
+                Box::new(move || Host::matching(pattern.as_deref())),
+                &Options::default(),
+            )
+            .unwrap();
+            Self {
+                exec,
+                answers,
+                id: 100,
+            }
+        }
+    }
+
+    impl Ask for Run {
+        fn ask(&mut self, name: &str, arguments: &str) -> Json {
+            self.id += 1;
+            self.exec.line(&line(self.id, name, arguments));
+            loop {
+                let got = self.answers.recv_timeout(Duration::from_secs(300)).unwrap();
+                if got.get("id").and_then(Json::int) == Some(self.id) {
+                    return got;
+                }
+            }
+        }
+    }
 
     const WALK_FLOOR: Duration = Duration::from_millis(1000);
 
