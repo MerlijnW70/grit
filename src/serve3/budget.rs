@@ -124,13 +124,6 @@ impl Pace {
 
     #[must_use]
     pub fn batch(&self, left: u32, time: Duration) -> u32 {
-        if self.wanted && !time.is_zero() {
-            return left.min(1);
-        }
-        self.sized(left, time)
-    }
-
-    fn sized(&self, left: u32, time: Duration) -> u32 {
         if time.is_zero() {
             return 0;
         }
@@ -151,7 +144,7 @@ impl Pace {
 
     pub fn opening(&mut self, left: u32, time: Duration) -> u32 {
         self.calls = self.calls.saturating_add(1);
-        let step = self.sized(left, time);
+        let step = self.batch(left, time);
         if left == 0 || time.is_zero() {
             return step;
         }
