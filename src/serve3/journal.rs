@@ -1013,21 +1013,40 @@ pub fn state_of(image: &Image) -> [u8; 32] {
             words(&mut hash, &[1]);
             words(&mut hash, sides);
             let per = brick_cells(*sides);
-            for pair in table.as_chunks::<2>().0 {
+            let planes = image.channels() as usize;
+            if planes > 1 {
+                words(&mut hash, &[u32::try_from(planes).unwrap_or(u32::MAX)]);
+            }
+            let count = table.len() / planes.saturating_add(1);
+            let (entries, upper) = table.split_at(count.saturating_mul(2).min(table.len()));
+            let held_count = pool.len() / per.saturating_mul(planes).max(1);
+            for (brick, pair) in entries.as_chunks::<2>().0.iter().enumerate() {
                 let [slot, value] = *pair;
-                if slot == UNIFORM {
-                    words(&mut hash, &[0, value]);
-                    continue;
-                }
-                let from = slot as usize * per;
-                let held = pool.get(from..from + per).unwrap_or_default();
-                match held.split_first() {
-                    Some((first, rest)) if rest.iter().all(|one| one == first) => {
-                        words(&mut hash, &[0, *first]);
+                for plane in 0..planes {
+                    if slot == UNIFORM {
+                        let value = match plane.checked_sub(1) {
+                            None => value,
+                            Some(upper_plane) => upper
+                                .get(upper_plane.saturating_mul(count).saturating_add(brick))
+                                .copied()
+                                .unwrap_or_default(),
+                        };
+                        words(&mut hash, &[0, value]);
+                        continue;
                     }
-                    _ => {
-                        words(&mut hash, &[1]);
-                        words(&mut hash, held);
+                    let from = plane
+                        .saturating_mul(held_count)
+                        .saturating_add(slot as usize)
+                        .saturating_mul(per);
+                    let held = pool.get(from..from.saturating_add(per)).unwrap_or_default();
+                    match held.split_first() {
+                        Some((first, rest)) if rest.iter().all(|one| one == first) => {
+                            words(&mut hash, &[0, *first]);
+                        }
+                        _ => {
+                            words(&mut hash, &[1]);
+                            words(&mut hash, held);
+                        }
                     }
                 }
             }
