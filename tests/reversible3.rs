@@ -1408,9 +1408,279 @@ fn the_back_tool_is_listed_described_and_checked_against_its_schema() {
     }
 }
 
+const SWAP: &str = r#"{"law":1,"name":"drift","params":0,"channels":1,"halo":0,"reversible":true,"tally":{"counts":1,"weighted":false},"consts":{},"defs":{},"step":["let",[["a0",["at","cells",0]],["b0",["at","cells",1]],["a2",["at","cells",2]],["b2",["at","cells",3]],["a4",["at","cells",4]],["b4",["at","cells",5]],["a6",["at","cells",6]],["b6",["at","cells",7]],["a0x",["xor","a0","b0"]],["b0x",["xor","b0","a0x"]],["a0y",["xor","a0x","b0x"]],["a2x",["xor","a2","b2"]],["b2x",["xor","b2","a2x"]],["a2y",["xor","a2x","b2x"]],["a4x",["xor","a4","b4"]],["b4x",["xor","b4","a4x"]],["a4y",["xor","a4x","b4x"]],["a6x",["xor","a6","b6"]],["b6x",["xor","b6","a6x"]],["a6y",["xor","a6x","b6x"]]],["vec",["vec","a0y","b0x","a2y","b2x","a4y","b4x","a6y","b6x"],["vec",["word",["ne","a0","b0"]]]]]}"#;
+
+fn swap_world(run: &mut Run) -> i64 {
+    let made = answer(&run.ask(
+        "grit_world_create",
+        &format!(
+            "{{\"wide\":256,\"deep\":32,\"tall\":32,\"law\":{},\"params\":[],\"sparse\":true,\"slots\":4}}",
+            quoted(SWAP)
+        ),
+    ));
+    let world = int_at(&made, "world");
+    answer(&run.ask(
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":[[0,0,0,7]]}}"),
+    ));
+    world
+}
+
+fn params_by(run: &mut Run, world: i64, params: &[u32]) {
+    answer(&run.ask(
+        "grit_world_params",
+        &format!("{{\"world\":{world},\"params\":{params:?}}}"),
+    ));
+}
+
+#[test]
+fn a_journal_of_writes_steps_params_and_backs_replays_to_the_live_world() {
+    let Some(host) = device("journal with backs replays") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("journal-backs");
+    let (text, params) = walking_law();
+    let law = compiled(&text);
+    let start = filled(Model::grid(), 1, 0x10A, true);
+    let mut run = Run::new(Some(scratch.dir()));
+    let mut held = Vec::new();
+    for sparse in [false, true] {
+        let world = created(&mut run, &text, &params, sparse);
+        write_all(&mut run, world, &start);
+        stepped_by(&mut run, world, 30);
+        back_by(&mut run, world, 10, false);
+        let other = created(&mut run, &text, &params, sparse);
+        write_all(&mut run, other, &start);
+        stepped_by(&mut run, other, 20);
+        let changed = [params[0] ^ 0x55, params[1].wrapping_add(3)];
+        params_by(&mut run, other, &changed);
+        back_by(&mut run, other, 15, false);
+        let mut model = Model {
+            law: law.clone(),
+            params: params.clone(),
+            cells: start.clone(),
+            frame: 0,
+        };
+        model.step(20);
+        model.params = changed.to_vec();
+        model.back(15);
+        assert_eq!(
+            read_all(&mut run, other),
+            model.cells,
+            "[write, step, params, back]"
+        );
+        for one in [world, other] {
+            let (state, frame) = state_of(&mut run, one, &format!("live-{one}"));
+            held.push((one, state, frame, read_all(&mut run, one)));
+        }
+    }
+    run.exec.finish();
+    let mut again = Run::new(Some(scratch.dir()));
+    for (world, state, frame, cells) in &held {
+        let opened = answer(&again.ask(
+            "grit_world_open",
+            &format!("{{\"name\":\"world-{world}\"}}"),
+        ));
+        assert_eq!(int_at(&opened, "frame"), *frame, "world {world}");
+        let (replayed, at) = state_of(&mut again, *world, &format!("replayed-{world}"));
+        assert_eq!(&replayed, state, "world {world} replayed its journal");
+        assert_eq!(at, *frame);
+        assert_eq!(&read_all(&mut again, *world), cells, "world {world}");
+    }
+    again.exec.finish();
+}
+
+#[test]
+fn a_walk_back_that_overflows_its_pool_is_refused_and_keeps_the_world() {
+    let Some(host) = device("walk back overflows its pool") else {
+        return;
+    };
+    drop(host);
+    let scratch = Scratch::new("overflow");
+    let mut run = Run::new(Some(scratch.dir()));
+    let world = swap_world(&mut run);
+    stepped_by(&mut run, world, 240);
+    answer(&run.ask(
+        "grit_world_write",
+        &format!("{{\"world\":{world},\"cells\":[[31,0,0,9],[95,8,8,10]]}}"),
+    ));
+    let (before, frame) = state_of(&mut run, world, "before");
+    assert_eq!(frame, 240);
+    let told = refusal(&run.ask(
+        "grit_world_back",
+        &format!("{{\"world\":{world},\"frames\":240,\"budget_ms\":600000}}"),
+    ));
+    assert_eq!(text_at(&told, "code"), "pool_full", "{}", written(&told));
+    let message = text_at(&told, "message");
+    assert!(message.contains("nothing was journaled"), "{message}");
+    assert!(message.contains("the world is at frame 240"), "{message}");
+    let (after, frame) = state_of(&mut run, world, "after");
+    assert_eq!(frame, 240);
+    assert_eq!(after, before, "the world is left as it was before the walk");
+    stepped_by(&mut run, world, 2);
+    back_by(&mut run, world, 2, true);
+    run.exec.finish();
+    let mut again = Run::new(Some(scratch.dir()));
+    answer(&again.ask(
+        "grit_world_open",
+        &format!("{{\"name\":\"world-{world}\"}}"),
+    ));
+    let (kept, frame) = state_of(&mut again, world, "kept");
+    assert_eq!(frame, 240);
+    assert_eq!(kept, before);
+    again.exec.finish();
+}
+
 #[cfg(feature = "faults")]
 mod faulted {
     use super::*;
+
+    #[test]
+    fn a_walk_stopped_by_its_budget_then_walked_home_comes_home() {
+        let Some(host) = device("budget stop then home") else {
+            return;
+        };
+        let mut server = Server::new(Some(&host));
+        let (text, params) = walking_law();
+        let call = |server: &mut Server<'_>, name: &str, arguments: String| {
+            server.heard(&line(9, name, &arguments)).unwrap()
+        };
+        let made = answer(&call(
+            &mut server,
+            "grit_world_create",
+            format!(
+                "{{\"wide\":{SIDE},\"deep\":{SIDE},\"tall\":{SIDE},\"law\":{},\"params\":{params:?},\"sparse\":true}}",
+                quoted(&text)
+            ),
+        ));
+        let world = int_at(&made, "world");
+        let start = filled(Model::grid(), 1, 0xB0E, true);
+        let grid = Model::grid();
+        let mut placed = Vec::new();
+        for z in 0..SIDE {
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let word = start[grid.index(x, y, z)];
+                    if word != 0 {
+                        placed.push(format!("[{x},{y},{z},{word}]"));
+                    }
+                }
+            }
+        }
+        answer(&call(
+            &mut server,
+            "grit_world_write",
+            format!("{{\"world\":{world},\"cells\":[{}]}}", placed.join(",")),
+        ));
+        answer(&call(
+            &mut server,
+            "grit_world_step",
+            format!("{{\"world\":{world},\"frames\":300,\"budget_ms\":600000}}"),
+        ));
+        grit::serve3::tools::faults::stall_every(Duration::from_millis(5));
+        let stopped = answer(&call(
+            &mut server,
+            "grit_world_back",
+            format!("{{\"world\":{world},\"frames\":300,\"budget_ms\":300}}"),
+        ));
+        grit::serve3::tools::faults::disarm();
+        assert_eq!(
+            text_at(&stopped, "stopped"),
+            "budget",
+            "{}",
+            written(&stopped)
+        );
+        let ran = u32::try_from(int_at(&stopped, "ran")).unwrap();
+        assert!(ran < 300);
+        let home = answer(&call(
+            &mut server,
+            "grit_world_back",
+            format!(
+                "{{\"world\":{world},\"frames\":{},\"home\":true,\"budget_ms\":600000}}",
+                300 - ran
+            ),
+        ));
+        assert_eq!(
+            home.get("home"),
+            Some(&Json::Bool(true)),
+            "{}",
+            written(&home)
+        );
+        assert_eq!(int_at(&home, "frame"), 0);
+        let last = SIDE - 1;
+        let mut cells = Vec::new();
+        for z in (0..SIDE).step_by(8) {
+            let got = answer(&call(
+                &mut server,
+                "grit_world_read",
+                format!(
+                    "{{\"world\":{world},\"from\":[0,0,{z}],\"to\":[{last},{last},{}]}}",
+                    z + 7
+                ),
+            ));
+            cells.extend(
+                got.get("cells")
+                    .and_then(Json::list)
+                    .unwrap()
+                    .iter()
+                    .map(|one| u32::try_from(one.int().unwrap()).unwrap()),
+            );
+        }
+        assert_eq!(cells, start);
+    }
+
+    #[test]
+    fn a_lost_device_during_and_after_a_sparse_walk_back_keeps_the_world_exact() {
+        let Some(host) = device("lost device sparse walk") else {
+            return;
+        };
+        drop(host);
+        let scratch = Scratch::new("lost-sparse");
+        let mut run = Run::new(Some(scratch.dir()));
+        let world = swap_world(&mut run);
+        let (start, _) = state_of(&mut run, world, "start");
+        stepped_by(&mut run, world, 240);
+        let (far, frame) = state_of(&mut run, world, "far");
+        assert_eq!(frame, 240);
+        run.exec.faults().lock().unwrap().wedge_after_batch = Some(0);
+        let lost = refusal(&run.ask(
+            "grit_world_back",
+            &format!("{{\"world\":{world},\"frames\":240,\"budget_ms\":600000}}"),
+        ));
+        assert_eq!(text_at(&lost, "code"), "device_lost", "{}", written(&lost));
+        assert!(
+            text_at(&lost, "message").contains("0 of the 240 frames were walked back"),
+            "{}",
+            written(&lost)
+        );
+        let (during, frame) = state_of(&mut run, world, "during");
+        assert_eq!(frame, 240);
+        assert_eq!(
+            during, far,
+            "a walk lost with the device leaves the world where it was"
+        );
+        back_by(&mut run, world, 240, false);
+        let (walked, frame) = state_of(&mut run, world, "walked");
+        assert_eq!(frame, 0);
+        assert_eq!(walked, start);
+        run.exec.faults().lock().unwrap().wedge_before_call = true;
+        let told = refusal(&run.ask(
+            "grit_world_read",
+            &format!("{{\"world\":{world},\"from\":[0,0,0],\"to\":[0,0,0]}}"),
+        ));
+        assert_eq!(text_at(&told, "code"), "device_lost", "{}", written(&told));
+        let (rebuilt, frame) = state_of(&mut run, world, "rebuilt");
+        assert_eq!(frame, 0);
+        assert_eq!(
+            rebuilt, start,
+            "rebuilt from a journal that ends in a walk back"
+        );
+        stepped_by(&mut run, world, 240);
+        let (again, _) = state_of(&mut run, world, "again");
+        assert_eq!(again, far);
+        run.exec.finish();
+    }
 
     #[test]
     fn a_walked_back_world_is_rebuilt_exactly_after_a_lost_device() {
