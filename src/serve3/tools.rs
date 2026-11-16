@@ -1224,6 +1224,11 @@ pub fn describe(status: &Status) -> Json {
                 ("law_tally", text(super::law::TALLIED)),
                 ("law_look", text(super::law::LOOK)),
                 ("law_reversible", text(super::back::REVERSIBLE)),
+                ("law_gradient", text(super::gradient::GRADIENT)),
+                ("walk_cells", number(super::gradient::CELLS_MOST)),
+                ("walk_work", number(super::gradient::WORK_MOST)),
+                ("walk_frames", number(super::gradient::FRAMES_MOST)),
+                ("descend_steps", number(super::gradient::STEPS_MOST)),
                 ("law_from_chip", text(super::law::FROM_CHIP)),
                 ("law_from_chip_gates", number(crate::law::chip::GATES_SURE)),
                 (

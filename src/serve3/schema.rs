@@ -463,7 +463,11 @@ pub fn code_of(tool: &str, path: &str, wrong: Wrong) -> Code {
         ("grit_world_create", "$.rule", Wrong::Missing | Wrong::Type | Wrong::Choice) => {
             Code::UnknownRule
         }
-        ("grit_world_step" | "grit_world_back", "$.frames", Wrong::Range) => Code::Frames,
+        (
+            "grit_world_step" | "grit_world_back" | "grit_law_gradient" | "grit_law_descend",
+            "$.frames",
+            Wrong::Range,
+        ) => Code::Frames,
         ("grit_world_slice", "$.axis", Wrong::Type | Wrong::Choice) => Code::Axis,
         ("grit_law_from_chip", _, Wrong::Range) => chip_range(path),
         (_, _, Wrong::Unknown) => Code::UnknownKey,

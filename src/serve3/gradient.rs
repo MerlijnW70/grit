@@ -1,0 +1,851 @@
+use std::time::Instant;
+
+use crate::law::Law;
+use crate::law::adjoint::{self, Aim, Fault, Plane, Reversible, stepped};
+use crate::question::Region;
+use crate::sand3::Grid3;
+use crate::wire::{Json, counted, map, text};
+
+use super::budget::{Stop, Work};
+use super::errors::{Code, Refusal};
+use super::schema::{object, property, whole, with, word};
+use super::tools::{exactly, int, ints, limited, refused, tool, unread, words_of};
+use super::{Failed, READ_MOST, Server, Tool};
+
+pub const TOOLS: &[Tool] = &[
+    Tool {
+        name: "grit_law_gradient",
+        shown: gradient_shown,
+        run: graded,
+    },
+    Tool {
+        name: "grit_law_descend",
+        shown: descend_shown,
+        run: descended,
+    },
+];
+
+pub const CELLS_MOST: u64 = 1 << 15;
+
+pub const FRAMES_MOST: u32 = 512;
+
+pub const STEPS_MOST: u32 = 256;
+
+pub const WORK_MOST: u64 = 1 << 28;
+
+pub const SIDE_MOST: u32 = 1024;
+
+pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU twin, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline, from frame first. The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string, from the walk back that recomputes every frame and must come home bit for bit. A descent walks, steps the params by the projected gradient planes and walks again, keeping its trail; best is the earliest lowest objective on it. Both are refused before any work for: a law that is not reversible (not_reversible, with the lifting refusal), a law that looks (no_gradient), params of the wrong count, a box outside the world, a target of the wrong size, a start past walk_cells or a walk past walk_work, and a walk the budget cannot fit by the fastest of the last three walks the server measured at the largest size not above this one. They never write a world or its journal";
+
+pub mod faults {
+    #[cfg(feature = "faults")]
+    use std::cell::Cell;
+
+    #[cfg(feature = "faults")]
+    thread_local! {
+        static WALKS: Cell<u64> = const { Cell::new(0) };
+        static CANCEL: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub fn walks() -> u64 {
+        WALKS.get()
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn cancel_after(walks: u64) {
+        CANCEL.set(Some(walks));
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn disarm() {
+        CANCEL.set(None);
+    }
+
+    #[cfg(feature = "faults")]
+    pub(super) fn walked() -> bool {
+        WALKS.set(WALKS.get().saturating_add(1));
+        match CANCEL.get() {
+            Some(0 | 1) => {
+                CANCEL.set(None);
+                true
+            }
+            Some(left) => {
+                CANCEL.set(Some(left - 1));
+                false
+            }
+            None => false,
+        }
+    }
+
+    #[cfg(not(feature = "faults"))]
+    pub(super) const fn walked() -> bool {
+        false
+    }
+}
+
+fn corner_shown(what: &str) -> Json {
+    map(vec![
+        ("type", text("array")),
+        ("items", word()),
+        ("description", text(what)),
+        ("minItems", Json::Int(3)),
+        ("maxItems", Json::Int(3)),
+    ])
+}
+
+fn words_shown(what: &str, most: i64) -> Json {
+    map(vec![
+        ("type", text("array")),
+        ("items", word()),
+        ("description", text(what)),
+        ("maxItems", Json::Int(most)),
+    ])
+}
+
+fn most(held: u64) -> i64 {
+    i64::try_from(held).unwrap_or(i64::MAX)
+}
+
+fn posed_shown() -> Vec<(&'static str, Json)> {
+    vec![
+        (
+            "world",
+            whole(
+                "a world of a reversible law: the start is its cells at its frame; give this or law",
+                1,
+                i64::from(u32::MAX),
+            ),
+        ),
+        (
+            "law",
+            property(
+                "string",
+                "the JSON text of a reversible law, with size and cells; give this or world",
+            ),
+        ),
+        (
+            "size",
+            map(vec![
+                ("type", text("array")),
+                (
+                    "items",
+                    whole("a side, a power of two", 2, i64::from(SIDE_MOST)),
+                ),
+                (
+                    "description",
+                    text("with law: the start's [wide, deep, tall]"),
+                ),
+                ("minItems", Json::Int(3)),
+                ("maxItems", Json::Int(3)),
+            ]),
+        ),
+        (
+            "cells",
+            words_shown(
+                "with law: every cell of the start, plane by plane, x fastest, then y, then z",
+                most(READ_MOST),
+            ),
+        ),
+        (
+            "first",
+            with(
+                whole(
+                    "with law: the frame the start is at; 0 if left out",
+                    0,
+                    i64::from(u32::MAX),
+                ),
+                vec![("default", Json::Int(0))],
+            ),
+        ),
+        (
+            "params",
+            words_shown(
+                "the law's params; the world's if left out",
+                most(crate::law::limits::PARAMS as u64),
+            ),
+        ),
+        (
+            "frames",
+            whole(
+                "how many frames run from the start before the objective",
+                1,
+                i64::from(FRAMES_MOST),
+            ),
+        ),
+        (
+            "aim",
+            object(
+                vec![
+                    ("from", corner_shown("the box's least corner, [x, y, z]")),
+                    ("to", corner_shown("the box's greatest corner, [x, y, z]")),
+                    (
+                        "target",
+                        words_shown(
+                            "the box's wanted cells, x fastest, then y, then z; give this or world",
+                            most(READ_MOST),
+                        ),
+                    ),
+                    (
+                        "world",
+                        whole(
+                            "take the target from this world's box, on plane 0; give this or target",
+                            1,
+                            i64::from(u32::MAX),
+                        ),
+                    ),
+                ],
+                &["from", "to"],
+            ),
+        ),
+    ]
+}
+
+fn gradient_shown() -> Json {
+    tool(
+        "grit_law_gradient",
+        "Exact gradient of a reversible law's params: the objective |cells - target| over a box after n frames, and d objective / d param times 2^64 per param.",
+        posed_shown(),
+        &["frames", "aim"],
+    )
+}
+
+fn descend_shown() -> Json {
+    let mut properties = posed_shown();
+    properties.push((
+        "steps",
+        whole(
+            "the most gradient steps after the first walk",
+            1,
+            i64::from(STEPS_MOST),
+        ),
+    ));
+    tool(
+        "grit_law_descend",
+        "Descend a reversible law's params by exact gradients from params toward the aim. Returns the best params, their objective, the trail and why it stopped.",
+        properties,
+        &["frames", "aim", "steps"],
+    )
+}
+
+#[derive(Debug)]
+pub struct Told(pub Refusal, pub Vec<(&'static str, Json)>);
+
+impl std::fmt::Display for Told {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{}", self.0.message)
+    }
+}
+
+impl std::error::Error for Told {}
+
+struct Posed {
+    reversible: Reversible,
+    grid: Grid3,
+    start: Vec<u32>,
+    first: u32,
+    frames: u32,
+    params: Vec<u32>,
+    region: Region,
+    target: Vec<u32>,
+    units: u64,
+}
+
+impl Posed {
+    fn aim(&self) -> Aim<'_> {
+        Aim {
+            region: self.region,
+            target: &self.target,
+        }
+    }
+}
+
+fn not_reversible(field: &str, why: &crate::law::Refusal) -> Failed {
+    Box::new(Told(
+        Refusal::new(
+            Code::NotReversible,
+            field,
+            format!("the law has no exact gradient: {why}; nothing ran"),
+        ),
+        vec![("law", why.json())],
+    ))
+}
+
+struct Start {
+    law: Law,
+    grid: Grid3,
+    planes: u32,
+    first: u32,
+    params: Option<Vec<u32>>,
+    world: Option<u32>,
+    field: &'static str,
+}
+
+fn started(server: &mut Server<'_>, held: &Json) -> Result<Start, Failed> {
+    match (held.get("world"), held.get("law")) {
+        (Some(_), None) => {
+            for key in ["size", "cells"] {
+                if held.get(key).is_some() {
+                    return Err(refused(
+                        Code::Malformed,
+                        &format!("$.{key}"),
+                        format!("{key} goes with law; a world's start is its own cells"),
+                    ));
+                }
+            }
+            let number = int(held, "world")?;
+            let live = server.world(held)?;
+            let Some(law) = live.world.law().cloned() else {
+                return Err(refused(
+                    Code::NotReversible,
+                    "$.world",
+                    format!(
+                        "the world runs the rule {}, not a law declaring \"reversible\": true; nothing ran",
+                        live.world.rule()
+                    ),
+                ));
+            };
+            let size = live.world.size();
+            let grid = Grid3::new(size[0], size[1], size[2]).ok_or("the world has no grid")?;
+            Ok(Start {
+                law,
+                grid,
+                planes: live.world.planes(),
+                first: live.world.frame(),
+                params: Some(live.world.params().to_vec()),
+                world: Some(number),
+                field: "$.world",
+            })
+        }
+        (None, Some(_)) => {
+            let law = Law::compile(words_of(held, "law")?).map_err(|why| {
+                if why.code == crate::law::Code::Lifting {
+                    not_reversible("$.law", &why)
+                } else {
+                    Box::new(super::law::Refused(why, "$.law")) as Failed
+                }
+            })?;
+            let size = held.get("size").ok_or_else(|| {
+                refused(
+                    Code::Malformed,
+                    "$.size",
+                    "a start given inline needs size and cells".to_owned(),
+                )
+            })?;
+            let size = ints(size, "size")?;
+            let [wide, deep, tall] =
+                <[u32; 3]>::try_from(size.as_slice()).map_err(|_| unread("size"))?;
+            let grid = Grid3::new(wide, deep, tall)
+                .filter(|grid| [grid.wide, grid.deep, grid.tall] == [wide, deep, tall])
+                .ok_or_else(|| {
+                    refused(
+                        Code::Malformed,
+                        "$.size",
+                        format!(
+                            "size {:?} has a side that is not a power of two from 2",
+                            [wide, deep, tall]
+                        ),
+                    )
+                })?;
+            let planes = crate::rule3::Declared::planes(&law);
+            Ok(Start {
+                law,
+                grid,
+                planes: u32::try_from(planes).unwrap_or(u32::MAX),
+                first: int(held, "first")?,
+                params: None,
+                world: None,
+                field: "$.law",
+            })
+        }
+        (given, _) => Err(refused(
+            Code::Malformed,
+            "$",
+            if given.is_some() {
+                "give a world or a law, and not both".to_owned()
+            } else {
+                "give a world, whose cells are the start, or a law with size and cells".to_owned()
+            },
+        )),
+    }
+}
+
+fn reversible_of(start: &Start) -> Result<Reversible, Failed> {
+    let reversible = Reversible::of(&start.law).map_err(|why| not_reversible(start.field, &why))?;
+    if start.law.halo() != 0 {
+        return Err(refused(
+            Code::NoGradient,
+            start.field,
+            format!(
+                "the law {} looks at neighbours (halo 1); the exact gradient covers only laws that read their own oct, so nothing ran",
+                start.law.name()
+            ),
+        ));
+    }
+    Ok(reversible)
+}
+
+fn corner_of(held: &Json, key: &str) -> Result<[u32; 3], Failed> {
+    let got = ints(held.get(key).ok_or_else(|| unread(key))?, key)?;
+    <[u32; 3]>::try_from(got.as_slice()).map_err(|_| unread(key))
+}
+
+fn region_of(aim: &Json, size: [u32; 3]) -> Result<Region, Failed> {
+    let from = corner_of(aim, "from")?;
+    let to = corner_of(aim, "to")?;
+    for (corner, field) in [(from, "$.aim.from"), (to, "$.aim.to")] {
+        if corner.iter().zip(size).any(|(one, side)| *one >= side) {
+            return Err(limited(
+                Code::Outside,
+                field,
+                format!(
+                    "{corner:?} is outside the world of {} by {} by {} cells",
+                    size[0], size[1], size[2]
+                ),
+                super::tools::sized(size.map(|side| side.saturating_sub(1))),
+            ));
+        }
+    }
+    if from.iter().zip(to).any(|(one, other)| *one > other) {
+        return Err(refused(
+            Code::Reversed,
+            "$.aim.to",
+            format!("the box from {from:?} to {to:?} has its first corner past its last"),
+        ));
+    }
+    Ok(Region::new(from, to.map(|one| one + 1)))
+}
+
+fn points_of(region: Region) -> Vec<[u32; 3]> {
+    let mut points = Vec::new();
+    for z in region.from[2]..region.to[2] {
+        for y in region.from[1]..region.to[1] {
+            for x in region.from[0]..region.to[0] {
+                points.push([x, y, z]);
+            }
+        }
+    }
+    points
+}
+
+fn units_of(reversible: &Reversible, grid: Grid3, frames: u32) -> u64 {
+    let nodes = reversible.forward().len() + reversible.inverse().len();
+    u64::from(grid.octs())
+        .saturating_mul(u64::from(frames))
+        .saturating_mul(u64::try_from(nodes).unwrap_or(u64::MAX))
+}
+
+fn posed(server: &mut Server<'_>, held: &Json) -> Result<Posed, Failed> {
+    let start = started(server, held)?;
+    let reversible = reversible_of(&start)?;
+    let grid = start.grid;
+    let size = [grid.wide, grid.deep, grid.tall];
+    let cells = u64::try_from(grid.cells())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(start.planes));
+    if cells > CELLS_MOST {
+        return Err(limited(
+            Code::TooMany,
+            start.field,
+            format!(
+                "the start holds {cells} words ({} cells on {} planes), more than the {CELLS_MOST} a walk on the CPU takes",
+                grid.cells(),
+                start.planes
+            ),
+            Json::Int(most(CELLS_MOST)),
+        ));
+    }
+    let params = match (held.get("params"), start.params) {
+        (Some(given), _) => ints(given, "params")?,
+        (None, Some(own)) => own,
+        (None, None) => Vec::new(),
+    };
+    let wanted = crate::rule3::Declared::params(reversible.forward());
+    if params.len() != wanted {
+        return Err(limited(
+            Code::Params,
+            "$.params",
+            format!(
+                "law {} reads {wanted} parameters, and {} were given",
+                start.law.name(),
+                params.len()
+            ),
+            counted(u32::try_from(wanted).unwrap_or(u32::MAX)),
+        ));
+    }
+    let given = match held.get("cells") {
+        Some(listed) => Some(ints(listed, "cells")?),
+        None => None,
+    };
+    if start.world.is_none() {
+        let length = given.as_ref().map_or(0, Vec::len) as u64;
+        if length != cells {
+            return Err(limited(
+                Code::Malformed,
+                "$.cells",
+                format!(
+                    "a start of size {size:?} on {} planes holds {cells} words, and {length} were given",
+                    start.planes
+                ),
+                Json::Int(most(cells)),
+            ));
+        }
+    }
+    let frames = int(held, "frames")?;
+    let aim = held.get("aim").ok_or_else(|| unread("aim"))?;
+    let region = region_of(aim, size)?;
+    let boxed = region.cells();
+    let target_world = match (aim.get("target"), aim.get("world")) {
+        (Some(listed), None) => {
+            let target = ints(listed, "target")?;
+            if target.len() as u128 != boxed {
+                return Err(limited(
+                    Code::TargetSize,
+                    "$.aim.target",
+                    format!(
+                        "the box holds {boxed} cells, and the target {}",
+                        target.len()
+                    ),
+                    Json::Int(i64::try_from(boxed).unwrap_or(i64::MAX)),
+                ));
+            }
+            Err(target)
+        }
+        (None, Some(_)) => {
+            let number = int(aim, "world")?;
+            let other = server.world_at(number, "$.aim.world")?;
+            let theirs = other.world.size();
+            if region.to.iter().zip(theirs).any(|(to, side)| *to > side) {
+                return Err(limited(
+                    Code::Outside,
+                    "$.aim.world",
+                    format!(
+                        "the box ends at {:?}, outside world {number} of {} by {} by {} cells",
+                        region.to.map(|one| one - 1),
+                        theirs[0],
+                        theirs[1],
+                        theirs[2]
+                    ),
+                    super::tools::sized(theirs.map(|side| side.saturating_sub(1))),
+                ));
+            }
+            Ok(number)
+        }
+        (given, _) => {
+            return Err(refused(
+                Code::Malformed,
+                "$.aim",
+                if given.is_some() {
+                    "give the aim a target or a world, and not both".to_owned()
+                } else {
+                    "give the aim a target, its wanted cells, or a world to take them from"
+                        .to_owned()
+                },
+            ));
+        }
+    };
+    let units = units_of(&reversible, grid, frames);
+    if units > WORK_MOST {
+        let each = units / u64::from(frames.max(1));
+        let fits = u32::try_from(WORK_MOST / each.max(1)).unwrap_or(u32::MAX);
+        return Err(limited(
+            Code::TooMany,
+            "$.frames",
+            format!(
+                "a walk of {frames} frames over {} octs of a law of {} nodes and an inverse of {} is {units} units of work, more than the {WORK_MOST} one walk may take; at most {fits} frames fit",
+                grid.octs(),
+                reversible.forward().len(),
+                reversible.inverse().len()
+            ),
+            counted(fits),
+        ));
+    }
+    server.fits(Work::Walk, units, "one walk out and back")?;
+    let start_cells = match (start.world, given) {
+        (Some(number), _) => world_cells(server, number, grid, start.planes)?,
+        (None, Some(given)) => given,
+        (None, None) => Vec::new(),
+    };
+    let target = match target_world {
+        Err(target) => target,
+        Ok(number) => server
+            .world_at(number, "$.aim.world")?
+            .world
+            .cells_at_plane(&points_of(region), 0)?,
+    };
+    Ok(Posed {
+        reversible,
+        grid,
+        start: start_cells,
+        first: start.first,
+        frames,
+        params,
+        region,
+        target,
+        units,
+    })
+}
+
+fn world_cells(
+    server: &mut Server<'_>,
+    number: u32,
+    grid: Grid3,
+    planes: u32,
+) -> Result<Vec<u32>, Failed> {
+    let points = points_of(Region::whole([grid.wide, grid.deep, grid.tall]));
+    let live = server.world_at(number, "$.world")?;
+    let mut cells = Vec::with_capacity(points.len() * planes as usize);
+    for plane in 0..planes {
+        cells.extend(live.world.cells_at_plane(&points, plane)?);
+    }
+    Ok(cells)
+}
+
+fn strayed_at(grid: Grid3, at: usize) -> ([u32; 3], u32) {
+    let stride = grid.cells().max(1);
+    let plane = u32::try_from(at / stride).unwrap_or(u32::MAX);
+    let index = u32::try_from(at % stride).unwrap_or(0);
+    let wide = grid.wide.max(1);
+    let deep = grid.deep.max(1);
+    (
+        [index % wide, (index / wide) % deep, index / wide / deep],
+        plane,
+    )
+}
+
+fn fault(grid: Grid3, why: Fault) -> Failed {
+    match why {
+        Fault::Strayed { at, was, now } => {
+            let (cell, plane) = strayed_at(grid, at);
+            let three = Json::List(cell.iter().map(|one| counted(*one)).collect());
+            Box::new(Told(
+                Refusal::new(
+                    Code::Strayed,
+                    "$",
+                    format!(
+                        "the walk back did not come home: cell {cell:?} of plane {plane} was {was} and came back {now}; no world was touched"
+                    ),
+                ),
+                vec![(
+                    "strayed",
+                    map(vec![
+                        ("cell", three),
+                        ("plane", counted(plane)),
+                        ("was", counted(was)),
+                        ("now", counted(now)),
+                    ]),
+                )],
+            ))
+        }
+        Fault::Overflow => refused(
+            Code::Overflow,
+            "$.frames",
+            format!("{why}; no world was touched"),
+        ),
+        other => refused(Code::Malformed, "$", other.to_string()),
+    }
+}
+
+#[cfg(feature = "faults")]
+fn walker(server: &Server<'_>, posed: &Posed) -> Reversible {
+    let armed = server
+        .book
+        .faults
+        .lock()
+        .map(|mut faults| std::mem::take(&mut faults.stray_walk))
+        .unwrap_or(false);
+    if !armed {
+        return posed.reversible.clone();
+    }
+    let mut steps = posed.reversible.steps().to_vec();
+    if let Some(first) = steps.first_mut() {
+        first.how = match first.how {
+            adjoint::Lifting::Add => adjoint::Lifting::Sub,
+            adjoint::Lifting::Sub | adjoint::Lifting::Xor => adjoint::Lifting::Add,
+        };
+    }
+    Reversible::from_steps(posed.reversible.forward(), steps)
+}
+
+#[cfg(not(feature = "faults"))]
+fn walker(_: &Server<'_>, posed: &Posed) -> Reversible {
+    posed.reversible.clone()
+}
+
+fn walk(
+    server: &mut Server<'_>,
+    reversible: &Reversible,
+    posed: &Posed,
+    params: &[u32],
+) -> Result<adjoint::Walked, Failed> {
+    let began = Instant::now();
+    super::tools::faults::stall(1);
+    let walked = reversible.walk(
+        posed.grid,
+        &posed.start,
+        params,
+        posed.first,
+        posed.frames,
+        &posed.aim(),
+    );
+    server
+        .book
+        .rates
+        .measure(Work::Walk, posed.units, began.elapsed());
+    if faults::walked()
+        && let Some(flag) = server.cancel.as_ref()
+    {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    walked.map_err(|why| fault(posed.grid, why))
+}
+
+fn listed(held: &[u32]) -> Json {
+    Json::List(held.iter().map(|one| counted(*one)).collect())
+}
+
+fn told(value: i128) -> Json {
+    text(&value.to_string())
+}
+
+fn graded(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
+    let posed = posed(server, held)?;
+    let reversible = walker(server, &posed);
+    let walked = walk(server, &reversible, &posed, &posed.params)?;
+    let mut answer = Vec::new();
+    if let Some(number) = held.get("world").and_then(Json::int) {
+        answer.push(("world", Json::Int(number)));
+    }
+    answer.extend([
+        ("params", listed(&posed.params)),
+        ("first", counted(posed.first)),
+        ("frames", counted(posed.frames)),
+        ("objective", exactly(u128::from(walked.objective))),
+        (
+            "gradient",
+            Json::List(walked.told.iter().map(|one| told(*one)).collect()),
+        ),
+        ("fraction", counted(adjoint::FRACTION)),
+        ("home", Json::Bool(true)),
+    ]);
+    Ok(map(answer))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    Converged,
+    Steps,
+    Stopped(Stop),
+}
+
+impl Why {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Converged => "converged",
+            Self::Steps => "steps",
+            Self::Stopped(stop) => stop.name(),
+        }
+    }
+}
+
+fn halted(server: &Server<'_>, units: u64, began: bool) -> Option<Stop> {
+    if let Some(stop) = server.stop() {
+        return Some(stop);
+    }
+    if !began {
+        return None;
+    }
+    let (least, _) = server.book.rates.least_of(Work::Walk, units);
+    (least > server.clock.left()).then_some(Stop::Budget)
+}
+
+fn descended(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
+    let most = int(held, "steps")?;
+    let posed = posed(server, held)?;
+    let reversible = walker(server, &posed);
+    let mut params = posed.params.clone();
+    let mut trail: Vec<(Vec<u32>, u64)> = Vec::new();
+    let mut planes: Vec<Plane> = Vec::new();
+    let memory = params.len().max(1);
+    let why = loop {
+        if let Some(stop) = halted(server, posed.units, !trail.is_empty()) {
+            if trail.is_empty() {
+                return Err(refused(
+                    stop.code(),
+                    if stop == Stop::Budget {
+                        "$.budget_ms"
+                    } else {
+                        "$"
+                    },
+                    format!(
+                        "the descent stopped on {} before its first walk; nothing ran",
+                        stop.name()
+                    ),
+                ));
+            }
+            break Why::Stopped(stop);
+        }
+        let walked = walk(server, &reversible, &posed, &params)?;
+        trail.push((params.clone(), walked.objective));
+        let steps = u32::try_from(trail.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        planes.push(Plane {
+            params: params.clone(),
+            objective: walked.objective,
+            told: walked.told,
+        });
+        if planes.len() > memory {
+            planes.remove(0);
+        }
+        let moved = stepped(&planes, &params);
+        if walked.objective == 0 {
+            break Why::Converged;
+        }
+        if steps >= most {
+            break Why::Steps;
+        }
+        if moved.iter().all(|&one| one == 0) {
+            break Why::Converged;
+        }
+        for (param, delta) in params.iter_mut().zip(moved) {
+            let next = i64::from(*param).saturating_add(delta);
+            *param = u32::try_from(next.clamp(0, i64::from(u32::MAX))).unwrap_or(0);
+        }
+    };
+    let (best, lowest) = trail
+        .iter()
+        .min_by_key(|(_, objective)| *objective)
+        .cloned()
+        .ok_or("the descent kept no trail")?;
+    let steps = u32::try_from(trail.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    let mut answer = Vec::new();
+    if let Some(number) = held.get("world").and_then(Json::int) {
+        answer.push(("world", Json::Int(number)));
+    }
+    answer.extend([
+        ("params", listed(&best)),
+        ("objective", exactly(u128::from(lowest))),
+        ("stopped", text(why.name())),
+        ("steps", counted(steps)),
+        (
+            "trail",
+            Json::List(
+                trail
+                    .iter()
+                    .map(|(params, objective)| {
+                        map(vec![
+                            ("params", listed(params)),
+                            ("objective", exactly(u128::from(*objective))),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("first", counted(posed.first)),
+        ("frames", counted(posed.frames)),
+    ]);
+    if let Why::Stopped(stop) = why {
+        answer.push(("hint", text(stop.code().hint())));
+    }
+    Ok(map(answer))
+}

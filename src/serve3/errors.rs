@@ -59,9 +59,12 @@ pub enum Code {
     NotReversible,
     PastStart,
     Strayed,
+    NoGradient,
+    TargetSize,
+    Overflow,
 }
 
-pub const CODES: [Code; 55] = [
+pub const CODES: [Code; 58] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -117,6 +120,9 @@ pub const CODES: [Code; 55] = [
     Code::NotReversible,
     Code::PastStart,
     Code::Strayed,
+    Code::NoGradient,
+    Code::TargetSize,
+    Code::Overflow,
 ];
 
 impl Code {
@@ -178,6 +184,9 @@ impl Code {
             Self::NotReversible => "not_reversible",
             Self::PastStart => "past_start",
             Self::Strayed => "strayed",
+            Self::NoGradient => "no_gradient",
+            Self::TargetSize => "target_size",
+            Self::Overflow => "overflow",
         }
     }
 
@@ -311,11 +320,20 @@ impl Code {
                 "Read a plane an output or state bit is on only at offset 0; put the inputs that read neighbours on a plane the chip does not write, such as plane 0 with the outputs on plane 1."
             }
             Self::NotReversible => {
-                "Walk back only a world whose law declares \"reversible\": true; for any other, fork the world before stepping and restore the fork."
+                "Walk back or take gradients only through a law that declares \"reversible\": true and is lifting steps; for any other, fork the world before stepping and restore the fork, or search its params."
             }
             Self::PastStart => "Walk back at most as many frames as the world's frame.",
             Self::Strayed => {
                 "Report the law and the call: an accepted reversible law must come home; the world was left as it was."
+            }
+            Self::NoGradient => {
+                "Take gradients only through a law that reads its own oct (halo 0); search the params of a law that looks."
+            }
+            Self::TargetSize => {
+                "Give the target exactly as many words as the aim's box holds, x fastest, then y, then z."
+            }
+            Self::Overflow => {
+                "Take the gradient over fewer frames or a smaller box; it passed the 128-bit fixed point it is carried in."
             }
         }
     }
