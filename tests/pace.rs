@@ -526,3 +526,36 @@ fn a_held_up_batch_in_every_split_so_far_never_refuses_a_frame_that_fits() {
         }
     }
 }
+
+#[test]
+fn a_cold_replay_reaches_full_batches_after_two_whatever_its_first_frame_cost() {
+    let warm = Device::new(100, 16);
+    let frames = 400_u32;
+    let full = frames.div_ceil(BATCH_MOST);
+    for first_ms in [1_u64, 5, 30, 200] {
+        let mut pace = Pace::first(0);
+        let mut done = 0;
+        let mut sizes = Vec::new();
+        while done < frames {
+            let step = if done == 0 {
+                pace.resumed(frames - done, Duration::from_secs(600))
+            } else {
+                pace.batch(frames - done, Duration::from_secs(600))
+            };
+            let took = if sizes.is_empty() {
+                Duration::from_millis(first_ms)
+            } else {
+                warm.cost(step)
+            };
+            pace.ran(step, took);
+            sizes.push(step);
+            done += step;
+        }
+        assert!(
+            u32::try_from(sizes.len()).unwrap() <= full + 2,
+            "a first frame of {first_ms} ms, then frames of {:?}: {} batches {sizes:?} for {frames} frames",
+            warm.cost(1),
+            sizes.len()
+        );
+    }
+}
