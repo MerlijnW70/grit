@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use crate::ops::Ops;
 use crate::rule3::{CORNERS, Declared, Oct, OneStep, Planed, Ruled, Tally};
@@ -12,6 +13,7 @@ pub mod learn;
 pub mod limits;
 pub mod parse;
 pub mod quiet;
+pub mod reversible;
 pub mod trace;
 pub mod value;
 
@@ -123,7 +125,7 @@ impl Code {
             Self::Recursion => "recursion",
             Self::Result => "result",
             Self::Unsupported => "unsupported",
-            Self::Lifting => "lifting",
+            Self::Lifting => "not_lifting",
             Self::HaloRadius => "halo_radius",
             Self::HaloConstant => "halo_constant",
             Self::HaloPlane => "halo_plane",
@@ -189,6 +191,7 @@ pub struct Law {
     hash: [u8; 32],
     work: u64,
     depth: usize,
+    inverse: Option<Arc<Law>>,
 }
 
 impl Law {
@@ -198,6 +201,14 @@ impl Law {
     }
 
     pub fn from_json(json: &Json) -> Result<Self, Refusal> {
+        Self::built(json, true)
+    }
+
+    pub(crate) fn derived(json: &Json) -> Result<Self, Refusal> {
+        Self::built(json, false)
+    }
+
+    fn built(json: &Json, derive: bool) -> Result<Self, Refusal> {
         let program = parse::program(json)?;
         let canonical = canonical(json);
         if canonical.len() > limits::BODY {
@@ -220,21 +231,27 @@ impl Law {
                 limit: None,
             });
         }
-        if program.reversible && program.halo > 0 {
-            return Err(Refusal {
-                code: Code::Unsupported,
-                path: String::from("$.reversible"),
-                expected: String::from(
-                    "a reversible law that does not look: the inverse of a look is not built",
-                ),
-                found: String::from("reversible true and halo 1"),
-                limit: None,
-            });
-        }
-        if program.reversible {
-            adjoint::lifted(&expanded.dag)
-                .map_err(|broken| broken.refusal(&expanded.dag, &places))?;
-        }
+        let steps = if program.reversible {
+            Some(
+                adjoint::lifted(&expanded.dag)
+                    .map_err(|broken| broken.refusal(&expanded.dag, &places, json))?,
+            )
+        } else {
+            None
+        };
+        let inverse = match steps {
+            Some(steps) if derive => {
+                let shape = reversible::Shape {
+                    name: program.name,
+                    params: program.params,
+                    channels: program.channels,
+                    halo: program.halo,
+                    tally: program.tally,
+                };
+                Some(Arc::new(reversible::inverse(shape, &expanded.dag, steps)?))
+            }
+            _ => None,
+        };
         let hash = crate::branch::sha256(canonical.as_bytes());
         Ok(Self {
             name: program.name.to_owned(),
@@ -247,7 +264,13 @@ impl Law {
             hash,
             work: expanded.work,
             depth: expanded.depth,
+            inverse,
         })
+    }
+
+    #[must_use]
+    pub fn inverse(&self) -> Option<&Self> {
+        self.inverse.as_deref()
     }
 
     #[must_use]

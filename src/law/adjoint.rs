@@ -9,6 +9,7 @@ use crate::question::cpu::{self, World};
 use crate::question::{Answer, Map, Measure, Reduce, Region, Seen};
 use crate::rule3::{CORNERS, Declared, Oct};
 use crate::sand3::{Grid3, lattice, reference};
+use crate::wire::Json;
 
 pub const FRACTION: u32 = 64;
 
@@ -98,6 +99,17 @@ impl Broken {
     }
 
     #[must_use]
+    pub const fn word(self) -> usize {
+        match self {
+            Self::Written { word, .. }
+            | Self::Dropped { word, .. }
+            | Self::ReadsItself { word, .. }
+            | Self::Shared { word, .. }
+            | Self::Tangled { word, .. } => word,
+        }
+    }
+
+    #[must_use]
     pub fn found(self, dag: &Dag) -> String {
         let made = named(dag, self.node());
         match self {
@@ -130,12 +142,23 @@ impl Broken {
     }
 
     #[must_use]
-    pub fn refusal(self, dag: &Dag, places: &Places) -> Refusal {
+    pub fn refusal(self, dag: &Dag, places: &Places, json: &Json) -> Refusal {
+        let passed = matches!(
+            usize::try_from(self.node())
+                .ok()
+                .and_then(|index| dag.nodes().get(index)),
+            Some(Node::Input(_))
+        );
+        let planes = u32::try_from(dag.planes().len() + 1).unwrap_or(1);
         Refusal {
             code: Code::Lifting,
-            path: places
-                .path(self.node())
-                .unwrap_or_else(|| String::from("$.step")),
+            path: if passed {
+                super::reversible::out_path(json, self.word(), planes)
+            } else {
+                places
+                    .path(self.node())
+                    .unwrap_or_else(|| String::from("$.step"))
+            },
             expected: String::from(EXPECTED),
             found: self.found(dag),
             limit: None,
@@ -307,9 +330,15 @@ fn offender(dag: &Dag, masks: &Masks, word: usize, start: u32) -> Broken {
     let mut here = start;
     loop {
         match lifting(node_at(dag, here)) {
-            Some((_, left, right)) => {
-                let next = [left, right]
+            Some((how, left, right)) => {
+                let carried = if how == Lifting::Sub {
+                    [Some(left), None]
+                } else {
+                    [Some(left), Some(right)]
+                };
+                let next = carried
                     .into_iter()
+                    .flatten()
                     .find(|&id| at(&masks.reaches, id) & bit(word) != 0);
                 match next {
                     Some(id) => here = id,
@@ -753,6 +782,7 @@ pub fn lifted(dag: &Dag) -> Result<Vec<Lift>, Broken> {
 
 struct Copier<'d> {
     dag: &'d Dag,
+    inputs: u32,
     nodes: Vec<Node>,
     reaches: Vec<u32>,
     copies: HashMap<u32, (u32, Vec<u32>)>,
@@ -789,8 +819,13 @@ impl Copier<'_> {
                 continue;
             }
             let node = node_at(self.dag, id);
-            if let Node::Input(_) = node {
-                self.remember(id, id);
+            if let Node::Input(which) = node {
+                let copy = if which < self.inputs {
+                    which
+                } else {
+                    self.push(Node::Input(which))
+                };
+                self.remember(id, copy);
                 continue;
             }
             if !expanded {
@@ -842,6 +877,7 @@ fn undone(dag: &Dag, steps: &[Lift]) -> Dag {
         .max(WORDS);
     let mut copier = Copier {
         dag,
+        inputs,
         nodes: (0..inputs).map(Node::Input).collect(),
         reaches: masks(dag).reaches,
         copies: HashMap::new(),
@@ -876,7 +912,9 @@ fn undone(dag: &Dag, steps: &[Lift]) -> Dag {
     };
     let first = corners(&current);
     let planes: Vec<[u32; CORNERS]> = current.chunks(CORNERS).skip(1).map(corners).collect();
-    Dag::new(copier.nodes, first, counts, dag.params(), dag.tally()).with_planes(planes)
+    Dag::new(copier.nodes, first, counts, dag.params(), dag.tally())
+        .with_planes(planes)
+        .with_halo(dag.halo())
 }
 
 #[derive(Clone, Debug)]
@@ -889,7 +927,10 @@ pub struct Reversible {
 impl Reversible {
     pub fn of(law: &Law) -> Result<Self, Refusal> {
         let dag = law.dag();
-        let steps = lifted(dag).map_err(|broken| broken.refusal(dag, law.places()))?;
+        let steps = lifted(dag).map_err(|broken| {
+            let json = super::parse::read(law.canonical()).unwrap_or(Json::Null);
+            broken.refusal(dag, law.places(), &json)
+        })?;
         if !law.reversible() {
             return Err(Refusal {
                 code: Code::Missing,
@@ -906,7 +947,7 @@ impl Reversible {
         lifted(dag).map(|steps| Self::from_steps(dag, steps))
     }
 
-    fn from_steps(dag: &Dag, steps: Vec<Lift>) -> Self {
+    pub(crate) fn from_steps(dag: &Dag, steps: Vec<Lift>) -> Self {
         Self {
             forward: dag.clone(),
             inverse: undone(dag, &steps),
