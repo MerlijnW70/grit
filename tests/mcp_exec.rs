@@ -727,6 +727,57 @@ fn the_state_hash_reads_a_uniform_brick_held_or_not_as_the_same_cells() {
     assert_ne!(journal::state_of(&held), journal::state_of(&other));
 }
 
+#[test]
+fn the_state_hash_reads_every_plane_of_a_sparse_world() {
+    use grit::branch::{Image, Law, State};
+    let uniform = Image {
+        law: Law::Rule {
+            name: "sand".to_owned(),
+        },
+        params: Vec::new(),
+        frame: 3,
+        size: [2, 2, 2],
+        state: State::Sparse {
+            capacity: 1,
+            sides: [2, 2, 2],
+            table: vec![u32::MAX, 4, 5],
+            pool: Vec::new(),
+        },
+    };
+    let mut upper = uniform.clone();
+    if let State::Sparse { table, .. } = &mut upper.state {
+        table[2] = 6;
+    }
+    assert_ne!(journal::state_of(&uniform), journal::state_of(&upper));
+    let mut planes = vec![4; 8];
+    planes.extend([5; 8]);
+    let held = Image {
+        state: State::Sparse {
+            capacity: 1,
+            sides: [2, 2, 2],
+            table: vec![0, 0, 0],
+            pool: planes,
+        },
+        ..uniform.clone()
+    };
+    assert_eq!(journal::state_of(&held), journal::state_of(&uniform));
+    let mut moved = held.clone();
+    if let State::Sparse { pool, .. } = &mut moved.state {
+        pool[12] = 7;
+    }
+    assert_ne!(journal::state_of(&held), journal::state_of(&moved));
+    let single = Image {
+        state: State::Sparse {
+            capacity: 1,
+            sides: [2, 2, 2],
+            table: vec![u32::MAX, 4],
+            pool: Vec::new(),
+        },
+        ..uniform.clone()
+    };
+    assert_ne!(journal::state_of(&single), journal::state_of(&uniform));
+}
+
 fn create(server: &mut Server<'_>, arguments: &str) -> u32 {
     let got = answer(&call(server, "grit_world_create", arguments));
     u32::try_from(got.int_at("world")).unwrap()
