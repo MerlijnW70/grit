@@ -77,6 +77,27 @@ mod served {
             return;
         };
         let mut server = Server::new(Some(&host));
+        let (probe, _) = call(
+            &mut server,
+            "grit_world_create",
+            &format!(
+                "{{\"wide\":{SIDE},\"deep\":{SIDE},\"tall\":{SIDE},\"rule\":\"sand\",\"sparse\":true,\"slots\":{},\"budget_ms\":120000}}",
+                u32::MAX
+            ),
+        );
+        let code = probe
+            .get("structuredContent")
+            .and_then(|held| held.get("code"))
+            .and_then(Json::text);
+        if matches!(code, Some("too_big" | "too_large")) {
+            eprintln!(
+                "r8a: this device cannot hold a {SIDE}^3 sparse world: {}",
+                written(&probe)
+            );
+            return;
+        }
+        drop(server);
+        let mut server = Server::new(Some(&host));
         let (small, small_built) = create(&mut server, Some(1));
         let (large, large_built) = create(&mut server, Some(u32::MAX));
         eprintln!("created small {small} in {small_built:?}, large {large} in {large_built:?}");
