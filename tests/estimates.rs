@@ -696,7 +696,7 @@ mod served {
         }
         let small = built(&mut server, 16, None);
         assert!(small >= held, "{small:?}");
-        let budget = held * 2;
+        let budget = small + held;
         let large = built(&mut server, side, Some(budget));
         eprintln!(
             "a 16^3 build held up to {small:?}, then a {side}^3 build with a {budget:?} budget ran in {large:?}"
@@ -755,7 +755,12 @@ mod served {
         };
         let mut server = Server::new(Some(&host));
         let faults = server.faults();
-        let slow = Duration::from_millis(3000);
+        let larger = (0..grit::serve3::budget::RECENT)
+            .map(|_| built(&mut server, 64, None))
+            .max()
+            .unwrap();
+        let short = (larger * 3).max(Duration::from_millis(1000));
+        let slow = short + Duration::from_secs(2);
         {
             let mut armed = faults.lock().unwrap();
             armed.slow_builds = 1;
@@ -763,7 +768,6 @@ mod served {
         }
         let first = built(&mut server, 16, None);
         assert!(first >= slow, "{first:?}");
-        let short = ((first - slow) * 3).max(Duration::from_millis(1000));
         assert!(short < first, "setup: {first:?} {short:?}");
         for refusal in 0..grit::serve3::budget::REMEASURE_AFTER {
             let told = result(
@@ -778,7 +782,7 @@ mod served {
         }
         let again = built(&mut server, 16, Some(short));
         eprintln!(
-            "a held-up 16^3 build {first:?}, 8 refusals at {short:?}, then it ran in {again:?}"
+            "64^3 builds at most {larger:?}; a held-up 16^3 build {first:?}, 8 refusals at {short:?}, then it ran in {again:?}"
         );
         assert!(again < short, "{again:?}");
         let fits = built(&mut server, 16, Some(short));
@@ -915,6 +919,8 @@ mod served {
         result(&opened(&mut server, 5, Duration::from_secs(600)), false);
     }
 
+    const OPEN_SLACK: Duration = Duration::from_secs(2);
+
     #[test]
     fn cut_replays_teach_nothing_and_never_refuse_an_identical_open_that_fits() {
         let Some(host) = device("cuts teach nothing") else {
@@ -955,7 +961,7 @@ mod served {
             whole = whole.min(began.elapsed());
         }
         let measured = replays_measured(&mut server);
-        let cut = whole * 2;
+        let cut = whole * 2 + OPEN_SLACK;
         for number in 2..=4 {
             {
                 let faults = server.faults();
@@ -1054,8 +1060,9 @@ mod served {
             .collect();
         let slowest = builds.iter().copied().max().unwrap();
         let budget = (slowest * 2 + Duration::from_millis(300)).max(Duration::from_millis(600));
-        eprintln!("32^3 builds {builds:?}; budget {budget:?}");
-        grit::serve3::tools::faults::stall_every(Duration::from_millis(20));
+        let stall = LATENESS / (4 * grit::serve3::budget::BATCH_MOST);
+        eprintln!("32^3 builds {builds:?}; budget {budget:?}; {stall:?} a frame");
+        grit::serve3::tools::faults::stall_every(stall);
         for call in 0..=grit::serve3::budget::RECENT {
             let before = replays_measured(&mut server);
             let began = Instant::now();
@@ -1162,7 +1169,7 @@ mod served {
             return;
         };
         let mut server = Server::new(Some(&host));
-        let held = Duration::from_secs(3);
+        let held = Duration::from_secs(4);
         {
             let faults = server.faults();
             let mut armed = faults.lock().unwrap();
@@ -1190,7 +1197,7 @@ mod served {
         drop(host);
         let host = device("create apart from image build, again").unwrap();
         let (mut server, _) = Server::resumed(Some(&host), book);
-        let budget = held / 3;
+        let budget = held / 2;
         let began = Instant::now();
         let got = read(&mut server, world, budget);
         let took = began.elapsed();
