@@ -1207,11 +1207,25 @@ mod served {
         );
     }
 
+    const SLOW_FRAMES: u32 = 400;
+
+    const FRAME_STALL: Duration = Duration::from_millis(5);
+
+    fn replay_floor() -> Duration {
+        FRAME_STALL * SLOW_FRAMES
+    }
+
     fn two_journals(label: &str) -> (Scratch, Options) {
         let held = scratch(label);
         let dir = held.0.join("worlds");
         let keep = Keep::at(&dir).unwrap();
-        for (number, frames) in [(1, 400), (2, 400), (3, 40), (4, 40), (5, 40)] {
+        for (number, frames) in [
+            (1, SLOW_FRAMES),
+            (2, SLOW_FRAMES),
+            (3, 40),
+            (4, 40),
+            (5, 40),
+        ] {
             let mut ledger = Ledger::created(Made {
                 rule: "sand".to_owned(),
                 params: Vec::new(),
@@ -1238,7 +1252,7 @@ mod served {
         };
         let (_held, options) = two_journals("journal-refusal");
         let mut server = Server::with(Some(&host), &options).unwrap();
-        grit::serve3::tools::faults::stall_every(Duration::from_millis(1));
+        grit::serve3::tools::faults::stall_every(FRAME_STALL);
         let began = Instant::now();
         result(&opened(&mut server, 1, Duration::from_secs(600)), false);
         let slow = began.elapsed();
@@ -1251,7 +1265,7 @@ mod served {
             );
             fast = fast.max(began.elapsed());
         }
-        let budget = (slow + fast) / 2;
+        let budget = ((slow + fast) / 2).min(replay_floor() * 9 / 10);
         eprintln!(
             "400 frames finished in {slow:?}, 40 frames in at most {fast:?}; budget {budget:?}"
         );
@@ -1277,11 +1291,11 @@ mod served {
         };
         let (_held, options) = two_journals("replay-remeasure");
         let mut server = Server::with(Some(&host), &options).unwrap();
-        grit::serve3::tools::faults::stall_every(Duration::from_millis(1));
+        grit::serve3::tools::faults::stall_every(FRAME_STALL);
         let began = Instant::now();
         result(&opened(&mut server, 1, Duration::from_secs(600)), false);
         let slow = began.elapsed();
-        let budget = slow / 2;
+        let budget = (slow / 2).min(replay_floor() / 2);
         let mut refused = 0;
         let mut answer = None;
         for _ in 0..=grit::serve3::budget::REMEASURE_AFTER {
