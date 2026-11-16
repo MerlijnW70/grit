@@ -380,6 +380,10 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if home {
         answer.push(("home", Json::Bool(true)));
     }
+    if let Some(used) = live.world.pool_use()? {
+        answer.push(("sparse", Json::Bool(true)));
+        answer.push(("pool_use", super::pooled(used)));
+    }
     if let Some(stop) = stopped {
         answer.push(("stopped", text(stop.name())));
         answer.push(("ran", counted(done)));
