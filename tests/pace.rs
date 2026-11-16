@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use grit::serve3::budget::{BATCH_MOST, FIXED_KEPT, Pace, REFUSED_MOST};
+use grit::serve3::budget::{BATCH_MOST, FIXED_MOVES_AFTER, Pace, REFUSED_MOST};
 
 #[derive(Debug, Clone, Copy)]
 struct Device {
@@ -79,7 +79,7 @@ fn a_world_whose_one_frame_outlasts_a_short_budget_is_refused_up_front_however_a
             }
         }
         assert!(
-            late.iter().all(|call_at| *call_at < FIXED_KEPT),
+            late.iter().all(|call_at| *call_at < FIXED_MOVES_AFTER),
             "a world whose one frame costs {:?} against a {SHORT:?} budget, a long client stepping {shape:?}: short calls {late:?} of 24 ran late; {pace:?}",
             slow.cost(1)
         );
@@ -136,7 +136,7 @@ fn a_world_whose_one_frame_fits_is_never_refused_however_large_the_long_clients_
             called(&mut pace, heavy, frames, LONG);
             let (ran, spent) = called(&mut pace, heavy, 65536, SHORT);
             assert!(
-                ran > 0 && (spent <= SHORT || call_at < FIXED_KEPT),
+                ran > 0 && (spent <= SHORT || call_at < FIXED_MOVES_AFTER),
                 "a world whose one frame costs {:?}, a long client stepping {shape:?}: short call {call_at} ran {ran} frames in {spent:?} of {SHORT:?}; {pace:?}",
                 heavy.cost(1)
             );
@@ -241,14 +241,14 @@ fn the_fixed_cost_is_split_only_from_batches_whose_sizes_differ_by_twice() {
 }
 
 #[test]
-fn the_fixed_cost_follows_the_device_once_every_split_it_keeps_is_new() {
+fn the_fixed_cost_follows_the_device_after_a_majority_of_the_splits_it_keeps() {
     let fast = Device::new(300, 20);
     let slow = Device::new(20_000, 30_000);
     let mut pace = Pace::first(0);
     called(&mut pace, fast, 4096, LONG);
     assert_eq!(pace.fixed(), fast.fixed, "{pace:?}");
     let mut sizes = [1_u32, 2].into_iter().cycle();
-    for _ in 0..FIXED_KEPT {
+    for _ in 0..FIXED_MOVES_AFTER {
         assert!(pace.fixed() < slow.fixed, "{pace:?}");
         let frames = sizes.next().unwrap();
         pace.ran(frames, slow.cost(frames));
@@ -303,26 +303,16 @@ fn a_fixed_cost_split_from_jittered_batches_keeps_a_world_too_slow_for_a_short_b
 }
 
 #[test]
-fn the_fixed_cost_comes_from_the_most_precise_split_it_keeps() {
+fn two_splits_far_off_never_move_the_fixed_cost() {
     let device = Device::new(4_600, 2_250);
     let off = Duration::from_millis(3);
-    let mut noisy = Pace::first(0);
-    noisy.ran(32, device.cost(32) + off);
-    noisy.ran(64, device.cost(64) - off);
     let mut pace = Pace::first(0);
-    pace.ran(1, device.cost(1));
-    pace.ran(2, device.cost(2));
+    for frames in [1, 2, 4, 8, 16] {
+        pace.ran(frames, device.cost(frames));
+    }
     pace.ran(32, device.cost(32) + off);
     pace.ran(64, device.cost(64) - off);
-    let close = Duration::from_micros(250);
-    assert!(
-        noisy.fixed().abs_diff(device.fixed) > off,
-        "batches of 32 and 64 frames, {off:?} off each, split far from the truth: {noisy:?}"
-    );
-    assert!(
-        pace.fixed().abs_diff(device.fixed) <= close,
-        "a split with a batch of 1 or 2 frames outranks one of 32 and 64: {pace:?}"
-    );
+    assert_eq!(pace.fixed(), device.fixed, "{pace:?}");
 }
 
 #[test]
