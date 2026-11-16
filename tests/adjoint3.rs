@@ -143,7 +143,7 @@ fn the_reversible_key_is_optional_true_only_and_part_of_the_hash() {
     assert_eq!(why.path, "$.reversable");
     assert!(why.expected.contains("reversible"), "{why}");
     assert!(Code::ALL.contains(&Code::Lifting));
-    assert_eq!(Code::Lifting.name(), "lifting");
+    assert_eq!(Code::Lifting.name(), "not_lifting");
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn a_law_that_breaks_the_form_is_refused_by_name_with_its_first_step() {
     swapped.swap(0, 1);
     broken_at(
         &view(&swapped),
-        "$.step",
+        "$.step[1][2]",
         "word 1 is made by cell 0 unchanged",
     );
 
@@ -1136,7 +1136,7 @@ fn every_law_the_check_admits_is_undone_by_its_inverse_on_a_seeded_fuzz() {
         "{FUZZ} mutated laws: {admitted} admitted and undone by their inverse, refusals {codes:?}"
     );
     assert!(admitted > 0);
-    assert!(codes.contains("lifting"));
+    assert!(codes.contains("not_lifting"));
 }
 
 fn lifting_law(defs: &str, step: &str) -> String {

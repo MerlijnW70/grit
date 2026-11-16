@@ -746,7 +746,18 @@ fn every_refused_look_is_named_by_its_code_and_path() {
         "$.halo",
     );
     let reversible = ok.replacen("\"halo\":1,", "\"halo\":1,\"reversible\":true,", 1);
-    refused_at(&reversible, Code::Unsupported, "$.reversible");
+    let why = refused_at(&reversible, Code::Lifting, "$.step[1]");
+    assert!(why.found.contains("unchanged"), "{why}");
+    let lifted = probe(
+        2,
+        1,
+        0,
+        "[\"vec\",[\"at\",[\"at\",\"cells\",\"c\"],0],[\"add\",[\"at\",[\"at\",\"cells\",\"c\"],1],[\"look\",0,-1,1,0,\"c\"]]]",
+    )
+    .replacen("\"halo\":1,", "\"halo\":1,\"reversible\":true,", 1);
+    let law = compiled(&lifted);
+    assert!(law.reversible());
+    assert_eq!(law.inverse().map(Law::halo), Some(1));
 }
 
 #[test]
