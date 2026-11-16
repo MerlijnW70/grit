@@ -1170,7 +1170,7 @@ mod served {
             return;
         };
         let mut server = Server::new(Some(&host));
-        let held = Duration::from_secs(4);
+        let held = Duration::from_secs(3);
         {
             let faults = server.faults();
             let mut armed = faults.lock().unwrap();
@@ -1198,7 +1198,7 @@ mod served {
         drop(host);
         let host = device("create apart from image build, again").unwrap();
         let (mut server, _) = Server::resumed(Some(&host), book);
-        let budget = held / 2;
+        let budget = held / 3;
         let began = Instant::now();
         let got = read(&mut server, world, budget);
         let took = began.elapsed();
