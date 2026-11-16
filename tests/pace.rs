@@ -692,3 +692,22 @@ fn a_world_whose_fixed_cost_turns_runs_no_call_late_and_misjudges_fewer_short_ca
         );
     }
 }
+
+#[test]
+fn a_batch_before_any_split_never_outlasts_the_time_left() {
+    let device = Device::new(20_000, 1_000);
+    let mut pace = Pace::first(32 * 32 * 32);
+    for _ in 0..2 {
+        pace.ran(BATCH_MOST, device.cost(BATCH_MOST));
+    }
+    for budget_ms in [5_u64, 21, 30, 60, 84] {
+        let budget = Duration::from_millis(budget_ms);
+        let step = pace.batch(65536, budget);
+        assert!(
+            step == 0 || device.cost(step) <= budget,
+            "batches of 64 at {:?}, no split yet: {step} frames on {budget:?} cost {:?}; {pace:?}",
+            device.cost(BATCH_MOST),
+            device.cost(step)
+        );
+    }
+}
