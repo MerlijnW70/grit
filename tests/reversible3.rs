@@ -1172,6 +1172,8 @@ fn a_walked_back_world_survives_replay_save_open_and_fork_at_its_frame_and_state
         let walked = back_by(&mut run, world, 25, false);
         assert_eq!(int_at(&walked, "frame"), 15);
         assert_eq!(text_at(&walked, "inverse"), law.inverse().unwrap().hex());
+        assert_eq!(walked.get("sparse"), sparse.then_some(&Json::Bool(true)));
+        assert_eq!(walked.get("pool_use").is_some(), sparse);
         model.back(25);
         stepped_by(&mut run, world, 9);
         model.step(9);
