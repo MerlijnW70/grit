@@ -12,7 +12,7 @@ use std::time::Duration;
 use grit::Host;
 use grit::branch::{Made, World};
 use grit::halo::BOX;
-use grit::law::{Code, Law, Refusal};
+use grit::law::{Code, Law, Refusal, limits};
 use grit::rule3::{CORNERS, Oct, Rule};
 use grit::sand3::{Grid3, reference};
 use grit::serve3::exec::Exec;
@@ -359,9 +359,9 @@ fn every_generated_law_compiles_reversible_with_an_ordinary_inverse() {
             assert!(law.reversible());
             let inverse = law
                 .inverse()
+                .unwrap_or_else(|why| panic!("{why}\n{text}"))
                 .unwrap_or_else(|| panic!("no inverse\n{text}"));
             assert!(inverse.reversible());
-            assert!(inverse.inverse().is_none());
             assert_ne!(inverse.hex(), law.hex());
             assert_eq!(inverse.name(), format!("gen{index}r{round}_back"));
             assert_eq!(inverse.channels(), law.channels());
@@ -377,7 +377,7 @@ fn every_generated_law_compiles_reversible_with_an_ordinary_inverse() {
             let again = compiled(inverse.canonical());
             assert_eq!(again.hex(), inverse.hex());
             assert_eq!(again.dag(), inverse.dag());
-            let twice = again.inverse().unwrap();
+            let twice = again.inverse().unwrap().unwrap();
             let params = params_of(kind, seed);
             let mut state = seed ^ 0x55;
             for _ in 0..256 {
@@ -400,7 +400,7 @@ fn the_inverse_composed_with_the_law_is_the_identity_on_sampled_full_words() {
         seed = next(&mut seed);
         let text = generated(kind, seed, &format!("full{index}"));
         let law = compiled(&text);
-        let inverse = law.inverse().unwrap();
+        let inverse = law.inverse().unwrap().unwrap();
         let params = params_of(kind, seed);
         let mut state = seed;
         for sample in 0..1 << 16 {
@@ -414,7 +414,7 @@ fn the_inverse_composed_with_the_law_is_the_identity_on_sampled_full_words() {
     }
     for text in [MIX, STIR] {
         let law = compiled(text);
-        let inverse = law.inverse().unwrap();
+        let inverse = law.inverse().unwrap().unwrap();
         let kind = Kind {
             channels: 1,
             params: 0,
@@ -454,7 +454,7 @@ fn the_inverse_composed_with_the_law_is_the_identity_on_every_oct_of_an_edge_dom
     laws.push((compiled(MIX), vec![3, 1 << 20]));
     laws.push((compiled(STIR), vec![7, 1 << 12, u32::MAX]));
     for (law, params) in &laws {
-        let inverse = law.inverse().unwrap();
+        let inverse = law.inverse().unwrap().unwrap();
         for index in 0..4_u32.pow(8) {
             let words: [u32; CORNERS] =
                 core::array::from_fn(|corner| EDGE[((index >> (2 * corner)) & 3) as usize]);
@@ -730,7 +730,7 @@ fn home_on_device(
 }
 
 fn home_on_cpu(law: &Law, params: &[u32], grid: Grid3, start: &[u32]) -> Vec<u32> {
-    let inverse = law.inverse().unwrap();
+    let inverse = law.inverse().unwrap().unwrap();
     let far = walked_forward(law, grid, start, params);
     let back = walked_back(inverse, grid, &far, params);
     assert!(
@@ -881,7 +881,7 @@ fn a_law_that_is_not_reversible_is_refused_a_walk_back_before_any_work() {
     let plain = MIX.replacen("\"reversible\": true,", "", 1);
     let law = compiled(&plain);
     assert!(!law.reversible());
-    assert!(law.inverse().is_none());
+    assert!(law.inverse().unwrap().is_none());
     let size = [8, 8, 8];
     let grid = grid_of(size);
     let start = filled(grid, 1, 9, false);
@@ -1042,7 +1042,7 @@ impl Model {
     }
 
     fn back(&mut self, frames: u32) {
-        let inverse = self.law.inverse().unwrap().clone();
+        let inverse = self.law.inverse().unwrap().unwrap().clone();
         for _ in 0..frames {
             self.frame -= 1;
             self.cells = reference(
@@ -1171,7 +1171,10 @@ fn a_walked_back_world_survives_replay_save_open_and_fork_at_its_frame_and_state
         model.step(40);
         let walked = back_by(&mut run, world, 25, false);
         assert_eq!(int_at(&walked, "frame"), 15);
-        assert_eq!(text_at(&walked, "inverse"), law.inverse().unwrap().hex());
+        assert_eq!(
+            text_at(&walked, "inverse"),
+            law.inverse().unwrap().unwrap().hex()
+        );
         assert_eq!(walked.get("sparse"), sparse.then_some(&Json::Bool(true)));
         assert_eq!(walked.get("pool_use").is_some(), sparse);
         model.back(25);
@@ -1639,8 +1642,126 @@ fn the_documented_example_is_a_reversible_law_that_comes_home() {
         "docs/law-worlds.md holds the example verbatim"
     );
     let law = compiled(SHEAR);
-    assert_eq!(law.inverse().unwrap().name(), "shear_back");
+    assert_eq!(law.inverse().unwrap().unwrap().name(), "shear_back");
     let grid = grid_of([8, 8, 8]);
     let start = filled(grid, 1, 0x5EA, false);
     home_on_cpu(&law, &[3], grid, &start);
+}
+
+fn bounded_law(params: u32, defs: &str, step: &str) -> String {
+    format!(
+        "{{\"law\":1,\"name\":\"probe\",\"params\":{params},\"channels\":1,\"halo\":0,\"tally\":{{\"counts\":1,\"weighted\":false}},\"consts\":{{}},\"defs\":{{{defs}}},\"step\":{step}}}"
+    )
+}
+fn lifted_law(lifts: u32) -> String {
+    let cells: Vec<String> = (0..8)
+        .map(|k| match k {
+            0 => format!(
+                "[\"fold\",\"w\",[\"at\",\"cells\",0],\"i\",[\"range\",{lifts}],[\"add\",\"w\",\"b\"]]"
+            ),
+            _ => format!("[\"at\",\"cells\",{k}]"),
+        })
+        .collect();
+    let shared = limits::NODES as u32 - lifts - 40;
+    bounded_law(
+        1,
+        "",
+        &format!(
+            "[\"let\",[[\"b\",[\"fold\",\"a\",[\"param\",0],\"i\",[\"range\",{shared}],[\"not\",\"a\"]]]],[\"vec\",[\"vec\",{}],[\"vec\",0]]]",
+            cells.join(",")
+        ),
+    )
+    .replacen("\"halo\":0,", "\"halo\":0,\"reversible\":true,", 1)
+}
+fn mixed_law(steps: u32, seed: u64) -> String {
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut current: Vec<String> = (0..8).map(|k| format!("[\"at\",\"cells\",{k}]")).collect();
+    let mut binds = Vec::new();
+    for step in 0..steps {
+        let word = (next() % 8) as usize;
+        let others: Vec<&String> = (0..8)
+            .filter(|&other| other != word)
+            .map(|other| &current[other])
+            .collect();
+        let one = others[(next() % 7) as usize];
+        let two = others[(next() % 7) as usize];
+        let by = format!("[\"add\",{one},{two}]");
+        let made = if next() % 2 == 0 {
+            format!(
+                "[\"{}\",{by},{}]",
+                ["add", "xor"][(next() % 2) as usize],
+                current[word]
+            )
+        } else {
+            format!(
+                "[\"{}\",{},{by}]",
+                ["add", "sub", "xor"][(next() % 3) as usize],
+                current[word]
+            )
+        };
+        binds.push(format!("[\"w{step}\",{made}]"));
+        current[word] = format!("\"w{step}\"");
+    }
+    bounded_law(
+        0,
+        "",
+        &format!(
+            "[\"let\",[{}],[\"vec\",[\"vec\",{}],[\"vec\",0]]]",
+            binds.join(","),
+            current.join(",")
+        ),
+    )
+    .replacen("\"halo\":0,", "\"halo\":0,\"reversible\":true,", 1)
+}
+
+const NANOS_PER_UNIT: f64 = if cfg!(debug_assertions) {
+    4000.0
+} else {
+    400.0
+};
+
+#[test]
+fn the_inverse_of_the_largest_laws_is_derived_in_time_bounded_per_unit_of_the_inverse() {
+    let texts: Vec<(String, String)> = [2_000, 4_000, 8_000]
+        .into_iter()
+        .map(|lifts| {
+            (
+                format!("{lifts} lifts over a shared subtree"),
+                lifted_law(lifts),
+            )
+        })
+        .chain(
+            [(2_000_u32, 1_u64), (8_100, 2)]
+                .into_iter()
+                .map(|(steps, seed)| {
+                    (
+                        format!("{steps} steps reading each other"),
+                        mixed_law(steps, seed),
+                    )
+                }),
+        )
+        .collect();
+    for (name, text) in texts {
+        let mut took = Duration::MAX;
+        let mut units = 0;
+        for _ in 0..3 {
+            let law = compiled(&text);
+            let began = std::time::Instant::now();
+            let inverse = law.inverse().unwrap().unwrap();
+            took = took.min(began.elapsed());
+            units = inverse.work() + inverse.nodes() as u64 + inverse.canonical().len() as u64;
+        }
+        let nanos = took.as_secs_f64() * 1e9 / units as f64;
+        println!(
+            "{name}: inverse derived in {:.2} ms, {units} units of the inverse, {nanos:.1} ns a unit",
+            took.as_secs_f64() * 1e3
+        );
+        assert!(nanos <= NANOS_PER_UNIT, "{name}: {nanos:.1} ns a unit");
+    }
 }

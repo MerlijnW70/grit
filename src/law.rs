@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::ops::Ops;
 use crate::rule3::{CORNERS, Declared, Oct, OneStep, Planed, Ruled, Tally};
@@ -191,7 +191,8 @@ pub struct Law {
     hash: [u8; 32],
     work: u64,
     depth: usize,
-    inverse: Option<Arc<Law>>,
+    steps: Option<Arc<[adjoint::Lift]>>,
+    inverse: OnceLock<Result<Arc<Law>, Refusal>>,
 }
 
 impl Law {
@@ -201,14 +202,6 @@ impl Law {
     }
 
     pub fn from_json(json: &Json) -> Result<Self, Refusal> {
-        Self::built(json, true)
-    }
-
-    pub(crate) fn derived(json: &Json) -> Result<Self, Refusal> {
-        Self::built(json, false)
-    }
-
-    fn built(json: &Json, derive: bool) -> Result<Self, Refusal> {
         let program = parse::program(json)?;
         let canonical = canonical(json);
         if canonical.len() > limits::BODY {
@@ -232,25 +225,11 @@ impl Law {
             });
         }
         let steps = if program.reversible {
-            Some(
-                adjoint::lifted(&expanded.dag)
-                    .map_err(|broken| broken.refusal(&expanded.dag, &places, json))?,
-            )
+            Some(Arc::from(adjoint::lifted(&expanded.dag).map_err(
+                |broken| broken.refusal(&expanded.dag, &places, json),
+            )?))
         } else {
             None
-        };
-        let inverse = match steps {
-            Some(steps) if derive => {
-                let shape = reversible::Shape {
-                    name: program.name,
-                    params: program.params,
-                    channels: program.channels,
-                    halo: program.halo,
-                    tally: program.tally,
-                };
-                Some(Arc::new(reversible::inverse(shape, &expanded.dag, steps)?))
-            }
-            _ => None,
         };
         let hash = crate::branch::sha256(canonical.as_bytes());
         Ok(Self {
@@ -264,13 +243,29 @@ impl Law {
             hash,
             work: expanded.work,
             depth: expanded.depth,
-            inverse,
+            steps,
+            inverse: OnceLock::new(),
         })
     }
 
-    #[must_use]
-    pub fn inverse(&self) -> Option<&Self> {
-        self.inverse.as_deref()
+    pub fn inverse(&self) -> Result<Option<&Self>, Refusal> {
+        let Some(steps) = self.steps.as_ref() else {
+            return Ok(None);
+        };
+        let derived = self.inverse.get_or_init(|| {
+            let shape = reversible::Shape {
+                name: &self.name,
+                params: self.dag.params(),
+                channels: self.channels,
+                halo: self.halo,
+                tally: self.dag.tally(),
+            };
+            reversible::inverse(shape, &self.dag, steps.to_vec()).map(Arc::new)
+        });
+        match derived {
+            Ok(law) => Ok(Some(law)),
+            Err(why) => Err(why.clone()),
+        }
     }
 
     #[must_use]

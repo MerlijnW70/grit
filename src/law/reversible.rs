@@ -82,7 +82,7 @@ pub fn back_name(name: &str) -> String {
 pub(crate) fn inverse(shape: Shape<'_>, dag: &Dag, steps: Vec<Lift>) -> Result<Law, Refusal> {
     let undone = Reversible::from_steps(dag, steps);
     let json = written(shape, undone.inverse());
-    Law::derived(&json).map_err(|why| Refusal {
+    Law::from_json(&json).map_err(|why| Refusal {
         code: why.code,
         path: String::from("$.reversible"),
         expected: String::from("a reversible law whose derived inverse passes every law limit"),

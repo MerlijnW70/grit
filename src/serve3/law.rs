@@ -155,7 +155,10 @@ impl Refused {
 }
 
 pub fn compiled(held: &str) -> Result<Law, Failed> {
-    Law::compile(held).map_err(|why| Box::new(Refused(why, "$.law")) as Failed)
+    let law = Law::compile(held).map_err(|why| Box::new(Refused(why, "$.law")) as Failed)?;
+    law.inverse()
+        .map_err(|why| Box::new(Refused(why, "$.law")) as Failed)?;
+    Ok(law)
 }
 
 #[must_use]
