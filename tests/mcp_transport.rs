@@ -817,7 +817,7 @@ fn code_of(tool: &str, path: &str, wrong: Wrong) -> &'static str {
         ("grit_world_create", "$.rule", Wrong::Missing | Wrong::Type | Wrong::Choice) => {
             "unknown_rule"
         }
-        ("grit_world_step", "$.frames", Wrong::Range) => "frames",
+        ("grit_world_step" | "grit_world_back", "$.frames", Wrong::Range) => "frames",
         ("grit_world_slice", "$.axis", Wrong::Type | Wrong::Choice) => "axis",
         ("grit_law_from_chip", _, Wrong::Range) => match path.rsplit('.').next() {
             Some("bit") => "bit_past",

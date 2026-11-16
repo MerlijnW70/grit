@@ -56,9 +56,12 @@ pub enum Code {
     BitShared,
     HaloWritten,
     ChipTooBig,
+    NotReversible,
+    PastStart,
+    Strayed,
 }
 
-pub const CODES: [Code; 52] = [
+pub const CODES: [Code; 55] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -111,6 +114,9 @@ pub const CODES: [Code; 52] = [
     Code::BitShared,
     Code::HaloWritten,
     Code::ChipTooBig,
+    Code::NotReversible,
+    Code::PastStart,
+    Code::Strayed,
 ];
 
 impl Code {
@@ -169,6 +175,9 @@ impl Code {
             Self::BitShared => "bit_shared",
             Self::HaloWritten => "halo_written",
             Self::ChipTooBig => "chip_too_big",
+            Self::NotReversible => "not_reversible",
+            Self::PastStart => "past_start",
+            Self::Strayed => "strayed",
         }
     }
 
@@ -300,6 +309,13 @@ impl Code {
             }
             Self::HaloWritten => {
                 "Read a plane an output or state bit is on only at offset 0; put the inputs that read neighbours on a plane the chip does not write, such as plane 0 with the outputs on plane 1."
+            }
+            Self::NotReversible => {
+                "Walk back only a world whose law declares \"reversible\": true; for any other, fork the world before stepping and restore the fork."
+            }
+            Self::PastStart => "Walk back at most as many frames as the world's frame.",
+            Self::Strayed => {
+                "Report the law and the call: an accepted reversible law must come home; the world was left as it was."
             }
         }
     }

@@ -57,6 +57,24 @@ A host write to a world whose law looks wakes the 27 octs around the oct of each
 
 `tests/halo3/` holds three laws that look: a 2D Sobel edge detector, a 3D 3x3x3 Sobel and a blur over two planes.
 
+## Reversible laws
+
+A law with `"reversible": true` must be a sequence of lifting steps over its words, 8 a plane: each step adds, subtracts or xors to one word, wrapping, a value made only of other words, params, `frame`, `at`, constants and looks at frozen planes. The compiler checks the form, derives the inverse (the steps undone in reverse order) as an ordinary law named with `_back` and its own hash, and refuses anything else with `not_lifting` at the offending step's path: a step that reads its own word, one node written to two words, a word made by another op (`b = f(a)`, `b | f`, `b * 3`).
+
+```json
+{"law":1,"name":"shear","params":1,"channels":1,"halo":0,"reversible":true,"tally":{"counts":1,"weighted":false},"consts":{},"defs":{},
+"step":["let",[["a",["at","cells",0]],["b",["at","cells",1]],["b2",["add","b",["mul","a",["param",0]]]],["a2",["xor","a",["shr","b2",3]]]],
+["vec",["vec","a2","b2",["at","cells",2],["at","cells",3],["at","cells",4],["at","cells",5],["at","cells",6],["at","cells",7]],["vec",0]]]}
+```
+
+`grit_world_back` walks a world of such a law back `frames` (1 to 65536) frames, never past frame 0: frame `f` is undone with the inverse at frame `f`'s phase and the world's params. It does not undo writes or params. With `home` true a copy of the walked-back world steps forward again; if it does not come back bit for bit the answer is `strayed`, with the first differing cell, and the world is left as it was.
+
+1. `grit_world_create` with the law above, `params` `[3]`.
+2. `grit_world_write` some cells, `grit_world_step` 100 frames.
+3. `grit_world_back` with `frames` 100 and `home` true: `frame` 0, `home` true, and the cells you wrote.
+
+Refusals: `not_reversible` at `$.world` for a world whose law is not reversible, or a rule; `past_start` at `$.frames` for more frames than the world's frame. Walked-back worlds save, open, fork, restore, replay their journal and rebuild after a lost device at their frame.
+
 ## The quiet class
 
 A listed world steps an oct only while it, or an oct around it, changed in the two frames before; a sparse world also keeps an all-one-value brick as a single word and steps it only while it is hot. That gives the cells of stepping every oct only when:

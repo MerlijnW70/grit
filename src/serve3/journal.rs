@@ -52,7 +52,11 @@ const LAW: u32 = 5;
 
 const PARAMS: u32 = 6;
 
+const BACK: u32 = 7;
+
 const RECORD_WORDS_MOST: usize = 1 << 24;
+
+const BACK_BATCH: u32 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Made {
@@ -110,6 +114,7 @@ pub enum Entry {
     Write(Vec<([u32; 3], u32)>),
     Step(u32),
     Params(Vec<u32>),
+    Back(u32),
 }
 
 impl Entry {
@@ -117,7 +122,7 @@ impl Entry {
     pub fn bytes(&self) -> usize {
         match self {
             Self::Write(cells) => 16 * cells.len() + 8,
-            Self::Step(_) => 8,
+            Self::Step(_) | Self::Back(_) => 8,
             Self::Params(params) => 4 * params.len() + 8,
         }
     }
@@ -203,8 +208,10 @@ impl Ledger {
     }
 
     pub fn push(&mut self, entry: Entry, spent: Duration) {
-        if let Entry::Step(frames) = entry {
-            self.frame = self.frame.wrapping_add(frames);
+        match entry {
+            Entry::Step(frames) => self.frame = self.frame.wrapping_add(frames),
+            Entry::Back(frames) => self.frame = self.frame.wrapping_sub(frames),
+            Entry::Write(_) | Entry::Params(_) => {}
         }
         self.bytes = self.bytes.saturating_add(entry.bytes());
         self.replay = self.replay.saturating_add(spent);
@@ -954,6 +961,7 @@ fn entry_record(entry: &Entry, spent: Duration) -> (u32, Vec<u32>) {
             (WRITE, words)
         }
         Entry::Step(frames) => (STEP, vec![*frames, micros]),
+        Entry::Back(frames) => (BACK, vec![*frames, micros]),
         Entry::Params(params) => {
             let mut words = params.clone();
             words.push(micros);
@@ -985,6 +993,10 @@ fn entry_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration)> {
             _ => None,
         },
         PARAMS => Some((Entry::Params(payload.to_vec()), spent)),
+        BACK => match payload {
+            [frames] => Some((Entry::Back(*frames), spent)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1156,6 +1168,17 @@ pub fn rebuilt<'host>(
                 timings.write_bytes = timings.write_bytes.saturating_add(entry.bytes() as u64);
             }
             Entry::Params(params) => super::law::reparam(&mut world, params)?,
+            Entry::Back(frames) => {
+                let mut done = 0_u32;
+                while done < *frames {
+                    if let Some(stop) = guard.stop() {
+                        return Err(halted(stop, world.frame()));
+                    }
+                    let step = BACK_BATCH.min(*frames - done);
+                    world.back(step)?;
+                    done += step;
+                }
+            }
             Entry::Step(frames) => {
                 let stepped = std::time::Instant::now();
                 if let Err(why) = stepping(&mut world, *frames) {
