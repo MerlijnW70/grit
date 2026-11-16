@@ -4595,10 +4595,24 @@ fn kept_journals(scratch: &Scratch, numbers: &[u32]) {
             sparse: false,
             slots: None,
         });
-        ledger.push(Entry::Step(400), Duration::from_secs(1));
+        ledger.push(Entry::Step(400), KEPT_RECORDED);
         keep.begin(number, &ledger).unwrap();
     }
     keep.set_next(numbers.iter().max().unwrap() + 1).unwrap();
+}
+
+#[cfg(feature = "faults")]
+const KEPT_RECORDED: Duration = Duration::from_secs(2);
+
+#[cfg(feature = "faults")]
+const FIRST_OPEN_HELD: Duration = Duration::from_secs(2);
+
+#[cfg(feature = "faults")]
+fn replays_held(server: &Server<'_>, by: Duration) {
+    let faults = server.faults();
+    let mut armed = faults.lock().unwrap();
+    armed.held_replays = 1;
+    armed.held_by = by;
 }
 
 #[cfg(feature = "faults")]
@@ -4615,25 +4629,31 @@ fn a_replay_held_up_once_never_refuses_the_next_open_of_a_kept_world_that_fits()
     let scratch = Scratch::new("held-replay-ratio");
     kept_journals(&scratch, &[1, 2, 3]);
     let mut server = kept_server(&host, &scratch);
+    replays_held(&server, FIRST_OPEN_HELD);
+    let began = Instant::now();
     answer(&call(
         &mut server,
         "grit_world_open",
         &opened_kept(1, 600_000),
     ));
-    {
-        let faults = server.faults();
-        let mut armed = faults.lock().unwrap();
-        armed.held_replays = 1;
-        armed.held_by = Duration::from_secs(4);
-    }
+    let fits = began.elapsed();
+    let budget = fits + Duration::from_millis(300);
+    let held = budget + Duration::from_secs(1);
+    replays_held(&server, held);
     answer(&call(
         &mut server,
         "grit_world_open",
         &opened_kept(2, 600_000),
     ));
     assert_eq!(server.faults().lock().unwrap().held_replays, 0);
-    let got = call(&mut server, "grit_world_open", &opened_kept(3, 2500));
-    eprintln!("open after one held-up replay: {}", written(&got));
+    let budget_ms = u64::try_from(budget.as_millis()).unwrap();
+    let began = Instant::now();
+    let got = call(&mut server, "grit_world_open", &opened_kept(3, budget_ms));
+    eprintln!(
+        "a first open held up {FIRST_OPEN_HELD:?} took {fits:?}, a second held up {held:?}, then {budget_ms} ms in {:?}: {}",
+        began.elapsed(),
+        written(&got)
+    );
     assert_eq!(answer(&got).int_at("frame"), 400);
 }
 
