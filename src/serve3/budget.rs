@@ -48,7 +48,9 @@ impl Stop {
 
 pub const REFUSED_MOST: u32 = 2;
 
-pub const FIXED_KEPT: usize = 3;
+pub const FIXED_MOVES_AFTER: usize = 3;
+
+pub const FIXED_KEPT: usize = 2 * FIXED_MOVES_AFTER - 1;
 
 #[derive(Debug, Clone, Copy)]
 struct Batch {
@@ -86,12 +88,11 @@ impl Pace {
 
     #[must_use]
     pub fn fixed(&self) -> Duration {
-        self.fixed
-            .iter()
-            .flatten()
-            .min()
-            .copied()
-            .unwrap_or(WORST_PER_SUBMIT)
+        let mut kept = self.fixed;
+        kept.sort_unstable();
+        let filled = kept.iter().flatten().count();
+        let at = FIXED_KEPT - filled + filled.saturating_sub(FIXED_MOVES_AFTER);
+        kept.get(at).copied().flatten().unwrap_or(WORST_PER_SUBMIT)
     }
 
     #[must_use]
