@@ -2460,10 +2460,16 @@ fn after_a_lost_device_only_the_worlds_a_call_touches_are_rebuilt_inside_its_bud
     assert_eq!(note.int_at("frame"), 20);
     let now = worlds(&mut run);
     assert_eq!((now.int_at("open"), now.int_at("lost")), (1, 2));
+    let budget = Duration::from_millis(1);
+    let held = budget * 100;
+    built_slower_than(&mut run, held);
     let third = models[2].0;
     let told = refused(&run.ask(
         "grit_world_read",
-        &format!("{{\"world\":{third},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":1}}"),
+        &format!(
+            "{{\"world\":{third},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":{}}}",
+            budget.as_millis()
+        ),
     ));
     assert_eq!(told.code, "budget", "{}", told.message);
     assert!(
@@ -2487,6 +2493,40 @@ fn after_a_lost_device_only_the_worlds_a_call_touches_are_rebuilt_inside_its_bud
         (3, 0, 1)
     );
     run.exec.finish();
+}
+
+#[cfg(feature = "faults")]
+fn built_slower_than(run: &mut Run, held: Duration) {
+    let recent = grit::serve3::budget::RECENT;
+    let faults = run.exec.faults();
+    {
+        let mut armed = faults.lock().unwrap();
+        armed.slow_builds = u32::try_from(recent).unwrap();
+        armed.slow_build = held;
+        armed.held_work = vec![grit::serve3::budget::Work::BuildImage; recent];
+        armed.held_by = held;
+    }
+    let mut made = Vec::new();
+    for _ in 0..recent {
+        let model = Model::new("sand", &[], 16);
+        made.push(answer(&run.ask("grit_world_create", &model.create(false))).int_at("world"));
+    }
+    answer(&run.ask(
+        "grit_world_save",
+        &format!("{{\"world\":{},\"name\":\"held\"}}", made[0]),
+    ));
+    for _ in 0..recent {
+        made.push(answer(&run.ask("grit_world_open", "{\"name\":\"held\"}")).int_at("world"));
+    }
+    for world in made {
+        answer(&run.ask("grit_world_close", &format!("{{\"world\":{world}}}")));
+    }
+    let armed = faults.lock().unwrap();
+    assert_eq!(
+        (armed.slow_builds, armed.held_work.len()),
+        (0, 0),
+        "setup: not every build was held"
+    );
 }
 
 #[test]
