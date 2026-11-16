@@ -381,6 +381,8 @@ const RATIO_MOST: f64 = 8.0;
 pub enum Work {
     Build,
     BuildSparse,
+    BuildImage,
+    BuildImageSparse,
     Fork,
     ForkSparse,
     Save,
@@ -392,9 +394,11 @@ pub enum Work {
 }
 
 impl Work {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Build,
         Self::BuildSparse,
+        Self::BuildImage,
+        Self::BuildImageSparse,
         Self::Fork,
         Self::ForkSparse,
         Self::Save,
@@ -411,6 +415,15 @@ impl Work {
             Self::BuildSparse
         } else {
             Self::Build
+        }
+    }
+
+    #[must_use]
+    pub const fn build_image(sparse: bool) -> Self {
+        if sparse {
+            Self::BuildImageSparse
+        } else {
+            Self::BuildImage
         }
     }
 
@@ -432,20 +445,27 @@ impl Work {
         match self {
             Self::Build => 0,
             Self::BuildSparse => 1,
-            Self::Fork => 2,
-            Self::ForkSparse => 3,
-            Self::Save => 4,
-            Self::Snap => 5,
-            Self::File => 6,
-            Self::FileOpen => 7,
-            Self::Write => 8,
-            Self::WriteSparse => 9,
+            Self::BuildImage => 2,
+            Self::BuildImageSparse => 3,
+            Self::Fork => 4,
+            Self::ForkSparse => 5,
+            Self::Save => 6,
+            Self::Snap => 7,
+            Self::File => 8,
+            Self::FileOpen => 9,
+            Self::Write => 10,
+            Self::WriteSparse => 11,
         }
     }
 
     const fn prior(self) -> f64 {
         match self {
-            Self::Build | Self::BuildSparse | Self::Fork | Self::ForkSparse => 1e-8,
+            Self::Build
+            | Self::BuildSparse
+            | Self::BuildImage
+            | Self::BuildImageSparse
+            | Self::Fork
+            | Self::ForkSparse => 1e-8,
             Self::Save | Self::Snap => 5e-8,
             Self::File | Self::FileOpen => 2e-8,
             Self::Write | Self::WriteSparse => 2e-4,
@@ -455,8 +475,8 @@ impl Work {
     #[must_use]
     pub const fn fastest(self) -> Option<f64> {
         match self {
-            Self::Build => Some(FASTEST_BUILD),
-            Self::BuildSparse => Some(FASTEST_BUILD_SPARSE),
+            Self::Build | Self::BuildImage => Some(FASTEST_BUILD),
+            Self::BuildSparse | Self::BuildImageSparse => Some(FASTEST_BUILD_SPARSE),
             Self::Fork | Self::ForkSparse => Some(FASTEST_FORK),
             Self::Save => Some(FASTEST_SAVE),
             Self::Snap => Some(FASTEST_SNAP),
@@ -477,6 +497,8 @@ impl Work {
         match self {
             Self::Build => "build",
             Self::BuildSparse => "build_sparse",
+            Self::BuildImage => "build_from_image",
+            Self::BuildImageSparse => "build_from_image_sparse",
             Self::Fork => "fork",
             Self::ForkSparse => "fork_sparse",
             Self::Save => "save",
@@ -628,9 +650,9 @@ impl Kept {
 
 #[derive(Debug, Clone, Default)]
 pub struct Rates {
-    kinds: [Kept; 10],
+    kinds: [Kept; Work::ALL.len()],
     replay: Kept,
-    samples: [Samples; 10],
+    samples: [Samples; Work::ALL.len()],
     journals: BTreeMap<u64, std::collections::VecDeque<f64>>,
     journal_order: std::collections::VecDeque<u64>,
     replays_seen: u64,

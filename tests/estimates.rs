@@ -1126,6 +1126,57 @@ mod served {
         result(&read(&mut server, fork, Duration::from_secs(600)), false);
     }
 
+    #[test]
+    fn a_held_up_create_never_refuses_the_rebuild_of_its_world_from_a_snapshot() {
+        let Some(host) = device("create apart from image build") else {
+            return;
+        };
+        let mut server = Server::new(Some(&host));
+        let held = Duration::from_secs(3);
+        {
+            let faults = server.faults();
+            let mut armed = faults.lock().unwrap();
+            armed.slow_builds = 1;
+            armed.slow_build = held;
+        }
+        let began = Instant::now();
+        let made = result(
+            &call(&mut server, "grit_world_create", &cube(32, None)),
+            false,
+        );
+        assert!(began.elapsed() >= held, "setup: the create was not held");
+        let world = int_at(&made, "world");
+        grit::serve3::tools::faults::stall_batch(0, held);
+        result(
+            &call(
+                &mut server,
+                "grit_world_step",
+                &format!("{{\"world\":{world},\"frames\":1,\"budget_ms\":600000}}"),
+            ),
+            false,
+        );
+        grit::serve3::tools::faults::disarm();
+        let book = lost(server);
+        drop(host);
+        let host = device("create apart from image build, again").unwrap();
+        let (mut server, _) = Server::resumed(Some(&host), book);
+        let budget = held / 3;
+        let began = Instant::now();
+        let got = read(&mut server, world, budget);
+        let took = began.elapsed();
+        let restored = result(&got, false);
+        eprintln!("rebuilt from its snapshot with {budget:?} in {took:?}");
+        let note = restored
+            .get("restored")
+            .unwrap_or_else(|| panic!("{}", written(&restored)));
+        assert_eq!(
+            int_at(note, "from_frame"),
+            1,
+            "setup: the world was not rebuilt from its snapshot: {}",
+            written(note)
+        );
+    }
+
     fn two_journals(label: &str) -> (Scratch, Options) {
         let held = scratch(label);
         let dir = held.0.join("worlds");

@@ -4538,7 +4538,7 @@ fn a_file_read_held_up_once_never_refuses_the_next_open_that_fits() {
 #[cfg(feature = "faults")]
 #[test]
 fn a_file_build_held_up_once_never_refuses_the_next_open_that_fits() {
-    file_opened_after_held_up(grit::serve3::budget::Work::Build, "held-file-build");
+    file_opened_after_held_up(grit::serve3::budget::Work::BuildImage, "held-file-build");
 }
 
 #[cfg(feature = "faults")]

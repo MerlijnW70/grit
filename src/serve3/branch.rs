@@ -263,7 +263,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         let planned = super::law::planned(host, image.law.name(), law.as_deref(), &image.params)?;
         let sizes = image_shaped(host, planned.as_ref(), &image)?;
         let bytes = admitted(server, host, &sizes, "the world")?;
-        let work = Work::build(matches!(image.state, crate::branch::State::Sparse { .. }));
+        let work = Work::build_image(matches!(image.state, crate::branch::State::Sparse { .. }));
         server.fits(work, bytes, "building the world from the file")?;
         let began = Instant::now();
         server.slowly(work);
