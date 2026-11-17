@@ -624,6 +624,7 @@ fn a_list_of_many_files_comes_in_pages_that_join_to_the_whole() {
     let mut names = Vec::new();
     let mut cursor = 0;
     let mut pages = 0;
+    let mut slowest = Duration::ZERO;
     loop {
         let began = Instant::now();
         let got = server
@@ -634,6 +635,7 @@ fn a_list_of_many_files_comes_in_pages_that_join_to_the_whole() {
             ))
             .unwrap();
         assert!(written(&got).len() <= 1 << 20);
+        slowest = slowest.max(began.elapsed());
         assert!(began.elapsed() < Duration::from_secs(5));
         let page = answer(&got);
         assert_eq!(page.int_at("total"), many);
@@ -1834,6 +1836,27 @@ fn kinds_listed(listed: &Json) -> Vec<(String, i64)> {
 }
 
 #[cfg(feature = "faults")]
+impl Run {
+    fn within(&mut self, id: i64, limit: Duration) -> Option<Json> {
+        if let Some(got) = self.early.remove(&id) {
+            return Some(got);
+        }
+        let began = Instant::now();
+        loop {
+            let left = limit.checked_sub(began.elapsed())?;
+            let got = self.answers.recv_timeout(left).ok()?;
+            let came = got.get("id").and_then(Json::int);
+            if came == Some(id) {
+                return Some(got);
+            }
+            if let Some(came) = came {
+                self.early.insert(came, got);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "faults")]
 fn reached(message: &str) -> u64 {
     let at = message
         .find("to frame ")
@@ -1874,7 +1897,11 @@ fn an_open_of_a_kept_world_stops_on_its_budget_and_its_cancel_and_opens_nothing(
         "grit_world_open",
         &format!("{{\"name\":\"world-1\",\"budget_ms\":{budget}}}"),
     );
-    let told = refused(&run.wait(id));
+    let Some(got) = run.within(id, WAIT) else {
+        std::mem::forget(run);
+        panic!("an open with budget_ms {budget} had not answered after {WAIT:?}");
+    };
+    let told = refused(&got);
     let frame = reached(&told.message);
     let most = 3
         + u64::try_from(Duration::from_millis(budget).as_nanos() / stall.as_nanos()).unwrap()
@@ -1924,7 +1951,11 @@ fn an_open_of_a_kept_world_stops_on_its_budget_and_its_cancel_and_opens_nothing(
         "{\"jsonrpc\":\"2.0\",\"id\":\"p\",\"result\":{}}"
     );
     run.cancel(id);
-    let told = refused(&run.wait(id));
+    let Some(got) = run.within(id, WAIT) else {
+        std::mem::forget(run);
+        panic!("a cancelled open had not answered after {WAIT:?}");
+    };
+    let told = refused(&got);
     eprintln!("open stopped by its cancel: {}", told.message);
     assert_eq!(told.code, "cancelled", "{}", told.message);
     assert!(
@@ -3162,39 +3193,6 @@ fn the_highest_world_number_described_is_the_highest_handed_out() {
 }
 
 #[cfg(feature = "faults")]
-fn off_worker_most(run: &mut Run, budget: u64, unit: Duration) -> Duration {
-    let told = answer(&run.ask("grit_describe", "{}"))
-        .get("submissions")
-        .cloned()
-        .unwrap();
-    let batch = u64::try_from(told.int_at("longest_ms"))
-        .unwrap()
-        .max(grit::serve3::budget::SUBMIT_MOST_MS);
-    Duration::from_millis(budget + batch + 300) + unit
-}
-
-#[cfg(feature = "faults")]
-fn idle_longest(run: &mut Run) -> Duration {
-    let told = answer(&run.ask("grit_describe", "{}"))
-        .get("submissions")
-        .cloned()
-        .unwrap();
-    Duration::from_millis(u64::try_from(told.int_at("idle_longest_ms")).unwrap())
-}
-
-fn late_most(run: &mut Run, budget: u64) -> Duration {
-    let told = answer(&run.ask("grit_describe", "{}"))
-        .get("submissions")
-        .cloned()
-        .unwrap();
-    let batch = u64::try_from(told.int_at("longest_ms"))
-        .unwrap()
-        .max(grit::serve3::budget::SUBMIT_MOST_MS);
-    let idle = u64::try_from(told.int_at("idle_longest_ms")).unwrap();
-    Duration::from_millis(budget + batch + idle + 150)
-}
-
-#[cfg(feature = "faults")]
 fn written_whole(run: &mut Run, world: i64, cells: &[([u32; 3], u32)]) {
     let wrote = answer(&run.ask(
         "grit_world_write",
@@ -3380,7 +3378,9 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     let world = sand_world(&mut run, 32);
     let faults = run.exec.faults();
     let slow = Duration::from_millis(3000);
+    let stall = Duration::from_millis(1);
     faults.lock().unwrap().slow_write = slow;
+    faults.lock().unwrap().stall_every = stall;
     let budget = 40;
     let due = Ledger::created(Made {
         rule: "sand".to_owned(),
@@ -3391,60 +3391,73 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     })
     .replay_most();
     let mut worst = Duration::ZERO;
-    let mut after = None;
-    let mut calls = 0;
+    let mut begun = false;
+    let mut calls = Vec::new();
     let mut idle_run = 0;
-    let mut stepping = Duration::ZERO;
-    while after.is_none_or(|first: Instant| first.elapsed() < slow * 2) {
+    let mut stepped = 0_i64;
+    let mut after_landing = 0;
+    while after_landing < 2 {
         assert!(
-            after.is_some() || stepping <= due * 2,
-            "no snapshot was taken between {calls} calls that spent {stepping:?}, twice the replay of {due:?} that makes one due"
+            calls.len() < 2000,
+            "no write landed in {} calls",
+            calls.len()
+        );
+        let held = stall * u32::try_from(stepped).unwrap();
+        assert!(
+            begun || held <= due * 2,
+            "no snapshot was taken between {} calls that ran {stepped} frames held {stall:?} each, twice the replay of {due:?} that makes one due",
+            calls.len()
         );
         let began = Instant::now();
-        let got = run.ask(
+        let id = run.send(
             "grit_world_step",
             &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
         );
+        let got = run.wait(id);
         let took = began.elapsed();
         let result = got.get("result").unwrap();
         assert_eq!(
             result.get("isError"),
             Some(&Json::Bool(false)),
-            "call {calls} after {took:?}: {}",
+            "call {} after {took:?}: {}",
+            calls.len(),
             written(&got)
         );
-        if got_frames(&got) > 0 {
+        let ran = got_frames(&got);
+        if ran > 0 {
             idle_run = 0;
         } else {
             idle_run += 1;
         }
         assert!(
             idle_run <= grit::serve3::budget::REFUSED_MOST,
-            "call {calls} was the {idle_run}th in a row to run no frame: {}",
+            "call {} was the {idle_run}th in a row to run no frame: {}",
+            calls.len(),
             written(&got)
         );
-        let most = off_worker_most(&mut run, budget, slow / 2);
-        assert!(
-            took <= most,
-            "call {calls} took {took:?}, more than {most:?}"
-        );
         worst = worst.max(took);
-        calls += 1;
-        if after.is_none() {
-            stepping += took;
+        calls.push((id, ran));
+        if !begun {
+            stepped += ran;
         }
-        if after.is_none() && faults.lock().unwrap().slowed > 0 {
-            after = Some(Instant::now());
+        let armed = faults.lock().unwrap();
+        begun |= armed.slowed > 0;
+        if !armed.writes.is_empty() {
+            after_landing += 1;
         }
     }
+    let armed = faults.lock().unwrap();
+    let served = writes_served(&armed, &calls);
     eprintln!(
-        "{calls} steps of {budget} ms beside a snapshot written for {slow:?} between calls; the slowest took {worst:?}"
+        "{} steps of {budget} ms beside a snapshot written for {slow:?} between calls; calls started during each landed write {served:?}; the slowest took {worst:?}",
+        calls.len()
     );
-    let idle = idle_longest(&mut run);
+    held_to_budget(&armed, &calls, budget, stall);
     assert!(
-        idle < slow / 2,
-        "the longest unit of work between calls took {idle:?}, near the injected write of {slow:?}"
+        !served.is_empty() && served.iter().all(|count| *count > 0),
+        "a write of {slow:?} held the worker: calls started during each write {served:?}"
     );
+    drop(armed);
     run.exec.finish();
     let left: Vec<String> = kept_files(&scratch)
         .into_iter()
@@ -3796,6 +3809,7 @@ fn a_world_whose_frames_outlast_a_short_budget_is_refused_at_once_between_probes
     let mut probed = Vec::new();
     for call_at in 0..12 {
         let submitted = batches(&mut server);
+        let measured = measured_work(&mut server);
         let got = call(&mut server, "grit_world_step", &short);
         let ran = got_frames(&got);
         let since = batches(&mut server) - submitted;
@@ -3804,6 +3818,11 @@ fn a_world_whose_frames_outlast_a_short_budget_is_refused_at_once_between_probes
             probed.push(call_at);
         } else {
             assert_eq!(since, 0, "refused call {call_at}: {}", written(&got));
+            assert_eq!(
+                measured_work(&mut server),
+                measured,
+                "refused call {call_at} measured work before it answered"
+            );
         }
     }
     grit::serve3::tools::faults::disarm();
@@ -4079,10 +4098,12 @@ fn behind_idle_work(dir: bool) {
     let slow = Duration::from_millis(1500);
     let budget = 100;
     let held = Duration::from_millis(2 * budget);
+    let stall = Duration::from_millis(1);
     {
         let mut armed = faults.lock().unwrap();
         armed.slow_idle_work = slow;
         armed.pause_after_answer = Duration::from_millis(5);
+        armed.stall_every = stall;
         if dir {
             armed.slow_write = held;
         } else {
@@ -4091,10 +4112,10 @@ fn behind_idle_work(dir: bool) {
         }
     }
     let want = if dir { 2 } else { 1 };
-    let mut sent = Vec::new();
+    let mut calls = Vec::new();
     let mut longest = Duration::ZERO;
     while faults.lock().unwrap().idle_works < want + 1 {
-        assert!(sent.len() < 200, "the server did no idle work");
+        assert!(calls.len() < 200, "the server did no idle work");
         let began = Instant::now();
         let id = run.send(
             "grit_world_step",
@@ -4107,35 +4128,33 @@ fn behind_idle_work(dir: bool) {
             result.get("isError"),
             Some(&Json::Bool(false)),
             "call {} after {took:?}: {}",
-            sent.len(),
+            calls.len(),
             written(&got)
         );
+        let ran = got_frames(&got);
         assert!(
-            got_frames(&got) > 0,
+            ran > 0,
             "call {} ran no frame: {}",
-            sent.len(),
+            calls.len(),
             written(&got)
         );
         longest = longest.max(took);
-        sent.push(id);
+        calls.push((id, ran));
     }
     let armed = faults.lock().unwrap();
-    let behind: Vec<u32> = sent
+    let behind: Vec<u32> = calls
         .iter()
-        .map(|id| {
+        .map(|(id, _)| {
             let (started, sent) = queued(&armed, *id);
             started.idle_done.saturating_sub(sent)
         })
         .collect();
     eprintln!(
         "{} steps of {budget} ms beside {} units of idle work of {slow:?} each (directory {dir}); units each call waited behind {behind:?}; the longest call took {longest:?}",
-        sent.len(),
+        calls.len(),
         armed.idle_works
     );
-    assert!(
-        behind.iter().all(|units| *units <= 1),
-        "a call waited behind more than one unit of idle work: {behind:?}"
-    );
+    held_to_budget(&armed, &calls, budget, stall);
     assert!(behind.contains(&1), "no call waited behind idle work");
     drop(armed);
     run.exec.finish();
@@ -4156,6 +4175,57 @@ fn queued(armed: &grit::serve3::Faults, id: i64) -> (grit::serve3::Started, u32)
         .map(|(_, done)| *done)
         .unwrap_or_else(|| panic!("call {id} was never sent"));
     (started, sent)
+}
+
+#[cfg(feature = "faults")]
+fn frames_most(armed: &grit::serve3::Faults, id: i64, budget_ms: u64, stall: Duration) -> i64 {
+    let (started, _) = queued(armed, id);
+    let left = Duration::from_millis(budget_ms).saturating_sub(started.charged);
+    i64::try_from(left.as_nanos() / stall.as_nanos()).unwrap()
+        + i64::from(grit::serve3::budget::BATCH_MOST)
+}
+
+#[cfg(feature = "faults")]
+fn held_to_budget(
+    armed: &grit::serve3::Faults,
+    calls: &[(i64, i64)],
+    budget_ms: u64,
+    stall: Duration,
+) {
+    for (at, (id, ran)) in calls.iter().enumerate() {
+        let (started, sent) = queued(armed, *id);
+        let behind = started.idle_done.saturating_sub(sent);
+        assert!(
+            behind <= 1,
+            "call {at} waited behind {behind} units of idle work"
+        );
+        let most = frames_most(armed, *id, budget_ms, stall);
+        assert!(
+            *ran <= most,
+            "call {at} ran {ran} frames held {stall:?} each, past the {most} its budget of {budget_ms} ms less its charge of {:?} and one batch allow",
+            started.charged
+        );
+    }
+}
+
+#[cfg(feature = "faults")]
+fn writes_served(armed: &grit::serve3::Faults, calls: &[(i64, i64)]) -> Vec<usize> {
+    let starts: Vec<Instant> = calls
+        .iter()
+        .map(|(id, _)| queued(armed, *id).0.at)
+        .collect();
+    let last = starts.iter().max().copied();
+    armed
+        .writes
+        .iter()
+        .filter(|(_, landed)| last.is_some_and(|last| *landed < last))
+        .map(|(began, landed)| {
+            starts
+                .iter()
+                .filter(|at| *at > began && *at < landed)
+                .count()
+        })
+        .collect()
 }
 
 #[cfg(feature = "faults")]
@@ -4227,51 +4297,61 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
     let world = sand_world(&mut run, 32);
     let faults = run.exec.faults();
     let slow = Duration::from_millis(3000);
+    let stall = Duration::from_millis(1);
     faults.lock().unwrap().slow_write = slow;
+    faults.lock().unwrap().stall_every = stall;
     let budget = 200;
-    let began = Instant::now();
-    let mut calls = 0;
+    let mut calls = Vec::new();
     let mut frame = 0;
     let mut worst = Duration::ZERO;
-    while began.elapsed() < slow * 4 || faults.lock().unwrap().slowed < 3 {
-        assert!(calls < 400, "no write was started between calls");
+    while faults.lock().unwrap().writes.len() < 3 {
+        assert!(calls.len() < 400, "no write was started between calls");
         let asked = Instant::now();
-        let got = run.ask(
+        let id = run.send(
             "grit_world_step",
             &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
         );
+        let got = run.wait(id);
         let took = asked.elapsed();
         let result = got.get("result").unwrap();
         assert_eq!(
             result.get("isError"),
             Some(&Json::Bool(false)),
-            "call {calls} after {took:?}: {}",
+            "call {} after {took:?}: {}",
+            calls.len(),
             written(&got)
         );
         let told = result.get("structuredContent").unwrap();
         assert!(
             told.int_at("frame") > frame,
-            "call {calls}: {}",
+            "call {}: {}",
+            calls.len(),
             written(&got)
         );
         frame = told.int_at("frame");
-        let most = off_worker_most(&mut run, budget, slow / 2);
-        assert!(
-            took <= most,
-            "call {calls} took {took:?}, more than {most:?}"
-        );
         worst = worst.max(took);
-        calls += 1;
+        calls.push((id, got_frames(&got)));
     }
-    let slowed = faults.lock().unwrap().slowed;
+    let id = run.send(
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
+    );
+    let got = answer(&run.wait(id));
+    frame = got.int_at("frame");
+    calls.push((id, got.int_at("ran")));
+    let armed = faults.lock().unwrap();
+    let served = writes_served(&armed, &calls);
     eprintln!(
-        "{calls} steps of {budget} ms beside {slowed} background writes of {slow:?} each reached frame {frame}; the slowest took {worst:?}"
+        "{} steps of {budget} ms beside {} background writes of {slow:?} each reached frame {frame}; calls started during each landed write {served:?}; the slowest took {worst:?}",
+        calls.len(),
+        armed.slowed
     );
-    let idle = idle_longest(&mut run);
+    held_to_budget(&armed, &calls, budget, stall);
     assert!(
-        idle < slow / 2,
-        "the longest unit of work between calls took {idle:?}, near the injected write of {slow:?}"
+        served.len() >= 3 && served.iter().all(|count| *count > 0),
+        "a write of {slow:?} held the worker: calls started during each write {served:?}"
     );
+    drop(armed);
     run.exec.finish();
     let mut again = Run::new(&options);
     let opened = answer(&again.ask(
@@ -4325,9 +4405,11 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
     let world = sand_world(&mut run, 128);
     let first = 600;
     let second = 1500;
-    let held = Duration::from_millis(second) / 2;
+    let held = Duration::from_millis(second) * 2 / 3;
+    let stall = Duration::from_millis(4);
     let faults = run.exec.faults();
     faults.lock().unwrap().queued_hold = held;
+    faults.lock().unwrap().stall_every = stall;
     let ahead = run.send(
         "grit_world_step",
         &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{first}}}"),
@@ -4361,7 +4443,14 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
         started.charged
     );
     let told = answer(&got);
-    assert!(told.int_at("ran") > 0, "{}", written(&got));
+    let ran = told.int_at("ran");
+    assert!(ran > 0, "{}", written(&got));
+    let most = frames_most(&faults.lock().unwrap(), behind, second, stall);
+    assert!(
+        ran <= most,
+        "the call ran {ran} frames held {stall:?} each, past the {most} its budget of {second} ms less its charge of {:?} and one batch allow",
+        started.charged
+    );
     run.exec.finish();
 }
 
@@ -4380,7 +4469,9 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
     let world = sand_world(&mut run, 64);
     let faults = run.exec.faults();
     let slow = Duration::from_millis(3000);
+    let stall = Duration::from_millis(1);
     faults.lock().unwrap().slow_write = slow;
+    faults.lock().unwrap().stall_every = stall;
     let budget = 1000;
     let due = Ledger::created(Made {
         rule: "sand".to_owned(),
@@ -4390,79 +4481,73 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
         slots: None,
     })
     .replay_most();
-    let snaps = |scratch: &Scratch| -> Vec<String> {
-        kept_files(scratch)
-            .into_iter()
-            .filter(|one| one.starts_with("snap-"))
-            .collect()
-    };
     let mut worst = Duration::ZERO;
     let mut frame = 0;
     let mut began = Vec::new();
     let mut owed = Some(due);
-    let mut stepping = Duration::ZERO;
-    let mut writing: Option<(Instant, Vec<String>)> = None;
-    let mut call = 0;
-    while call < 10 || began.len() < 2 {
-        if let Some((from, before)) = writing.as_ref()
-            && snaps(&scratch) != *before
-        {
-            owed = Some(due.max(from.elapsed() * 4));
-            writing = None;
+    let mut stepped = 0_i64;
+    let mut landed = 0;
+    let mut calls = Vec::new();
+    while calls.len() < 10 || began.len() < 2 {
+        assert!(
+            calls.len() < 400,
+            "two snapshot writes did not begin and land in {} calls",
+            calls.len()
+        );
+        let now_landed = faults.lock().unwrap().writes.clone();
+        if now_landed.len() > landed {
+            landed = now_landed.len();
+            let (start, end) = now_landed[landed - 1];
+            owed = Some(due.max(end.saturating_duration_since(start) * 4));
         }
-        match (owed, writing.as_ref()) {
-            (Some(owed), _) => assert!(
-                stepping <= owed * 2,
-                "snapshot {} did not begin after {stepping:?} of steps, twice the replay of {owed:?} that makes it due",
+        if let Some(owed) = owed {
+            let held = stall * u32::try_from(stepped).unwrap();
+            assert!(
+                held <= owed * 2,
+                "snapshot {} did not begin after {stepped} frames held {stall:?} each, twice the replay of {owed:?} that makes it due",
                 began.len() + 1
-            ),
-            (None, Some((from, _))) => assert!(
-                from.elapsed() <= slow * 4,
-                "the write of {slow:?} begun by call {:?} had not landed after {:?}",
-                began.last(),
-                from.elapsed()
-            ),
-            (None, None) => {}
+            );
         }
         let asked = Instant::now();
-        let got = run.ask(
+        let id = run.send(
             "grit_world_step",
             &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
         );
+        let got = run.wait(id);
         let took = asked.elapsed();
         let told = answer(&got);
         assert!(
             told.int_at("frame") > frame,
-            "call {call}: {}",
+            "call {}: {}",
+            calls.len(),
             written(&got)
         );
         frame = told.int_at("frame");
-        let most = off_worker_most(&mut run, budget, slow / 2);
-        assert!(
-            took <= most,
-            "call {call} took {took:?}, more than {most:?}"
-        );
         worst = worst.max(took);
-        stepping += took;
+        let ran = got_frames(&got);
+        stepped += ran;
+        calls.push((id, ran));
         let slowed = faults.lock().unwrap().slowed;
         if usize::try_from(slowed).unwrap() > began.len() {
-            began.push(call);
-            writing = Some((asked, snaps(&scratch)));
+            began.push(calls.len() - 1);
             owed = None;
-            stepping = Duration::ZERO;
+            stepped = 0;
         }
-        call += 1;
     }
-    let slowed = faults.lock().unwrap().slowed;
+    let armed = faults.lock().unwrap();
+    let served = writes_served(&armed, &calls);
     eprintln!(
-        "{call} steps of {budget} ms beside {slowed} snapshot writes of {slow:?}, begun by calls {began:?}; the slowest took {worst:?}"
+        "{} steps of {budget} ms beside {} snapshot writes of {slow:?}, begun by calls {began:?}; calls started during each landed write {served:?}; the slowest took {worst:?}",
+        calls.len(),
+        armed.slowed
     );
-    assert!(slowed >= 2, "{slowed}");
-    let idle = idle_longest(&mut run);
+    assert!(armed.slowed >= 2, "{}", armed.slowed);
+    held_to_budget(&armed, &calls, budget, stall);
     assert!(
-        idle < slow / 2,
-        "the longest unit of work between calls took {idle:?}, near the injected write of {slow:?}"
+        served.iter().all(|count| *count > 0),
+        "a write of {slow:?} held the worker: calls started during each write {served:?}"
     );
+    drop(armed);
     run.exec.finish();
 }
 
@@ -4677,21 +4762,26 @@ fn a_device_lost_during_a_snapshot_between_calls_is_handled_as_a_loss() {
     run.exec.finish();
 }
 
-fn step_within(run: &mut Run, world: i64, budget: u64) -> (Duration, i64) {
-    let began = Instant::now();
-    let got = run.ask(
+#[cfg(feature = "faults")]
+fn step_counted(run: &mut Run, world: i64, budget: u64) -> (i64, i64, i64) {
+    let id = run.send(
         "grit_world_step",
         &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
     );
-    let took = began.elapsed();
+    let got = run.wait(id);
     let told = got
         .get("result")
         .and_then(|one| one.get("structuredContent"))
         .cloned()
         .unwrap();
-    (took, told.get("frame").and_then(Json::int).unwrap_or(-1))
+    (
+        id,
+        got_frames(&got),
+        told.get("frame").and_then(Json::int).unwrap_or(-1),
+    )
 }
 
+#[cfg(feature = "faults")]
 #[test]
 fn a_cold_server_stepping_with_small_budgets_never_overruns_by_more_than_a_batch() {
     let Some(host) = device("cold small budgets") else {
@@ -4704,41 +4794,38 @@ fn a_cold_server_stepping_with_small_budgets_never_overruns_by_more_than_a_batch
         memory: None,
     };
     let budget = 300;
-    let mut worst = Duration::ZERO;
+    let stall = Duration::from_millis(1);
     let mut moved = 0;
     let mut run = Run::new(&options);
+    run.exec.faults().lock().unwrap().stall_every = stall;
     let world = sand_world(&mut run, 128);
+    let mut calls = Vec::new();
     for _ in 0..12 {
-        let (took, frame) = step_within(&mut run, world, budget);
-        worst = worst.max(took);
+        let (id, ran, frame) = step_counted(&mut run, world, budget);
         moved += i64::from(frame > 0);
-        let most = late_most(&mut run, budget);
-        assert!(took <= most, "first run: {took:?}, more than {most:?}");
+        calls.push((id, ran));
     }
+    held_to_budget(&run.exec.faults().lock().unwrap(), &calls, budget, stall);
     run.exec.finish();
     let mut again = Run::new(&options);
+    again.exec.faults().lock().unwrap().stall_every = stall;
     answer(&again.ask(
         "grit_world_open",
         &format!("{{\"name\":\"world-{world}\"}}"),
     ));
+    let mut calls = Vec::new();
     for _ in 0..8 {
-        let (took, _) = step_within(&mut again, world, budget);
-        worst = worst.max(took);
-        let most = late_most(&mut again, budget);
-        assert!(
-            took <= most,
-            "after a restart: {took:?}, more than {most:?}"
-        );
+        let (id, ran, _) = step_counted(&mut again, world, budget);
+        calls.push((id, ran));
     }
     let small = sand_world(&mut again, 64);
     for _ in 0..8 {
-        let (took, frame) = step_within(&mut again, small, budget);
-        worst = worst.max(took);
+        let (id, ran, frame) = step_counted(&mut again, small, budget);
         moved += i64::from(frame > 0);
-        let most = late_most(&mut again, budget);
-        assert!(took <= most, "a new size: {took:?}, more than {most:?}");
+        calls.push((id, ran));
     }
-    eprintln!("the slowest of 28 small-budget steps took {worst:?}; {moved} advanced");
+    held_to_budget(&again.exec.faults().lock().unwrap(), &calls, budget, stall);
+    eprintln!("28 small-budget steps held {stall:?} a frame; {moved} advanced");
     assert!(moved >= 10, "{moved}");
     again.exec.finish();
 }
