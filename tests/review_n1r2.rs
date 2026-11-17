@@ -20,7 +20,13 @@ mod pipeline {
             .collect();
         all.push(DIVIDER.to_owned());
         let out: Vec<String> = (0..8)
-            .map(|k| if k == 7 { "\"w7v1\"".to_owned() } else { format!("\"w{k}v0\"") })
+            .map(|k| {
+                if k == 7 {
+                    "\"w7v1\"".to_owned()
+                } else {
+                    format!("\"w{k}v0\"")
+                }
+            })
             .collect();
         format!(
             "{{\"law\":1,\"name\":\"divider\",\"params\":1,\"channels\":1,\"halo\":0,\"reversible\":true,\"tally\":{{\"counts\":1,\"weighted\":false}},\"consts\":{{}},\"defs\":{{}},\"step\":[\"let\",[{}],[\"vec\",[\"vec\",{}],[\"vec\",0]]]}}",
