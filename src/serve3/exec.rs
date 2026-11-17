@@ -327,7 +327,7 @@ fn work(
         let mut reopen = false;
         let mut answered = false;
         loop {
-            if std::mem::take(&mut answered) && !server.lost() && server.idle() {
+            if std::mem::take(&mut answered) && !server.lost() && idled(&mut server) {
                 shared.publish(&server);
                 if server.lost() {
                     reopen = true;
@@ -339,7 +339,7 @@ fn work(
                 None => match jobs.try_recv() {
                     Ok(job) => job,
                     Err(mpsc::TryRecvError::Empty) => {
-                        if !server.lost() && server.idle() {
+                        if !server.lost() && idled(&mut server) {
                             shared.publish(&server);
                             if server.lost() {
                                 reopen = true;
@@ -387,7 +387,19 @@ fn work(
             }
             let now = Instant::now();
             let arrived = now.checked_sub(shared.behind(&job.cancel)).unwrap_or(now);
+            #[cfg(feature = "faults")]
+            if let Ok(mut faults) = server.faults().lock() {
+                let idle_done = faults.idle_done;
+                faults.started.push(super::Started {
+                    id: job.id.clone(),
+                    idle_done,
+                    charged: now.saturating_duration_since(arrived),
+                    at: now,
+                });
+            }
             server.arriving(Some(arrived), Some(Arc::clone(&job.cancel)));
+            #[cfg(feature = "faults")]
+            stalled(&server);
             let answer = shared.running(|| {
                 let answer = server.handle(&job.request).unwrap_or(Json::Null);
                 #[cfg(feature = "faults")]
@@ -420,6 +432,29 @@ fn work(
             book.drain();
             return;
         }
+    }
+}
+
+fn idled(server: &mut Server<'_>) -> bool {
+    let did = server.idle();
+    #[cfg(feature = "faults")]
+    if did && let Ok(mut faults) = server.faults().lock() {
+        faults.idle_done = faults.idle_done.saturating_add(1);
+    }
+    did
+}
+
+#[cfg(feature = "faults")]
+fn stalled(server: &Server<'_>) {
+    let by = server
+        .faults()
+        .lock()
+        .map(|faults| faults.stall_every)
+        .unwrap_or_default();
+    if by.is_zero() {
+        super::tools::faults::disarm();
+    } else {
+        super::tools::faults::stall_every(by);
     }
 }
 
@@ -558,6 +593,8 @@ impl Exec {
                 behind: Duration::ZERO,
             });
         }
+        #[cfg(feature = "faults")]
+        let sent = id.clone();
         let job = Job {
             request,
             id,
@@ -565,6 +602,13 @@ impl Exec {
             state,
         };
         let refused = self.jobs.as_ref().and_then(|jobs| jobs.send(job).err());
+        #[cfg(feature = "faults")]
+        if refused.is_none()
+            && let Ok(mut faults) = self.faults.lock()
+        {
+            let done = faults.idle_done;
+            faults.sent.push((sent, done));
+        }
         refused.map(|job| {
             let job = job.0;
             self.shared.landed(&job.cancel);
