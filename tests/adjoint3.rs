@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 mod common;
+mod halo_grad;
 
 use std::collections::BTreeSet;
 
@@ -1731,4 +1732,85 @@ fn every_sequential_lifting_program_is_admitted_and_undone() {
     println!(
         "3000 sequential lifting programs of {steps} steps: all admitted, each undone on 200 octs"
     );
+}
+
+const HALO_LAWS: u64 = 96;
+
+#[test]
+fn h1_the_adjoint_of_a_law_that_looks_equals_its_dual_numbers_exactly() {
+    let mut tally = halo_grad::Tally::default();
+    let mut planes = [0_u32; 4];
+    let mut frames = [0_u32; 9];
+    for seed in 0..HALO_LAWS {
+        let drawn = halo_grad::case(0x6200 + seed);
+        tally.laws += 1;
+        planes[drawn.case.planes] += 1;
+        frames[drawn.case.frames as usize] += 1;
+        tally.refused += drawn.refused;
+        match drawn.case.walked(&drawn.reversible) {
+            Ok(walked) => halo_grad::checked(&drawn, &walked, &mut tally),
+            Err(Fault::Overflow) => tally.overflowed += 1,
+            Err(why) => panic!(
+                "seed {}: {why}
+{}",
+                drawn.case.seed, drawn.case.text
+            ),
+        }
+    }
+    println!("{tally:?}, laws by planes {planes:?}, by frames {frames:?}");
+    assert!(planes[1..].iter().all(|one| *one > 0), "{planes:?}");
+    assert!(frames[1..].iter().all(|one| *one > 0), "{frames:?}");
+    assert!(tally.moved >= 40, "{tally:?}");
+    assert!(tally.looked >= 200, "{tally:?}");
+    assert!(tally.slopes >= 4_000, "{tally:?}");
+    assert!(tally.overflowed + tally.skipped <= 8, "{tally:?}");
+}
+
+const MAIN_WALKS: &str = "89af4bc4d8cd6e0f8839d900893a467e723883154ebb19c68a47d72be9a88e34";
+
+#[test]
+fn h2_a_law_that_does_not_look_walks_and_descends_byte_for_byte_as_on_main() {
+    let grid = Grid3::new(SMALL, SMALL, SMALL).unwrap();
+    let mut heard = String::new();
+    for (text, truth) in [(MIX, MIX_PARAMS.to_vec()), (STIR, STIR_PARAMS.to_vec())] {
+        let law = reversible(text);
+        for seed in [11_u64, 12] {
+            let start = calm(grid, seed);
+            let target = ran(&law, grid, &start, &truth, GRADIENT_FRAMES);
+            let aim = Aim {
+                region: Region::whole([SMALL, SMALL, SMALL]),
+                target: &target,
+            };
+            for scale in [115_u32, 85] {
+                let params: Vec<u32> = truth.iter().map(|one| one * scale / 100).collect();
+                heard.push_str(&format!(
+                    "{:?}",
+                    law.walk(grid, &start, &params, 0, GRADIENT_FRAMES, &aim)
+                ));
+            }
+        }
+        for seed in 1..=DESCENT_SEEDS {
+            heard.push_str(&format!("{:?}", descended(&law, &truth, seed)));
+        }
+    }
+    let law = reversible(LAYERS);
+    for seed in [21_u64, 31, 32] {
+        let start = layered(grid, seed);
+        let ended = ran(&law, grid, &start, &LAYERS_PARAMS, GRADIENT_FRAMES);
+        let target = ended[..grid.cells()].to_vec();
+        let aim = Aim {
+            region: Region::whole([SMALL, SMALL, SMALL]),
+            target: &target,
+        };
+        for scale in [115_u32, 100, 85] {
+            let params: Vec<u32> = LAYERS_PARAMS.iter().map(|one| one * scale / 100).collect();
+            heard.push_str(&format!(
+                "{:?}",
+                law.walk(grid, &start, &params, 0, GRADIENT_FRAMES, &aim)
+            ));
+        }
+    }
+    let digest = grit::law::hex(&grit::branch::format::sha256(heard.as_bytes()));
+    println!("{} bytes, sha256 {digest}", heard.len());
+    assert_eq!(digest, MAIN_WALKS);
 }
