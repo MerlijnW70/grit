@@ -524,10 +524,11 @@ pub enum Work {
     Write,
     WriteSparse,
     Walk,
+    Run,
 }
 
 impl Work {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Build,
         Self::BuildSparse,
         Self::BuildImage,
@@ -541,6 +542,7 @@ impl Work {
         Self::Write,
         Self::WriteSparse,
         Self::Walk,
+        Self::Run,
     ];
 
     #[must_use]
@@ -590,6 +592,7 @@ impl Work {
             Self::Write => 10,
             Self::WriteSparse => 11,
             Self::Walk => 12,
+            Self::Run => 13,
         }
     }
 
@@ -604,7 +607,7 @@ impl Work {
             Self::Save | Self::Snap => 5e-8,
             Self::File | Self::FileOpen => 2e-8,
             Self::Write | Self::WriteSparse => 2e-4,
-            Self::Walk => 1e-8,
+            Self::Walk | Self::Run => 1e-8,
         }
     }
 
@@ -617,13 +620,13 @@ impl Work {
             Self::Save => Some(FASTEST_SAVE),
             Self::Snap => Some(FASTEST_SNAP),
             Self::File | Self::FileOpen => Some(FASTEST_FILE),
-            Self::Write | Self::WriteSparse | Self::Walk => None,
+            Self::Write | Self::WriteSparse | Self::Walk | Self::Run => None,
         }
     }
 
     const fn fixed(self) -> f64 {
         match self {
-            Self::Write | Self::WriteSparse | Self::Walk => 0.0,
+            Self::Write | Self::WriteSparse | Self::Walk | Self::Run => 0.0,
             _ => FIXED_BYTES,
         }
     }
@@ -644,6 +647,7 @@ impl Work {
             Self::Write => "write",
             Self::WriteSparse => "write_sparse",
             Self::Walk => "walk",
+            Self::Run => "run",
         }
     }
 }

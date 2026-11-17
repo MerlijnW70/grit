@@ -65,9 +65,11 @@ pub enum Code {
     Start,
     Aim,
     WalkLimit,
+    Bounds,
+    RunLimit,
 }
 
-pub const CODES: [Code; 61] = [
+pub const CODES: [Code; 63] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -129,6 +131,8 @@ pub const CODES: [Code; 61] = [
     Code::Start,
     Code::Aim,
     Code::WalkLimit,
+    Code::Bounds,
+    Code::RunLimit,
 ];
 
 impl Code {
@@ -196,6 +200,8 @@ impl Code {
             Self::Start => "start",
             Self::Aim => "aim",
             Self::WalkLimit => "walk_limit",
+            Self::Bounds => "bounds",
+            Self::RunLimit => "run_limit",
         }
     }
 
@@ -352,6 +358,12 @@ impl Code {
             }
             Self::WalkLimit => {
                 "Take gradients on a smaller start or over fewer frames; grit_describe names walk_cells and walk_work."
+            }
+            Self::Bounds => {
+                "Give each param inside its [least, greatest] bounds, and bounds that let at least one param move."
+            }
+            Self::RunLimit => {
+                "Score or search on a smaller start or over fewer frames; grit_describe names run_cells and run_work."
             }
         }
     }

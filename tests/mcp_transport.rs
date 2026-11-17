@@ -818,10 +818,12 @@ fn code_of(tool: &str, path: &str, wrong: Wrong) -> &'static str {
             "unknown_rule"
         }
         (
-            "grit_world_step" | "grit_world_back" | "grit_law_gradient" | "grit_law_descend",
+            "grit_world_step" | "grit_world_back" | "grit_law_gradient" | "grit_law_descend"
+            | "grit_law_score" | "grit_learn_params",
             "$.frames",
             Wrong::Range,
         ) => "frames",
+        ("grit_learn_params", "$.population" | "$.generations", Wrong::Range) => "too_many",
         ("grit_world_slice", "$.axis", Wrong::Type | Wrong::Choice) => "axis",
         ("grit_law_from_chip", _, Wrong::Range) => match path.rsplit('.').next() {
             Some("bit") => "bit_past",

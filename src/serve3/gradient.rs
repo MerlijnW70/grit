@@ -543,7 +543,7 @@ fn corner_of(held: &Json, key: &str) -> Result<[u32; 3], Failed> {
     <[u32; 3]>::try_from(got.as_slice()).map_err(|_| unread(key))
 }
 
-fn region_of(aim: &Json, size: [u32; 3]) -> Result<Region, Failed> {
+pub(super) fn region_of(aim: &Json, size: [u32; 3]) -> Result<Region, Failed> {
     let from = corner_of(aim, "from")?;
     let to = corner_of(aim, "to")?;
     for (corner, field) in [(from, "$.aim.from"), (to, "$.aim.to")] {
@@ -569,7 +569,7 @@ fn region_of(aim: &Json, size: [u32; 3]) -> Result<Region, Failed> {
     Ok(Region::new(from, to.map(|one| one + 1)))
 }
 
-fn points_of(region: Region) -> Vec<[u32; 3]> {
+pub(super) fn points_of(region: Region) -> Vec<[u32; 3]> {
     let mut points = Vec::new();
     for z in region.from[2]..region.to[2] {
         for y in region.from[1]..region.to[1] {
@@ -741,7 +741,7 @@ fn posed(server: &mut Server<'_>, held: &Json) -> Result<Posed, Failed> {
     })
 }
 
-fn world_cells(
+pub(super) fn world_cells(
     server: &mut Server<'_>,
     number: u32,
     grid: Grid3,

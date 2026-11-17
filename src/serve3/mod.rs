@@ -298,6 +298,7 @@ pub struct Faults {
     pub held_replays: u32,
     pub held_by: Duration,
     pub stray_walk: bool,
+    pub wedge_after_runs: Option<u64>,
 }
 
 impl Book {
@@ -578,7 +579,7 @@ pub struct Server<'host> {
 }
 
 /// The names of the world tools, in the order `tools/list` gives them.
-pub const WORLD_TOOLS: [&str; 18] = [
+pub const WORLD_TOOLS: [&str; 20] = [
     "grit_world_rules",
     "grit_world_create",
     "grit_world_write",
@@ -597,6 +598,8 @@ pub const WORLD_TOOLS: [&str; 18] = [
     "grit_world_back",
     "grit_law_gradient",
     "grit_law_descend",
+    "grit_law_score",
+    "grit_learn_params",
 ];
 
 fn served() -> impl Iterator<Item = &'static Tool> {
@@ -605,9 +608,9 @@ fn served() -> impl Iterator<Item = &'static Tool> {
         .chain(law::TOOLS)
         .chain(ask::TOOLS)
         .chain(branch::TOOLS)
-        .chain(learn::TOOLS)
         .chain(back::TOOLS)
         .chain(gradient::TOOLS)
+        .chain(learn::TOOLS)
 }
 
 fn shut(tool: Json) -> Json {

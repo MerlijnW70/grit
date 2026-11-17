@@ -1229,6 +1229,13 @@ pub fn describe(status: &Status) -> Json {
                 ("walk_work", number(super::gradient::WORK_MOST)),
                 ("walk_frames", number(super::gradient::FRAMES_MOST)),
                 ("descend_steps", number(super::gradient::STEPS_MOST)),
+                ("law_search", text(super::learn::SEARCH)),
+                ("run_cells", number(super::learn::CELLS_MOST)),
+                ("run_work", number(super::learn::WORK_MOST)),
+                ("run_frames", number(super::learn::FRAMES_MOST)),
+                ("search_population", number(super::learn::POPULATION_MOST)),
+                ("search_generations", number(super::learn::GENERATIONS_MOST)),
+                ("search_stale", number(super::learn::STALE)),
                 ("law_from_chip", text(super::law::FROM_CHIP)),
                 ("law_from_chip_gates", number(crate::law::chip::GATES_SURE)),
                 (
