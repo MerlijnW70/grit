@@ -71,6 +71,7 @@ pub mod faults {
         static BATCH: Cell<Option<u32>> = const { Cell::new(None) };
         static STALL: Cell<Option<(u32, Duration, bool)>> = const { Cell::new(None) };
         static SUBMISSION: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static CELLS: Cell<Duration> = const { Cell::new(Duration::ZERO) };
     }
 
     pub fn fail_batch(nth: u32) {
@@ -87,6 +88,17 @@ pub mod faults {
 
     pub fn stall_submission(by: Duration) {
         SUBMISSION.set(by);
+    }
+
+    pub fn stall_cells(by: Duration) {
+        CELLS.set(by);
+    }
+
+    pub(crate) fn cells(count: usize) {
+        let by = CELLS.get();
+        if !by.is_zero() {
+            std::thread::sleep(by.saturating_mul(u32::try_from(count).unwrap_or(u32::MAX)));
+        }
     }
 
     pub(crate) fn stall(frames: u32) {
@@ -112,6 +124,7 @@ pub mod faults {
         BATCH.set(None);
         STALL.set(None);
         SUBMISSION.set(Duration::ZERO);
+        CELLS.set(Duration::ZERO);
     }
 
     pub(in crate::serve3) fn batch() -> Result<(), Failed> {
@@ -142,6 +155,8 @@ pub(crate) mod faults {
     }
 
     pub(crate) const fn stall(_: u32) {}
+
+    pub(crate) const fn cells(_: usize) {}
 }
 
 pub(super) fn refused(code: Code, field: &str, message: String) -> Failed {
@@ -716,6 +731,7 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         };
         let piece = points.get(done..done + chunk).unwrap_or_default();
         let began = Instant::now();
+        faults::cells(piece.len());
         let ran = server.world(held)?.world.write(piece);
         let took = began.elapsed();
         if let Err(why) = ran {
