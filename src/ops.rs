@@ -68,10 +68,6 @@ pub trait Ops {
     fn mul(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
     fn div(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
 
-    fn quotient(&mut self, left: Self::Word, right: Self::Word) -> Self::Word {
-        self.div(left, right)
-    }
-
     fn dot_signed(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
     fn dot_unsigned(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
 
@@ -447,14 +443,6 @@ impl<const LANES: u32> Ops for Device<'_, '_, LANES> {
     }
 
     fn div(&mut self, left: Self::Word, right: Self::Word) -> Self::Word {
-        let one = self.one;
-        self.emitted(|lanes| {
-            let divisor = lanes.max(right, one)?;
-            lanes.div(left, divisor)
-        })
-    }
-
-    fn quotient(&mut self, left: Self::Word, right: Self::Word) -> Self::Word {
         let (zero, one) = (self.zero, self.one);
         self.emitted(|lanes| {
             let divisor = lanes.max(right, one)?;
