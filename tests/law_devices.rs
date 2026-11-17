@@ -738,6 +738,12 @@ mod pipeline {
             let message = message.text().unwrap();
             assert!(message.contains(host.name()), "{label}: {message}");
             assert!(message.contains(&format!("{code:?}")), "{label}: {message}");
+            let (said, unsaid) = match step {
+                Step::Shader => ("vkCreateShaderModule", "vkCreateComputePipelines"),
+                _ => ("vkCreateComputePipelines", "vkCreateShaderModule"),
+            };
+            assert!(message.contains(said), "{label}: {message}");
+            assert!(!message.contains(unsaid), "{label}: {message}");
             assert!(
                 field(&told, "hint").text().unwrap().contains("law"),
                 "{label}: {}",
@@ -952,6 +958,104 @@ mod pipeline {
             if key == "message" {
                 assert!(said.contains(host.name()), "{label}: {said}");
             }
+        }
+    }
+
+    fn kept_world(host: &Host, options: &grit::serve3::Options, arguments: &str) -> (i64, Json) {
+        let mut server = Server::with(Some(host), options).unwrap();
+        let made = answered(&mut server, "grit_world_create", arguments);
+        let world = made.get("world").and_then(Json::int).unwrap();
+        answered(
+            &mut server,
+            "grit_world_write",
+            &format!("{{\"world\":{world},\"cells\":[[1,2,3,4294967295],[5,6,7,99]]}}"),
+        );
+        answered(
+            &mut server,
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":2}}"),
+        );
+        let cells = read_world(&mut server, world);
+        (world, cells)
+    }
+
+    fn kept_kind(server: &mut Server<'_>, world: i64) -> String {
+        let listed = answered(server, "grit_world_list", "{}");
+        let worlds = field(&listed, "items");
+        worlds
+            .list()
+            .unwrap()
+            .iter()
+            .find(|one| one.get("world").and_then(Json::int) == Some(world))
+            .map(|one| text_of(one, "kind"))
+            .unwrap_or_else(|| panic!("world {world} is not listed: {}", written(&listed)))
+    }
+
+    #[test]
+    fn a_refused_open_of_a_kept_world_leaves_it_kept_and_openable() {
+        let Some(host) = device("a_refused_open_of_a_kept_world_leaves_it_kept_and_openable")
+        else {
+            return;
+        };
+        let held = scratch();
+        let options = grit::serve3::Options {
+            dir: Some(held.0.join("worlds")),
+            memory: None,
+        };
+        let text = lifting_text("divider", &[DIVIDER]);
+        let (lawful, lawful_cells) = kept_world(&host, &options, &making(&text));
+        let (ruled, ruled_cells) = kept_world(
+            &host,
+            &options,
+            &format!(
+                "{{\"wide\":{SIDE},\"deep\":{SIDE},\"tall\":{SIDE},\"rule\":\"sand\",\"params\":{:?}}}",
+                params_of_rule("sand")
+            ),
+        );
+        let mut server = Server::with(Some(&host), &options).unwrap();
+        for (world, cells, code, field_of) in [
+            (lawful, lawful_cells, "law_not_built", "$.law"),
+            (ruled, ruled_cells, "kernel_not_built", "$"),
+        ] {
+            let open = format!("{{\"name\":\"world-{world}\"}}");
+            let described = answered(&mut server, "grit_describe", "{}");
+            let before = (
+                field(&described, "memory"),
+                field(&described, "worlds"),
+                answered(&mut server, "grit_world_list", "{}"),
+            );
+            assert_eq!(kept_kind(&mut server, world), "kept");
+            for step in [Step::Pipeline, Step::Shader] {
+                faults::reset();
+                faults::arm_with(step, 0, vk::Result::ERROR_UNKNOWN);
+                let (error, told) = content(&call(&mut server, "grit_world_open", &open));
+                faults::disarm();
+                let label = format!("world {world} {step:?}");
+                assert!(faults::fired() && error, "{label}: {}", written(&told));
+                assert_eq!(text_of(&told, "code"), code, "{label}: {}", written(&told));
+                assert_eq!(text_of(&told, "field"), field_of, "{label}");
+                assert!(
+                    text_of(&told, "hint").contains("a kept world stays kept"),
+                    "{label}: {}",
+                    written(&told)
+                );
+                for kind in Step::ALL {
+                    let count = faults::count(kind);
+                    assert_eq!(count.made, count.gone, "{label}: {kind:?} leaked {count:?}");
+                }
+                assert_eq!(kept_kind(&mut server, world), "kept", "{label}");
+                let described = answered(&mut server, "grit_describe", "{}");
+                let after = (
+                    field(&described, "memory"),
+                    field(&described, "worlds"),
+                    answered(&mut server, "grit_world_list", "{}"),
+                );
+                assert_eq!(after, before, "{label}: the server changed");
+            }
+            let opened = answered(&mut server, "grit_world_open", &open);
+            assert_eq!(opened.get("world").and_then(Json::int), Some(world));
+            assert_eq!(opened.get("frame").and_then(Json::int), Some(2));
+            assert_eq!(read_world(&mut server, world), cells, "world {world}");
         }
     }
 }
