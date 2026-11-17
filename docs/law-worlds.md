@@ -81,12 +81,16 @@ Refusals: `not_reversible` at `$.world` for a world whose law is not reversible,
 
 The answers equal the library's `Reversible::walk` and `Reversible::descend` exactly, on the CPU.
 
-`grit_law_descend` takes the same and `steps`; it answers the best `params` and their `objective` (the earliest lowest on its `trail`), `steps` and `stopped`: `converged` (objective 0, or no step moves), `steps`, `budget` or `cancelled` (the best so far).
+`grit_law_descend` takes the same and `steps`, the most trial points after the start. It walks the start, then one trial point per step, and keeps a trial only when its objective is lower than the kept point's. A trial is the secant step through the gradients of its last walks; after a trial that is not lower it retries once at most as far, then at most half as far, then moves one param by 1 against its gradient. So its answer is never worse than its start and its kept objectives fall strictly. It finds a local optimum, not the global one.
 
-1. `grit_world_create` with `law` mix (`tests/law/mix.law.json`) and the hidden `params` `[3000,1700]`, `grit_world_write` the start, `grit_world_step` 8 frames: the target world.
+It answers the last kept `params` and their `objective` (also the earliest lowest on its `trail`), `steps`, `trail` (every point walked, with `kept`) and `stopped`: `converged` (objective 0), `local` (no trial it can make is lower), `steps`, `budget` or `cancelled` (the best so far).
+
+1. `grit_world_create` with `law` mix (`tests/law/mix.law.json`) and the hidden `params` `[3000,1700]`, `grit_world_write` a calm start (every cell between 2^21 and 2^23), `grit_world_step` 8 frames: the target world.
 2. `grit_world_create` the same law with a guess, `params` `[2100,2250]`, and `grit_world_write` the same start: the learner.
 3. `grit_law_descend` with `world` the learner, `frames` 8, `aim` `{"from":[0,0,0],"to":[15,15,15],"world":<target>}`, `steps` 16: `params` `[3000,1700]`, `objective` 0, `stopped` `converged`, after 3 steps.
 4. `grit_world_params` the learner with them and `grit_world_step` 8 frames: its cells equal the target's.
+
+The gradient only sees the optimum where the objective is smooth around it. A `mul` that wraps makes it ripple: with mix, 256 cells spread over all 32 bits and the same guess, the objective rises only within 12 of `[3000,1700]` along each param, and the descent stops `local` at `[232,0]`, objective 553884330929 against 588373928375 at its start. On such starts `grit_learn_params` often ends lower for the same number of runs; on calm starts the descent does.
 
 Neither tool writes a world or its journal. Refused before any walk: `not_reversible` (with the lifting refusal as `law`), `no_gradient` (above), `params`, `outside`, `reversed`, `target_size`, `aim`, `start`, `walk_limit` (a start past `walk_cells` words, a walk past `walk_work`), `budget`. A walk that does not come home answers `strayed` with the cell; one past 128 bits answers `overflow`. `grit_describe` names the limits under `law_gradient`.
 
