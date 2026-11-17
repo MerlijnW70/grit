@@ -284,7 +284,7 @@ fn paired<O: Ops>(ops: &mut O, node: Node, left: O::Word, right: O::Word) -> O::
         Node::Add(..) => ops.add(left, right),
         Node::Sub(..) => ops.sub(left, right),
         Node::Mul(..) => ops.mul(left, right),
-        Node::Div(..) => ops.quotient(left, right),
+        Node::Div(..) => ops.div(left, right),
         Node::DotS(..) => ops.dot_signed(left, right),
         Node::DotU(..) => ops.dot_unsigned(left, right),
         Node::Eq(..) => ops.equal(left, right).word(),
