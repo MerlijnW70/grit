@@ -649,6 +649,7 @@ fn a_list_of_many_files_comes_in_pages_that_join_to_the_whole() {
             None => break,
         }
     }
+    eprintln!("{pages} pages of {many} files; the slowest page took {slowest:?}");
     assert!(pages > 1, "{pages}");
     let mut want: Vec<String> = (0..many).map(|at| format!("{long}{at:04}")).collect();
     want.sort();
