@@ -36,9 +36,11 @@ pub const WORK_MOST: u64 = 1 << 26;
 
 pub const OCT_UNITS: u64 = 128;
 
+pub const LOOK_UNITS: u64 = 3 * crate::halo::BOX as u64;
+
 pub const SIDE_MOST: u32 = 1024;
 
-pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string: the derivative of every add, sub, mul, div, shift and sel arm on the way from params[i] to a cell, carried back by recomputing every frame with the inverse, where a compare (and so a sel's choice) counts as constant; a walk that does not come home answers strayed. A law is refused no_gradient, at the path of the first such node, when a not, and, or, xor, dot_s or dot_u takes a value that moves with a param (directly or through a cell an earlier frame moved) and its result reaches a cell other than through a compare, and when it looks (halo 1). A descent walks its start, then walks one trial point per step: the secant step of the gradients of its last walks, after a trial that is not lower one retry at most as long and then each at most half as long, then moves of 1 in one param against its gradient. It keeps a trial only when its objective is lower than the kept point's, so its answer is never worse than its start and the kept objectives fall strictly; it finds a local optimum, not the global one. It stops converged (objective 0), local (no trial it can make is lower), steps, or on budget or cancelled before a walk, and answers the last kept point; the trail holds every point walked, with kept. A walk costs its octs times frames times the nodes of the law and its inverse plus 128; it may cost at most walk_work, on a start of at most walk_cells words, and cannot stop part way, so an answer can come one walk late. Refused before any walk: not_reversible (with the lifting refusal as law), no_gradient (with its path as law), params, outside, reversed, target_size, aim, start, walk_limit, and budget when the fastest of the last three walks the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
+pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string: the derivative of every add, sub, mul, div, shift and sel arm on the way from params[i] to a cell, carried back by recomputing every frame with the inverse, where a compare (and so a sel's choice) counts as constant; a look (halo 1) reads a frozen plane, so it moves with no param, and the walk back reads the same neighbour at the same frame and carries the look's share back to that cell; a walk that does not come home answers strayed. A law is refused no_gradient, at the path of the first such node, when a not, and, or, xor, dot_s or dot_u takes a value that moves with a param (directly or through a cell an earlier frame moved) and its result reaches a cell other than through a compare. A look at a plane the law writes is refused when the law compiles (halo_written). A descent walks its start, then walks one trial point per step: the secant step of the gradients of its last walks, after a trial that is not lower one retry at most as long and then each at most half as long, then moves of 1 in one param against its gradient. It keeps a trial only when its objective is lower than the kept point's, so its answer is never worse than its start and the kept objectives fall strictly; it finds a local optimum, not the global one. It stops converged (objective 0), local (no trial it can make is lower), steps, or on budget or cancelled before a walk, and answers the last kept point; the trail holds every point walked, with kept. A walk costs its octs times frames times (the nodes of the law and its inverse plus 128, plus 192 for each plane the law looks at); it may cost at most walk_work, on a start of at most walk_cells words, and cannot stop part way, so an answer can come one walk late. Refused before any walk: not_reversible (with the lifting refusal as law), no_gradient (with its path as law), params, outside, reversed, target_size, aim, start, walk_limit, and budget when the fastest of the last three walks the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -376,16 +378,6 @@ fn started(server: &mut Server<'_>, held: &Json) -> Result<Start, Failed> {
 
 fn reversible_of(start: &Start) -> Result<Reversible, Failed> {
     let reversible = Reversible::of(&start.law).map_err(|why| not_reversible(start.field, &why))?;
-    if start.law.halo() != 0 {
-        return Err(refused(
-            Code::NoGradient,
-            start.field,
-            format!(
-                "the law {} looks at neighbours (halo 1); the exact gradient covers only laws that read their own oct, so nothing ran",
-                start.law.name()
-            ),
-        ));
-    }
     if let Some((node, op)) = cut(reversible.forward()) {
         let path = start
             .law
@@ -581,10 +573,15 @@ pub(super) fn points_of(region: Region) -> Vec<[u32; 3]> {
     points
 }
 
+fn looked(reversible: &Reversible) -> u64 {
+    u64::try_from(reversible.forward().halo().looking()).unwrap_or(u64::MAX)
+}
+
 fn units_of(reversible: &Reversible, grid: Grid3, frames: u32) -> u64 {
     let nodes = u64::try_from(reversible.forward().len() + reversible.inverse().len())
         .unwrap_or(u64::MAX)
-        .saturating_add(OCT_UNITS);
+        .saturating_add(OCT_UNITS)
+        .saturating_add(LOOK_UNITS.saturating_mul(looked(reversible)));
     u64::from(grid.octs())
         .saturating_mul(u64::from(frames))
         .saturating_mul(nodes)
@@ -703,11 +700,17 @@ fn posed(server: &mut Server<'_>, held: &Json) -> Result<Posed, Failed> {
     if units > WORK_MOST {
         let each = units / u64::from(frames.max(1));
         let fits = u32::try_from(WORK_MOST / each.max(1)).unwrap_or(u32::MAX);
+        let planes = looked(&reversible);
+        let looks = if planes == 0 {
+            String::new()
+        } else {
+            format!(" plus {LOOK_UNITS} for each of the {planes} planes it looks at",)
+        };
         return Err(limited(
             Code::WalkLimit,
             if fits == 0 { start.field } else { "$.frames" },
             format!(
-                "a walk of {frames} frames over {} octs of a law of {} nodes with an inverse of {} is {units} units of work (octs times frames times the nodes of both plus {OCT_UNITS}), more than the {WORK_MOST} one walk may take; at most {fits} frames fit",
+                "a walk of {frames} frames over {} octs of a law of {} nodes with an inverse of {} is {units} units of work (octs times frames times the nodes of both plus {OCT_UNITS}{looks}), more than the {WORK_MOST} one walk may take; at most {fits} frames fit",
                 grid.octs(),
                 reversible.forward().len(),
                 reversible.inverse().len()

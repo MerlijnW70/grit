@@ -354,7 +354,7 @@ impl Code {
                 "Report the law and the call: an accepted reversible law must come home; the world was left as it was."
             }
             Self::NoGradient => {
-                "Take gradients only through a law that reads its own oct and whose params reach its cells only through add, sub, mul, div, shifts, sel arms and compares; search the params of any other law."
+                "Take gradients only through a law whose params reach its cells only through add, sub, mul, div, shifts, sel arms and compares; search the params of any other law."
             }
             Self::TargetSize => {
                 "Give the target exactly as many words as the aim's box holds, x fastest, then y, then z."
