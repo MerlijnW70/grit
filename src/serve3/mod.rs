@@ -304,6 +304,7 @@ pub struct Faults {
     pub sent: Vec<(Json, u32)>,
     pub started: Vec<Started>,
     pub writes: Vec<(Instant, Instant)>,
+    pub answered: Vec<(Json, Instant)>,
 }
 
 #[cfg(feature = "faults")]

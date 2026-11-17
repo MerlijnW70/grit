@@ -408,6 +408,10 @@ fn work(
             });
             server.arriving(None, None);
             shared.publish(&server);
+            #[cfg(feature = "faults")]
+            if let Ok(mut faults) = server.faults().lock() {
+                faults.answered.push((job.id.clone(), Instant::now()));
+            }
             if server.lost() {
                 let _ = answers.send(patched(answer, &server.pending()));
                 shared.landed(&job.cancel);

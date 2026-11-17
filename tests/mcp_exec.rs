@@ -2014,6 +2014,16 @@ fn a_world_stepped_by_budget_stopped_calls_keeps_its_replay_bounded() {
         "no snapshot after {stepping:?} of stepping: {kept:?}"
     );
     run.exec.finish();
+    let (journals, _) = Keep::at(&scratch.dir()).unwrap().scan();
+    let ledger = journals
+        .iter()
+        .find(|(number, _)| i64::from(*number) == world)
+        .map(|(_, ledger)| ledger)
+        .unwrap();
+    let journal::Base::Snapshot(snap) = &ledger.base else {
+        panic!("the kept journal of world {world} was never cut by a snapshot");
+    };
+    assert!(snap.frame > 0, "the kept snapshot is at frame 0");
     let mut again = Run::new(&options);
     let began = Instant::now();
     let opened = answer(&again.ask(
@@ -2022,12 +2032,18 @@ fn a_world_stepped_by_budget_stopped_calls_keeps_its_replay_bounded() {
     ));
     let took = began.elapsed();
     eprintln!(
-        "reopened at frame {} replaying {} entries in {took:?}",
+        "reopened at frame {} from the snapshot at frame {} replaying {} of the kept journal's {} entries in {took:?}",
         opened.int_at("frame"),
-        opened.int_at("replayed")
+        snap.frame,
+        opened.int_at("replayed"),
+        ledger.entries.len()
     );
     assert_eq!(opened.int_at("frame"), frames);
-    assert!(took < Duration::from_millis(2000 + 250 + 1500), "{took:?}");
+    assert_eq!(
+        opened.int_at("replayed"),
+        i64::try_from(ledger.entries.len()).unwrap(),
+        "the reopen replayed more than the kept journal after its snapshot"
+    );
     again.exec.finish();
 }
 
@@ -3449,15 +3465,15 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
         }
     }
     let armed = faults.lock().unwrap();
-    let served = writes_served(&armed, &calls, slow);
+    let served = writes_served(&armed, &calls);
     eprintln!(
-        "{} steps of {budget} ms beside a snapshot written for {slow:?} between calls; calls started within {slow:?} of each landed write beginning and the first start after it in ms {served:?}; the slowest took {worst:?}",
+        "{} steps of {budget} ms beside a snapshot written for {slow:?} between calls; calls that started after each landed write began and answered before it landed {served:?}; the slowest took {worst:?}",
         calls.len()
     );
     held_to_budget(&armed, &calls, budget, stall);
     assert!(
-        !served.is_empty() && served.iter().all(|(early, _)| *early > 0),
-        "a write of {slow:?} held the worker: calls started within {slow:?} of each write beginning and the first start after it in ms {served:?}"
+        !served.is_empty() && served.iter().all(|count| *count > 0),
+        "a write of {slow:?} held the calls behind it: calls that started after each write began and answered before it landed {served:?}"
     );
     drop(armed);
     run.exec.finish();
@@ -4211,36 +4227,32 @@ fn held_to_budget(
 }
 
 #[cfg(feature = "faults")]
-fn writes_served(
-    armed: &grit::serve3::Faults,
-    calls: &[(i64, i64)],
-    slow: Duration,
-) -> Vec<(usize, u128)> {
-    let starts: Vec<Instant> = calls
+fn writes_served(armed: &grit::serve3::Faults, calls: &[(i64, i64)]) -> Vec<usize> {
+    let spans: Vec<(Instant, Instant)> = calls
         .iter()
-        .map(|(id, _)| queued(armed, *id).0.at)
+        .map(|(id, _)| {
+            let started = queued(armed, *id).0.at;
+            let answered = armed
+                .answered
+                .iter()
+                .find(|(one, _)| one.int() == Some(*id))
+                .map(|(_, at)| *at)
+                .unwrap_or_else(|| panic!("call {id} was never answered"));
+            (started, answered)
+        })
         .collect();
-    let first = starts.iter().min().copied();
-    let last = starts.iter().max().copied();
+    let first = spans.iter().map(|(started, _)| *started).min();
+    let last = spans.iter().map(|(started, _)| *started).max();
     armed
         .writes
         .iter()
         .filter(|(began, _)| first.is_some_and(|first| *began > first))
         .filter(|(_, landed)| last.is_some_and(|last| *landed < last))
-        .map(|(began, _)| {
-            let held = *began + slow;
-            let early = starts
+        .map(|(began, landed)| {
+            spans
                 .iter()
-                .filter(|at| *at > began && *at < &held)
-                .count();
-            let after = starts
-                .iter()
-                .filter(|at| *at > began)
-                .min()
-                .map_or(u128::MAX, |at| {
-                    at.saturating_duration_since(*began).as_millis()
-                });
-            (early, after)
+                .filter(|(started, answered)| started > began && answered < landed)
+                .count()
         })
         .collect()
 }
@@ -4366,16 +4378,16 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
     frame = got.int_at("frame");
     calls.push((id, got.int_at("ran")));
     let armed = faults.lock().unwrap();
-    let served = writes_served(&armed, &calls, slow);
+    let served = writes_served(&armed, &calls);
     eprintln!(
-        "{} steps of {budget} ms beside {} background writes of {slow:?} each reached frame {frame}; calls started within {slow:?} of each landed write beginning and the first start after it in ms {served:?}; the slowest took {worst:?}",
+        "{} steps of {budget} ms beside {} background writes of {slow:?} each reached frame {frame}; calls that started after each landed write began and answered before it landed {served:?}; the slowest took {worst:?}",
         calls.len(),
         armed.slowed
     );
     held_to_budget(&armed, &calls, budget, stall);
     assert!(
-        served.len() >= 3 && served.iter().all(|(early, _)| *early > 0),
-        "a write of {slow:?} held the worker: calls started within {slow:?} of each write beginning and the first start after it in ms {served:?}"
+        served.len() >= 3 && served.iter().all(|count| *count > 0),
+        "a write of {slow:?} held the calls behind it: calls that started after each write began and answered before it landed {served:?}"
     );
     drop(armed);
     run.exec.finish();
@@ -4569,17 +4581,17 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
         }
     }
     let armed = faults.lock().unwrap();
-    let served = writes_served(&armed, &calls, slow);
+    let served = writes_served(&armed, &calls);
     eprintln!(
-        "{} steps of {budget} ms beside {} snapshot writes of {slow:?}, begun by calls {began:?}; calls started within {slow:?} of each landed write beginning and the first start after it in ms {served:?}; the slowest took {worst:?}",
+        "{} steps of {budget} ms beside {} snapshot writes of {slow:?}, begun by calls {began:?}; calls that started after each landed write began and answered before it landed {served:?}; the slowest took {worst:?}",
         calls.len(),
         armed.slowed
     );
     assert!(armed.slowed >= 2, "{}", armed.slowed);
     held_to_budget(&armed, &calls, budget, stall);
     assert!(
-        !served.is_empty() && served.iter().all(|(early, _)| *early > 0),
-        "a write of {slow:?} held the worker: calls started within {slow:?} of each write beginning and the first start after it in ms {served:?}"
+        !served.is_empty() && served.iter().all(|count| *count > 0),
+        "a write of {slow:?} held the calls behind it: calls that started after each write began and answered before it landed {served:?}"
     );
     drop(armed);
     run.exec.finish();
