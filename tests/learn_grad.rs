@@ -1705,6 +1705,680 @@ fn g1_a_gradient_past_128_bits_is_refused_as_overflow_like_the_walk() {
     same_descent("square", &got, &posed.descent(&law, 2), 2);
 }
 
+fn own_objective(region: Region, target: &[u32], cells: &[u32]) -> u64 {
+    boxed(region, cells)
+        .iter()
+        .zip(target)
+        .map(|(&cell, &wanted)| u64::from(cell.abs_diff(wanted)))
+        .sum()
+}
+
+struct Owned {
+    law: Reversible,
+    start: Vec<u32>,
+    first: u32,
+    frames: u32,
+    region: Region,
+    target: Vec<u32>,
+}
+
+impl Owned {
+    fn objective(&self, params: &[u32]) -> u64 {
+        own_objective(
+            self.region,
+            &self.target,
+            &ran(&self.law, &self.start, params, self.first, self.frames),
+        )
+    }
+
+    fn posed(&self) -> Posed<'_> {
+        Posed {
+            grid: grid(),
+            start: &self.start,
+            first: self.first,
+            frames: self.frames,
+            aim: Aim {
+                region: self.region,
+                target: &self.target,
+            },
+        }
+    }
+}
+
+fn never_worse(label: &str, owned: &Owned, from: &[u32], most: u32, descent: &Descent) {
+    let trail = &descent.trail;
+    assert_eq!(
+        trail[0],
+        Tried {
+            params: from.to_vec(),
+            objective: owned.objective(from),
+            kept: true,
+        },
+        "{label}: the trail starts at the start"
+    );
+    let mut kept = trail[0].clone();
+    for (at, tried) in trail.iter().enumerate().skip(1) {
+        assert_eq!(
+            tried.objective,
+            owned.objective(&tried.params),
+            "{label}: trail {at} is the forward run's objective"
+        );
+        assert_eq!(
+            tried.kept,
+            tried.objective < kept.objective,
+            "{label}: trail {at} is kept exactly when it is lower than the kept point {}: {trail:?}",
+            kept.objective
+        );
+        assert!(
+            trail[..at].iter().all(|one| one.params != tried.params),
+            "{label}: trail {at} walks a point again"
+        );
+        if tried.kept {
+            kept = tried.clone();
+        }
+    }
+    assert!(
+        descent.objective <= trail[0].objective,
+        "{label}: worse than the start"
+    );
+    assert_eq!(
+        (descent.params.clone(), descent.objective),
+        (kept.params.clone(), kept.objective),
+        "{label}: the answer is the last kept point"
+    );
+    assert_eq!(
+        (descent.params.clone(), descent.objective),
+        best_of(trail),
+        "{label}: the answer is the earliest lowest point walked"
+    );
+    assert_eq!(descent.steps as usize, trail.len() - 1, "{label}");
+    assert!(descent.steps <= most, "{label}: steps");
+    match descent.settled {
+        Some(Settled::Converged) => assert_eq!(descent.objective, 0, "{label}"),
+        Some(Settled::Steps) => {
+            assert!(descent.objective > 0 && descent.steps == most, "{label}");
+        }
+        Some(Settled::Local) => {
+            assert!(descent.objective > 0 && descent.steps < most, "{label}");
+        }
+        None => panic!("{label}: the library descent did not settle"),
+    }
+}
+
+const SWEEP: u64 = 160;
+
+fn swept_law(seed: u64) -> (String, Vec<u32>) {
+    if seed.is_multiple_of(2) {
+        return smooth(0xD100 + seed);
+    }
+    let mut tried = seed;
+    loop {
+        let (text, values) = random_law(0xD1C0_0000 + tried);
+        if grit::serve3::gradient::cut(reversible(&text).forward()).is_none() {
+            return (text, values);
+        }
+        tried += SWEEP;
+    }
+}
+
+fn swept_start(seed: u64, kind: u64) -> Vec<u32> {
+    let mut state = seed ^ 0x5717;
+    match kind {
+        0 => calm(seed),
+        1 => (0..grid().cells()).map(|_| word(&mut state)).collect(),
+        _ => (0..grid().cells())
+            .map(|_| (1 << 26) + u32::try_from(below(&mut state, 1 << 26)).unwrap())
+            .collect(),
+    }
+}
+
+fn near(state: &mut u64, values: &[u32]) -> Vec<u32> {
+    values
+        .iter()
+        .map(|&one| {
+            let off = i64::try_from(below(state, 81)).unwrap() - 40;
+            let made = i64::from(one) * (100 + off) / 100;
+            u32::try_from(made.clamp(0, i64::from(u32::MAX))).unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn d1_a_descent_never_answers_worse_than_its_start_and_its_kept_objectives_fall() {
+    let mut descended = 0;
+    let mut overflowed = 0;
+    let mut lower = 0;
+    let mut rejected = 0;
+    let mut climbed_past_start = 0;
+    let mut kinds = [0; 3];
+    for seed in 0..SWEEP {
+        let (text, truth) = swept_law(seed);
+        let law = reversible(&text);
+        let mut state = seed.wrapping_mul(0x9E37) + 1;
+        let kind = below(&mut state, 3);
+        let start = swept_start(seed, kind);
+        let first = u32::try_from(below(&mut state, 5)).unwrap();
+        let frames = 1 + u32::try_from(below(&mut state, 8)).unwrap();
+        let region = if below(&mut state, 4) == 0 {
+            random_region(&mut state)
+        } else {
+            Region::whole([SIDE, SIDE, SIDE])
+        };
+        let target = if below(&mut state, 4) == 0 {
+            (0..region.cells()).map(|_| word(&mut state)).collect()
+        } else {
+            boxed(region, &ran(&law, &start, &truth, first, frames))
+        };
+        let from = near(&mut state, &truth);
+        let most = 1 + u32::try_from(below(&mut state, 24)).unwrap();
+        let owned = Owned {
+            law,
+            start,
+            first,
+            frames,
+            region,
+            target,
+        };
+        let label = format!("case {seed} (start kind {kind}, {frames} frames, {most} steps)");
+        let descent = match owned.law.descend(&owned.posed(), &from, most) {
+            Ok(descent) => descent,
+            Err(Fault::Overflow) => {
+                overflowed += 1;
+                continue;
+            }
+            Err(other) => panic!("{label}: {other}"),
+        };
+        never_worse(&label, &owned, &from, most, &descent);
+        descended += 1;
+        kinds[usize::try_from(kind).unwrap()] += 1;
+        if descent.objective < descent.trail[0].objective {
+            lower += 1;
+        }
+        if descent.trail.iter().any(|tried| !tried.kept) {
+            rejected += 1;
+        }
+        if descent
+            .trail
+            .last()
+            .is_some_and(|last| last.objective > descent.trail[0].objective)
+        {
+            climbed_past_start += 1;
+        }
+    }
+    println!(
+        "{SWEEP} cases: {descended} descended ({kinds:?} by start kind), {overflowed} past 128 bits at a walk; {lower} answered lower than their start, {rejected} walked a point they did not keep, {climbed_past_start} walked last a point worse than their start; every answer no worse than its start and every kept objective lower than the one before"
+    );
+    assert!(descended >= SWEEP * 9 / 10, "{descended}");
+    assert!(kinds.iter().all(|one| *one >= SWEEP / 5), "{kinds:?}");
+    assert!(lower >= SWEEP / 3, "{lower}");
+    assert!(rejected >= descended / 4, "{rejected}");
+    assert!(climbed_past_start >= SWEEP / 16, "{climbed_past_start}");
+}
+
+const JUDGE_FROM: [u32; 2] = [2_100, 2_250];
+
+const JUDGE_FRAMES: u32 = 8;
+
+const JUDGE_STEPS: u32 = 16;
+
+const JUDGE_START: u64 = 588_373_928_375;
+
+const JUDGE_BEST: [u32; 2] = [232, 0];
+
+const JUDGE_LOWEST: u64 = 553_884_330_929;
+
+const JUDGE_WALKED: i64 = 11;
+
+const RIPPLE: i64 = 12;
+
+fn judge_words() -> Vec<[u32; 4]> {
+    let mut words = Vec::new();
+    for x in (0..SIDE).step_by(2) {
+        for y in (0..SIDE).step_by(2) {
+            for z in (0..SIDE).step_by(4) {
+                let mixed = (u64::from(x * 7 + y * 13 + z * 29) * 2_654_435_761) & 0xFFFF_FFFF;
+                words.push([x, y, z, u32::try_from(mixed).unwrap()]);
+            }
+        }
+    }
+    words
+}
+
+fn judge_start() -> Vec<u32> {
+    let mut cells = vec![0; grid().cells()];
+    for [x, y, z, word] in judge_words() {
+        cells[grid().index(x, y, z)] = word;
+    }
+    cells
+}
+
+fn judge_owned(start: Vec<u32>) -> Owned {
+    let law = reversible(MIX);
+    let region = Region::whole([SIDE, SIDE, SIDE]);
+    let target = boxed(region, &ran(&law, &start, &MIX_TRUTH, 0, JUDGE_FRAMES));
+    Owned {
+        law,
+        start,
+        first: 0,
+        frames: JUDGE_FRAMES,
+        region,
+        target,
+    }
+}
+
+fn judge_arguments(owned: &Owned) -> String {
+    Inline {
+        text: MIX,
+        start: &owned.start,
+        first: 0,
+        params: &JUDGE_FROM,
+        frames: JUDGE_FRAMES,
+        region: owned.region,
+        target: &owned.target,
+    }
+    .arguments(&format!(",\"steps\":{JUDGE_STEPS}"))
+}
+
+fn checked_judge(got: &Json, owned: &Owned) {
+    let descent = owned
+        .law
+        .descend(&owned.posed(), &JUDGE_FROM, JUDGE_STEPS)
+        .unwrap();
+    never_worse(
+        "the judge's case",
+        owned,
+        &JUDGE_FROM,
+        JUDGE_STEPS,
+        &descent,
+    );
+    assert_eq!(trail_of(got), descent.trail, "the library's trail");
+    assert_eq!(descent.trail[0].objective, JUDGE_START);
+    assert_eq!(words_of(got.get("params").unwrap()), JUDGE_BEST);
+    assert_eq!(whole_of(got.get("objective").unwrap()), JUDGE_LOWEST);
+    assert_eq!(text_at(got, "stopped"), "local");
+    assert_eq!(int_at(got, "steps"), JUDGE_WALKED);
+}
+
+fn ripple(owned: &Owned, axis: usize, sign: i64) -> i64 {
+    let mut before = 0;
+    for distance in 1..=4 * RIPPLE {
+        let mut params = MIX_TRUTH;
+        params[axis] = u32::try_from(i64::from(params[axis]) + sign * distance).unwrap();
+        let objective = owned.objective(&params);
+        if objective <= before {
+            return distance;
+        }
+        before = objective;
+    }
+    panic!("the objective rises {} units from the truth", 4 * RIPPLE);
+}
+
+#[test]
+fn d2_the_judges_case_answers_its_documented_best_and_a_calm_start_reaches_zero() {
+    let owned = judge_owned(judge_start());
+    let mut server = Server::new(None);
+    let got = answer(&call(
+        &mut server,
+        "grit_law_descend",
+        &judge_arguments(&owned),
+    ));
+    checked_judge(&got, &owned);
+    let mut widest = 0;
+    for axis in 0..2 {
+        for sign in [-1, 1] {
+            let ends = ripple(&owned, axis, sign);
+            assert!(ends <= RIPPLE, "axis {axis} {sign}: {ends}");
+            widest = widest.max(ends);
+        }
+        assert!(
+            i64::from(JUDGE_FROM[axis].abs_diff(MIX_TRUTH[axis])) > 40 * RIPPLE,
+            "the start lies far outside the ripple"
+        );
+    }
+    println!(
+        "the judge's case: from {JUDGE_FROM:?} (objective {JUDGE_START}) to {JUDGE_BEST:?} (objective {JUDGE_LOWEST}), local after {JUDGE_WALKED} walks; the objective rises at most {widest} units from {MIX_TRUTH:?} along each param, and the start is {} and {} away",
+        JUDGE_FROM[0].abs_diff(MIX_TRUTH[0]),
+        JUDGE_FROM[1].abs_diff(MIX_TRUTH[1])
+    );
+    let calm = judge_owned(calm(0x5C));
+    let got = answer(&call(
+        &mut server,
+        "grit_law_descend",
+        &Inline {
+            text: MIX,
+            start: &calm.start,
+            first: 0,
+            params: &JUDGE_FROM,
+            frames: JUDGE_FRAMES,
+            region: calm.region,
+            target: &calm.target,
+        }
+        .arguments(&format!(",\"steps\":{JUDGE_STEPS}")),
+    ));
+    let descent = calm
+        .law
+        .descend(&calm.posed(), &JUDGE_FROM, JUDGE_STEPS)
+        .unwrap();
+    never_worse("calm", &calm, &JUDGE_FROM, JUDGE_STEPS, &descent);
+    assert_eq!(trail_of(&got), descent.trail);
+    assert_eq!(words_of(got.get("params").unwrap()), MIX_TRUTH);
+    assert_eq!(whole_of(got.get("objective").unwrap()), 0);
+    assert_eq!(text_at(&got, "stopped"), "converged");
+    assert_eq!(int_at(&got, "steps"), 3);
+}
+
+const BASIN_SEEDS: u64 = 16;
+
+#[test]
+fn d2_from_inside_the_basin_a_calm_start_reaches_zero_within_sixteen_steps() {
+    let mut most = 0;
+    for (name, text, truth) in [
+        ("mix", MIX, MIX_TRUTH.to_vec()),
+        ("stir", STIR, STIR_TRUTH.to_vec()),
+    ] {
+        for seed in 0..BASIN_SEEDS {
+            let law = reversible(text);
+            let start = calm(0xBA51 + seed);
+            let region = Region::whole([SIDE, SIDE, SIDE]);
+            let target = boxed(region, &ran(&law, &start, &truth, 0, JUDGE_FRAMES));
+            let owned = Owned {
+                law,
+                start,
+                first: 0,
+                frames: JUDGE_FRAMES,
+                region,
+                target,
+            };
+            let mut state = seed + 1;
+            let from = near(&mut state, &truth);
+            let descent = owned
+                .law
+                .descend(&owned.posed(), &from, JUDGE_STEPS)
+                .unwrap();
+            let label = format!("{name} seed {seed} from {from:?}");
+            never_worse(&label, &owned, &from, JUDGE_STEPS, &descent);
+            assert_eq!(descent.objective, 0, "{label}: {:?}", descent.trail);
+            assert_eq!(descent.params, truth, "{label}");
+            most = most.max(descent.steps);
+        }
+    }
+    println!(
+        "mix and stir, {BASIN_SEEDS} calm starts each, from up to 40 % off the truth: objective 0 in at most {most} of {JUDGE_STEPS} steps"
+    );
+}
+
+#[test]
+fn d4_the_same_descent_again_on_a_fresh_server_and_fewer_steps_a_prefix() {
+    let owned = judge_owned(judge_start());
+    let arguments = judge_arguments(&owned);
+    let mut server = Server::new(None);
+    let whole = written(&answer(&call(&mut server, "grit_law_descend", &arguments)));
+    let again = written(&answer(&call(&mut server, "grit_law_descend", &arguments)));
+    let fresh = written(&answer(&call(
+        &mut Server::new(None),
+        "grit_law_descend",
+        &arguments,
+    )));
+    assert_eq!(again, whole, "the same server, the same answer");
+    assert_eq!(fresh, whole, "a fresh server, the same answer");
+    let full = trail_of(&grit::wire::read(&whole).unwrap());
+    for steps in 1..JUDGE_STEPS {
+        let shorter = Inline {
+            text: MIX,
+            start: &owned.start,
+            first: 0,
+            params: &JUDGE_FROM,
+            frames: JUDGE_FRAMES,
+            region: owned.region,
+            target: &owned.target,
+        }
+        .arguments(&format!(",\"steps\":{steps}"));
+        let got = answer(&call(&mut server, "grit_law_descend", &shorter));
+        let trail = trail_of(&got);
+        let walked = trail.len();
+        assert_eq!(trail[..], full[..walked], "{steps} steps: a prefix");
+        assert_eq!(
+            (
+                words_of(got.get("params").unwrap()),
+                whole_of(got.get("objective").unwrap())
+            ),
+            best_of(&trail),
+            "{steps} steps"
+        );
+        assert_eq!(
+            walked,
+            full.len().min(usize::try_from(steps).unwrap() + 1),
+            "{steps} steps"
+        );
+    }
+    let pinned = grit::law::hex(&grit::branch::sha256(whole.as_bytes()));
+    println!("the judge's descent answer sha256 {pinned}");
+    assert_eq!(pinned, JUDGE_PINNED, "the answer on any machine and OS");
+}
+
+const JUDGE_PINNED: &str = "07e867a9668d992f5cde995a6d19bbdb6c9d0f0b4e9c73ebb2ee20b3c5d4ddc1";
+
+#[test]
+fn the_descent_reaches_the_search_or_lower_at_the_same_runs_on_smooth_starts() {
+    let mut server = Server::new(None);
+    let mut rows = [[0_u32; 3]; 3];
+    for seed in 0..96_u64 {
+        let (text, truth) = smooth(0xD100 + seed);
+        let law = reversible(&text);
+        let mut state = seed.wrapping_mul(0x9E37) + 1;
+        let kind = below(&mut state, 3);
+        let start = swept_start(seed, kind);
+        let frames = 1 + u32::try_from(below(&mut state, 8)).unwrap();
+        let region = Region::whole([SIDE, SIDE, SIDE]);
+        let target = boxed(region, &ran(&law, &start, &truth, 0, frames));
+        let from = near(&mut state, &truth);
+        let posed = Inline {
+            text: &text,
+            start: &start,
+            first: 0,
+            params: &from,
+            frames,
+            region,
+            target: &target,
+        };
+        let descended = call(
+            &mut server,
+            "grit_law_descend",
+            &posed.arguments(&format!(",\"steps\":{JUDGE_STEPS}")),
+        );
+        let descended = answer(&descended);
+        let runs = u32::try_from(trail_of(&descended).len()).unwrap();
+        let generations = (runs - 1).div_ceil(4).max(1);
+        let bounds: Vec<[u32; 2]> = from.iter().map(|_| [0, 8_191]).collect();
+        let searched = answer(&call(
+            &mut server,
+            "grit_learn_params",
+            &posed.arguments(&format!(
+                ",\"bounds\":{bounds:?},\"seed\":{seed},\"population\":4,\"generations\":{generations}"
+            )),
+        ));
+        let scored = u32::try_from(int_at(&searched, "scored")).unwrap();
+        assert!(scored >= runs, "seed {seed}: {scored} runs against {runs}");
+        let low = whole_of(descended.get("objective").unwrap());
+        let found = whole_of(searched.get("objective").unwrap());
+        let row = &mut rows[usize::try_from(kind).unwrap()];
+        row[usize::from(low > found) + usize::from(low >= found)] += 1;
+        if kind == 0 {
+            assert_eq!(low, 0, "seed {seed}: a calm start reaches 0");
+            assert!(low <= found, "seed {seed}");
+        }
+    }
+    for (kind, [won, tied, lost]) in rows.iter().enumerate() {
+        println!(
+            "start kind {kind}: the descent lower in {won}, equal in {tied}, the search lower in {lost}, the search given at least the descent's walks in runs"
+        );
+    }
+    assert_eq!(rows[0][2], 0);
+}
+
+mod judged {
+    use super::*;
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "grit-learngrad-judged-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn dir(&self) -> PathBuf {
+            self.0.join("worlds")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Process {
+        child: Child,
+        input: ChildStdin,
+        output: BufReader<ChildStdout>,
+        id: i64,
+    }
+
+    impl Process {
+        fn start(dir: &Path) -> Self {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_grit-mcp"))
+                .arg("--dir")
+                .arg(dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let input = child.stdin.take().unwrap();
+            let output = BufReader::new(child.stdout.take().unwrap());
+            Self {
+                child,
+                input,
+                output,
+                id: 0,
+            }
+        }
+
+        fn kill(mut self) {
+            self.child.kill().unwrap();
+            self.child.wait().unwrap();
+        }
+    }
+
+    impl Ask for Process {
+        fn ask(&mut self, name: &str, arguments: &str) -> Json {
+            self.id += 1;
+            writeln!(self.input, "{}", line(self.id, name, arguments)).unwrap();
+            self.input.flush().unwrap();
+            loop {
+                let mut held = String::new();
+                assert!(
+                    self.output.read_line(&mut held).unwrap() > 0,
+                    "the server ended"
+                );
+                let got = grit::wire::read(held.trim_end()).unwrap();
+                if got.get("id").and_then(Json::int) == Some(self.id) {
+                    return got;
+                }
+            }
+        }
+    }
+
+    fn opened(asker: &mut dyn Ask) -> (i64, i64) {
+        let placed: Vec<String> = judge_words()
+            .iter()
+            .map(|[x, y, z, word]| format!("[{x},{y},{z},{word}]"))
+            .collect();
+        let mut worlds = Vec::new();
+        for params in [JUDGE_FROM, MIX_TRUTH] {
+            let world = create(asker, MIX, &params, SIDE);
+            answer(&asker.ask(
+                "grit_world_write",
+                &format!(
+                    "{{\"world\":{world},\"cells\":[{}],\"budget_ms\":{LONG}}}",
+                    placed.join(",")
+                ),
+            ));
+            worlds.push(world);
+        }
+        step(asker, worlds[1], JUDGE_FRAMES);
+        (worlds[0], worlds[1])
+    }
+
+    fn descend(asker: &mut dyn Ask, learner: i64, target: i64) -> Json {
+        let last = SIDE - 1;
+        answer(&asker.ask(
+            "grit_law_descend",
+            &format!(
+                "{{\"world\":{learner},\"frames\":{JUDGE_FRAMES},\"aim\":{{\"from\":[0,0,0],\"to\":[{last},{last},{last}],\"world\":{target}}},\"steps\":{JUDGE_STEPS},\"budget_ms\":60000}}"
+            ),
+        ))
+    }
+
+    fn unworlded(got: &Json) -> String {
+        match got {
+            Json::Map(fields) => written(&Json::Map(
+                fields
+                    .iter()
+                    .filter(|(key, _)| key != "world")
+                    .cloned()
+                    .collect(),
+            )),
+            other => written(other),
+        }
+    }
+
+    #[test]
+    fn d2_d4_the_judges_descent_through_grit_mcp_worlds_answers_the_same_after_a_restart() {
+        let Some(host) = device("learn_grad judged") else {
+            return;
+        };
+        drop(host);
+        let owned = judge_owned(judge_start());
+        let inline = written(&answer(&call(
+            &mut Server::new(None),
+            "grit_law_descend",
+            &judge_arguments(&owned),
+        )));
+        let scratch = Scratch::new();
+        let mut first = Process::start(&scratch.dir());
+        let (learner, target) = opened(&mut first);
+        let before = descend(&mut first, learner, target);
+        checked_judge(&before, &owned);
+        assert_eq!(int_at(&before, "world"), learner);
+        assert_eq!(unworlded(&before), inline, "a world start is its cells");
+        first.kill();
+        let mut second = Process::start(&scratch.dir());
+        for world in [learner, target] {
+            answer(&second.ask(
+                "grit_world_open",
+                &format!("{{\"name\":\"world-{world}\"}}"),
+            ));
+        }
+        let after = descend(&mut second, learner, target);
+        assert_eq!(written(&after), written(&before), "across a restart");
+        second.kill();
+    }
+}
+
 #[cfg(feature = "faults")]
 mod faulted {
     use super::*;
