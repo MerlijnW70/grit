@@ -50,9 +50,9 @@ pub const SYMMETRIC: &str = "the ladder finds the smallest circuit f that answer
 
 pub const ZERO_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; to read 0 past an example's edge, write it at the origin of a world at least one cell longer than it along each axis the stencil reads, every other cell of the read planes 0";
 
-pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world of exactly its size, and a world example's box read its neighbours from that world";
+pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world whose sides equal its own along each axis the stencil reads (3x3 reads x and y, so its tall is free; a world's tall is at least 2), and a world example's box reads its neighbours from that world";
 
-pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung doubles its crowd up to 65536 while unsolved, and the ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call does not fit; the first build cannot stop part way, and its kernel is unrolled over the rows searched (under symmetric every image of every seen row), so it grows with them and an answer can come late by up to one build; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. Counting the decided rows cannot stop part way, so an answer can come late by up to two to the inputs rows times the law's gates of host work. The same request gives the same answer on the same device";
+pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung doubles its crowd up to 65536 while unsolved, and the ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call does not fit; the first build cannot stop part way, and its kernel is unrolled over the rows searched (under symmetric every image of every seen row), so it grows with them and an answer can come late by up to one build; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion and the count of decided rows check budget and cancel every 4096 rows or 64-row blocks and refuse budget or cancelled. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -987,16 +987,16 @@ fn ladder_shown(rungs: &[Rung]) -> Json {
     )
 }
 
-fn fits_kernel(inputs: u32, outputs: u32, top: u32, traces: usize) -> Result<(), Failed> {
+fn rows_most(inputs: u32, outputs: u32, top: u32) -> u64 {
     let each = u64::from(top) + u64::from(inputs) + u64::from(outputs);
-    let wide = u64::try_from(traces)
-        .unwrap_or(u64::MAX)
-        .div_ceil(32)
-        .max(1);
-    if each.saturating_mul(wide) <= crate::serve::WORK {
+    crate::serve::WORK / each.max(1) * 32
+}
+
+fn fits_kernel(inputs: u32, outputs: u32, top: u32, traces: usize) -> Result<(), Failed> {
+    let fits = rows_most(inputs, outputs, top);
+    if u64::try_from(traces).unwrap_or(u64::MAX) <= fits {
         return Ok(());
     }
-    let fits = crate::serve::WORK / each * 32;
     Err(limited(
         Code::LearnLimit,
         "$.examples",
@@ -1043,6 +1043,21 @@ fn wiring(asked: &Asked, held: &Json, channels: u32) -> Wiring {
             _ => Rest::Kept,
         },
     }
+}
+
+fn halted_refusal(stop: Stop, when: &str) -> Failed {
+    refused(
+        stop.code(),
+        if stop == Stop::Budget {
+            "$.budget_ms"
+        } else {
+            "$"
+        },
+        format!(
+            "the call stopped on {} {when}; nothing was learned",
+            stop.name()
+        ),
+    )
 }
 
 fn exact(held: u64) -> Json {
@@ -1097,7 +1112,29 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         Some(_) => int(held, "channels")?,
     };
     plane_checks(&asked, channels)?;
-    let top = int(held, "gates")?;
+    let asked_top = int(held, "gates")?;
+    let copies = if symmetric {
+        u32::try_from(stencil.symmetries().len()).unwrap_or(u32::MAX)
+    } else {
+        1
+    };
+    let fits_law = if symmetric {
+        crate::law::chip::GATES_SURE.saturating_sub(outputs.saturating_mul(copies - 1)) / copies
+    } else {
+        asked_top
+    };
+    if fits_law < outputs {
+        return Err(limited(
+            Code::LearnLimit,
+            "$.writes",
+            format!(
+                "a symmetric law is {copies} copies of the circuit joined by ors, and with {outputs} outputs not even one gate an output fits the {} gates a law always holds",
+                crate::law::chip::GATES_SURE
+            ),
+            counted(0),
+        ));
+    }
+    let top = asked_top.min(fits_law);
     if top < outputs {
         return Err(limited(
             Code::LearnLimit,
@@ -1130,8 +1167,36 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .iter()
         .map(|places| stencil::inputs_moved(stencil, reads, places))
         .collect();
+    fits_kernel(inputs, outputs, top, rows.seen.len())?;
+    let most = usize::try_from(rows_most(inputs, outputs, top)).unwrap_or(usize::MAX);
+    let guard = server.guard();
+    let mut stopped: Option<Stop> = None;
     let wanted: std::collections::BTreeMap<u32, u32> = if symmetric {
-        let orbits = stencil::orbits(&rows.seen, &moves);
+        let mut halted = || {
+            stopped = guard.stop();
+            stopped.is_some()
+        };
+        let orbits = match stencil::orbits(&rows.seen, &moves, most, &mut halted) {
+            Ok(orbits) => orbits,
+            Err(stencil::Cut::Rows(count)) => {
+                return Err(limited(
+                    Code::LearnLimit,
+                    "$.examples",
+                    format!(
+                        "the images of the {} seen rows under the {} stencil's {copies} symmetries pass {count} rows, more than the {most} one search kernel holds with {top} gates, {inputs} inputs and {outputs} outputs; nothing was searched",
+                        rows.seen.len(),
+                        stencil.name()
+                    ),
+                    Json::Int(i64::try_from(most).unwrap_or(i64::MAX)),
+                ));
+            }
+            Err(stencil::Cut::Halted) => {
+                return Err(halted_refusal(
+                    stopped.unwrap_or(Stop::Budget),
+                    "while expanding the seen rows under the symmetries",
+                ));
+            }
+        };
         if !orbits.broken.is_empty() {
             return Err(asymmetric(&orbits, stencil));
         }
@@ -1216,7 +1281,18 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let total = 1_u64 << inputs;
     let seen = u64::try_from(rows.seen.len()).unwrap_or(u64::MAX);
     let unseen = total - seen;
-    let count = stencil::ones(inputs, outputs, &law_gates);
+    let mut counting_stop: Option<Stop> = None;
+    let guard = server.guard();
+    let mut halted = || {
+        counting_stop = guard.stop();
+        counting_stop.is_some()
+    };
+    let Some(count) = stencil::ones(inputs, outputs, &law_gates, &mut halted) else {
+        return Err(halted_refusal(
+            counting_stop.unwrap_or(Stop::Budget),
+            "while counting the decided rows, after the law was found",
+        ));
+    };
     let mut ones = Vec::with_capacity(outputs as usize);
     let mut zeros = Vec::with_capacity(outputs as usize);
     for output in 0..outputs {
@@ -1317,6 +1393,23 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ("ladder", ladder_shown(&laddered.rungs)),
         ("stopped", text(laddered.stop.map_or("ladder", Stop::name))),
     ]);
+    if top < asked_top {
+        answer.push((
+            "gates_capped",
+            map(vec![
+                ("asked", counted(asked_top)),
+                ("used", counted(top)),
+                (
+                    "why",
+                    text(&format!(
+                        "a symmetric law is {copies} copies of the circuit and {} or gates, and a law always holds {} gates, so the ladder starts at {top}",
+                        outputs.saturating_mul(copies - 1),
+                        crate::law::chip::GATES_SURE
+                    )),
+                ),
+            ]),
+        ));
+    }
     if let Some(stop) = laddered.stop {
         answer.push(("hint", text(stop.code().hint())));
     }
