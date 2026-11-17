@@ -3397,6 +3397,7 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
     let mut idle_run = 0;
     let mut stepped = 0_i64;
     let mut after_landing = 0;
+    let first_sent = Instant::now();
     while after_landing < 2 {
         assert!(
             calls.len() < 2000,
@@ -3443,7 +3444,7 @@ fn a_slow_snapshot_between_calls_never_costs_a_sequential_client_its_budget() {
         }
         let armed = faults.lock().unwrap();
         begun |= armed.slowed > 0;
-        if !armed.writes.is_empty() {
+        if armed.writes.iter().any(|(began, _)| *began > first_sent) {
             after_landing += 1;
         }
     }
@@ -4215,10 +4216,12 @@ fn writes_served(armed: &grit::serve3::Faults, calls: &[(i64, i64)]) -> Vec<usiz
         .iter()
         .map(|(id, _)| queued(armed, *id).0.at)
         .collect();
+    let first = starts.iter().min().copied();
     let last = starts.iter().max().copied();
     armed
         .writes
         .iter()
+        .filter(|(began, _)| first.is_some_and(|first| *began > first))
         .filter(|(_, landed)| last.is_some_and(|last| *landed < last))
         .map(|(began, landed)| {
             starts
@@ -4305,7 +4308,16 @@ fn a_slow_background_write_never_refuses_a_sequential_client() {
     let mut calls = Vec::new();
     let mut frame = 0;
     let mut worst = Duration::ZERO;
-    while faults.lock().unwrap().writes.len() < 3 {
+    let first_sent = Instant::now();
+    while faults
+        .lock()
+        .unwrap()
+        .writes
+        .iter()
+        .filter(|(began, _)| *began > first_sent)
+        .count()
+        < 3
+    {
         assert!(calls.len() < 400, "no write was started between calls");
         let asked = Instant::now();
         let id = run.send(
@@ -4489,13 +4501,21 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
     let mut stepped = 0_i64;
     let mut landed = 0;
     let mut calls = Vec::new();
+    let first_sent = Instant::now();
     while calls.len() < 10 || began.len() < 2 {
         assert!(
             calls.len() < 400,
             "two snapshot writes did not begin and land in {} calls",
             calls.len()
         );
-        let now_landed = faults.lock().unwrap().writes.clone();
+        let now_landed: Vec<(Instant, Instant)> = faults
+            .lock()
+            .unwrap()
+            .writes
+            .iter()
+            .copied()
+            .filter(|(began, _)| *began > first_sent)
+            .collect();
         if now_landed.len() > landed {
             landed = now_landed.len();
             let (start, end) = now_landed[landed - 1];
@@ -4545,7 +4565,7 @@ fn a_slow_disk_never_stalls_a_step_that_snapshots_inside_its_budget() {
     assert!(armed.slowed >= 2, "{}", armed.slowed);
     held_to_budget(&armed, &calls, budget, stall);
     assert!(
-        served.iter().all(|count| *count > 0),
+        !served.is_empty() && served.iter().all(|count| *count > 0),
         "a write of {slow:?} held the worker: calls started during each write {served:?}"
     );
     drop(armed);
