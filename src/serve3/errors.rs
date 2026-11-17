@@ -73,9 +73,10 @@ pub enum Code {
     Conflict,
     Asymmetric,
     Unsolved,
+    LearnLimit,
 }
 
-pub const CODES: [Code; 69] = [
+pub const CODES: [Code; 70] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -145,6 +146,7 @@ pub const CODES: [Code; 69] = [
     Code::Conflict,
     Code::Asymmetric,
     Code::Unsolved,
+    Code::LearnLimit,
 ];
 
 impl Code {
@@ -220,6 +222,7 @@ impl Code {
             Self::Conflict => "conflict",
             Self::Asymmetric => "asymmetric",
             Self::Unsolved => "unsolved",
+            Self::LearnLimit => "learn_limit",
         }
     }
 
@@ -400,6 +403,9 @@ impl Code {
             }
             Self::Unsolved => {
                 "Search with more gates, rounds or crowd; no circuit at or below gates was found within them."
+            }
+            Self::LearnLimit => {
+                "Give fewer reads or example cells, fewer rows to search, or at least as many gates as writes; grit_describe names learn_inputs, learn_cells and learn_examples."
             }
         }
     }

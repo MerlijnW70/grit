@@ -782,11 +782,13 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let frame = live.world.frame();
     let mut answer = vec![
         ("world", counted(number)),
-        ("plane", counted(plane)),
         ("written", counted(written)),
         ("frame", counted(frame)),
         ("listed", counted(listed)),
     ];
+    if plane > 0 {
+        answer.insert(1, ("plane", counted(plane)));
+    }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
