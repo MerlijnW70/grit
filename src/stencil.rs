@@ -285,16 +285,35 @@ pub struct Orbits {
     pub broken: BTreeMap<u32, BTreeMap<u32, u32>>,
 }
 
-#[must_use]
-pub fn orbits(seen: &BTreeMap<u32, Seen>, moves: &[Vec<u32>]) -> Orbits {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    Rows(usize),
+    Halted,
+}
+
+pub const CHECK_EVERY: usize = 4096;
+
+pub fn orbits(
+    seen: &BTreeMap<u32, Seen>,
+    moves: &[Vec<u32>],
+    most: usize,
+    halted: &mut dyn FnMut() -> bool,
+) -> Result<Orbits, Cut> {
     let mut groups: BTreeMap<u32, BTreeMap<u32, u32>> = BTreeMap::new();
-    for (row, one) in seen {
-        let images: Vec<u32> = moves.iter().map(|moved| image(*row, moved)).collect();
-        let least = images.iter().copied().min().unwrap_or(*row);
+    for (done, (row, one)) in seen.iter().enumerate() {
+        if done.is_multiple_of(CHECK_EVERY) && halted() {
+            return Err(Cut::Halted);
+        }
+        let least = moves
+            .iter()
+            .map(|moved| image(*row, moved))
+            .min()
+            .unwrap_or(*row);
         groups.entry(least).or_default().insert(*row, one.outputs);
     }
     let mut expanded = BTreeMap::new();
     let mut broken = BTreeMap::new();
+    let mut done = 0_usize;
     for (least, rows) in groups {
         let values: BTreeSet<u32> = rows.values().copied().collect();
         if values.len() > 1 {
@@ -305,12 +324,19 @@ pub fn orbits(seen: &BTreeMap<u32, Seen>, moves: &[Vec<u32>]) -> Orbits {
             continue;
         };
         for row in rows.keys() {
+            if done.is_multiple_of(CHECK_EVERY) && halted() {
+                return Err(Cut::Halted);
+            }
+            done += 1;
             for moved in moves {
                 expanded.insert(image(*row, moved), value);
             }
+            if expanded.len() > most {
+                return Err(Cut::Rows(expanded.len()));
+            }
         }
     }
-    Orbits { expanded, broken }
+    Ok(Orbits { expanded, broken })
 }
 
 #[must_use]
@@ -484,8 +510,12 @@ fn block(inputs: u32, gates: &[Gate], number: u64, values: &mut Vec<u64>) {
     }
 }
 
-#[must_use]
-pub fn ones(inputs: u32, outputs: u32, gates: &[Gate]) -> Vec<u64> {
+pub fn ones(
+    inputs: u32,
+    outputs: u32,
+    gates: &[Gate],
+    halted: &mut dyn FnMut() -> bool,
+) -> Option<Vec<u64>> {
     let rows = 1_u64 << inputs;
     let blocks = rows.div_ceil(64);
     let lanes = if rows < 64 {
@@ -497,13 +527,16 @@ pub fn ones(inputs: u32, outputs: u32, gates: &[Gate]) -> Vec<u64> {
     let mut values = Vec::with_capacity(inputs as usize + gates.len());
     let first = (inputs as usize + gates.len()).saturating_sub(outputs as usize);
     for number in 0..blocks {
+        if number.is_multiple_of(CHECK_EVERY as u64) && halted() {
+            return None;
+        }
         block(inputs, gates, number, &mut values);
         for (output, held) in ones.iter_mut().enumerate() {
             let word = values.get(first + output).copied().unwrap_or(0) & lanes;
             *held += u64::from(word.count_ones());
         }
     }
-    ones
+    Some(ones)
 }
 
 #[must_use]

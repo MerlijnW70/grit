@@ -741,7 +741,7 @@ fn l3_a_symmetric_3x3x3_law_turns_with_its_input_on_a_world() {
     let seen = seen_of(&rows, &wanted);
     assert_eq!(ones + zeros + seen.len() as u64, 1 << 27);
     let gates = gates_of(got.get("chip").unwrap().get("gates").unwrap());
-    let all = stencil::ones(27, 1, &gates)[0];
+    let all = stencil::ones(27, 1, &gates, &mut || false).unwrap()[0];
     let on_seen = seen.values().filter(|one| **one == 1).count() as u64;
     assert_eq!(all - on_seen, ones, "the decided ones are the chip's");
     let law = text_at(&got, "law");
