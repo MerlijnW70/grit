@@ -52,7 +52,7 @@ pub const ZERO_RUNS: &str = "the law reads its neighbours wrapped on the world's
 
 pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world of exactly its size, and a world example's box read its neighbours from that world";
 
-pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung doubles its crowd up to 65536 while unsolved, and the ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. Counting the decided rows cannot stop part way, so an answer can come late by up to two to the inputs rows times the law's gates of host work. The same request gives the same answer on the same device";
+pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung doubles its crowd up to 65536 while unsolved, and the ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call does not fit; the first build cannot stop part way, and its kernel is unrolled over the rows searched (under symmetric every image of every seen row), so it grows with them and an answer can come late by up to one build; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. Counting the decided rows cannot stop part way, so an answer can come late by up to two to the inputs rows times the law's gates of host work. The same request gives the same answer on the same device";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -153,6 +153,8 @@ struct Watch<'host> {
     guard: Guard,
     host: Option<&'host crate::host::Host>,
     stop: Option<Stop>,
+    began: Option<std::time::Instant>,
+    built: Option<Duration>,
     #[cfg(feature = "faults")]
     faults: std::sync::Arc<std::sync::Mutex<super::Faults>>,
 }
@@ -170,7 +172,25 @@ impl Watch<'_> {
 }
 
 impl Halt for Watch<'_> {
+    fn building(&mut self) -> bool {
+        let next = self.built.unwrap_or(Duration::ZERO);
+        if self.over(next) {
+            return true;
+        }
+        self.began = Some(std::time::Instant::now());
+        false
+    }
+
     fn halted(&mut self, next: Duration) -> bool {
+        if let Some(began) = self.began.take() {
+            self.built = Some(began.elapsed());
+        }
+        self.over(next)
+    }
+}
+
+impl Watch<'_> {
+    fn over(&mut self, next: Duration) -> bool {
         let charged = self.charged();
         if let Some(stop) = self.guard.stop() {
             self.stop = Some(stop);
@@ -1131,6 +1151,8 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         guard: server.guard(),
         host: server.host,
         stop: None,
+        began: None,
+        built: None,
         #[cfg(feature = "faults")]
         faults: server.faults(),
     };
