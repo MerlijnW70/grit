@@ -340,12 +340,11 @@ fn seen_of(rows: &[u32], outputs: &[u32]) -> BTreeMap<u32, u32> {
         .collect()
 }
 
-fn round_trip(host: &Host, stencil: Stencil, size: [u32; 3], seed: u64, truth_gates: u32) {
+fn round_trip(host: &Host, stencil: Stencil, size: [u32; 3], seed: u64, truth: &[Gate], top: u32) {
     let mut rng = Rng(seed);
     let mut mcp = Mcp::new(Some(host));
     let inputs = stencil.positions();
-    let truth = random_circuit(&mut rng, inputs, truth_gates);
-    let truth_law = chip_law(&mut mcp, stencil, &truth, 1, 0);
+    let truth_law = chip_law(&mut mcp, stencil, truth, 1, 0);
     let cells = size.iter().product::<u32>() as usize;
     let input = random_bits(&mut rng, cells, 2);
     let hidden = mcp.world(&truth_law, size);
@@ -359,7 +358,7 @@ fn round_trip(host: &Host, stencil: Stencil, size: [u32; 3], seed: u64, truth_ga
     let rows = own_rows(stencil, size, &input, true);
     for (row, out) in rows.iter().zip(&wanted) {
         assert_eq!(
-            stencil::answer(inputs, 1, &truth, *row),
+            stencil::answer(inputs, 1, truth, *row),
             *out,
             "the truth law answers its chip"
         );
@@ -374,7 +373,7 @@ fn round_trip(host: &Host, stencil: Stencil, size: [u32; 3], seed: u64, truth_ga
             &format!("[{{\"world\":{hidden}}}]"),
             1,
             0,
-            ",\"gates\":12,\"crowd\":2048,\"rounds\":2000",
+            &format!(",\"gates\":{top},\"crowd\":2048,\"rounds\":2000"),
         ),
     );
     let examples = got.get("examples").unwrap();
@@ -423,7 +422,16 @@ fn l1_a_learned_3x3_law_equals_its_truth_on_every_seen_neighbourhood() {
         return;
     };
     for seed in [11, 12, 13] {
-        round_trip(&host, Stencil::Square, [16, 16, 2], seed, 6);
+        let truth = random_circuit(&mut Rng(seed * 7), 9, 6);
+        round_trip(&host, Stencil::Square, [16, 16, 2], seed, &truth, 12);
+    }
+    for place in 0..9 {
+        let copy = [Gate {
+            kind: 10,
+            left: place,
+            right: place,
+        }];
+        round_trip(&host, Stencil::Square, [16, 16, 2], 14, &copy, 2);
     }
 }
 
@@ -433,7 +441,16 @@ fn l1_a_learned_3x3x3_law_equals_its_truth_on_every_seen_neighbourhood() {
         return;
     };
     for seed in [21, 22] {
-        round_trip(&host, Stencil::Cube, [8, 8, 8], seed, 6);
+        let truth = random_circuit(&mut Rng(seed * 7), 27, 6);
+        round_trip(&host, Stencil::Cube, [8, 8, 8], seed, &truth, 12);
+    }
+    for place in 0..27 {
+        let copy = [Gate {
+            kind: 10,
+            left: place,
+            right: place,
+        }];
+        round_trip(&host, Stencil::Cube, [8, 8, 8], 23, &copy, 2);
     }
 }
 
