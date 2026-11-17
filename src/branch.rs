@@ -179,6 +179,38 @@ fn unfit(why: impl std::fmt::Display) -> Refused {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LawUnbuilt {
+    pub law: String,
+    pub hash: String,
+    pub device: String,
+    pub code: ash::vk::Result,
+}
+
+impl std::fmt::Display for LawUnbuilt {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "the driver of the device {:?} could not compile the kernel of the law {:?} ({}): pipeline creation failed with {:?}",
+            self.device, self.law, self.hash, self.code
+        )
+    }
+}
+
+impl std::error::Error for LawUnbuilt {}
+
+fn built_from(rule: &Stepper) -> impl Fn(host::Error) -> Failed + '_ {
+    move |why| match (rule, why) {
+        (Stepper::Law(law, _), host::Error::Unbuilt { device, code }) => Box::new(LawUnbuilt {
+            law: law.name().to_owned(),
+            hash: law.hex(),
+            device,
+            code,
+        }),
+        (_, other) => fitted(other),
+    }
+}
+
 pub(crate) fn fitted(why: host::Error) -> Failed {
     match why {
         host::Error::TooLarge { .. }
@@ -546,7 +578,7 @@ impl<'host> World<'host> {
             .admits_on(&sizes, None, host.heap())
             .map_err(fitted)?;
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-        let live = host.resident(&sizes, &modules).map_err(fitted)?;
+        let live = host.resident(&sizes, &modules).map_err(built_from(&rule))?;
         Ok(Self {
             host,
             rule,

@@ -46,6 +46,7 @@ pub enum Code {
     RuleOrLaw,
     LawRefused,
     LawNotBuilt,
+    KernelNotBuilt,
     QuietRefused,
     HaloSparse,
     ChipRefused,
@@ -70,7 +71,7 @@ pub enum Code {
     RunLimit,
 }
 
-pub const CODES: [Code; 64] = [
+pub const CODES: [Code; 65] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -113,6 +114,7 @@ pub const CODES: [Code; 64] = [
     Code::RuleOrLaw,
     Code::LawRefused,
     Code::LawNotBuilt,
+    Code::KernelNotBuilt,
     Code::QuietRefused,
     Code::HaloSparse,
     Code::ChipRefused,
@@ -183,6 +185,7 @@ impl Code {
             Self::RuleOrLaw => "rule_or_law",
             Self::LawRefused => "law_refused",
             Self::LawNotBuilt => "law_not_built",
+            Self::KernelNotBuilt => "kernel_not_built",
             Self::QuietRefused => "quiet_refused",
             Self::HaloSparse => "halo_sparse",
             Self::ChipRefused => "chip_refused",
@@ -311,6 +314,9 @@ impl Code {
             }
             Self::LawRefused => {
                 "Fix the law at the path its refusal names; law.code says what is wrong there."
+            }
+            Self::KernelNotBuilt => {
+                "This device's driver could not compile one of the engine's kernels for this call, so retrying on it will fail the same way; nothing changed. Use another device, and report the call with the device the message names."
             }
             Self::LawNotBuilt => {
                 "This device's driver could not compile the law's kernel; the law is valid and nothing changed. Write the failing part another way or use another device, and report the law with the device the message names."
@@ -464,6 +470,9 @@ pub fn refusal_of(why: &(dyn std::error::Error + 'static)) -> Refusal {
     if why.downcast_ref::<crate::sand::Unfit>().is_some() {
         return plain(Code::Unfit);
     }
+    if why.downcast_ref::<crate::branch::LawUnbuilt>().is_some() {
+        return Refusal::new(Code::LawNotBuilt, "$.law", message);
+    }
     if let Some(held) = why.downcast_ref::<crate::compact::TooBig>() {
         let limit = match held {
             crate::compact::TooBig::Blocks { limit, .. } => int(*limit),
@@ -485,9 +494,7 @@ pub fn refusal_of(why: &(dyn std::error::Error + 'static)) -> Refusal {
         }
         Some(crate::host::Error::NoComputeDevice) => plain(Code::NoComputeDevice),
         Some(crate::host::Error::Lane(_)) => plain(Code::Lane),
-        Some(crate::host::Error::Unbuilt { .. }) => {
-            Refusal::new(Code::LawNotBuilt, "$.law", message.clone())
-        }
+        Some(crate::host::Error::Unbuilt { .. }) => plain(Code::KernelNotBuilt),
         Some(_) => plain(Code::Device),
         None => plain(Code::Error),
     }

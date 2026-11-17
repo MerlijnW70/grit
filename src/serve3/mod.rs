@@ -793,9 +793,15 @@ fn refused_with(why: &(dyn std::error::Error + 'static)) -> (Refusal, Vec<(&'sta
     if let Some(held) = why.downcast_ref::<law::Refused>() {
         return held.refusal();
     }
-    if let Some(crate::host::Error::Unbuilt { device, code }) =
-        why.downcast_ref::<crate::host::Error>()
-    {
+    let unbuilt = match (
+        why.downcast_ref::<crate::branch::LawUnbuilt>(),
+        why.downcast_ref::<crate::host::Error>(),
+    ) {
+        (Some(held), _) => Some((&held.device, held.code)),
+        (None, Some(crate::host::Error::Unbuilt { device, code })) => Some((device, *code)),
+        _ => None,
+    };
+    if let Some((device, code)) = unbuilt {
         return (
             refusal_of(why),
             vec![
