@@ -349,10 +349,11 @@ fn write_shown() -> Json {
     tool(
         "grit_world_write",
         &format!(
-            "Set cells between frames and wake them, so the next frame steps them. At most {READ_MOST} cells a call; the last write to a cell wins."
+            "Set cells of one plane between frames and wake them, so the next frame steps them. At most {READ_MOST} cells a call; the last write to a cell wins."
         ),
         vec![
             ("world", world_number()),
+            ("plane", plane_shown()),
             (
                 "cells",
                 map(vec![
@@ -687,6 +688,7 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
     let live = server.world(held)?;
     let size = live.world.size();
+    let plane = plane_of(held, &live.world)?;
     let list = held
         .get("cells")
         .and_then(Json::list)
@@ -735,7 +737,7 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         let piece = points.get(done..done + chunk).unwrap_or_default();
         let began = server.now();
         faults::cells(server.time(), piece.len());
-        let ran = server.world(held)?.world.write(piece);
+        let ran = server.world(held)?.world.write_plane(plane, piece);
         let took = server.since(began);
         if let Err(why) = ran {
             failure = Some(why);
@@ -751,13 +753,13 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let written = u32::try_from(done)?;
     let journal = if done > 0 {
         points.truncate(done);
+        let entry = if plane == 0 {
+            Entry::Write(points)
+        } else {
+            Entry::WritePlane(plane, points)
+        };
         server
-            .journaled(
-                number,
-                Entry::Write(points),
-                spent,
-                write_cost(done, sparse),
-            )
+            .journaled(number, entry, spent, write_cost(done, sparse))
             .or(owed)
     } else {
         owed
@@ -780,6 +782,7 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let frame = live.world.frame();
     let mut answer = vec![
         ("world", counted(number)),
+        ("plane", counted(plane)),
         ("written", counted(written)),
         ("frame", counted(frame)),
         ("listed", counted(listed)),
