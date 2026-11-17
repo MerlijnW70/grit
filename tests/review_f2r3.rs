@@ -170,6 +170,17 @@ mod served {
         );
     }
 
+    fn replayed(text: &str) -> usize {
+        text.find("replayed through ").map_or(0, |at| {
+            text[at + 17..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        })
+    }
+
     #[test]
     fn r3d_a_sparse_journal_of_writes_that_never_fits_burns_its_budget_every_call() {
         use grit::serve3::Options;
@@ -233,6 +244,11 @@ mod served {
             (got, began.elapsed())
         };
         let budget = 150_u64;
+        let cell = Duration::from_micros(100);
+        let most = usize::try_from(Duration::from_millis(budget).as_nanos() / cell.as_nanos())
+            .unwrap()
+            + 64;
+        grit::serve3::tools::faults::stall_cells(cell);
         let mut burned = 0;
         let mut late = 0;
         let mut refused = 0;
@@ -248,13 +264,14 @@ mod served {
             if took >= Duration::from_millis(budget) {
                 burned += 1;
             }
-            if took > Duration::from_millis(budget) + Duration::from_secs(1) {
+            if replayed(&text) * 64 > most {
                 late += 1;
             }
             if text.contains("nothing ran") && !text.contains("whose build alone") {
                 refused += 1;
             }
         }
+        grit::serve3::tools::faults::disarm();
         let rates = written(&server.heard("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"grit_describe\",\"arguments\":{}}}").unwrap());
         let at = rates.find("\"rates\"").unwrap_or(0);
         eprintln!("rates: {}", &rates[at..(at + 900).min(rates.len())]);
@@ -265,7 +282,7 @@ mod served {
         }
         assert!(
             late == 0 && refused == 0,
-            "a sparse replay that never fits {budget} ms ran its whole budget {burned} of 8 calls, {late} of them past it by more than 1 s, and was refused {refused} times without a finished replay"
+            "a sparse replay that never fits {budget} ms ran its whole budget {burned} of 8 calls, {late} of them past it by more than one entry of cells held {cell:?} each ({most} cells), and was refused {refused} times without a finished replay"
         );
     }
 }
