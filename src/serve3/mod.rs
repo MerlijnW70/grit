@@ -737,6 +737,14 @@ impl transport::Served for Flat<'_> {
     }
 }
 
+pub(crate) fn unbuilt(why: &(dyn std::error::Error + 'static)) -> bool {
+    why.downcast_ref::<crate::branch::LawUnbuilt>().is_some()
+        || matches!(
+            why.downcast_ref::<crate::host::Error>(),
+            Some(crate::host::Error::Unbuilt { .. })
+        )
+}
+
 fn lost_device(why: &(dyn std::error::Error + 'static)) -> bool {
     why.downcast_ref::<tools::Lost>().is_some()
         || matches!(
@@ -798,7 +806,7 @@ fn refused_with(why: &(dyn std::error::Error + 'static)) -> (Refusal, Vec<(&'sta
         why.downcast_ref::<crate::host::Error>(),
     ) {
         (Some(held), _) => Some((&held.device, held.code)),
-        (None, Some(crate::host::Error::Unbuilt { device, code })) => Some((device, *code)),
+        (None, Some(crate::host::Error::Unbuilt { device, code, .. })) => Some((device, *code)),
         _ => None,
     };
     if let Some((device, code)) = unbuilt {
@@ -991,7 +999,7 @@ impl<'host> Server<'host> {
                 self.live.insert(number, live);
             }
             Err(why) => {
-                if why.downcast_ref::<budget::Halted>().is_some() {
+                if why.downcast_ref::<budget::Halted>().is_some() || unbuilt(why.as_ref()) {
                     return Err(why);
                 }
                 let said = refused_with(why.as_ref()).0.message;

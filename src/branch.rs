@@ -184,6 +184,7 @@ pub struct LawUnbuilt {
     pub law: String,
     pub hash: String,
     pub device: String,
+    pub call: host::Compiling,
     pub code: ash::vk::Result,
 }
 
@@ -191,8 +192,8 @@ impl std::fmt::Display for LawUnbuilt {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             out,
-            "the driver of the device {:?} could not compile the kernel of the law {:?} ({}): pipeline creation failed with {:?}",
-            self.device, self.law, self.hash, self.code
+            "the driver of the device {:?} could not compile the kernel of the law {:?} ({}): {} failed with {:?}",
+            self.device, self.law, self.hash, self.call, self.code
         )
     }
 }
@@ -201,12 +202,15 @@ impl std::error::Error for LawUnbuilt {}
 
 fn built_from(rule: &Stepper) -> impl Fn(host::Error) -> Failed + '_ {
     move |why| match (rule, why) {
-        (Stepper::Law(law, _), host::Error::Unbuilt { device, code }) => Box::new(LawUnbuilt {
-            law: law.name().to_owned(),
-            hash: law.hex(),
-            device,
-            code,
-        }),
+        (Stepper::Law(law, _), host::Error::Unbuilt { device, call, code }) => {
+            Box::new(LawUnbuilt {
+                law: law.name().to_owned(),
+                hash: law.hex(),
+                device,
+                call,
+                code,
+            })
+        }
         (_, other) => fitted(other),
     }
 }

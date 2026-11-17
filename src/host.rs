@@ -246,8 +246,24 @@ pub enum Error {
     Lane(simdr::lanes::LaneError),
     Unbuilt {
         device: String,
+        call: Compiling,
         code: vk::Result,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compiling {
+    ShaderModule,
+    Pipeline,
+}
+
+impl std::fmt::Display for Compiling {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::ShaderModule => "shader module creation (vkCreateShaderModule)",
+            Self::Pipeline => "pipeline creation (vkCreateComputePipelines)",
+        })
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -378,9 +394,9 @@ impl std::fmt::Display for Error {
                 "a frame wrote a uniform brick that held no slot, and the write was dropped"
             ),
             Self::Lane(why) => write!(out, "a kernel could not be built: {why}"),
-            Self::Unbuilt { device, code } => write!(
+            Self::Unbuilt { device, call, code } => write!(
                 out,
-                "the driver of the device {device:?} could not compile a kernel: pipeline creation failed with {code:?}"
+                "the driver of the device {device:?} could not compile a kernel: {call} failed with {code:?}"
             ),
         }
     }

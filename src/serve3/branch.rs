@@ -369,7 +369,11 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
         Ok(world) => world,
         Err(why) => {
             let stopped = why.downcast_ref::<super::budget::Halted>().is_some();
-            if !stopped && !super::lost_device(why.as_ref()) && !server.wedged() {
+            if !stopped
+                && !super::lost_device(why.as_ref())
+                && !super::unbuilt(why.as_ref())
+                && !server.wedged()
+            {
                 let said = super::refused_with(why.as_ref()).0.message;
                 server.book.broken_earlier.insert(number, said);
             }

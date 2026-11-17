@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use ash::vk;
 
-use crate::host::{Error, Host};
+use crate::host::{Compiling, Error, Host};
 use crate::written::{Written, written};
 
 /// Counts every object resident construction makes and frees, and the
@@ -416,13 +416,14 @@ pub(crate) mod faults {
 
 use faults::Step;
 
-fn unbuilt(host: &Host, code: vk::Result) -> Error {
+fn unbuilt(host: &Host, call: crate::host::Compiling, code: vk::Result) -> Error {
     match code {
         vk::Result::ERROR_OUT_OF_HOST_MEMORY
         | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
         | vk::Result::ERROR_DEVICE_LOST => Error::Vulkan(code),
         _ => Error::Unbuilt {
             device: host.name().to_owned(),
+            call,
             code,
         },
     }
@@ -1036,10 +1037,11 @@ impl<'host> Resident<'host> {
 
         for words in modules {
             let create = vk::ShaderModuleCreateInfo::default().code(words);
-            faults::enter(Step::Shader).map_err(|code| unbuilt(self.host, code))?;
+            faults::enter(Step::Shader)
+                .map_err(|code| unbuilt(self.host, Compiling::ShaderModule, code))?;
             let shader =
                 unsafe { device.create_shader_module(&create, faults::callbacks(Step::Shader)) }
-                    .map_err(|code| unbuilt(self.host, code))?;
+                    .map_err(|code| unbuilt(self.host, Compiling::ShaderModule, code))?;
             faults::made(Step::Shader, shader);
             self.shaders.push(shader);
 
@@ -1069,7 +1071,7 @@ impl<'host> Resident<'host> {
                 self.pipelines.push(pipeline);
             }
             if let Some(code) = failed {
-                return Err(unbuilt(self.host, code));
+                return Err(unbuilt(self.host, Compiling::Pipeline, code));
             }
         }
         Ok(())
