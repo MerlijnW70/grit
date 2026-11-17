@@ -24,7 +24,7 @@
 //! The [`Helpers`] every rule uses are composed of these operations alone,
 //! so they too are the same on both.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use simdr::lanes::{LaneError, Lanes, Predicate, U32, Vector};
 use simdr::module::Id;
@@ -295,6 +295,7 @@ pub struct Device<'held, 'module, const LANES: u32> {
     one: Word<LANES>,
     failed: Option<LaneError>,
     truths: BTreeMap<Id, Predicate<LANES>>,
+    constants: BTreeSet<Id>,
     dots: Dots,
 }
 
@@ -314,6 +315,7 @@ impl<'held, 'module, const LANES: u32> Device<'held, 'module, LANES> {
             one,
             failed: None,
             truths: BTreeMap::new(),
+            constants: BTreeSet::from([zero.id(), one.id()]),
             dots,
         })
     }
@@ -359,7 +361,11 @@ impl<'held, 'module, const LANES: u32> Device<'held, 'module, LANES> {
     }
 
     fn constant_word(&mut self, value: u32) -> Word<LANES> {
-        self.emitted(|lanes| lanes.splat_bits::<U32, LANES>(value))
+        let word = self.emitted(|lanes| lanes.splat_bits::<U32, LANES>(value));
+        if self.failed.is_none() {
+            self.constants.insert(word.id());
+        }
+        word
     }
 
     fn component(&mut self, word: Word<LANES>, lane: u32, sign: bool) -> Word<LANES> {
@@ -444,6 +450,12 @@ impl<const LANES: u32> Ops for Device<'_, '_, LANES> {
 
     fn div(&mut self, left: Self::Word, right: Self::Word) -> Self::Word {
         let (zero, one) = (self.zero, self.one);
+        if self.constants.contains(&right.id()) {
+            return self.emitted(|lanes| {
+                let divisor = lanes.max(right, one)?;
+                lanes.div(left, divisor)
+            });
+        }
         self.emitted(|lanes| {
             let divisor = lanes.max(right, one)?;
             let half = lanes.shift_right_logical(left, one)?;
