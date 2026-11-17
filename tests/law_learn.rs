@@ -1003,6 +1003,98 @@ fn a_symmetry_group_has_eight_or_forty_eight_distinct_moves() {
     }
 }
 
+fn cube_examples(seed: u64, many: usize) -> String {
+    let mut rng = Rng(seed);
+    let size = [16, 16, 16];
+    let listed: Vec<String> = (0..many)
+        .map(|_| {
+            let input = random_bits(&mut rng, 4096, 2);
+            let output = vec![0_u32; 4096];
+            inline(size, &input, &output)
+        })
+        .collect();
+    format!("[{}]", listed.join(","))
+}
+
+#[test]
+fn a_symmetric_cube_ladder_starts_where_its_law_fits() {
+    let Some(host) = device("law_learn gates capped") else {
+        return;
+    };
+    let mut mcp = Mcp::new(Some(&host));
+    let size = [8, 8, 8];
+    let mut input = vec![0_u32; 512];
+    for at in [[2, 2, 2], [3, 2, 2], [6, 6, 5], [2, 6, 6], [3, 7, 7]] {
+        input[stencil::index(size, at)] = 1;
+    }
+    let truth = symmetric_truth();
+    let rows = own_rows(Stencil::Cube, size, &input, true);
+    let wanted: Vec<u32> = rows
+        .iter()
+        .map(|row| stencil::answer(27, 1, &truth, *row))
+        .collect();
+    let got = mcp.ok(
+        "grit_law_learn",
+        &learn_args(
+            Stencil::Cube,
+            "symmetric",
+            "wrapped",
+            &format!("[{}]", inline(size, &input, &wanted)),
+            0,
+            1,
+            ",\"gates\":40,\"crowd\":16384,\"rounds\":2000",
+        ),
+    );
+    let capped = got.get("gates_capped").unwrap();
+    assert_eq!(int_at(capped, "asked"), 40);
+    assert_eq!(
+        int_at(capped, "used"),
+        11,
+        "48 copies of 11 and 47 ors fit 600"
+    );
+    let ladder = got.get("ladder").and_then(Json::list).unwrap();
+    assert_eq!(int_at(&ladder[0], "gates"), 11);
+    assert!(int_at(&got, "gates") <= 600);
+    let fine = mcp.ok(
+        "grit_law_learn",
+        &learn_args(
+            Stencil::Cube,
+            "symmetric",
+            "wrapped",
+            &format!("[{}]", inline(size, &input, &wanted)),
+            0,
+            1,
+            ",\"gates\":8,\"crowd\":16384,\"rounds\":2000",
+        ),
+    );
+    assert!(fine.get("gates_capped").is_none());
+}
+
+#[test]
+fn images_past_one_kernel_are_refused_before_any_search() {
+    let Some(host) = device("law_learn images past a kernel") else {
+        return;
+    };
+    let mut mcp = Mcp::new(Some(&host));
+    let examples = cube_examples(61, 8);
+    let told = mcp.no(
+        "grit_law_learn",
+        &learn_args(Stencil::Cube, "symmetric", "wrapped", &examples, 0, 1, ""),
+    );
+    assert_eq!(
+        (text_at(&told, "refused"), text_at(&told, "field")),
+        ("learn_limit".to_owned(), "$.examples".to_owned()),
+        "{}",
+        written(&told)
+    );
+    assert!(
+        text_at(&told, "message").contains("images"),
+        "{}",
+        written(&told)
+    );
+    assert_eq!(int_at(&told, "limit"), 860_352);
+}
+
 #[cfg(feature = "faults")]
 mod faulted {
     use super::*;
@@ -1129,6 +1221,30 @@ mod faulted {
             written(&told)
         );
         assert!(text_at(&told, "message").contains("nothing was learned"));
+    }
+
+    #[test]
+    fn an_expansion_cancelled_part_way_is_refused_by_name_before_any_search() {
+        let Some(host) = device("law_learn expansion cancelled") else {
+            return;
+        };
+        let examples = cube_examples(62, 2);
+        let arguments = learn_args(Stencil::Cube, "symmetric", "wrapped", &examples, 0, 1, "");
+        let mut mcp = Mcp::new(Some(&host));
+        let flag = Arc::new(AtomicBool::new(false));
+        mcp.server.arriving(None, Some(Arc::clone(&flag)));
+        cancel_after(1);
+        let before = checks();
+        let told = mcp.no("grit_law_learn", &arguments);
+        disarm();
+        assert!(flag.load(Ordering::SeqCst));
+        assert_eq!(text_at(&told, "refused"), "cancelled", "{}", written(&told));
+        assert!(text_at(&told, "message").contains("expanding"));
+        assert_eq!(
+            checks() - before,
+            2,
+            "the second check of the expansion stopped it"
+        );
     }
 
     struct Run {
