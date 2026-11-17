@@ -34,3 +34,4 @@ pub use resident::{Groups, Resident, Run, Ticket};
 pub mod branch;
 pub mod credit;
 pub mod question;
+pub mod stencil;

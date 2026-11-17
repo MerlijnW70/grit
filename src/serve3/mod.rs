@@ -40,6 +40,7 @@ pub mod exec;
 pub mod gradient;
 pub mod journal;
 pub mod law;
+pub mod law_learn;
 pub mod learn;
 pub mod schema;
 pub mod tools;
@@ -303,6 +304,7 @@ pub struct Faults {
     pub held_by: Duration,
     pub stray_walk: bool,
     pub wedge_after_runs: Option<u64>,
+    pub wedge_after_checks: Option<u64>,
     pub stall_every: Duration,
     pub idle_done: u32,
     pub sent: Vec<(Json, u32)>,
@@ -629,7 +631,7 @@ pub struct Server<'host> {
 }
 
 /// The names of the world tools, in the order `tools/list` gives them.
-pub const WORLD_TOOLS: [&str; 20] = [
+pub const WORLD_TOOLS: [&str; 21] = [
     "grit_world_rules",
     "grit_world_create",
     "grit_world_write",
@@ -640,6 +642,7 @@ pub const WORLD_TOOLS: [&str; 20] = [
     "grit_describe",
     "grit_world_params",
     "grit_law_from_chip",
+    "grit_law_learn",
     "grit_world_save",
     "grit_world_open",
     "grit_world_list",
@@ -656,6 +659,7 @@ fn served() -> impl Iterator<Item = &'static Tool> {
     tools::TOOLS
         .iter()
         .chain(law::TOOLS)
+        .chain(law_learn::TOOLS)
         .chain(ask::TOOLS)
         .chain(branch::TOOLS)
         .chain(back::TOOLS)
