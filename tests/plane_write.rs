@@ -108,7 +108,10 @@ fn written_planes(server: &mut Server<'_>, world: i64) -> (Vec<i64>, Vec<i64>) {
         "grit_world_write",
         &format!("{{\"world\":{world},\"cells\":{zero}}}"),
     );
-    assert_eq!(int_at(&got, "plane"), 0, "plane 0 if left out");
+    assert!(
+        got.get("plane").is_none(),
+        "a plane 0 write answers as before"
+    );
     assert_eq!(read(server, world, 0), first);
     assert_eq!(read(server, world, 1), vec![0; 4096]);
     let (one, second) = cells(2);

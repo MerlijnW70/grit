@@ -235,9 +235,9 @@ fn words_shown(what: &str) -> Json {
     list_shown(
         list_shown(
             word(),
-            "one word a cell, x fastest, then y, then z",
+            "one word a cell, x fastest, then y, then z; a larger example is read from a world",
             1,
-            most(CELLS_MOST),
+            most(super::READ_MOST),
         ),
         what,
         1,
@@ -500,7 +500,7 @@ fn inline(asked: &Asked, held: &Json, at: usize) -> Result<Owned, Failed> {
     let cells = cells_of(size);
     if cells > CELLS_MOST {
         return Err(limited(
-            Code::TooMany,
+            Code::LearnLimit,
             &format!("$.examples[{at}].size"),
             format!("the example holds {cells} cells, more than the {CELLS_MOST} a call takes"),
             Json::Int(most(CELLS_MOST)),
@@ -750,7 +750,7 @@ fn examples_of(server: &mut Server<'_>, asked: &Asked, held: &Json) -> Result<Ve
         cells = cells.saturating_add(cells_of(example.inner));
         if cells > CELLS_MOST {
             return Err(limited(
-                Code::TooMany,
+                Code::LearnLimit,
                 &format!("$.examples[{at}]"),
                 format!(
                     "the examples up to this one hold {cells} cells, more than the {CELLS_MOST} a call takes"
@@ -998,7 +998,7 @@ fn fits_kernel(inputs: u32, outputs: u32, top: u32, traces: usize) -> Result<(),
     }
     let fits = crate::serve::WORK / each * 32;
     Err(limited(
-        Code::TooMany,
+        Code::LearnLimit,
         "$.examples",
         format!(
             "{traces} rows to search over with {top} gates, {inputs} inputs and {outputs} outputs pass the {} operations one kernel is allowed; at most {fits} rows fit",
@@ -1075,7 +1075,7 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let inputs = stencil.positions().saturating_mul(reads);
     if inputs > INPUTS_MOST {
         return Err(limited(
-            Code::TooMany,
+            Code::LearnLimit,
             "$.reads",
             format!(
                 "{reads} reads at the {} places of the {} stencil make {inputs} inputs, more than the {INPUTS_MOST} a learned law takes",
@@ -1100,7 +1100,7 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let top = int(held, "gates")?;
     if top < outputs {
         return Err(limited(
-            Code::TooMany,
+            Code::LearnLimit,
             "$.gates",
             format!("gates is {top}, and each of the {outputs} outputs is a gate"),
             counted(outputs),
