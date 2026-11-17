@@ -1007,7 +1007,8 @@ fn gradient_steps_recover_the_params_that_made_a_target() {
         let mut most = 0;
         for seed in 1..=DESCENT_SEEDS {
             let descent = descended(&law, &truth, seed);
-            let (from, away) = descent.trail[0].clone();
+            let from = descent.trail[0].params.clone();
+            let away = descent.trail[0].objective;
             println!(
                 "{name} seed {seed}: from {from:?} (objective {away}) to {:?} in {} steps, objective {}",
                 descent.params, descent.steps, descent.objective
@@ -1021,7 +1022,10 @@ fn gradient_steps_recover_the_params_that_made_a_target() {
             assert_ne!(from, truth, "{name} seed {seed}: started right");
             assert!(descent.steps <= MOST_STEPS);
             assert!(
-                descent.trail.windows(2).all(|pair| pair[0].0 != pair[1].0),
+                descent
+                    .trail
+                    .windows(2)
+                    .all(|pair| pair[0].params != pair[1].params),
                 "{name} seed {seed}: a step that did not move"
             );
             assert_eq!(

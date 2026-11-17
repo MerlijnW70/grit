@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use crate::law::Law;
-use crate::law::adjoint::{self, Aim, Fault, Plane, Reversible, stepped};
+use crate::law::adjoint::{self, Aim, Descender, Fault, Next, Reversible, Settled};
 use crate::law::dag::{FIRST_PARAM, Node};
 use crate::question::Region;
 use crate::sand3::Grid3;
@@ -38,7 +38,7 @@ pub const OCT_UNITS: u64 = 128;
 
 pub const SIDE_MOST: u32 = 1024;
 
-pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string: the derivative of every add, sub, mul, div, shift and sel arm on the way from params[i] to a cell, carried back by recomputing every frame with the inverse, where a compare (and so a sel's choice) counts as constant; a walk that does not come home answers strayed. A law is refused no_gradient, at the path of the first such node, when a not, and, or, xor, dot_s or dot_u takes a value that moves with a param (directly or through a cell an earlier frame moved) and its result reaches a cell other than through a compare, and when it looks (halo 1). A descent walks, moves the params by the step Reversible::descend takes and walks again; it stops converged (objective 0, or no step moves), on steps, or on budget or cancelled before a walk, and answers the earliest lowest objective on its trail with its params. A walk costs its octs times frames times the nodes of the law and its inverse plus 128; it may cost at most walk_work, on a start of at most walk_cells words, and cannot stop part way, so an answer can come one walk late. Refused before any walk: not_reversible (with the lifting refusal as law), no_gradient (with its path as law), params, outside, reversed, target_size, aim, start, walk_limit, and budget when the fastest of the last three walks the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
+pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string: the derivative of every add, sub, mul, div, shift and sel arm on the way from params[i] to a cell, carried back by recomputing every frame with the inverse, where a compare (and so a sel's choice) counts as constant; a walk that does not come home answers strayed. A law is refused no_gradient, at the path of the first such node, when a not, and, or, xor, dot_s or dot_u takes a value that moves with a param (directly or through a cell an earlier frame moved) and its result reaches a cell other than through a compare, and when it looks (halo 1). A descent walks its start, then walks one trial point per step: the secant step of the gradients of its last walks, after a trial that is not lower one retry at most as long and then each at most half as long, then moves of 1 in one param against its gradient. It keeps a trial only when its objective is lower than the kept point's, so its answer is never worse than its start and the kept objectives fall strictly; it finds a local optimum, not the global one. It stops converged (objective 0), local (no trial it can make is lower), steps, or on budget or cancelled before a walk, and answers the last kept point; the trail holds every point walked, with kept. A walk costs its octs times frames times the nodes of the law and its inverse plus 128; it may cost at most walk_work, on a start of at most walk_cells words, and cannot stop part way, so an answer can come one walk late. Refused before any walk: not_reversible (with the lifting refusal as law), no_gradient (with its path as law), params, outside, reversed, target_size, aim, start, walk_limit, and budget when the fastest of the last three walks the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -216,14 +216,14 @@ fn descend_shown() -> Json {
     properties.push((
         "steps",
         whole(
-            "the most gradient steps after the first walk",
+            "the most trial points walked after the first walk",
             1,
             i64::from(STEPS_MOST),
         ),
     ));
     tool(
         "grit_law_descend",
-        "Descend a reversible law's params by exact gradients from params toward the aim. Returns the best params, their objective, the trail and why it stopped.",
+        "Descend a reversible law's params by exact gradients from params toward the aim, keeping only lower points: never worse than the start, a local optimum at best. Returns the best params, their objective, the trail and why it stopped.",
         properties,
         &["frames", "aim", "steps"],
     )
@@ -888,16 +888,16 @@ fn graded(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Why {
-    Converged,
-    Steps,
+    Settled(Settled),
     Stopped(Stop),
 }
 
 impl Why {
     const fn name(self) -> &'static str {
         match self {
-            Self::Converged => "converged",
-            Self::Steps => "steps",
+            Self::Settled(Settled::Converged) => "converged",
+            Self::Settled(Settled::Local) => "local",
+            Self::Settled(Settled::Steps) => "steps",
             Self::Stopped(stop) => stop.name(),
         }
     }
@@ -918,78 +918,54 @@ fn descended(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let most = int(held, "steps")?;
     let posed = posed(server, held)?;
     let reversible = walker(server, &posed);
-    let mut params = posed.params.clone();
-    let mut trail: Vec<(Vec<u32>, u64)> = Vec::new();
-    let mut planes: Vec<Plane> = Vec::new();
-    let memory = params.len().max(1);
+    if let Some(stop) = halted(server, posed.units, false) {
+        return Err(refused(
+            stop.code(),
+            if stop == Stop::Budget {
+                "$.budget_ms"
+            } else {
+                "$"
+            },
+            format!(
+                "the descent stopped on {} before its first walk; nothing ran",
+                stop.name()
+            ),
+        ));
+    }
+    let first = walk(server, &reversible, &posed, &posed.params)?;
+    let mut descender = Descender::new(&posed.params, &first, most);
     let why = loop {
-        if let Some(stop) = halted(server, posed.units, !trail.is_empty()) {
-            if trail.is_empty() {
-                return Err(refused(
-                    stop.code(),
-                    if stop == Stop::Budget {
-                        "$.budget_ms"
-                    } else {
-                        "$"
-                    },
-                    format!(
-                        "the descent stopped on {} before its first walk; nothing ran",
-                        stop.name()
-                    ),
-                ));
-            }
+        let params = match descender.next() {
+            Next::Settled(settled) => break Why::Settled(settled),
+            Next::Walk(params) => params,
+        };
+        if let Some(stop) = halted(server, posed.units, true) {
             break Why::Stopped(stop);
         }
         let walked = walk(server, &reversible, &posed, &params)?;
-        trail.push((params.clone(), walked.objective));
-        let steps = u32::try_from(trail.len().saturating_sub(1)).unwrap_or(u32::MAX);
-        planes.push(Plane {
-            params: params.clone(),
-            objective: walked.objective,
-            told: walked.told,
-        });
-        if planes.len() > memory {
-            planes.remove(0);
-        }
-        let moved = stepped(&planes, &params);
-        if walked.objective == 0 {
-            break Why::Converged;
-        }
-        if steps >= most {
-            break Why::Steps;
-        }
-        if moved.iter().all(|&one| one == 0) {
-            break Why::Converged;
-        }
-        for (param, delta) in params.iter_mut().zip(moved) {
-            let next = i64::from(*param).saturating_add(delta);
-            *param = u32::try_from(next.clamp(0, i64::from(u32::MAX))).unwrap_or(0);
-        }
+        descender.walked(&walked);
     };
-    let (best, lowest) = trail
-        .iter()
-        .min_by_key(|(_, objective)| *objective)
-        .cloned()
-        .ok_or("the descent kept no trail")?;
-    let steps = u32::try_from(trail.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    let descent = descender.descent();
     let mut answer = Vec::new();
     if let Some(number) = held.get("world").and_then(Json::int) {
         answer.push(("world", Json::Int(number)));
     }
     answer.extend([
-        ("params", listed(&best)),
-        ("objective", exactly(u128::from(lowest))),
+        ("params", listed(&descent.params)),
+        ("objective", exactly(u128::from(descent.objective))),
         ("stopped", text(why.name())),
-        ("steps", counted(steps)),
+        ("steps", counted(descent.steps)),
         (
             "trail",
             Json::List(
-                trail
+                descent
+                    .trail
                     .iter()
-                    .map(|(params, objective)| {
+                    .map(|tried| {
                         map(vec![
-                            ("params", listed(params)),
-                            ("objective", exactly(u128::from(*objective))),
+                            ("params", listed(&tried.params)),
+                            ("objective", exactly(u128::from(tried.objective))),
+                            ("kept", Json::Bool(tried.kept)),
                         ])
                     })
                     .collect(),

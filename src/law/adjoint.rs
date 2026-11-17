@@ -1091,43 +1091,21 @@ impl Reversible {
     }
 
     pub fn descend(&self, world: &Posed<'_>, from: &[u32], most: u32) -> Result<Descent, Fault> {
-        let mut params = from.to_vec();
-        let mut trail = Vec::new();
-        let mut planes: Vec<Plane> = Vec::new();
-        let memory = params.len().max(1);
-        loop {
-            let walked = self.walk(
+        let walk = |params: &[u32]| {
+            self.walk(
                 world.grid,
                 world.start,
-                &params,
+                params,
                 world.first,
                 world.frames,
                 &world.aim,
-            )?;
-            trail.push((params.clone(), walked.objective));
-            let steps = u32::try_from(trail.len().saturating_sub(1)).unwrap_or(u32::MAX);
-            planes.push(Plane {
-                params: params.clone(),
-                objective: walked.objective,
-                told: walked.told,
-            });
-            if planes.len() > memory {
-                planes.remove(0);
-            }
-            let moved = stepped(&planes, &params);
-            if walked.objective == 0 || steps >= most || moved.iter().all(|&one| one == 0) {
-                return Ok(Descent {
-                    params,
-                    objective: walked.objective,
-                    steps,
-                    trail,
-                });
-            }
-            for (param, delta) in params.iter_mut().zip(moved) {
-                let next = i64::from(*param).saturating_add(delta);
-                *param = u32::try_from(next.clamp(0, i64::from(u32::MAX))).unwrap_or(0);
-            }
+            )
+        };
+        let mut descender = Descender::new(from, &walk(from)?, most);
+        while let Next::Walk(params) = descender.next() {
+            descender.walked(&walk(&params)?);
         }
+        Ok(descender.descent())
     }
 }
 
@@ -1363,6 +1341,254 @@ pub fn stepped(planes: &[Plane], current: &[u32]) -> Vec<i64> {
     moved
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tried {
+    pub params: Vec<u32>,
+    pub objective: u64,
+    pub kept: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settled {
+    Converged,
+    Local,
+    Steps,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Next {
+    Walk(Vec<u32>),
+    Settled(Settled),
+}
+
+#[derive(Clone, Debug)]
+pub struct Descender {
+    most: u32,
+    memory: usize,
+    trail: Vec<Tried>,
+    here: Tried,
+    told: Vec<i128>,
+    planes: Vec<Plane>,
+    direction: Vec<i64>,
+    reach: u64,
+    radius: u64,
+    retried: bool,
+    lining: bool,
+    units: Vec<(usize, i64)>,
+    next: Next,
+}
+
+fn widest(delta: &[i64]) -> u64 {
+    delta
+        .iter()
+        .map(|one| one.unsigned_abs())
+        .max()
+        .unwrap_or(0)
+}
+
+fn scaled(direction: &[i64], reach: u64) -> Vec<i64> {
+    let widest = widest(direction);
+    if reach >= widest {
+        return direction.to_vec();
+    }
+    direction
+        .iter()
+        .map(|&one| {
+            let made = i128::from(one) * i128::from(reach) / i128::from(widest);
+            i64::try_from(made).unwrap_or(0)
+        })
+        .collect()
+}
+
+fn moved(here: &[u32], delta: &[i64]) -> Vec<u32> {
+    here.iter()
+        .zip(delta.iter().copied().chain(core::iter::repeat(0)))
+        .map(|(&param, by)| {
+            let next = i64::from(param).saturating_add(by);
+            u32::try_from(next.clamp(0, i64::from(u32::MAX))).unwrap_or(0)
+        })
+        .collect()
+}
+
+fn between(params: &[u32], here: &[u32]) -> u64 {
+    params
+        .iter()
+        .zip(here)
+        .map(|(&now, &then)| u64::from(now.abs_diff(then)))
+        .max()
+        .unwrap_or(0)
+}
+
+fn descending(told: &[i128], direction: &[i64]) -> bool {
+    let largest = told.iter().map(|one| magnitude(*one)).max().unwrap_or(0);
+    let shift = largest.saturating_sub(NORMAL_BITS);
+    let normal: Vec<i128> = told.iter().map(|one| one >> shift).collect();
+    let along: Vec<i128> = direction.iter().map(|one| i128::from(*one)).collect();
+    dot(&normal, &along).is_some_and(|slope| slope < 0)
+}
+
+impl Descender {
+    #[must_use]
+    pub fn new(from: &[u32], walked: &Walked, most: u32) -> Self {
+        let here = Tried {
+            params: from.to_vec(),
+            objective: walked.objective,
+            kept: true,
+        };
+        let mut descender = Self {
+            most,
+            memory: from.len().max(1),
+            trail: vec![here.clone()],
+            here,
+            told: walked.told.clone(),
+            planes: Vec::new(),
+            direction: Vec::new(),
+            reach: 0,
+            radius: u64::MAX,
+            retried: false,
+            lining: false,
+            units: Vec::new(),
+            next: Next::Settled(Settled::Converged),
+        };
+        descender.remember(from, walked);
+        descender.lined();
+        descender
+    }
+
+    #[must_use]
+    pub fn next(&self) -> Next {
+        self.next.clone()
+    }
+
+    fn steps(&self) -> u32 {
+        u32::try_from(self.trail.len().saturating_sub(1)).unwrap_or(u32::MAX)
+    }
+
+    fn remember(&mut self, params: &[u32], walked: &Walked) {
+        self.planes.push(Plane {
+            params: params.to_vec(),
+            objective: walked.objective,
+            told: walked.told.clone(),
+        });
+        if self.planes.len() > self.memory {
+            self.planes.remove(0);
+        }
+    }
+
+    fn aimed(&self) -> Vec<i64> {
+        let here = &self.here.params;
+        let modelled = stepped(&self.planes, here);
+        if descending(&self.told, &modelled) {
+            return modelled;
+        }
+        stepped(
+            &[Plane {
+                params: here.clone(),
+                objective: self.here.objective,
+                told: self.told.clone(),
+            }],
+            here,
+        )
+    }
+
+    fn lined(&mut self) {
+        if self.here.objective == 0 {
+            self.next = Next::Settled(Settled::Converged);
+            return;
+        }
+        self.direction = self.aimed();
+        self.reach = widest(&self.direction).min(self.radius);
+        self.retried = false;
+        let mut order: Vec<(usize, i128)> = self
+            .told
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, slope)| *slope != 0)
+            .collect();
+        order.sort_by_key(|(_, slope)| Reverse(slope.unsigned_abs()));
+        self.units = order
+            .into_iter()
+            .rev()
+            .map(|(index, slope)| (index, if slope > 0 { -1 } else { 1 }))
+            .collect();
+        self.next = self.proposed();
+    }
+
+    fn fresh(&self, params: &[u32]) -> bool {
+        !self.trail.iter().any(|tried| tried.params == params)
+    }
+
+    fn proposed(&mut self) -> Next {
+        if self.steps() >= self.most {
+            return Next::Settled(Settled::Steps);
+        }
+        let here = self.here.params.clone();
+        while self.reach > 0 {
+            let params = moved(&here, &scaled(&self.direction, self.reach));
+            if self.fresh(&params) {
+                self.lining = true;
+                return Next::Walk(params);
+            }
+            self.reach /= 2;
+        }
+        self.lining = false;
+        while let Some((index, by)) = self.units.pop() {
+            let mut delta = vec![0; here.len()];
+            if let Some(slot) = delta.get_mut(index) {
+                *slot = by;
+            }
+            let params = moved(&here, &delta);
+            if self.fresh(&params) {
+                return Next::Walk(params);
+            }
+        }
+        Next::Settled(Settled::Local)
+    }
+
+    pub fn walked(&mut self, walked: &Walked) {
+        let Next::Walk(params) = self.next.clone() else {
+            return;
+        };
+        let step = between(&params, &self.here.params);
+        let kept = walked.objective < self.here.objective;
+        let tried = Tried {
+            params: params.clone(),
+            objective: walked.objective,
+            kept,
+        };
+        self.trail.push(tried.clone());
+        self.remember(&params, walked);
+        if kept {
+            self.here = tried;
+            self.told = walked.told.clone();
+            self.radius = step.saturating_mul(2);
+            self.lined();
+            return;
+        }
+        if self.lining {
+            self.direction = self.aimed();
+            self.reach = widest(&self.direction).min(if self.retried { step / 2 } else { step });
+            self.retried = true;
+        }
+        self.next = self.proposed();
+    }
+
+    #[must_use]
+    pub fn descent(&self) -> Descent {
+        Descent {
+            params: self.here.params.clone(),
+            objective: self.here.objective,
+            steps: self.steps(),
+            settled: match self.next {
+                Next::Settled(why) => Some(why),
+                Next::Walk(_) => None,
+            },
+            trail: self.trail.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Plain;
 
@@ -1480,7 +1706,8 @@ pub struct Descent {
     pub params: Vec<u32>,
     pub objective: u64,
     pub steps: u32,
-    pub trail: Vec<(Vec<u32>, u64)>,
+    pub settled: Option<Settled>,
+    pub trail: Vec<Tried>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

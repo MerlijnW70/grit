@@ -5,7 +5,7 @@ mod common;
 use common::device;
 
 use grit::law::Law;
-use grit::law::adjoint::{self, Aim, Descent, Fault, Posed, Reversible, Walked};
+use grit::law::adjoint::{self, Aim, Descent, Fault, Posed, Reversible, Settled, Tried, Walked};
 use grit::question::Region;
 use grit::sand3::{Grid3, reference};
 use grit::serve3::Server;
@@ -401,27 +401,35 @@ fn gradient_of(got: &Json) -> Vec<i128> {
         .collect()
 }
 
-fn trail_of(got: &Json) -> Vec<(Vec<u32>, u64)> {
+fn trail_of(got: &Json) -> Vec<Tried> {
     got.get("trail")
         .and_then(Json::list)
         .unwrap()
         .iter()
-        .map(|one| {
-            (
-                words_of(one.get("params").unwrap()),
-                whole_of(one.get("objective").unwrap()),
-            )
+        .map(|one| Tried {
+            params: words_of(one.get("params").unwrap()),
+            objective: whole_of(one.get("objective").unwrap()),
+            kept: one.get("kept") == Some(&Json::Bool(true)),
         })
         .collect()
 }
 
-fn best_of(trail: &[(Vec<u32>, u64)]) -> (Vec<u32>, u64) {
-    let lowest = trail.iter().map(|(_, objective)| *objective).min().unwrap();
-    trail
+fn best_of(trail: &[Tried]) -> (Vec<u32>, u64) {
+    let lowest = trail.iter().map(|tried| tried.objective).min().unwrap();
+    let best = trail
         .iter()
-        .find(|(_, objective)| *objective == lowest)
-        .cloned()
-        .unwrap()
+        .find(|tried| tried.objective == lowest)
+        .unwrap();
+    (best.params.clone(), best.objective)
+}
+
+const fn settled_name(settled: Option<Settled>) -> &'static str {
+    match settled {
+        Some(Settled::Converged) => "converged",
+        Some(Settled::Local) => "local",
+        Some(Settled::Steps) => "steps",
+        None => "none",
+    }
 }
 
 fn fault_code(why: Fault) -> &'static str {
@@ -505,21 +513,20 @@ fn same_descent(label: &str, got: &Json, descent: &Result<Descent, Fault>, most:
                 i64::from(descent.steps),
                 "{label}: steps"
             );
+            assert!(descent.steps <= most, "{label}: steps");
+            let params = words_of(got.get("params").unwrap());
+            let objective = whole_of(got.get("objective").unwrap());
             assert_eq!(
-                trail.last().unwrap(),
-                &(descent.params.clone(), descent.objective),
-                "{label}: last"
+                (params.clone(), objective),
+                (descent.params.clone(), descent.objective),
+                "{label}: the library's answer"
             );
-            let (best, lowest) = best_of(&descent.trail);
-            assert_eq!(words_of(got.get("params").unwrap()), best, "{label}: best");
-            assert_eq!(whole_of(got.get("objective").unwrap()), lowest, "{label}");
-            let stopped = text_at(&got, "stopped");
-            let wanted = if descent.objective == 0 || descent.steps < most {
-                "converged"
-            } else {
-                "steps"
-            };
-            assert_eq!(stopped, wanted, "{label}: stopped");
+            assert_eq!((params, objective), best_of(&trail), "{label}: best");
+            assert_eq!(
+                text_at(&got, "stopped"),
+                settled_name(descent.settled),
+                "{label}: stopped"
+            );
         }
         Err(why) => {
             let told = refusal(got);
@@ -1817,7 +1824,7 @@ mod faulted {
     }
 
     fn climbs(descent: &Descent) -> usize {
-        let objectives: Vec<u64> = descent.trail.iter().map(|(_, one)| *one).collect();
+        let objectives: Vec<u64> = descent.trail.iter().map(|tried| tried.objective).collect();
         (1..objectives.len())
             .find(|&at| objectives[at] > objectives[..at].iter().copied().min().unwrap())
             .unwrap_or_else(|| panic!("the case never climbs: {objectives:?}"))
@@ -1839,9 +1846,13 @@ mod faulted {
         assert_eq!(text_at(got, "stopped"), why);
         let (best, lowest) = best_of(&trail);
         assert_ne!(
-            trail.last().unwrap().0,
+            trail.last().unwrap().params,
             best,
             "the case must stop on a step worse than the best"
+        );
+        assert!(
+            !trail.last().unwrap().kept,
+            "a step worse than the best is not kept"
         );
         assert_eq!(
             words_of(got.get("params").unwrap()),
