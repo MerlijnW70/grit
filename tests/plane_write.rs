@@ -64,7 +64,7 @@ fn created(server: &mut Server<'_>, law: &str, sparse: bool) -> i64 {
         server,
         "grit_world_create",
         &format!(
-            "{{\"wide\":8,\"deep\":8,\"tall\":8,\"law\":{},\"sparse\":{sparse}}}",
+            "{{\"wide\":16,\"deep\":16,\"tall\":16,\"law\":{},\"sparse\":{sparse}}}",
             written(&Json::Text(law.to_owned()))
         ),
     );
@@ -75,7 +75,7 @@ fn read(server: &mut Server<'_>, world: i64, plane: u32) -> Vec<i64> {
     let got = ok(
         server,
         "grit_world_read",
-        &format!("{{\"world\":{world},\"plane\":{plane},\"from\":[0,0,0],\"to\":[7,7,7]}}"),
+        &format!("{{\"world\":{world},\"plane\":{plane},\"from\":[0,0,0],\"to\":[15,15,15]}}"),
     );
     got.get("cells")
         .and_then(Json::list)
@@ -86,12 +86,17 @@ fn read(server: &mut Server<'_>, world: i64, plane: u32) -> Vec<i64> {
 }
 
 fn cells(seed: u32) -> (String, Vec<i64>) {
-    let mut words = vec![0_i64; 512];
+    let mut words = vec![0_i64; 4096];
     let mut listed = Vec::new();
-    for at in (0..512_u32).step_by(7) {
-        let word = (at * 2_654_435_761_u32.wrapping_add(seed)) | 1;
+    for at in (0..4096_u32).step_by(7) {
+        let word = at.wrapping_mul(2_654_435_761_u32.wrapping_add(seed)) | 1;
         words[at as usize] = i64::from(word);
-        listed.push(format!("[{},{},{},{word}]", at % 8, at / 8 % 8, at / 64));
+        listed.push(format!(
+            "[{},{},{},{word}]",
+            at % 16,
+            at / 16 % 16,
+            at / 256
+        ));
     }
     (format!("[{}]", listed.join(",")), words)
 }
@@ -105,7 +110,7 @@ fn written_planes(server: &mut Server<'_>, world: i64) -> (Vec<i64>, Vec<i64>) {
     );
     assert_eq!(int_at(&got, "plane"), 0, "plane 0 if left out");
     assert_eq!(read(server, world, 0), first);
-    assert_eq!(read(server, world, 1), vec![0; 512]);
+    assert_eq!(read(server, world, 1), vec![0; 4096]);
     let (one, second) = cells(2);
     let got = ok(
         server,
@@ -140,7 +145,7 @@ fn a_plane_past_the_world_is_refused_at_plane_and_nothing_is_written() {
     let law = two_planes(&mut server);
     let world = created(&mut server, &law, false);
     let (some, _) = cells(3);
-    for plane in [2, 15] {
+    for plane in [2, 3] {
         let told = no(
             &mut server,
             "grit_world_write",
@@ -156,11 +161,11 @@ fn a_plane_past_the_world_is_refused_at_plane_and_nothing_is_written() {
     let told = no(
         &mut server,
         "grit_world_write",
-        &format!("{{\"world\":{world},\"plane\":16,\"cells\":{some}}}"),
+        &format!("{{\"world\":{world},\"plane\":4,\"cells\":{some}}}"),
     );
     assert_eq!(text_at(&told, "field"), "$.plane", "{}", written(&told));
-    assert_eq!(read(&mut server, world, 0), vec![0; 512]);
-    assert_eq!(read(&mut server, world, 1), vec![0; 512]);
+    assert_eq!(read(&mut server, world, 0), vec![0; 4096]);
+    assert_eq!(read(&mut server, world, 1), vec![0; 4096]);
     let rule = ok(
         &mut server,
         "grit_world_create",
@@ -214,6 +219,12 @@ fn a_plane_write_comes_back_after_a_restart() {
     let (first, second) = written_planes(&mut server, world);
     drop(server);
     let mut again = served(&host, &dir);
+    let opened = ok(
+        &mut again,
+        "grit_world_open",
+        &format!("{{\"name\":\"world-{world}\"}}"),
+    );
+    let world = int_at(&opened, "world");
     assert_eq!(read(&mut again, world, 0), first, "plane 0 after a restart");
     assert_eq!(
         read(&mut again, world, 1),
