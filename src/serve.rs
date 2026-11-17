@@ -30,6 +30,11 @@ pub const RUNGS: usize = 64;
 
 pub const SEEDING: u32 = 0x1234_5678;
 
+pub const ROW_ORDER: &str = "input j is bit j of a table row's index, so the row for inputs x is the sum of x_j times 2^j, and output j is bit j of the row's word";
+
+pub const FEED_ORDER: &str =
+    "input j is bit j of each feed word, and output j is bit j of each want and said word";
+
 pub struct Found {
     pub marks: u32,
     pub full: u32,
@@ -565,7 +570,19 @@ pub fn walked(
     Ok(longest)
 }
 
-type Climbed = (u32, Vec<u32>, std::time::Duration, Escapes);
+type Climbed = (u32, Vec<u32>, std::time::Duration, Escapes, bool);
+
+pub trait Halt {
+    fn halted(&mut self, next: std::time::Duration) -> bool;
+}
+
+pub struct Never;
+
+impl Halt for Never {
+    fn halted(&mut self, _: std::time::Duration) -> bool {
+        false
+    }
+}
 
 fn climbed(
     resident: &mut Resident<'_>,
@@ -574,6 +591,7 @@ fn climbed(
     effort: Effort,
     restart: u32,
     gauge: Gauge,
+    halt: &mut dyn Halt,
 ) -> Result<Climbed, Box<dyn std::error::Error>> {
     let gates = climb.shape.gates as usize;
     let mut escapes = Escapes::default();
@@ -588,10 +606,19 @@ fn climbed(
     let mut kept: Option<(u32, Vec<u32>)> = None;
     let mut best = Vec::new();
     let mut escaped: HashSet<Vec<u32>> = HashSet::new();
+    let mut last: Option<std::time::Duration> = None;
+    let mut stopped = false;
     while done < effort.rounds {
         let step = climb.look.min(effort.rounds - done);
+        let next = last.unwrap_or_else(|| gauge.round.saturating_mul(step));
+        if halt.halted(next) {
+            stopped = true;
+            break;
+        }
+        let began = std::time::Instant::now();
         longest = longest.max(walked(&mut Staged::new(resident, stages), &mut pace, step)?);
         done += step;
+        last = Some(began.elapsed());
         best = resident.read(BEST as usize, climb.many as usize)?;
         let (who, now) = leader(&best);
         if now >= climb.full {
@@ -661,11 +688,14 @@ fn climbed(
             since = 0;
         }
     }
+    if stopped && best.is_empty() {
+        best = resident.read(BEST as usize, climb.many as usize)?;
+    }
     let (who, now) = leader(&best);
     if let Some((score, gates)) = kept
         && score > now
     {
-        return Ok((done, gates, longest, escapes));
+        return Ok((done, gates, longest, escapes, stopped));
     }
     let held = resident.read(HELD as usize, room)?;
     let from = who * gates;
@@ -674,6 +704,7 @@ fn climbed(
         held.get(from..from + gates).unwrap_or(&[]).to_vec(),
         longest,
         escapes,
+        stopped,
     ))
 }
 
@@ -738,8 +769,15 @@ fn sought_within(
         width,
         board: Some(Board::of(exam)),
     };
-    let (done, gates, longest, escapes) =
-        climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
+    let (done, gates, longest, escapes, _) = climbed(
+        &mut resident,
+        &stages,
+        &climb,
+        effort,
+        restart,
+        gauge,
+        &mut Never,
+    )?;
     let mut found = judged(shape, exam, &gates)?;
     found.escapes = escapes;
     found.rounds = done;
@@ -843,6 +881,7 @@ pub struct Ran {
     pub wrong: Vec<(u32, u32)>,
     pub most: u32,
     pub longest: std::time::Duration,
+    pub stopped: bool,
 }
 
 fn laid(held: Machine, traces: &[(Vec<u32>, Vec<u32>)], wide: u32) -> (Vec<u32>, Vec<u32>) {
@@ -917,6 +956,7 @@ fn told_of(
         wrong,
         most: CROWD,
         longest: std::time::Duration::ZERO,
+        stopped: false,
     })
 }
 
@@ -927,7 +967,8 @@ pub fn machined(
     effort: Effort,
     restart: u32,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
-    machined_within(host, held, traces, effort, restart)?.map_err(|held| refused_overlong(&held))
+    machined_within(host, held, traces, effort, restart, &mut Never)?
+        .map_err(|held| refused_overlong(&held))
 }
 
 fn machined_within(
@@ -936,6 +977,7 @@ fn machined_within(
     traces: &[(Vec<u32>, Vec<u32>)],
     effort: Effort,
     restart: u32,
+    halt: &mut dyn Halt,
 ) -> Result<Result<Ran, Overlong>, Box<dyn std::error::Error>> {
     let shape = held.shape()?;
     let width = host.width();
@@ -1003,12 +1045,13 @@ fn machined_within(
         width,
         board: None,
     };
-    let (done, gates, longest, _) =
-        climbed(&mut resident, &stages, &climb, effort, restart, gauge)?;
+    let (done, gates, longest, _, stopped) =
+        climbed(&mut resident, &stages, &climb, effort, restart, gauge, halt)?;
     let chip = Chip::of(shape, gates.clone(), held.named())?;
     let mut ran = told_of(held, traces, &chip, &gates, done, many)?;
     ran.most = gauge.most;
     ran.longest = longest;
+    ran.stopped = stopped;
     Ok(Ok(ran))
 }
 
@@ -1018,19 +1061,34 @@ pub fn pressed_machine(
     traces: &[(Vec<u32>, Vec<u32>)],
     effort: Effort,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
+    pressed_machine_halted(host, held, traces, effort, &mut Never)
+}
+
+pub fn pressed_machine_halted(
+    host: &Host,
+    held: Machine,
+    traces: &[(Vec<u32>, Vec<u32>)],
+    effort: Effort,
+    halt: &mut dyn Halt,
+) -> Result<Ran, Box<dyn std::error::Error>> {
     let mut effort = effort;
     let mut restart = 0_u32;
     let mut before: Option<Ran> = None;
     loop {
-        let mut ran = match machined_within(host, held, traces, effort, restart)? {
+        let mut ran = match machined_within(host, held, traces, effort, restart, halt)? {
             Ok(ran) => ran,
             Err(over) => return before.ok_or_else(|| refused_overlong(&over)),
         };
         if let Some(earlier) = &before {
             ran.longest = ran.longest.max(earlier.longest);
+            if ran.stopped && earlier.marks > ran.marks {
+                let mut kept = before.take().ok_or("no earlier search was kept")?;
+                kept.stopped = true;
+                return Ok(kept);
+            }
         }
         let most = CROWD.min(ran.most);
-        if ran.marks >= ran.full || effort.crowd >= most {
+        if ran.stopped || ran.marks >= ran.full || effort.crowd >= most {
             return Ok(ran);
         }
         effort.crowd = effort.crowd.saturating_mul(2).min(most);
@@ -1098,6 +1156,7 @@ fn told(found: &Found, sought: bool) -> Json {
             Json::List(found.wrong.iter().map(|one| counted(*one)).collect()),
         ),
         ("checked_on_the_host", Json::Bool(true)),
+        ("row_order", text(ROW_ORDER)),
     ];
     if let Some(cared) = found.cared {
         held.insert(3, ("cared", counted(cared)));
@@ -1902,7 +1961,7 @@ pub(crate) fn tools() -> Json {
         "table",
         array(
             row_item(),
-            "one word a row, the wanted output bits, lowest output in bit zero, below two to the outputs; exactly two to the inputs rows; null marks a row whose answer does not matter, and only the other rows are scored, at least one",
+            "one word a row, the wanted output bits, below two to the outputs; exactly two to the inputs rows; null marks a row whose answer does not matter, and only the other rows are scored, at least one. Row bit j is input j: input j is bit j of a row's index, so the row for inputs x is the sum of x_j times 2^j, and output j is bit j of the row's word",
         ),
     );
     let shape = vec![
@@ -1954,14 +2013,14 @@ pub(crate) fn tools() -> Json {
                     "feed",
                     array(
                         whole_item(),
-                        "one word a step, the input bits for that step, below two to the inputs; exactly steps of them",
+                        "one word a step, the input bits for that step, below two to the inputs; exactly steps of them. Feed bit j is input j",
                     ),
                 ),
                 (
                     "want",
                     array(
                         whole_item(),
-                        "one word a step, the output bits wanted at that step, below two to the outputs; exactly steps of them",
+                        "one word a step, the output bits wanted at that step, below two to the outputs; exactly steps of them. Want bit j is output j",
                     ),
                 ),
             ],
@@ -2095,12 +2154,12 @@ pub(crate) fn tools() -> Json {
     Json::List(vec![
         tool(
             "grit_machine",
-            "Search for a synchronous machine, a circuit with state, that answers every run it is given. A run is a feed of input words and the output words wanted at each step; the machine starts from a state of all zeros. Returns the gates, what the best machine says on each run, and which step of which run it gets wrong, all marked on the host. Pass chip to mark a machine you already hold instead of searching for one. Solved means every run in the request is answered, which is not the same as holding the rule behind them: take the gates it returns, pass them back as chip with runs it has never seen, and read the marks. Runs that last longer pin a machine down on far fewer marks than short runs do.",
+            "Search for a synchronous machine, a circuit with state, that answers every run it is given. A run is a feed of input words and the output words wanted at each step; the machine starts from a state of all zeros. Feed bit j is input j and want bit j is output j. Returns the gates, what the best machine says on each run, and which step of which run it gets wrong, all marked on the host. Pass chip to mark a machine you already hold instead of searching for one. Solved means every run in the request is answered, which is not the same as holding the rule behind them: take the gates it returns, pass them back as chip with runs it has never seen, and read the marks. Runs that last longer pin a machine down on far fewer marks than short runs do.",
             object(running, &["state", "inputs", "outputs", "gates", "traces"]),
         ),
         tool(
             "grit_synthesise",
-            "Search for a circuit of two-input gates that answers a truth table exactly. Returns the circuit and the marks it scores, checked on the host, or the best it reached with the rounds and crowd it spent. While it has not solved, the search doubles the crowd itself up to 65536 before giving an answer, so a result that is not solved is evidence about the gate budget rather than about a crowd the caller happened to pick.",
+            "Search for a circuit of two-input gates that answers a truth table exactly. Row bit j is input j: the row for inputs x is the sum of x_j times 2^j, and output j is bit j of the row's word. Returns the circuit and the marks it scores, checked on the host, or the best it reached with the rounds and crowd it spent. While it has not solved, the search doubles the crowd itself up to 65536 before giving an answer, so a result that is not solved is evidence about the gate budget rather than about a crowd the caller happened to pick.",
             object(seeking.clone(), &["inputs", "outputs", "gates", "table"]),
         ),
         tool(
@@ -3053,6 +3112,7 @@ pub(crate) fn ran(
                 ),
             ),
             ("checked_on_the_host", Json::Bool(true)),
+            ("row_order", text(FEED_ORDER)),
         ]));
     }
     let inputs = if name == "grit_check" {
