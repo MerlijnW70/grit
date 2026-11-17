@@ -68,6 +68,10 @@ pub trait Ops {
     fn mul(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
     fn div(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
 
+    fn quotient(&mut self, left: Self::Word, right: Self::Word) -> Self::Word {
+        self.div(left, right)
+    }
+
     fn dot_signed(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
     fn dot_unsigned(&mut self, left: Self::Word, right: Self::Word) -> Self::Word;
 
@@ -447,6 +451,24 @@ impl<const LANES: u32> Ops for Device<'_, '_, LANES> {
         self.emitted(|lanes| {
             let divisor = lanes.max(right, one)?;
             lanes.div(left, divisor)
+        })
+    }
+
+    fn quotient(&mut self, left: Self::Word, right: Self::Word) -> Self::Word {
+        let (zero, one) = (self.zero, self.one);
+        self.emitted(|lanes| {
+            let divisor = lanes.max(right, one)?;
+            let half = lanes.shift_right_logical(left, one)?;
+            let whole = lanes.div(half, divisor)?;
+            let back = lanes.mul(whole, divisor)?;
+            let rest = lanes.sub(half, back)?;
+            let rest = lanes.shift_left(rest, one)?;
+            let low = lanes.and(left, one)?;
+            let rest = lanes.or(rest, low)?;
+            let over = lanes.greater_equal(rest, divisor)?;
+            let carry = lanes.select(over, one, zero)?;
+            let whole = lanes.shift_left(whole, one)?;
+            lanes.add(whole, carry)
         })
     }
 
