@@ -54,6 +54,8 @@ const PARAMS: u32 = 6;
 
 const BACK: u32 = 7;
 
+const WRITE_PLANE: u32 = 8;
+
 const RECORD_WORDS_MOST: usize = 1 << 24;
 
 const BACK_BATCH: u32 = 64;
@@ -112,6 +114,7 @@ pub enum Base {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Entry {
     Write(Vec<([u32; 3], u32)>),
+    WritePlane(u32, Vec<([u32; 3], u32)>),
     Step(u32),
     Params(Vec<u32>),
     Back(u32),
@@ -122,6 +125,7 @@ impl Entry {
     pub fn bytes(&self) -> usize {
         match self {
             Self::Write(cells) => 16 * cells.len() + 8,
+            Self::WritePlane(_, cells) => 16 * cells.len() + 12,
             Self::Step(_) | Self::Back(_) => 8,
             Self::Params(params) => 4 * params.len() + 8,
         }
@@ -211,7 +215,7 @@ impl Ledger {
         match entry {
             Entry::Step(frames) => self.frame = self.frame.wrapping_add(frames),
             Entry::Back(frames) => self.frame = self.frame.wrapping_sub(frames),
-            Entry::Write(_) | Entry::Params(_) => {}
+            Entry::Write(_) | Entry::WritePlane(..) | Entry::Params(_) => {}
         }
         self.bytes = self.bytes.saturating_add(entry.bytes());
         self.replay = self.replay.saturating_add(spent);
@@ -304,7 +308,7 @@ impl Ledger {
     pub fn write_bytes(&self) -> u64 {
         self.entries
             .iter()
-            .filter(|entry| matches!(entry, Entry::Write(_)))
+            .filter(|entry| matches!(entry, Entry::Write(_) | Entry::WritePlane(..)))
             .fold(0_u64, |all, entry| all.saturating_add(entry.bytes() as u64))
     }
 
@@ -960,6 +964,16 @@ fn entry_record(entry: &Entry, spent: Duration) -> (u32, Vec<u32>) {
             words.push(micros);
             (WRITE, words)
         }
+        Entry::WritePlane(plane, cells) => {
+            let mut words = Vec::with_capacity(cells.len() * 4 + 2);
+            words.push(*plane);
+            for (at, word) in cells {
+                words.extend_from_slice(at);
+                words.push(*word);
+            }
+            words.push(micros);
+            (WRITE_PLANE, words)
+        }
         Entry::Step(frames) => (STEP, vec![*frames, micros]),
         Entry::Back(frames) => (BACK, vec![*frames, micros]),
         Entry::Params(params) => {
@@ -979,6 +993,22 @@ fn entry_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration)> {
             rest.is_empty().then(|| {
                 (
                     Entry::Write(
+                        cells
+                            .iter()
+                            .map(|[x, y, z, word]| ([*x, *y, *z], *word))
+                            .collect(),
+                    ),
+                    spent,
+                )
+            })
+        }
+        WRITE_PLANE => {
+            let (&plane, payload) = payload.split_first()?;
+            let (cells, rest) = payload.as_chunks::<4>();
+            rest.is_empty().then(|| {
+                (
+                    Entry::WritePlane(
+                        plane,
                         cells
                             .iter()
                             .map(|[x, y, z, word]| ([*x, *y, *z], *word))
@@ -1150,8 +1180,14 @@ pub fn rebuilt<'host>(
         if let Some(stop) = guard.stop() {
             return Err(halted(stop, world.frame()));
         }
+        let written = match entry {
+            Entry::Write(cells) => Some((0, cells)),
+            Entry::WritePlane(plane, cells) => Some((*plane, cells)),
+            _ => None,
+        };
         match entry {
-            Entry::Write(cells) => {
+            Entry::Write(_) | Entry::WritePlane(..) => {
+                let (plane, cells) = written.ok_or("a write entry holds no cells")?;
                 let writing = std::time::Instant::now();
                 let chunk = if world.pool().is_some() {
                     cells.len().max(1)
@@ -1163,7 +1199,7 @@ pub fn rebuilt<'host>(
                         return Err(halted(stop, world.frame()));
                     }
                     super::tools::faults::cells(piece.len());
-                    world.write(piece)?;
+                    world.write_plane(plane, piece)?;
                 }
                 timings.writes = timings.writes.saturating_add(writing.elapsed());
                 timings.write_bytes = timings.write_bytes.saturating_add(entry.bytes() as u64);
