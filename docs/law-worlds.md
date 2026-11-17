@@ -169,7 +169,7 @@ Refusals, each at the path of the binding or gate:
 | `chip_too_big` | at `$.gates`: the chip compiles to more than the 16384 nodes a law holds; search with fewer gates |
 | `law_refused` | the law it makes passes another law limit |
 
-`grit_world_read` and `grit_world_slice` take `plane` to read a law world's other planes, and `grit_world_write` takes `plane` to write one: 0 if left out, as before. A plane past the world's planes is refused `outside` at `$.plane` and nothing is written. A write to plane 1 or above is journaled with its plane and comes back after a restart.
+`grit_world_read` and `grit_world_slice` take `plane` to read a law world's other planes, and `grit_world_write` takes `plane` to write one: 0 if left out, as before. A plane past the world's planes is refused `outside` at `$.plane` and nothing is written. A write to plane 1 or above names `plane` in its answer, is journaled with its plane and comes back after a restart; a plane 0 write answers and is journaled exactly as before.
 
 The X0 edge task, a 24-gate chip that `grit_machine` learned from 3x3 neighbourhoods (input `k` is row `k / 3`, column `k % 3`, from the top left):
 
@@ -200,7 +200,7 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `writes` | `{plane, bit}`, written at the cell itself |
 | `border` | `zero`: a neighbour past an example's edge reads 0. `wrapped`: an inline example wraps on itself, and a world example's box reads its neighbours from that world |
 | `rule` | `minimal` or `symmetric`, below |
-| `examples` | inline `{size, input, output}`, with one word list per read and per write, x fastest; or `{world, output_world, from, to}` |
+| `examples` | inline `{size, input, output}`, with one word list per read and per write, x fastest, at most 4096 words a list; or `{world, output_world, from, to}` for larger ones, up to 2^20 cells over all examples |
 | `gates`, `crowd`, `rounds`, `seed` | the search's effort, as `grit_least` |
 
 The server builds every example cell's row, counts the rows, and refuses `conflict` at `$.examples` when one row is seen with two outputs. The refusal's `rows` lists each such row with every output and where it was first seen. The search is `grit_machine`'s, over the seen rows only, so 27-input stencils work. It walks a gate ladder down from `gates` as `grit_least` does and keeps the smallest circuit that answers every seen row.
@@ -219,6 +219,6 @@ The answer adds `stencil`, `row_order`, `border` and `runs_as` (how to run it so
 - `unseen`: `rows`, `rule`, `means`, and per output the `zeros` and `ones` decided; for 9 inputs or fewer also the full `table` and the `unseen_rows`.
 - `stopped`: `ladder`, `budget` or `cancelled`.
 
-A search checks budget and cancel before each 50 rounds of a rung, by the last 50 rounds it measured, and before each build of a search, by the last build it measured in the call. A build compiles a kernel unrolled over the rows searched, every image of every seen row under `symmetric`, so it grows with them; the first build cannot stop part way, so an answer can come late by up to one build. A stopped ladder answers the smallest circuit solved so far, and refuses `budget` or `cancelled` when there is none. A ladder that solves nothing is refused `unsolved` at `$.gates`. Other refusals: `example`, `outside`, `reversed`, `plane_past`, `halo_written` (a read on a plane a write writes), `bit_shared`, `too_many`, `no_world`, `chip_too_big` and `no_compute_device`.
+A search checks budget and cancel before each 50 rounds of a rung, by the last 50 rounds it measured, and before each build of a search, by the last build it measured in the call. A build compiles a kernel unrolled over the rows searched, every image of every seen row under `symmetric`, so it grows with them; the first build cannot stop part way, so an answer can come late by up to one build. A stopped ladder answers the smallest circuit solved so far, and refuses `budget` or `cancelled` when there is none. A ladder that solves nothing is refused `unsolved` at `$.gates`. Other refusals: `example`, `outside`, `reversed`, `plane_past`, `halo_written` (a read on a plane a write writes), `bit_shared`, `learn_limit` (inputs past 27, cells past 2^20, rows past one kernel, gates below writes), `no_world`, `chip_too_big` and `no_compute_device`.
 
 The X0b edge task: 24 inline 32x32 pairs, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `zero`. Both rules see 125 rows of 512, refuse nothing, and find the same 4 gates: the centre is 1 and not all four of its orthogonal neighbours are. Under `minimal` that is the law; under `symmetric` it is 8 copies and 7 ors, 39 gates, with the same table. Run it as `runs_as` says: each image at the origin of a 64x64x2 world, plane 0, one step, plane 1 read.

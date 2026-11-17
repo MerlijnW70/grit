@@ -939,7 +939,7 @@ fn malformed_requests_are_refused_by_name_before_any_search() {
         ),
         (
             format!("{{\"stencil\":\"3x3x3\",\"reads\":[{{\"plane\":0,\"bit\":0}},{{\"plane\":0,\"bit\":1}}],\"writes\":[{{\"plane\":1,\"bit\":0}}],\"border\":\"zero\",\"rule\":\"minimal\",\"examples\":{examples}}}"),
-            "too_many",
+            "learn_limit",
             "$.reads",
         ),
     ];
