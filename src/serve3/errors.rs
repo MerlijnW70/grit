@@ -69,9 +69,13 @@ pub enum Code {
     WalkLimit,
     Bounds,
     RunLimit,
+    Example,
+    Conflict,
+    Asymmetric,
+    Unsolved,
 }
 
-pub const CODES: [Code; 65] = [
+pub const CODES: [Code; 69] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -137,6 +141,10 @@ pub const CODES: [Code; 65] = [
     Code::WalkLimit,
     Code::Bounds,
     Code::RunLimit,
+    Code::Example,
+    Code::Conflict,
+    Code::Asymmetric,
+    Code::Unsolved,
 ];
 
 impl Code {
@@ -208,6 +216,10 @@ impl Code {
             Self::WalkLimit => "walk_limit",
             Self::Bounds => "bounds",
             Self::RunLimit => "run_limit",
+            Self::Example => "example",
+            Self::Conflict => "conflict",
+            Self::Asymmetric => "asymmetric",
+            Self::Unsolved => "unsolved",
         }
     }
 
@@ -376,6 +388,18 @@ impl Code {
             }
             Self::RunLimit => {
                 "Score or search on a smaller start or over fewer frames; grit_describe names run_cells and run_work."
+            }
+            Self::Example => {
+                "Give each example either size, input and output inline, or world with an optional output_world, from and to; not both."
+            }
+            Self::Conflict => {
+                "Fix or drop the examples that give one neighbourhood two outputs; rows names each with where it was seen."
+            }
+            Self::Asymmetric => {
+                "Use rule minimal, or fix the examples whose neighbourhoods are rotations or reflections of each other with different outputs; orbits names them."
+            }
+            Self::Unsolved => {
+                "Search with more gates, rounds or crowd; no circuit at or below gates was found within them."
             }
         }
     }
