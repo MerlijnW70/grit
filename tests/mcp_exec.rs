@@ -4344,8 +4344,6 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
     assert!(went.int_at("ran") > 0, "{}", written(&went));
     let got = run.wait(behind);
     let took = sent.elapsed();
-    let told = answer(&got);
-    assert!(told.int_at("ran") > 0, "{}", written(&got));
     let (started, _) = queued(&faults.lock().unwrap(), behind);
     let waited = started.at.saturating_duration_since(sent);
     eprintln!(
@@ -4362,6 +4360,8 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
         "the call was charged {:?}, more than the {waited:?} it waited",
         started.charged
     );
+    let told = answer(&got);
+    assert!(told.int_at("ran") > 0, "{}", written(&got));
     run.exec.finish();
 }
 
