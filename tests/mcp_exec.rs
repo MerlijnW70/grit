@@ -216,15 +216,59 @@ fn opener() -> grit::serve3::exec::Opener {
     Box::new(move || Host::matching(pattern.as_deref()))
 }
 
+#[cfg(feature = "faults")]
+struct Reopen(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+#[cfg(feature = "faults")]
+impl Reopen {
+    fn allow(&self) {
+        let (allowed, changed) = &*self.0;
+        *allowed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        changed.notify_all();
+    }
+}
+
+#[cfg(feature = "faults")]
+impl Drop for Reopen {
+    fn drop(&mut self) {
+        self.allow();
+    }
+}
+
 impl Run {
     fn new(options: &Options) -> Self {
-        let (exec, answers) = Exec::spawn(opener(), options).unwrap();
+        Self::opened_by(opener(), options)
+    }
+
+    fn opened_by(opener: grit::serve3::exec::Opener, options: &Options) -> Self {
+        let (exec, answers) = Exec::spawn(opener, options).unwrap();
         Self {
             exec,
             answers,
             id: 100,
             early: BTreeMap::new(),
         }
+    }
+
+    #[cfg(feature = "faults")]
+    fn held_reopen(options: &Options) -> (Self, Reopen) {
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let held = std::sync::Arc::clone(&gate);
+        let mut first = opener();
+        let mut opened = false;
+        let opener: grit::serve3::exec::Opener = Box::new(move || {
+            if std::mem::replace(&mut opened, true) {
+                let (allowed, changed) = &*held;
+                let mut allowed = allowed.lock().unwrap();
+                while !*allowed {
+                    allowed = changed.wait(allowed).unwrap();
+                }
+            }
+            first()
+        });
+        (Self::opened_by(opener, options), Reopen(gate))
     }
 
     fn send(&mut self, name: &str, arguments: &str) -> i64 {
@@ -263,6 +307,14 @@ impl Run {
     fn batches(&mut self) -> i64 {
         let got = answer(&self.ask("grit_describe", "{}"));
         got.get("submissions").unwrap().int_at("batches")
+    }
+
+    fn measured_work(&mut self) -> Vec<(String, i64, i64)> {
+        let submissions = answer(&self.ask("grit_describe", "{}"))
+            .get("submissions")
+            .cloned()
+            .unwrap();
+        in_call_work(&submissions)
     }
 }
 
@@ -1143,6 +1195,7 @@ fn budgeted_side(host: &Host) -> u32 {
     side
 }
 
+#[cfg(feature = "faults")]
 #[test]
 fn a_long_step_on_a_large_world_returns_within_its_budget_with_whole_frames() {
     let Some(host) = device("budgeted step") else {
@@ -1180,6 +1233,8 @@ fn a_long_step_on_a_large_world_returns_within_its_budget_with_whole_frames() {
     )
     .unwrap();
     let budget = 500;
+    let stall = Duration::from_millis(2);
+    grit::serve3::tools::faults::stall_every(stall);
     let began = Instant::now();
     let got = answer(&call(
         &mut server,
@@ -1187,15 +1242,21 @@ fn a_long_step_on_a_large_world_returns_within_its_budget_with_whole_frames() {
         &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
     ));
     let took = began.elapsed();
-    eprintln!("{} of 65536 frames in {took:?}", got.int_at("ran"));
-    assert!(
-        took < Duration::from_millis(budget + 1000),
-        "{took:?}: {}",
-        written(&got)
+    grit::serve3::tools::faults::disarm();
+    let most = i64::try_from(Duration::from_millis(budget).as_nanos() / stall.as_nanos()).unwrap()
+        + i64::from(grit::serve3::budget::BATCH_MOST);
+    eprintln!(
+        "{} of 65536 frames held {stall:?} each in {took:?} (at most {most})",
+        got.int_at("ran")
     );
     assert_eq!(got.get("stopped").and_then(Json::text), Some("budget"));
     let ran = got.int_at("ran");
     assert!(ran > 0 && ran < 65536, "{ran}");
+    assert!(
+        ran <= most,
+        "{ran} frames held {stall:?} each ran past a budget of {budget} ms and one batch: {}",
+        written(&got)
+    );
     assert_eq!(got.int_at("frame"), ran);
     assert_eq!(got.int_at("frames"), 65536);
     let mut left = ran;
@@ -1294,7 +1355,6 @@ fn ping_and_describe_answer_at_once_while_a_step_runs_and_cancel_stops_it_betwee
     while run.batches() == before {
         assert!(started.elapsed() < WAIT, "the step never began");
     }
-    let asked = Instant::now();
     run.exec
         .line("{\"jsonrpc\":\"2.0\",\"id\":\"p\",\"method\":\"ping\"}");
     let pong = loop {
@@ -1306,21 +1366,22 @@ fn ping_and_describe_answer_at_once_while_a_step_runs_and_cancel_stops_it_betwee
         assert_ne!(id, long, "the step answered before the ping");
         run.early.insert(id, got);
     };
-    let ping_took = asked.elapsed();
     assert_eq!(
         written(&pong),
         "{\"jsonrpc\":\"2.0\",\"id\":\"p\",\"result\":{}}"
     );
-    assert!(ping_took < Duration::from_millis(500), "{ping_took:?}");
     let described = answer(&run.ask("grit_describe", "{}"));
     assert!(described.get("device").unwrap().get("name").is_some());
     assert!(!run.early.contains_key(&long));
-    let cancelled_at = Instant::now();
     run.cancel(long);
+    let at_cancel = run.batches();
     let stopped = answer(&run.wait(long));
-    let late = cancelled_at.elapsed();
-    eprintln!("cancel answered in {late:?}, ping in {ping_took:?}");
-    assert!(late < Duration::from_millis(1000), "{late:?}");
+    let after_cancel = run.batches() - at_cancel;
+    eprintln!("{after_cancel} batches finished after the cancel was seen");
+    assert!(
+        after_cancel <= 1,
+        "{after_cancel} batches finished after the cancel"
+    );
     assert_eq!(
         stopped.get("stopped").and_then(Json::text),
         Some("cancelled")
@@ -1742,26 +1803,6 @@ fn a_world_survives_the_end_of_its_server_and_opens_at_its_frame() {
     third.kill();
 }
 
-impl Run {
-    fn within(&mut self, id: i64, limit: Duration) -> Option<Json> {
-        if let Some(got) = self.early.remove(&id) {
-            return Some(got);
-        }
-        let began = Instant::now();
-        loop {
-            let left = limit.checked_sub(began.elapsed())?;
-            let got = self.answers.recv_timeout(left).ok()?;
-            let came = got.get("id").and_then(Json::int);
-            if came == Some(id) {
-                return Some(got);
-            }
-            if let Some(came) = came {
-                self.early.insert(came, got);
-            }
-        }
-    }
-}
-
 fn kept_sand(dir: &Path, number: u32, steps: &[u32]) {
     let keep = Keep::at(dir).unwrap();
     let mut ledger = Ledger::created(Made {
@@ -1792,6 +1833,20 @@ fn kinds_listed(listed: &Json) -> Vec<(String, i64)> {
         .collect()
 }
 
+#[cfg(feature = "faults")]
+fn reached(message: &str) -> u64 {
+    let at = message
+        .find("to frame ")
+        .unwrap_or_else(|| panic!("no frame in {message}"));
+    message[at + 9..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(feature = "faults")]
 #[test]
 fn an_open_of_a_kept_world_stops_on_its_budget_and_its_cancel_and_opens_nothing() {
     let Some(host) = device("open within its budget") else {
@@ -1812,21 +1867,22 @@ fn an_open_of_a_kept_world_stops_on_its_budget_and_its_cancel_and_opens_nothing(
     .int_at("world");
     let build = built.elapsed();
     answer(&run.ask("grit_world_close", &format!("{{\"world\":{probe}}}")));
-    eprintln!("building the world itself takes {build:?}, one step no budget can cut");
+    let stall = Duration::from_millis(1);
+    run.exec.faults().lock().unwrap().stall_every = stall;
     let budget = 300 + 2 * build.as_millis() as u64;
-    let began = Instant::now();
     let id = run.send(
         "grit_world_open",
         &format!("{{\"name\":\"world-1\",\"budget_ms\":{budget}}}"),
     );
-    let Some(got) = run.within(id, Duration::from_millis(budget + 1000) + build) else {
-        std::mem::forget(run);
-        panic!(
-            "an open with budget_ms {budget} had not answered after its budget, 1 s and {build:?}"
-        );
-    };
-    eprintln!("open stopped by its budget after {:?}", began.elapsed());
-    let told = refused(&got);
+    let told = refused(&run.wait(id));
+    let frame = reached(&told.message);
+    let most = 3
+        + u64::try_from(Duration::from_millis(budget).as_nanos() / stall.as_nanos()).unwrap()
+        + u64::from(grit::serve3::budget::BATCH_MOST);
+    eprintln!(
+        "an open with budget_ms {budget} and {stall:?} a frame stopped at frame {frame} (at most {most}): {}",
+        told.message
+    );
     assert_eq!(
         (told.code.as_str(), told.field.as_str()),
         ("budget", "$.budget_ms"),
@@ -1843,25 +1899,33 @@ fn an_open_of_a_kept_world_stops_on_its_budget_and_its_cancel_and_opens_nothing(
         "{}",
         told.message
     );
+    assert!(
+        frame <= most,
+        "a replay held {stall:?} a frame ran to frame {frame}, past the {most} its budget of {budget} ms and one batch allow"
+    );
     let id = run.send(
         "grit_world_open",
         "{\"name\":\"world-1\",\"budget_ms\":600000}",
     );
     std::thread::sleep(Duration::from_millis(400));
-    let asked = Instant::now();
     run.exec
         .line("{\"jsonrpc\":\"2.0\",\"id\":\"p\",\"method\":\"ping\"}");
-    let pong = run.answers.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(pong.get("id"), Some(&Json::Text("p".to_owned())));
-    assert!(asked.elapsed() < Duration::from_millis(500));
-    let cancelled = Instant::now();
-    run.cancel(id);
-    let Some(got) = run.within(id, Duration::from_millis(1000) + build) else {
-        std::mem::forget(run);
-        panic!("a cancelled open had not answered after 1 s and {build:?}");
+    let pong = loop {
+        let got = run.answers.recv_timeout(WAIT).unwrap();
+        if got.get("id") == Some(&Json::Text("p".to_owned())) {
+            break got;
+        }
+        let came = got.get("id").and_then(Json::int).unwrap();
+        assert_ne!(came, id, "the open answered before the ping");
+        run.early.insert(came, got);
     };
-    eprintln!("open stopped by its cancel after {:?}", cancelled.elapsed());
-    let told = refused(&got);
+    assert_eq!(
+        written(&pong),
+        "{\"jsonrpc\":\"2.0\",\"id\":\"p\",\"result\":{}}"
+    );
+    run.cancel(id);
+    let told = refused(&run.wait(id));
+    eprintln!("open stopped by its cancel: {}", told.message);
     assert_eq!(told.code, "cancelled", "{}", told.message);
     assert!(
         told.message.contains("nothing was opened"),
@@ -2278,9 +2342,8 @@ fn a_save_an_open_a_fork_and_a_create_too_slow_for_their_budget_are_refused_befo
             "building the world",
         ),
     ] {
-        let began = Instant::now();
+        let measured = measured_work(&mut server);
         let told = refused(&call(&mut server, tool, &arguments));
-        let took = began.elapsed();
         assert_eq!(
             (told.code.as_str(), told.field.as_str()),
             ("budget", "$.budget_ms"),
@@ -2294,7 +2357,11 @@ fn a_save_an_open_a_fork_and_a_create_too_slow_for_their_budget_are_refused_befo
             "{tool}: {}",
             written(&told.all)
         );
-        assert!(took < Duration::from_millis(50), "{tool}: {took:?}");
+        assert_eq!(
+            measured_work(&mut server),
+            measured,
+            "{tool}: the refused call measured work"
+        );
     }
     assert_eq!(entries(&scratch.dir()), before);
     let after = answer(&call(&mut server, "grit_world_list", "{}")).int_at("total");
@@ -2313,6 +2380,29 @@ fn a_save_an_open_a_fork_and_a_create_too_slow_for_their_budget_are_refused_befo
     }
     let next = create(&mut server, &format!("{made}}}"));
     assert_eq!(next, world + 1);
+}
+
+fn in_call_work(submissions: &Json) -> Vec<(String, i64, i64)> {
+    let Some(Json::Map(rates)) = submissions.get("rates") else {
+        panic!("no rates in {}", written(submissions));
+    };
+    let mut seen: Vec<(String, i64, i64)> = rates
+        .iter()
+        .filter(|(name, _)| name != "save" && name != "snapshot_in_memory")
+        .filter_map(|(name, one)| {
+            Some((
+                name.clone(),
+                one.get("observations").and_then(Json::int)?,
+                one.get("bytes_per_second").and_then(Json::int)?,
+            ))
+        })
+        .collect();
+    seen.push(("batches".to_owned(), submissions.int_at("batches"), 0));
+    seen
+}
+
+fn measured_work(server: &mut Server<'_>) -> Vec<(String, i64, i64)> {
+    in_call_work(&described(server).get("submissions").cloned().unwrap())
 }
 
 fn dense_side(host: &Host) -> u32 {
@@ -2367,23 +2457,23 @@ fn a_kept_world_too_large_to_build_in_the_budget_is_refused_before_it_is_built()
     ))
     .int_at("world");
     answer(&again.ask("grit_world_close", &format!("{{\"world\":{measured}}}")));
-    let began = Instant::now();
+    let measured = again.measured_work();
     let told = refused(&again.ask(
         "grit_world_open",
         &format!("{{\"name\":\"world-{world}\",\"budget_ms\":20}}"),
     ));
-    let took = began.elapsed();
-    eprintln!(
-        "a {side}^3 kept world refused in {took:?}: {}",
-        told.message
-    );
+    eprintln!("a {side}^3 kept world refused: {}", told.message);
     assert_eq!(told.code, "budget", "{}", told.message);
     assert!(
         told.message.contains("rebuilding world"),
         "{}",
         told.message
     );
-    assert!(took < Duration::from_millis(20 + 100), "{took:?}");
+    assert_eq!(
+        again.measured_work(),
+        measured,
+        "the refused open measured work"
+    );
     let opened = answer(&again.ask(
         "grit_world_open",
         &format!("{{\"name\":\"world-{world}\"}}"),
@@ -2400,7 +2490,7 @@ fn after_a_lost_device_only_the_worlds_a_call_touches_are_rebuilt_inside_its_bud
     };
     drop(host);
     let scratch = Scratch::new("lazy");
-    let mut run = Run::new(&Options {
+    let (mut run, reopen) = Run::held_reopen(&Options {
         dir: Some(scratch.dir()),
         memory: None,
     });
@@ -2427,14 +2517,18 @@ fn after_a_lost_device_only_the_worlds_a_call_touches_are_rebuilt_inside_its_bud
     };
     armed(&run, None, true);
     let first = models[0].0;
-    let began = Instant::now();
+    let measured = run.measured_work();
     let told = refused(&run.ask(
         "grit_world_read",
         &format!("{{\"world\":{first},\"from\":[0,0,0],\"to\":[0,0,0],\"budget_ms\":1000}}"),
     ));
-    let lost_took = began.elapsed();
-    assert!(lost_took < Duration::from_millis(1000), "{lost_took:?}");
     assert_eq!(told.code, "device_lost", "{}", told.message);
+    assert_eq!(
+        run.measured_work(),
+        measured,
+        "the call that lost the device measured work"
+    );
+    reopen.allow();
     let restored = told
         .all
         .get("restored")
@@ -3678,7 +3772,6 @@ fn a_world_whose_frames_outlast_a_short_budget_is_refused_at_once_between_probes
     ));
     let budget = Duration::from_millis(40);
     let frame = budget * 2;
-    let late = Duration::from_millis(grit::serve3::budget::SUBMIT_MOST_MS);
     let short = format!(
         "{{\"world\":{world},\"frames\":65536,\"budget_ms\":{}}}",
         budget.as_millis()
@@ -3692,9 +3785,7 @@ fn a_world_whose_frames_outlast_a_short_budget_is_refused_at_once_between_probes
     let mut probed = Vec::new();
     for call_at in 0..12 {
         let submitted = batches(&mut server);
-        let began = Instant::now();
         let got = call(&mut server, "grit_world_step", &short);
-        let took = began.elapsed();
         let ran = got_frames(&got);
         let since = batches(&mut server) - submitted;
         if ran > 0 {
@@ -3703,10 +3794,6 @@ fn a_world_whose_frames_outlast_a_short_budget_is_refused_at_once_between_probes
         } else {
             assert_eq!(since, 0, "refused call {call_at}: {}", written(&got));
         }
-        assert!(
-            took <= budget + frame + late,
-            "call {call_at} took {took:?}, more than its budget, one frame of {frame:?} and one batch"
-        );
     }
     grit::serve3::tools::faults::disarm();
     assert_eq!(probed, vec![0, 3, 6, 9]);
@@ -3858,7 +3945,7 @@ fn a_frame_held_up_while_a_world_is_rebuilt_never_refuses_a_journal_that_fits() 
 #[test]
 fn a_world_whose_one_frame_outlasts_a_short_budget_by_its_fixed_cost_is_refused_however_a_long_client_batches()
  {
-    use grit::serve3::budget::{FIXED_MOVES_AFTER, SUBMIT_MOST_MS};
+    use grit::serve3::budget::FIXED_MOVES_AFTER;
     let Some(host) = device("fixed cost too slow") else {
         return;
     };
@@ -3895,14 +3982,16 @@ fn a_world_whose_one_frame_outlasts_a_short_budget_by_its_fixed_cost_is_refused_
         let since = batches(&mut server) - submitted;
         eprintln!("short call {call_at}: {ran} frames in {since} batches, {took:?}");
         if ran > 0 {
+            assert_eq!(
+                (ran, since),
+                (1, 1),
+                "short call {call_at} ran past one frame of {frame:?}: {}",
+                written(&got)
+            );
             probed.push(call_at);
         } else {
             assert_eq!(since, 0, "refused call {call_at}: {}", written(&got));
         }
-        assert!(
-            took <= budget + frame + Duration::from_millis(SUBMIT_MOST_MS),
-            "short call {call_at} took {took:?}"
-        );
     }
     grit::serve3::tools::faults::disarm();
     assert!(
@@ -3915,7 +4004,6 @@ fn a_world_whose_one_frame_outlasts_a_short_budget_by_its_fixed_cost_is_refused_
 #[test]
 fn a_world_whose_one_frame_fits_a_short_budget_is_never_refused_however_large_the_long_clients_batches()
  {
-    use grit::serve3::budget::SUBMIT_MOST_MS;
     let Some(host) = device("fixed cost fits") else {
         return;
     };
@@ -3928,6 +4016,7 @@ fn a_world_whose_one_frame_fits_a_short_budget_is_never_refused_however_large_th
     ));
     let budget = Duration::from_millis(60);
     let fixed = Duration::from_millis(15);
+    let most = i64::try_from(budget.as_nanos() / fixed.as_nanos()).unwrap() + 1;
     grit::serve3::tools::faults::stall_submission(fixed);
     let long = format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":1000}}");
     let short = format!(
@@ -3941,17 +4030,19 @@ fn a_world_whose_one_frame_fits_a_short_budget_is_never_refused_however_large_th
             (got_frames(&got), got)
         };
         assert!(ran > 64, "long call {call_at} ran {ran} frames");
+        let submitted = batches(&mut server);
         let began = Instant::now();
         let got = call(&mut server, "grit_world_step", &short);
         let took = began.elapsed();
         let ran = got_frames(&got);
-        eprintln!("short call {call_at}: {ran} frames in {took:?}");
+        let since = batches(&mut server) - submitted;
+        eprintln!("short call {call_at}: {ran} frames in {since} batches, {took:?}");
         if ran == 0 {
             refused.push(call_at);
         }
         assert!(
-            took <= budget + Duration::from_millis(SUBMIT_MOST_MS),
-            "short call {call_at} took {took:?}"
+            since <= most,
+            "short call {call_at} ran {since} batches of at least {fixed:?} each, past its budget of {budget:?} and one batch"
         );
     }
     grit::serve3::tools::faults::disarm();
@@ -3975,48 +4066,85 @@ fn behind_idle_work(dir: bool) {
     let world = sand_world(&mut run, 32);
     let faults = run.exec.faults();
     let slow = Duration::from_millis(1500);
-    faults.lock().unwrap().slow_idle_work = slow;
-    faults.lock().unwrap().pause_after_answer = Duration::from_millis(5);
     let budget = 100;
+    let held = Duration::from_millis(2 * budget);
+    {
+        let mut armed = faults.lock().unwrap();
+        armed.slow_idle_work = slow;
+        armed.pause_after_answer = Duration::from_millis(5);
+        if dir {
+            armed.slow_write = held;
+        } else {
+            armed.held_work = vec![grit::serve3::budget::Work::Snap; 64];
+            armed.held_by = held;
+        }
+    }
     let want = if dir { 2 } else { 1 };
-    let mut behind = Duration::ZERO;
-    let mut calls = 0;
+    let mut sent = Vec::new();
+    let mut longest = Duration::ZERO;
     while faults.lock().unwrap().idle_works < want + 1 {
-        assert!(calls < 200, "the server did no idle work");
+        assert!(sent.len() < 200, "the server did no idle work");
         let began = Instant::now();
-        let got = run.ask(
+        let id = run.send(
             "grit_world_step",
             &format!("{{\"world\":{world},\"frames\":65536,\"budget_ms\":{budget}}}"),
         );
+        let got = run.wait(id);
         let took = began.elapsed();
         let result = got.get("result").unwrap();
         assert_eq!(
             result.get("isError"),
             Some(&Json::Bool(false)),
-            "call {calls} after {took:?}: {}",
+            "call {} after {took:?}: {}",
+            sent.len(),
             written(&got)
-        );
-        let most = off_worker_most(&mut run, budget, slow + slow / 3);
-        assert!(
-            took <= most,
-            "call {calls} took {took:?}, more than {most:?}"
         );
         assert!(
             got_frames(&got) > 0,
-            "call {calls} ran no frame: {}",
+            "call {} ran no frame: {}",
+            sent.len(),
             written(&got)
         );
-        if took > slow / 2 {
-            behind = behind.max(took);
-        }
-        calls += 1;
+        longest = longest.max(took);
+        sent.push(id);
     }
-    let units = faults.lock().unwrap().idle_works;
+    let armed = faults.lock().unwrap();
+    let behind: Vec<u32> = sent
+        .iter()
+        .map(|id| {
+            let (started, sent) = queued(&armed, *id);
+            started.idle_done.saturating_sub(sent)
+        })
+        .collect();
     eprintln!(
-        "{calls} steps of {budget} ms beside {units} units of idle work of {slow:?} each (directory {dir}); the longest call behind one took {behind:?}"
+        "{} steps of {budget} ms beside {} units of idle work of {slow:?} each (directory {dir}); units each call waited behind {behind:?}; the longest call took {longest:?}",
+        sent.len(),
+        armed.idle_works
     );
-    assert!(behind > slow / 2, "no call waited behind idle work");
+    assert!(
+        behind.iter().all(|units| *units <= 1),
+        "a call waited behind more than one unit of idle work: {behind:?}"
+    );
+    assert!(behind.contains(&1), "no call waited behind idle work");
+    drop(armed);
     run.exec.finish();
+}
+
+#[cfg(feature = "faults")]
+fn queued(armed: &grit::serve3::Faults, id: i64) -> (grit::serve3::Started, u32) {
+    let started = armed
+        .started
+        .iter()
+        .find(|one| one.id.int() == Some(id))
+        .cloned()
+        .unwrap_or_else(|| panic!("call {id} never started"));
+    let sent = armed
+        .sent
+        .iter()
+        .find(|(one, _)| one.int() == Some(id))
+        .map(|(_, done)| *done)
+        .unwrap_or_else(|| panic!("call {id} was never sent"));
+    (started, sent)
 }
 
 #[cfg(feature = "faults")]
@@ -4207,13 +4335,22 @@ fn a_call_queued_behind_another_is_charged_that_wait_once() {
     let took = sent.elapsed();
     let told = answer(&got);
     assert!(told.int_at("ran") > 0, "{}", written(&got));
-    let most = late_most(&mut run, second);
-    let least = Duration::from_millis(second - grit::serve3::budget::SUBMIT_MOST_MS);
+    let (started, _) = queued(&faults.lock().unwrap(), behind);
+    let waited = started.at.saturating_duration_since(sent);
     eprintln!(
-        "a call of {second} ms behind one of {first} ms held {held:?} after its work answered {took:?} after it was sent (between {least:?} and {most:?})"
+        "a call of {second} ms behind one of {first} ms held {held:?} after its work was charged {:?} of the {waited:?} it waited and answered {took:?} after it was sent",
+        started.charged
     );
-    assert!(took <= most, "{took:?}, more than {most:?}");
-    assert!(took >= least, "{took:?}, less than {least:?}");
+    assert!(
+        started.charged >= held,
+        "the call was charged {:?}, less than the {held:?} it was held behind the call ahead",
+        started.charged
+    );
+    assert!(
+        started.charged <= waited,
+        "the call was charged {:?}, more than the {waited:?} it waited",
+        started.charged
+    );
     run.exec.finish();
 }
 
