@@ -3014,6 +3014,7 @@ fn a_world_stepped_with_small_budgets_keeps_making_progress() {
     run.exec.finish();
 }
 
+#[cfg(feature = "faults")]
 #[test]
 fn a_write_past_its_budget_stops_between_cells_and_says_how_many_it_wrote() {
     let Some(host) = device("write budget") else {
@@ -3032,22 +3033,32 @@ fn a_write_past_its_budget_stops_between_cells_and_says_how_many_it_wrote() {
             cells.push((at, word));
         }
     }
+    let budget = Duration::from_millis(100);
+    let stall = Duration::from_millis(1);
+    let aim = Duration::from_millis(grit::serve3::budget::SUBMIT_MOST_MS / 2);
+    let most = usize::try_from((budget + aim).as_nanos() / stall.as_nanos()).unwrap();
+    grit::serve3::tools::faults::stall_cells(stall);
     let began = Instant::now();
     let got = answer(&call(
         &mut server,
         "grit_world_write",
         &format!(
-            "{{\"world\":{world},\"cells\":{},\"budget_ms\":100}}",
-            writing(&cells)
+            "{{\"world\":{world},\"cells\":{},\"budget_ms\":{}}}",
+            writing(&cells),
+            budget.as_millis()
         ),
     ));
     let took = began.elapsed();
+    grit::serve3::tools::faults::disarm();
     let wrote = usize::try_from(got.int_at("written")).unwrap();
     eprintln!(
-        "a write of {} cells with budget_ms 100 wrote {wrote} in {took:?}",
+        "a write of {} cells held {stall:?} each with budget_ms 100 wrote {wrote} (at most {most}) in {took:?}",
         cells.len()
     );
-    assert!(took < Duration::from_millis(100 + 250 + 100), "{took:?}");
+    assert!(
+        wrote <= most,
+        "{wrote} cells held {stall:?} each were written past a budget of {budget:?} and one write aimed at {aim:?}"
+    );
     assert_eq!(got.get("stopped").and_then(Json::text), Some("budget"));
     assert_eq!(got.int_at("asked"), i64::try_from(cells.len()).unwrap());
     assert!(wrote >= 1 && wrote < cells.len(), "{wrote}");
