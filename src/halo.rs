@@ -61,6 +61,11 @@ impl Halo {
     }
 
     #[must_use]
+    pub fn looking(self) -> usize {
+        self.cells.iter().filter(|&&held| held != 0).count()
+    }
+
+    #[must_use]
     pub fn loads(self) -> usize {
         self.cells
             .iter()
@@ -104,19 +109,23 @@ pub fn own(cell: usize) -> Option<usize> {
 }
 
 #[must_use]
-pub fn boxed(grid: Grid3, frame: u32, oct: u32, plane: &[u32]) -> Option<[u32; BOX]> {
+pub fn place(grid: Grid3, frame: u32, oct: u32, cell: usize) -> usize {
     let [bx, by, bz] = crate::sand3::lattice(grid, oct);
     let phase = frame & 1;
     let least = [bx * 2 + phase, by * 2 + phase, bz * 2 + phase];
+    let [x, y, z] = point(cell).map(|value| u32::try_from(value).unwrap_or(0));
+    grid.index(
+        least[0].wrapping_add(x).wrapping_sub(1),
+        least[1].wrapping_add(y).wrapping_sub(1),
+        least[2].wrapping_add(z).wrapping_sub(1),
+    )
+}
+
+#[must_use]
+pub fn boxed(grid: Grid3, frame: u32, oct: u32, plane: &[u32]) -> Option<[u32; BOX]> {
     let mut out = [0_u32; BOX];
     for (at, slot) in out.iter_mut().enumerate() {
-        let [x, y, z] = point(at).map(|value| u32::try_from(value).unwrap_or(0));
-        let place = grid.index(
-            least[0].wrapping_add(x).wrapping_sub(1),
-            least[1].wrapping_add(y).wrapping_sub(1),
-            least[2].wrapping_add(z).wrapping_sub(1),
-        );
-        *slot = *plane.get(place)?;
+        *slot = *plane.get(place(grid, frame, oct, at))?;
     }
     Some(out)
 }

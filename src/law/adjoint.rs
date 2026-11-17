@@ -4,6 +4,7 @@ use std::fmt;
 
 use super::dag::{AT, Dag, FIRST_PARAM, FRAME, Node};
 use super::{Code, Law, Places, Refusal};
+use crate::halo::{self, BOX};
 use crate::ops::{Cpu, Flag, Ops};
 use crate::question::cpu::{self, World};
 use crate::question::{Answer, Map, Measure, Reduce, Region, Seen};
@@ -302,6 +303,14 @@ fn input_word(dag: &Dag, which: u32) -> Option<usize> {
     }
     let above = usize::try_from(which.checked_sub(dag.first_plane())?).ok()?;
     (above < CORNERS * dag.planes().len()).then_some(CORNERS + above)
+}
+
+fn halo_input(dag: &Dag, which: u32) -> Option<(usize, usize)> {
+    if dag.halo().is_empty() {
+        return None;
+    }
+    let above = usize::try_from(which.checked_sub(dag.first_halo())?).ok()?;
+    Some((above / BOX, above % BOX))
 }
 
 struct Masks {
@@ -977,8 +986,20 @@ impl Reversible {
         weights: &[i128],
         told: &mut [i128],
     ) -> Result<Vec<i128>, Fault> {
+        self.carried_looking(oct, planes, &[], weights, told, &mut [])
+    }
+
+    pub fn carried_looking(
+        &self,
+        oct: Oct<'_, u32>,
+        planes: &[[u32; CORNERS]],
+        boxes: &[[u32; BOX]],
+        weights: &[i128],
+        told: &mut [i128],
+        looked: &mut [[i128; BOX]],
+    ) -> Result<Vec<i128>, Fault> {
         let dag = &self.forward;
-        let values = evaluated(dag, &oct, planes);
+        let values = evaluated(dag, &oct, planes, boxes);
         let mut adjoint = vec![0_i128; values.len()];
         for (word, &weight) in weights.iter().enumerate().take(spread(dag)) {
             added(&mut adjoint, word_out(dag, word), weight)?;
@@ -992,6 +1013,11 @@ impl Reversible {
             if let Node::Input(which) = node {
                 if let Some(word) = input_word(dag, which) {
                     added(&mut before, word_of(word), weight)?;
+                } else if let Some((plane, cell)) = halo_input(dag, which) {
+                    if let Some(slot) = looked.get_mut(plane).and_then(|boxed| boxed.get_mut(cell))
+                    {
+                        *slot = slot.checked_add(weight).ok_or(Fault::Overflow)?;
+                    }
                 } else if let Some(param) = which.checked_sub(FIRST_PARAM) {
                     added(told, param, weight)?;
                 }
@@ -1036,8 +1062,14 @@ impl Reversible {
         let objective = aim.measured(grid, &ended);
         let mut weights = aim.weights(grid, &ended);
         let mut told = vec![0_i128; params.len()];
+        let looks = self.forward.halo();
         for frame in (0..frames).rev().map(|done| first.wrapping_add(done)) {
             let before = reference(&self.inverse, grid, frame, &cells, params);
+            if !looks.is_empty() {
+                weights = self.looking_back(grid, frame, &before, params, &weights, &mut told)?;
+                cells = before;
+                continue;
+            }
             let mut carried = vec![0_i128; weights.len()];
             for oct in 0..grid.octs() {
                 let places = grid.corners(frame, oct);
@@ -1088,6 +1120,74 @@ impl Reversible {
             told,
             slope: weights,
         })
+    }
+
+    fn looking_back(
+        &self,
+        grid: Grid3,
+        frame: u32,
+        before: &[u32],
+        params: &[u32],
+        weights: &[i128],
+        told: &mut [i128],
+    ) -> Result<Vec<i128>, Fault> {
+        let stride = grid.cells();
+        let layers = spread(&self.forward) / CORNERS;
+        let looks = self.forward.halo();
+        let mut carried = vec![0_i128; weights.len()];
+        for oct in 0..grid.octs() {
+            let places = grid.corners(frame, oct);
+            let spots: Vec<usize> = (0..layers)
+                .flat_map(|layer| places.map(|place| layer * stride + place))
+                .collect();
+            let words = places.map(|place| before.get(place).copied().unwrap_or(0));
+            let upper: Vec<[u32; CORNERS]> = (1..layers)
+                .map(|layer| {
+                    places.map(|place| before.get(layer * stride + place).copied().unwrap_or(0))
+                })
+                .collect();
+            let boxes: Vec<[u32; BOX]> = (0..layers)
+                .map(|layer| {
+                    if !looks.looked(layer) {
+                        return [0; BOX];
+                    }
+                    before
+                        .get(layer * stride..(layer + 1) * stride)
+                        .and_then(|plane| halo::boxed(grid, frame, oct, plane))
+                        .unwrap_or([0; BOX])
+                })
+                .collect();
+            let given: Vec<i128> = spots
+                .iter()
+                .map(|&spot| weights.get(spot).copied().unwrap_or(0))
+                .collect();
+            let mut looked = vec![[0_i128; BOX]; layers];
+            let back = self.carried_looking(
+                Oct {
+                    words,
+                    frame,
+                    at: lattice(grid, oct),
+                    params,
+                },
+                &upper,
+                &boxes,
+                &given,
+                told,
+                &mut looked,
+            )?;
+            for (spot, value) in spots.into_iter().zip(back) {
+                added(&mut carried, word_of(spot), value)?;
+            }
+            for (layer, boxed) in looked.iter().enumerate() {
+                for (cell, &value) in boxed.iter().enumerate() {
+                    if value != 0 {
+                        let spot = layer * stride + halo::place(grid, frame, oct, cell);
+                        added(&mut carried, word_of(spot), value)?;
+                    }
+                }
+            }
+        }
+        Ok(carried)
     }
 
     pub fn descend(&self, world: &Posed<'_>, from: &[u32], most: u32) -> Result<Descent, Fault> {
@@ -1159,16 +1259,26 @@ fn shares(node: Node, weight: i128, values: &[u32]) -> Result<Shares, Fault> {
     })
 }
 
-fn evaluated(dag: &Dag, oct: &Oct<'_, u32>, planes: &[[u32; CORNERS]]) -> Vec<u32> {
+fn evaluated(
+    dag: &Dag,
+    oct: &Oct<'_, u32>,
+    planes: &[[u32; CORNERS]],
+    boxes: &[[u32; BOX]],
+) -> Vec<u32> {
     let cpu = &mut Cpu;
     let mut values: Vec<u32> = Vec::with_capacity(dag.len());
     for &node in dag.nodes() {
         let get = |id: u32| at(&values, id);
         let made = match node {
-            Node::Input(which) => match input_word(dag, which) {
-                Some(word) if word >= CORNERS => planes
+            Node::Input(which) => match (input_word(dag, which), halo_input(dag, which)) {
+                (Some(word), _) if word >= CORNERS => planes
                     .get(word / CORNERS - 1)
                     .and_then(|plane| plane.get(word % CORNERS))
+                    .copied()
+                    .unwrap_or(0),
+                (None, Some((plane, cell))) => boxes
+                    .get(plane)
+                    .and_then(|boxed| boxed.get(cell))
                     .copied()
                     .unwrap_or(0),
                 _ => input(oct, which),
