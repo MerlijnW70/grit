@@ -721,14 +721,12 @@ mod served {
         assert!(first >= slow, "{first:?}");
         let short = Duration::from_millis(1000);
         for asked in [16, side] {
-            let began = Instant::now();
             let told = result(
                 &call(&mut server, "grit_world_create", &cube(asked, Some(short))),
                 true,
             );
-            let took = began.elapsed();
             let message = told.get("message").and_then(Json::text).unwrap();
-            eprintln!("{asked}^3 with a {short:?} budget refused in {took:?}: {message}");
+            eprintln!("{asked}^3 with a {short:?} budget refused: {message}");
             assert_eq!(told.get("code").and_then(Json::text), Some("budget"));
             assert_eq!(told.get("field").and_then(Json::text), Some("$.budget_ms"));
             assert!(message.contains("building the world"), "{message}");
@@ -738,13 +736,12 @@ mod served {
                 "{}",
                 written(&told)
             );
-            assert!(took < short, "{took:?}");
+            assert_eq!(
+                faults.lock().unwrap().slow_builds,
+                u32::MAX - 1,
+                "the refused create of {asked}^3 built"
+            );
         }
-        assert_eq!(
-            faults.lock().unwrap().slow_builds,
-            u32::MAX - 1,
-            "a refused create built nothing"
-        );
         faults.lock().unwrap().slow_builds = 0;
     }
 
@@ -1032,6 +1029,18 @@ mod served {
 
     const LATENESS: Duration = Duration::from_secs(1);
 
+    fn reached(message: &str) -> u64 {
+        let at = message
+            .find("to frame ")
+            .unwrap_or_else(|| panic!("no frame in {message}"));
+        message[at + 9..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap()
+    }
+
     #[test]
     fn a_replay_that_never_finished_is_never_refused_and_each_cut_ends_within_its_budget() {
         let Some(host) = device("cut replays") else {
@@ -1064,18 +1073,24 @@ mod served {
         let stall = LATENESS / (4 * grit::serve3::budget::BATCH_MOST);
         eprintln!("32^3 builds {builds:?}; budget {budget:?}; {stall:?} a frame");
         grit::serve3::tools::faults::stall_every(stall);
+        let most = u64::try_from(budget.as_nanos() / stall.as_nanos()).unwrap()
+            + u64::from(grit::serve3::budget::BATCH_MOST);
         for call in 0..=grit::serve3::budget::RECENT {
             let before = replays_measured(&mut server);
             let began = Instant::now();
             let told = result(&opened(&mut server, 1, budget), true);
             let took = began.elapsed();
             let message = told.get("message").and_then(Json::text).unwrap().to_owned();
-            eprintln!("call {call} with {budget:?}: {took:?}");
+            let frame = reached(&message);
+            eprintln!("call {call} with {budget:?}: frame {frame} of at most {most} in {took:?}");
             assert!(
                 message.contains("nothing was opened"),
                 "call {call}: {message}"
             );
-            assert!(took < budget + LATENESS, "call {call}: {took:?}");
+            assert!(
+                frame <= most,
+                "call {call}: frames held {stall:?} each ran past the budget and one batch: {message}"
+            );
             assert_eq!(replays_measured(&mut server), before, "call {call}");
         }
         grit::serve3::tools::faults::disarm();
