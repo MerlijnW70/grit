@@ -98,7 +98,7 @@ pub mod faults {
     }
 
     thread_local! {
-        static ARMED: Cell<Option<(Step, u32)>> = const { Cell::new(None) };
+        static ARMED: Cell<Option<(Step, u32, vk::Result)>> = const { Cell::new(None) };
         static FIRED: Cell<bool> = const { Cell::new(false) };
         static COUNTS: RefCell<[(u64, u64); KINDS]> = const { RefCell::new([(0, 0); KINDS]) };
         static HOOKS: &'static Hooks = hooks();
@@ -273,7 +273,11 @@ pub mod faults {
 
     /// Fails the `nth` time, counting from nought, that `step` is reached.
     pub fn arm(step: Step, nth: u32) {
-        ARMED.set(Some((step, nth)));
+        arm_with(step, nth, vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+
+    pub fn arm_with(step: Step, nth: u32, code: vk::Result) {
+        ARMED.set(Some((step, nth, code)));
         FIRED.set(false);
     }
 
@@ -321,19 +325,19 @@ pub mod faults {
     }
 
     pub(crate) fn enter(step: Step) -> Result<(), vk::Result> {
-        let Some((armed, nth)) = ARMED.get() else {
+        let Some((armed, nth, code)) = ARMED.get() else {
             return Ok(());
         };
         if armed != step {
             return Ok(());
         }
         if nth > 0 {
-            ARMED.set(Some((armed, nth - 1)));
+            ARMED.set(Some((armed, nth - 1, code)));
             return Ok(());
         }
         ARMED.set(None);
         FIRED.set(true);
-        Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        Err(code)
     }
 
     fn tally(step: Step, handle: impl vk::Handle, made: bool) {
@@ -411,6 +415,18 @@ pub(crate) mod faults {
 }
 
 use faults::Step;
+
+fn unbuilt(host: &Host, code: vk::Result) -> Error {
+    match code {
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY
+        | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+        | vk::Result::ERROR_DEVICE_LOST => Error::Vulkan(code),
+        _ => Error::Unbuilt {
+            device: host.name().to_owned(),
+            code,
+        },
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Groups {
@@ -1020,9 +1036,10 @@ impl<'host> Resident<'host> {
 
         for words in modules {
             let create = vk::ShaderModuleCreateInfo::default().code(words);
-            faults::enter(Step::Shader)?;
+            faults::enter(Step::Shader).map_err(|code| unbuilt(self.host, code))?;
             let shader =
-                unsafe { device.create_shader_module(&create, faults::callbacks(Step::Shader)) }?;
+                unsafe { device.create_shader_module(&create, faults::callbacks(Step::Shader)) }
+                    .map_err(|code| unbuilt(self.host, code))?;
             faults::made(Step::Shader, shader);
             self.shaders.push(shader);
 
@@ -1052,7 +1069,7 @@ impl<'host> Resident<'host> {
                 self.pipelines.push(pipeline);
             }
             if let Some(code) = failed {
-                return Err(code.into());
+                return Err(unbuilt(self.host, code));
             }
         }
         Ok(())
