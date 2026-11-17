@@ -25,6 +25,7 @@ Refusals:
 |---|---|---|
 | `rule_or_law` | both or neither of `rule` and `law` | `$` |
 | `law_refused` | the law does not compile; `law` in the answer holds its own `code`, `path`, `expected`, `found` | `$.law` |
+| `law_not_built` | the device's driver failed to compile the law's kernel (pipeline creation); `device` and `vulkan` in the answer name the device and its result; no world is made and nothing else changes | `$.law` |
 | `params` | a params count other than the law's | `$.params` |
 | `quiet_refused` | a sparse world under a `whole` law | `$.sparse` |
 
