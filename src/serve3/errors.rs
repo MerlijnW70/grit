@@ -45,6 +45,7 @@ pub enum Code {
     Io,
     RuleOrLaw,
     LawRefused,
+    LawNotBuilt,
     QuietRefused,
     HaloSparse,
     ChipRefused,
@@ -61,7 +62,7 @@ pub enum Code {
     Strayed,
 }
 
-pub const CODES: [Code; 55] = [
+pub const CODES: [Code; 56] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -103,6 +104,7 @@ pub const CODES: [Code; 55] = [
     Code::Io,
     Code::RuleOrLaw,
     Code::LawRefused,
+    Code::LawNotBuilt,
     Code::QuietRefused,
     Code::HaloSparse,
     Code::ChipRefused,
@@ -164,6 +166,7 @@ impl Code {
             Self::Io => "io",
             Self::RuleOrLaw => "rule_or_law",
             Self::LawRefused => "law_refused",
+            Self::LawNotBuilt => "law_not_built",
             Self::QuietRefused => "quiet_refused",
             Self::HaloSparse => "halo_sparse",
             Self::ChipRefused => "chip_refused",
@@ -284,6 +287,9 @@ impl Code {
             }
             Self::LawRefused => {
                 "Fix the law at the path its refusal names; law.code says what is wrong there."
+            }
+            Self::LawNotBuilt => {
+                "This device's driver could not compile the law's kernel; the law is valid and nothing changed. Write the failing part another way or use another device, and report the law with the device the message names."
             }
             Self::QuietRefused => {
                 "Make the world dense, which steps every oct, or keep params under which the law is proved."
@@ -431,6 +437,9 @@ pub fn refusal_of(why: &(dyn std::error::Error + 'static)) -> Refusal {
         }
         Some(crate::host::Error::NoComputeDevice) => plain(Code::NoComputeDevice),
         Some(crate::host::Error::Lane(_)) => plain(Code::Lane),
+        Some(crate::host::Error::Unbuilt { .. }) => {
+            Refusal::new(Code::LawNotBuilt, "$.law", message.clone())
+        }
         Some(_) => plain(Code::Device),
         None => plain(Code::Error),
     }
