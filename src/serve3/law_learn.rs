@@ -52,7 +52,7 @@ pub const ZERO_RUNS: &str = "the law reads its neighbours wrapped on the world's
 
 pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world whose sides equal its own along each axis the stencil reads (3x3 reads x and y, so its tall is free; a world's tall is at least 2), and a world example's box reads its neighbours from that world";
 
-pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung doubles its crowd up to 65536 while unsolved, and the ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call does not fit; the first build cannot stop part way, and its kernel is unrolled over the rows searched (under symmetric every image of every seen row), so it grows with them and an answer can come late by up to one build; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion and the count of decided rows check budget and cancel every 4096 rows or 64-row blocks and refuse budget or cancelled. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device";
+pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung doubles its crowd up to 65536 while unsolved, and the ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call does not fit; the first build cannot stop part way, and its kernel is unrolled over the rows searched (under symmetric every image of every seen row), so it grows with them and an answer can come late by up to one build; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion and the count of decided rows check budget and cancel every 4096 rows or 64-row blocks and refuse budget or cancelled; after a stopped ladder the count runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so that the smallest circuit solved so far is answered with its counts. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -1169,11 +1169,20 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .collect();
     fits_kernel(inputs, outputs, top, rows.seen.len())?;
     let most = usize::try_from(rows_most(inputs, outputs, top)).unwrap_or(usize::MAX);
-    let guard = server.guard();
+    let mut watch = Watch {
+        guard: server.guard(),
+        host: server.host,
+        stop: None,
+        began: None,
+        built: None,
+        #[cfg(feature = "faults")]
+        faults: server.faults(),
+    };
     let mut stopped: Option<Stop> = None;
     let wanted: std::collections::BTreeMap<u32, u32> = if symmetric {
         let mut halted = || {
-            stopped = guard.stop();
+            let _ = watch.charged();
+            stopped = watch.guard.stop();
             stopped.is_some()
         };
         let orbits = match stencil::orbits(&rows.seen, &moves, most, &mut halted) {
@@ -1212,15 +1221,6 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .map(|(row, out)| (vec![*row], vec![*out]))
         .collect();
     fits_kernel(inputs, outputs, top, traces.len())?;
-    let mut watch = Watch {
-        guard: server.guard(),
-        host: server.host,
-        stop: None,
-        began: None,
-        built: None,
-        #[cfg(feature = "faults")]
-        faults: server.faults(),
-    };
     let laddered = ladder(host, &mut watch, (inputs, outputs), &traces, top, effort)?;
     let Some((found, gates)) = laddered.best else {
         if let Some(stop) = laddered.stop {
@@ -1283,7 +1283,11 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let unseen = total - seen;
     let mut counting_stop: Option<Stop> = None;
     let guard = server.guard();
+    let already = laddered.stop.is_some();
     let mut halted = || {
+        if already {
+            return false;
+        }
         counting_stop = guard.stop();
         counting_stop.is_some()
     };
