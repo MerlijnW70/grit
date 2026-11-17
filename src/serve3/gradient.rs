@@ -223,7 +223,7 @@ fn descend_shown() -> Json {
     ));
     tool(
         "grit_law_descend",
-        "Descend a reversible law's params by exact gradients from params toward the aim, keeping only lower points: never worse than the start, a local optimum at best. Returns the best params, their objective, the trail and why it stopped.",
+        "Descend a reversible law's params by exact gradients toward the aim, keeping only lower points: never worse than the start, a local optimum at best. Returns the best params, objective, trail and stop.",
         properties,
         &["frames", "aim", "steps"],
     )
