@@ -101,11 +101,11 @@ mod served {
         let _ = std::fs::remove_dir_all(&root);
         let refused = first.get("result").and_then(|r| r.get("isError")) == Some(&Json::Bool(true));
         let said = written(&first);
+        let cut =
+            said.contains("before the call stopped on budget") && !said.contains("nothing ran");
         assert!(
-            !refused
-                || (said.contains("before the call stopped on budget")
-                    && !said.contains("nothing ran")),
-            "refused a replay before running it, which then ran in {took2:?}: {said}"
+            !refused || (cut && took >= Duration::from_secs(30)),
+            "refused a replay after {took:?} of its 30 s budget, which then ran in {took2:?}: {said}"
         );
     }
 }
