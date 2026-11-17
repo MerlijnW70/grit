@@ -3066,7 +3066,7 @@ fn a_write_past_its_budget_stops_between_cells_and_says_how_many_it_wrote() {
         }
     }
     let budget = Duration::from_millis(100);
-    let stall = Duration::from_millis(1);
+    let stall = Duration::from_millis(20);
     let aim = Duration::from_millis(grit::serve3::budget::SUBMIT_MOST_MS / 2);
     let most = usize::try_from((budget + aim).as_nanos() / stall.as_nanos()).unwrap();
     grit::serve3::tools::faults::stall_cells(stall);
