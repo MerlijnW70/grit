@@ -206,6 +206,18 @@ mod served {
         }
     }
 
+    fn reached(text: &str) -> u64 {
+        let at = text
+            .find("to frame ")
+            .unwrap_or_else(|| panic!("no frame in {text}"));
+        text[at + 9..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap()
+    }
+
     fn shaped(label: &str, worlds: &[(u32, u32, Duration)]) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -248,6 +260,8 @@ mod served {
         let mut server = Server::with(Some(&host), &options).unwrap();
         grit::serve3::tools::faults::stall_every(STALL);
         let short = Duration::from_millis(200);
+        let most = u64::try_from(short.as_nanos() / STALL.as_nanos()).unwrap()
+            + u64::from(grit::serve3::budget::BATCH_MOST);
         let mut cut = 0;
         let mut refused = None;
         let mut late = None;
@@ -269,7 +283,7 @@ mod served {
                 break;
             }
             assert!(text.contains("stopped on budget"), "setup: {text}");
-            if took > short + Duration::from_secs(1) {
+            if reached(&text) > most {
                 late.get_or_insert(took);
             }
             cut += 1;
@@ -280,7 +294,7 @@ mod served {
         let _ = std::fs::remove_dir_all(&root);
         assert!(
             refused.is_none() && late.is_none(),
-            "a replay of {FRAMES} frames, each held {STALL:?}, can never fit {short:?} and never finished, so it must be cut by its budget within 1 s every time and never refused, whatever another journal finished: cut {cut} times, refused at round {refused:?}, first late cut {late:?}; last: {}",
+            "a replay of {FRAMES} frames, each held {STALL:?}, can never fit {short:?} and never finished, so it must be cut by its budget and one batch ({most} frames) every time and never refused, whatever another journal finished: cut {cut} times, refused at round {refused:?}, first late cut after {late:?}; last: {}",
             last.unwrap_or_default()
         );
     }
