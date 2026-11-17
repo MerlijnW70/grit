@@ -90,6 +90,25 @@ The answers equal the library's `Reversible::walk` and `Reversible::descend` exa
 
 Neither tool writes a world or its journal. Refused before any walk: `not_reversible` (with the lifting refusal as `law`), `no_gradient` (above), `params`, `outside`, `reversed`, `target_size`, `aim`, `start`, `walk_limit` (a start past `walk_cells` words, a walk past `walk_work`), `budget`. A walk that does not come home answers `strayed` with the cell; one past 128 bits answers `overflow`. `grit_describe` names the limits under `law_gradient`.
 
+## Searching a law's params
+
+`grit_law_score` and `grit_learn_params` work for any law: not reversible, with `not`, `and`, `xor`, `dot_s`, thresholds or looks. They take the start, `params`, `frames` (1 to 4096) and `aim` as `grit_law_gradient` does, and run the law forward on the CPU with `sand3::reference`, the CPU twin the device kernels are tested equal to, so the answer is the same on every device. The objective is the same sum of `|cell - target|`.
+
+`grit_law_score` answers `objective` for `params`.
+
+`grit_learn_params` also takes `bounds` (`[least, greatest]` per param), `seed`, `population` (1 to 256) and `generations` (1 to 1024). It is a (1+`population`) evolution strategy over whole params: each generation runs `population` children of the parent, each param moved by about its spread and clamped to its bounds; the earliest lowest child becomes the parent when it is no worse. A spread starts at a quarter of its bounds' width, grows when more than a fifth of the children were no worse, and shrinks when fewer were. After 8 generations without a lower parent, with every spread at 1, the parent restarts at a random point inside bounds. All draws come from `seed`.
+
+It answers `params` and `objective` (the earliest lowest of every run), `stopped` (`found` at objective 0, `generations`, `budget` or `cancelled`), `generations`, `scored` (runs made) and `trail` (each finished generation's earliest lowest `{params, objective}`; generation 0 is `params`). The same arguments give the same answer byte for byte; a stopped search's `trail` is a prefix of the whole search's.
+
+1. `grit_world_create` with `law` heat (`tests/law/heat.law.json`), 8 by 8 by 8, the hidden `params` `[300,7,900]`, `grit_world_write` the start, `grit_world_step` 8 frames: the target world.
+2. `grit_world_create` the same law with a guess, `params` `[700,12,3000]`, and `grit_world_write` the same start: the learner.
+3. `grit_learn_params` with `world` the learner, `frames` 8, `aim` `{"from":[0,0,0],"to":[7,7,7],"world":<target>}`, `bounds` `[[0,1023],[0,15],[0,4095]]`, `seed` 7, `population` 8, `generations` 200: `objective` 0, `stopped` `found`, after 533 runs.
+4. `grit_world_params` the learner with the answer's `params` and `grit_world_step` 8 frames: its cells equal the target's.
+
+Many params can give objective 0 (heat's `chance` only matters through a 4-bit draw), so the answer need not equal the hidden params. Heat has local optima: from this guess, 10 of seeds 0 to 19 reach 0 within 200 generations at population 8, and 15 at population 16; search again with another seed or a larger population when one stops on `generations`.
+
+A run costs octs times frames times (law nodes + 128), at most `run_work` (2^26), on a start of at most `run_cells` (32768) words; it cannot stop part way. Refused before any run: `law_refused`, `start` (also a world under a named rule), `params` (also at `$.bounds` for the wrong count), `bounds` (a param outside its bounds, or no param free to move), `reversed`, `outside`, `target_size`, `aim`, `run_limit`, `budget`, and `too_many` for `population` or `generations` past their limit. A device lost during a search does not change its answer, which says `restored`. Neither tool writes a world or its journal. `grit_describe` names the limits under `law_search`.
+
 ## The quiet class
 
 A listed world steps an oct only while it, or an oct around it, changed in the two frames before; a sparse world also keeps an all-one-value brick as a single word and steps it only while it is hot. That gives the cells of stepping every oct only when:
