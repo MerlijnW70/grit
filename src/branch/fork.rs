@@ -2,7 +2,7 @@ use crate::layout::Windows;
 use crate::live;
 use crate::resident::Resident;
 
-use super::{Failed, Refused, World, fitted};
+use super::{Failed, Refused, World, built_from};
 
 fn copied(
     from: &mut Resident<'_>,
@@ -34,7 +34,10 @@ impl<'host> World<'host> {
     pub fn fork(&mut self) -> Result<Self, Failed> {
         let rule = self.rule.again(self.host, &self.params)?;
         let modules: Vec<&[u32]> = self.passes.iter().map(Vec::as_slice).collect();
-        let mut live = self.host.resident(&self.sizes, &modules).map_err(fitted)?;
+        let mut live = self
+            .host
+            .resident(&self.sizes, &modules)
+            .map_err(built_from(&self.rule))?;
         let reach = self.reach()?;
         copied(&mut self.live, &mut live, &self.sizes, reach)?;
         Ok(Self {
