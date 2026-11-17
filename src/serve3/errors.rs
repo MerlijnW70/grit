@@ -316,10 +316,10 @@ impl Code {
                 "Fix the law at the path its refusal names; law.code says what is wrong there."
             }
             Self::KernelNotBuilt => {
-                "This device's driver could not compile one of the engine's kernels for this call, so retrying on it will fail the same way; nothing changed. Use another device, and report the call with the device the message names."
+                "This device's driver could not compile one of the engine's kernels for this call, so retrying on this device fails the same way. No world was made or changed, and a kept world stays kept: it opens on a device that compiles it. Use another device, and report the call with the device the message names."
             }
             Self::LawNotBuilt => {
-                "This device's driver could not compile the law's kernel; the law is valid and nothing changed. Write the failing part another way or use another device, and report the law with the device the message names."
+                "This device's driver could not compile a kernel made from this law, though the law is valid. No world was made or changed, and a kept world stays kept: it opens on a device that compiles it. Write the failing part another way or use another device, and report the law with the device the message names."
             }
             Self::QuietRefused => {
                 "Make the world dense, which steps every oct, or keep params under which the law is proved."
