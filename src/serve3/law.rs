@@ -554,7 +554,7 @@ fn spots_of(held: &Json, key: &str) -> Vec<Spot> {
         .collect()
 }
 
-fn chip_refused(why: &chip::Refused) -> Failed {
+pub(super) fn chip_refused(why: &chip::Refused) -> Failed {
     let code = match why.fault {
         chip::Fault::Chip => Code::ChipRefused,
         chip::Fault::Channels => Code::Malformed,
@@ -630,6 +630,13 @@ fn from_chip(_: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         keeps: spots_of(held, chip::KEEPS),
         rest,
     };
+    Ok(map(chip_law(circuit, wiring)?))
+}
+
+pub(super) fn chip_law(
+    circuit: Circuit,
+    wiring: Wiring,
+) -> Result<Vec<(&'static str, Json)>, Failed> {
     let wired = Wired::new(circuit, wiring).map_err(|why| chip_refused(&why))?;
     let written = wired.text();
     let law = Law::compile(&written).map_err(|why| too_big(&why, wired.circuit()))?;
@@ -658,5 +665,5 @@ fn from_chip(_: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if let Some(why) = class.why() {
         answer.insert(6, ("quiet_why", text(&why)));
     }
-    Ok(map(answer))
+    Ok(answer)
 }

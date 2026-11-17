@@ -1260,6 +1260,11 @@ pub fn describe(status: &Status) -> Json {
                 ("search_stale", number(super::learn::STALE)),
                 ("law_from_chip", text(super::law::FROM_CHIP)),
                 ("law_from_chip_gates", number(crate::law::chip::GATES_SURE)),
+                ("law_learn", text(super::law_learn::LEARN)),
+                ("law_learn_rows", text(crate::stencil::ORDER)),
+                ("learn_cells", number(super::law_learn::CELLS_MOST)),
+                ("learn_examples", number(super::law_learn::EXAMPLES_MOST)),
+                ("learn_inputs", number(super::law_learn::INPUTS_MOST)),
                 (
                     "law_from_chip_nodes",
                     text(&format!(
