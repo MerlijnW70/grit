@@ -40,7 +40,9 @@ fn call(server: &mut Server<'_>, name: &str, arguments: &str) -> Json {
 }
 
 fn res(got: &Json, error: bool) -> Json {
-    let held = got.get("result").unwrap_or_else(|| panic!("{}", written(got)));
+    let held = got
+        .get("result")
+        .unwrap_or_else(|| panic!("{}", written(got)));
     let text = written(got);
     assert_eq!(
         held.get("isError"),
@@ -73,7 +75,11 @@ fn text_at(held: &Json, key: &str) -> String {
 }
 
 fn ints(held: &Json) -> Vec<i64> {
-    held.list().unwrap().iter().map(|one| one.int().unwrap()).collect()
+    held.list()
+        .unwrap()
+        .iter()
+        .map(|one| one.int().unwrap())
+        .collect()
 }
 
 fn list(words: &[u32]) -> String {
@@ -145,13 +151,7 @@ fn offsets(cube: bool) -> Vec<[i64; 3]> {
     out
 }
 
-fn hood(
-    cube: bool,
-    size: [u32; 3],
-    planes: &[Vec<u32>],
-    at: [u32; 3],
-    wrap: bool,
-) -> u32 {
+fn hood(cube: bool, size: [u32; 3], planes: &[Vec<u32>], at: [u32; 3], wrap: bool) -> u32 {
     let places = offsets(cube);
     let positions = places.len() as u32;
     let mut row = 0;
@@ -235,7 +235,11 @@ fn read_box(server: &mut Server<'_>, number: i64, plane: u32, size: [u32; 3]) ->
                     size[0] - 1
                 ),
             );
-            out.extend(ints(got.get("cells").unwrap()).into_iter().map(|one| one as u32));
+            out.extend(
+                ints(got.get("cells").unwrap())
+                    .into_iter()
+                    .map(|one| one as u32),
+            );
         }
     }
     out
@@ -267,7 +271,11 @@ fn r1_zero_border_two_reads_two_writes_on_odd_examples_runs_as_truth_on_padded_w
         let truth = {
             let mut held = truth;
             let n = held.len() as u32 + 18;
-            held.push(G { kind: 10, left: n - 2, right: n - 2 });
+            held.push(G {
+                kind: 10,
+                left: n - 2,
+                right: n - 2,
+            });
             held
         };
         let sizes = [[5_u32, 7, 1], [6, 3, 1], [7, 5, 1]];
@@ -360,7 +368,11 @@ fn r1_zero_border_two_reads_two_writes_on_odd_examples_runs_as_truth_on_padded_w
                     "seed {seed} size {size:?} output 1 at {at:?}"
                 );
             }
-            ok(&mut server, "grit_world_close", &format!("{{\"world\":{number}}}"));
+            ok(
+                &mut server,
+                "grit_world_close",
+                &format!("{{\"world\":{number}}}"),
+            );
         }
     }
 }
@@ -387,17 +399,34 @@ fn r2_cube_wrapped_box_on_a_rounded_world_runs_as_truth_inside_the_box() {
         let mut rng = Rng(seed);
         let mut truth = random_gates(&mut rng, 27, 4);
         let n = truth.len() as u32 + 27;
-        truth.push(G { kind: 6, left: n - 1, right: rng.below(27) });
-        let input: Vec<u32> = (0..full.iter().product::<u32>()).map(|_| rng.below(2)).collect();
+        truth.push(G {
+            kind: 6,
+            left: n - 1,
+            right: rng.below(27),
+        });
+        let input: Vec<u32> = (0..full.iter().product::<u32>())
+            .map(|_| rng.below(2))
+            .collect();
         let outs: Vec<u32> = all_at(full)
             .into_iter()
-            .map(|at| eval(27, 1, &truth, hood(true, full, &[input.clone()], at, true)))
+            .map(|at| {
+                eval(
+                    27,
+                    1,
+                    &truth,
+                    hood(true, full, std::slice::from_ref(&input), at, true),
+                )
+            })
             .collect();
         let example = world(&mut server, &base, asked);
-        let cells_in: Vec<([u32; 3], u32)> =
-            all_at(full).into_iter().map(|at| (at, input[idx(full, at)])).collect();
-        let cells_out: Vec<([u32; 3], u32)> =
-            all_at(full).into_iter().map(|at| (at, outs[idx(full, at)])).collect();
+        let cells_in: Vec<([u32; 3], u32)> = all_at(full)
+            .into_iter()
+            .map(|at| (at, input[idx(full, at)]))
+            .collect();
+        let cells_out: Vec<([u32; 3], u32)> = all_at(full)
+            .into_iter()
+            .map(|at| (at, outs[idx(full, at)]))
+            .collect();
         write(&mut server, example, 0, &cells_in);
         write(&mut server, example, 1, &cells_out);
         let from = [2_u32, 1, 0];
@@ -413,10 +442,13 @@ fn r2_cube_wrapped_box_on_a_rounded_world_runs_as_truth_inside_the_box() {
         let mut seen = BTreeSet::new();
         for at in all_at(full) {
             if (0..3).all(|axis| at[axis] >= from[axis] && at[axis] <= to[axis]) {
-                seen.insert(hood(true, full, &[input.clone()], at, true));
+                seen.insert(hood(true, full, std::slice::from_ref(&input), at, true));
             }
         }
-        assert_eq!(int_at(got.get("examples").unwrap(), "seen"), seen.len() as i64);
+        assert_eq!(
+            int_at(got.get("examples").unwrap(), "seen"),
+            seen.len() as i64
+        );
         let law = text_at(&got, "law");
         let run = world(&mut server, &law, asked);
         write(&mut server, run, 0, &cells_in);
@@ -424,11 +456,23 @@ fn r2_cube_wrapped_box_on_a_rounded_world_runs_as_truth_inside_the_box() {
         let got_out = read_box(&mut server, run, 1, full);
         for at in all_at(full) {
             if (0..3).all(|axis| at[axis] >= from[axis] && at[axis] <= to[axis]) {
-                assert_eq!(got_out[idx(full, at)] & 1, outs[idx(full, at)], "seed {seed} at {at:?}");
+                assert_eq!(
+                    got_out[idx(full, at)] & 1,
+                    outs[idx(full, at)],
+                    "seed {seed} at {at:?}"
+                );
             }
         }
-        ok(&mut server, "grit_world_close", &format!("{{\"world\":{run}}}"));
-        ok(&mut server, "grit_world_close", &format!("{{\"world\":{example}}}"));
+        ok(
+            &mut server,
+            "grit_world_close",
+            &format!("{{\"world\":{run}}}"),
+        );
+        ok(
+            &mut server,
+            "grit_world_close",
+            &format!("{{\"world\":{example}}}"),
+        );
     }
 }
 
@@ -479,7 +523,11 @@ fn tiled_run(server: &mut Server<'_>, law: &str) -> Vec<u32> {
     write(server, number, 0, &cells);
     step(server, number);
     let out = read_box(server, number, 1, [128, 64, 2]);
-    ok(server, "grit_world_close", &format!("{{\"world\":{number}}}"));
+    ok(
+        server,
+        "grit_world_close",
+        &format!("{{\"world\":{number}}}"),
+    );
     (0..512_u32)
         .map(|row| out[idx([128, 64, 2], [(row % 32) * 4 + 1, (row / 32) * 4 + 1, 0])] & 1)
         .collect()
@@ -502,7 +550,7 @@ fn r3_every_row_runs_on_a_world_as_the_reported_table_and_symmetric_tables_are_i
     let mut seen: BTreeMap<u32, u32> = BTreeMap::new();
     let mut output = Vec::new();
     for at in all_at(size) {
-        let row = hood(false, size, &[input.clone()], at, true);
+        let row = hood(false, size, std::slice::from_ref(&input), at, true);
         seen.insert(row, truth(row));
         output.push(truth(row));
     }
@@ -516,24 +564,47 @@ fn r3_every_row_runs_on_a_world_as_the_reported_table_and_symmetric_tables_are_i
         let again = ok(&mut server, "grit_law_learn", &args);
         assert_eq!(written(&got), written(&again), "same bytes, rule {rule}");
         let unseen = got.get("unseen").unwrap();
-        let table: Vec<u32> = ints(unseen.get("table").unwrap()).into_iter().map(|one| one as u32).collect();
-        let listed: Vec<u32> = ints(unseen.get("unseen_rows").unwrap()).into_iter().map(|one| one as u32).collect();
+        let table: Vec<u32> = ints(unseen.get("table").unwrap())
+            .into_iter()
+            .map(|one| one as u32)
+            .collect();
+        let listed: Vec<u32> = ints(unseen.get("unseen_rows").unwrap())
+            .into_iter()
+            .map(|one| one as u32)
+            .collect();
         let mine: Vec<u32> = (0..512).filter(|row| !seen.contains_key(row)).collect();
         assert_eq!(listed, mine, "unseen rows, rule {rule}");
         assert_eq!(int_at(unseen, "rows"), mine.len() as i64);
         let ones = mine.iter().filter(|row| table[**row as usize] == 1).count() as i64;
-        assert_eq!(ints(unseen.get("ones").unwrap()), vec![ones], "ones, rule {rule}");
-        assert_eq!(ints(unseen.get("zeros").unwrap()), vec![mine.len() as i64 - ones]);
+        assert_eq!(
+            ints(unseen.get("ones").unwrap()),
+            vec![ones],
+            "ones, rule {rule}"
+        );
+        assert_eq!(
+            ints(unseen.get("zeros").unwrap()),
+            vec![mine.len() as i64 - ones]
+        );
         for (row, out) in &seen {
-            assert_eq!(table[*row as usize], *out, "seen row {row} in table, rule {rule}");
+            assert_eq!(
+                table[*row as usize], *out,
+                "seen row {row} in table, rule {rule}"
+            );
         }
         let law = text_at(&got, "law");
         let ran = tiled_run(&mut server, &law);
-        assert_eq!(ran, table, "every row on a world equals the reported table, rule {rule}");
+        assert_eq!(
+            ran, table,
+            "every row on a world equals the reported table, rule {rule}"
+        );
         if rule == "symmetric" {
             for m in d4() {
                 for row in 0..512 {
-                    assert_eq!(table[row as usize], table[turned(row, m) as usize], "row {row} under {m:?}");
+                    assert_eq!(
+                        table[row as usize],
+                        table[turned(row, m) as usize],
+                        "row {row} under {m:?}"
+                    );
                 }
             }
         }
@@ -558,11 +629,23 @@ fn r3_every_row_runs_on_a_world_as_the_reported_table_and_symmetric_tables_are_i
             list(&out)
         ),
     );
-    assert_eq!(text_at(&told, "refused"), "asymmetric", "{}", written(&told));
+    assert_eq!(
+        text_at(&told, "refused"),
+        "asymmetric",
+        "{}",
+        written(&told)
+    );
 }
 
 fn cube_group() -> Vec<[[i64; 3]; 3]> {
-    let perms = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    let perms = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
     let mut out = Vec::new();
     for p in perms {
         for signs in 0..8 {
@@ -583,7 +666,9 @@ fn cube_turned(row: u32, m: [[i64; 3]; 3]) -> u32 {
             continue;
         }
         let v = [place % 3 - 1, place / 3 % 3 - 1, place / 9 - 1];
-        let n: Vec<i64> = (0..3).map(|a| (0..3).map(|b| m[a][b] * v[b]).sum()).collect();
+        let n: Vec<i64> = (0..3)
+            .map(|a| (0..3).map(|b| m[a][b] * v[b]).sum())
+            .collect();
         out |= 1 << ((n[2] + 1) * 9 + (n[1] + 1) * 3 + n[0] + 1);
     }
     out
@@ -598,11 +683,15 @@ fn r4_a_symmetric_cube_law_is_invariant_under_48_moves_and_reports_its_unseen_co
     let size = [4_u32, 4, 4];
     let mut rng = Rng(77);
     let input: Vec<u32> = (0..64).map(|_| u32::from(rng.below(4) == 0)).collect();
-    let truth = |row: u32| ((row >> 13) & ((row >> 4) ^ (row >> 10) ^ (row >> 12) ^ (row >> 14) ^ (row >> 16) ^ (row >> 22))) & 1;
+    let truth = |row: u32| {
+        ((row >> 13)
+            & ((row >> 4) ^ (row >> 10) ^ (row >> 12) ^ (row >> 14) ^ (row >> 16) ^ (row >> 22)))
+            & 1
+    };
     let mut output = Vec::new();
     let mut seen = BTreeSet::new();
     for at in all_at(size) {
-        let row = hood(true, size, &[input.clone()], at, true);
+        let row = hood(true, size, std::slice::from_ref(&input), at, true);
         seen.insert(row);
         output.push(truth(row));
     }
@@ -615,7 +704,10 @@ fn r4_a_symmetric_cube_law_is_invariant_under_48_moves_and_reports_its_unseen_co
             list(&output)
         ),
     );
-    assert_eq!(int_at(got.get("examples").unwrap(), "seen"), seen.len() as i64);
+    assert_eq!(
+        int_at(got.get("examples").unwrap(), "seen"),
+        seen.len() as i64
+    );
     let chip = gates_of(got.get("chip").unwrap().get("gates").unwrap());
     let group = cube_group();
     assert_eq!(group.len(), 48);
@@ -660,7 +752,10 @@ fn r4_a_symmetric_cube_law_is_invariant_under_48_moves_and_reports_its_unseen_co
         }
         all += i64::from(values.last().unwrap().count_ones());
     }
-    let on_seen = seen.iter().filter(|row| eval(27, 1, &chip, **row) == 1).count() as i64;
+    let on_seen = seen
+        .iter()
+        .filter(|row| eval(27, 1, &chip, **row) == 1)
+        .count() as i64;
     let ones = all - on_seen;
     let unseen = got.get("unseen").unwrap();
     assert_eq!(ints(unseen.get("ones").unwrap()), vec![ones]);
@@ -696,7 +791,7 @@ fn r5_a_large_symmetric_cube_request_is_refused_within_its_budget() {
         eprintln!(
             "r5 {rule}: refused {} after {took:?}: {}",
             text_at(&told, "refused"),
-            &text_at(&told, "message")
+            text_at(&told, "message")
         );
         assert!(
             took < std::time::Duration::from_millis(3000),
@@ -738,7 +833,12 @@ fn r6_a_journal_written_by_main_replays_the_same_cells() {
         let mut rng = Rng(99);
         for round in 0..3 {
             let cells: Vec<([u32; 3], u32)> = (0..40)
-                .map(|_| ([rng.below(16), rng.below(16), rng.below(2)], rng.below(1 << 20)))
+                .map(|_| {
+                    (
+                        [rng.below(16), rng.below(16), rng.below(2)],
+                        rng.below(1 << 20),
+                    )
+                })
                 .collect();
             let parts: Vec<String> = cells
                 .iter()
@@ -755,7 +855,10 @@ fn r6_a_journal_written_by_main_replays_the_same_cells() {
         }
         let mut text = format!("{number}\n");
         for plane in 0..3 {
-            text.push_str(&format!("{:?}\n", read_box(&mut server, number, plane, size)));
+            text.push_str(&format!(
+                "{:?}\n",
+                read_box(&mut server, number, plane, size)
+            ));
         }
         std::fs::write(&dump, text).unwrap();
         return;
