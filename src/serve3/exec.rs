@@ -601,14 +601,16 @@ impl Exec {
             cancel,
             state,
         };
+        #[cfg(feature = "faults")]
+        let mut faults = self.faults.lock().unwrap_or_else(PoisonError::into_inner);
         let refused = self.jobs.as_ref().and_then(|jobs| jobs.send(job).err());
         #[cfg(feature = "faults")]
-        if refused.is_none()
-            && let Ok(mut faults) = self.faults.lock()
-        {
+        if refused.is_none() {
             let done = faults.idle_done;
             faults.sent.push((sent, done));
         }
+        #[cfg(feature = "faults")]
+        drop(faults);
         refused.map(|job| {
             let job = job.0;
             self.shared.landed(&job.cancel);

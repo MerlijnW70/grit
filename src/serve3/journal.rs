@@ -1162,6 +1162,7 @@ pub fn rebuilt<'host>(
                     if let Some(stop) = guard.stop() {
                         return Err(halted(stop, world.frame()));
                     }
+                    super::tools::faults::cells(piece.len());
                     world.write(piece)?;
                 }
                 timings.writes = timings.writes.saturating_add(writing.elapsed());

@@ -303,6 +303,7 @@ pub struct Faults {
     pub idle_done: u32,
     pub sent: Vec<(Json, u32)>,
     pub started: Vec<Started>,
+    pub writes: Vec<(Instant, Instant)>,
 }
 
 #[cfg(feature = "faults")]
@@ -501,6 +502,10 @@ impl Book {
         let Some(mut writing) = self.writing.take() else {
             return false;
         };
+        #[cfg(feature = "faults")]
+        if let Ok(mut faults) = self.faults.lock() {
+            faults.writes.push((writing.began, finished));
+        }
         if let Some(thread) = writing.thread.take() {
             let _ = thread.join();
         }
