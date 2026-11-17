@@ -155,6 +155,7 @@ struct Watch<'host> {
     stop: Option<Stop>,
     began: Option<std::time::Instant>,
     built: Option<Duration>,
+    crowd_most: u32,
     #[cfg(feature = "faults")]
     faults: std::sync::Arc<std::sync::Mutex<super::Faults>>,
 }
@@ -179,6 +180,10 @@ impl Halt for Watch<'_> {
         }
         self.began = Some(std::time::Instant::now());
         false
+    }
+
+    fn crowd_most(&self) -> u32 {
+        self.crowd_most
     }
 
     fn halted(&mut self, next: Duration) -> bool {
@@ -992,6 +997,34 @@ fn rows_most(inputs: u32, outputs: u32, top: u32) -> u64 {
     crate::serve::WORK / each.max(1) * 32
 }
 
+fn crowd_fitting(
+    host: &crate::host::Host,
+    inputs: u32,
+    top: u32,
+    traces: usize,
+) -> Result<u32, Failed> {
+    let wide = u64::try_from(traces)
+        .unwrap_or(u64::MAX)
+        .div_ceil(32)
+        .max(1);
+    let words = host.ceiling() / 4;
+    let each = u64::from(inputs + top).saturating_mul(wide).max(1);
+    let width = u64::from(host.width().max(1));
+    let fits = (words / each / width).saturating_mul(width);
+    let least = width.max(64);
+    if fits < least {
+        return Err(limited(
+            Code::LearnLimit,
+            "$.examples",
+            format!(
+                "{traces} rows searched with {top} gates and {inputs} inputs need {each} words a candidate in one binding, and this device's binding holds {words} words, so not even a crowd of {least} fits; give fewer rows or gates"
+            ),
+            Json::Int(i64::try_from(words / each).unwrap_or(i64::MAX)),
+        ));
+    }
+    Ok(u32::try_from(fits.min(u64::from(crate::serve::CROWD))).unwrap_or(u32::MAX))
+}
+
 fn fits_kernel(inputs: u32, outputs: u32, top: u32, traces: usize) -> Result<(), Failed> {
     let fits = rows_most(inputs, outputs, top);
     if u64::try_from(traces).unwrap_or(u64::MAX) <= fits {
@@ -1175,6 +1208,7 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         stop: None,
         began: None,
         built: None,
+        crowd_most: u32::MAX,
         #[cfg(feature = "faults")]
         faults: server.faults(),
     };
@@ -1221,6 +1255,13 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .map(|(row, out)| (vec![*row], vec![*out]))
         .collect();
     fits_kernel(inputs, outputs, top, traces.len())?;
+    let crowd_most = crowd_fitting(host, inputs, top, traces.len())?;
+    watch.crowd_most = crowd_most;
+    let asked_crowd = effort.crowd;
+    let effort = Effort {
+        crowd: effort.crowd.min(crowd_most),
+        ..effort
+    };
     let laddered = ladder(host, &mut watch, (inputs, outputs), &traces, top, effort)?;
     let Some((found, gates)) = laddered.best else {
         if let Some(stop) = laddered.stop {
@@ -1397,6 +1438,21 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ("ladder", ladder_shown(&laddered.rungs)),
         ("stopped", text(laddered.stop.map_or("ladder", Stop::name))),
     ]);
+    if effort.crowd < asked_crowd {
+        answer.push((
+            "crowd_capped",
+            map(vec![
+                ("asked", counted(asked_crowd)),
+                ("used", counted(effort.crowd)),
+                (
+                    "why",
+                    text(
+                        "a candidate holds the inputs plus the gates times the rows over 32 words in one binding, and this device's binding holds no larger crowd; it is not doubled past this",
+                    ),
+                ),
+            ]),
+        ));
+    }
     if top < asked_top {
         answer.push((
             "gates_capped",

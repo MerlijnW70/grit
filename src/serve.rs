@@ -578,6 +578,10 @@ pub trait Halt {
     fn building(&mut self) -> bool {
         false
     }
+
+    fn crowd_most(&self) -> u32 {
+        u32::MAX
+    }
 }
 
 pub struct Never;
@@ -1098,7 +1102,7 @@ pub fn pressed_machine_halted(
                 return Ok(kept);
             }
         }
-        let most = CROWD.min(ran.most);
+        let most = CROWD.min(ran.most).min(halt.crowd_most());
         if ran.stopped || ran.marks >= ran.full || effort.crowd >= most {
             return Ok(ran);
         }
