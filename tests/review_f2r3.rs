@@ -244,7 +244,7 @@ mod served {
             (got, began.elapsed())
         };
         let budget = 150_u64;
-        let cell = Duration::from_micros(100);
+        let cell = Duration::from_millis(2);
         let most = usize::try_from(Duration::from_millis(budget).as_nanos() / cell.as_nanos())
             .unwrap()
             + 64;
