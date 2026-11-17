@@ -100,11 +100,16 @@ fn twin(host: &Host, law: &Law, params: &[u32], cells: &[u32]) -> Result<(), Str
         .write_plane(0, &placed)
         .map_err(|why| format!("write: {why}"))?;
     for (frame, want) in want.iter().enumerate() {
-        world.step(1).map_err(|why| format!("step {frame}: {why}"))?;
+        world
+            .step(1)
+            .map_err(|why| format!("step {frame}: {why}"))?;
         let got = world.cells().map_err(|why| format!("read: {why}"))?;
         if &got != want {
             let at = got.iter().zip(want).position(|(a, b)| a != b).unwrap();
-            return Err(format!("frame {frame}: cell {at} {} vs {}", got[at], want[at]));
+            return Err(format!(
+                "frame {frame}: cell {at} {} vs {}",
+                got[at], want[at]
+            ));
         }
     }
     Ok(())
@@ -112,14 +117,37 @@ fn twin(host: &Host, law: &Law, params: &[u32], cells: &[u32]) -> Result<(), Str
 
 fn constant_divisor_laws() -> Vec<String> {
     let mut outs = Vec::new();
-    for c in [2_u32, 3, 7, 255, 65_535, 0x8000_0001, 0xFFFF_FFFE, 0xFFFF_FFFF] {
-        outs.push(format!("[\"sel\",[\"ne\",[\"div\",[\"mul\",\"i1\",{c}],{c}],\"i1\"],1,0]"));
-        outs.push(format!("[\"sel\",[\"eq\",[\"div\",[\"mul\",{c},\"i1\"],{c}],\"i1\"],7,9]"));
-        outs.push(format!("[\"sel\",[\"lt\",[\"div\",4294967295,{c}],\"i1\"],1,0]"));
-        outs.push(format!("[\"sel\",[\"lt\",[\"div\",[\"not\",0],{c}],\"i1\"],1,0]"));
-        outs.push(format!("[\"sel\",[\"lt\",[\"div\",[\"sub\",0,1],{c}],\"i1\"],1,0]"));
-        outs.push(format!("[\"sel\",[\"lt\",[\"div\",[\"or\",\"i2\",4294967295],{c}],\"i1\"],1,0]"));
-        outs.push(format!("[\"sel\",[\"ge\",[\"div\",[\"or\",\"i2\",4294967295],{c}],\"i1\"],1,0]"));
+    for c in [
+        2_u32,
+        3,
+        7,
+        255,
+        65_535,
+        0x8000_0001,
+        0xFFFF_FFFE,
+        0xFFFF_FFFF,
+    ] {
+        outs.push(format!(
+            "[\"sel\",[\"ne\",[\"div\",[\"mul\",\"i1\",{c}],{c}],\"i1\"],1,0]"
+        ));
+        outs.push(format!(
+            "[\"sel\",[\"eq\",[\"div\",[\"mul\",{c},\"i1\"],{c}],\"i1\"],7,9]"
+        ));
+        outs.push(format!(
+            "[\"sel\",[\"lt\",[\"div\",4294967295,{c}],\"i1\"],1,0]"
+        ));
+        outs.push(format!(
+            "[\"sel\",[\"lt\",[\"div\",[\"not\",0],{c}],\"i1\"],1,0]"
+        ));
+        outs.push(format!(
+            "[\"sel\",[\"lt\",[\"div\",[\"sub\",0,1],{c}],\"i1\"],1,0]"
+        ));
+        outs.push(format!(
+            "[\"sel\",[\"lt\",[\"div\",[\"or\",\"i2\",4294967295],{c}],\"i1\"],1,0]"
+        ));
+        outs.push(format!(
+            "[\"sel\",[\"ge\",[\"div\",[\"or\",\"i2\",4294967295],{c}],\"i1\"],1,0]"
+        ));
     }
     outs.push("[\"sel\",[\"ne\",[\"div\",[\"mul\",\"i1\",\"i2\"],\"i1\"],\"i2\"],1,0]".into());
     outs.push("[\"sel\",[\"lt\",[\"div\",[\"or\",\"i2\",4294967295],\"i3\"],\"i1\"],1,0]".into());
@@ -170,7 +198,12 @@ fn constant_and_foldable_divisor_idioms_build_and_match_on_the_device() {
     for one in &failed {
         println!("FAILED {one}");
     }
-    println!("{} laws on {}, {} failed", laws.len(), host.name(), failed.len());
+    println!(
+        "{} laws on {}, {} failed",
+        laws.len(),
+        host.name(),
+        failed.len()
+    );
     assert!(failed.is_empty());
 }
 
@@ -189,7 +222,14 @@ fn the_halved_quotient_equals_the_plain_one_on_edges_and_random_pairs() {
     let mut edges: Vec<u32> = Vec::new();
     for k in 0..32 {
         let p = 1_u32 << k;
-        edges.extend([p, p.wrapping_sub(1), p.wrapping_add(1), !p, !p + 1, p | (p >> 1)]);
+        edges.extend([
+            p,
+            p.wrapping_sub(1),
+            p.wrapping_add(1),
+            !p,
+            !p + 1,
+            p | (p >> 1),
+        ]);
     }
     edges.extend([0, 1, 2, 3, u32::MAX, u32::MAX - 1, 0x5555_5555, 0xAAAA_AAAA]);
     for &a in &edges {
@@ -230,6 +270,14 @@ mod pipeline {
         server.heard(&line).unwrap()
     }
 
+    fn params_of(rule: &str) -> Vec<u32> {
+        grit::serve3::rules()
+            .iter()
+            .find(|one| one.name() == rule)
+            .map(|one| vec![0_u32; one.params()])
+            .unwrap()
+    }
+
     #[test]
     fn a_rule_world_whose_kernel_fails_to_build_is_not_called_a_law_fault() {
         let Some(host) =
@@ -244,7 +292,10 @@ mod pipeline {
             let got = call(
                 &mut server,
                 "grit_world_create",
-                &format!("{{\"wide\":{SIDE},\"deep\":{SIDE},\"tall\":{SIDE},\"rule\":\"{rule}\"}}"),
+                &format!(
+                    "{{\"wide\":{SIDE},\"deep\":{SIDE},\"tall\":{SIDE},\"rule\":\"{rule}\",\"params\":{:?}}}",
+                    params_of(rule)
+                ),
             );
             faults::disarm();
             assert!(faults::fired(), "{rule}: the fault never fired");
