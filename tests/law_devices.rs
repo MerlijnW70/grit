@@ -775,4 +775,183 @@ mod pipeline {
         let cells: Vec<u32> = (0..grid().cells()).map(|at| at as u32 * 997).collect();
         stepped_like_its_twin(&host, &law, &[0], &cells).unwrap();
     }
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch() -> Scratch {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("grit-law-devices-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Scratch(path)
+    }
+
+    fn failing(server: &mut Server<'_>, name: &str, arguments: &str) -> Json {
+        faults::reset();
+        faults::arm_with(Step::Pipeline, 0, vk::Result::ERROR_UNKNOWN);
+        let (error, told) = content(&call(server, name, arguments));
+        faults::disarm();
+        assert!(faults::fired(), "{name} {arguments}: the fault never fired");
+        assert!(error, "{name} {arguments}: {}", written(&told));
+        for kind in Step::ALL {
+            let count = faults::count(kind);
+            assert_eq!(count.made, count.gone, "{name}: {kind:?} leaked {count:?}");
+        }
+        told
+    }
+
+    fn params_of_rule(rule: &str) -> Vec<u32> {
+        grit::serve3::rules()
+            .iter()
+            .find(|one| one.name() == rule)
+            .map(|one| vec![0_u32; one.params()])
+            .unwrap()
+    }
+
+    fn text_of(held: &Json, key: &str) -> String {
+        field(held, key).text().unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_kernel_that_fails_to_build_is_a_law_fault_only_where_a_law_was_compiled() {
+        let Some(host) =
+            device("a_kernel_that_fails_to_build_is_a_law_fault_only_where_a_law_was_compiled")
+        else {
+            return;
+        };
+        let held = scratch();
+        let mut server = Server::with(
+            Some(&host),
+            &grit::serve3::Options {
+                dir: Some(held.0.join("worlds")),
+                memory: None,
+            },
+        )
+        .unwrap();
+        let text = lifting_text("divider", &[DIVIDER]);
+        let lawful = answered(&mut server, "grit_world_create", &making(&text));
+        let lawful = lawful.get("world").and_then(Json::int).unwrap();
+        let ruled = answered(
+            &mut server,
+            "grit_world_create",
+            &format!(
+                "{{\"wide\":{SIDE},\"deep\":{SIDE},\"tall\":{SIDE},\"rule\":\"sand\",\"params\":{:?}}}",
+                params_of_rule("sand")
+            ),
+        );
+        let ruled = ruled.get("world").and_then(Json::int).unwrap();
+        answered(
+            &mut server,
+            "grit_world_write",
+            &format!("{{\"world\":{lawful},\"cells\":[[1,2,3,4294967295],[5,6,7,99]]}}"),
+        );
+        answered(
+            &mut server,
+            "grit_world_step",
+            &format!("{{\"world\":{lawful},\"frames\":2}}"),
+        );
+        answered(
+            &mut server,
+            "grit_world_save",
+            &format!("{{\"world\":{lawful},\"name\":\"kept-law\"}}"),
+        );
+        let before = seen(&mut server, lawful);
+        for rule in ["sand", "heat", "nature"] {
+            let params = params_of_rule(rule);
+            let arguments = format!(
+                "{{\"wide\":{SIDE},\"deep\":{SIDE},\"tall\":{SIDE},\"rule\":\"{rule}\",\"params\":{params:?}}}"
+            );
+            let told = failing(&mut server, "grit_world_create", &arguments);
+            neutral(&told, &host, rule);
+            assert_eq!(
+                seen(&mut server, lawful),
+                before,
+                "{rule}: the server changed"
+            );
+        }
+        let told = failing(
+            &mut server,
+            "grit_world_fork",
+            &format!("{{\"world\":{ruled}}}"),
+        );
+        neutral(&told, &host, "fork of a rule world");
+        assert_eq!(
+            seen(&mut server, lawful),
+            before,
+            "rule fork changed the server"
+        );
+        for (name, arguments) in [
+            ("grit_world_fork", format!("{{\"world\":{lawful}}}")),
+            ("grit_world_open", String::from("{\"name\":\"kept-law\"}")),
+            ("grit_world_create", making(&text)),
+        ] {
+            let told = failing(&mut server, name, &arguments);
+            assert_eq!(
+                text_of(&told, "code"),
+                "law_not_built",
+                "{name}: {}",
+                written(&told)
+            );
+            assert_eq!(text_of(&told, "field"), "$.law", "{name}");
+            assert_eq!(text_of(&told, "device"), host.name(), "{name}");
+            assert!(
+                text_of(&told, "message").contains("divider"),
+                "{name}: {}",
+                written(&told)
+            );
+            assert_eq!(
+                seen(&mut server, lawful),
+                before,
+                "{name}: the server changed"
+            );
+        }
+        let forked = answered(
+            &mut server,
+            "grit_world_fork",
+            &format!("{{\"world\":{lawful}}}"),
+        );
+        assert_eq!(
+            read_world(
+                &mut server,
+                forked.get("world").and_then(Json::int).unwrap()
+            ),
+            before[3]
+        );
+        let opened = answered(&mut server, "grit_world_open", "{\"name\":\"kept-law\"}");
+        assert_eq!(
+            read_world(
+                &mut server,
+                opened.get("world").and_then(Json::int).unwrap()
+            ),
+            before[3]
+        );
+    }
+
+    fn neutral(told: &Json, host: &Host, label: &str) {
+        assert_eq!(
+            text_of(told, "code"),
+            "kernel_not_built",
+            "{label}: {}",
+            written(told)
+        );
+        assert_eq!(text_of(told, "field"), "$", "{label}");
+        assert_eq!(text_of(told, "device"), host.name(), "{label}");
+        assert_eq!(text_of(told, "vulkan"), "ERROR_UNKNOWN", "{label}");
+        for key in ["message", "hint"] {
+            let said = text_of(told, key);
+            assert!(!said.contains("law"), "{label}: {key} names a law: {said}");
+            if key == "message" {
+                assert!(said.contains(host.name()), "{label}: {said}");
+            }
+        }
+    }
 }
