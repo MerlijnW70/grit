@@ -299,6 +299,19 @@ pub struct Faults {
     pub held_by: Duration,
     pub stray_walk: bool,
     pub wedge_after_runs: Option<u64>,
+    pub stall_every: Duration,
+    pub idle_done: u32,
+    pub sent: Vec<(Json, u32)>,
+    pub started: Vec<Started>,
+}
+
+#[cfg(feature = "faults")]
+#[derive(Debug, Clone)]
+pub struct Started {
+    pub id: Json,
+    pub idle_done: u32,
+    pub charged: Duration,
+    pub at: Instant,
 }
 
 impl Book {
