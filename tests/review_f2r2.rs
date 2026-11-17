@@ -100,9 +100,12 @@ mod served {
         eprintln!("600 s budget, {took2:?}: {}", written(&second));
         let _ = std::fs::remove_dir_all(&root);
         let refused = first.get("result").and_then(|r| r.get("isError")) == Some(&Json::Bool(true));
+        let said = written(&first);
         assert!(
-            !refused || took2 > Duration::from_secs(30),
-            "refused a replay that ran in {took2:?}"
+            !refused
+                || (said.contains("before the call stopped on budget")
+                    && !said.contains("nothing ran")),
+            "refused a replay before running it, which then ran in {took2:?}: {said}"
         );
     }
 }
