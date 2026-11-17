@@ -9,8 +9,6 @@ use grit::branch::{Made, Stepping, World};
 use grit::law::Law;
 use grit::law::quiet;
 use grit::sand3::Grid3;
-use grit::serve3::Server;
-use grit::wire::{Json, written};
 
 const SIDE: u32 = 8;
 const FRAMES: u32 = 3;
@@ -182,7 +180,7 @@ fn constant_and_foldable_divisor_idioms_build_and_match_on_the_device() {
         let cells: Vec<u32> = (0..grid().cells())
             .map(|_| {
                 let r = next(&mut state);
-                if r % 2 == 0 {
+                if r.is_multiple_of(2) {
                     EDGES[(r >> 8) as usize % EDGES.len()]
                 } else {
                     (r >> 32) as u32
@@ -262,6 +260,8 @@ mod pipeline {
 
     use ash::vk;
     use grit::resident::faults::{self, Step};
+    use grit::serve3::Server;
+    use grit::wire::{Json, written};
 
     fn call(server: &mut Server<'_>, name: &str, arguments: &str) -> Json {
         let line = format!(
