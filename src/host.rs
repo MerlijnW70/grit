@@ -244,6 +244,10 @@ pub enum Error {
     },
     LostWrite,
     Lane(simdr::lanes::LaneError),
+    Unbuilt {
+        device: String,
+        code: vk::Result,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -374,6 +378,10 @@ impl std::fmt::Display for Error {
                 "a frame wrote a uniform brick that held no slot, and the write was dropped"
             ),
             Self::Lane(why) => write!(out, "a kernel could not be built: {why}"),
+            Self::Unbuilt { device, code } => write!(
+                out,
+                "the driver of the device {device:?} could not compile a kernel: pipeline creation failed with {code:?}"
+            ),
         }
     }
 }
