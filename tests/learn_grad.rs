@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 mod common;
+mod halo_grad;
 
 use common::device;
 
@@ -1195,12 +1196,6 @@ fn g1_a_world_start_and_a_target_world_answer_the_walk_exactly() {
     assert!(accepted >= 4, "{accepted}");
 }
 
-fn look_law() -> String {
-    let mut lifter = Lifter::planed(2);
-    lifter.lift(0, "add", "[\"mul\",[\"look\",1,-1,0,0,0],[\"param\",0]]");
-    lifter.text("looker", 1).replace("\"halo\":0", "\"halo\":1")
-}
-
 fn walks() -> Option<u64> {
     #[cfg(feature = "faults")]
     {
@@ -1251,7 +1246,7 @@ fn g3_every_refusal_names_its_code_and_path_before_any_work() {
         "world",
     );
     let heat = create(&mut server, HEAT, &[300, 4, 7], SIDE);
-    let looks = create(&mut server, &look_law(), &[3], SIDE);
+    let looks = create(&mut server, &cut_looker(), &[3], SIDE);
     let notted = cut_laws().remove(0).1;
     let cutter = create(&mut server, &notted, &[3_000], SIDE);
     let small = create(&mut server, MIX, &MIX_TRUTH, 8);
@@ -1279,7 +1274,7 @@ fn g3_every_refusal_names_its_code_and_path_before_any_work() {
     assert_ne!(marked_heat, HEAT);
     let unmarked_mix = MIX.replacen("\"reversible\": true,", "", 1);
     assert_ne!(unmarked_mix, MIX);
-    let looking = look_law();
+    let looking = cut_looker();
     let boxed_at = |from: &str, to: &str, rest: &str| {
         format!("{{\"world\":{mix},\"frames\":2,\"aim\":{{\"from\":{from},\"to\":{to}{rest}}}}}")
     };
@@ -1746,12 +1741,22 @@ impl Owned {
 }
 
 fn never_worse(label: &str, owned: &Owned, from: &[u32], most: u32, descent: &Descent) {
+    never_worse_by(label, |params| owned.objective(params), from, most, descent);
+}
+
+fn never_worse_by(
+    label: &str,
+    objective: impl Fn(&[u32]) -> u64,
+    from: &[u32],
+    most: u32,
+    descent: &Descent,
+) {
     let trail = &descent.trail;
     assert_eq!(
         trail[0],
         Tried {
             params: from.to_vec(),
-            objective: owned.objective(from),
+            objective: objective(from),
             kept: true,
         },
         "{label}: the trail starts at the start"
@@ -1760,7 +1765,7 @@ fn never_worse(label: &str, owned: &Owned, from: &[u32], most: u32, descent: &De
     for (at, tried) in trail.iter().enumerate().skip(1) {
         assert_eq!(
             tried.objective,
-            owned.objective(&tried.params),
+            objective(&tried.params),
             "{label}: trail {at} is the forward run's objective"
         );
         assert_eq!(
@@ -2663,6 +2668,41 @@ mod faulted {
     }
 
     #[test]
+    fn h5_a_walk_of_a_law_that_looks_the_budget_cannot_fit_is_refused_by_evidence() {
+        let (case, _) = spread_case(2, &[2_400, 2_000], 4);
+        let mut server = Server::new(None);
+        stall_every(WALK_FLOOR);
+        let began = Instant::now();
+        answer(&call(
+            &mut server,
+            "grit_law_gradient",
+            &posed_case(&case, ""),
+        ));
+        assert!(began.elapsed() >= WALK_FLOOR);
+        let short = u64::try_from(WALK_FLOOR.as_millis()).unwrap() / 2;
+        let ran_before = walks();
+        for (tool, more) in [
+            ("grit_law_gradient", String::new()),
+            ("grit_law_descend", ",\"steps\":3".to_owned()),
+        ] {
+            let arguments = posed_case(&case, &more).replace(
+                &format!("\"budget_ms\":{LONG}"),
+                &format!("\"budget_ms\":{short}"),
+            );
+            let told = refusal(&call(&mut server, tool, &arguments));
+            assert_eq!(
+                (text_at(&told, "code"), text_at(&told, "field")),
+                ("budget".to_owned(), "$.budget_ms".to_owned()),
+                "{tool}: {}",
+                written(&told)
+            );
+            assert!(text_at(&told, "message").contains("nothing ran"));
+        }
+        assert_eq!(walks(), ran_before, "a budget refusal ran a walk");
+        unstall();
+    }
+
+    #[test]
     fn g3_a_walk_that_strays_answers_strayed_with_where_and_touches_no_world() {
         let Some(host) = device("learn_grad strayed") else {
             return;
@@ -2718,4 +2758,476 @@ mod faulted {
         assert_eq!(written(&again), written(&clean));
         run.exec.finish();
     }
+}
+
+fn posed_case(case: &halo_grad::Case, more: &str) -> String {
+    let last = case.region.to.map(|one| one - 1);
+    format!(
+        "{{\"law\":{},\"size\":{:?},\"cells\":{},\"first\":{},\"params\":{},\"frames\":{},\"aim\":{{\"from\":{:?},\"to\":{last:?},\"target\":{}}},\"budget_ms\":{LONG}{more}}}",
+        quoted(&case.text),
+        case.size,
+        listed(&case.start),
+        case.first,
+        listed(&case.params),
+        case.frames,
+        case.region.from,
+        listed(&case.target)
+    )
+}
+
+fn descent_of(case: &halo_grad::Case, law: &Reversible, most: u32) -> Result<Descent, Fault> {
+    law.descend(
+        &Posed {
+            grid: case.grid(),
+            start: &case.start,
+            first: case.first,
+            frames: case.frames,
+            aim: case.aim(),
+        },
+        &case.params,
+        most,
+    )
+}
+
+const LOOKING_LAWS: u64 = 32;
+
+#[test]
+fn h4_a_law_that_looks_answers_the_walk_exactly_through_the_mcp() {
+    let mut server = Server::new(None);
+    let mut moved = 0;
+    for seed in 0..LOOKING_LAWS {
+        let drawn = halo_grad::case(0x4400 + seed);
+        let case = &drawn.case;
+        let label = format!("looking law {seed}");
+        let walked = case.walked(&drawn.reversible);
+        if walked
+            .as_ref()
+            .is_ok_and(|one| one.told.iter().any(|told| *told != 0))
+        {
+            moved += 1;
+        }
+        let got = call(&mut server, "grit_law_gradient", &posed_case(case, ""));
+        same_gradient(&label, &got, &walked);
+        let most = 1 + u32::try_from(seed % 4).unwrap();
+        let got = call(
+            &mut server,
+            "grit_law_descend",
+            &posed_case(case, &format!(",\"steps\":{most}")),
+        );
+        same_descent(
+            &label,
+            &got,
+            &descent_of(case, &drawn.reversible, most),
+            most,
+        );
+    }
+    println!(
+        "{LOOKING_LAWS} laws that look: gradient and descent equal the library, {moved} with a gradient that is not zero"
+    );
+    assert!(moved >= LOOKING_LAWS / 4, "{moved}");
+}
+
+#[test]
+fn h4_a_world_of_a_law_that_looks_answers_the_walk_exactly() {
+    let Some(host) = device("learn_grad looking world") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let text = halo_grad::spread_law();
+    let law = reversible(&text);
+    let truth = halo_grad::SPREAD_TRUTH;
+    let start_world = create(&mut server, &text, &truth, SIDE);
+    write_all(&mut server, start_world, &calm(0x44));
+    step(&mut server, start_world, 3);
+    let other: Vec<u32> = truth.iter().map(|one| one + 40).collect();
+    let target_world = create(&mut server, &text, &other, SIDE);
+    write_all(&mut server, target_world, &calm(0x44));
+    step(&mut server, target_world, 3 + 4);
+    let (frame, start) = state(&mut server, start_world, 2);
+    assert_eq!(frame, 3);
+    let (_, aimed) = state(&mut server, target_world, 1);
+    let region = Region::new([2, 0, 1], [14, 16, 9]);
+    let target = boxed(region, &aimed);
+    let aim = Aim {
+        region,
+        target: &target,
+    };
+    let aim_text = aimed_at(region, &format!("\"world\":{target_world}"));
+    let walked = law.walk(grid(), &start, &truth, 3, 4, &aim);
+    assert_ne!(walked.as_ref().unwrap().told[1], 0);
+    let got = server.ask(
+        "grit_law_gradient",
+        &format!(
+            "{{\"world\":{start_world},\"frames\":4,\"aim\":{aim_text},\"budget_ms\":{LONG}}}"
+        ),
+    );
+    same_gradient("looking world", &got, &walked);
+    let posed = Posed {
+        grid: grid(),
+        start: &start,
+        first: 3,
+        frames: 4,
+        aim,
+    };
+    let got = server.ask(
+        "grit_law_descend",
+        &format!(
+            "{{\"world\":{start_world},\"frames\":4,\"aim\":{aim_text},\"steps\":4,\"budget_ms\":{LONG}}}"
+        ),
+    );
+    same_descent("looking world", &got, &law.descend(&posed, &truth, 4), 4);
+    assert_eq!(state(&mut server, start_world, 2), (3, start));
+}
+
+const SPREAD_SEEDS: u64 = 16;
+
+const SPREAD_SIZE: [u32; 3] = [16, 16, 8];
+
+fn spread_case(seed: u64, from: &[u32], frames: u32) -> (halo_grad::Case, Reversible) {
+    let text = halo_grad::spread_law();
+    let law = reversible(&text);
+    let grid = Grid3::new(SPREAD_SIZE[0], SPREAD_SIZE[1], SPREAD_SIZE[2]).unwrap();
+    let mut case = halo_grad::Case {
+        seed,
+        text,
+        params: from.to_vec(),
+        size: SPREAD_SIZE,
+        planes: 2,
+        frozen: vec![false, true],
+        frames,
+        first: 0,
+        start: halo_grad::spread_start(grid, 0x5B0 + seed),
+        region: Region::whole(SPREAD_SIZE),
+        target: Vec::new(),
+    };
+    let ended = halo_grad::ran(
+        &compiled(&case.text),
+        &case.posing(),
+        &halo_grad::SPREAD_TRUTH,
+    );
+    case.target = halo_grad::boxed(grid, case.region, &ended);
+    (case, law)
+}
+
+#[test]
+fn h3_a_descent_through_the_mcp_learns_the_params_of_a_law_that_looks() {
+    let truth = halo_grad::SPREAD_TRUTH.to_vec();
+    let compiled_law = compiled(&halo_grad::spread_law());
+    let mut server = Server::new(None);
+    let mut most = 0;
+    for seed in 0..SPREAD_SEEDS {
+        let mut state = seed + 7;
+        let from = near(&mut state, &truth);
+        let (case, law) = spread_case(seed, &from, JUDGE_FRAMES);
+        let label = format!("spread seed {seed} from {from:?}");
+        let got = answer(&call(
+            &mut server,
+            "grit_law_descend",
+            &posed_case(&case, &format!(",\"steps\":{JUDGE_STEPS}")),
+        ));
+        let descent = descent_of(&case, &law, JUDGE_STEPS).unwrap();
+        let objective = |params: &[u32]| {
+            let ended = halo_grad::ran(&compiled_law, &case.posing(), params);
+            halo_grad::boxed(case.grid(), case.region, &ended)
+                .iter()
+                .zip(&case.target)
+                .map(|(&cell, &wanted)| u64::from(cell.abs_diff(wanted)))
+                .sum()
+        };
+        never_worse_by(&label, objective, &from, JUDGE_STEPS, &descent);
+        assert_eq!(trail_of(&got), descent.trail, "{label}");
+        assert_eq!(
+            whole_of(got.get("objective").unwrap()),
+            0,
+            "{label}: {:?}",
+            descent.trail
+        );
+        assert_eq!(words_of(got.get("params").unwrap()), truth, "{label}");
+        assert_eq!(text_at(&got, "stopped"), "converged", "{label}");
+        most = most.max(descent.steps);
+    }
+    println!(
+        "spread, {SPREAD_SEEDS} calm starts from up to 40 % off {:?}: objective 0 through the MCP in at most {most} of {JUDGE_STEPS} steps",
+        halo_grad::SPREAD_TRUTH
+    );
+}
+
+fn cut_looker() -> String {
+    let mut lifter = Lifter::planed(2);
+    lifter.lift(
+        0,
+        "add",
+        "[\"xor\",[\"mul\",\"w1v0\",[\"param\",0]],[\"look\",1,-1,0,0,0]]",
+    );
+    lifter
+        .text("cut_looker", 1)
+        .replace("\"halo\":0", "\"halo\":1")
+}
+
+fn written_looker() -> String {
+    let mut lifter = Lifter::planed(2);
+    lifter.lift(0, "add", "[\"mul\",[\"look\",1,-1,0,0,0],[\"param\",0]]");
+    lifter.lift(9, "add", "[\"param\",0]");
+    lifter
+        .text("written_looker", 1)
+        .replace("\"halo\":0", "\"halo\":1")
+}
+
+#[test]
+fn h5_a_law_that_looks_and_cannot_be_covered_is_refused_by_name_before_any_walk() {
+    let mut server = Server::new(None);
+    let walked = walks();
+    let aim = "{\"from\":[0,0,0],\"to\":[1,1,1],\"target\":[1,2,3,4,5,6,7,8]}";
+    let cells = vec![CALM; 1024];
+    let cut_text = cut_looker();
+    let written_text = written_looker();
+    for tool in ["grit_law_gradient", "grit_law_descend"] {
+        let steps = if tool == "grit_law_descend" {
+            "\"steps\":4,"
+        } else {
+            ""
+        };
+        let told = refusal(&call(
+            &mut server,
+            tool,
+            &format!(
+                "{{{steps}{}",
+                &inline(&cut_text, "[8,8,8]", &cells, "[3]", aim)[1..]
+            ),
+        ));
+        assert_eq!(
+            (text_at(&told, "code"), text_at(&told, "field")),
+            ("no_gradient".to_owned(), "$.law".to_owned()),
+            "{}",
+            written(&told)
+        );
+        assert!(text_at(&told, "message").contains("nothing ran"));
+        let law = told.get("law").unwrap();
+        assert_eq!(text_at(law, "found"), "xor");
+        let node = located(&grit::wire::read(&cut_text).unwrap(), &text_at(law, "path"));
+        assert_eq!(
+            node.list().unwrap()[0].text(),
+            Some("xor"),
+            "{}",
+            written(&told)
+        );
+        let told = refusal(&call(
+            &mut server,
+            tool,
+            &format!(
+                "{{{steps}{}",
+                &inline(&written_text, "[8,8,8]", &cells, "[3]", aim)[1..]
+            ),
+        ));
+        assert_eq!(
+            (text_at(&told, "code"), text_at(&told, "field")),
+            ("law_refused".to_owned(), "$.law".to_owned()),
+            "{}",
+            written(&told)
+        );
+        let law = told.get("law").unwrap();
+        assert_eq!(text_at(law, "code"), "halo_written", "{}", written(&told));
+        let node = located(
+            &grit::wire::read(&written_text).unwrap(),
+            &text_at(law, "path"),
+        );
+        assert_eq!(
+            node.list().unwrap()[0].text(),
+            Some("look"),
+            "{}",
+            written(&told)
+        );
+    }
+    assert_eq!(walks(), walked, "a refusal ran a walk");
+}
+
+#[test]
+fn h5_the_walk_limit_counts_the_looks_of_a_law_before_any_walk() {
+    let Some(host) = device("learn_grad looking walk limit") else {
+        return;
+    };
+    let text = halo_grad::spread_law();
+    let law = reversible(&text);
+    let octs = u64::from(grid().octs());
+    let nodes = u64::try_from(law.forward().len() + law.inverse().len()).unwrap() + 128;
+    let looking = nodes + 3 * 64;
+    let fits = WORK_MOST / (octs * looking);
+    let unlooked = WORK_MOST / (octs * nodes);
+    assert!(
+        fits < unlooked && unlooked < u64::from(FRAMES_MOST),
+        "{fits} {unlooked}"
+    );
+    let mut server = Server::new(Some(&host));
+    let world = create(&mut server, &text, &halo_grad::SPREAD_TRUTH, SIDE);
+    write_all(&mut server, world, &calm(5));
+    let before = state(&mut server, world, 2);
+    let aim = "{\"from\":[0,0,0],\"to\":[1,1,1],\"target\":[1,2,3,4,5,6,7,8]}";
+    let walked = walks();
+    for frames in [fits + 1, unlooked] {
+        for (tool, more) in [
+            ("grit_law_gradient", ""),
+            ("grit_law_descend", ",\"steps\":2"),
+        ] {
+            let told = refusal(&server.ask(
+                tool,
+                &format!("{{\"world\":{world},\"frames\":{frames},\"aim\":{aim}{more}}}"),
+            ));
+            assert_eq!(
+                (text_at(&told, "code"), text_at(&told, "field")),
+                ("walk_limit".to_owned(), "$.frames".to_owned()),
+                "{tool} {frames}: {}",
+                written(&told)
+            );
+            assert_eq!(
+                told.get("limit").and_then(Json::int),
+                Some(i64::try_from(fits).unwrap()),
+                "{}",
+                written(&told)
+            );
+            let units = octs * frames * looking;
+            assert!(
+                text_at(&told, "message").contains(&format!(
+                    "is {units} units of work (octs times frames times the nodes of both plus 128 plus 192 for each of the 1 planes it looks at)"
+                )),
+                "{}",
+                written(&told)
+            );
+        }
+    }
+    assert_eq!(walks(), walked, "a refusal ran a walk");
+    assert_eq!(state(&mut server, world, 2), before);
+}
+
+fn unhinted(held: Json) -> Json {
+    match held {
+        Json::Map(pairs) => {
+            let refused = pairs
+                .iter()
+                .any(|(key, value)| key == "code" && value.text() == Some("no_gradient"));
+            Json::Map(
+                pairs
+                    .into_iter()
+                    .filter(|(key, _)| !(refused && key == "hint"))
+                    .map(|(key, value)| (key, unhinted(value)))
+                    .collect(),
+            )
+        }
+        Json::List(items) => Json::List(items.into_iter().map(unhinted).collect()),
+        other => other,
+    }
+}
+
+const MAIN_ANSWERS: &str = "305f4c04046a2417ddc957895a447a74bdbae0e00eea4a4f44abbae276eee0b6";
+
+#[test]
+fn h2_a_law_that_does_not_look_answers_through_the_mcp_byte_for_byte_as_on_main() {
+    let mut server = Server::new(None);
+    let mut heard = Vec::new();
+    let mut asked = 0;
+    for seed in 0..RANDOM_LAWS * 2 {
+        let (text, values) = if seed % 2 == 0 {
+            random_law(0xA1B0 + seed)
+        } else {
+            smooth(0xA1B0 + seed)
+        };
+        let law = reversible(&text);
+        let mut state = seed.wrapping_mul(0x51ED);
+        let start: Vec<u32> = if seed % 2 == 0 {
+            (0..grid().cells()).map(|_| word(&mut state)).collect()
+        } else {
+            calm(seed)
+        };
+        let first = u32::try_from(below(&mut state, 5)).unwrap();
+        let frames = 1 + u32::try_from(below(&mut state, 6)).unwrap();
+        let region = random_region(&mut state);
+        let target = boxed(region, &ran(&law, &start, &values, first, frames + 1));
+        let posed = Inline {
+            text: &text,
+            start: &start,
+            first,
+            params: &values,
+            frames,
+            region,
+            target: &target,
+        };
+        let most = 1 + u32::try_from(below(&mut state, 4)).unwrap();
+        for more in [String::new(), format!(",\"steps\":{most}")] {
+            let tool = if more.is_empty() {
+                "grit_law_gradient"
+            } else {
+                "grit_law_descend"
+            };
+            heard.extend(
+                written(&unhinted(call(&mut server, tool, &posed.arguments(&more)))).into_bytes(),
+            );
+            asked += 1;
+        }
+    }
+    let mut cases: Vec<(String, Vec<u32>, Vec<u32>)> = vec![
+        (MIX.to_owned(), MIX_TRUTH.to_vec(), calm(0x5C)),
+        (STIR.to_owned(), STIR_TRUTH.to_vec(), calm(0xBA51)),
+    ];
+    for seed in 0..SMOOTH_LAWS {
+        let (text, values) = smooth_far(0x5300 + seed);
+        cases.push((text, values, far_start(0x77 + seed)));
+    }
+    for (_, text, values) in op_laws() {
+        cases.push((text, values, far_start(0x0B)));
+    }
+    for (_, text) in cut_laws() {
+        cases.push((text, vec![3_000], far_start(0x0C)));
+    }
+    for (case, (text, values, start)) in cases.iter().enumerate() {
+        let law = reversible(text);
+        let mut state = (case as u64).wrapping_mul(0xFA2) ^ 0x3D;
+        let region = Region::whole([SIDE, SIDE, SIDE]);
+        let target = if case < 2 {
+            boxed(region, &ran(&law, start, values, 0, JUDGE_FRAMES))
+        } else {
+            far_target(&mut state, region)
+        };
+        let from: Vec<u32> = values.iter().map(|one| one * 85 / 100).collect();
+        let posed = Inline {
+            text,
+            start,
+            first: 0,
+            params: &from,
+            frames: JUDGE_FRAMES,
+            region,
+            target: &target,
+        };
+        for more in ["", ",\"steps\":16"] {
+            let tool = if more.is_empty() {
+                "grit_law_gradient"
+            } else {
+                "grit_law_descend"
+            };
+            heard.extend(
+                written(&unhinted(call(&mut server, tool, &posed.arguments(more)))).into_bytes(),
+            );
+            asked += 1;
+        }
+    }
+    let tiny = vec![CALM; 512];
+    let aim = "{\"from\":[0,0,0],\"to\":[1,1,1],\"target\":[1,2,3,4,5,6,7,8]}";
+    for (text, size, cells, params, frames) in [
+        (MIX, "[8,8,8]", &tiny, "[1,2]", FRAMES_MOST),
+        (MIX, "[8,8,8]", &tiny, "[1,2,3]", 2),
+        (MIX, "[8,8,8]", &tiny[1..].to_vec(), "[1,2]", 2),
+    ] {
+        let arguments = inline(text, size, cells, params, aim)
+            .replace("\"frames\":2", &format!("\"frames\":{frames}"));
+        for tool in ["grit_law_gradient", "grit_law_descend"] {
+            let arguments = if tool == "grit_law_descend" {
+                arguments.replacen('{', "{\"steps\":4,", 1)
+            } else {
+                arguments.clone()
+            };
+            heard.extend(written(&unhinted(call(&mut server, tool, &arguments))).into_bytes());
+            asked += 1;
+        }
+    }
+    let digest = grit::law::hex(&grit::branch::format::sha256(&heard));
+    println!("{asked} answers, {} bytes, sha256 {digest}", heard.len());
+    assert_eq!(digest, MAIN_ANSWERS);
 }
