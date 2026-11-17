@@ -696,8 +696,10 @@ fn l3_a_symmetric_3x3x3_law_turns_with_its_input_on_a_world() {
     let mut mcp = Mcp::new(Some(&host));
     let truth = symmetric_truth();
     let size = [8, 8, 8];
-    let mut rng = Rng(41);
-    let input = random_bits(&mut rng, 512, 6);
+    let mut input = vec![0_u32; 512];
+    for at in [[2, 2, 2], [3, 2, 2], [6, 6, 5], [2, 6, 6], [3, 7, 7]] {
+        input[stencil::index(size, at)] = 1;
+    }
     let rows = own_rows(Stencil::Cube, size, &input, true);
     let wanted: Vec<u32> = rows
         .iter()
@@ -712,7 +714,7 @@ fn l3_a_symmetric_3x3x3_law_turns_with_its_input_on_a_world() {
             &format!("[{}]", inline(size, &input, &wanted)),
             0,
             1,
-            ",\"gates\":10,\"crowd\":2048",
+            ",\"gates\":8,\"crowd\":16384,\"rounds\":500",
         ),
     );
     let unseen = got.get("unseen").unwrap();
@@ -1180,4 +1182,150 @@ mod faulted {
         assert_eq!(again, clean);
         run.exec.finish();
     }
+}
+
+fn own_group(axes: usize) -> Vec<[[i64; 3]; 3]> {
+    let orders: Vec<Vec<usize>> = if axes == 2 {
+        vec![vec![0, 1], vec![1, 0]]
+    } else {
+        vec![
+            vec![0, 1, 2],
+            vec![0, 2, 1],
+            vec![1, 0, 2],
+            vec![1, 2, 0],
+            vec![2, 0, 1],
+            vec![2, 1, 0],
+        ]
+    };
+    let mut out = Vec::new();
+    for order in &orders {
+        for signs in 0..(1 << axes) {
+            let mut matrix = [[0_i64; 3]; 3];
+            for row in 0..3 {
+                if row < axes {
+                    matrix[row][order[row]] = if (signs >> row) & 1 == 1 { -1 } else { 1 };
+                } else {
+                    matrix[row][row] = 1;
+                }
+            }
+            out.push(matrix);
+        }
+    }
+    out
+}
+
+fn own_place(at: [i64; 3], axes: usize) -> u32 {
+    let layer = if axes == 2 { 0 } else { (at[2] + 1) * 9 };
+    u32::try_from(layer + (at[1] + 1) * 3 + (at[0] + 1)).unwrap()
+}
+
+fn own_offset(place: u32, axes: usize) -> [i64; 3] {
+    let place = i64::from(place);
+    let dz = if axes == 2 { 0 } else { place / 9 - 1 };
+    [place % 3 - 1, place / 3 % 3 - 1, dz]
+}
+
+fn own_image(row: u32, matrix: &[[i64; 3]; 3], axes: usize) -> u32 {
+    let places = if axes == 2 { 9 } else { 27 };
+    (0..places)
+        .filter(|place| (row >> place) & 1 == 1)
+        .map(|place| {
+            let from = own_offset(place, axes);
+            let mut to = [0_i64; 3];
+            for (row, slot) in to.iter_mut().enumerate() {
+                *slot = (0..3).map(|col| matrix[row][col] * from[col]).sum();
+            }
+            1 << own_place(to, axes)
+        })
+        .fold(0, |held, bit| held | bit)
+}
+
+fn refused_under_each_symmetry(host: &Host, stencil: Stencil, chain: &[[i64; 3]], size: [u32; 3]) {
+    let axes = stencil.axes();
+    let group = own_group(axes);
+    let pattern = chain
+        .iter()
+        .fold(0_u32, |held, at| held | 1 << own_place(*at, axes));
+    let orbit: BTreeSet<u32> = group
+        .iter()
+        .map(|matrix| own_image(pattern, matrix, axes))
+        .collect();
+    assert_eq!(
+        orbit.len(),
+        group.len(),
+        "a pattern no symmetry but one fixes"
+    );
+    let least = *orbit.iter().next().unwrap();
+    let first = [3, 3, if axes == 2 { 0 } else { 3 }];
+    let second = [11, 3, if axes == 2 { 0 } else { 3 }];
+    let mut mcp = Mcp::new(Some(host));
+    let cells = size.iter().product::<u32>() as usize;
+    for matrix in group.iter().skip(1) {
+        let other = own_image(least, matrix, axes);
+        let mut input = vec![0_u32; cells];
+        for (centre, row) in [(first, least), (second, other)] {
+            for place in 0..stencil.positions() {
+                if (row >> place) & 1 == 1 {
+                    let at = own_offset(place, axes);
+                    let spot = [0, 1, 2]
+                        .map(|axis| u32::try_from(i64::from(centre[axis]) + at[axis]).unwrap());
+                    input[stencil::index(size, spot)] = 1;
+                }
+            }
+        }
+        let mut output = vec![0_u32; cells];
+        output[stencil::index(size, first)] = 1;
+        let rows = own_rows(stencil, size, &input, false);
+        assert_eq!(rows[stencil::index(size, first)], least);
+        assert_eq!(rows[stencil::index(size, second)], other);
+        let inside = rows.iter().filter(|row| orbit.contains(row)).count();
+        assert_eq!(inside, 2, "only the two patches see the pattern");
+        let told = mcp.no(
+            "grit_law_learn",
+            &learn_args(
+                stencil,
+                "symmetric",
+                "zero",
+                &format!("[{}]", inline(size, &input, &output)),
+                0,
+                1,
+                "",
+            ),
+        );
+        assert_eq!(
+            text_at(&told, "refused"),
+            "asymmetric",
+            "{matrix:?}: {}",
+            written(&told)
+        );
+        let named: BTreeSet<(i64, i64)> = told
+            .get("orbits")
+            .and_then(Json::list)
+            .unwrap()
+            .iter()
+            .flat_map(|one| one.get("rows").and_then(Json::list).unwrap().iter())
+            .map(|one| (int_at(one, "row"), int_at(one, "outputs")))
+            .collect();
+        assert!(named.contains(&(i64::from(least), 1)), "{named:?}");
+        assert!(named.contains(&(i64::from(other), 0)), "{named:?}");
+    }
+}
+
+#[test]
+fn l3_a_pattern_and_any_one_of_its_images_seen_apart_are_refused_by_name() {
+    let Some(host) = device("law_learn l3 every symmetry") else {
+        return;
+    };
+    refused_under_each_symmetry(
+        &host,
+        Stencil::Square,
+        &[[0, 0, 0], [0, -1, 0], [1, 1, 0]],
+        [16, 8, 1],
+    );
+    refused_under_each_symmetry(
+        &host,
+        Stencil::Cube,
+        &[[0, 0, 0], [-1, -1, -1], [1, 0, -1]],
+        [16, 8, 8],
+    );
 }

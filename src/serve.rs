@@ -574,6 +574,10 @@ type Climbed = (u32, Vec<u32>, std::time::Duration, Escapes, bool);
 
 pub trait Halt {
     fn halted(&mut self, next: std::time::Duration) -> bool;
+
+    fn building(&mut self) -> bool {
+        false
+    }
 }
 
 pub struct Never;
@@ -983,6 +987,13 @@ fn machined_within(
     let width = host.width();
     let many = whole(effort.crowd, width);
     let wide = u32::try_from(traces.len())?.div_ceil(32).max(1);
+    if halt.building() {
+        let chip = Chip::of(shape, vec![0; shape.gates as usize], held.named())?;
+        let mut ran = told_of(held, traces, &chip, &[], 0, many)?;
+        ran.marks = 0;
+        ran.stopped = true;
+        return Ok(Ok(ran));
+    }
     unrolled(held, wide)?;
     let (feed, want) = laid(held, traces, wide);
 
