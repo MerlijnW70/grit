@@ -25,7 +25,7 @@ Refusals:
 |---|---|---|
 | `rule_or_law` | both or neither of `rule` and `law` | `$` |
 | `law_refused` | the law does not compile; `law` in the answer holds its own `code`, `path`, `expected`, `found` | `$.law` |
-| `law_not_built` | the device's driver failed to compile the law's kernel (pipeline creation); `device` and `vulkan` in the answer name the device and its result; no world is made and nothing else changes | `$.law` |
+| `law_not_built` | the device's driver failed to compile a kernel made from a law: a create with `law`, and an open, fork, walk back or rebuild of a law world; `device` and `vulkan` in the answer name the device and its result; no world is made and nothing else changes. A kernel made from no law (a rule world) is `kernel_not_built` at `$` | `$.law` |
 | `params` | a params count other than the law's | `$.params` |
 | `quiet_refused` | a sparse world under a `whole` law | `$.sparse` |
 
