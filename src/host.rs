@@ -611,6 +611,13 @@ impl Blocked {
     }
 }
 
+pub fn in_driver<T>(work: impl FnOnce() -> T) -> T {
+    let watch = Blocked::start();
+    let done = work();
+    spent_on_device(watch.blocked());
+    done
+}
+
 pub fn synced(file: &std::fs::File) -> std::io::Result<()> {
     let watch = Blocked::start();
     disk::slow();
@@ -644,6 +651,33 @@ pub mod disk {
 mod disk {
     #[inline(always)]
     pub(crate) const fn slow() {}
+}
+
+#[cfg(feature = "faults")]
+pub mod driver {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static ALLOCATING: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    pub fn slow_allocations(by: Duration) {
+        ALLOCATING.set(by);
+    }
+
+    pub(crate) fn allocating() {
+        let by = ALLOCATING.get();
+        if !by.is_zero() {
+            std::thread::sleep(by);
+        }
+    }
+}
+
+#[cfg(not(feature = "faults"))]
+pub(crate) mod driver {
+    #[inline(always)]
+    pub(crate) const fn allocating() {}
 }
 
 pub struct Host {

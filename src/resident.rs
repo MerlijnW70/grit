@@ -785,8 +785,10 @@ impl Host {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         faults::enter(Step::Buffer)?;
         let handle = unsafe {
-            self.device()
-                .create_buffer(&create, faults::callbacks(Step::Buffer))
+            crate::host::in_driver(|| {
+                self.device()
+                    .create_buffer(&create, faults::callbacks(Step::Buffer))
+            })
         }?;
         faults::made(Step::Buffer, handle);
         let unmade = |why: Error| {
@@ -808,17 +810,24 @@ impl Host {
             .memory_type_index(kind);
         let memory = faults::enter(Step::Memory)
             .and_then(|()| unsafe {
-                self.device()
-                    .allocate_memory(&allocate, faults::callbacks(Step::Memory))
+                crate::host::in_driver(|| {
+                    crate::host::driver::allocating();
+                    self.device()
+                        .allocate_memory(&allocate, faults::callbacks(Step::Memory))
+                })
             })
             .map_err(|code| unmade(code.into()))?;
         faults::made(Step::Memory, memory);
         faults::enter(Step::Bind)
-            .and_then(|()| unsafe { self.device().bind_buffer_memory(handle, memory, 0) })
+            .and_then(|()| unsafe {
+                crate::host::in_driver(|| self.device().bind_buffer_memory(handle, memory, 0))
+            })
             .map_err(|code| {
                 unsafe {
-                    self.device()
-                        .free_memory(memory, faults::callbacks(Step::Memory))
+                    crate::host::in_driver(|| {
+                        self.device()
+                            .free_memory(memory, faults::callbacks(Step::Memory))
+                    })
                 };
                 faults::gone(Step::Memory, memory);
                 unmade(code.into())
@@ -888,8 +897,10 @@ impl Host {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         faults::enter(Step::Buffer)?;
         let handle = unsafe {
-            self.device()
-                .create_buffer(&create, faults::callbacks(Step::Buffer))
+            crate::host::in_driver(|| {
+                self.device()
+                    .create_buffer(&create, faults::callbacks(Step::Buffer))
+            })
         }?;
         faults::made(Step::Buffer, handle);
         let requirements = unsafe { self.device().get_buffer_memory_requirements(handle) };
@@ -1077,11 +1088,13 @@ impl<'host> Resident<'host> {
                 .layout(self.pipeline_layout)];
             let built = match faults::enter(Step::Pipeline) {
                 Ok(()) => unsafe {
-                    device.create_compute_pipelines(
-                        vk::PipelineCache::null(),
-                        &create,
-                        faults::callbacks(Step::Pipeline),
-                    )
+                    crate::host::in_driver(|| {
+                        device.create_compute_pipelines(
+                            vk::PipelineCache::null(),
+                            &create,
+                            faults::callbacks(Step::Pipeline),
+                        )
+                    })
                 },
                 Err(code) => Err((Vec::new(), code)),
             };
@@ -1353,14 +1366,16 @@ impl Resident<'_> {
         let staging = self.staging.memory;
 
         unsafe {
-            let mapped = self.host.device().map_memory(
-                staging,
-                from.from,
-                from.bytes,
-                vk::MemoryMapFlags::empty(),
-            )?;
+            let mapped = crate::host::in_driver(|| {
+                self.host.device().map_memory(
+                    staging,
+                    from.from,
+                    from.bytes,
+                    vk::MemoryMapFlags::empty(),
+                )
+            })?;
             std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
-            self.host.device().unmap_memory(staging);
+            crate::host::in_driver(|| self.host.device().unmap_memory(staging));
         }
 
         let region = [vk::BufferCopy::default()
@@ -1380,14 +1395,16 @@ impl Resident<'_> {
         words: &[u32],
     ) -> Result<(), Error> {
         unsafe {
-            let mapped = self.host.device().map_memory(
-                memory,
-                into.from,
-                into.bytes,
-                vk::MemoryMapFlags::empty(),
-            )?;
+            let mapped = crate::host::in_driver(|| {
+                self.host.device().map_memory(
+                    memory,
+                    into.from,
+                    into.bytes,
+                    vk::MemoryMapFlags::empty(),
+                )
+            })?;
             std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
-            self.host.device().unmap_memory(memory);
+            crate::host::in_driver(|| self.host.device().unmap_memory(memory));
         }
         Ok(())
     }
@@ -1439,19 +1456,21 @@ impl Resident<'_> {
 
         let staging = self.staging.memory;
         unsafe {
-            let mapped = self.host.device().map_memory(
-                staging,
-                whole.from,
-                whole.bytes,
-                vk::MemoryMapFlags::empty(),
-            )?;
+            let mapped = crate::host::in_driver(|| {
+                self.host.device().map_memory(
+                    staging,
+                    whole.from,
+                    whole.bytes,
+                    vk::MemoryMapFlags::empty(),
+                )
+            })?;
             let mut along = 0_usize;
             for &(_, _, words) in &taken {
                 let into = mapped.cast::<u32>().add(along);
                 std::ptr::copy_nonoverlapping(words.as_ptr(), into, words.len());
                 along += words.len();
             }
-            self.host.device().unmap_memory(staging);
+            crate::host::in_driver(|| self.host.device().unmap_memory(staging));
         }
 
         let source = self.staging.handle;
@@ -1537,7 +1556,10 @@ impl Resident<'_> {
             let allocate = vk::MemoryAllocateInfo::default()
                 .allocation_size(bytes)
                 .memory_type_index(kind);
-            let memory = device.allocate_memory(&allocate, None)?;
+            let memory = crate::host::in_driver(|| {
+                crate::host::driver::allocating();
+                device.allocate_memory(&allocate, None)
+            })?;
 
             let binds = [vk::SparseMemoryBind::default()
                 .resource_offset(from)
@@ -1550,7 +1572,7 @@ impl Resident<'_> {
             let fence = match device.create_fence(&vk::FenceCreateInfo::default(), None) {
                 Ok(fence) => fence,
                 Err(code) => {
-                    device.free_memory(memory, None);
+                    crate::host::in_driver(|| device.free_memory(memory, None));
                     return Err(code.into());
                 }
             };
@@ -1558,7 +1580,7 @@ impl Resident<'_> {
                 Ok(gate) => gate.into_iter().collect(),
                 Err(code) => {
                     device.destroy_fence(fence, None);
-                    device.free_memory(memory, None);
+                    crate::host::in_driver(|| device.free_memory(memory, None));
                     return Err(code.into());
                 }
             };
@@ -1574,11 +1596,13 @@ impl Resident<'_> {
                 info.push_next(&mut timeline)
             }];
             let ordered = self.host.ordered();
-            let held = device.queue_bind_sparse(self.host.queue(), &info, fence);
+            let held = crate::host::in_driver(|| {
+                device.queue_bind_sparse(self.host.queue(), &info, fence)
+            });
             drop(ordered);
             if held.is_err() {
                 device.destroy_fence(fence, None);
-                device.free_memory(memory, None);
+                crate::host::in_driver(|| device.free_memory(memory, None));
                 held?;
             }
             let waited = self.await_fence(fence, None);
@@ -1590,7 +1614,7 @@ impl Resident<'_> {
             match waited {
                 Ok(wait) => self.credit(wait, None),
                 Err(why) => {
-                    device.free_memory(memory, None);
+                    crate::host::in_driver(|| device.free_memory(memory, None));
                     return Err(why);
                 }
             }
@@ -1648,7 +1672,9 @@ impl Resident<'_> {
             }];
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let ordered = self.host.ordered();
-            let sent = device.queue_bind_sparse(self.host.queue(), &info, fence);
+            let sent = crate::host::in_driver(|| {
+                device.queue_bind_sparse(self.host.queue(), &info, fence)
+            });
             drop(ordered);
             if sent.is_err() {
                 device.destroy_fence(fence, None);
@@ -1663,7 +1689,7 @@ impl Resident<'_> {
             self.credit(waited?, None);
 
             for &(_, memory, _) in &going {
-                device.free_memory(memory, None);
+                crate::host::in_driver(|| device.free_memory(memory, None));
             }
             if let Some(slot) = self.buffers.get_mut(index) {
                 slot.pages.retain(|held| !going.contains(held));
@@ -1766,12 +1792,14 @@ impl Resident<'_> {
         self.copies += 1;
         let memory = self.staging.memory;
         unsafe {
-            let mapped = self.host.device().map_memory(
-                memory,
-                into.from,
-                into.bytes,
-                vk::MemoryMapFlags::empty(),
-            )?;
+            let mapped = crate::host::in_driver(|| {
+                self.host.device().map_memory(
+                    memory,
+                    into.from,
+                    into.bytes,
+                    vk::MemoryMapFlags::empty(),
+                )
+            })?;
             let words = std::slice::from_raw_parts(mapped.cast::<u32>(), total);
             let mut along = 0_usize;
             for &(run, _, _, count) in parts {
@@ -1782,7 +1810,7 @@ impl Resident<'_> {
                 }
                 along += count;
             }
-            self.host.device().unmap_memory(memory);
+            crate::host::in_driver(|| self.host.device().unmap_memory(memory));
         }
         Ok(())
     }
@@ -1984,7 +2012,9 @@ impl Resident<'_> {
         unsafe {
             device.destroy_buffer(old.handle, faults::callbacks(Step::Buffer));
             faults::gone(Step::Buffer, old.handle);
-            device.free_memory(old.memory, faults::callbacks(Step::Memory));
+            crate::host::in_driver(|| {
+                device.free_memory(old.memory, faults::callbacks(Step::Memory))
+            });
             faults::gone(Step::Memory, old.memory);
         }
         self.free()
@@ -2214,7 +2244,9 @@ impl Resident<'_> {
             let ordered = self.host.ordered();
             unsafe {
                 device.reset_fences(&[facing.fence])?;
-                device.queue_submit(self.host.queue(), &submit, facing.fence)?;
+                crate::host::in_driver(|| {
+                    device.queue_submit(self.host.queue(), &submit, facing.fence)
+                })?;
             }
             drop(ordered);
             self.reused += 1;
@@ -2386,7 +2418,9 @@ impl Resident<'_> {
 
             let ordered = self.host.ordered();
             device.reset_fences(&[facing.fence])?;
-            device.queue_submit(self.host.queue(), &submit, facing.fence)?;
+            crate::host::in_driver(|| {
+                device.queue_submit(self.host.queue(), &submit, facing.fence)
+            })?;
             drop(ordered);
         }
 
@@ -2467,7 +2501,7 @@ impl Resident<'_> {
             }];
             let ordered = self.host.ordered();
             device.reset_fences(&[self.fence])?;
-            device.queue_submit(self.host.queue(), &submit, self.fence)?;
+            crate::host::in_driver(|| device.queue_submit(self.host.queue(), &submit, self.fence))?;
             self.sending.store(true, Ordering::SeqCst);
             drop(ordered);
         }
@@ -2519,15 +2553,17 @@ impl Resident<'_> {
         }
         let from = staged(at, count, room)?;
         unsafe {
-            let mapped = self.host.device().map_memory(
-                memory,
-                from.from,
-                from.bytes,
-                vk::MemoryMapFlags::empty(),
-            )?;
+            let mapped = crate::host::in_driver(|| {
+                self.host.device().map_memory(
+                    memory,
+                    from.from,
+                    from.bytes,
+                    vk::MemoryMapFlags::empty(),
+                )
+            })?;
             let mut out = vec![0_u32; count];
             std::ptr::copy_nonoverlapping(mapped.cast::<u32>(), out.as_mut_ptr(), count);
-            self.host.device().unmap_memory(memory);
+            crate::host::in_driver(|| self.host.device().unmap_memory(memory));
             Ok(out)
         }
     }
@@ -2750,15 +2786,17 @@ impl Drop for Resident<'_> {
             {
                 device.destroy_buffer(held.handle, faults::callbacks(Step::Buffer));
                 faults::gone(Step::Buffer, held.handle);
-                device.free_memory(held.memory, faults::callbacks(Step::Memory));
+                crate::host::in_driver(|| {
+                    device.free_memory(held.memory, faults::callbacks(Step::Memory))
+                });
                 faults::gone(Step::Memory, held.memory);
                 for &(_, memory, _) in &held.pages {
-                    device.free_memory(memory, None);
+                    crate::host::in_driver(|| device.free_memory(memory, None));
                 }
             }
             for &(fence, memory) in &self.stranded {
                 device.destroy_fence(fence, None);
-                device.free_memory(memory, None);
+                crate::host::in_driver(|| device.free_memory(memory, None));
             }
         }
         if self.built {

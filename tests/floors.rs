@@ -1021,3 +1021,43 @@ fn e2_a_save_whose_sync_the_disk_itself_holds_is_refused_up_front() {
     let (got, took) = timed(|| save(&mut server, world, name, Some(budget)));
     refused_without_running(&got, took, budget, "e2 save sync");
 }
+
+struct Allocations;
+
+impl Allocations {
+    fn slowed(by: Duration) -> Self {
+        grit::host::driver::slow_allocations(by);
+        Self
+    }
+}
+
+impl Drop for Allocations {
+    fn drop(&mut self) {
+        grit::host::driver::slow_allocations(Duration::ZERO);
+    }
+}
+
+#[test]
+fn e2_a_build_whose_allocations_the_driver_holds_is_refused_up_front() {
+    let _starving = starving();
+    let Some(host) = device("e2 build allocations") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let fits = plain_rounds(|| {
+        let (made, took) = timed(|| answered(&create(&mut server, None)));
+        close(&mut server, int_at(&made, "world"));
+        took
+    });
+    let budget = short_of(fits);
+    let slowed = Allocations::slowed(budget * 2);
+    for round in 0..RECENT {
+        let (made, took) = timed(|| answered(&create(&mut server, None)));
+        close(&mut server, int_at(&made, "world"));
+        eprintln!("e2 build allocations: driver held round {round} took {took:?}");
+        assert!(took > budget, "setup: took {took:?}, budget {budget:?}");
+    }
+    drop(slowed);
+    let (got, took) = timed(|| create(&mut server, Some(budget)));
+    refused_without_running(&got, took, budget, "e2 build allocations");
+}
