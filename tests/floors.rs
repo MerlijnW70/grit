@@ -872,3 +872,152 @@ fn e4_holds_off_the_cpu_never_change_the_bytes_of_an_answer() {
     unarmed(&held);
     assert_eq!(first, second);
 }
+
+const HELD_TRANSFER_MOST: Duration = Duration::from_millis(200);
+
+struct Transfers;
+
+impl Transfers {
+    fn slowed(by: Duration) -> Self {
+        grit::resident::faults::slow_transfers(by);
+        Self
+    }
+}
+
+impl Drop for Transfers {
+    fn drop(&mut self) {
+        grit::resident::faults::slow_transfers(Duration::ZERO);
+    }
+}
+
+fn held_on_the_device<T>(budget: Duration, mut work: impl FnMut() -> T, label: &str) {
+    let each = (budget * 2).min(HELD_TRANSFER_MOST);
+    eprintln!("{label}: each transfer held {each:?}, budget {budget:?}");
+    let slowed = Transfers::slowed(each);
+    for round in 0..RECENT {
+        let (_, took) = timed(&mut work);
+        eprintln!("{label}: device held round {round} took {took:?}");
+        assert!(
+            took > budget,
+            "setup: {label} took {took:?}, budget {budget:?}"
+        );
+    }
+    drop(slowed);
+}
+
+fn refused_without_running(got: &Json, took: Duration, budget: Duration, label: &str) {
+    eprintln!(
+        "{label} with {budget:?} answered in {took:?}: {}",
+        written(got)
+    );
+    needs_at_least(&refused(got));
+    assert!(took < budget, "{label}: the refused call ran for {took:?}");
+}
+
+#[test]
+fn e2_a_build_whose_transfers_the_device_itself_holds_is_refused_up_front() {
+    let _beside = beside();
+    let Some(host) = device("e2 build transfers") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let fits = plain_rounds(|| {
+        let (made, took) = timed(|| answered(&create(&mut server, None)));
+        close(&mut server, int_at(&made, "world"));
+        took
+    });
+    let budget = short_of(fits);
+    held_on_the_device(
+        budget,
+        || {
+            let made = answered(&create(&mut server, None));
+            close(&mut server, int_at(&made, "world"));
+        },
+        "e2 build transfers",
+    );
+    let (got, took) = timed(|| create(&mut server, Some(budget)));
+    refused_without_running(&got, took, budget, "e2 build transfers");
+}
+
+#[test]
+fn e2_a_fork_whose_copies_the_device_itself_holds_is_refused_up_front() {
+    let _beside = beside();
+    let Some(host) = device("e2 fork copies") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = int_at(&answered(&create(&mut server, None)), "world");
+    let fits = plain_rounds(|| {
+        let (forked, took) = timed(|| answered(&fork(&mut server, world, None)));
+        close(&mut server, int_at(&forked, "world"));
+        took
+    });
+    let budget = short_of(fits);
+    held_on_the_device(
+        budget,
+        || {
+            let forked = answered(&fork(&mut server, world, None));
+            close(&mut server, int_at(&forked, "world"));
+        },
+        "e2 fork copies",
+    );
+    let (got, took) = timed(|| fork(&mut server, world, Some(budget)));
+    refused_without_running(&got, took, budget, "e2 fork copies");
+}
+
+struct Disk;
+
+impl Disk {
+    fn slowed(by: Duration) -> Self {
+        grit::host::disk::slow_sync(by);
+        Self
+    }
+}
+
+impl Drop for Disk {
+    fn drop(&mut self) {
+        grit::host::disk::slow_sync(Duration::ZERO);
+    }
+}
+
+fn save(server: &mut Server<'_>, world: i64, name: u32, budget: Option<Duration>) -> Json {
+    call(
+        server,
+        "grit_world_save",
+        &format!(
+            "{{\"world\":{world},\"name\":\"saved-{name}\"{}}}",
+            budgeted(budget)
+        ),
+    )
+}
+
+#[test]
+fn e2_a_save_whose_sync_the_disk_itself_holds_is_refused_up_front() {
+    let _beside = beside();
+    let Some(host) = device("e2 save sync") else {
+        return;
+    };
+    let scratch = Scratch::new("e2-save");
+    let mut server = Server::with(Some(&host), &scratch.kept(0)).unwrap();
+    let world = int_at(&answered(&create(&mut server, None)), "world");
+    let mut name = 0;
+    let fits = plain_rounds(|| {
+        name += 1;
+        let (got, took) = timed(|| save(&mut server, world, name, None));
+        answered(&got);
+        took
+    });
+    let budget = short_of(fits);
+    let slowed = Disk::slowed(budget * 2);
+    for round in 0..RECENT {
+        name += 1;
+        let (got, took) = timed(|| save(&mut server, world, name, None));
+        answered(&got);
+        eprintln!("e2 save sync: disk held round {round} took {took:?}");
+        assert!(took > budget, "setup: took {took:?}, budget {budget:?}");
+    }
+    drop(slowed);
+    name += 1;
+    let (got, took) = timed(|| save(&mut server, world, name, Some(budget)));
+    refused_without_running(&got, took, budget, "e2 save sync");
+}

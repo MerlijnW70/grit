@@ -496,6 +496,156 @@ const fn cpu_stalled() -> Option<Duration> {
     None
 }
 
+#[cfg(target_os = "linux")]
+pub fn thread_cpu() -> Option<Duration> {
+    #[repr(C)]
+    struct Spec {
+        seconds: std::ffi::c_long,
+        nanos: std::ffi::c_long,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: std::ffi::c_int, spec: *mut Spec) -> std::ffi::c_int;
+    }
+    const THREAD_CPU: std::ffi::c_int = 3;
+    let mut spec = Spec {
+        seconds: 0,
+        nanos: 0,
+    };
+    let read = unsafe { clock_gettime(THREAD_CPU, &raw mut spec) };
+    if read != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(spec.seconds).ok()?;
+    let nanos = u32::try_from(spec.nanos).ok()?;
+    Some(Duration::new(seconds, nanos))
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThread() -> *mut std::ffi::c_void;
+    fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
+}
+
+#[cfg(windows)]
+fn thread_cycles() -> Option<u64> {
+    let mut cycles = 0_u64;
+    let read = unsafe { QueryThreadCycleTime(GetCurrentThread(), &raw mut cycles) };
+    (read != 0).then_some(cycles)
+}
+
+#[cfg(windows)]
+const CALIBRATION: Duration = Duration::from_millis(2);
+
+#[cfg(windows)]
+const CALIBRATIONS: u32 = 5;
+
+#[cfg(windows)]
+fn cycles_per_second() -> Option<f64> {
+    static RATE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        let mut best: Option<f64> = None;
+        for _ in 0..CALIBRATIONS {
+            let began = std::time::Instant::now();
+            let from = thread_cycles()?;
+            while began.elapsed() < CALIBRATION {
+                std::hint::spin_loop();
+            }
+            let to = thread_cycles()?;
+            let rate = to.saturating_sub(from) as f64 / began.elapsed().as_secs_f64();
+            if rate.is_finite() && rate > 0.0 {
+                best = Some(best.map_or(rate, |held| held.max(rate)));
+            }
+        }
+        best
+    })
+}
+
+#[cfg(windows)]
+pub fn thread_cpu() -> Option<Duration> {
+    let rate = cycles_per_second()?;
+    Duration::try_from_secs_f64(thread_cycles()? as f64 / rate).ok()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub const fn thread_cpu() -> Option<Duration> {
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Blocked {
+    began: std::time::Instant,
+    cpu: Option<Duration>,
+    stalled: Option<Duration>,
+}
+
+impl Blocked {
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            began: std::time::Instant::now(),
+            cpu: thread_cpu(),
+            stalled: cpu_stalled(),
+        }
+    }
+
+    #[must_use]
+    pub fn cpu(&self) -> Duration {
+        match (self.cpu, thread_cpu()) {
+            (Some(from), Some(to)) => to.saturating_sub(from),
+            _ => Duration::ZERO,
+        }
+    }
+
+    #[must_use]
+    pub fn blocked(&self) -> Duration {
+        let wall = self.began.elapsed();
+        if self.cpu.is_none() {
+            return Duration::ZERO;
+        }
+        let stalled = match (self.stalled, cpu_stalled()) {
+            (Some(from), Some(to)) => to.saturating_sub(from),
+            _ => Duration::ZERO,
+        };
+        wall.saturating_sub(self.cpu()).saturating_sub(stalled)
+    }
+}
+
+pub fn synced(file: &std::fs::File) -> std::io::Result<()> {
+    let watch = Blocked::start();
+    disk::slow();
+    let synced = file.sync_all();
+    spent_on_device(watch.blocked());
+    synced
+}
+
+#[cfg(feature = "faults")]
+pub mod disk {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static SLOW: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    pub fn slow_sync(by: Duration) {
+        SLOW.set(by);
+    }
+
+    pub(crate) fn slow() {
+        let by = SLOW.get();
+        if !by.is_zero() {
+            std::thread::sleep(by);
+        }
+    }
+}
+
+#[cfg(not(feature = "faults"))]
+mod disk {
+    #[inline(always)]
+    pub(crate) const fn slow() {}
+}
+
 pub struct Host {
     entry: ash::Entry,
     instance: ash::Instance,

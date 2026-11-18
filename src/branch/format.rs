@@ -1098,10 +1098,7 @@ where
         let (out, written) = encode(image, out)?;
         let inner = out.into_inner().map_err(io::IntoInnerError::into_error)?;
         drop(inner);
-        OpenOptions::new()
-            .write(true)
-            .open(&temporary)?
-            .sync_all()?;
+        crate::host::synced(&OpenOptions::new().write(true).open(&temporary)?)?;
         fs::rename(&temporary, path)?;
         Ok(written)
     })();
@@ -1123,7 +1120,7 @@ fn settled(path: &Path) {
         .parent()
         .filter(|folder| !folder.as_os_str().is_empty())
     {
-        let _ = File::open(folder).and_then(|held| held.sync_all());
+        let _ = File::open(folder).and_then(|held| crate::host::synced(&held));
     }
 }
 

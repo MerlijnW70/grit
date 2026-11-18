@@ -103,6 +103,15 @@ pub mod faults {
         static COUNTS: RefCell<[(u64, u64); KINDS]> = const { RefCell::new([(0, 0); KINDS]) };
         static HOOKS: &'static Hooks = hooks();
         static HOLDING: Cell<Option<u64>> = const { Cell::new(None) };
+        static SLOWED: Cell<std::time::Duration> = const { Cell::new(std::time::Duration::ZERO) };
+    }
+
+    pub fn slow_transfers(by: std::time::Duration) {
+        SLOWED.set(by);
+    }
+
+    pub(crate) fn slowed() -> std::time::Duration {
+        SLOWED.get()
     }
 
     struct Gate {
@@ -412,6 +421,11 @@ pub(crate) mod faults {
 
     #[inline(always)]
     pub(crate) fn ungate(_: &ash::Device, _: u64) {}
+
+    #[inline(always)]
+    pub(crate) const fn slowed() -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
 }
 
 use faults::Step;
@@ -565,6 +579,12 @@ pub(crate) fn forming() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Wait {
+    cpu: Duration,
+    blocked: Duration,
+}
+
 pub struct Resident<'host> {
     host: &'host Host,
     direct: bool,
@@ -582,6 +602,7 @@ pub struct Resident<'host> {
     commands: vk::CommandPool,
     transfer: vk::CommandBuffer,
     fence: vk::Fence,
+    stamps: Option<vk::QueryPool>,
     sending: AtomicBool,
     stranded: Vec<(vk::Fence, vk::DeviceMemory)>,
     slots: Vec<Slot>,
@@ -737,6 +758,7 @@ impl Host {
             made.writes = modules.iter().map(|words| written(words)).collect();
             made.record()?;
             made.fence = self.fence()?;
+            made.stamps = self.queries();
             for slot in &mut made.slots {
                 slot.fence = self.fence()?;
                 slot.queries = self.queries();
@@ -934,6 +956,7 @@ impl<'host> Resident<'host> {
             commands: vk::CommandPool::null(),
             transfer: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            stamps: None,
             sending: AtomicBool::new(false),
             stranded: Vec::new(),
             slots: Vec::with_capacity(SLOTS),
@@ -1195,16 +1218,28 @@ impl Resident<'_> {
         Ok(())
     }
 
-    fn await_fence(&self, fence: vk::Fence) -> Result<(), Error> {
+    fn await_fence(
+        &self,
+        fence: vk::Fence,
+        held: Option<(vk::Event, Duration)>,
+    ) -> Result<Wait, Error> {
         let patience = u64::try_from(self.patience.as_nanos()).unwrap_or(u64::MAX);
         let watch = self.host.on_cpu().then(crate::host::Unstalled::start);
+        let blocked = crate::host::Blocked::start();
+        if let Some((event, by)) = held {
+            std::thread::sleep(by);
+            unsafe { self.host.device().set_event(event) }?;
+        }
         let waited = unsafe { self.host.device().wait_for_fences(&[fence], true, patience) };
         match waited {
             Ok(()) => {
                 if let Some(watch) = watch {
                     crate::host::spent_on_device(watch.unstalled());
                 }
-                Ok(())
+                Ok(Wait {
+                    cpu: blocked.cpu(),
+                    blocked: blocked.blocked(),
+                })
             }
             Err(vk::Result::TIMEOUT) => {
                 self.host.wedge();
@@ -1546,15 +1581,18 @@ impl Resident<'_> {
                 device.free_memory(memory, None);
                 held?;
             }
-            let waited = self.await_fence(fence);
+            let waited = self.await_fence(fence, None);
             if self.host.wedged() {
                 self.stranded.push((fence, memory));
-                return waited;
+                return waited.map(|_| ());
             }
             device.destroy_fence(fence, None);
-            if waited.is_err() {
-                device.free_memory(memory, None);
-                return waited;
+            match waited {
+                Ok(wait) => self.credit(wait, None),
+                Err(why) => {
+                    device.free_memory(memory, None);
+                    return Err(why);
+                }
             }
 
             if let Some(slot) = self.buffers.get_mut(index) {
@@ -1616,13 +1654,13 @@ impl Resident<'_> {
                 device.destroy_fence(fence, None);
                 sent?;
             }
-            let waited = self.await_fence(fence);
+            let waited = self.await_fence(fence, None);
             if self.host.wedged() {
                 self.stranded.push((fence, vk::DeviceMemory::null()));
-                return waited;
+                return waited.map(|_| ());
             }
             device.destroy_fence(fence, None);
-            waited?;
+            self.credit(waited?, None);
 
             for &(_, memory, _) in &going {
                 device.free_memory(memory, None);
@@ -2029,23 +2067,19 @@ impl Resident<'_> {
             (held.began, held.out.clone(), slot.fence)
         };
 
-        self.await_fence(fence)?;
+        let wait = self.await_fence(fence, None)?;
         if let Some(slot) = self.slots.get_mut(at) {
             slot.flight = None;
         }
         self.device = self.timed(at);
         self.spans = self.split(at);
-        if !self.host.on_cpu()
-            && let Some(each) = self.device
-        {
-            let times = self
-                .slots
-                .get(at)
-                .and_then(|slot| slot.held.as_ref())
-                .map_or(1, |held| held.times)
-                .max(1);
-            crate::host::spent_on_device(each.saturating_mul(times));
-        }
+        let times = self
+            .slots
+            .get(at)
+            .and_then(|slot| slot.held.as_ref())
+            .map_or(1, |held| held.times)
+            .max(1);
+        self.credit(wait, self.device.map(|each| each.saturating_mul(times)));
         Ok((began.elapsed(), out, at))
     }
 
@@ -2371,13 +2405,48 @@ impl Resident<'_> {
     {
         self.idle()?;
         let device = self.host.device();
+        let slowed = faults::slowed();
+        let held = if slowed.is_zero() {
+            None
+        } else {
+            let event = unsafe { device.create_event(&vk::EventCreateInfo::default(), None) }?;
+            Some((event, slowed))
+        };
         unsafe {
             device.reset_command_buffer(self.transfer, vk::CommandBufferResetFlags::empty())?;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             device.begin_command_buffer(self.transfer, &begin)?;
+            if let Some(pool) = self.stamps {
+                device.cmd_reset_query_pool(self.transfer, pool, 0, 2);
+                device.cmd_write_timestamp(
+                    self.transfer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    pool,
+                    0,
+                );
+            }
+            if let Some((event, _)) = held {
+                device.cmd_wait_events(
+                    self.transfer,
+                    &[event],
+                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    &[],
+                    &[],
+                    &[],
+                );
+            }
             after_earlier(device, self.transfer);
             record(device, self.transfer);
+            if let Some(pool) = self.stamps {
+                device.cmd_write_timestamp(
+                    self.transfer,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    1,
+                );
+            }
             device.end_command_buffer(self.transfer)?;
 
             let commands = [self.transfer];
@@ -2402,9 +2471,40 @@ impl Resident<'_> {
             self.sending.store(true, Ordering::SeqCst);
             drop(ordered);
         }
-        self.await_fence(self.fence)?;
+        let waited = self.await_fence(self.fence, held);
         self.sending.store(false, Ordering::SeqCst);
+        let wait = waited?;
+        if let Some((event, _)) = held {
+            unsafe { self.host.device().destroy_event(event, None) };
+        }
+        self.credit(wait, self.stamped());
         Ok(())
+    }
+
+    fn stamped(&self) -> Option<Duration> {
+        let pool = self.stamps?;
+        let mut stamps = [0_u64; 2];
+        unsafe {
+            self.host
+                .device()
+                .get_query_pool_results(pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64)
+                .ok()?;
+        }
+        let [first, last] = stamps;
+        let ticks = last.checked_sub(first)?;
+        let (tick, _) = self.host.ticking();
+        Some(Duration::from_nanos(
+            (ticks as f64 * f64::from(tick)) as u64,
+        ))
+    }
+
+    fn credit(&self, wait: Wait, device: Option<Duration>) {
+        if self.host.on_cpu() {
+            return;
+        }
+        crate::host::spent_on_device(
+            device.map_or(wait.blocked, |device| device.saturating_sub(wait.cpu)),
+        );
     }
 
     unsafe fn mapped_at(
@@ -2601,6 +2701,10 @@ impl Drop for Resident<'_> {
             faults::ungate(device, self.owner());
             device.destroy_fence(self.fence, faults::callbacks(Step::Fence));
             faults::gone(Step::Fence, self.fence);
+            if let Some(pool) = self.stamps {
+                device.destroy_query_pool(pool, faults::callbacks(Step::Queries));
+                faults::gone(Step::Queries, pool);
+            }
             for slot in &self.slots {
                 device.destroy_fence(slot.fence, faults::callbacks(Step::Fence));
                 faults::gone(Step::Fence, slot.fence);

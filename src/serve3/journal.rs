@@ -608,7 +608,7 @@ impl Keep {
         {
             let mut file = File::create(&temporary)?;
             file.write_all(&bytes_of(&words))?;
-            file.sync_all()?;
+            crate::host::synced(&file)?;
         }
         fs::rename(&temporary, &path)
     }
