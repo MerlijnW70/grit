@@ -429,6 +429,73 @@ pub fn on_device() -> Duration {
     ON_DEVICE.get()
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Unstalled {
+    began: std::time::Instant,
+    stalled: Option<Duration>,
+}
+
+impl Unstalled {
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            began: std::time::Instant::now(),
+            stalled: cpu_stalled(),
+        }
+    }
+
+    #[must_use]
+    pub fn unstalled(&self) -> Duration {
+        let wall = self.began.elapsed();
+        match (self.stalled, cpu_stalled()) {
+            (Some(from), Some(to)) => wall.saturating_sub(to.saturating_sub(from)),
+            _ => Duration::ZERO,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pressure_file() -> Option<&'static std::path::Path> {
+    static FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let own = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|groups| {
+                groups
+                    .lines()
+                    .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+            })
+            .map(|path| {
+                std::path::Path::new("/sys/fs/cgroup")
+                    .join(path.trim_start_matches('/'))
+                    .join("cpu.pressure")
+            })
+            .filter(|path| std::fs::read_to_string(path).is_ok());
+        own.or_else(|| {
+            let system = std::path::PathBuf::from("/proc/pressure/cpu");
+            std::fs::read_to_string(&system).is_ok().then_some(system)
+        })
+    })
+    .as_deref()
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_stalled() -> Option<Duration> {
+    let text = std::fs::read_to_string(pressure_file()?).ok()?;
+    let some = text.lines().find(|line| line.starts_with("some"))?;
+    let micros = some
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("total="))?
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_micros(micros))
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn cpu_stalled() -> Option<Duration> {
+    None
+}
+
 pub struct Host {
     entry: ash::Entry,
     instance: ash::Instance,

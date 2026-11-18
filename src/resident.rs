@@ -1197,9 +1197,15 @@ impl Resident<'_> {
 
     fn await_fence(&self, fence: vk::Fence) -> Result<(), Error> {
         let patience = u64::try_from(self.patience.as_nanos()).unwrap_or(u64::MAX);
+        let watch = self.host.on_cpu().then(crate::host::Unstalled::start);
         let waited = unsafe { self.host.device().wait_for_fences(&[fence], true, patience) };
         match waited {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(watch) = watch {
+                    crate::host::spent_on_device(watch.unstalled());
+                }
+                Ok(())
+            }
             Err(vk::Result::TIMEOUT) => {
                 self.host.wedge();
                 Err(Error::Wedged {
