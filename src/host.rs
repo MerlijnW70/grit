@@ -572,11 +572,115 @@ pub const fn thread_cpu() -> Option<Duration> {
     None
 }
 
+#[cfg(windows)]
+const PROCESSORS: usize = 64;
+
+#[cfg(not(windows))]
+type Idle = ();
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct Idle {
+    allowed: u64,
+    cycles: [u64; PROCESSORS],
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn QueryIdleProcessorCycleTime(length: *mut u32, cycles: *mut u64) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationThread(
+        thread: *mut std::ffi::c_void,
+        class: u32,
+        information: *mut std::ffi::c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct ThreadBasic {
+    exit: i32,
+    teb: *mut std::ffi::c_void,
+    process: usize,
+    thread: usize,
+    affinity: usize,
+    priority: i32,
+    base: i32,
+}
+
+#[cfg(windows)]
+fn idle_now() -> Option<Idle> {
+    let mut basic = ThreadBasic {
+        exit: 0,
+        teb: std::ptr::null_mut(),
+        process: 0,
+        thread: 0,
+        affinity: 0,
+        priority: 0,
+        base: 0,
+    };
+    let size = u32::try_from(size_of::<ThreadBasic>()).ok()?;
+    let status = unsafe {
+        NtQueryInformationThread(
+            GetCurrentThread(),
+            0,
+            (&raw mut basic).cast(),
+            size,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let mut cycles = [0_u64; PROCESSORS];
+    let mut length = u32::try_from(size_of_val(&cycles)).ok()?;
+    let read = unsafe { QueryIdleProcessorCycleTime(&raw mut length, cycles.as_mut_ptr()) };
+    if read == 0 {
+        return None;
+    }
+    Some(Idle {
+        allowed: u64::try_from(basic.affinity).ok()?,
+        cycles,
+    })
+}
+
+#[cfg(windows)]
+fn idle_since(from: &Idle) -> Option<Duration> {
+    let to = idle_now()?;
+    let rate = cycles_per_second()?;
+    let most = (0..PROCESSORS)
+        .filter(|&at| from.allowed >> at & 1 == 1)
+        .filter_map(|at| {
+            let (began, ended) = (from.cycles.get(at)?, to.cycles.get(at)?);
+            Some(ended.saturating_sub(*began))
+        })
+        .max()?;
+    Duration::try_from_secs_f64(most as f64 / rate).ok()
+}
+
+#[cfg(not(windows))]
+const fn idle_now() -> Option<Idle> {
+    None
+}
+
+#[cfg(not(windows))]
+const fn idle_since(_: &Idle) -> Option<Duration> {
+    None
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Blocked {
     began: std::time::Instant,
     cpu: Option<Duration>,
     stalled: Option<Duration>,
+    idle: Option<Idle>,
 }
 
 impl Blocked {
@@ -586,6 +690,7 @@ impl Blocked {
             began: std::time::Instant::now(),
             cpu: thread_cpu(),
             stalled: cpu_stalled(),
+            idle: idle_now(),
         }
     }
 
@@ -607,7 +712,11 @@ impl Blocked {
             (Some(from), Some(to)) => to.saturating_sub(from),
             _ => Duration::ZERO,
         };
-        wall.saturating_sub(self.cpu()).saturating_sub(stalled)
+        let waited = wall.saturating_sub(self.cpu()).saturating_sub(stalled);
+        match self.idle.as_ref().and_then(idle_since) {
+            Some(idle) => waited.min(idle),
+            None => waited,
+        }
     }
 }
 
