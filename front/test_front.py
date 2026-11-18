@@ -411,7 +411,7 @@ class Running(unittest.TestCase):
 
 
 class Surviving(unittest.TestCase):
-    """The survivor triage, on the parts that need no model and no noha."""
+    """The survivor triage, on the parts that need no model and no mutation tool."""
 
     def test_the_enclosing_function_is_found_by_walking_back(self):
         lines = ["fn one() {", "    let a = 1;", "}", "",

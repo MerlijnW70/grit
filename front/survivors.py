@@ -1,6 +1,6 @@
 """Mutation survivors, sorted into test gaps and changes that do nothing.
 
-noha makes the mutants and runs the suite. Neither needs a model: one is an
+The mutation tool makes the mutants and runs the suite. Neither needs a model: one is an
 edit to a line, the other is a test run. What is left over is the expensive
 part - a mutant the suite did not kill is either a hole in the tests or a
 change that cannot alter what the program does, and telling those apart is a
@@ -144,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="survivors", description=__doc__.split("\n")[0])
     parser.add_argument("--from", dest="source",
-                        help="noha report --json, or - to read it from stdin")
+                        help="a survivors report in JSON, or - to read it from stdin")
     parser.add_argument("--check", action="store_true",
                         help="run the marked mutants and score the judging")
     parser.add_argument("--json", action="store_true")
@@ -277,7 +277,7 @@ def marked(args) -> int:
               f"{'  ' if said == one['equivalent'] else '<<'} {one['before'][:44]}")
     print(f"\n{right}/{len(MARKED)} judged as the code behaves.")
     print("Eight mutants chosen by whoever wrote this, which is not a score to "
-          "trust. Bring\nyour own survivors: noha report --json, then --from.")
+          "trust. Bring\nyour own survivors: a survivors report in JSON, then --from.")
     return 0 if right == len(MARKED) else 1
 
 

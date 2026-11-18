@@ -27,3 +27,5 @@ the card.
 
 `spike`, `back` and `climb` also open a window. `scale`, `stages` and `loop_cost`
 print tables and need none. `grit-mcp` speaks MCP on stdin and stdout.
+
+Grit is licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
