@@ -44,7 +44,7 @@ pub const TABLE_INPUTS: u32 = 9;
 
 pub const PATIENCE: u32 = 2;
 
-pub const KERNEL_WORDS: usize = 1 << 16;
+pub const MARGIN: u32 = 2;
 
 pub const MINIMAL: &str = "each row the examples never showed takes the answer of the smallest circuit the gate ladder found that answers every seen row";
 
@@ -54,7 +54,7 @@ pub const ZERO_RUNS: &str = "the law reads its neighbours wrapped on the world's
 
 pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world whose sides equal its own along each axis the stencil reads (3x3 reads x and y, so its tall is free; a world's tall is at least 2), and a world example's box reads its neighbours from that world";
 
-pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call, less its wait for other calls' builds, does not fit; a build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; a top rung whose kernel passes 65536 words is refused learn_limit at gates before any search, so an answer can come late by up to one build of at most that kernel; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion and the count of decided rows check budget and cancel every 4096 rows or 64-row blocks and refuse budget or cancelled; after a stopped ladder the count runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so that the smallest circuit solved so far is answered with its counts. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on the time measured, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it";
+pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call, less its wait for other calls' builds, does not fit; a build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; before the ladder the call builds the kernel of its smallest rung, then larger ones while each build, grown with the square of its words from the closest build measured, stays within half the device's patience; a top rung past that is refused learn_limit at gates with the most gates that fit, so an answer can come late by up to one build the device's evidence puts within half its patience; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion and the count of decided rows check budget and cancel every 4096 rows or 64-row blocks and refuse budget or cancelled; after a stopped ladder the count runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so that the smallest circuit solved so far is answered with its counts. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on the time measured, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -74,6 +74,31 @@ pub mod faults {
         static BUILDS: Cell<u64> = const { Cell::new(0) };
         static HELD_UP: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
         static CEILING: Cell<Option<u64>> = const { Cell::new(None) };
+        static SLOW: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static CALIBRATED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn builds_slowed_by(each_word: Duration) {
+        SLOW.set(each_word);
+    }
+
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub fn calibrations() -> u64 {
+        CALIBRATED.get()
+    }
+
+    #[cfg(feature = "faults")]
+    pub(super) fn calibrating(words: usize) -> Duration {
+        CALIBRATED.set(CALIBRATED.get().saturating_add(1));
+        SLOW.get()
+            .saturating_mul(u32::try_from(words).unwrap_or(u32::MAX))
+    }
+
+    #[cfg(not(feature = "faults"))]
+    pub(super) const fn calibrating(_: usize) -> Duration {
+        Duration::ZERO
     }
 
     #[cfg(feature = "faults")]
@@ -151,6 +176,8 @@ pub mod faults {
         CHARGE.set(None);
         HELD_UP.set(None);
         CEILING.set(None);
+        SLOW.set(Duration::ZERO);
+        CALIBRATED.set(0);
         KERNEL.set(0);
     }
 
@@ -1120,37 +1147,109 @@ fn kernel_words(
     Ok(crate::marking::stepped_rolled(host.width(), machine, wide)?.len())
 }
 
+struct Built {
+    gates: u32,
+    words: usize,
+    took: Duration,
+}
+
+fn predicted(evidence: &[Built], words: usize) -> Duration {
+    evidence
+        .iter()
+        .map(|one| {
+            let ratio = (words as f64 / one.words.max(1) as f64).max(1.0);
+            one.took.mul_f64(ratio * ratio)
+        })
+        .min()
+        .unwrap_or(Duration::MAX)
+}
+
+fn calibrated(
+    host: &crate::host::Host,
+    shape: (u32, u32),
+    gates: u32,
+    wide: u32,
+) -> Result<(Built, Duration), Failed> {
+    let machine = Machine::over(0, shape.0, shape.1, gates, chip_kinds(), 1)?;
+    let module = crate::marking::stepped_rolled(host.width(), machine, wide)?;
+    let modules: Vec<&[u32]> = vec![&module];
+    let sizes = vec![64_usize; crate::marking::BINDINGS as usize];
+    let began = std::time::Instant::now();
+    let resident = host.resident(&sizes, &modules)?;
+    let took = began
+        .elapsed()
+        .saturating_sub(resident.waited())
+        .saturating_add(faults::calibrating(module.len()));
+    Ok((
+        Built {
+            gates,
+            words: module.len(),
+            took,
+        },
+        resident.patience(),
+    ))
+}
+
 fn kernel_fitting(
     host: &crate::host::Host,
+    watch: &mut Watch<'_>,
     shape: (u32, u32),
     top: u32,
     traces: usize,
 ) -> Result<(), Failed> {
     let wide = u32::try_from(traces.div_ceil(32).max(1)).unwrap_or(u32::MAX);
-    let words = kernel_words(host, shape, top, wide)?;
-    if words <= KERNEL_WORDS {
-        return Ok(());
-    }
-    let mut fits = 0;
-    let (mut low, mut high) = (shape.1.max(1), top);
-    while low < high {
-        let mid = low + (high - low) / 2;
-        if kernel_words(host, shape, mid, wide)? <= KERNEL_WORDS {
-            fits = mid;
-            low = mid + 1;
-        } else {
-            high = mid;
+    let least = shape.1.max(1);
+    let (first, patience) = calibrated(host, shape, least, wide)?;
+    let most = patience / MARGIN;
+    let mut evidence = vec![first];
+    let top_words = kernel_words(host, shape, top, wide)?;
+    loop {
+        let fits = |gates: u32, evidence: &[Built]| -> Result<bool, Failed> {
+            Ok(predicted(evidence, kernel_words(host, shape, gates, wide)?) <= most)
+        };
+        if fits(top, &evidence)? {
+            return Ok(());
         }
+        let (mut low, mut high) = (least, top);
+        while low + 1 < high {
+            let mid = low + (high - low) / 2;
+            if fits(mid, &evidence)? {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        let tried = evidence.iter().map(|one| one.gates).max().unwrap_or(least);
+        let admitted = if fits(low, &evidence)? { low } else { 0 };
+        if admitted <= tried {
+            let best = evidence
+                .iter()
+                .min_by_key(|one| predicted(std::slice::from_ref(*one), top_words))
+                .map_or((0, Duration::ZERO), |one| (one.words, one.took));
+            return Err(limited(
+                Code::LearnLimit,
+                "$.gates",
+                format!(
+                    "a search kernel of {top} gates over {} inputs and {} outputs is {top_words} words; this device built {} words in {} ms, and with a build growing at most with the square of its words that is about {} ms, past half the {} ms a submission may take on this device; at most {} gates fit, and nothing was searched",
+                    shape.0,
+                    shape.1,
+                    best.0,
+                    best.1.as_millis(),
+                    predicted(&evidence, top_words).as_millis(),
+                    patience.as_millis(),
+                    admitted
+                ),
+                counted(admitted),
+            ));
+        }
+        if watch.over(predicted(&evidence, kernel_words(host, shape, low, wide)?)) {
+            return Err(halted_refusal(
+                watch.stop.unwrap_or(Stop::Budget),
+                "while measuring how fast this device builds a search kernel",
+            ));
+        }
+        evidence.push(calibrated(host, shape, low, wide)?.0);
     }
-    Err(limited(
-        Code::LearnLimit,
-        "$.gates",
-        format!(
-            "a search kernel of {top} gates over {} inputs and {} outputs is {words} words, more than the {KERNEL_WORDS} one build may compile within the device's patience; at most {fits} gates fit, and nothing was searched",
-            shape.0, shape.1
-        ),
-        counted(fits),
-    ))
 }
 
 fn fits_kernel(inputs: u32, outputs: u32, top: u32, traces: usize) -> Result<(), Failed> {
@@ -1386,7 +1485,7 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .collect();
     fits_kernel(inputs, outputs, top, traces.len())?;
     let crowd_most = crowd_fitting(host, inputs, top, traces.len())?;
-    kernel_fitting(host, (inputs, outputs), top, traces.len())?;
+    kernel_fitting(host, &mut watch, (inputs, outputs), top, traces.len())?;
     watch.crowd_most = crowd_most;
     let asked_crowd = effort.crowd;
     let effort = Effort {

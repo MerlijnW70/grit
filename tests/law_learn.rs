@@ -1106,9 +1106,9 @@ mod faulted {
 
     use grit::serve3::Options;
     use grit::serve3::exec::Exec;
-    use grit::serve3::law_learn::KERNEL_WORDS;
     use grit::serve3::law_learn::faults::{
-        cancel_after, ceiling_at, charge_after, checks, disarm, held_up_at, kernel_most,
+        builds_slowed_by, calibrations, cancel_after, ceiling_at, charge_after, checks, disarm,
+        held_up_at, kernel_most,
     };
 
     fn arguments() -> String {
@@ -1286,29 +1286,47 @@ mod faulted {
             large.abs_diff(small) * 32 < small,
             "64 rows built {small} words and about 4096 rows {large}; only constants differ"
         );
-        assert!(
-            large <= KERNEL_WORDS,
-            "{large} words past the bound {KERNEL_WORDS}"
-        );
     }
 
     #[test]
-    fn a_top_rung_whose_kernel_passes_its_bound_is_refused_before_any_search() {
+    fn a_top_rung_whose_build_the_evidence_puts_past_half_the_patience_is_refused_before_any_search()
+     {
         let Some(host) = device("law_learn kernel refused") else {
             return;
         };
-        let (told, built) = kernel_of(&host, &copied(73, [4, 4, 4], 256));
-        let told = result(&told, true);
+        let patience =
+            grit::Resident::patience_of(std::env::var("GRIT_PATIENCE_SECS").ok().as_deref());
+        let machine =
+            grit::machine::Machine::over(0, 27, 1, 64, grit::law::chip::KINDS, 1).unwrap();
+        let top = grit::marking::stepped_rolled(host.width(), machine, 2)
+            .unwrap()
+            .len();
+        let each = patience / u32::try_from(top).unwrap();
+        let mut mcp = Mcp::new(Some(&host));
+        disarm();
+        builds_slowed_by(each);
+        let told = mcp.no("grit_law_learn", &copied(73, [4, 4, 4], 64));
+        let (built, measured) = (kernel_most(), calibrations());
+        disarm();
         assert_eq!(
             (text_at(&told, "refused"), text_at(&told, "field")),
             ("learn_limit".to_owned(), "$.gates".to_owned()),
             "{}",
             written(&told)
         );
-        assert_eq!(built, 0, "no kernel was built before the refusal");
-        let fits = u32::try_from(int_at(&told, "limit")).unwrap();
-        assert!(fits > 8 && fits < 256, "{fits}");
-        let (got, built) = kernel_of(&host, &copied(73, [4, 4, 4], fits));
+        assert_eq!(built, 0, "no search kernel was built before the refusal");
+        assert!(measured >= 1, "the device's build was measured");
+        assert!(int_at(&told, "limit") < 64, "{}", written(&told));
+        let mut mcp = Mcp::new(Some(&host));
+        disarm();
+        builds_slowed_by(each / 4);
+        let got = mcp.raw("grit_law_learn", &copied(73, [4, 4, 4], 64));
+        let built = kernel_most();
+        assert!(
+            calibrations() > 1,
+            "a quarter of the patience is admitted by measuring larger builds"
+        );
+        disarm();
         if let Some(told) = got
             .get("result")
             .and_then(|one| one.get("structuredContent"))
@@ -1316,7 +1334,10 @@ mod faulted {
         {
             assert_ne!(told.text(), Some("learn_limit"), "{}", written(&got));
         }
-        assert!(built > 0 && built <= KERNEL_WORDS, "{built}");
+        assert!(
+            built > 0,
+            "the same request without the slowed builds searched"
+        );
     }
 
     #[test]
