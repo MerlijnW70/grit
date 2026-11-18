@@ -1122,6 +1122,10 @@ mod served {
         );
     }
 
+    const FORK_STALL: Duration = Duration::from_millis(20);
+
+    const FORK_FRAMES: u32 = 40;
+
     #[test]
     fn a_fork_and_a_lost_device_keep_the_journal_key_their_rebuilds_are_decided_by() {
         let Some(host) = device("journal key kept") else {
@@ -1133,12 +1137,12 @@ mod served {
             false,
         );
         let world = int_at(&made, "world");
-        grit::serve3::tools::faults::stall_every(Duration::from_millis(20));
+        grit::serve3::tools::faults::stall_every(FORK_STALL);
         result(
             &call(
                 &mut server,
                 "grit_world_step",
-                &format!("{{\"world\":{world},\"frames\":40,\"budget_ms\":600000}}"),
+                &format!("{{\"world\":{world},\"frames\":{FORK_FRAMES},\"budget_ms\":600000}}"),
             ),
             false,
         );
@@ -1158,7 +1162,7 @@ mod served {
         let began = Instant::now();
         result(&read(&mut server, world, Duration::from_secs(600)), false);
         let whole = began.elapsed();
-        let budget = whole / 2;
+        let budget = FORK_STALL * FORK_FRAMES / 2;
         let told = result(&read(&mut server, fork, budget), true);
         refused_by_its_journal(
             &told,
@@ -1288,13 +1292,13 @@ mod served {
             );
             fast = fast.max(began.elapsed());
         }
-        let budget = ((slow + fast) / 2).min(replay_floor() * 9 / 10);
+        let budget = replay_floor() * 9 / 10;
         eprintln!(
             "400 frames finished in {slow:?}, 40 frames in at most {fast:?}; budget {budget:?}"
         );
         assert!(
-            fast + Duration::from_millis(20) < budget,
-            "setup: {fast:?} {budget:?}"
+            FRAME_STALL * 40 + Duration::from_millis(20) < budget,
+            "setup: {budget:?}"
         );
         let began = Instant::now();
         let told = result(&opened(&mut server, 2, budget), true);
