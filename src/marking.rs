@@ -2,7 +2,7 @@ use crate::machine::Machine;
 use crate::netlist::{KIND_BITS, Netlist, SOURCE_BITS};
 
 use simdr::kernel::{Kernel, Shape};
-use simdr::lanes::{LaneError, Lanes, U32, Vector};
+use simdr::lanes::{LaneError, Lanes, U32, UniformCount, Vector};
 
 pub const HELD: u32 = 0;
 
@@ -610,13 +610,13 @@ pub fn stepped_rolled(
     })
 }
 
-fn each_word<F>(kernel: &mut Kernel<U32>, wide: u32, body: F) -> Result<(), LaneError>
+fn each_word<F>(kernel: &mut Kernel<U32>, wide: UniformCount, body: F) -> Result<(), LaneError>
 where
     F: FnOnce(&mut Kernel<U32>, simdr::module::Id) -> Result<(), LaneError>,
 {
     let uint = kernel.index_type();
     let blank = kernel.module().constant_u32(0)?;
-    kernel.repeat_rolled_many(wide, uint, &[blank], |kernel, carried, word| {
+    kernel.repeat_rolled_many_by(wide, uint, &[blank], |kernel, carried, word| {
         body(kernel, word)?;
         Ok(carried.to_vec())
     })?;
@@ -643,8 +643,17 @@ pub fn stepping_rolled<const LANES: u32>(
     let ours = kernel.module().i_mul(uint, who, count)?;
 
     let blank = kernel.module().constant_u32(0)?;
+    let told = kernel
+        .module()
+        .constant_u32(held.steps * held.inputs * wide)?;
+    let told = kernel.load_at(FEED, told)?;
+    let words = {
+        let mut lanes = kernel.lanes()?;
+        let told = lanes.splat_id::<U32, LANES>(told)?;
+        lanes.first_lane_count::<LANES>(told)?
+    };
     for bit in 0..held.state {
-        each_word(&mut kernel, wide, |kernel, word| {
+        each_word(&mut kernel, words, |kernel, word| {
             let place = placed(kernel, uint, mine, bit * wide, word)?;
             kernel.store_at(VALUES, place, blank)
         })?;
@@ -653,7 +662,7 @@ pub fn stepping_rolled<const LANES: u32>(
     let mut total = blank;
     for tick in 0..held.steps {
         for input in 0..held.inputs {
-            each_word(&mut kernel, wide, |kernel, word| {
+            each_word(&mut kernel, words, |kernel, word| {
                 let asked = kernel
                     .module()
                     .constant_u32((tick * held.inputs + input) * wide)?;
@@ -666,7 +675,7 @@ pub fn stepping_rolled<const LANES: u32>(
 
         for at in 0..shape.gates {
             let gate = decoded::<LANES>(&mut kernel, uint, mine, ours, at, wide)?;
-            each_word(&mut kernel, wide, |kernel, word| {
+            each_word(&mut kernel, words, |kernel, word| {
                 let here = kernel.module().i_add(uint, gate.left, word)?;
                 let there = kernel.module().i_add(uint, gate.right, word)?;
                 let low = kernel.load_at(VALUES, here)?;
@@ -696,7 +705,7 @@ pub fn stepping_rolled<const LANES: u32>(
         for output in 0..held.outputs {
             let from = shape.inputs + shape.gates - held.outputs + output;
             let summed =
-                kernel.repeat_rolled_many(wide, uint, &[total], |kernel, carried, word| {
+                kernel.repeat_rolled_many_by(words, uint, &[total], |kernel, carried, word| {
                     let before = carried.first().copied().unwrap_or(blank);
                     let place = placed(kernel, uint, mine, from * wide, word)?;
                     let got = kernel.load_at(VALUES, place)?;
@@ -719,7 +728,7 @@ pub fn stepping_rolled<const LANES: u32>(
 
         for bit in 0..held.state {
             let from = shape.inputs + shape.gates - held.outputs - held.state + bit;
-            each_word(&mut kernel, wide, |kernel, word| {
+            each_word(&mut kernel, words, |kernel, word| {
                 let place = placed(kernel, uint, mine, from * wide, word)?;
                 let value = kernel.load_at(VALUES, place)?;
                 let place = placed(kernel, uint, mine, bit * wide, word)?;

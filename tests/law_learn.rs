@@ -1585,14 +1585,23 @@ fn l3_a_pattern_and_any_one_of_its_images_seen_apart_are_refused_by_name() {
     );
 }
 
-fn scores_of(host: &Host, module: &[u32], held: grit::machine::Machine, wide: u32) -> Vec<u32> {
+fn scores_of(
+    host: &Host,
+    module: &[u32],
+    held: grit::machine::Machine,
+    wide: u32,
+    told: bool,
+) -> Vec<u32> {
     use grit::Groups;
     use grit::marking::{BINDINGS, FEED, SCORE, TRIAL, VALUES, WANTED};
     const CROWD: u32 = 256;
     let shape = held.shape().unwrap();
     let mut rng = Rng(0x5EED);
     let mut words = |many: u32| -> Vec<u32> { (0..many).map(|_| rng.next() as u32).collect() };
-    let feed = words(held.steps * held.inputs * wide);
+    let mut feed = words(held.steps * held.inputs * wide);
+    if told {
+        feed.push(wide);
+    }
     let want = words(held.steps * held.outputs * wide);
     let mut state = 0x1234_5679_u32;
     let chips: Vec<u32> = (0..CROWD * shape.gates)
@@ -1642,10 +1651,10 @@ fn a_search_kernel_rolled_over_its_rows_scores_every_candidate_as_the_unrolled_o
         let held = grit::machine::Machine::over(state, inputs, outputs, gates, 16, steps).unwrap();
         let unrolled = grit::marking::stepped(host.width(), held, wide).unwrap();
         let rolled = grit::marking::stepped_rolled(host.width(), held, wide).unwrap();
-        let before = scores_of(&host, &unrolled, held, wide);
+        let before = scores_of(&host, &unrolled, held, wide, false);
         assert!(before.iter().any(|one| *one > 0));
         assert_eq!(
-            scores_of(&host, &rolled, held, wide),
+            scores_of(&host, &rolled, held, wide, true),
             before,
             "state {state}, inputs {inputs}, outputs {outputs}, gates {gates}, steps {steps}, wide {wide}"
         );

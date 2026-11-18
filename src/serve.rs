@@ -1007,7 +1007,10 @@ fn machined_within(
         return Ok(Ok(ran));
     }
     unrolled(held, wide)?;
-    let (feed, want) = laid(held, traces, wide);
+    let (mut feed, want) = laid(held, traces, wide);
+    if halt.rolled() {
+        feed.push(wide);
+    }
 
     let turn = turned_on(width, shape)?;
     let mark = if halt.rolled() {
