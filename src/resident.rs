@@ -2505,9 +2505,8 @@ impl Resident<'_> {
             self.sending.store(true, Ordering::SeqCst);
             drop(ordered);
         }
-        let waited = self.await_fence(self.fence, held);
+        let wait = self.await_fence(self.fence, held)?;
         self.sending.store(false, Ordering::SeqCst);
-        let wait = waited?;
         if let Some((event, _)) = held {
             unsafe { self.host.device().destroy_event(event, None) };
         }
