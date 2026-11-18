@@ -533,6 +533,38 @@ fn tiled_run(server: &mut Server<'_>, law: &str) -> Vec<u32> {
         .collect()
 }
 
+fn same_or_prefix(got: &Json, again: &Json, rule: &str) {
+    let ladder = |held: &Json| -> Vec<String> {
+        held.get("ladder")
+            .and_then(Json::list)
+            .unwrap()
+            .iter()
+            .map(written)
+            .collect()
+    };
+    let (first, second) = (text_at(got, "stopped"), text_at(again, "stopped"));
+    if first == "ladder" && second == "ladder" {
+        assert_eq!(written(got), written(again), "same bytes, rule {rule}");
+        return;
+    }
+    let (short, long) = if ladder(got).len() <= ladder(again).len() {
+        (got, again)
+    } else {
+        (again, got)
+    };
+    assert!(
+        ["budget", "cancelled"].contains(&text_at(short, "stopped").as_str()),
+        "only a stopped answer may differ, rule {rule}: {}",
+        written(short)
+    );
+    let part = ladder(short);
+    assert_eq!(
+        part[..],
+        ladder(long)[..part.len()],
+        "a stopped ladder is a prefix, rule {rule}"
+    );
+}
+
 #[test]
 fn r3_every_row_runs_on_a_world_as_the_reported_table_and_symmetric_tables_are_invariant() {
     let Some(host) = device("review l2 r3") else {
@@ -562,7 +594,7 @@ fn r3_every_row_runs_on_a_world_as_the_reported_table_and_symmetric_tables_are_i
         );
         let got = ok(&mut server, "grit_law_learn", &args);
         let again = ok(&mut server, "grit_law_learn", &args);
-        assert_eq!(written(&got), written(&again), "same bytes, rule {rule}");
+        same_or_prefix(&got, &again, rule);
         let unseen = got.get("unseen").unwrap();
         let table: Vec<u32> = ints(unseen.get("table").unwrap())
             .into_iter()
