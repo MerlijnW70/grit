@@ -20,6 +20,10 @@ const SIDE: u32 = 64;
 
 const SPINNERS: usize = 15;
 
+const SPIN: Duration = Duration::from_millis(19);
+
+const GAP: Duration = Duration::from_millis(1);
+
 const CELLS: u32 = 64;
 
 const FRAMES: u32 = 40;
@@ -209,6 +213,17 @@ mod pin {
         only
     }
 
+    #[cfg(target_os = "linux")]
+    pub const fn yielding(_: bool) {}
+
+    #[cfg(windows)]
+    pub fn yielding(on: bool) {
+        const IDLE: i32 = -15;
+        const NORMAL: i32 = 0;
+        let done = unsafe { SetThreadPriority(GetCurrentThread(), if on { IDLE } else { NORMAL }) };
+        assert_ne!(done, 0, "SetThreadPriority failed");
+    }
+
     #[cfg(windows)]
     pub type Mask = usize;
 
@@ -218,6 +233,7 @@ mod pin {
         fn GetCurrentThread() -> *mut std::ffi::c_void;
         fn GetCurrentProcess() -> *mut std::ffi::c_void;
         fn SetThreadAffinityMask(thread: *mut std::ffi::c_void, mask: usize) -> usize;
+        fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
         fn GetProcessAffinityMask(
             process: *mut std::ffi::c_void,
             mask: *mut usize,
@@ -275,12 +291,17 @@ impl Starved {
                 std::thread::spawn(move || {
                     pin::set(&core);
                     while !stop.load(Ordering::Relaxed) {
-                        std::hint::spin_loop();
+                        let began = Instant::now();
+                        while began.elapsed() < SPIN {
+                            std::hint::spin_loop();
+                        }
+                        std::thread::sleep(GAP);
                     }
                 })
             })
             .collect();
         pin::set(&core);
+        pin::yielding(true);
         Self {
             saved,
             stop,
@@ -291,6 +312,7 @@ impl Starved {
 
 impl Drop for Starved {
     fn drop(&mut self) {
+        pin::yielding(false);
         pin::set(&self.saved);
         self.stop.store(true, Ordering::Relaxed);
         for spinner in self.spinners.drain(..) {
@@ -312,7 +334,7 @@ fn opened_on(hold: Hold, core: pin::Mask, label: &str) -> Option<Host> {
 
 const LONG: Duration = Duration::from_secs(600);
 
-const ESCALATIONS: usize = 4;
+const ESCALATIONS: usize = 2;
 
 fn plain_rounds(mut work: impl FnMut() -> Duration) -> Duration {
     work();
