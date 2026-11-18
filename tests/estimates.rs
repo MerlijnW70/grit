@@ -1284,21 +1284,24 @@ mod served {
         result(&opened(&mut server, 1, Duration::from_secs(600)), false);
         let slow = began.elapsed();
         let mut fast = Duration::ZERO;
+        let mut fast_own = Duration::ZERO;
         for number in 3..=5 {
-            let began = Instant::now();
+            let meter = grit::serve3::budget::Meter::start();
             result(
                 &opened(&mut server, number, Duration::from_secs(600)),
                 false,
             );
-            fast = fast.max(began.elapsed());
+            let spent = meter.spent();
+            fast = fast.max(spent.wall);
+            fast_own = fast_own.max(spent.own);
         }
         let budget = replay_floor() * 9 / 10;
         eprintln!(
-            "400 frames finished in {slow:?}, 40 frames in at most {fast:?}; budget {budget:?}"
+            "400 frames finished in {slow:?}, 40 frames in at most {fast:?} of which at most {fast_own:?} on the cpu or device; budget {budget:?}"
         );
         assert!(
-            FRAME_STALL * 40 + Duration::from_millis(20) < budget,
-            "setup: {budget:?}"
+            fast_own + Duration::from_millis(20) < budget,
+            "setup: {fast_own:?} {budget:?}"
         );
         let began = Instant::now();
         let told = result(&opened(&mut server, 2, budget), true);

@@ -3942,6 +3942,7 @@ fn ten_held_up_probes_leave_a_world_refused_no_longer_than_a_few_calls() {
 struct HeldRebuild {
     got: Json,
     took: Duration,
+    own: Duration,
     budget: Duration,
     held: Duration,
     rebuilt: Duration,
@@ -3990,9 +3991,10 @@ fn held_frame_rebuild(off_cpu: bool) -> Option<HeldRebuild> {
         armed.off_cpu_by = budget - held;
     }
     grit::serve3::tools::faults::stall_batch(0, held);
-    let began = Instant::now();
+    let meter = grit::serve3::budget::Meter::start();
     let got = open(&mut again, budget);
-    let took = began.elapsed();
+    let spent = meter.spent();
+    let (took, own) = (spent.wall, spent.own);
     grit::serve3::tools::faults::disarm();
     assert!(
         again.faults().lock().unwrap().off_cpu.is_empty(),
@@ -4001,6 +4003,7 @@ fn held_frame_rebuild(off_cpu: bool) -> Option<HeldRebuild> {
     Some(HeldRebuild {
         got,
         took,
+        own,
         budget,
         held,
         rebuilt,
@@ -4012,12 +4015,13 @@ fn kept_to_its_budget(rebuild: &HeldRebuild) -> bool {
     let HeldRebuild {
         got,
         took,
+        own,
         budget,
         held,
         rebuilt,
     } = rebuild;
     let said = format!(
-        "rebuilt in {rebuilt:?}, its first frame held up {held:?} of a {budget:?} budget, answered in {took:?}: {}",
+        "rebuilt in {rebuilt:?}, its first frame held up {held:?} of a {budget:?} budget, answered in {took:?} of which {own:?} on its cpu or device: {}",
         written(got)
     );
     let result = got.get("result").unwrap();
@@ -4032,6 +4036,10 @@ fn kept_to_its_budget(rebuild: &HeldRebuild) -> bool {
         "{said}"
     );
     assert!(took >= budget, "the rebuild stopped with time left: {said}");
+    assert!(
+        *own < *held + *rebuilt * 2,
+        "the rebuild's own work outgrew the time it was given, so the cut was not kept waiting: {said}"
+    );
     false
 }
 
