@@ -3939,11 +3939,17 @@ fn ten_held_up_probes_leave_a_world_refused_no_longer_than_a_few_calls() {
 }
 
 #[cfg(feature = "faults")]
-#[test]
-fn a_frame_held_up_while_a_world_is_rebuilt_never_refuses_a_journal_that_fits() {
-    let Some(host) = device("held up replay") else {
-        return;
-    };
+struct HeldRebuild {
+    got: Json,
+    took: Duration,
+    budget: Duration,
+    held: Duration,
+    rebuilt: Duration,
+}
+
+#[cfg(feature = "faults")]
+fn held_frame_rebuild(off_cpu: bool) -> Option<HeldRebuild> {
+    let host = device("held up replay")?;
     let scratch = Scratch::new("held-replay");
     let options = Options {
         dir: Some(scratch.dir()),
@@ -3974,19 +3980,80 @@ fn a_frame_held_up_while_a_world_is_rebuilt_never_refuses_a_journal_that_fits() 
     answer(&open(&mut plain, Duration::from_secs(600)));
     let rebuilt = began.elapsed();
     drop(plain);
-    let slack = rebuilt * 20 + Duration::from_secs(2);
-    let held = slack * 2;
-    let budget = held + slack;
+    let held = rebuilt * 2 + Duration::from_millis(1500);
+    let budget = held + rebuilt * 2 + Duration::from_millis(500);
     let mut again = Server::with(Some(&host), &options).unwrap();
+    if off_cpu {
+        let faults = again.faults();
+        let mut armed = faults.lock().unwrap();
+        armed.off_cpu = vec![grit::serve3::budget::Work::Build];
+        armed.off_cpu_by = budget - held;
+    }
     grit::serve3::tools::faults::stall_batch(0, held);
+    let began = Instant::now();
     let got = open(&mut again, budget);
+    let took = began.elapsed();
     grit::serve3::tools::faults::disarm();
-    let opened = answer(&got);
-    assert_eq!(
-        opened.int_at("frame"),
-        65,
-        "rebuilt in {rebuilt:?}, its first frame held up {held:?} of a {budget:?} budget: {}",
-        written(&got)
+    assert!(
+        again.faults().lock().unwrap().off_cpu.is_empty(),
+        "setup: the hold was not used"
+    );
+    Some(HeldRebuild {
+        got,
+        took,
+        budget,
+        held,
+        rebuilt,
+    })
+}
+
+#[cfg(feature = "faults")]
+fn kept_to_its_budget(rebuild: &HeldRebuild) -> bool {
+    let HeldRebuild {
+        got,
+        took,
+        budget,
+        held,
+        rebuilt,
+    } = rebuild;
+    let said = format!(
+        "rebuilt in {rebuilt:?}, its first frame held up {held:?} of a {budget:?} budget, answered in {took:?}: {}",
+        written(got)
+    );
+    let result = got.get("result").unwrap();
+    if result.get("isError") == Some(&Json::Bool(false)) {
+        assert_eq!(answer(got).int_at("frame"), 65, "{said}");
+        return true;
+    }
+    let told = refused(got);
+    assert_eq!(told.code, "budget", "{said}");
+    assert!(
+        told.message.contains("stopped on budget") && told.message.contains("nothing was opened"),
+        "{said}"
+    );
+    assert!(took >= budget, "the rebuild stopped with time left: {said}");
+    false
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_frame_held_up_while_a_world_is_rebuilt_never_refuses_a_journal_that_fits() {
+    let Some(rebuild) = held_frame_rebuild(false) else {
+        return;
+    };
+    kept_to_its_budget(&rebuild);
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn a_rebuild_held_off_its_cpu_past_the_time_left_stops_only_when_its_budget_is_spent() {
+    let Some(rebuild) = held_frame_rebuild(true) else {
+        return;
+    };
+    assert!(
+        !kept_to_its_budget(&rebuild),
+        "setup: the held rebuild fit: {}",
+        written(&rebuild.got)
     );
 }
 

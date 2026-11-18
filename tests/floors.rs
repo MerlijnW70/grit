@@ -547,11 +547,17 @@ const KEPT: u32 = 96;
 
 const LONG_FRAMES: u32 = 4000;
 
-static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static STARVING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-fn alone() -> std::sync::MutexGuard<'static, ()> {
-    ALONE
-        .lock()
+fn beside() -> std::sync::RwLockReadGuard<'static, ()> {
+    STARVING
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn starving() -> std::sync::RwLockWriteGuard<'static, ()> {
+    STARVING
+        .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -594,55 +600,55 @@ fn e1_replay(hold: Hold, label: &str) {
 
 #[test]
 fn e1_a_build_held_off_its_cpu_by_a_hook_never_refuses_the_same_build() {
-    let _alone = alone();
+    let _beside = beside();
     e1_build(Hold::Hook, "e1 build hook");
 }
 
 #[test]
 fn e1_a_build_starved_of_its_cpu_never_refuses_the_same_build() {
-    let _alone = alone();
+    let _starving = starving();
     e1_build(Hold::Contention, "e1 build contention");
 }
 
 #[test]
 fn e1_a_fork_held_off_its_cpu_by_a_hook_never_refuses_the_same_fork() {
-    let _alone = alone();
+    let _beside = beside();
     e1_fork(Hold::Hook, "e1 fork hook");
 }
 
 #[test]
 fn e1_a_fork_starved_of_its_cpu_never_refuses_the_same_fork() {
-    let _alone = alone();
+    let _starving = starving();
     e1_fork(Hold::Contention, "e1 fork contention");
 }
 
 #[test]
 fn e1_a_write_held_off_its_cpu_by_a_hook_is_never_refused() {
-    let _alone = alone();
+    let _beside = beside();
     e1_write(Hold::Hook, "e1 write hook");
 }
 
 #[test]
 fn e1_a_write_starved_of_its_cpu_is_never_refused() {
-    let _alone = alone();
+    let _starving = starving();
     e1_write(Hold::Contention, "e1 write contention");
 }
 
 #[test]
 fn e1_a_replay_held_off_its_cpu_by_a_hook_never_refuses_the_same_replay() {
-    let _alone = alone();
+    let _beside = beside();
     e1_replay(Hold::Hook, "e1 replay hook");
 }
 
 #[test]
 fn e1_a_replay_starved_of_its_cpu_never_refuses_the_same_replay() {
-    let _alone = alone();
+    let _starving = starving();
     e1_replay(Hold::Contention, "e1 replay contention");
 }
 
 #[test]
 fn e1_cut_replays_whose_builds_were_held_off_their_cpu_never_refuse_the_next_open() {
-    let _alone = alone();
+    let _beside = beside();
     let Some(host) = device("e1 cut replays") else {
         return;
     };
@@ -693,7 +699,7 @@ fn e1_cut_replays_whose_builds_were_held_off_their_cpu_never_refuse_the_next_ope
 
 #[test]
 fn e2_a_build_the_device_itself_makes_slow_is_refused_up_front_after_holds_off_its_cpu() {
-    let _alone = alone();
+    let _beside = beside();
     let Some(host) = device("e2 build") else {
         return;
     };
@@ -739,7 +745,7 @@ fn e2_a_build_the_device_itself_makes_slow_is_refused_up_front_after_holds_off_i
 
 #[test]
 fn e2_a_fork_the_device_itself_makes_slow_is_refused_up_front() {
-    let _alone = alone();
+    let _beside = beside();
     let Some(host) = device("e2 fork") else {
         return;
     };
@@ -764,7 +770,7 @@ fn e2_a_fork_the_device_itself_makes_slow_is_refused_up_front() {
 
 #[test]
 fn e2_a_replay_the_device_itself_makes_slow_is_refused_up_front() {
-    let _alone = alone();
+    let _beside = beside();
     let Some(host) = device("e2 replay") else {
         return;
     };
@@ -827,7 +833,7 @@ fn sequence(server: &mut Server<'_>) -> Vec<String> {
 
 #[test]
 fn e4_holds_off_the_cpu_never_change_the_bytes_of_an_answer() {
-    let _alone = alone();
+    let _beside = beside();
     let Some(host) = device("e4") else {
         return;
     };
