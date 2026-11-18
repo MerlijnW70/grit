@@ -582,7 +582,70 @@ type Idle = ();
 #[derive(Debug, Clone, Copy)]
 struct Idle {
     allowed: u64,
+    at: std::time::Instant,
     cycles: [u64; PROCESSORS],
+}
+
+#[cfg(windows)]
+const SAMPLE: Duration = Duration::from_millis(1);
+
+#[cfg(windows)]
+const SAMPLED_FOR: Duration = Duration::from_secs(1);
+
+#[cfg(windows)]
+const SAMPLES_KEPT: usize = 8192;
+
+#[cfg(windows)]
+type Sample = (std::time::Instant, [u64; PROCESSORS]);
+
+#[cfg(windows)]
+static SAMPLES: std::sync::Mutex<std::collections::VecDeque<Sample>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+#[cfg(windows)]
+static WANTED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn sampled() {
+    static SAMPLER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Ok(mut wanted) = WANTED.lock() {
+        *wanted = Some(std::time::Instant::now() + SAMPLED_FOR);
+    }
+    SAMPLER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("grit-idle".to_owned())
+            .spawn(sampling)
+            .is_ok()
+    });
+}
+
+#[cfg(windows)]
+fn sampling() {
+    loop {
+        let until = WANTED.lock().ok().and_then(|wanted| *wanted);
+        let now = std::time::Instant::now();
+        if until.is_none_or(|until| now > until) {
+            std::thread::sleep(SAMPLED_FOR / 50);
+            continue;
+        }
+        if let Some(cycles) = idle_cycles()
+            && let Ok(mut kept) = SAMPLES.lock()
+        {
+            kept.push_back((std::time::Instant::now(), cycles));
+            while kept.len() > SAMPLES_KEPT {
+                kept.pop_front();
+            }
+        }
+        std::thread::sleep(SAMPLE);
+    }
+}
+
+#[cfg(windows)]
+fn idle_cycles() -> Option<[u64; PROCESSORS]> {
+    let mut cycles = [0_u64; PROCESSORS];
+    let mut length = u32::try_from(size_of_val(&cycles)).ok()?;
+    let read = unsafe { QueryIdleProcessorCycleTime(&raw mut length, cycles.as_mut_ptr()) };
+    (read != 0).then_some(cycles)
 }
 
 #[cfg(windows)]
@@ -639,30 +702,42 @@ fn idle_now() -> Option<Idle> {
     if status != 0 {
         return None;
     }
-    let mut cycles = [0_u64; PROCESSORS];
-    let mut length = u32::try_from(size_of_val(&cycles)).ok()?;
-    let read = unsafe { QueryIdleProcessorCycleTime(&raw mut length, cycles.as_mut_ptr()) };
-    if read == 0 {
-        return None;
-    }
+    sampled();
+    let at = std::time::Instant::now();
+    let cycles = idle_cycles()?;
     Some(Idle {
         allowed: u64::try_from(basic.affinity).ok()?,
+        at,
         cycles,
     })
 }
 
 #[cfg(windows)]
 fn idle_since(from: &Idle) -> Option<Duration> {
-    let to = idle_now()?;
+    let ended = (std::time::Instant::now(), idle_cycles()?);
     let rate = cycles_per_second()?;
-    let most = (0..PROCESSORS)
-        .filter(|&at| from.allowed >> at & 1 == 1)
-        .filter_map(|at| {
-            let (began, ended) = (from.cycles.get(at)?, to.cycles.get(at)?);
-            Some(ended.saturating_sub(*began))
+    let mut points = vec![(from.at, from.cycles)];
+    if let Ok(kept) = SAMPLES.lock() {
+        points.extend(
+            kept.iter()
+                .filter(|(at, _)| *at > from.at && *at < ended.0)
+                .copied(),
+        );
+    }
+    points.push(ended);
+    let cycles: u64 = points
+        .windows(2)
+        .filter_map(|pair| {
+            let [(_, began), (_, done)] = pair else {
+                return None;
+            };
+            (0..PROCESSORS)
+                .filter(|&at| from.allowed >> at & 1 == 1)
+                .filter_map(|at| Some(done.get(at)?.saturating_sub(*began.get(at)?)))
+                .max()
         })
-        .max()?;
-    Duration::try_from_secs_f64(most as f64 / rate).ok()
+        .sum();
+    Duration::try_from_secs_f64(cycles as f64 / rate).ok()
 }
 
 #[cfg(not(windows))]
