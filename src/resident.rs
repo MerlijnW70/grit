@@ -599,6 +599,7 @@ pub struct Resident<'host> {
     spans: Vec<Duration>,
     reused: u64,
     waited: Duration,
+    warmed: Duration,
 }
 
 impl Host {
@@ -751,7 +752,9 @@ impl Host {
         }
         made.built = true;
         self.owe();
+        let warming = Instant::now();
         unsafe { made.warm() }?;
+        made.warmed = warming.elapsed();
         Ok(made)
     }
 
@@ -958,6 +961,7 @@ impl<'host> Resident<'host> {
             spans: Vec::new(),
             reused: 0,
             waited: Duration::ZERO,
+            warmed: Duration::ZERO,
         }
     }
 
@@ -2062,6 +2066,11 @@ impl Resident<'_> {
     #[must_use]
     pub const fn waited(&self) -> Duration {
         self.waited
+    }
+
+    #[must_use]
+    pub const fn warmed(&self) -> Duration {
+        self.warmed
     }
 
     #[must_use]
