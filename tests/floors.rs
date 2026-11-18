@@ -545,6 +545,8 @@ fn replays_held(server: &Server<'_>, by: Duration) {
 
 const KEPT: u32 = 96;
 
+const LONG_FRAMES: u32 = 4000;
+
 static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn alone() -> std::sync::MutexGuard<'static, ()> {
@@ -636,6 +638,57 @@ fn e1_a_replay_held_off_its_cpu_by_a_hook_never_refuses_the_same_replay() {
 fn e1_a_replay_starved_of_its_cpu_never_refuses_the_same_replay() {
     let _alone = alone();
     e1_replay(Hold::Contention, "e1 replay contention");
+}
+
+#[test]
+fn e1_cut_replays_whose_builds_were_held_off_their_cpu_never_refuse_the_next_open() {
+    let _alone = alone();
+    let Some(host) = device("e1 cut replays") else {
+        return;
+    };
+    let scratch = Scratch::new("e1-cut");
+    let dir = scratch.0.join("worlds");
+    let keep = Keep::at(&dir).unwrap();
+    let mut ledger = Ledger::created(Made {
+        rule: "sand".to_owned(),
+        params: Vec::new(),
+        size: [32, 32, 32],
+        sparse: false,
+        slots: None,
+    });
+    ledger.push(Entry::Step(LONG_FRAMES), Duration::from_millis(400));
+    keep.begin(1, &ledger).unwrap();
+    keep.set_next(2).unwrap();
+    drop(keep);
+    let options = Options {
+        dir: Some(dir),
+        memory: None,
+    };
+    let mut server = Server::with(Some(&host), &options).unwrap();
+    let cube = "{\"wide\":32,\"deep\":32,\"tall\":32,\"rule\":\"sand\"}";
+    let fits = plain_rounds(|| {
+        let (made, took) = timed(|| answered(&call(&mut server, "grit_world_create", cube)));
+        close(&mut server, int_at(&made, "world"));
+        took
+    });
+    let budget = short_of(fits).max(Duration::from_millis(600));
+    grit::serve3::tools::faults::stall_every(budget / 64);
+    off_cpu(&server, Work::Build, RECENT, budget * 2);
+    for round in 0..RECENT {
+        let told = refused(&open(&mut server, 1, Some(budget)));
+        let message = text_at(&told, "message");
+        eprintln!("held build {round} with {budget:?}: {message}");
+        assert!(message.contains("nothing was opened"), "{message}");
+    }
+    unarmed(&server);
+    let told = refused(&open(&mut server, 1, Some(budget)));
+    grit::serve3::tools::faults::disarm();
+    let message = text_at(&told, "message");
+    eprintln!("open with {budget:?} after {RECENT} held builds: {message}");
+    assert!(
+        message.contains("nothing was opened") && !message.contains("needs at least"),
+        "{message}"
+    );
 }
 
 #[test]

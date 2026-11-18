@@ -1090,6 +1090,7 @@ pub fn rebuilt<'host>(
     keep: Option<&Keep>,
     guard: &super::budget::Guard,
     timings: &mut Timings,
+    held: Duration,
     mut stepping: impl FnMut(&mut World<'host>, u32) -> Result<(), super::Failed>,
 ) -> Result<World<'host>, super::Failed> {
     if let Some(stop) = guard.stop() {
@@ -1102,6 +1103,7 @@ pub fn rebuilt<'host>(
         }));
     }
     let began = Meter::start();
+    std::thread::sleep(held);
     let mut world = match &ledger.base {
         Base::Created(made) => match &ledger.law {
             None => World::create(host, &made.branch())?,

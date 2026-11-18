@@ -972,6 +972,7 @@ impl<'host> Server<'host> {
             self.book.keep.as_ref(),
             &guard,
             &mut timings,
+            self.held_off(base_work(ledger)),
             |world, frames| {
                 std::thread::sleep(std::mem::take(&mut held));
                 paced(world, frames, pace, &guard)
@@ -1638,16 +1639,25 @@ impl<'host> Server<'host> {
                     faults.held_work.remove(at);
                     slow = slow.saturating_add(faults.held_by);
                 }
-                let mut off = Duration::ZERO;
-                if let Some(at) = faults.off_cpu.iter().position(|one| *one == work) {
-                    faults.off_cpu.remove(at);
-                    off = faults.off_cpu_by;
-                }
-                (slow, off)
+                (slow, off_cpu(&mut faults, work))
             })
             .unwrap_or_default();
         budget::busy_device(slow);
         std::thread::sleep(off);
+    }
+
+    #[cfg(feature = "faults")]
+    fn held_off(&self, work: budget::Work) -> Duration {
+        self.book
+            .faults
+            .lock()
+            .map(|mut faults| off_cpu(&mut faults, work))
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(feature = "faults"))]
+    const fn held_off(&self, _: budget::Work) -> Duration {
+        Duration::ZERO
     }
 
     #[cfg(not(feature = "faults"))]
@@ -1971,6 +1981,15 @@ fn rule_of(host: &Host, name: &str) -> Result<Box<dyn Listed>, Failed> {
             }) as Failed
         })?;
     Ok(known.swap_remove(at))
+}
+
+#[cfg(feature = "faults")]
+fn off_cpu(faults: &mut Faults, work: budget::Work) -> Duration {
+    let Some(at) = faults.off_cpu.iter().position(|one| *one == work) else {
+        return Duration::ZERO;
+    };
+    faults.off_cpu.remove(at);
+    faults.off_cpu_by
 }
 
 fn paced(

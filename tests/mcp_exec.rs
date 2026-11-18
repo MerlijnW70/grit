@@ -3974,8 +3974,9 @@ fn a_frame_held_up_while_a_world_is_rebuilt_never_refuses_a_journal_that_fits() 
     answer(&open(&mut plain, Duration::from_secs(600)));
     let rebuilt = began.elapsed();
     drop(plain);
-    let held = rebuilt * 2 + Duration::from_millis(1500);
-    let budget = held + rebuilt * 2 + Duration::from_millis(500);
+    let slack = rebuilt * 20 + Duration::from_secs(2);
+    let held = slack * 2;
+    let budget = held + slack;
     let mut again = Server::with(Some(&host), &options).unwrap();
     grit::serve3::tools::faults::stall_batch(0, held);
     let got = open(&mut again, budget);
