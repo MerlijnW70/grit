@@ -8,6 +8,7 @@ use crate::branch::format::{Image, Sha256, State, UNIFORM, brick_cells};
 use crate::branch::{self, World};
 use crate::host::Host;
 
+use super::budget::{Meter, Spent};
 use super::errors::{Code, Refusal, shown};
 
 pub const NAME_MOST: usize = 64;
@@ -1074,11 +1075,11 @@ pub fn state_of(image: &Image) -> [u8; 32] {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timings {
-    pub build: Duration,
+    pub build: Spent,
     pub file_bytes: u64,
-    pub file: Duration,
+    pub file: Spent,
     pub write_bytes: u64,
-    pub writes: Duration,
+    pub writes: Spent,
     pub recorded: Duration,
     pub steps: Duration,
 }
@@ -1100,7 +1101,7 @@ pub fn rebuilt<'host>(
             goal: ledger.frame,
         }));
     }
-    let began = std::time::Instant::now();
+    let began = Meter::start();
     let mut world = match &ledger.base {
         Base::Created(made) => match &ledger.law {
             None => World::create(host, &made.branch())?,
@@ -1120,10 +1121,10 @@ pub fn rebuilt<'host>(
                         ),
                     )));
                 }
-                let reading = std::time::Instant::now();
+                let reading = Meter::start();
                 let image = crate::branch::format::fetch(&path)?;
                 timings.file_bytes = fs::metadata(&path).map_or(0, |found| found.len());
-                timings.file = reading.elapsed();
+                timings.file = reading.spent();
                 super::law::opened(host, &image)?
             }
             (None, None) => {
@@ -1135,7 +1136,7 @@ pub fn rebuilt<'host>(
             }
         },
     };
-    timings.build = began.elapsed().saturating_sub(timings.file);
+    timings.build = began.spent().less(timings.file);
     let of = ledger.entries.len();
     for (at, entry) in ledger.entries.iter().enumerate() {
         let halted = |stop, frame| {
@@ -1152,7 +1153,7 @@ pub fn rebuilt<'host>(
         }
         match entry {
             Entry::Write(cells) => {
-                let writing = std::time::Instant::now();
+                let writing = Meter::start();
                 let chunk = if world.pool().is_some() {
                     cells.len().max(1)
                 } else {
@@ -1165,7 +1166,7 @@ pub fn rebuilt<'host>(
                     super::tools::faults::cells(piece.len());
                     world.write(piece)?;
                 }
-                timings.writes = timings.writes.saturating_add(writing.elapsed());
+                timings.writes = timings.writes.and(writing.spent());
                 timings.write_bytes = timings.write_bytes.saturating_add(entry.bytes() as u64);
             }
             Entry::Params(params) => super::law::reparam(&mut world, params)?,

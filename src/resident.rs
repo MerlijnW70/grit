@@ -2029,6 +2029,17 @@ impl Resident<'_> {
         }
         self.device = self.timed(at);
         self.spans = self.split(at);
+        if !self.host.on_cpu()
+            && let Some(each) = self.device
+        {
+            let times = self
+                .slots
+                .get(at)
+                .and_then(|slot| slot.held.as_ref())
+                .map_or(1, |held| held.times)
+                .max(1);
+            crate::host::spent_on_device(each.saturating_mul(times));
+        }
         Ok((began.elapsed(), out, at))
     }
 

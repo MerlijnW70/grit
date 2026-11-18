@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::branch::World;
 use crate::host::Host;
 use crate::wire::{Json, counted, map, text};
 
 use super::budget::{
-    self, BATCH_MOST, BUDGET_MOST_MS, BUDGET_MS, Pace, SUBMIT_MOST_MS, Stop, Work, world_cost,
+    self, BATCH_MOST, BUDGET_MOST_MS, BUDGET_MS, Meter, Pace, SUBMIT_MOST_MS, Stop, Work,
+    world_cost,
 };
 use super::errors::{self, Code, Refusal};
 use super::journal::{self, Entry, Ledger, Made};
@@ -97,22 +98,20 @@ pub mod faults {
     pub(crate) fn cells(count: usize) {
         let by = CELLS.get();
         if !by.is_zero() {
-            std::thread::sleep(by.saturating_mul(u32::try_from(count).unwrap_or(u32::MAX)));
+            super::budget::busy_device(by.saturating_mul(u32::try_from(count).unwrap_or(u32::MAX)));
         }
     }
 
     pub(crate) fn stall(frames: u32) {
         let fixed = SUBMISSION.get();
-        if !fixed.is_zero() {
-            std::thread::sleep(fixed);
-        }
+        super::budget::busy_device(fixed);
         match STALL.get() {
             Some((0, by, every)) => {
                 if every {
-                    std::thread::sleep(by.saturating_mul(frames));
+                    super::budget::busy_device(by.saturating_mul(frames));
                 } else {
                     STALL.set(None);
-                    std::thread::sleep(by);
+                    super::budget::busy_device(by);
                 }
             }
             Some((nth, by, every)) => STALL.set(Some((nth - 1, by, every))),
@@ -631,7 +630,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     made.size = [grid.wide, grid.deep, grid.tall];
     let bytes = admitted(server, host, &sizes, "the world")?;
     server.fits(Work::build(sparse), bytes, "building the world")?;
-    let began = Instant::now();
+    let meter = Meter::start();
     server.slowly(Work::build(sparse));
     let world = match rule.lawful() {
         None => World::create(host, &made.branch())?,
@@ -645,7 +644,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server
         .book
         .rates
-        .measure(Work::build(sparse), bytes, began.elapsed());
+        .measured(Work::build(sparse), bytes, meter.spent());
     let id = server.number()?;
     let pace = first_pace(&world);
     let law = rule
@@ -730,10 +729,11 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             fits.clamp(1, total - done)
         };
         let piece = points.get(done..done + chunk).unwrap_or_default();
-        let began = Instant::now();
+        let meter = Meter::start();
+        server.slowly(Work::write(sparse));
         faults::cells(piece.len());
         let ran = server.world(held)?.world.write(piece);
-        let took = began.elapsed();
+        let took = meter.spent();
         if let Err(why) = ran {
             failure = Some(why);
             break;
@@ -741,8 +741,8 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         server
             .book
             .rates
-            .measure(Work::write(sparse), 16 * chunk as u64, took);
-        spent = spent.saturating_add(took);
+            .measured(Work::write(sparse), 16 * chunk as u64, took);
+        spent = spent.saturating_add(took.wall);
         done += chunk;
     }
     let written = u32::try_from(done)?;
@@ -855,10 +855,11 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             failure = Some(why);
             break;
         }
-        let began = Instant::now();
+        let meter = super::budget::Meter::start();
         faults::stall(step);
         let ran = server.world(held)?.world.step(step);
-        let took = began.elapsed();
+        let measured = meter.spent();
+        let took = measured.wall;
         if let Err(why) = ran {
             failure = Some(why);
             break;
@@ -867,7 +868,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             failure = Some(Box::new(crate::host::Error::Wedged { after: took }));
             break;
         }
-        pace.ran(step, took);
+        pace.ran_with(step, measured);
         let stats = &mut server.book.stats;
         stats
             .batches
@@ -1266,7 +1267,7 @@ pub fn describe(status: &Status) -> Json {
                 (
                     "budget_late",
                     text(
-                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait. Steps run in batches. The server times each batch, by any client, and splits its time into a cost per batch and a cost per frame from pairs of batches at least 1.5 times apart in frames (the cost per batch is the third highest of the last five splits, or the lowest while there are fewer than three). A batch grows past the last one only as far as the last batch's time per frame shows it fits both the time left and the aim; a smaller batch is sized by the split costs, or before any split by the last batch's whole time. A world's first batch is one frame. A step is refused at once only when the world has run at least two batches, both took longer than its budget, and either their time per frame alone, or their split costs together with the world's last two one-frame batches (the newer run in the previous call) say one frame does not fit; after two calls in a row were refused since the last batch the next one runs one frame to measure again. After such a refusal or doubt the world's next call starts with a one-frame batch. Otherwise a step whose first batch does not fit runs one frame to measure; an open or rebuild runs one frame at the start of each journal entry its replay would otherwise stop at. Any of these answers can come after its budget by up to one frame of that world. Work that cannot stop part way (building, copying, saving or reading a world, a snapshot a world owes, and one sparse journal write) is refused at once when it cannot fit the time left by the larger of two figures: the fastest of the last three times the server measured that kind of work (dense and sparse worlds, snapshots to disk and in memory, and files opened and replayed, each apart) at the largest size it measured that is not above this one, and the fastest any tested device has shown per byte. Otherwise it runs to its end, so its answer can come after its budget by as much as it then runs slower than that, as when the device is busy, a world of a new shape compiles its kernels on its first build, or a world is larger than any the server has measured. After 8 such refusals in a row for one kind and size by the server's own measurements, the next call runs to measure again, so work that truly cannot fit runs late at most once in every 9 such calls. Replayed steps and writes are refused up front only by the server's own measurements of them: steps by the fastest of the last three replay speeds, writes like work that cannot stop part way but without the per-byte figure. Without any, the replay runs and stops on its budget, and every replay stopped so adds a measurement",
+                        "an answer can come after its budget by up to one batch (submission_ms), and by up to the time the server takes to snapshot its largest world between calls (reading it back, and without a directory also hashing it); a call is not charged for that wait. Steps run in batches. The server times each batch, by any client, and splits its time into a cost per batch and a cost per frame from pairs of batches at least 1.5 times apart in frames (the cost per batch is the third highest of the last five splits, or the lowest while there are fewer than three). A batch grows past the last one only as far as the last batch's time per frame shows it fits both the time left and the aim; a smaller batch is sized by the split costs, or before any split by the last batch's whole time. A world's first batch is one frame. A step is refused at once only when the world has run at least two batches, both spent longer than its budget on the device itself, and either their time per frame alone, or their split costs together with the world's last two one-frame batches (the newer run in the previous call) say one frame does not fit; after two calls in a row were refused since the last batch the next one runs one frame to measure again. After such a refusal or doubt the world's next call starts with a one-frame batch. Otherwise a step whose first batch does not fit runs one frame to measure; an open or rebuild runs one frame at the start of each journal entry its replay would otherwise stop at. Any of these answers can come after its budget by up to one frame of that world. Work that cannot stop part way (building, copying, saving or reading a world, a snapshot a world owes, and one sparse journal write) is refused at once when it cannot fit the time left by the larger of two figures: the fastest of the last three times that kind of work spent on the device itself (dense and sparse worlds, snapshots to disk and in memory, and files opened and replayed, each apart) at the largest size it measured that is not above this one, and the fastest any tested device has shown per byte. Time spent on the device itself is the measuring thread's CPU time plus, on a GPU, the device's own timestamps, never time spent waiting for a CPU, a lock or other work; batch sizes and every other estimate use whole times. Otherwise it runs to its end, so its answer can come after its budget by as much as it then runs slower than that, as when the device is busy, a world of a new shape compiles its kernels on its first build, or a world is larger than any the server has measured. After 8 such refusals in a row for one kind and size by the server's own measurements, the next call runs to measure again, so work that truly cannot fit runs late at most once in every 9 such calls. Replayed steps and writes are refused up front only by the server's own measurements of them: steps by the fastest of the last three replay speeds, writes like work that cannot stop part way but without the per-byte figure. Without any, the replay runs and stops on its budget, and every replay stopped so adds a measurement",
                     ),
                 ),
                 (

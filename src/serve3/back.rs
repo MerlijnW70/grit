@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::branch::format::{self, Image, State, UNIFORM};
 use crate::wire::{Json, counted, map, text};
@@ -305,10 +305,11 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             failure = Some(why);
             break;
         }
-        let began = Instant::now();
+        let meter = super::budget::Meter::start();
         super::tools::faults::stall(step);
         let ran = server.world(held)?.world.back(step);
-        let took = began.elapsed();
+        let measured = meter.spent();
+        let took = measured.wall;
         if let Err(why) = ran {
             failure = Some(why);
             break;
@@ -317,7 +318,7 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             failure = Some(Box::new(crate::host::Error::Wedged { after: took }));
             break;
         }
-        pace.ran(step, took);
+        pace.ran_with(step, measured);
         let stats = &mut server.book.stats;
         stats
             .batches

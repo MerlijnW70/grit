@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use crate::law::Law;
 use crate::law::adjoint::Aim;
 use crate::question::Region;
@@ -7,7 +5,7 @@ use crate::rule3::Declared;
 use crate::sand3::{Grid3, reference};
 use crate::wire::{Json, counted, map, text};
 
-use super::budget::{Stop, Work};
+use super::budget::{Meter, Stop, Work};
 use super::errors::Code;
 use super::gradient::{points_of, region_of, world_cells};
 use super::schema::{object, property, whole, word};
@@ -43,7 +41,7 @@ pub const GENERATIONS_MOST: u32 = 1024;
 
 pub const STALE: u32 = 8;
 
-pub const SEARCH: &str = "grit_law_score and grit_learn_params run any law forward on the CPU with sand3::reference, the CPU twin every device kernel is tested equal to: reversible or not, with cut ops or looks. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames, as grit_law_gradient. A run costs its octs times frames times the law's nodes plus 128; it may cost at most run_work, on a start of at most run_cells words, and cannot stop part way, so an answer can come one run late. A search is a (1+population) evolution strategy over whole params inside bounds, drawn from seed: generation 0 runs params; each later generation runs population children of the parent, each param moved by the sum of three draws from 0 to 2 spread, less 3 spread, and clamped to its bounds (a child equal to its parent moves one param by 1); the earliest lowest child becomes the parent when it is no worse. Each param's spread starts at a quarter of its bounds' width, at least 1; it grows by half when more than a fifth of a generation's children were no worse than the parent and shrinks by a third when fewer were, from 1 to the width. After search_stale generations in a row without a lower parent, with every spread at 1, the parent restarts at a point drawn evenly inside bounds and every spread starts again. It stops found (objective 0), generations, or on budget or cancelled before a run, and answers the earliest lowest objective of every run with its params, the trail of each finished generation's earliest lowest, and scored, the runs made. The same arguments give the same answer on every device; a stopped search's trail is a prefix of the whole one's. Refused before any run: law_refused, start, params, bounds, reversed, outside, target_size, aim, run_limit, and budget when the fastest of the last three runs the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
+pub const SEARCH: &str = "grit_law_score and grit_learn_params run any law forward on the CPU with sand3::reference, the CPU twin every device kernel is tested equal to: reversible or not, with cut ops or looks. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames, as grit_law_gradient. A run costs its octs times frames times the law's nodes plus 128; it may cost at most run_work, on a start of at most run_cells words, and cannot stop part way, so an answer can come one run late. A search is a (1+population) evolution strategy over whole params inside bounds, drawn from seed: generation 0 runs params; each later generation runs population children of the parent, each param moved by the sum of three draws from 0 to 2 spread, less 3 spread, and clamped to its bounds (a child equal to its parent moves one param by 1); the earliest lowest child becomes the parent when it is no worse. Each param's spread starts at a quarter of its bounds' width, at least 1; it grows by half when more than a fifth of a generation's children were no worse than the parent and shrinks by a third when fewer were, from 1 to the width. After search_stale generations in a row without a lower parent, with every spread at 1, the parent restarts at a point drawn evenly inside bounds and every spread starts again. It stops found (objective 0), generations, or on budget or cancelled before a run, and answers the earliest lowest objective of every run with its params, the trail of each finished generation's earliest lowest, and scored, the runs made. The same arguments give the same answer on every device; a stopped search's trail is a prefix of the whole one's. Refused before any run: law_refused, start, params, bounds, reversed, outside, target_size, aim, run_limit, and budget when the fastest of the last three runs the server measured at the largest size not above this one, by its thread's CPU time and never time spent waiting, does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -655,13 +653,13 @@ fn objective_of(posed: &Posed, params: &[u32]) -> u64 {
 }
 
 fn run(server: &mut Server<'_>, posed: &Posed, params: &[u32]) -> u64 {
-    let began = Instant::now();
+    let meter = Meter::start();
     super::tools::faults::stall(1);
     let objective = objective_of(posed, params);
     server
         .book
         .rates
-        .measure(Work::Run, posed.units, began.elapsed());
+        .measured(Work::Run, posed.units, meter.spent());
     if faults::ran()
         && let Some(flag) = server.cancel.as_ref()
     {

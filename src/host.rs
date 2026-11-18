@@ -416,6 +416,19 @@ impl From<simdr::lanes::LaneError> for Error {
     }
 }
 
+thread_local! {
+    static ON_DEVICE: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+pub fn spent_on_device(time: Duration) {
+    ON_DEVICE.set(ON_DEVICE.get().saturating_add(time));
+}
+
+#[must_use]
+pub fn on_device() -> Duration {
+    ON_DEVICE.get()
+}
+
 pub struct Host {
     entry: ash::Entry,
     instance: ash::Instance,
@@ -435,6 +448,7 @@ pub struct Host {
     limits: Limits,
     tick: f32,
     timing: bool,
+    on_cpu: bool,
     wedged: AtomicBool,
     owing: AtomicUsize,
     sparse: bool,
@@ -665,6 +679,8 @@ impl Host {
         let name = unsafe { name_of(&instance, physical) };
         let limits = unsafe { limits_of(&instance, physical) };
         let (tick, timing) = unsafe { timestamps(&instance, physical, family) };
+        let on_cpu = unsafe { instance.get_physical_device_properties(physical) }.device_type
+            == vk::PhysicalDeviceType::CPU;
 
         let priorities = [1.0_f32];
         let has = unsafe { instance.get_physical_device_features(physical) };
@@ -731,6 +747,7 @@ impl Host {
             limits,
             tick,
             timing,
+            on_cpu,
             sparse,
             strict,
             int64,
@@ -766,6 +783,11 @@ impl Host {
 
     pub(crate) const fn ticking(&self) -> (f32, bool) {
         (self.tick, self.timing)
+    }
+
+    #[must_use]
+    pub const fn on_cpu(&self) -> bool {
+        self.on_cpu
     }
 
     #[must_use]

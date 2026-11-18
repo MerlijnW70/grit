@@ -226,7 +226,8 @@ struct Writing {
     made: Made,
     bytes: u64,
     began: Instant,
-    done: std::sync::mpsc::Receiver<(Result<[u8; 32], String>, Instant)>,
+    own: Duration,
+    done: std::sync::mpsc::Receiver<(Result<[u8; 32], String>, Instant, Duration)>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -297,6 +298,8 @@ pub struct Faults {
     pub held_work: Vec<budget::Work>,
     pub held_replays: u32,
     pub held_by: Duration,
+    pub off_cpu: Vec<budget::Work>,
+    pub off_cpu_by: Duration,
     pub stray_walk: bool,
     pub wedge_after_runs: Option<u64>,
     pub stall_every: Duration,
@@ -483,23 +486,30 @@ impl Book {
             Wait::Poll => match writing.done.try_recv() {
                 Ok(got) => got,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    (Err(WRITER_STOPPED.to_owned()), Instant::now())
-                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => (
+                    Err(WRITER_STOPPED.to_owned()),
+                    Instant::now(),
+                    Duration::ZERO,
+                ),
             },
             Wait::For(left) => match writing.done.recv_timeout(left) {
                 Ok(got) => got,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    (Err(WRITER_STOPPED.to_owned()), Instant::now())
-                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => (
+                    Err(WRITER_STOPPED.to_owned()),
+                    Instant::now(),
+                    Duration::ZERO,
+                ),
             },
-            Wait::Landed => writing
-                .done
-                .recv()
-                .unwrap_or_else(|_| (Err(WRITER_STOPPED.to_owned()), Instant::now())),
+            Wait::Landed => writing.done.recv().unwrap_or_else(|_| {
+                (
+                    Err(WRITER_STOPPED.to_owned()),
+                    Instant::now(),
+                    Duration::ZERO,
+                )
+            }),
         };
-        let (got, finished) = got;
+        let (got, finished, written) = got;
         let Some(mut writing) = self.writing.take() else {
             return false;
         };
@@ -525,7 +535,14 @@ impl Book {
                 return true;
             }
         };
-        self.rates.measure(budget::Work::Save, writing.bytes, cost);
+        self.rates.measured(
+            budget::Work::Save,
+            writing.bytes,
+            budget::Spent {
+                wall: cost,
+                own: writing.own.saturating_add(written).min(cost),
+            },
+        );
         if !current {
             self.release(Some(sum));
             return true;
@@ -948,7 +965,7 @@ impl<'host> Server<'host> {
         let guard = self.guard();
         let mut held = self.held_replay();
         let mut timings = journal::Timings::default();
-        let began = Instant::now();
+        let began = budget::Meter::start();
         let built = journal::rebuilt(
             host,
             ledger,
@@ -960,23 +977,23 @@ impl<'host> Server<'host> {
                 paced(world, frames, pace, &guard)
             },
         );
-        let took = began.elapsed();
+        let took = began.spent();
         let rates = &mut self.book.rates;
-        if !timings.build.is_zero() {
-            rates.measure(base_work(ledger), bytes, timings.build);
+        if !timings.build.wall.is_zero() {
+            rates.measured(base_work(ledger), bytes, timings.build);
         }
         if timings.file_bytes > 0 {
-            rates.measure(budget::Work::File, timings.file_bytes, timings.file);
+            rates.measured(budget::Work::File, timings.file_bytes, timings.file);
         }
         if timings.write_bytes > 0 {
-            rates.measure(
+            rates.measured(
                 budget::Work::write(ledger.made().sparse),
                 timings.write_bytes,
                 timings.writes,
             );
         }
         if built.is_ok() {
-            rates.measure_journal(ledger.journal(), took);
+            rates.journal_measured(ledger.journal(), took);
             rates.measure_replay(timings.recorded, timings.steps);
         }
         built
@@ -1364,7 +1381,10 @@ impl<'host> Server<'host> {
         taken
     }
 
-    fn snap_image(&mut self, number: u32) -> Result<(crate::branch::Image, Made, Instant), Failed> {
+    fn snap_image(
+        &mut self,
+        number: u32,
+    ) -> Result<(crate::branch::Image, Made, budget::Meter), Failed> {
         #[cfg(feature = "faults")]
         {
             let (fail, wedge) = self
@@ -1399,7 +1419,7 @@ impl<'host> Server<'host> {
             .made()
             .clone();
         let live = self.live.get_mut(&number).ok_or("the world is not open")?;
-        let began = Instant::now();
+        let began = budget::Meter::start();
         let image = live.world.image()?;
         let made = Made {
             slots: match &image.state {
@@ -1414,7 +1434,7 @@ impl<'host> Server<'host> {
     fn snap_attempt(&mut self, number: u32) -> Result<Option<Json>, Failed> {
         let (image, made, began) = self.snap_image(number)?;
         self.slowly(self.snap_work());
-        std::thread::sleep(self.slow_idle());
+        budget::busy_device(self.slow_idle());
         let frame = image.frame;
         let keep = self.book.keep.clone();
         let snap = match keep.as_ref() {
@@ -1432,9 +1452,10 @@ impl<'host> Server<'host> {
             },
         };
         let sum = snap.sum;
-        let cost = began.elapsed();
+        let spent = began.spent();
+        let cost = spent.wall;
         let size = self.book.held.get(&number).map_or(0, |held| held.bytes);
-        self.book.rates.measure(self.snap_work(), size, cost);
+        self.book.rates.measured(self.snap_work(), size, spent);
         let epoch = self.book.bump();
         let held = self
             .book
@@ -1466,14 +1487,16 @@ impl<'host> Server<'host> {
             let (epoch, from, bytes) = (held.epoch, held.ledger.entries.len(), held.bytes);
             let frame = image.frame;
             let slow = self.slow_idle();
+            let own = began.spent().own;
             let (sender, done) = std::sync::mpsc::channel();
             let thread = std::thread::Builder::new()
                 .name("grit-snapshot".to_owned())
                 .spawn(move || {
-                    std::thread::sleep(slow);
+                    let meter = budget::Meter::start();
+                    budget::busy_device(slow);
                     let got = stored(&keep, number, &image)
                         .map_err(|why| refused_with(why.as_ref()).0.message);
-                    let _ = sender.send((got, Instant::now()));
+                    let _ = sender.send((got, Instant::now(), meter.spent().own));
                 })
                 .map_err(|why| io_refusal(&why))?;
             self.book.writing = Some(Writing {
@@ -1483,7 +1506,8 @@ impl<'host> Server<'host> {
                 frame,
                 made,
                 bytes,
-                began,
+                began: began.began(),
+                own,
                 done,
                 thread: Some(thread),
             });
@@ -1598,7 +1622,7 @@ impl<'host> Server<'host> {
 
     #[cfg(feature = "faults")]
     pub(super) fn slowly(&self, work: budget::Work) {
-        let slow = self
+        let (slow, off) = self
             .book
             .faults
             .lock()
@@ -1614,10 +1638,16 @@ impl<'host> Server<'host> {
                     faults.held_work.remove(at);
                     slow = slow.saturating_add(faults.held_by);
                 }
-                slow
+                let mut off = Duration::ZERO;
+                if let Some(at) = faults.off_cpu.iter().position(|one| *one == work) {
+                    faults.off_cpu.remove(at);
+                    off = faults.off_cpu_by;
+                }
+                (slow, off)
             })
             .unwrap_or_default();
-        std::thread::sleep(slow);
+        budget::busy_device(slow);
+        std::thread::sleep(off);
     }
 
     #[cfg(not(feature = "faults"))]
@@ -1962,10 +1992,10 @@ fn paced(
         if step == 0 {
             return Err(Box::new(budget::Cut(Stop::Budget)));
         }
-        let began = Instant::now();
+        let meter = budget::Meter::start();
         tools::faults::stall(step);
         world.step(step)?;
-        pace.ran(step, began.elapsed());
+        pace.ran_with(step, meter.spent());
         done += step;
     }
     Ok(())

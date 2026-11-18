@@ -56,6 +56,16 @@ pub const FIXED_KEPT: usize = 2 * FIXED_MOVES_AFTER - 1;
 struct Batch {
     frames: u32,
     spent: Duration,
+    own: Duration,
+}
+
+impl Batch {
+    const fn owned(self) -> Self {
+        Self {
+            spent: self.own,
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -63,9 +73,11 @@ pub struct Pace {
     last: Batch,
     previous: Batch,
     fixed: [Option<Duration>; FIXED_KEPT],
+    fixed_own: [Option<Duration>; FIXED_KEPT],
     measured: u32,
     refused: u32,
     one_frame: [Option<Duration>; 2],
+    one_frame_own: [Option<Duration>; 2],
     wanted: bool,
     probing: bool,
     calls: u32,
@@ -74,20 +86,24 @@ pub struct Pace {
 impl Pace {
     #[must_use]
     pub fn first(cells: u64) -> Self {
+        let spent = WORST_PER_CELL
+            .checked_mul(u32::try_from(cells).unwrap_or(u32::MAX))
+            .unwrap_or(Duration::MAX)
+            .saturating_add(WORST_PER_SUBMIT);
         let guess = Batch {
             frames: 1,
-            spent: WORST_PER_CELL
-                .checked_mul(u32::try_from(cells).unwrap_or(u32::MAX))
-                .unwrap_or(Duration::MAX)
-                .saturating_add(WORST_PER_SUBMIT),
+            spent,
+            own: spent,
         };
         Self {
             last: guess,
             previous: guess,
             fixed: [None; FIXED_KEPT],
+            fixed_own: [None; FIXED_KEPT],
             measured: 0,
             refused: 0,
             one_frame: [None; 2],
+            one_frame_own: [None; 2],
             wanted: false,
             probing: false,
             calls: 0,
@@ -95,11 +111,7 @@ impl Pace {
     }
 
     fn known(&self) -> Option<Duration> {
-        let mut kept = self.fixed;
-        kept.sort_unstable();
-        let filled = kept.iter().flatten().count();
-        let at = FIXED_KEPT - filled + filled.saturating_sub(FIXED_MOVES_AFTER);
-        kept.get(at).copied().flatten()
+        agreed(self.fixed)
     }
 
     fn doubted(&self, time: Duration) -> bool {
@@ -107,6 +119,24 @@ impl Pace {
         fixed.is_some()
             && within(self.last, fixed, time) == 0
             && within(self.previous, fixed, time) == 0
+    }
+
+    fn refusable(&self, time: Duration) -> bool {
+        let (last, previous) = (self.last.owned(), self.previous.owned());
+        let bound = Some(Duration::ZERO);
+        let shown = within(last, bound, time) == 0 && within(previous, bound, time) == 0;
+        let fixed = agreed(self.fixed_own);
+        let doubted = !shown
+            && fixed.is_some()
+            && within(last, fixed, time) == 0
+            && within(previous, fixed, time) == 0;
+        let vouched = doubted
+            && self.calls <= 1
+            && self
+                .one_frame_own
+                .iter()
+                .all(|one| one.is_some_and(|one| one > time));
+        shown || vouched
     }
 
     #[must_use]
@@ -157,13 +187,7 @@ impl Pace {
         if doubted || shown {
             self.wanted = true;
         }
-        let vouched = doubted
-            && self.calls <= 1
-            && self
-                .one_frame
-                .iter()
-                .all(|one| one.is_some_and(|one| one > time));
-        if self.measured >= 2 && (shown || vouched) && self.refused < REFUSED_MOST {
+        if self.measured >= 2 && self.refused < REFUSED_MOST && self.refusable(time) {
             self.refused += 1;
             return 0;
         }
@@ -181,20 +205,25 @@ impl Pace {
     }
 
     pub fn ran(&mut self, frames: u32, spent: Duration) {
+        self.ran_with(frames, Spent::whole(spent));
+    }
+
+    pub fn ran_with(&mut self, frames: u32, spent: Spent) {
         if frames == 0 {
             return;
         }
-        let now = Batch { frames, spent };
-        if self.measured > 0
-            && let Some(fixed) = split(self.last, now)
-        {
-            self.fixed.rotate_right(1);
-            if let Some(newest) = self.fixed.first_mut() {
-                *newest = Some(fixed);
-            }
+        let now = Batch {
+            frames,
+            spent: spent.wall,
+            own: spent.own,
+        };
+        if self.measured > 0 {
+            kept_split(&mut self.fixed, split(self.last, now));
+            kept_split(&mut self.fixed_own, split(self.last.owned(), now.owned()));
         }
         if frames == 1 {
-            self.one_frame = [Some(spent), self.one_frame[0]];
+            self.one_frame = [Some(spent.wall), self.one_frame[0]];
+            self.one_frame_own = [Some(spent.own), self.one_frame_own[0]];
             self.wanted = self.wanted && self.probing;
             self.calls = 0;
         }
@@ -203,6 +232,24 @@ impl Pace {
         self.refused = 0;
         self.probing = false;
         self.measured = self.measured.saturating_add(1);
+    }
+}
+
+fn agreed(fixed: [Option<Duration>; FIXED_KEPT]) -> Option<Duration> {
+    let mut kept = fixed;
+    kept.sort_unstable();
+    let filled = kept.iter().flatten().count();
+    let at = FIXED_KEPT - filled + filled.saturating_sub(FIXED_MOVES_AFTER);
+    kept.get(at).copied().flatten()
+}
+
+fn kept_split(fixed: &mut [Option<Duration>; FIXED_KEPT], found: Option<Duration>) {
+    let Some(found) = found else {
+        return;
+    };
+    fixed.rotate_right(1);
+    if let Some(newest) = fixed.first_mut() {
+        *newest = Some(found);
     }
 }
 
@@ -263,6 +310,155 @@ fn within(batch: Batch, fixed: Option<Duration>, time: Duration) -> u32 {
     }
     let frames = room.as_nanos().saturating_mul(u128::from(batch.frames)) / each;
     u32::try_from(frames).unwrap_or(u32::MAX)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Spent {
+    pub wall: Duration,
+    pub own: Duration,
+}
+
+impl Spent {
+    #[must_use]
+    pub const fn whole(wall: Duration) -> Self {
+        Self { wall, own: wall }
+    }
+
+    #[must_use]
+    pub fn less(self, other: Self) -> Self {
+        Self {
+            wall: self.wall.saturating_sub(other.wall),
+            own: self.own.saturating_sub(other.own),
+        }
+    }
+
+    #[must_use]
+    pub fn and(self, other: Self) -> Self {
+        Self {
+            wall: self.wall.saturating_add(other.wall),
+            own: self.own.saturating_add(other.own),
+        }
+    }
+}
+
+pub fn busy_device(time: Duration) {
+    if time.is_zero() {
+        return;
+    }
+    std::thread::sleep(time);
+    crate::host::spent_on_device(time);
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Meter {
+    began: Instant,
+    cpu: Option<Duration>,
+    device: Duration,
+}
+
+impl Meter {
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            began: Instant::now(),
+            cpu: thread_cpu(),
+            device: crate::host::on_device(),
+        }
+    }
+
+    #[must_use]
+    pub const fn began(&self) -> Instant {
+        self.began
+    }
+
+    #[must_use]
+    pub fn spent(&self) -> Spent {
+        let wall = self.began.elapsed();
+        let own = match (self.cpu, thread_cpu()) {
+            (Some(from), Some(to)) => to
+                .saturating_sub(from)
+                .saturating_add(crate::host::on_device().saturating_sub(self.device))
+                .min(wall),
+            _ => wall,
+        };
+        Spent { wall, own }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn thread_cpu() -> Option<Duration> {
+    #[repr(C)]
+    struct Spec {
+        seconds: std::ffi::c_long,
+        nanos: std::ffi::c_long,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: std::ffi::c_int, spec: *mut Spec) -> std::ffi::c_int;
+    }
+    const THREAD_CPU: std::ffi::c_int = 3;
+    let mut spec = Spec {
+        seconds: 0,
+        nanos: 0,
+    };
+    let read = unsafe { clock_gettime(THREAD_CPU, &raw mut spec) };
+    if read != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(spec.seconds).ok()?;
+    let nanos = u32::try_from(spec.nanos).ok()?;
+    Some(Duration::new(seconds, nanos))
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThread() -> *mut std::ffi::c_void;
+    fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
+}
+
+#[cfg(windows)]
+fn thread_cycles() -> Option<u64> {
+    let mut cycles = 0_u64;
+    let read = unsafe { QueryThreadCycleTime(GetCurrentThread(), &raw mut cycles) };
+    (read != 0).then_some(cycles)
+}
+
+#[cfg(windows)]
+const CALIBRATION: Duration = Duration::from_millis(2);
+
+#[cfg(windows)]
+const CALIBRATIONS: u32 = 5;
+
+#[cfg(windows)]
+fn cycles_per_second() -> Option<f64> {
+    static RATE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        let mut best: Option<f64> = None;
+        for _ in 0..CALIBRATIONS {
+            let began = Instant::now();
+            let from = thread_cycles()?;
+            while began.elapsed() < CALIBRATION {
+                std::hint::spin_loop();
+            }
+            let to = thread_cycles()?;
+            let rate = to.saturating_sub(from) as f64 / began.elapsed().as_secs_f64();
+            if rate.is_finite() && rate > 0.0 {
+                best = Some(best.map_or(rate, |held| held.max(rate)));
+            }
+        }
+        best
+    })
+}
+
+#[cfg(windows)]
+fn thread_cpu() -> Option<Duration> {
+    let rate = cycles_per_second()?;
+    Duration::try_from_secs_f64(thread_cycles()? as f64 / rate).ok()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+const fn thread_cpu() -> Option<Duration> {
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -910,8 +1106,12 @@ impl Rates {
     }
 
     pub fn measure(&mut self, work: Work, bytes: u64, spent: Duration) {
+        self.measured(work, bytes, Spent::whole(spent));
+    }
+
+    pub fn measured(&mut self, work: Work, bytes: u64, spent: Spent) {
         let size = bytes as f64 + work.fixed();
-        let sample = spent.as_secs_f64() / size;
+        let sample = spent.wall.as_secs_f64() / size;
         if !sample.is_finite() || sample <= 0.0 {
             return;
         }
@@ -922,7 +1122,7 @@ impl Rates {
         if let Some(kept) = self.kinds.get_mut(work.index()) {
             kept.push(size, taken);
         }
-        self.sampled(work, bytes, spent);
+        self.sampled(work, bytes, spent.own);
     }
 
     #[must_use]
@@ -943,6 +1143,11 @@ impl Rates {
     }
 
     pub fn measure_journal(&mut self, journal: u64, spent: Duration) {
+        self.journal_measured(journal, Spent::whole(spent));
+    }
+
+    pub fn journal_measured(&mut self, journal: u64, spent: Spent) {
+        let spent = spent.own;
         if spent.is_zero() {
             return;
         }
