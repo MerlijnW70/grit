@@ -598,6 +598,7 @@ pub struct Resident<'host> {
     device: Option<Duration>,
     spans: Vec<Duration>,
     reused: u64,
+    waited: Duration,
 }
 
 impl Host {
@@ -687,8 +688,10 @@ impl Host {
             | vk::MemoryPropertyFlags::HOST_VISIBLE
             | vk::MemoryPropertyFlags::HOST_COHERENT;
 
+        let asked = Instant::now();
         let _forming = forming();
         let mut made = Resident::building(self, direct, sizes.len());
+        made.waited = asked.elapsed();
         unsafe {
             for (at, &bytes) in lengths.iter().enumerate() {
                 if Some(at) == vast {
@@ -954,6 +957,7 @@ impl<'host> Resident<'host> {
             device: None,
             spans: Vec::new(),
             reused: 0,
+            waited: Duration::ZERO,
         }
     }
 
@@ -2053,6 +2057,11 @@ impl Resident<'_> {
     #[must_use]
     pub const fn reused(&self) -> u64 {
         self.reused
+    }
+
+    #[must_use]
+    pub const fn waited(&self) -> Duration {
+        self.waited
     }
 
     #[must_use]

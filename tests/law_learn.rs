@@ -1106,7 +1106,10 @@ mod faulted {
 
     use grit::serve3::Options;
     use grit::serve3::exec::Exec;
-    use grit::serve3::law_learn::faults::{cancel_after, charge_after, checks, disarm};
+    use grit::serve3::law_learn::KERNEL_WORDS;
+    use grit::serve3::law_learn::faults::{
+        cancel_after, ceiling_at, charge_after, checks, disarm, held_up_at, kernel_most,
+    };
 
     fn arguments() -> String {
         let (train, _) = x0b();
@@ -1244,6 +1247,125 @@ mod faulted {
             checks() - before,
             2,
             "the second check of the expansion stopped it"
+        );
+    }
+
+    fn copied(seed: u64, size: [u32; 3], gates: u32) -> String {
+        let mut rng = Rng(seed);
+        let cells = size.iter().product::<u32>() as usize;
+        let input = random_bits(&mut rng, cells, 2);
+        learn_args(
+            Stencil::Cube,
+            "minimal",
+            "wrapped",
+            &format!("[{}]", inline(size, &input, &input)),
+            0,
+            1,
+            &format!(",\"gates\":{gates},\"crowd\":64,\"rounds\":1"),
+        )
+    }
+
+    fn kernel_of(host: &Host, arguments: &str) -> (Json, usize) {
+        let mut mcp = Mcp::new(Some(host));
+        disarm();
+        let got = mcp.raw("grit_law_learn", arguments);
+        let words = kernel_most();
+        disarm();
+        (got, words)
+    }
+
+    #[test]
+    fn a_search_kernel_loops_over_its_rows_and_stays_within_its_bound() {
+        let Some(host) = device("law_learn kernel bound") else {
+            return;
+        };
+        let (_, small) = kernel_of(&host, &copied(71, [4, 4, 4], 8));
+        let (_, large) = kernel_of(&host, &copied(72, [16, 16, 16], 8));
+        assert!(small > 0, "a search kernel was built");
+        assert!(
+            large.abs_diff(small) * 32 < small,
+            "64 rows built {small} words and about 4096 rows {large}; only constants differ"
+        );
+        assert!(
+            large <= KERNEL_WORDS,
+            "{large} words past the bound {KERNEL_WORDS}"
+        );
+    }
+
+    #[test]
+    fn a_top_rung_whose_kernel_passes_its_bound_is_refused_before_any_search() {
+        let Some(host) = device("law_learn kernel refused") else {
+            return;
+        };
+        let (told, built) = kernel_of(&host, &copied(73, [4, 4, 4], 256));
+        let told = result(&told, true);
+        assert_eq!(
+            (text_at(&told, "refused"), text_at(&told, "field")),
+            ("learn_limit".to_owned(), "$.gates".to_owned()),
+            "{}",
+            written(&told)
+        );
+        assert_eq!(built, 0, "no kernel was built before the refusal");
+        let fits = u32::try_from(int_at(&told, "limit")).unwrap();
+        assert!(fits > 8 && fits < 256, "{fits}");
+        let (got, built) = kernel_of(&host, &copied(73, [4, 4, 4], fits));
+        if let Some(told) = got
+            .get("result")
+            .and_then(|one| one.get("structuredContent"))
+            .and_then(|one| one.get("refused"))
+        {
+            assert_ne!(told.text(), Some("learn_limit"), "{}", written(&got));
+        }
+        assert!(built > 0 && built <= KERNEL_WORDS, "{built}");
+    }
+
+    #[test]
+    fn a_build_held_up_by_other_calls_builds_is_not_charged_to_the_next_build() {
+        let Some(host) = device("law_learn held up build") else {
+            return;
+        };
+        let (full, _) = whole(&host);
+        let mut mcp = Mcp::new(Some(&host));
+        held_up_at(1, Duration::from_secs(3600));
+        let got = mcp.ok("grit_law_learn", &arguments());
+        disarm();
+        assert_eq!(written(&got), written(&full));
+    }
+
+    #[test]
+    fn a_crowd_past_one_binding_is_capped_and_named() {
+        let Some(host) = device("law_learn crowd capped") else {
+            return;
+        };
+        let mut mcp = Mcp::new(Some(&host));
+        let free = mcp.ok("grit_law_learn", &arguments());
+        assert!(free.get("crowd_capped").is_none(), "{}", written(&free));
+        let rows = u64::try_from(int_at(free.get("examples").unwrap(), "seen")).unwrap();
+        let wide = rows.div_ceil(32).max(1);
+        let each = (9 + 16) * wide;
+        let width = u64::from(host.width());
+        let crowd = 1024_u64.max(width * 4);
+        let mut mcp = Mcp::new(Some(&host));
+        ceiling_at(crowd * each * 4);
+        let got = mcp.ok("grit_law_learn", &arguments());
+        disarm();
+        let capped = got
+            .get("crowd_capped")
+            .unwrap_or_else(|| panic!("{}", written(&got)));
+        assert_eq!(int_at(capped, "asked"), 4096);
+        assert_eq!(
+            int_at(capped, "used"),
+            i64::try_from(crowd / width * width).unwrap()
+        );
+        let mut mcp = Mcp::new(Some(&host));
+        ceiling_at(each * 4 * (width.max(64) - 1));
+        let told = mcp.no("grit_law_learn", &arguments());
+        disarm();
+        assert_eq!(
+            (text_at(&told, "refused"), text_at(&told, "field")),
+            ("learn_limit".to_owned(), "$.examples".to_owned()),
+            "{}",
+            written(&told)
         );
     }
 
@@ -1461,4 +1583,71 @@ fn l3_a_pattern_and_any_one_of_its_images_seen_apart_are_refused_by_name() {
         &[[0, 0, 0], [-1, -1, -1], [1, 0, -1]],
         [16, 8, 8],
     );
+}
+
+fn scores_of(host: &Host, module: &[u32], held: grit::machine::Machine, wide: u32) -> Vec<u32> {
+    use grit::Groups;
+    use grit::marking::{BINDINGS, FEED, SCORE, TRIAL, VALUES, WANTED};
+    const CROWD: u32 = 256;
+    let shape = held.shape().unwrap();
+    let mut rng = Rng(0x5EED);
+    let mut words = |many: u32| -> Vec<u32> { (0..many).map(|_| rng.next() as u32).collect() };
+    let feed = words(held.steps * held.inputs * wide);
+    let want = words(held.steps * held.outputs * wide);
+    let mut state = 0x1234_5679_u32;
+    let chips: Vec<u32> = (0..CROWD * shape.gates)
+        .map(|at| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            grit::netlist::drawn(&shape, at % shape.gates, state).pack()
+        })
+        .collect();
+    let sizes = [
+        (CROWD * shape.gates) as usize,
+        (CROWD * shape.gates) as usize,
+        (CROWD * shape.sources() * wide) as usize,
+        want.len(),
+        CROWD as usize,
+        CROWD as usize,
+        CROWD as usize,
+        feed.len(),
+    ];
+    assert_eq!(sizes.len(), BINDINGS as usize);
+    let modules: Vec<&[u32]> = vec![module];
+    let mut resident = host.resident(&sizes, &modules).unwrap();
+    resident.write(TRIAL as usize, &chips).unwrap();
+    resident
+        .write(VALUES as usize, &vec![0_u32; sizes[VALUES as usize]])
+        .unwrap();
+    resident.write(WANTED as usize, &want).unwrap();
+    resident.write(FEED as usize, &feed).unwrap();
+    resident
+        .write(SCORE as usize, &vec![0_u32; CROWD as usize])
+        .unwrap();
+    let over = [Groups::Fixed(CROWD.div_ceil(host.width()))];
+    let stages: Vec<&[Groups]> = vec![&over];
+    resident.staged(&stages).unwrap();
+    resident.read(SCORE as usize, CROWD as usize).unwrap()
+}
+
+#[test]
+fn a_search_kernel_rolled_over_its_rows_scores_every_candidate_as_the_unrolled_one() {
+    let Some(host) = device("law_learn rolled kernel") else {
+        return;
+    };
+    for (state, inputs, outputs, gates, steps, wide) in
+        [(0, 27, 1, 8, 1, 3), (2, 3, 2, 9, 3, 5), (0, 9, 1, 14, 1, 1)]
+    {
+        let held = grit::machine::Machine::over(state, inputs, outputs, gates, 16, steps).unwrap();
+        let unrolled = grit::marking::stepped(host.width(), held, wide).unwrap();
+        let rolled = grit::marking::stepped_rolled(host.width(), held, wide).unwrap();
+        let before = scores_of(&host, &unrolled, held, wide);
+        assert!(before.iter().any(|one| *one > 0));
+        assert_eq!(
+            scores_of(&host, &rolled, held, wide),
+            before,
+            "state {state}, inputs {inputs}, outputs {outputs}, gates {gates}, steps {steps}, wide {wide}"
+        );
+    }
 }

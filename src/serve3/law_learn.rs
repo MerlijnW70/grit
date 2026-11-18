@@ -44,6 +44,8 @@ pub const TABLE_INPUTS: u32 = 9;
 
 pub const PATIENCE: u32 = 2;
 
+pub const KERNEL_WORDS: usize = 1 << 15;
+
 pub const MINIMAL: &str = "each row the examples never showed takes the answer of the smallest circuit the gate ladder found that answers every seen row";
 
 pub const SYMMETRIC: &str = "the ladder finds the smallest circuit f that answers every seen row and every rotation and reflection of one (8 for 3x3, 48 for 3x3x3); the law answers output j 1 exactly when f answers it 1 on some rotation or reflection of the neighbourhood, so every row the examples never showed is decided alike with its images";
@@ -52,7 +54,7 @@ pub const ZERO_RUNS: &str = "the law reads its neighbours wrapped on the world's
 
 pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world whose sides equal its own along each axis the stencil reads (3x3 reads x and y, so its tall is free; a world's tall is at least 2), and a world example's box reads its neighbours from that world";
 
-pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call does not fit; the first build cannot stop part way, and its kernel is unrolled over the rows searched (under symmetric every image of every seen row), so it grows with them and an answer can come late by up to one build; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion and the count of decided rows check budget and cancel every 4096 rows or 64-row blocks and refuse budget or cancelled; after a stopped ladder the count runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so that the smallest circuit solved so far is answered with its counts. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device";
+pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call, less its wait for other calls' builds, does not fit; a build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; a top rung whose kernel passes 32768 words is refused learn_limit at gates before any search, so an answer can come late by up to one build of at most that kernel; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion and the count of decided rows check budget and cancel every 4096 rows or 64-row blocks and refuse budget or cancelled; after a stopped ladder the count runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so that the smallest circuit solved so far is answered with its counts. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on the time measured, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -68,6 +70,63 @@ pub mod faults {
         static CHECKS: Cell<u64> = const { Cell::new(0) };
         static CANCEL: Cell<Option<u64>> = const { Cell::new(None) };
         static CHARGE: Cell<Option<u64>> = const { Cell::new(None) };
+        static KERNEL: Cell<usize> = const { Cell::new(0) };
+        static BUILDS: Cell<u64> = const { Cell::new(0) };
+        static HELD_UP: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
+        static CEILING: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn ceiling_at(bytes: u64) {
+        CEILING.set(Some(bytes));
+    }
+
+    #[cfg(feature = "faults")]
+    pub(super) fn ceiling(host: &Host) -> u64 {
+        CEILING.get().unwrap_or_else(|| host.ceiling())
+    }
+
+    #[cfg(not(feature = "faults"))]
+    pub(super) fn ceiling(host: &Host) -> u64 {
+        host.ceiling()
+    }
+
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub fn kernel_most() -> usize {
+        KERNEL.get()
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn held_up_at(build: u64, wait: Duration) {
+        BUILDS.set(0);
+        HELD_UP.set(Some((build, wait)));
+    }
+
+    #[cfg(feature = "faults")]
+    pub(super) fn kernel(words: usize) {
+        KERNEL.set(KERNEL.get().max(words));
+    }
+
+    #[cfg(not(feature = "faults"))]
+    pub(super) const fn kernel(_: usize) {}
+
+    #[cfg(feature = "faults")]
+    pub(super) fn held_up() -> Duration {
+        let build = BUILDS.get();
+        BUILDS.set(build.saturating_add(1));
+        match HELD_UP.get() {
+            Some((at, extra)) if at == build => {
+                HELD_UP.set(None);
+                extra
+            }
+            _ => Duration::ZERO,
+        }
+    }
+
+    #[cfg(not(feature = "faults"))]
+    pub(super) const fn held_up() -> Duration {
+        Duration::ZERO
     }
 
     #[cfg(feature = "faults")]
@@ -90,6 +149,9 @@ pub mod faults {
     pub fn disarm() {
         CANCEL.set(None);
         CHARGE.set(None);
+        HELD_UP.set(None);
+        CEILING.set(None);
+        KERNEL.set(0);
     }
 
     #[cfg(feature = "faults")]
@@ -155,6 +217,8 @@ struct Watch<'host> {
     stop: Option<Stop>,
     began: Option<std::time::Instant>,
     built: Option<Duration>,
+    waited: Duration,
+    held_up: Duration,
     crowd_most: u32,
     #[cfg(feature = "faults")]
     faults: std::sync::Arc<std::sync::Mutex<super::Faults>>,
@@ -179,6 +243,8 @@ impl Halt for Watch<'_> {
             return true;
         }
         self.began = Some(std::time::Instant::now());
+        self.waited = Duration::ZERO;
+        self.held_up = Duration::ZERO;
         false
     }
 
@@ -186,9 +252,28 @@ impl Halt for Watch<'_> {
         self.crowd_most
     }
 
+    fn rolled(&self) -> bool {
+        true
+    }
+
+    fn kernel(&mut self, words: usize) {
+        faults::kernel(words);
+    }
+
+    fn waited(&mut self, wait: Duration) {
+        let extra = faults::held_up();
+        self.held_up = self.held_up.saturating_add(extra);
+        self.waited = self.waited.saturating_add(wait).saturating_add(extra);
+    }
+
     fn halted(&mut self, next: Duration) -> bool {
         if let Some(began) = self.began.take() {
-            self.built = Some(began.elapsed());
+            self.built = Some(
+                began
+                    .elapsed()
+                    .saturating_add(self.held_up)
+                    .saturating_sub(self.waited),
+            );
         }
         self.over(next)
     }
@@ -1007,7 +1092,7 @@ fn crowd_fitting(
         .unwrap_or(u64::MAX)
         .div_ceil(32)
         .max(1);
-    let words = host.ceiling() / 4;
+    let words = faults::ceiling(host) / 4;
     let each = u64::from(inputs + top).saturating_mul(wide).max(1);
     let width = u64::from(host.width().max(1));
     let fits = (words / each / width).saturating_mul(width);
@@ -1023,6 +1108,49 @@ fn crowd_fitting(
         ));
     }
     Ok(u32::try_from(fits.min(u64::from(crate::serve::CROWD))).unwrap_or(u32::MAX))
+}
+
+fn kernel_words(
+    host: &crate::host::Host,
+    shape: (u32, u32),
+    gates: u32,
+    wide: u32,
+) -> Result<usize, Failed> {
+    let machine = Machine::over(0, shape.0, shape.1, gates, chip_kinds(), 1)?;
+    Ok(crate::marking::stepped_rolled(host.width(), machine, wide)?.len())
+}
+
+fn kernel_fitting(
+    host: &crate::host::Host,
+    shape: (u32, u32),
+    top: u32,
+    traces: usize,
+) -> Result<(), Failed> {
+    let wide = u32::try_from(traces.div_ceil(32).max(1)).unwrap_or(u32::MAX);
+    let words = kernel_words(host, shape, top, wide)?;
+    if words <= KERNEL_WORDS {
+        return Ok(());
+    }
+    let mut fits = 0;
+    let (mut low, mut high) = (shape.1.max(1), top);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if kernel_words(host, shape, mid, wide)? <= KERNEL_WORDS {
+            fits = mid;
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    Err(limited(
+        Code::LearnLimit,
+        "$.gates",
+        format!(
+            "a search kernel of {top} gates over {} inputs and {} outputs is {words} words, more than the {KERNEL_WORDS} one build may compile within the device's patience; at most {fits} gates fit, and nothing was searched",
+            shape.0, shape.1
+        ),
+        counted(fits),
+    ))
 }
 
 fn fits_kernel(inputs: u32, outputs: u32, top: u32, traces: usize) -> Result<(), Failed> {
@@ -1208,6 +1336,8 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         stop: None,
         began: None,
         built: None,
+        waited: Duration::ZERO,
+        held_up: Duration::ZERO,
         crowd_most: u32::MAX,
         #[cfg(feature = "faults")]
         faults: server.faults(),
@@ -1256,6 +1386,7 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .collect();
     fits_kernel(inputs, outputs, top, traces.len())?;
     let crowd_most = crowd_fitting(host, inputs, top, traces.len())?;
+    kernel_fitting(host, (inputs, outputs), top, traces.len())?;
     watch.crowd_most = crowd_most;
     let asked_crowd = effort.crowd;
     let effort = Effort {

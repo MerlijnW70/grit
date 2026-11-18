@@ -8,7 +8,7 @@ use crate::layout::{BRUSH, GRAND, PARAMS, STATE};
 use crate::machine::Machine;
 use crate::marking::{
     BEST, BINDINGS, FEED, HELD, MARKED_INPUTS, SCORE, SEED, TRIAL, VALUES, WANTED, chosen,
-    marked_by, stepped, turned_on, words_of,
+    marked_by, stepped, stepped_rolled, turned_on, words_of,
 };
 use crate::netlist::{Chip, Exam, Gate, INPUTS, Netlist, OUTPUTS, SOURCES, drawn, turned};
 use crate::resident::{Groups, Resident};
@@ -582,6 +582,14 @@ pub trait Halt {
     fn crowd_most(&self) -> u32 {
         u32::MAX
     }
+
+    fn rolled(&self) -> bool {
+        false
+    }
+
+    fn kernel(&mut self, _: usize) {}
+
+    fn waited(&mut self, _: std::time::Duration) {}
 }
 
 pub struct Never;
@@ -1002,7 +1010,12 @@ fn machined_within(
     let (feed, want) = laid(held, traces, wide);
 
     let turn = turned_on(width, shape)?;
-    let mark = stepped(width, held, wide)?;
+    let mark = if halt.rolled() {
+        stepped_rolled(width, held, wide)?
+    } else {
+        stepped(width, held, wide)?
+    };
+    halt.kernel(mark.len());
     let pick = chosen(width, shape, SIDE, many)?;
     let modules: Vec<&[u32]> = vec![&turn, &mark, &pick];
     let sizes = [
@@ -1016,6 +1029,7 @@ fn machined_within(
         feed.len().max(1),
     ];
     let mut resident = host.resident(&sizes, &modules)?;
+    halt.waited(resident.waited());
     let (crowd, seeds) = opening(shape, effort.seed, restart, many);
     resident.write(HELD as usize, &crowd)?;
     for binding in [TRIAL, VALUES, SCORE, BEST] {

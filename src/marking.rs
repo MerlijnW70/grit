@@ -528,6 +528,212 @@ fn gated_at<const LANES: u32>(
     Ok(())
 }
 
+struct Decoded {
+    left: simdr::module::Id,
+    right: simdr::module::Id,
+    kinds: Vec<simdr::module::Id>,
+}
+
+fn decoded<const LANES: u32>(
+    kernel: &mut Kernel<U32>,
+    uint: simdr::module::Id,
+    mine: simdr::module::Id,
+    ours: simdr::module::Id,
+    at: u32,
+    wide: u32,
+) -> Result<Decoded, LaneError> {
+    let step = kernel.module().constant_u32(at)?;
+    let place = kernel.module().i_add(uint, ours, step)?;
+    let packed = kernel.load_at(TRIAL, place)?;
+    let mut lanes = kernel.lanes()?;
+    let word = lanes.splat_id::<U32, LANES>(packed)?;
+    let row = lanes.splat_id::<U32, LANES>(mine)?;
+    let by = lanes.splat_bits::<U32, LANES>(KIND_BITS)?;
+    let far = lanes.splat_bits::<U32, LANES>(KIND_BITS + SOURCE_BITS)?;
+    let mask = lanes.splat_bits::<U32, LANES>((1 << SOURCE_BITS) - 1)?;
+    let spanning = lanes.splat_bits::<U32, LANES>(wide)?;
+    let shifted = lanes.shift_right_logical(word, by)?;
+    let left = lanes.and(shifted, mask)?;
+    let left = lanes.mul(left, spanning)?;
+    let left = lanes.add(row, left)?;
+    let shifted = lanes.shift_right_logical(word, far)?;
+    let right = lanes.and(shifted, mask)?;
+    let right = lanes.mul(right, spanning)?;
+    let right = lanes.add(row, right)?;
+    let mut kinds = Vec::with_capacity(4);
+    for bit in 0..4_u32 {
+        let by = lanes.splat_bits::<U32, LANES>(bit)?;
+        let one = lanes.splat_bits::<U32, LANES>(1)?;
+        let none = lanes.splat_bits::<U32, LANES>(0)?;
+        let all = lanes.splat_bits::<U32, LANES>(u32::MAX)?;
+        let shifted = lanes.shift_right_logical(word, by)?;
+        let set = lanes.and(shifted, one)?;
+        let live = lanes.equal(set, one)?;
+        kinds.push(lanes.select(live, all, none)?.id());
+    }
+    Ok(Decoded {
+        left: left.id(),
+        right: right.id(),
+        kinds,
+    })
+}
+
+fn placed(
+    kernel: &mut Kernel<U32>,
+    uint: simdr::module::Id,
+    base: simdr::module::Id,
+    offset: u32,
+    word: simdr::module::Id,
+) -> Result<simdr::module::Id, LaneError> {
+    let step = kernel.module().constant_u32(offset)?;
+    let place = kernel.module().i_add(uint, base, step)?;
+    Ok(kernel.module().i_add(uint, place, word)?)
+}
+
+pub fn stepped_rolled(
+    subgroup: u32,
+    held: Machine,
+    wide: u32,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    Ok(match subgroup {
+        4 => stepping_rolled::<4>(subgroup, held, wide)?,
+        8 => stepping_rolled::<8>(subgroup, held, wide)?,
+        16 => stepping_rolled::<16>(subgroup, held, wide)?,
+        32 => stepping_rolled::<32>(subgroup, held, wide)?,
+        64 => stepping_rolled::<64>(subgroup, held, wide)?,
+        other => {
+            return Err(Box::new(LaneError::NoMapping {
+                lanes: other,
+                width: subgroup,
+            }));
+        }
+    })
+}
+
+fn each_word<F>(kernel: &mut Kernel<U32>, wide: u32, body: F) -> Result<(), LaneError>
+where
+    F: FnOnce(&mut Kernel<U32>, simdr::module::Id) -> Result<(), LaneError>,
+{
+    let uint = kernel.index_type();
+    let blank = kernel.module().constant_u32(0)?;
+    kernel.repeat_rolled_many(wide, uint, &[blank], |kernel, carried, word| {
+        body(kernel, word)?;
+        Ok(carried.to_vec())
+    })?;
+    Ok(())
+}
+
+pub fn stepping_rolled<const LANES: u32>(
+    subgroup: u32,
+    held: Machine,
+    wide: u32,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let shape = held.shape()?;
+    let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, BINDINGS))?;
+    let uint = kernel.index_type();
+    let group = kernel.workgroup_index();
+    let lane = kernel.local_index();
+    let width = kernel.module().constant_u32(subgroup)?;
+    let base = kernel.module().i_mul(uint, group, width)?;
+    let who = kernel.module().i_add(uint, base, lane)?;
+
+    let sources = kernel.module().constant_u32(shape.sources() * wide)?;
+    let mine = kernel.module().i_mul(uint, who, sources)?;
+    let count = kernel.module().constant_u32(shape.gates)?;
+    let ours = kernel.module().i_mul(uint, who, count)?;
+
+    let blank = kernel.module().constant_u32(0)?;
+    for bit in 0..held.state {
+        each_word(&mut kernel, wide, |kernel, word| {
+            let place = placed(kernel, uint, mine, bit * wide, word)?;
+            kernel.store_at(VALUES, place, blank)
+        })?;
+    }
+
+    let mut total = blank;
+    for tick in 0..held.steps {
+        for input in 0..held.inputs {
+            each_word(&mut kernel, wide, |kernel, word| {
+                let asked = kernel
+                    .module()
+                    .constant_u32((tick * held.inputs + input) * wide)?;
+                let asked = kernel.module().i_add(uint, asked, word)?;
+                let given = kernel.load_at(FEED, asked)?;
+                let place = placed(kernel, uint, mine, (held.state + input) * wide, word)?;
+                kernel.store_at(VALUES, place, given)
+            })?;
+        }
+
+        for at in 0..shape.gates {
+            let gate = decoded::<LANES>(&mut kernel, uint, mine, ours, at, wide)?;
+            each_word(&mut kernel, wide, |kernel, word| {
+                let here = kernel.module().i_add(uint, gate.left, word)?;
+                let there = kernel.module().i_add(uint, gate.right, word)?;
+                let low = kernel.load_at(VALUES, here)?;
+                let high = kernel.load_at(VALUES, there)?;
+                let answered = {
+                    let mut lanes = kernel.lanes()?;
+                    let low = lanes.splat_id::<U32, LANES>(low)?;
+                    let high = lanes.splat_id::<U32, LANES>(high)?;
+                    let not_low = lanes.not(low)?;
+                    let not_high = lanes.not(high)?;
+                    let mut sum = lanes.splat_bits::<U32, LANES>(0)?;
+                    for (bit, kind) in gate.kinds.iter().enumerate() {
+                        let kind = lanes.splat_id::<U32, LANES>(*kind)?;
+                        let one = if bit & 1 == 0 { not_low } else { low };
+                        let other = if bit & 2 == 0 { not_high } else { high };
+                        let both = lanes.and(one, other)?;
+                        let part = lanes.and(kind, both)?;
+                        sum = lanes.or(sum, part)?;
+                    }
+                    sum.id()
+                };
+                let place = placed(kernel, uint, mine, (shape.inputs + at) * wide, word)?;
+                kernel.store_at(VALUES, place, answered)
+            })?;
+        }
+
+        for output in 0..held.outputs {
+            let from = shape.inputs + shape.gates - held.outputs + output;
+            let summed =
+                kernel.repeat_rolled_many(wide, uint, &[total], |kernel, carried, word| {
+                    let before = carried.first().copied().unwrap_or(blank);
+                    let place = placed(kernel, uint, mine, from * wide, word)?;
+                    let got = kernel.load_at(VALUES, place)?;
+                    let asked = kernel
+                        .module()
+                        .constant_u32((tick * held.outputs + output) * wide)?;
+                    let asked = kernel.module().i_add(uint, asked, word)?;
+                    let wanted = kernel.load_at(WANTED, asked)?;
+                    let mut lanes = kernel.lanes()?;
+                    let got = lanes.splat_id::<U32, LANES>(got)?;
+                    let wanted = lanes.splat_id::<U32, LANES>(wanted)?;
+                    let apart = lanes.xor(got, wanted)?;
+                    let same = lanes.not(apart)?;
+                    let marks = counted::<LANES>(&mut lanes, same)?;
+                    let before = lanes.splat_id::<U32, LANES>(before)?;
+                    Ok(vec![lanes.add(before, marks)?.id()])
+                })?;
+            total = summed.first().copied().unwrap_or(total);
+        }
+
+        for bit in 0..held.state {
+            let from = shape.inputs + shape.gates - held.outputs - held.state + bit;
+            each_word(&mut kernel, wide, |kernel, word| {
+                let place = placed(kernel, uint, mine, from * wide, word)?;
+                let value = kernel.load_at(VALUES, place)?;
+                let place = placed(kernel, uint, mine, bit * wide, word)?;
+                kernel.store_at(VALUES, place, value)
+            })?;
+        }
+    }
+
+    if held.steps > 0 && held.outputs > 0 {
+        kernel.store_at(SCORE, who, total)?;
+    }
+    Ok(kernel.finish()?)
+}
+
 pub fn stepped(
     subgroup: u32,
     held: Machine,
