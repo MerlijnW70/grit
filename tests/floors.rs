@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use common::device;
 
 use grit::Host;
-use grit::serve3::budget::{RECENT, Work};
+use grit::serve3::budget::{Meter, RECENT, Spent, Work};
 use grit::serve3::journal::{Entry, Keep, Ledger, Made};
 use grit::serve3::{Options, Server};
 use grit::wire::{Json, written};
@@ -965,6 +965,17 @@ fn e2_a_fork_whose_copies_the_device_itself_holds_is_refused_up_front() {
     refused_without_running(&got, took, budget, "e2 fork copies");
 }
 
+fn shown_as_waiting(spent: Spent, budget: Duration, label: &str) {
+    assert!(
+        spent.wall > budget,
+        "setup: {label} held {spent:?}, budget {budget:?}"
+    );
+    assert!(
+        spent.own > budget,
+        "setup: {label} held {spent:?}, budget {budget:?}: no core it may run on was idle while it waited, so nothing shows the wait was not for a cpu"
+    );
+}
+
 struct Disk;
 
 impl Disk {
@@ -1011,10 +1022,11 @@ fn e2_a_save_whose_sync_the_disk_itself_holds_is_refused_up_front() {
     let slowed = Disk::slowed(budget * 2);
     for round in 0..RECENT {
         name += 1;
-        let (got, took) = timed(|| save(&mut server, world, name, None));
-        answered(&got);
-        eprintln!("e2 save sync: disk held round {round} took {took:?}");
-        assert!(took > budget, "setup: took {took:?}, budget {budget:?}");
+        let meter = Meter::start();
+        answered(&save(&mut server, world, name, None));
+        let spent = meter.spent();
+        eprintln!("e2 save sync: disk held round {round}: {spent:?}");
+        shown_as_waiting(spent, budget, "e2 save sync");
     }
     drop(slowed);
     name += 1;
@@ -1052,10 +1064,12 @@ fn e2_a_build_whose_allocations_the_driver_holds_is_refused_up_front() {
     let budget = short_of(fits);
     let slowed = Allocations::slowed(budget * 2);
     for round in 0..RECENT {
-        let (made, took) = timed(|| answered(&create(&mut server, None)));
+        let meter = Meter::start();
+        let made = answered(&create(&mut server, None));
+        let spent = meter.spent();
         close(&mut server, int_at(&made, "world"));
-        eprintln!("e2 build allocations: driver held round {round} took {took:?}");
-        assert!(took > budget, "setup: took {took:?}, budget {budget:?}");
+        eprintln!("e2 build allocations: driver held round {round}: {spent:?}");
+        shown_as_waiting(spent, budget, "e2 build allocations");
     }
     drop(slowed);
     let (got, took) = timed(|| create(&mut server, Some(budget)));
