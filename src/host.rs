@@ -416,6 +416,10 @@ impl From<simdr::lanes::LaneError> for Error {
     }
 }
 
+pub(crate) struct Turn<'host> {
+    _held: std::sync::MutexGuard<'host, ()>,
+}
+
 pub struct Host {
     entry: ash::Entry,
     instance: ash::Instance,
@@ -819,14 +823,45 @@ impl Host {
     ///
     /// A poisoned lock is taken anyway: it guards an order, not a value, and a
     /// panic in one thread is no reason for every later submission to refuse.
-    pub(crate) fn ordered(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.ordered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub(crate) fn ordered(&self) -> Turn<'_> {
+        Turn {
+            _held: self
+                .ordered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
     }
 
-    pub(crate) const fn queue(&self) -> vk::Queue {
-        self.queue
+    pub(crate) unsafe fn submit(
+        &self,
+        _turn: &Turn<'_>,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        unsafe { self.device.queue_submit(self.queue, submits, fence) }
+    }
+
+    pub(crate) unsafe fn bind_sparse(
+        &self,
+        _turn: &Turn<'_>,
+        binds: &[vk::BindSparseInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        unsafe { self.device.queue_bind_sparse(self.queue, binds, fence) }
+    }
+
+    #[cfg(feature = "window")]
+    pub(crate) unsafe fn present(
+        &self,
+        _turn: &Turn<'_>,
+        chains: &ash::khr::swapchain::Device,
+        shown: &vk::PresentInfoKHR<'_>,
+    ) -> Result<bool, vk::Result> {
+        unsafe { chains.queue_present(self.queue, shown) }
+    }
+
+    pub(crate) fn wait(&self, fences: &[vk::Fence], patience: u64) -> Result<(), vk::Result> {
+        unsafe { self.device.wait_for_fences(fences, true, patience) }
     }
 
     pub(crate) const fn family(&self) -> u32 {

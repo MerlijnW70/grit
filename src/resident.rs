@@ -1197,7 +1197,7 @@ impl Resident<'_> {
 
     fn await_fence(&self, fence: vk::Fence) -> Result<(), Error> {
         let patience = u64::try_from(self.patience.as_nanos()).unwrap_or(u64::MAX);
-        let waited = unsafe { self.host.device().wait_for_fences(&[fence], true, patience) };
+        let waited = self.host.wait(&[fence], patience);
         match waited {
             Ok(()) => Ok(()),
             Err(vk::Result::TIMEOUT) => {
@@ -1231,8 +1231,7 @@ impl Resident<'_> {
         }
         let bound = self.patience.max(Self::PATIENCE);
         let patience = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX);
-        let waited = unsafe { self.host.device().wait_for_fences(&pending, true, patience) };
-        waited.is_ok()
+        self.host.wait(&pending, patience).is_ok()
     }
 
     #[must_use]
@@ -1533,7 +1532,7 @@ impl Resident<'_> {
                 info.push_next(&mut timeline)
             }];
             let ordered = self.host.ordered();
-            let held = device.queue_bind_sparse(self.host.queue(), &info, fence);
+            let held = self.host.bind_sparse(&ordered, &info, fence);
             drop(ordered);
             if held.is_err() {
                 device.destroy_fence(fence, None);
@@ -1604,7 +1603,7 @@ impl Resident<'_> {
             }];
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let ordered = self.host.ordered();
-            let sent = device.queue_bind_sparse(self.host.queue(), &info, fence);
+            let sent = self.host.bind_sparse(&ordered, &info, fence);
             drop(ordered);
             if sent.is_err() {
                 device.destroy_fence(fence, None);
@@ -2163,7 +2162,7 @@ impl Resident<'_> {
             let ordered = self.host.ordered();
             unsafe {
                 device.reset_fences(&[facing.fence])?;
-                device.queue_submit(self.host.queue(), &submit, facing.fence)?;
+                self.host.submit(&ordered, &submit, facing.fence)?;
             }
             drop(ordered);
             self.reused += 1;
@@ -2335,7 +2334,7 @@ impl Resident<'_> {
 
             let ordered = self.host.ordered();
             device.reset_fences(&[facing.fence])?;
-            device.queue_submit(self.host.queue(), &submit, facing.fence)?;
+            self.host.submit(&ordered, &submit, facing.fence)?;
             drop(ordered);
         }
 
@@ -2381,7 +2380,7 @@ impl Resident<'_> {
             }];
             let ordered = self.host.ordered();
             device.reset_fences(&[self.fence])?;
-            device.queue_submit(self.host.queue(), &submit, self.fence)?;
+            self.host.submit(&ordered, &submit, self.fence)?;
             self.sending.store(true, Ordering::SeqCst);
             drop(ordered);
         }

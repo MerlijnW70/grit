@@ -268,7 +268,6 @@ impl<'h> Presenter<'h> {
     /// Waits until no work this presenter sent is left on the device. Call
     /// it before the resident it presents from is dropped.
     pub fn settle(&mut self) -> Result<(), Refused> {
-        let device = self.host.device();
         let fences: Vec<vk::Fence> = self
             .flights
             .iter()
@@ -276,7 +275,7 @@ impl<'h> Presenter<'h> {
             .map(|flight| flight.fence)
             .collect();
         if !fences.is_empty() {
-            unsafe { device.wait_for_fences(&fences, true, PATIENCE) }?;
+            self.host.wait(&fences, PATIENCE)?;
         }
         Ok(())
     }
@@ -293,7 +292,7 @@ impl<'h> Presenter<'h> {
             return Err(Refused::NoPresent);
         };
         let (command, fence, acquired) = (flight.command, flight.fence, flight.acquired);
-        unsafe { device.wait_for_fences(&[fence], true, PATIENCE) }?;
+        self.host.wait(&[fence], PATIENCE)?;
         let taken = unsafe {
             self.chains
                 .acquire_next_image(self.chain, PATIENCE, acquired, vk::Fence::null())
@@ -344,9 +343,9 @@ impl<'h> Presenter<'h> {
             .swapchains(&chains)
             .image_indices(&indices);
         let presented = {
-            let _turn = self.host.ordered();
-            unsafe { device.queue_submit(self.host.queue(), &submit, fence) }?;
-            unsafe { self.chains.queue_present(self.host.queue(), &shown) }
+            let turn = self.host.ordered();
+            unsafe { self.host.submit(&turn, &submit, fence) }?;
+            unsafe { self.host.present(&turn, &self.chains, &shown) }
         };
         if let Some(flight) = self.flights.get_mut(at) {
             flight.used = true;
