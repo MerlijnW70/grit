@@ -633,6 +633,33 @@ mod served {
         call(server, "grit_world_create", arguments)
     }
 
+    fn two_planes(server: &mut Server<'_>) -> i64 {
+        let made = call(
+            server,
+            "grit_law_from_chip",
+            "{\"inputs\":1,\"outputs\":1,\"gates\":[{\"kind\":10,\"left\":0,\"right\":0}],\"bind_inputs\":[{\"plane\":0,\"bit\":0}],\"bind_outputs\":[{\"plane\":1,\"bit\":31}],\"channels\":2}",
+        );
+        let law = made.get("law").and_then(Json::text).unwrap().to_owned();
+        int_at(
+            &create(
+                server,
+                &format!(
+                    "{{\"wide\":16,\"deep\":16,\"tall\":16,\"law\":{},\"budget_ms\":600000}}",
+                    written(&Json::Text(law))
+                ),
+            ),
+            "world",
+        )
+    }
+
+    fn on_plane(world: i64, count: u32, side: u32, seed: u32, plane: u32) -> String {
+        cells(world, count, side, seed).replacen(
+            "\"cells\"",
+            &format!("\"plane\":{plane},\"cells\""),
+            1,
+        )
+    }
+
     fn dense(server: &mut Server<'_>, side: u32) -> i64 {
         int_at(
             &create(
@@ -876,6 +903,12 @@ mod served {
             "world",
         );
         step(&mut server, fork, 2);
+        let planes = two_planes(&mut server);
+        call(
+            &mut server,
+            "grit_world_write",
+            &on_plane(planes, 40, 16, 8, 1),
+        );
         let (bricked, _) = sparse(&mut server);
         let written_to = call(&mut server, "grit_world_write", &cells(bricked, 20, 32, 3));
         let first = held_bricks(&written_to);
@@ -891,7 +924,8 @@ mod served {
         step(&mut server, snapped, 5);
         call(&mut server, "grit_world_write", &cells(snapped, 2, 8, 5));
         step(&mut server, snapped, 6);
-        let numbers = [law_world, fork, bricked, snapped].map(|one| u32::try_from(one).unwrap());
+        let numbers =
+            [law_world, fork, bricked, snapped, planes].map(|one| u32::try_from(one).unwrap());
         let live: Vec<Ledger> = numbers
             .iter()
             .map(|number| server.ledger(*number).unwrap().clone())
@@ -919,6 +953,18 @@ mod served {
                 assert_eq!(ledger.costs(), pure_costs(ledger), "world {number}");
             }
         }
+        let plane_entries = &live[4].entries;
+        assert_eq!(plane_entries.len(), 1, "{plane_entries:?}");
+        let Entry::WritePlane(1, plane_cells) = &plane_entries[0] else {
+            panic!("a plane 1 write is journaled as one: {plane_entries:?}");
+        };
+        assert_eq!(plane_cells.len(), 40);
+        assert_eq!(live[4].costs(), [cost(Priced::Write, 40, 2)]);
+        assert_eq!(
+            priced(live[4].made(), &plane_entries[0], None),
+            priced(live[4].made(), &Entry::Write(plane_cells.clone()), None),
+            "a plane write is priced as a write of the same cells"
+        );
         let sparse_costs = live[2].costs().to_vec();
         let sparse_entries = &live[2].entries;
         assert_eq!(
