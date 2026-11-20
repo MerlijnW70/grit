@@ -4,6 +4,7 @@ use crate::branch::format;
 use crate::wire::{Json, counted, map, text};
 
 use super::budget::{Short, Work, counted64};
+use super::cost::{Cost, Priced};
 use super::errors::Code;
 use super::journal::{self, Keep, Ledger, Made, Snap, hex, regular, tail_sum};
 use super::schema::{property, whole, with};
@@ -145,6 +146,34 @@ fn file_refusal(why: &crate::branch::Refused, name: &str) -> Failed {
     Box::new(refusal)
 }
 
+const fn copied(kind: Priced, bytes: u64) -> Cost {
+    Cost {
+        kind,
+        units: bytes,
+        submits: 0,
+    }
+}
+
+#[must_use]
+pub const fn save_cost(bytes: u64) -> Cost {
+    copied(Priced::Save, bytes)
+}
+
+#[must_use]
+pub const fn file_cost(bytes: u64) -> Cost {
+    copied(Priced::File, bytes)
+}
+
+#[must_use]
+pub const fn fork_cost(bytes: u64) -> Cost {
+    copied(Priced::Fork, bytes)
+}
+
+#[must_use]
+pub const fn restore_cost(bytes: u64) -> Cost {
+    copied(Priced::Restore, bytes)
+}
+
 fn saved(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
     let name = words_of(held, "name")?.to_owned();
@@ -182,6 +211,7 @@ fn saved(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .book
         .rates
         .measure(Work::Save, size, server.since(began));
+    server.priced(save_cost(size));
     let sum = tail_sum(&path).map_err(|why| super::io_refusal(&why))?;
     Ok(map(vec![
         ("world", counted(number)),
@@ -257,6 +287,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         .book
         .rates
         .measure(Work::FileOpen, length, server.since(began));
+    server.priced(file_cost(length));
     let (sum, _) = keep
         .settle(&pending)
         .map_err(|why| super::io_refusal(&why))?;
@@ -271,6 +302,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         server.slowly(work);
         let world = super::law::opened(host, &image)?;
         server.book.rates.measure(work, bytes, server.since(began));
+        server.priced(super::tools::build_cost(bytes));
         let rule = super::law::listed(host, &world)?;
         if let Some(lawful) = rule.lawful()
             && world.pool().is_some()
@@ -528,6 +560,7 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .book
         .rates
         .measure(work, source.bytes, server.since(began));
+    server.priced(fork_cost(source.bytes));
     let rule = super::law::listed(host, &fork)?;
     let id = server.number()?;
     let mut live = Live { world: fork, rule };
@@ -596,6 +629,7 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server.live.insert(from, source);
     done?;
     server.book.rates.measure(work, size, server.since(began));
+    server.priced(restore_cost(size));
     let taken = server
         .book
         .held

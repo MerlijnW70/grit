@@ -270,6 +270,7 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             .memory
             .admits(bytes, "the copy that checks the walk")?;
     }
+    let cells = super::tools::world_frame_cells(&server.world(held)?.world);
     let owed = server.owed(number)?;
     let start = if home {
         Some(server.world(held)?.world.image()?)
@@ -365,7 +366,14 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         checked(server, number, start, done)?;
     }
     let journal = if done > 0 {
-        server.journaled(number, Entry::Back(done), spent).or(owed)
+        server
+            .journaled(
+                number,
+                Entry::Back(done),
+                spent,
+                super::tools::frames_cost(cells, done),
+            )
+            .or(owed)
     } else {
         owed
     };

@@ -55,6 +55,7 @@ impl<'host> World<'host> {
             words_read: 0,
             back: self.back.clone(),
             backward: self.backward,
+            seen: self.seen,
         })
     }
 
@@ -75,6 +76,7 @@ impl<'host> World<'host> {
             return unlike("bindings");
         }
         let reach = from.reach()?;
+        self.seen = None;
         copied(&mut from.live, &mut self.live, &self.sizes, reach)?;
         self.params.clone_from(&from.params);
         self.frame = from.frame;

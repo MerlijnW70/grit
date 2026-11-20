@@ -287,6 +287,15 @@ fn params_shown() -> Json {
     )
 }
 
+#[must_use]
+pub fn params_cost(count: usize) -> super::cost::Cost {
+    super::cost::Cost {
+        kind: super::cost::Priced::Params,
+        units: u64::try_from(count).unwrap_or(u64::MAX).saturating_mul(4),
+        submits: 0,
+    }
+}
+
 fn params_written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
     let params = ints(
@@ -327,7 +336,12 @@ fn params_written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> 
     server.world(held)?.world.set_params(&params, stepping)?;
     let spent = server.since(began);
     let journal = server
-        .journaled(number, Entry::Params(params.clone()), spent)
+        .journaled(
+            number,
+            Entry::Params(params.clone()),
+            spent,
+            params_cost(params.len()),
+        )
         .or(owed);
     let snapshot = server.settle(number);
     let live = server.world(held)?;

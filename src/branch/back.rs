@@ -131,6 +131,7 @@ impl World<'_> {
             }));
         };
         let groups: Vec<Vec<Groups>> = back.clone();
+        self.seen = None;
         self.turned(true)?;
         let groups: Vec<&[Groups]> = groups.iter().map(Vec::as_slice).collect();
         let mut done = 0_u32;

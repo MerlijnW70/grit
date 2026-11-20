@@ -8,6 +8,7 @@ use crate::wire::{Json, counted, map, text};
 use super::budget::{
     self, BATCH_MOST, BUDGET_MOST_MS, BUDGET_MS, Pace, SUBMIT_MOST_MS, Stop, Work, world_cost,
 };
+use super::cost::{Cost, Priced};
 use super::errors::{self, Code, Refusal};
 use super::journal::{self, Entry, Ledger, Made};
 use super::schema::{choice, object, property, whole, with, word};
@@ -647,6 +648,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .book
         .rates
         .measure(Work::build(sparse), bytes, server.since(began));
+    server.priced(build_cost(bytes));
     let id = server.number()?;
     let pace = first_pace(&world);
     let law = rule
@@ -750,7 +752,12 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let journal = if done > 0 {
         points.truncate(done);
         server
-            .journaled(number, Entry::Write(points), spent)
+            .journaled(
+                number,
+                Entry::Write(points),
+                spent,
+                write_cost(done, sparse),
+            )
             .or(owed)
     } else {
         owed
@@ -794,6 +801,57 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
 
 const AIM_WRITE: Duration = Duration::from_millis(budget::SUBMIT_MOST_MS / 2);
 
+#[must_use]
+pub const fn build_cost(bytes: u64) -> Cost {
+    Cost {
+        kind: Priced::Build,
+        units: bytes,
+        submits: 1,
+    }
+}
+
+#[must_use]
+pub fn write_cost(cells: usize, sparse: bool) -> Cost {
+    let chunks = if sparse {
+        cells.min(1)
+    } else {
+        cells.div_ceil(journal::WRITE_CHUNK)
+    };
+    Cost {
+        kind: Priced::Write,
+        units: u64::try_from(cells).unwrap_or(u64::MAX),
+        submits: u32::try_from(chunks).unwrap_or(u32::MAX),
+    }
+}
+
+#[must_use]
+pub fn frame_cells(size: [u32; 3], bricks: Option<(u32, usize)>) -> u64 {
+    match bricks {
+        Some((held, per)) => u64::from(held).saturating_mul(u64::try_from(per).unwrap_or(u64::MAX)),
+        None => size
+            .iter()
+            .fold(1_u64, |all, side| all.saturating_mul(u64::from(*side))),
+    }
+}
+
+#[must_use]
+pub fn world_frame_cells(world: &World<'_>) -> u64 {
+    let bricks = world
+        .pool()
+        .zip(world.bricks_seen())
+        .map(|(pool, held)| (held, pool.cells()));
+    frame_cells(world.size(), bricks)
+}
+
+#[must_use]
+pub const fn frames_cost(cells: u64, frames: u32) -> Cost {
+    Cost {
+        kind: Priced::Frame,
+        units: cells.saturating_mul(frames as u64),
+        submits: frames.div_ceil(BATCH_MOST),
+    }
+}
+
 #[cfg(feature = "faults")]
 pub(super) fn wedged_after(server: &Server<'_>, batch: u32) -> bool {
     let armed = server
@@ -823,7 +881,7 @@ pub(super) const fn wedged_after(_: &Server<'_>, _: u32) -> bool {
 fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
     let frames = int(held, "frames")?;
-    server.world(held)?;
+    let cells = world_frame_cells(&server.world(held)?.world);
     let owed = server.owed(number)?;
     let mut pace = server
         .book
@@ -891,7 +949,12 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
                 continue;
             }
             journal = server
-                .journaled(number, Entry::Step(pending), spent)
+                .journaled(
+                    number,
+                    Entry::Step(pending),
+                    spent,
+                    frames_cost(cells, pending),
+                )
                 .or(journal);
             pending = 0;
             spent = Duration::ZERO;
@@ -919,7 +982,12 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     if pending > 0 {
         journal = server
-            .journaled(number, Entry::Step(pending), spent)
+            .journaled(
+                number,
+                Entry::Step(pending),
+                spent,
+                frames_cost(cells, pending),
+            )
             .or(journal);
     }
     let frame = server

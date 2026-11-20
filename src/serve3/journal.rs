@@ -8,6 +8,7 @@ use crate::branch::format::{Image, Sha256, State, UNIFORM, brick_cells};
 use crate::branch::{self, World};
 use crate::host::Host;
 
+use super::cost::{Cost, Priced};
 use super::errors::{Code, Refusal, shown};
 
 pub const NAME_MOST: usize = 64;
@@ -53,6 +54,14 @@ const LAW: u32 = 5;
 const PARAMS: u32 = 6;
 
 const BACK: u32 = 7;
+
+const FORMAT: u32 = 8;
+
+pub const FORMAT_VERSION: u32 = 2;
+
+const PRICED: u32 = 1 << 8;
+
+const PRICE_WORDS: usize = 3;
 
 const RECORD_WORDS_MOST: usize = 1 << 24;
 
@@ -135,6 +144,7 @@ pub struct Ledger {
     pub entries: Vec<Entry>,
     pub frame: u32,
     recorded: Vec<Duration>,
+    costs: Vec<Cost>,
     pub unreadable: Option<String>,
     bytes: usize,
     replay: Duration,
@@ -150,6 +160,7 @@ impl Ledger {
             entries: Vec::new(),
             frame: 0,
             recorded: Vec::new(),
+            costs: Vec::new(),
             unreadable: None,
             bytes: 0,
             replay: Duration::ZERO,
@@ -165,6 +176,7 @@ impl Ledger {
             law: None,
             entries: Vec::new(),
             recorded: Vec::new(),
+            costs: Vec::new(),
             unreadable: None,
             bytes: 0,
             replay: Duration::ZERO,
@@ -208,6 +220,11 @@ impl Ledger {
     }
 
     pub fn push(&mut self, entry: Entry, spent: Duration) {
+        let cost = priced(self.made(), &entry, None);
+        self.push_priced(entry, spent, cost);
+    }
+
+    pub fn push_priced(&mut self, entry: Entry, spent: Duration, cost: Cost) {
         match entry {
             Entry::Step(frames) => self.frame = self.frame.wrapping_add(frames),
             Entry::Back(frames) => self.frame = self.frame.wrapping_sub(frames),
@@ -216,7 +233,26 @@ impl Ledger {
         self.bytes = self.bytes.saturating_add(entry.bytes());
         self.replay = self.replay.saturating_add(spent);
         self.recorded.push(spent);
+        self.costs.push(cost);
         self.entries.push(entry);
+    }
+
+    #[must_use]
+    pub fn costs(&self) -> &[Cost] {
+        &self.costs
+    }
+
+    #[must_use]
+    pub fn units(&self) -> u64 {
+        self.units_from(0)
+    }
+
+    #[must_use]
+    pub fn units_from(&self, from: usize) -> u64 {
+        self.costs
+            .iter()
+            .skip(from)
+            .fold(0_u64, |all, cost| all.saturating_add(cost.units))
     }
 
     #[must_use]
@@ -318,10 +354,11 @@ impl Ledger {
     pub fn rebase_at(&mut self, snap: Arc<Snap>, cost: Duration, from: usize) {
         let entries = self.entries.split_off(from.min(self.entries.len()));
         let recorded = self.recorded.split_off(from.min(self.recorded.len()));
+        let costs = self.costs.split_off(from.min(self.costs.len()));
         let mut ledger = Self::snapped(snap).with_law(self.law.take());
         ledger.snapping = cost;
-        for (entry, spent) in entries.into_iter().zip(recorded) {
-            ledger.push(entry, spent);
+        for ((entry, spent), priced) in entries.into_iter().zip(recorded).zip(costs) {
+            ledger.push_priced(entry, spent, priced);
         }
         *self = ledger;
     }
@@ -595,12 +632,18 @@ impl Keep {
     pub fn begin(&self, world: u32, ledger: &Ledger) -> io::Result<()> {
         let mut words = Vec::new();
         record(&mut words, base_record(&ledger.base));
+        record(&mut words, (FORMAT, vec![FORMAT_VERSION]));
         if let Some(law) = &ledger.law {
             record(&mut words, (LAW, text_words(law)));
         }
         for (at, entry) in ledger.entries.iter().enumerate() {
             let spent = ledger.recorded.get(at).copied().unwrap_or_default();
-            record(&mut words, entry_record(entry, spent));
+            let cost = ledger
+                .costs
+                .get(at)
+                .copied()
+                .unwrap_or_else(|| priced(ledger.made(), entry, None));
+            record(&mut words, priced_record(entry, spent, cost));
         }
         let path = self.journal(world);
         let temporary = self.kept.join(format!(".world-{world}.journal.tmp"));
@@ -613,8 +656,22 @@ impl Keep {
     }
 
     pub fn append(&self, world: u32, entry: &Entry, spent: Duration) -> io::Result<()> {
+        self.appended(world, entry_record(entry, spent))
+    }
+
+    pub fn append_priced(
+        &self,
+        world: u32,
+        entry: &Entry,
+        spent: Duration,
+        cost: Cost,
+    ) -> io::Result<()> {
+        self.appended(world, priced_record(entry, spent, cost))
+    }
+
+    fn appended(&self, world: u32, held: (u32, Vec<u32>)) -> io::Result<()> {
         let mut words = Vec::new();
-        record(&mut words, entry_record(entry, spent));
+        record(&mut words, held);
         let mut file = OpenOptions::new().append(true).open(self.journal(world))?;
         file.write_all(&bytes_of(&words))
     }
@@ -748,6 +805,19 @@ impl Keep {
         };
         let mut index = 0_usize;
         let mut ahead = records.at;
+        let mut version = 1_u32;
+        if let Some((FORMAT, payload)) = records.next() {
+            if payload != [FORMAT_VERSION] {
+                ledger.unreadable = Some(format!(
+                    "its journal is in format {}, and this server reads formats 1 and {FORMAT_VERSION}",
+                    payload.first().copied().unwrap_or_default()
+                ));
+                return Some(ledger);
+            }
+            version = FORMAT_VERSION;
+            ahead = records.at;
+        }
+        records.at = ahead;
         if let Some((LAW, payload)) = records.next() {
             ledger.law = Some(Arc::from(text_of(payload)?));
             index += 1;
@@ -756,14 +826,24 @@ impl Keep {
         records.at = ahead;
         while let Some((tag, payload)) = records.next() {
             index += 1;
-            let Some((entry, spent)) = entry_of(tag, payload) else {
+            let read = if tag & PRICED == 0 {
+                entry_of(tag, payload).map(|(entry, spent)| {
+                    let cost = priced(ledger.made(), &entry, None);
+                    (entry, spent, cost)
+                })
+            } else if version < FORMAT_VERSION {
+                None
+            } else {
+                priced_of(tag & !PRICED, payload)
+            };
+            let Some((entry, spent, cost)) = read else {
                 ledger.unreadable = Some(format!(
                     "record {index} of its journal has a good checksum and is not a record this server reads (tag {tag}, {} words)",
                     payload.len()
                 ));
                 break;
             };
-            ledger.push(entry, spent);
+            ledger.push_priced(entry, spent, cost);
         }
         Some(ledger)
     }
@@ -968,6 +1048,49 @@ fn entry_record(entry: &Entry, spent: Duration) -> (u32, Vec<u32>) {
             (PARAMS, words)
         }
     }
+}
+
+fn priced_record(entry: &Entry, spent: Duration, cost: Cost) -> (u32, Vec<u32>) {
+    let (tag, mut words) = entry_record(entry, spent);
+    let [low, high] = [cost.units, cost.units >> 32].map(|half| (half & 0xFFFF_FFFF) as u32);
+    words.extend_from_slice(&[low, high, cost.submits]);
+    (tag | PRICED, words)
+}
+
+fn priced_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration, Cost)> {
+    let (payload, price) = payload.split_at_checked(payload.len().checked_sub(PRICE_WORDS)?)?;
+    let [low, high, submits] = <[u32; PRICE_WORDS]>::try_from(price).ok()?;
+    let (entry, spent) = entry_of(tag, payload)?;
+    let kind = match entry {
+        Entry::Write(_) => Priced::Write,
+        Entry::Step(_) | Entry::Back(_) => Priced::Frame,
+        Entry::Params(_) => Priced::Params,
+    };
+    let cost = Cost {
+        kind,
+        units: u64::from(low) | (u64::from(high) << 32),
+        submits,
+    };
+    Some((entry, spent, cost))
+}
+
+#[must_use]
+pub fn priced(made: &Made, entry: &Entry, bricks: Option<(u32, usize)>) -> Cost {
+    match entry {
+        Entry::Write(cells) => super::tools::write_cost(cells.len(), made.sparse),
+        Entry::Step(frames) | Entry::Back(frames) => {
+            super::tools::frames_cost(super::tools::frame_cells(made.size, bricks), *frames)
+        }
+        Entry::Params(params) => super::law::params_cost(params.len()),
+    }
+}
+
+#[must_use]
+pub fn replay_cost(ledger: &Ledger) -> Cost {
+    ledger
+        .costs
+        .iter()
+        .fold(Cost::none(Priced::Replay), |all, cost| all.plus(*cost))
 }
 
 fn entry_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration)> {

@@ -34,6 +34,7 @@ pub mod ask;
 pub mod back;
 pub mod branch;
 pub mod budget;
+pub mod cost;
 pub mod errors;
 pub mod exec;
 pub mod gradient;
@@ -274,6 +275,7 @@ pub struct Book {
 
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
+    pub priced: cost::Tally,
     pub batches: Arc<std::sync::atomic::AtomicU64>,
     pub longest: Duration,
     pub longest_frames: u32,
@@ -554,6 +556,7 @@ impl Book {
             }
         };
         self.rates.measure(budget::Work::Save, writing.bytes, cost);
+        self.stats.priced.add(snapshot_cost(writing.bytes));
         if !current {
             self.release(Some(sum));
             return true;
@@ -909,6 +912,20 @@ impl<'host> Server<'host> {
         self.book.time.now()
     }
 
+    fn priced(&mut self, cost: cost::Cost) {
+        self.book.stats.priced.add(cost);
+    }
+
+    #[must_use]
+    pub fn tally(&self, kind: cost::Priced) -> cost::Cost {
+        self.book.stats.priced.of(kind)
+    }
+
+    #[must_use]
+    pub fn ledger(&self, number: u32) -> Option<&Ledger> {
+        self.book.held.get(&number).map(|held| &held.ledger)
+    }
+
     fn since(&self, earlier: Instant) -> Duration {
         self.book.time.since(earlier)
     }
@@ -1028,6 +1045,12 @@ impl<'host> Server<'host> {
         if built.is_ok() {
             rates.measure_journal(ledger.journal(), took);
             rates.measure_replay(timings.recorded, timings.steps);
+            let priced = &mut self.book.stats.priced;
+            priced.add(tools::build_cost(bytes));
+            if timings.file_bytes > 0 {
+                priced.add(branch::file_cost(timings.file_bytes));
+            }
+            priced.add(journal::replay_cost(ledger));
         }
         built
     }
@@ -1287,13 +1310,20 @@ impl<'host> Server<'host> {
         failed.map(|why| text(&format!("the journal could not be written: {why}")))
     }
 
-    fn journaled(&mut self, number: u32, entry: Entry, spent: Duration) -> Option<Json> {
+    fn journaled(
+        &mut self,
+        number: u32,
+        entry: Entry,
+        spent: Duration,
+        cost: cost::Cost,
+    ) -> Option<Json> {
         let keep = self.book.keep.clone();
         let failed = keep
             .as_ref()
-            .and_then(|keep| keep.append(number, &entry, spent).err());
+            .and_then(|keep| keep.append_priced(number, &entry, spent, cost).err());
+        self.priced(cost);
         let held = self.book.held.get_mut(&number)?;
-        held.ledger.push(entry, spent);
+        held.ledger.push_priced(entry, spent, cost);
         failed.map(|why| text(&format!("the journal could not be written: {why}")))
     }
 
@@ -1486,6 +1516,7 @@ impl<'host> Server<'host> {
         let cost = self.since(began);
         let size = self.book.held.get(&number).map_or(0, |held| held.bytes);
         self.book.rates.measure(self.snap_work(), size, cost);
+        self.priced(snapshot_cost(size));
         let epoch = self.book.bump();
         let held = self
             .book
@@ -2024,6 +2055,15 @@ fn paced(
         done += step;
     }
     Ok(())
+}
+
+#[must_use]
+pub const fn snapshot_cost(bytes: u64) -> cost::Cost {
+    cost::Cost {
+        kind: cost::Priced::Snapshot,
+        units: bytes,
+        submits: 0,
+    }
 }
 
 fn base_work(ledger: &Ledger) -> budget::Work {

@@ -456,6 +456,7 @@ pub struct World<'host> {
     words_read: u64,
     back: Option<Vec<Vec<Groups>>>,
     backward: bool,
+    seen: Option<u32>,
 }
 
 pub(crate) fn ruled(host: &Host, name: &str, params: &[u32]) -> Result<Box<dyn Listed>, Refused> {
@@ -598,6 +599,7 @@ impl<'host> World<'host> {
             words_read: 0,
             back,
             backward: false,
+            seen: None,
         })
     }
 
@@ -827,6 +829,7 @@ impl<'host> World<'host> {
             }
         };
         listed_if_sparse(self.pool.is_some(), stepping)?;
+        self.seen = None;
         if let Stepper::Law(_, held) = &mut self.rule {
             *held = stepping;
         }
@@ -887,6 +890,11 @@ impl<'host> World<'host> {
         self.pool
     }
 
+    #[must_use]
+    pub const fn bricks_seen(&self) -> Option<u32> {
+        self.seen
+    }
+
     pub fn write(&mut self, cells: &[([u32; 3], u32)]) -> Result<(), Failed> {
         self.write_plane(0, cells)
     }
@@ -909,6 +917,7 @@ impl<'host> World<'host> {
         {
             return Err(Box::new(Refused::Outside { at, size }));
         }
+        self.seen = None;
         match self.pool {
             Some(bricks) => bricks.put_plane_at(&mut self.live, plane as usize, cells)?,
             None => {
@@ -933,6 +942,7 @@ impl<'host> World<'host> {
     }
 
     pub fn step(&mut self, frames: u32) -> Result<(), Failed> {
+        self.seen = None;
         self.turned(false)?;
         let groups: Vec<&[Groups]> = self.stages.iter().map(Vec::as_slice).collect();
         let mut done = 0_u32;
@@ -1271,7 +1281,11 @@ impl<'host> World<'host> {
 
     pub fn pool_use(&mut self) -> Result<Option<bricks::PoolUse>, Failed> {
         match self.pool {
-            Some(bricks) => Ok(Some(bricks.pool_use(&mut self.live)?)),
+            Some(bricks) => {
+                let used = bricks.pool_use(&mut self.live)?;
+                self.seen = Some(used.held);
+                Ok(Some(used))
+            }
             None => Ok(None),
         }
     }
