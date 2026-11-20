@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::branch::format::{self, Image, State, UNIFORM};
 use crate::wire::{Json, counted, map, text};
@@ -305,10 +305,10 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             failure = Some(why);
             break;
         }
-        let began = Instant::now();
-        super::tools::faults::stall(step);
+        let began = server.now();
+        super::tools::faults::stall(server.time(), step);
         let ran = server.world(held)?.world.back(step);
-        let took = began.elapsed();
+        let took = server.since(began);
         if let Err(why) = ran {
             failure = Some(why);
             break;

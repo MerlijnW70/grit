@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use simdr::lanes::LaneError;
 
@@ -324,9 +323,9 @@ fn params_written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> 
         .as_ref()
         .map_or(Stepping::Listed, |(_, class)| stepping_of(class, sparse));
     let owed = server.owed(number)?;
-    let began = Instant::now();
+    let began = server.now();
     server.world(held)?.world.set_params(&params, stepping)?;
-    let spent = began.elapsed();
+    let spent = server.since(began);
     let journal = server
         .journaled(number, Entry::Params(params.clone()), spent)
         .or(owed);

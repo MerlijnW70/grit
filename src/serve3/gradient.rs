@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use crate::law::Law;
 use crate::law::adjoint::{self, Aim, Descender, Fault, Next, Reversible, Settled};
 use crate::law::dag::{FIRST_PARAM, Node};
@@ -836,8 +834,8 @@ fn walk(
     posed: &Posed,
     params: &[u32],
 ) -> Result<adjoint::Walked, Failed> {
-    let began = Instant::now();
-    super::tools::faults::stall(1);
+    let began = server.now();
+    super::tools::faults::stall(server.time(), 1);
     let walked = reversible.walk(
         posed.grid,
         &posed.start,
@@ -849,7 +847,7 @@ fn walk(
     server
         .book
         .rates
-        .measure(Work::Walk, posed.units, began.elapsed());
+        .measure(Work::Walk, posed.units, server.since(began));
     if faults::walked()
         && let Some(flag) = server.cancel.as_ref()
     {

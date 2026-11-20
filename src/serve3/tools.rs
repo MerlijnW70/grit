@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::branch::World;
 use crate::host::Host;
@@ -66,6 +66,7 @@ pub mod faults {
     use std::time::Duration;
 
     use super::{Code, Failed, Refusal};
+    use crate::clock::Time;
 
     thread_local! {
         static BATCH: Cell<Option<u32>> = const { Cell::new(None) };
@@ -94,25 +95,25 @@ pub mod faults {
         CELLS.set(by);
     }
 
-    pub(crate) fn cells(count: usize) {
+    pub(crate) fn cells(time: &dyn Time, count: usize) {
         let by = CELLS.get();
         if !by.is_zero() {
-            std::thread::sleep(by.saturating_mul(u32::try_from(count).unwrap_or(u32::MAX)));
+            time.sleep(by.saturating_mul(u32::try_from(count).unwrap_or(u32::MAX)));
         }
     }
 
-    pub(crate) fn stall(frames: u32) {
+    pub(crate) fn stall(time: &dyn Time, frames: u32) {
         let fixed = SUBMISSION.get();
         if !fixed.is_zero() {
-            std::thread::sleep(fixed);
+            time.sleep(fixed);
         }
         match STALL.get() {
             Some((0, by, every)) => {
                 if every {
-                    std::thread::sleep(by.saturating_mul(frames));
+                    time.sleep(by.saturating_mul(frames));
                 } else {
                     STALL.set(None);
-                    std::thread::sleep(by);
+                    time.sleep(by);
                 }
             }
             Some((nth, by, every)) => STALL.set(Some((nth - 1, by, every))),
@@ -154,9 +155,9 @@ pub(crate) mod faults {
         Ok(())
     }
 
-    pub(crate) const fn stall(_: u32) {}
+    pub(crate) fn stall(_: &dyn crate::clock::Time, _: u32) {}
 
-    pub(crate) const fn cells(_: usize) {}
+    pub(crate) fn cells(_: &dyn crate::clock::Time, _: usize) {}
 }
 
 pub(super) fn refused(code: Code, field: &str, message: String) -> Failed {
@@ -631,7 +632,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     made.size = [grid.wide, grid.deep, grid.tall];
     let bytes = admitted(server, host, &sizes, "the world")?;
     server.fits(Work::build(sparse), bytes, "building the world")?;
-    let began = Instant::now();
+    let began = server.now();
     server.slowly(Work::build(sparse));
     let world = match rule.lawful() {
         None => World::create(host, &made.branch())?,
@@ -645,7 +646,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server
         .book
         .rates
-        .measure(Work::build(sparse), bytes, began.elapsed());
+        .measure(Work::build(sparse), bytes, server.since(began));
     let id = server.number()?;
     let pace = first_pace(&world);
     let law = rule
@@ -730,10 +731,10 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             fits.clamp(1, total - done)
         };
         let piece = points.get(done..done + chunk).unwrap_or_default();
-        let began = Instant::now();
-        faults::cells(piece.len());
+        let began = server.now();
+        faults::cells(server.time(), piece.len());
         let ran = server.world(held)?.world.write(piece);
-        let took = began.elapsed();
+        let took = server.since(began);
         if let Err(why) = ran {
             failure = Some(why);
             break;
@@ -855,10 +856,10 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             failure = Some(why);
             break;
         }
-        let began = Instant::now();
-        faults::stall(step);
+        let began = server.now();
+        faults::stall(server.time(), step);
         let ran = server.world(held)?.world.step(step);
-        let took = began.elapsed();
+        let took = server.since(began);
         if let Err(why) = ran {
             failure = Some(why);
             break;

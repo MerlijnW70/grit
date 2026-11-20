@@ -13,6 +13,7 @@ use simdr::lanes::LaneError;
 
 use crate::branch::World;
 use crate::bricks::{Bricks, PoolUse};
+use crate::clock::Time;
 use crate::compact::Plan;
 use crate::host::Host;
 use crate::layout::{BINDINGS, Dimension};
@@ -266,6 +267,7 @@ pub struct Book {
     ignored: Vec<String>,
     epochs: u64,
     writing: Option<Writing>,
+    time: Arc<dyn Time>,
     #[cfg(feature = "faults")]
     faults: Arc<std::sync::Mutex<Faults>>,
 }
@@ -318,6 +320,15 @@ pub struct Started {
 
 impl Book {
     pub fn new(options: &Options) -> std::io::Result<Self> {
+        Self::kept(options, crate::clock::real())
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn timed(options: &Options, time: Arc<dyn Time>) -> std::io::Result<Self> {
+        Self::kept(options, time)
+    }
+
+    fn kept(options: &Options, time: Arc<dyn Time>) -> std::io::Result<Self> {
         let keep = options.dir.as_deref().map(Keep::locked).transpose()?;
         let (earlier, mut ignored) = keep.as_ref().map(Keep::scan).unwrap_or_default();
         let (kept_next, crafted) = keep.as_ref().map_or((None, None), Keep::next_checked);
@@ -380,6 +391,7 @@ impl Book {
             ignored,
             epochs: 0,
             writing: None,
+            time,
             #[cfg(feature = "faults")]
             faults: Arc::default(),
         })
@@ -387,6 +399,16 @@ impl Book {
 
     #[must_use]
     pub fn empty() -> Self {
+        Self::blank(crate::clock::real())
+    }
+
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub fn empty_timed(time: Arc<dyn Time>) -> Self {
+        Self::blank(time)
+    }
+
+    fn blank(time: Arc<dyn Time>) -> Self {
         Self {
             next: 1,
             held: BTreeMap::new(),
@@ -402,9 +424,15 @@ impl Book {
             ignored: Vec::new(),
             epochs: 0,
             writing: None,
+            time,
             #[cfg(feature = "faults")]
             faults: Arc::default(),
         }
+    }
+
+    #[must_use]
+    pub fn time(&self) -> Arc<dyn Time> {
+        Arc::clone(&self.time)
     }
 
     #[cfg(feature = "faults")]
@@ -435,7 +463,7 @@ impl Book {
     }
 
     fn snap_failed(&mut self, number: u32, message: String) {
-        let now = Instant::now();
+        let now = self.time.now();
         if let Some(held) = self.held.get_mut(&number) {
             let failures = held
                 .snap_failure
@@ -462,7 +490,7 @@ impl Book {
                         .get(&number)
                         .is_some_and(|held| held.epoch == writing.epoch)
             })
-            .map(|writing| (writing.from, writing.began.elapsed()))
+            .map(|writing| (writing.from, self.time.since(writing.began)))
     }
 
     fn writing_for(&self, number: u32) -> bool {
@@ -484,20 +512,20 @@ impl Book {
                 Ok(got) => got,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    (Err(WRITER_STOPPED.to_owned()), Instant::now())
+                    (Err(WRITER_STOPPED.to_owned()), self.time.now())
                 }
             },
             Wait::For(left) => match writing.done.recv_timeout(left) {
                 Ok(got) => got,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    (Err(WRITER_STOPPED.to_owned()), Instant::now())
+                    (Err(WRITER_STOPPED.to_owned()), self.time.now())
                 }
             },
             Wait::Landed => writing
                 .done
                 .recv()
-                .unwrap_or_else(|_| (Err(WRITER_STOPPED.to_owned()), Instant::now())),
+                .unwrap_or_else(|_| (Err(WRITER_STOPPED.to_owned()), self.time.now())),
         };
         let (got, finished) = got;
         let Some(mut writing) = self.writing.take() else {
@@ -868,6 +896,27 @@ impl<'host> Server<'host> {
         Ok(Self::resumed(host, Book::new(options)?).0)
     }
 
+    #[cfg(feature = "faults")]
+    pub fn timed(
+        host: Option<&'host Host>,
+        options: &Options,
+        time: Arc<dyn Time>,
+    ) -> std::io::Result<Self> {
+        Ok(Self::resumed(host, Book::timed(options, time)?).0)
+    }
+
+    fn now(&self) -> Instant {
+        self.book.time.now()
+    }
+
+    fn since(&self, earlier: Instant) -> Duration {
+        self.book.time.since(earlier)
+    }
+
+    pub(super) fn time(&self) -> &dyn Time {
+        self.book.time.as_ref()
+    }
+
     #[must_use]
     pub fn resumed(host: Option<&'host Host>, mut book: Book) -> (Self, Vec<Json>) {
         if !book.memory_fixed {
@@ -876,11 +925,12 @@ impl<'host> Server<'host> {
         }
         let was_lost = book.lost;
         book.lost = false;
+        let clock = Clock::of(book.time(), book.time.now(), budget::BUDGET_MS);
         let mut server = Self {
             host,
             book,
             live: BTreeMap::new(),
-            clock: Clock::of(Instant::now(), budget::BUDGET_MS),
+            clock,
             arrived: None,
             cancel: None,
         };
@@ -948,7 +998,7 @@ impl<'host> Server<'host> {
         let guard = self.guard();
         let mut held = self.held_replay();
         let mut timings = journal::Timings::default();
-        let began = Instant::now();
+        let began = self.now();
         let built = journal::rebuilt(
             host,
             ledger,
@@ -956,11 +1006,11 @@ impl<'host> Server<'host> {
             &guard,
             &mut timings,
             |world, frames| {
-                std::thread::sleep(std::mem::take(&mut held));
+                guard.time.sleep(std::mem::take(&mut held));
                 paced(world, frames, pace, &guard)
             },
         );
-        let took = began.elapsed();
+        let took = self.since(began);
         let rates = &mut self.book.rates;
         if !timings.build.is_zero() {
             rates.measure(base_work(ledger), bytes, timings.build);
@@ -1075,6 +1125,7 @@ impl<'host> Server<'host> {
         budget::Guard {
             deadline: Some(self.clock.deadline),
             cancel: self.cancel.clone(),
+            time: self.book.time(),
         }
     }
 
@@ -1296,7 +1347,7 @@ impl<'host> Server<'host> {
             return Ok(None);
         };
         if let Some(failure) = held.snap_failure.as_ref()
-            && failure.next > Instant::now()
+            && failure.next > self.now()
         {
             if !far {
                 return Ok(None);
@@ -1310,7 +1361,7 @@ impl<'host> Server<'host> {
                     errors::shown(&failure.message),
                     failure
                         .next
-                        .saturating_duration_since(Instant::now())
+                        .saturating_duration_since(self.now())
                         .as_millis()
                 ),
             )));
@@ -1399,7 +1450,7 @@ impl<'host> Server<'host> {
             .made()
             .clone();
         let live = self.live.get_mut(&number).ok_or("the world is not open")?;
-        let began = Instant::now();
+        let began = self.book.time.now();
         let image = live.world.image()?;
         let made = Made {
             slots: match &image.state {
@@ -1414,7 +1465,7 @@ impl<'host> Server<'host> {
     fn snap_attempt(&mut self, number: u32) -> Result<Option<Json>, Failed> {
         let (image, made, began) = self.snap_image(number)?;
         self.slowly(self.snap_work());
-        std::thread::sleep(self.slow_idle());
+        self.time().sleep(self.slow_idle());
         let frame = image.frame;
         let keep = self.book.keep.clone();
         let snap = match keep.as_ref() {
@@ -1432,7 +1483,7 @@ impl<'host> Server<'host> {
             },
         };
         let sum = snap.sum;
-        let cost = began.elapsed();
+        let cost = self.since(began);
         let size = self.book.held.get(&number).map_or(0, |held| held.bytes);
         self.book.rates.measure(self.snap_work(), size, cost);
         let epoch = self.book.bump();
@@ -1466,14 +1517,15 @@ impl<'host> Server<'host> {
             let (epoch, from, bytes) = (held.epoch, held.ledger.entries.len(), held.bytes);
             let frame = image.frame;
             let slow = self.slow_idle();
+            let time = self.book.time();
             let (sender, done) = std::sync::mpsc::channel();
             let thread = std::thread::Builder::new()
                 .name("grit-snapshot".to_owned())
                 .spawn(move || {
-                    std::thread::sleep(slow);
+                    time.sleep(slow);
                     let got = stored(&keep, number, &image)
                         .map_err(|why| refused_with(why.as_ref()).0.message);
-                    let _ = sender.send((got, Instant::now()));
+                    let _ = sender.send((got, time.now()));
                 })
                 .map_err(|why| io_refusal(&why))?;
             self.book.writing = Some(Writing {
@@ -1533,10 +1585,10 @@ impl<'host> Server<'host> {
     }
 
     pub fn idle(&mut self) -> bool {
-        let began = Instant::now();
+        let began = self.now();
         let did = self.idle_unit();
         if did {
-            let took = began.elapsed();
+            let took = self.since(began);
             if took > self.book.stats.idle_longest {
                 self.book.stats.idle_longest = took;
             }
@@ -1553,7 +1605,7 @@ impl<'host> Server<'host> {
             return landed;
         }
         let ratio = self.book.rates.replay();
-        let now = Instant::now();
+        let now = self.now();
         let owed = self
             .book
             .held
@@ -1571,7 +1623,7 @@ impl<'host> Server<'host> {
             return false;
         };
         let wedged_before = self.wedged();
-        self.clock = Clock::of(Instant::now(), budget::BUDGET_MOST_MS);
+        self.clock = Clock::of(self.book.time(), self.now(), budget::BUDGET_MOST_MS);
         let taken = match self.book.keep.clone() {
             Some(keep) => {
                 let started = self.snap_behind(number, keep);
@@ -1617,7 +1669,7 @@ impl<'host> Server<'host> {
                 slow
             })
             .unwrap_or_default();
-        std::thread::sleep(slow);
+        self.time().sleep(slow);
     }
 
     #[cfg(not(feature = "faults"))]
@@ -1675,7 +1727,7 @@ impl<'host> Server<'host> {
                 faults.slow_idle_work
             })
             .unwrap_or_default();
-        std::thread::sleep(slow);
+        self.time().sleep(slow);
     }
 
     #[cfg(not(feature = "faults"))]
@@ -1699,7 +1751,7 @@ impl<'host> Server<'host> {
                 .held
                 .get(&number)
                 .and_then(|held| held.snap_failure.as_ref())
-                .is_some_and(|failure| failure.next > Instant::now())
+                .is_some_and(|failure| failure.next > self.now())
     }
 
     #[must_use]
@@ -1848,8 +1900,11 @@ impl<'host> Server<'host> {
             .and_then(Json::int)
             .and_then(|one| u64::try_from(one).ok())
             .unwrap_or(budget::BUDGET_MS);
-        let arrived = self.arrived.take().unwrap_or_else(Instant::now);
-        self.clock = Clock::of(arrived, budget_ms);
+        let arrived = match self.arrived.take() {
+            Some(arrived) => arrived,
+            None => self.now(),
+        };
+        self.clock = Clock::of(self.book.time(), arrived, budget_ms);
         if self.cancelled() {
             return world_refusal(
                 Refusal::new(
@@ -1962,10 +2017,10 @@ fn paced(
         if step == 0 {
             return Err(Box::new(budget::Cut(Stop::Budget)));
         }
-        let began = Instant::now();
-        tools::faults::stall(step);
+        let began = guard.time.now();
+        tools::faults::stall(guard.time.as_ref(), step);
         world.step(step)?;
-        pace.ran(step, began.elapsed());
+        pace.ran(step, guard.time.since(began));
         done += step;
     }
     Ok(())

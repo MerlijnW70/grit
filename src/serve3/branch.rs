@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::branch::format;
 use crate::wire::{Json, counted, map, text};
@@ -174,12 +173,15 @@ fn saved(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         size,
         &format!("writing world {number} to a file"),
     )?;
-    let began = Instant::now();
+    let began = server.now();
     server.slowly(Work::Save);
     let live = server.world(held)?;
     let image = live.world.image()?;
     let bytes = format::store(&path, &image).map_err(|why| file_refusal(&why, &name))?;
-    server.book.rates.measure(Work::Save, size, began.elapsed());
+    server
+        .book
+        .rates
+        .measure(Work::Save, size, server.since(began));
     let sum = tail_sum(&path).map_err(|why| super::io_refusal(&why))?;
     Ok(map(vec![
         ("world", counted(number)),
@@ -239,7 +241,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         length,
         &format!("reading the file {name}{}", journal::SUFFIX),
     )?;
-    let began = Instant::now();
+    let began = server.now();
     server.slowly(Work::FileOpen);
     let pending = keep
         .copied(&path, server.book.next)
@@ -254,7 +256,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
     server
         .book
         .rates
-        .measure(Work::FileOpen, length, began.elapsed());
+        .measure(Work::FileOpen, length, server.since(began));
     let (sum, _) = keep
         .settle(&pending)
         .map_err(|why| super::io_refusal(&why))?;
@@ -265,10 +267,10 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         let bytes = admitted(server, host, &sizes, "the world")?;
         let work = Work::build_image(matches!(image.state, crate::branch::State::Sparse { .. }));
         server.fits(work, bytes, "building the world from the file")?;
-        let began = Instant::now();
+        let began = server.now();
         server.slowly(work);
         let world = super::law::opened(host, &image)?;
-        server.book.rates.measure(work, bytes, began.elapsed());
+        server.book.rates.measure(work, bytes, server.since(began));
         let rule = super::law::listed(host, &world)?;
         if let Some(lawful) = rule.lawful()
             && world.pool().is_some()
@@ -518,14 +520,14 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server.book.memory.admits(source.bytes, "the fork")?;
     let work = Work::fork(source.ledger.made().sparse);
     server.fits(work, source.bytes, &format!("copying world {number}"))?;
-    let began = Instant::now();
+    let began = server.now();
     server.slowly(work);
     let live = server.world(held)?;
     let fork = live.world.fork()?;
     server
         .book
         .rates
-        .measure(work, source.bytes, began.elapsed());
+        .measure(work, source.bytes, server.since(began));
     let rule = super::law::listed(host, &fork)?;
     let id = server.number()?;
     let mut live = Live { world: fork, rule };
@@ -583,7 +585,7 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         size,
         &format!("copying world {from} into world {number}"),
     )?;
-    let began = Instant::now();
+    let began = server.now();
     server.slowly(work);
     let mut source = server.live.remove(&from).ok_or_else(|| unread("from"))?;
     let done = server
@@ -593,7 +595,7 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .and_then(|target| target.world.restore(&mut source.world));
     server.live.insert(from, source);
     done?;
-    server.book.rates.measure(work, size, began.elapsed());
+    server.book.rates.measure(work, size, server.since(began));
     let taken = server
         .book
         .held

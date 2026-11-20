@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::clock::Time;
 use crate::wire::{Json, map};
 
 use super::errors::{Code, Refusal};
@@ -269,33 +270,46 @@ fn within(batch: Batch, fixed: Option<Duration>, time: Duration) -> u32 {
 pub struct Clock {
     pub began: Instant,
     pub deadline: Instant,
+    pub time: Arc<dyn Time>,
 }
 
 impl Clock {
     #[must_use]
-    pub fn of(arrived: Instant, budget_ms: u64) -> Self {
+    pub fn of(time: Arc<dyn Time>, arrived: Instant, budget_ms: u64) -> Self {
         let budget = Duration::from_millis(budget_ms.min(BUDGET_MOST_MS));
         Self {
             began: arrived,
             deadline: arrived + budget,
+            time,
         }
     }
 
     #[must_use]
     pub fn left(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+        self.deadline.saturating_duration_since(self.time.now())
     }
 
     #[must_use]
     pub fn spent(&self) -> Duration {
-        self.began.elapsed()
+        self.time.since(self.began)
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Guard {
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
+    pub time: Arc<dyn Time>,
+}
+
+impl Default for Guard {
+    fn default() -> Self {
+        Self {
+            deadline: None,
+            cancel: None,
+            time: crate::clock::real(),
+        }
+    }
 }
 
 impl Guard {
@@ -309,14 +323,14 @@ impl Guard {
             return Some(Stop::Cancelled);
         }
         self.deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|deadline| self.time.now() >= deadline)
             .then_some(Stop::Budget)
     }
 
     #[must_use]
     pub fn left(&self) -> Duration {
         self.deadline.map_or(Duration::MAX, |deadline| {
-            deadline.saturating_duration_since(Instant::now())
+            deadline.saturating_duration_since(self.time.now())
         })
     }
 }

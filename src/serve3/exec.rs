@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::clock::Time;
 use crate::host::{self, Host};
 use crate::wire::{Json, map, text};
 
@@ -64,6 +65,7 @@ struct Shared {
     flights: Mutex<Flights>,
     batches: Arc<AtomicU64>,
     stopping: AtomicBool,
+    time: Arc<dyn Time>,
 }
 
 fn budget_of(request: &Json) -> u64 {
@@ -101,7 +103,7 @@ fn watch(shared: &Shared, answers: &Sender<Json>) {
             .flights
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
+        let now = shared.time.now();
         let busy = flights.busy;
         flights.list.retain(|flight| {
             let charged = flight.charged(now, busy);
@@ -164,10 +166,10 @@ impl Shared {
         self.flights
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .busy = Some(Instant::now());
+            .busy = Some(self.time.now());
         let did = work();
         let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
+        let now = self.time.now();
         if let Some(began) = flights.busy.take() {
             for flight in &mut flights.list {
                 let behind = now.saturating_duration_since(began.max(flight.arrived));
@@ -354,7 +356,7 @@ fn work(
                                 .recv()
                                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
                             #[cfg(feature = "faults")]
-                            std::thread::sleep(
+                            shared.time.sleep(
                                 server
                                     .faults()
                                     .lock()
@@ -385,7 +387,7 @@ fn work(
             {
                 continue;
             }
-            let now = Instant::now();
+            let now = shared.time.now();
             let arrived = now.checked_sub(shared.behind(&job.cancel)).unwrap_or(now);
             #[cfg(feature = "faults")]
             if let Ok(mut faults) = server.faults().lock() {
@@ -410,7 +412,7 @@ fn work(
             shared.publish(&server);
             #[cfg(feature = "faults")]
             if let Ok(mut faults) = server.faults().lock() {
-                faults.answered.push((job.id.clone(), Instant::now()));
+                faults.answered.push((job.id.clone(), shared.time.now()));
             }
             if server.lost() {
                 let _ = answers.send(patched(answer, &server.pending()));
@@ -421,7 +423,7 @@ fn work(
             let _ = answers.send(answer);
             shared.landed(&job.cancel);
             #[cfg(feature = "faults")]
-            std::thread::sleep(
+            shared.time.sleep(
                 server
                     .faults()
                     .lock()
@@ -475,13 +477,26 @@ fn held_for_queued(server: &Server<'_>, shared: &Shared, cancel: &Arc<AtomicBool
     while !shared.queued_beside(cancel) {
         std::thread::sleep(WATCH);
     }
-    std::thread::sleep(held);
+    shared.time.sleep(held);
 }
 
 impl Exec {
     pub fn spawn(opener: Opener, options: &Options) -> std::io::Result<(Self, Receiver<Json>)> {
-        let book = Book::new(options)?;
+        Self::spawned(opener, Book::new(options)?)
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn spawn_timed(
+        opener: Opener,
+        options: &Options,
+        time: Arc<dyn Time>,
+    ) -> std::io::Result<(Self, Receiver<Json>)> {
+        Self::spawned(opener, Book::timed(options, time)?)
+    }
+
+    fn spawned(opener: Opener, book: Book) -> std::io::Result<(Self, Receiver<Json>)> {
         let batches = book.batches();
+        let time = book.time();
         #[cfg(feature = "faults")]
         let faults = book.faults();
         let (jobs, inbox) = mpsc::channel::<Job>();
@@ -492,6 +507,7 @@ impl Exec {
             flights: Mutex::new(Flights::default()),
             batches,
             stopping: AtomicBool::new(false),
+            time,
         });
         let worker = {
             let shared = Arc::clone(&shared);
@@ -568,7 +584,7 @@ impl Exec {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let state = Arc::new(AtomicU8::new(QUEUED));
-        let arrived = Instant::now();
+        let arrived = self.shared.time.now();
         {
             let mut flights = self
                 .shared

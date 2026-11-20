@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use crate::law::Law;
 use crate::law::adjoint::Aim;
 use crate::question::Region;
@@ -655,13 +653,13 @@ fn objective_of(posed: &Posed, params: &[u32]) -> u64 {
 }
 
 fn run(server: &mut Server<'_>, posed: &Posed, params: &[u32]) -> u64 {
-    let began = Instant::now();
-    super::tools::faults::stall(1);
+    let began = server.now();
+    super::tools::faults::stall(server.time(), 1);
     let objective = objective_of(posed, params);
     server
         .book
         .rates
-        .measure(Work::Run, posed.units, began.elapsed());
+        .measure(Work::Run, posed.units, server.since(began));
     if faults::ran()
         && let Some(flag) = server.cancel.as_ref()
     {

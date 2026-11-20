@@ -1100,7 +1100,7 @@ pub fn rebuilt<'host>(
             goal: ledger.frame,
         }));
     }
-    let began = std::time::Instant::now();
+    let began = guard.time.now();
     let mut world = match &ledger.base {
         Base::Created(made) => match &ledger.law {
             None => World::create(host, &made.branch())?,
@@ -1120,10 +1120,10 @@ pub fn rebuilt<'host>(
                         ),
                     )));
                 }
-                let reading = std::time::Instant::now();
+                let reading = guard.time.now();
                 let image = crate::branch::format::fetch(&path)?;
                 timings.file_bytes = fs::metadata(&path).map_or(0, |found| found.len());
-                timings.file = reading.elapsed();
+                timings.file = guard.time.since(reading);
                 super::law::opened(host, &image)?
             }
             (None, None) => {
@@ -1135,7 +1135,7 @@ pub fn rebuilt<'host>(
             }
         },
     };
-    timings.build = began.elapsed().saturating_sub(timings.file);
+    timings.build = guard.time.since(began).saturating_sub(timings.file);
     let of = ledger.entries.len();
     for (at, entry) in ledger.entries.iter().enumerate() {
         let halted = |stop, frame| {
@@ -1152,7 +1152,7 @@ pub fn rebuilt<'host>(
         }
         match entry {
             Entry::Write(cells) => {
-                let writing = std::time::Instant::now();
+                let writing = guard.time.now();
                 let chunk = if world.pool().is_some() {
                     cells.len().max(1)
                 } else {
@@ -1162,10 +1162,10 @@ pub fn rebuilt<'host>(
                     if let Some(stop) = guard.stop() {
                         return Err(halted(stop, world.frame()));
                     }
-                    super::tools::faults::cells(piece.len());
+                    super::tools::faults::cells(guard.time.as_ref(), piece.len());
                     world.write(piece)?;
                 }
-                timings.writes = timings.writes.saturating_add(writing.elapsed());
+                timings.writes = timings.writes.saturating_add(guard.time.since(writing));
                 timings.write_bytes = timings.write_bytes.saturating_add(entry.bytes() as u64);
             }
             Entry::Params(params) => super::law::reparam(&mut world, params)?,
@@ -1181,14 +1181,14 @@ pub fn rebuilt<'host>(
                 }
             }
             Entry::Step(frames) => {
-                let stepped = std::time::Instant::now();
+                let stepped = guard.time.now();
                 if let Err(why) = stepping(&mut world, *frames) {
                     return Err(match why.downcast_ref::<super::budget::Cut>() {
                         Some(cut) => halted(cut.0, world.frame()),
                         None => why,
                     });
                 }
-                timings.steps = timings.steps.saturating_add(stepped.elapsed());
+                timings.steps = timings.steps.saturating_add(guard.time.since(stepped));
                 let recorded = ledger.recorded.get(at).copied().unwrap_or_default();
                 timings.recorded = timings.recorded.saturating_add(recorded);
             }
