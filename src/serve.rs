@@ -556,10 +556,14 @@ pub fn walked(
     submits: &mut impl Submits,
     pace: &mut Pace,
     rounds: u32,
-) -> Result<std::time::Duration, Box<dyn std::error::Error>> {
+    halt: &mut dyn Halt,
+) -> Result<(u32, std::time::Duration), Box<dyn std::error::Error>> {
     let mut gone = 0_u32;
     let mut longest = std::time::Duration::ZERO;
     while gone < rounds {
+        if halt.halted() {
+            break;
+        }
         let step = pace.next(rounds - gone);
         let began = std::time::Instant::now();
         let round = submits.submitted(step)?;
@@ -567,13 +571,13 @@ pub fn walked(
         pace.learn(round);
         gone += step;
     }
-    Ok(longest)
+    Ok((gone, longest))
 }
 
 type Climbed = (u32, Vec<u32>, std::time::Duration, Escapes, bool);
 
 pub trait Halt {
-    fn halted(&mut self, next: std::time::Duration) -> bool;
+    fn halted(&mut self) -> bool;
 
     fn building(&mut self) -> bool {
         false
@@ -588,14 +592,12 @@ pub trait Halt {
     }
 
     fn kernel(&mut self, _: usize) {}
-
-    fn waited(&mut self, _: std::time::Duration) {}
 }
 
 pub struct Never;
 
 impl Halt for Never {
-    fn halted(&mut self, _: std::time::Duration) -> bool {
+    fn halted(&mut self) -> bool {
         false
     }
 }
@@ -622,19 +624,16 @@ fn climbed(
     let mut kept: Option<(u32, Vec<u32>)> = None;
     let mut best = Vec::new();
     let mut escaped: HashSet<Vec<u32>> = HashSet::new();
-    let mut last: Option<std::time::Duration> = None;
     let mut stopped = false;
     while done < effort.rounds {
         let step = climb.look.min(effort.rounds - done);
-        let next = last.unwrap_or_else(|| gauge.round.saturating_mul(step));
-        if halt.halted(next) {
+        let (gone, took) = walked(&mut Staged::new(resident, stages), &mut pace, step, halt)?;
+        longest = longest.max(took);
+        done += gone;
+        if gone < step {
             stopped = true;
             break;
         }
-        let began = std::time::Instant::now();
-        longest = longest.max(walked(&mut Staged::new(resident, stages), &mut pace, step)?);
-        done += step;
-        last = Some(began.elapsed());
         best = resident.read(BEST as usize, climb.many as usize)?;
         let (who, now) = leader(&best);
         if now >= climb.full {
@@ -1032,7 +1031,6 @@ fn machined_within(
         feed.len().max(1),
     ];
     let mut resident = host.resident(&sizes, &modules)?;
-    halt.waited(resident.waited());
     let (crowd, seeds) = opening(shape, effort.seed, restart, many);
     resident.write(HELD as usize, &crowd)?;
     for binding in [TRIAL, VALUES, SCORE, BEST] {

@@ -510,6 +510,37 @@ fn block(inputs: u32, gates: &[Gate], number: u64, values: &mut Vec<u64>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Count {
+    pub inputs: u32,
+    pub outputs: u32,
+    pub copies: u32,
+}
+
+impl Count {
+    #[must_use]
+    pub const fn blocks(&self) -> u64 {
+        (1_u64 << self.inputs).div_ceil(64)
+    }
+
+    #[must_use]
+    pub const fn law_gates(&self, gates: u32) -> u32 {
+        if self.copies > 1 {
+            self.copies
+                .saturating_mul(gates)
+                .saturating_add(self.outputs.saturating_mul(self.copies - 1))
+        } else {
+            gates
+        }
+    }
+
+    #[must_use]
+    pub const fn units(&self, gates: u32) -> u64 {
+        self.blocks()
+            .saturating_mul(self.inputs as u64 + self.law_gates(gates) as u64)
+    }
+}
+
 pub fn ones(
     inputs: u32,
     outputs: u32,

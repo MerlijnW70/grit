@@ -10,7 +10,7 @@ use grit::machine::Machine;
 use grit::marking::{BINDINGS, HELD, SEED, TRIAL, chosen, marked, turned_on, words_of};
 use grit::netlist::{Exam, Gate, Netlist, drawn, turned};
 use grit::serve::{
-    ASIDE, Effort, Escape, Pace, Rolls, SEEDING, SIDE, SUBMISSION, Staged, Submits, handle,
+    ASIDE, Effort, Escape, Never, Pace, Rolls, SEEDING, SIDE, SUBMISSION, Staged, Submits, handle,
     machined, mixed, opening, pressed, shaken, walked,
 };
 use grit::wire::{Json, read, written};
@@ -709,7 +709,7 @@ fn every_submission_stays_within_its_target_however_long_a_round_takes() {
                 sent: Vec::new(),
             };
             for _ in 0..10 {
-                walked(&mut timed, &mut pace, 100).unwrap();
+                walked(&mut timed, &mut pace, 100, &mut Never).unwrap();
             }
             let fits = (SUBMISSION.as_millis() as u64 / millis).clamp(1, 100) as u32;
             assert_eq!(timed.sent.iter().sum::<u32>(), 1000);
@@ -807,7 +807,7 @@ fn round_of(host: &Host, shape: Netlist, many: u32, rounds: u32) -> Vec<Sent> {
     let mut gone = 0;
     while gone < rounds {
         let look = 100.min(rounds - gone);
-        walked(&mut watched, &mut pace, look).unwrap();
+        walked(&mut watched, &mut pace, look, &mut Never).unwrap();
         gone += look;
     }
     watched.sent

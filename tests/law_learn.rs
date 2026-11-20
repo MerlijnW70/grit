@@ -1104,12 +1104,16 @@ mod faulted {
     use std::sync::mpsc::Receiver;
     use std::time::Duration;
 
+    use grit::clock::{Fake, Time};
     use grit::serve3::Options;
     use grit::serve3::exec::Exec;
+    use grit::serve3::law_learn::Point;
     use grit::serve3::law_learn::faults::{
-        builds_slowed_by, calibrations, cancel_after, ceiling_at, charge_after, checks, disarm,
-        held_up_at, kernel_most,
+        builds, builds_slowed_by, calibration_slowed, calibrations, cancel_after, ceiling_at,
+        checks, deadline_passed_at, disarm, kernel_most, reached, rounds_each_submission,
+        submissions,
     };
+    use grit::stencil::Count;
 
     fn arguments() -> String {
         let (train, _) = x0b();
@@ -1135,10 +1139,96 @@ mod faulted {
 
     fn whole(host: &Host) -> (Json, u64) {
         let mut mcp = Mcp::new(Some(host));
+        disarm();
+        rounds_each_submission(1);
         let before = checks();
         let got = mcp.ok("grit_law_learn", &arguments());
+        disarm();
         assert_eq!(text_at(&got, "stopped"), "ladder");
         (got, checks() - before)
+    }
+
+    fn timed(host: &Host) -> (Mcp<'_>, Arc<Fake>) {
+        let fake = Arc::new(Fake::new());
+        let time: Arc<dyn Time> = fake.clone();
+        let server = Server::timed(Some(host), &Options::default(), time).unwrap();
+        (Mcp { server }, fake)
+    }
+
+    fn within(arguments: &str, budget: u64) -> String {
+        let long = format!("\"budget_ms\":{LONG}");
+        assert!(arguments.contains(&long));
+        arguments.replace(&long, &format!("\"budget_ms\":{budget}"))
+    }
+
+    fn top_words(host: &Host, whole: &Json, gates: u32) -> u32 {
+        let seen = u32::try_from(int_at(whole.get("examples").unwrap(), "seen")).unwrap();
+        let machine =
+            grit::machine::Machine::over(0, 9, 1, gates, grit::law::chip::KINDS, 1).unwrap();
+        let words = grit::marking::stepped_rolled(host.width(), machine, seen.div_ceil(32).max(1))
+            .unwrap()
+            .len();
+        u32::try_from(words).unwrap()
+    }
+
+    fn patience() -> Duration {
+        grit::Resident::patience_of(std::env::var("GRIT_PATIENCE_SECS").ok().as_deref())
+    }
+
+    fn frozen(host: &Host) -> (Json, [u64; 5], u64, u64) {
+        let (mut mcp, fake) = timed(host);
+        disarm();
+        rounds_each_submission(1);
+        let got = mcp.ok("grit_law_learn", &arguments());
+        let counts = [
+            Point::Calibration,
+            Point::Build,
+            Point::Submission,
+            Point::Expansion,
+            Point::Count,
+        ]
+        .map(reached);
+        let made = (builds(), submissions());
+        disarm();
+        assert_eq!(fake.elapsed(), Duration::ZERO, "the clock stayed frozen");
+        assert_eq!(text_at(&got, "stopped"), "ladder", "{}", written(&got));
+        (got, counts, made.0, made.1)
+    }
+
+    fn braked_at(host: &Host, point: Point, ordinal: u64) -> (Json, u64, u64, u64) {
+        let (mut mcp, fake) = timed(host);
+        disarm();
+        rounds_each_submission(1);
+        deadline_passed_at(point, ordinal, Arc::clone(&fake), LONG + 1);
+        let got = mcp.raw("grit_law_learn", &arguments());
+        let counts = (reached(point), builds(), submissions());
+        disarm();
+        assert!(
+            fake.elapsed() > Duration::from_millis(LONG),
+            "the {} point {ordinal} passed the deadline",
+            point.name()
+        );
+        (got, counts.0, counts.1, counts.2)
+    }
+
+    fn on_budget(got: &Json, whole: &Json, point: Point, ordinal: u64) -> Option<Json> {
+        let failed =
+            got.get("result").and_then(|one| one.get("isError")) == Some(&Json::Bool(true));
+        if failed {
+            let told = result(got, true);
+            assert_eq!(
+                (text_at(&told, "refused"), text_at(&told, "field")),
+                ("budget".to_owned(), "$.budget_ms".to_owned()),
+                "{} {ordinal}: {}",
+                point.name(),
+                written(&told)
+            );
+            assert!(text_at(&told, "message").contains("nothing was learned"));
+            return None;
+        }
+        let held = result(got, false);
+        stopped_at(&held, whole, "budget");
+        Some(held)
     }
 
     fn stopped_at(got: &Json, whole: &Json, why: &str) {
@@ -1173,6 +1263,7 @@ mod faulted {
             let mut mcp = Mcp::new(Some(&host));
             let flag = Arc::new(AtomicBool::new(false));
             mcp.server.arriving(None, Some(Arc::clone(&flag)));
+            rounds_each_submission(1);
             cancel_after(spent / 2);
             let got = mcp.ok("grit_law_learn", &arguments());
             disarm();
@@ -1188,41 +1279,6 @@ mod faulted {
         let told = mcp.no("grit_law_learn", &arguments());
         disarm();
         assert_eq!(text_at(&told, "refused"), "cancelled", "{}", written(&told));
-        assert!(text_at(&told, "message").contains("nothing was learned"));
-    }
-
-    #[test]
-    fn a_ladder_whose_next_look_does_not_fit_stops_on_budget_by_evidence() {
-        let Some(host) = device("law_learn budget") else {
-            return;
-        };
-        let (full, spent) = whole(&host);
-        let mut answers = Vec::new();
-        for _ in 0..2 {
-            let mut mcp = Mcp::new(Some(&host));
-            charge_after(spent / 2);
-            let before = checks();
-            let got = mcp.ok("grit_law_learn", &arguments());
-            disarm();
-            assert_eq!(
-                checks() - before,
-                spent / 2 + 1,
-                "no look ran past the charge"
-            );
-            stopped_at(&got, &full, "budget");
-            answers.push(written(&got));
-        }
-        assert_eq!(answers[0], answers[1]);
-        let mut mcp = Mcp::new(Some(&host));
-        charge_after(0);
-        let told = mcp.no("grit_law_learn", &arguments());
-        disarm();
-        assert_eq!(
-            (text_at(&told, "refused"), text_at(&told, "field")),
-            ("budget".to_owned(), "$.budget_ms".to_owned()),
-            "{}",
-            written(&told)
-        );
         assert!(text_at(&told, "message").contains("nothing was learned"));
     }
 
@@ -1341,19 +1397,6 @@ mod faulted {
     }
 
     #[test]
-    fn a_build_held_up_by_other_calls_builds_is_not_charged_to_the_next_build() {
-        let Some(host) = device("law_learn held up build") else {
-            return;
-        };
-        let (full, _) = whole(&host);
-        let mut mcp = Mcp::new(Some(&host));
-        held_up_at(1, Duration::from_secs(3600));
-        let got = mcp.ok("grit_law_learn", &arguments());
-        disarm();
-        assert_eq!(written(&got), written(&full));
-    }
-
-    #[test]
     fn a_crowd_past_one_binding_is_capped_and_named() {
         let Some(host) = device("law_learn crowd capped") else {
             return;
@@ -1388,6 +1431,215 @@ mod faulted {
             "{}",
             written(&told)
         );
+    }
+
+    #[test]
+    fn w1_a_clock_that_never_reaches_the_deadline_never_stops_or_refuses_on_budget() {
+        let Some(host) = device("law_learn w1") else {
+            return;
+        };
+        let (full, _) = whole(&host);
+        let each = patience() / (4 * top_words(&host, &full, 16));
+        let mut answers = Vec::new();
+        for budget in [1, 2, LONG] {
+            let (mut mcp, fake) = timed(&host);
+            disarm();
+            builds_slowed_by(each);
+            let got = mcp.raw("grit_law_learn", &within(&arguments(), budget));
+            let measured = calibrations();
+            disarm();
+            let got = result(&got, false);
+            assert_eq!(fake.elapsed(), Duration::ZERO);
+            assert!(measured >= 1, "budget {budget}: the builds were measured");
+            assert_eq!(
+                text_at(&got, "stopped"),
+                "ladder",
+                "budget {budget}: {}",
+                written(&got)
+            );
+            answers.push(written(&got));
+        }
+        assert_eq!(answers[0], answers[1]);
+        assert_eq!(answers[0], answers[2]);
+        assert_eq!(answers[0], written(&full));
+    }
+
+    #[test]
+    fn w2_a_deadline_passed_at_a_named_point_answers_the_rungs_before_it_the_same_again() {
+        let Some(host) = device("law_learn w2") else {
+            return;
+        };
+        let (full, counts, made, sent) = frozen(&host);
+        let (calibrated, built, submitted) = (counts[0], counts[1], counts[2]);
+        assert_eq!(built, made, "every build point was followed by a build");
+        assert_eq!(submitted, sent, "every submission point by a submission");
+        assert!(
+            built >= 4 && submitted >= 200,
+            "{built} builds, {submitted} submissions"
+        );
+        let looks = submitted / 50;
+        let cases = [
+            (Point::Calibration, 0, false),
+            (Point::Calibration, calibrated - 1, false),
+            (Point::Build, 0, false),
+            (Point::Build, built / 2, true),
+            (Point::Build, built - 1, true),
+            (Point::Submission, 0, false),
+            (Point::Submission, looks / 2 * 50 + 25, true),
+            (Point::Submission, submitted - 1, true),
+        ];
+        for (point, ordinal, answers) in cases {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (got, at, builds_after, sent_after) = braked_at(&host, point, ordinal);
+                assert_eq!(
+                    at,
+                    ordinal + 1,
+                    "{}: no later point was reached",
+                    point.name()
+                );
+                if point == Point::Build {
+                    assert_eq!(builds_after, ordinal, "no build started after the deadline");
+                }
+                if point == Point::Submission {
+                    assert_eq!(sent_after, ordinal, "no submission after the deadline");
+                }
+                let held = on_budget(&got, &full, point, ordinal);
+                assert_eq!(
+                    held.is_some(),
+                    answers,
+                    "{} {ordinal}: {}",
+                    point.name(),
+                    written(&got)
+                );
+                seen.push(written(&got));
+            }
+            assert_eq!(seen[0], seen[1], "{} {ordinal}", point.name());
+        }
+    }
+
+    #[test]
+    fn w3_once_the_deadline_passes_inside_a_look_no_further_submission_starts() {
+        let Some(host) = device("law_learn w3") else {
+            return;
+        };
+        let (_, counts, _, sent) = frozen(&host);
+        assert_eq!(counts[2], sent);
+        for ordinal in [25, sent / 50 / 2 * 50 + 17] {
+            let (_, at, _, after) = braked_at(&host, Point::Submission, ordinal);
+            assert_eq!(at, ordinal + 1);
+            assert_eq!(
+                after, ordinal,
+                "the deadline passed before submission {ordinal}, inside a look of 50"
+            );
+        }
+    }
+
+    #[test]
+    fn c1_a_deadline_passed_during_the_count_changes_no_byte_of_the_answer() {
+        let Some(host) = device("law_learn c1") else {
+            return;
+        };
+        let (full, counts, _, _) = frozen(&host);
+        assert!(counts[4] >= 1, "the count was checked");
+        let (got, at, _, _) = braked_at(&host, Point::Count, 0);
+        assert_eq!(at, counts[4]);
+        assert_eq!(written(&result(&got, false)), written(&full));
+    }
+
+    #[test]
+    fn c2_count_units_are_the_hand_counted_blocks_times_inputs_and_law_gates() {
+        let fake = Fake::new();
+        let minimal = Count {
+            inputs: 9,
+            outputs: 1,
+            copies: 1,
+        };
+        let square = Count {
+            inputs: 9,
+            outputs: 1,
+            copies: 8,
+        };
+        let cube = Count {
+            inputs: 27,
+            outputs: 1,
+            copies: 48,
+        };
+        let cube_two = Count {
+            inputs: 27,
+            outputs: 2,
+            copies: 48,
+        };
+        let small = Count {
+            inputs: 3,
+            outputs: 1,
+            copies: 1,
+        };
+        for _ in 0..2 {
+            assert_eq!(minimal.blocks(), 8);
+            assert_eq!(minimal.units(5), 8 * (9 + 5));
+            assert_eq!(square.law_gates(5), 47);
+            assert_eq!(square.units(5), 8 * (9 + 47));
+            assert_eq!(cube.blocks(), 1 << 21);
+            assert_eq!(cube.law_gates(8), 431);
+            assert_eq!(cube.units(8), 960_495_616);
+            assert_eq!(cube_two.law_gates(8), 478);
+            assert_eq!(cube_two.units(8), 1_059_061_760);
+            assert_eq!(small.blocks(), 1);
+            assert_eq!(small.units(3), 6);
+        }
+        assert_eq!(fake.reads(), 0);
+        assert_eq!(fake.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn p2_a_later_slower_calibration_never_lowers_the_admitted_rung() {
+        let Some(host) = device("law_learn p2") else {
+            return;
+        };
+        let machine =
+            grit::machine::Machine::over(0, 27, 1, 64, grit::law::chip::KINDS, 1).unwrap();
+        let top = grit::marking::stepped_rolled(host.width(), machine, 2)
+            .unwrap()
+            .len();
+        let each = patience() / u32::try_from(top).unwrap();
+        let mut mcp = Mcp::new(Some(&host));
+        disarm();
+        builds_slowed_by(each);
+        let plain = mcp.no("grit_law_learn", &copied(73, [4, 4, 4], 64));
+        let measured = calibrations();
+        disarm();
+        assert_eq!(
+            text_at(&plain, "refused"),
+            "learn_limit",
+            "{}",
+            written(&plain)
+        );
+        assert!(measured >= 2, "{measured} calibrations");
+        for slowed in [patience(), patience() * 1000] {
+            let mut mcp = Mcp::new(Some(&host));
+            disarm();
+            builds_slowed_by(each);
+            calibration_slowed(measured - 1, slowed);
+            let told = mcp.no("grit_law_learn", &copied(73, [4, 4, 4], 64));
+            let again = calibrations();
+            let built = kernel_most();
+            disarm();
+            assert_eq!(
+                text_at(&told, "refused"),
+                "learn_limit",
+                "{}",
+                written(&told)
+            );
+            assert_eq!(again, measured);
+            assert_eq!(built, 0);
+            assert_eq!(
+                int_at(&told, "limit"),
+                int_at(&plain, "limit"),
+                "a slower last sample lowered the admitted rung: {}",
+                written(&told)
+            );
+        }
     }
 
     struct Run {

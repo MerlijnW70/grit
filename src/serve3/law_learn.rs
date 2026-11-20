@@ -54,33 +54,81 @@ pub const ZERO_RUNS: &str = "the law reads its neighbours wrapped on the world's
 
 pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world whose sides equal its own along each axis the stencil reads (3x3 reads x and y, so its tall is free; a world's tall is at least 2), and a world example's box reads its neighbours from that world";
 
-pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A search checks its budget and cancel before each 50 rounds of a rung and stops when the last 50 rounds it measured, or the device's first measured round times 50, do not fit the time left, and before each search's build when the last build it measured in this call, less its wait for other calls' builds, does not fit; a build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission, where a driver that compiles at its first dispatch compiles, grown with the square of the kernel's words from the closest one measured, stays within half the device's patience; a top rung past that is refused learn_limit at gates with the most gates that fit, so an answer can come late by up to one build the device's evidence puts within half its patience; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion and the count of decided rows check budget and cancel every 4096 rows or 64-row blocks and refuse budget or cancelled; after a stopped ladder the count runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so that the smallest circuit solved so far is answered with its counts. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on the time measured, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it";
+pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A call stops on its deadline or cancel only at a brake: before each build that measures the device, before each search's build and before each device submission of a look; no measured time is compared with the time left. Once the deadline has passed no further submission starts, so an answer can come late by the one submission in flight: a build, or one submission of a look, sized by the device's measured pace. A build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission, where a driver that compiles at its first dispatch compiles, grown with the square of the kernel's words from the closest one measured, stays within half the device's patience; a top rung past that is refused learn_limit at gates with the most gates that fit, a limit measured on this device at this moment and so outside the same answer below; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion checks budget and cancel every 4096 rows and refuses budget or cancelled. The count of decided rows checks only cancel, every 4096 blocks of 64 rows, and none after a stopped ladder; otherwise it runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so a found law is never lost to the deadline. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on when the deadline passed or the cancel came, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Point {
+    Calibration,
+    Build,
+    Submission,
+    Expansion,
+    Count,
+}
+
+impl Point {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Calibration => "calibration",
+            Self::Build => "build",
+            Self::Submission => "submission",
+            Self::Expansion => "expansion",
+            Self::Count => "count",
+        }
+    }
+
+    #[cfg(feature = "faults")]
+    const fn at(self) -> usize {
+        match self {
+            Self::Calibration => 0,
+            Self::Build => 1,
+            Self::Submission => 2,
+            Self::Expansion => 3,
+            Self::Count => 4,
+        }
+    }
+}
 
 pub mod faults {
     #[cfg(feature = "faults")]
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
+    #[cfg(feature = "faults")]
+    use crate::clock::Fake;
     use crate::host::Host;
+
+    use super::Point;
+
+    #[cfg(feature = "faults")]
+    type Passed = Option<(Point, u64, Arc<Fake>, u64)>;
 
     #[cfg(feature = "faults")]
     thread_local! {
         static CHECKS: Cell<u64> = const { Cell::new(0) };
         static CANCEL: Cell<Option<u64>> = const { Cell::new(None) };
-        static CHARGE: Cell<Option<u64>> = const { Cell::new(None) };
         static KERNEL: Cell<usize> = const { Cell::new(0) };
-        static BUILDS: Cell<u64> = const { Cell::new(0) };
-        static HELD_UP: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
+        static BUILT: Cell<u64> = const { Cell::new(0) };
+        static SUBMITTED: Cell<u64> = const { Cell::new(0) };
+        static REACHED: Cell<[u64; 5]> = const { Cell::new([0; 5]) };
+        static PASSED: RefCell<Passed> = const { RefCell::new(None) };
         static CEILING: Cell<Option<u64>> = const { Cell::new(None) };
         static SLOW: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static SLOWED: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
         static CALIBRATED: Cell<u64> = const { Cell::new(0) };
+        static EACH: Cell<Option<u32>> = const { Cell::new(None) };
     }
 
     #[cfg(feature = "faults")]
     pub fn builds_slowed_by(each_word: Duration) {
         SLOW.set(each_word);
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn calibration_slowed(at: u64, by: Duration) {
+        SLOWED.set(Some((at, by)));
     }
 
     #[cfg(feature = "faults")]
@@ -90,15 +138,39 @@ pub mod faults {
     }
 
     #[cfg(feature = "faults")]
-    pub(super) fn calibrating(words: usize) -> Duration {
-        CALIBRATED.set(CALIBRATED.get().saturating_add(1));
-        SLOW.get()
-            .saturating_mul(u32::try_from(words).unwrap_or(u32::MAX))
+    pub(super) fn calibrating(words: usize, measured: Duration) -> Duration {
+        let at = CALIBRATED.get();
+        CALIBRATED.set(at.saturating_add(1));
+        let each = SLOW.get();
+        let took = if each.is_zero() {
+            measured
+        } else {
+            each.saturating_mul(u32::try_from(words).unwrap_or(u32::MAX))
+        };
+        match SLOWED.get() {
+            Some((slowed, by)) if slowed == at => took.saturating_add(by),
+            _ => took,
+        }
     }
 
     #[cfg(not(feature = "faults"))]
-    pub(super) const fn calibrating(_: usize) -> Duration {
-        Duration::ZERO
+    pub(super) const fn calibrating(_: usize, measured: Duration) -> Duration {
+        measured
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn rounds_each_submission(rounds: u32) {
+        EACH.set(Some(rounds));
+    }
+
+    #[cfg(feature = "faults")]
+    pub(super) fn submitted_most(asked: u32) -> u32 {
+        EACH.get().unwrap_or(asked)
+    }
+
+    #[cfg(not(feature = "faults"))]
+    pub(super) const fn submitted_most(asked: u32) -> u32 {
+        asked
     }
 
     #[cfg(feature = "faults")]
@@ -123,36 +195,39 @@ pub mod faults {
     }
 
     #[cfg(feature = "faults")]
-    pub fn held_up_at(build: u64, wait: Duration) {
-        BUILDS.set(0);
-        HELD_UP.set(Some((build, wait)));
+    #[must_use]
+    pub fn builds() -> u64 {
+        BUILT.get()
+    }
+
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub fn submissions() -> u64 {
+        SUBMITTED.get()
+    }
+
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub fn reached(point: Point) -> u64 {
+        REACHED.get().get(point.at()).copied().unwrap_or(0)
     }
 
     #[cfg(feature = "faults")]
     pub(super) fn kernel(words: usize) {
         KERNEL.set(KERNEL.get().max(words));
+        BUILT.set(BUILT.get().saturating_add(1));
     }
 
     #[cfg(not(feature = "faults"))]
     pub(super) const fn kernel(_: usize) {}
 
     #[cfg(feature = "faults")]
-    pub(super) fn held_up() -> Duration {
-        let build = BUILDS.get();
-        BUILDS.set(build.saturating_add(1));
-        match HELD_UP.get() {
-            Some((at, extra)) if at == build => {
-                HELD_UP.set(None);
-                extra
-            }
-            _ => Duration::ZERO,
-        }
+    pub(super) fn submitting() {
+        SUBMITTED.set(SUBMITTED.get().saturating_add(1));
     }
 
     #[cfg(not(feature = "faults"))]
-    pub(super) const fn held_up() -> Duration {
-        Duration::ZERO
-    }
+    pub(super) const fn submitting() {}
 
     #[cfg(feature = "faults")]
     #[must_use]
@@ -166,19 +241,23 @@ pub mod faults {
     }
 
     #[cfg(feature = "faults")]
-    pub fn charge_after(checks: u64) {
-        CHARGE.set(Some(checks));
+    pub fn deadline_passed_at(point: Point, ordinal: u64, clock: Arc<Fake>, ms: u64) {
+        PASSED.set(Some((point, ordinal, clock, ms)));
     }
 
     #[cfg(feature = "faults")]
     pub fn disarm() {
         CANCEL.set(None);
-        CHARGE.set(None);
-        HELD_UP.set(None);
+        PASSED.set(None);
         CEILING.set(None);
         SLOW.set(Duration::ZERO);
+        SLOWED.set(None);
+        EACH.set(None);
         CALIBRATED.set(0);
         KERNEL.set(0);
+        BUILT.set(0);
+        SUBMITTED.set(0);
+        REACHED.set([0; 5]);
     }
 
     #[cfg(feature = "faults")]
@@ -197,12 +276,33 @@ pub mod faults {
     }
 
     #[cfg(feature = "faults")]
+    fn passing(point: Point) {
+        let mut reached = REACHED.get();
+        let ordinal = reached.get(point.at()).copied().unwrap_or(0);
+        if let Some(one) = reached.get_mut(point.at()) {
+            *one = ordinal.saturating_add(1);
+        }
+        REACHED.set(reached);
+        PASSED.with_borrow_mut(|held| {
+            if let Some((at, when, clock, ms)) = held.as_ref()
+                && *at == point
+                && *when == ordinal
+            {
+                clock.advance(*ms);
+                *held = None;
+            }
+        });
+    }
+
+    #[cfg(feature = "faults")]
     pub(super) fn checked(
+        point: Point,
         host: Option<&Host>,
         cancel: Option<&Arc<AtomicBool>>,
         faults: &std::sync::Mutex<super::super::Faults>,
-    ) -> Duration {
+    ) {
         CHECKS.set(CHECKS.get().saturating_add(1));
+        passing(point);
         if due(&CANCEL)
             && let Some(flag) = cancel
         {
@@ -225,27 +325,16 @@ pub mod faults {
         if wedge && let Some(host) = host {
             host.wedge();
         }
-        if due(&CHARGE) {
-            Duration::MAX
-        } else {
-            Duration::ZERO
-        }
     }
 
     #[cfg(not(feature = "faults"))]
-    pub(super) const fn checked(_: Option<&Host>, _: Option<&Arc<AtomicBool>>) -> Duration {
-        Duration::ZERO
-    }
+    pub(super) const fn checked(_: Point, _: Option<&Host>, _: Option<&Arc<AtomicBool>>) {}
 }
 
 struct Watch<'host> {
     guard: Guard,
     host: Option<&'host crate::host::Host>,
     stop: Option<Stop>,
-    began: Option<std::time::Instant>,
-    built: Option<Duration>,
-    waited: Duration,
-    held_up: Duration,
     crowd_most: u32,
     #[cfg(feature = "faults")]
     faults: std::sync::Arc<std::sync::Mutex<super::Faults>>,
@@ -253,26 +342,41 @@ struct Watch<'host> {
 
 impl Watch<'_> {
     #[cfg(feature = "faults")]
-    fn charged(&self) -> Duration {
-        faults::checked(self.host, self.guard.cancel.as_ref(), &self.faults)
+    fn checked(&self, point: Point) {
+        faults::checked(point, self.host, self.guard.cancel.as_ref(), &self.faults);
     }
 
     #[cfg(not(feature = "faults"))]
-    fn charged(&self) -> Duration {
-        faults::checked(self.host, self.guard.cancel.as_ref())
+    fn checked(&self, point: Point) {
+        faults::checked(point, self.host, self.guard.cancel.as_ref());
+    }
+
+    fn braked(&mut self, point: Point) -> bool {
+        self.checked(point);
+        if let Some(stop) = self.guard.stop() {
+            self.stop = Some(stop);
+            return true;
+        }
+        false
+    }
+
+    fn cancelled(&self, point: Point) -> bool {
+        self.checked(point);
+        self.guard.stop() == Some(Stop::Cancelled)
     }
 }
 
 impl Halt for Watch<'_> {
-    fn building(&mut self) -> bool {
-        let next = self.built.unwrap_or(Duration::ZERO);
-        if self.over(next) {
+    fn halted(&mut self) -> bool {
+        if self.braked(Point::Submission) {
             return true;
         }
-        self.began = Some(std::time::Instant::now());
-        self.waited = Duration::ZERO;
-        self.held_up = Duration::ZERO;
+        faults::submitting();
         false
+    }
+
+    fn building(&mut self) -> bool {
+        self.braked(Point::Build)
     }
 
     fn crowd_most(&self) -> u32 {
@@ -285,39 +389,6 @@ impl Halt for Watch<'_> {
 
     fn kernel(&mut self, words: usize) {
         faults::kernel(words);
-    }
-
-    fn waited(&mut self, wait: Duration) {
-        let extra = faults::held_up();
-        self.held_up = self.held_up.saturating_add(extra);
-        self.waited = self.waited.saturating_add(wait).saturating_add(extra);
-    }
-
-    fn halted(&mut self, next: Duration) -> bool {
-        if let Some(began) = self.began.take() {
-            self.built = Some(
-                began
-                    .elapsed()
-                    .saturating_add(self.held_up)
-                    .saturating_sub(self.waited),
-            );
-        }
-        self.over(next)
-    }
-}
-
-impl Watch<'_> {
-    fn over(&mut self, next: Duration) -> bool {
-        let charged = self.charged();
-        if let Some(stop) = self.guard.stop() {
-            self.stop = Some(stop);
-            return true;
-        }
-        if next.saturating_add(charged) > self.guard.left() {
-            self.stop = Some(Stop::Budget);
-            return true;
-        }
-        false
     }
 }
 
@@ -1052,9 +1123,6 @@ fn ladder(
     let mut budget = top;
     let mut missed = 0;
     while budget >= outputs.max(1) && missed < PATIENCE && rungs.len() < crate::serve::RUNGS {
-        if watch.halted(Duration::ZERO) {
-            break;
-        }
         let machine = Machine::over(0, inputs, outputs, budget, chip_kinds(), 1)?;
         let ran = crate::serve::pressed_machine_halted(host, machine, traces, effort, watch)?;
         if ran.stopped {
@@ -1175,9 +1243,7 @@ fn calibrated(
     let modules: Vec<&[u32]> = vec![&module];
     let sizes = vec![64_usize; crate::marking::BINDINGS as usize];
     let resident = host.resident(&sizes, &modules)?;
-    let took = resident
-        .warmed()
-        .saturating_add(faults::calibrating(module.len()));
+    let took = faults::calibrating(module.len(), resident.warmed());
     Ok((
         Built {
             gates,
@@ -1197,6 +1263,7 @@ fn kernel_fitting(
 ) -> Result<(), Failed> {
     let wide = u32::try_from(traces.div_ceil(32).max(1)).unwrap_or(u32::MAX);
     let least = shape.1.max(1);
+    calibrating(watch)?;
     let (first, patience) = calibrated(host, shape, least, wide)?;
     let most = patience / MARGIN;
     let mut evidence = vec![first];
@@ -1240,14 +1307,19 @@ fn kernel_fitting(
                 counted(admitted),
             ));
         }
-        if watch.over(predicted(&evidence, kernel_words(host, shape, low, wide)?)) {
-            return Err(halted_refusal(
-                watch.stop.unwrap_or(Stop::Budget),
-                "while measuring how fast this device builds a search kernel",
-            ));
-        }
+        calibrating(watch)?;
         evidence.push(calibrated(host, shape, low, wide)?.0);
     }
+}
+
+fn calibrating(watch: &mut Watch<'_>) -> Result<(), Failed> {
+    if watch.braked(Point::Calibration) {
+        return Err(halted_refusal(
+            watch.stop.unwrap_or(Stop::Budget),
+            "while measuring how fast this device builds a search kernel",
+        ));
+    }
+    Ok(())
 }
 
 fn fits_kernel(inputs: u32, outputs: u32, top: u32, traces: usize) -> Result<(), Failed> {
@@ -1407,6 +1479,10 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         seed: int(held, "seed")?,
         ..Effort::of(CROWD, ROUNDS)
     };
+    let effort = Effort {
+        submitted: faults::submitted_most(effort.submitted),
+        ..effort
+    };
     let host = server.host.ok_or_else(|| {
         refused(
             Code::NoComputeDevice,
@@ -1431,10 +1507,6 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         guard: server.guard(),
         host: server.host,
         stop: None,
-        began: None,
-        built: None,
-        waited: Duration::ZERO,
-        held_up: Duration::ZERO,
         crowd_most: u32::MAX,
         #[cfg(feature = "faults")]
         faults: server.faults(),
@@ -1442,9 +1514,9 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let mut stopped: Option<Stop> = None;
     let wanted: std::collections::BTreeMap<u32, u32> = if symmetric {
         let mut halted = || {
-            let _ = watch.charged();
-            stopped = watch.guard.stop();
-            stopped.is_some()
+            let braked = watch.braked(Point::Expansion);
+            stopped = watch.stop;
+            braked
         };
         let orbits = match stencil::orbits(&rows.seen, &moves, most, &mut halted) {
             Ok(orbits) => orbits,
@@ -1550,19 +1622,11 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let total = 1_u64 << inputs;
     let seen = u64::try_from(rows.seen.len()).unwrap_or(u64::MAX);
     let unseen = total - seen;
-    let mut counting_stop: Option<Stop> = None;
-    let guard = server.guard();
     let already = laddered.stop.is_some();
-    let mut halted = || {
-        if already {
-            return false;
-        }
-        counting_stop = guard.stop();
-        counting_stop.is_some()
-    };
+    let mut halted = || !already && watch.cancelled(Point::Count);
     let Some(count) = stencil::ones(inputs, outputs, &law_gates, &mut halted) else {
         return Err(halted_refusal(
-            counting_stop.unwrap_or(Stop::Budget),
+            Stop::Cancelled,
             "while counting the decided rows, after the law was found",
         ));
     };
