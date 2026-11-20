@@ -476,6 +476,7 @@ fn r2_cube_wrapped_box_on_a_rounded_world_runs_as_truth_inside_the_box() {
     }
 }
 
+#[cfg(feature = "faults")]
 fn d4() -> Vec<[[i64; 2]; 2]> {
     let mut out = Vec::new();
     for swap in [false, true] {
@@ -493,6 +494,7 @@ fn d4() -> Vec<[[i64; 2]; 2]> {
     out
 }
 
+#[cfg(feature = "faults")]
 fn turned(row: u32, m: [[i64; 2]; 2]) -> u32 {
     let mut out = 0;
     for place in 0..9_i64 {
@@ -507,6 +509,7 @@ fn turned(row: u32, m: [[i64; 2]; 2]) -> u32 {
     out
 }
 
+#[cfg(feature = "faults")]
 fn tiled_run(server: &mut Server<'_>, law: &str) -> Vec<u32> {
     let size = [128_u32, 64, 2];
     let number = world(server, law, size);
@@ -533,44 +536,21 @@ fn tiled_run(server: &mut Server<'_>, law: &str) -> Vec<u32> {
         .collect()
 }
 
-fn same_or_prefix(got: &Json, again: &Json, rule: &str) {
-    let ladder = |held: &Json| -> Vec<String> {
-        held.get("ladder")
-            .and_then(Json::list)
-            .unwrap()
-            .iter()
-            .map(written)
-            .collect()
-    };
-    let (first, second) = (text_at(got, "stopped"), text_at(again, "stopped"));
-    if first == "ladder" && second == "ladder" {
-        assert_eq!(written(got), written(again), "same bytes, rule {rule}");
-        return;
-    }
-    let (short, long) = if ladder(got).len() <= ladder(again).len() {
-        (got, again)
-    } else {
-        (again, got)
-    };
-    assert!(
-        ["budget", "cancelled"].contains(&text_at(short, "stopped").as_str()),
-        "only a stopped answer may differ, rule {rule}: {}",
-        written(short)
-    );
-    let part = ladder(short);
-    assert_eq!(
-        part[..],
-        ladder(long)[..part.len()],
-        "a stopped ladder is a prefix, rule {rule}"
-    );
+#[cfg(feature = "faults")]
+fn frozen(host: &grit::Host) -> (Server<'_>, std::sync::Arc<grit::clock::Fake>) {
+    let fake = std::sync::Arc::new(grit::clock::Fake::new());
+    let time: std::sync::Arc<dyn grit::clock::Time> = fake.clone();
+    let server = Server::timed(Some(host), &Options::default(), time).unwrap();
+    (server, fake)
 }
 
+#[cfg(feature = "faults")]
 #[test]
 fn r3_every_row_runs_on_a_world_as_the_reported_table_and_symmetric_tables_are_invariant() {
     let Some(host) = device("review l2 r3") else {
         return;
     };
-    let mut server = Server::new(Some(&host));
+    let (mut server, fake) = frozen(&host);
     let size = [8_u32, 8, 1];
     let mut rng = Rng(31);
     let input: Vec<u32> = (0..64).map(|_| u32::from(rng.below(3) == 0)).collect();
@@ -594,7 +574,9 @@ fn r3_every_row_runs_on_a_world_as_the_reported_table_and_symmetric_tables_are_i
         );
         let got = ok(&mut server, "grit_law_learn", &args);
         let again = ok(&mut server, "grit_law_learn", &args);
-        same_or_prefix(&got, &again, rule);
+        assert_eq!(text_at(&got, "stopped"), "ladder", "rule {rule}");
+        assert_eq!(written(&got), written(&again), "same bytes, rule {rule}");
+        assert_eq!(fake.elapsed(), std::time::Duration::ZERO);
         let unseen = got.get("unseen").unwrap();
         let table: Vec<u32> = ints(unseen.get("table").unwrap())
             .into_iter()
@@ -669,6 +651,7 @@ fn r3_every_row_runs_on_a_world_as_the_reported_table_and_symmetric_tables_are_i
     );
 }
 
+#[cfg(feature = "faults")]
 fn cube_group() -> Vec<[[i64; 3]; 3]> {
     let perms = [
         [0, 1, 2],
@@ -691,6 +674,7 @@ fn cube_group() -> Vec<[[i64; 3]; 3]> {
     out
 }
 
+#[cfg(feature = "faults")]
 fn cube_turned(row: u32, m: [[i64; 3]; 3]) -> u32 {
     let mut out = 0;
     for place in 0..27_i64 {
@@ -706,12 +690,13 @@ fn cube_turned(row: u32, m: [[i64; 3]; 3]) -> u32 {
     out
 }
 
+#[cfg(feature = "faults")]
 #[test]
 fn r4_a_symmetric_cube_law_is_invariant_under_48_moves_and_reports_its_unseen_counts() {
     let Some(host) = device("review l2 r4") else {
         return;
     };
-    let mut server = Server::new(Some(&host));
+    let (mut server, fake) = frozen(&host);
     let size = [4_u32, 4, 4];
     let mut rng = Rng(77);
     let input: Vec<u32> = (0..64).map(|_| u32::from(rng.below(4) == 0)).collect();
@@ -736,6 +721,8 @@ fn r4_a_symmetric_cube_law_is_invariant_under_48_moves_and_reports_its_unseen_co
             list(&output)
         ),
     );
+    assert_eq!(fake.elapsed(), std::time::Duration::ZERO);
+    assert_eq!(text_at(&got, "stopped"), "ladder");
     assert_eq!(
         int_at(got.get("examples").unwrap(), "seen"),
         seen.len() as i64
