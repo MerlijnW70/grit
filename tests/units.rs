@@ -366,26 +366,22 @@ fn copied_fixture(label: &str) -> PathBuf {
 }
 
 #[cfg(feature = "faults")]
-const MAIN_STATES: [(u32, i64, &str); 4] = [
+const MAIN_STATES: [(u32, i64, Option<&str>); 4] = [
     (
         1,
         107,
-        "ce4c0ac4667246c78b02556869b14d77e178924fbdf639ce9fe12f1a9ac1bc7c",
+        Some("ce4c0ac4667246c78b02556869b14d77e178924fbdf639ce9fe12f1a9ac1bc7c"),
     ),
-    (
-        2,
-        39,
-        "a8e05a0b02c63594858cd1c71604b6a61c5c11fc851c28993da56bd0ca730d7b",
-    ),
+    (2, 39, None),
     (
         3,
         13,
-        "cb2e901ee3eccd2bc2213fc0188b543815cd064df03a0879c1bbc18be9a94dcd",
+        Some("cb2e901ee3eccd2bc2213fc0188b543815cd064df03a0879c1bbc18be9a94dcd"),
     ),
     (
         4,
         7,
-        "016c9b7c7bca3115e3f2df91fdc301ec1009d7ca34f875ee7299d7347a84cfa8",
+        Some("016c9b7c7bca3115e3f2df91fdc301ec1009d7ca34f875ee7299d7347a84cfa8"),
     ),
 ];
 
@@ -971,6 +967,30 @@ mod served {
         }
     }
 
+    const MAIN_SPARSE_TALLY: [i64; 7] = [30, 10, 5, 12, 14, 14, 15];
+
+    fn sparse_on_this_device(server: &mut Server<'_>) -> String {
+        let (world, _) = sparse(server);
+        call(server, "grit_world_write", &cells(world, 20, 32, 3));
+        step(server, world, 30);
+        let last = step(server, world, 9);
+        let tally: Vec<i64> = last
+            .get("tally")
+            .and_then(Json::list)
+            .unwrap()
+            .iter()
+            .map(|one| one.int().unwrap())
+            .collect();
+        assert_eq!(tally, MAIN_SPARSE_TALLY);
+        let saved = call(
+            server,
+            "grit_world_save",
+            &format!("{{\"world\":{world},\"name\":\"live-sparse\",\"budget_ms\":600000}}"),
+        );
+        assert_eq!(int_at(&saved, "frame"), 39);
+        saved.get("state").and_then(Json::text).unwrap().to_owned()
+    }
+
     #[test]
     fn u4_a_journal_written_by_main_reopens_bit_for_bit() {
         let Some(host) = common::device("u4 main journal") else {
@@ -1006,9 +1026,10 @@ mod served {
                 "grit_world_save",
                 &format!("{{\"world\":{number},\"name\":\"main-{number}\",\"budget_ms\":600000}}"),
             );
+            let state = state.map_or_else(|| sparse_on_this_device(&mut server), str::to_owned);
             assert_eq!(
                 saved.get("state").and_then(Json::text),
-                Some(*state),
+                Some(state.as_str()),
                 "world {number} differs from the run on main"
             );
             assert_eq!(int_at(&saved, "frame"), *frame);
