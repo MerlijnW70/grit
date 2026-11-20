@@ -33,7 +33,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dir: named("--dir", "GRIT_DIR").map(PathBuf::from),
         memory,
     };
-    let (exec, answers) = Exec::spawn(Box::new(Host::open), &options)?;
+    let dir = options.dir.clone();
+    let opener = move || -> Result<Option<Host>, grit::host::Error> {
+        let host = Host::open()?;
+        if let Some(host) = host.as_ref() {
+            match grit::calibrate::taken(host, dir.as_deref()) {
+                Ok(taken) => {
+                    if let Some(why) = taken.refused {
+                        eprintln!("grit-mcp: {why}");
+                    }
+                }
+                Err(why) => eprintln!("grit-mcp: the device was not calibrated: {why}"),
+            }
+        }
+        Ok(host)
+    };
+    let (exec, answers) = Exec::spawn(Box::new(opener), &options)?;
     let writer = std::thread::spawn(move || -> std::io::Result<()> {
         let mut out = std::io::stdout();
         for answer in answers {

@@ -559,10 +559,47 @@ static FORMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// What [`crate::Host`] holds while it opens a device, and a resident while
 /// it is built.
-pub(crate) fn forming() -> std::sync::MutexGuard<'static, ()> {
-    FORMING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+pub(crate) fn forming() -> Forming {
+    if SOLE.with(std::cell::Cell::get) {
+        return Forming {
+            _held: None,
+            marked: false,
+        };
+    }
+    Forming {
+        _held: Some(
+            FORMING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ),
+        marked: false,
+    }
+}
+
+thread_local! {
+    static SOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct Forming {
+    _held: Option<std::sync::MutexGuard<'static, ()>>,
+    marked: bool,
+}
+
+impl Drop for Forming {
+    fn drop(&mut self) {
+        if self.marked {
+            SOLE.with(|sole| sole.set(false));
+        }
+    }
+}
+
+pub(crate) fn forming_sole() -> Forming {
+    let mut held = forming();
+    if held._held.is_some() {
+        SOLE.with(|sole| sole.set(true));
+        held.marked = true;
+    }
+    held
 }
 
 pub struct Resident<'host> {
@@ -596,6 +633,7 @@ pub struct Resident<'host> {
     poked: u64,
     patience: Duration,
     device: Option<Duration>,
+    ticks: Option<(u64, u64)>,
     spans: Vec<Duration>,
     reused: u64,
     warmed: Duration,
@@ -955,6 +993,7 @@ impl<'host> Resident<'host> {
             poked: 0,
             patience: Resident::patience_of(std::env::var("GRIT_PATIENCE_SECS").ok().as_deref()),
             device: None,
+            ticks: None,
             spans: Vec::new(),
             reused: 0,
             warmed: Duration::ZERO,
@@ -2035,6 +2074,7 @@ impl Resident<'_> {
             slot.flight = None;
         }
         self.device = self.timed(at);
+        self.ticks = self.ticked(at);
         self.spans = self.split(at);
         Ok((began.elapsed(), out, at))
     }
@@ -2106,6 +2146,24 @@ impl Resident<'_> {
                 Duration::from_nanos((ticks as f64 * f64::from(tick)) as u64)
             })
             .collect()
+    }
+
+    #[must_use]
+    pub const fn on_device_ticks(&self) -> Option<(u64, u64)> {
+        self.ticks
+    }
+
+    fn ticked(&self, at: usize) -> Option<(u64, u64)> {
+        let pool = self.slots.get(at)?.queries?;
+        let mut stamps = [0_u64; 2];
+        unsafe {
+            self.host
+                .device()
+                .get_query_pool_results(pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64)
+                .ok()?;
+        }
+        let [first, last] = stamps;
+        (last >= first).then_some((first, last))
     }
 
     fn timed(&self, at: usize) -> Option<Duration> {

@@ -17,6 +17,7 @@ use super::{
     DIGITS, Failed, Listed, Live, PAGE_BYTES, POOL_LEAST_CELLS, READ_MOST, SLICE_MOST, STEP_MOST,
     Server, Status, Tool, rules, rules_on, shaped,
 };
+use crate::calibrate::Key;
 
 pub const TOOLS: &[Tool] = &[
     Tool {
@@ -645,10 +646,9 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             super::law::stepping_of(lawful.class(), sparse),
         )?,
     };
-    server
-        .book
-        .rates
-        .measure(Work::build(sparse), bytes, server.since(began));
+    let took = server.since(began);
+    server.book.rates.measure(Work::build(sparse), bytes, took);
+    server.sampled(&Key::Build { sparse }, (bytes, 1), took, None);
     server.priced(build_cost(bytes));
     let id = server.number()?;
     let pace = first_pace(&world);
@@ -747,6 +747,12 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             .book
             .rates
             .measure(Work::write(sparse), 16 * chunk as u64, took);
+        server.sampled(
+            &Key::Write { sparse },
+            (u64::try_from(chunk).unwrap_or(u64::MAX), 1),
+            took,
+            None,
+        );
         spent = spent.saturating_add(took);
         done += chunk;
     }
@@ -849,6 +855,69 @@ pub fn world_frame_cells(world: &World<'_>) -> u64 {
 }
 
 #[must_use]
+pub fn by_fallback(world: &World<'_>) -> bool {
+    world.pool().is_some() && world.bricks_seen().is_none()
+}
+
+pub(super) fn frame_key(live: &super::Live<'_>) -> Key {
+    let sparse = live.world.pool().is_some();
+    match live.rule.lawful() {
+        Some(lawful) => Key::law(lawful.law().canonical(), sparse),
+        None => Key::rule(live.rule.name(), sparse),
+    }
+}
+
+struct Sound<'host> {
+    cpu: Option<&'host crate::calibrate::cpu::Driver>,
+    needed: bool,
+    total: Option<Duration>,
+    mark: Option<crate::calibrate::cpu::Mark>,
+    spans: Vec<Option<(u64, u64)>>,
+}
+
+impl<'host> Sound<'host> {
+    fn of(host: Option<&'host Host>, needed: bool) -> Self {
+        Self {
+            cpu: host
+                .filter(|host| host.on_cpu())
+                .and_then(Host::driver_threads),
+            needed,
+            total: Some(Duration::ZERO),
+            mark: None,
+            spans: Vec::new(),
+        }
+    }
+
+    fn before(&mut self) {
+        self.mark = match self.cpu {
+            Some(driver) if self.needed => driver.mark(),
+            _ => None,
+        };
+    }
+
+    fn after(&mut self, world: &World<'_>, frames: u32) {
+        if self.cpu.is_none() {
+            self.spans.push(world.on_device_ticks());
+        }
+        let measured = crate::calibrate::scripted_sound().unwrap_or_else(|| match self.cpu {
+            Some(driver) => self
+                .mark
+                .take()
+                .zip(driver.closing())
+                .map(|(from, to)| driver.between(from, to)),
+            None => world.on_device().map(|frame| frame * frames),
+        });
+        self.total = self.total.zip(measured).map(|(all, one)| all + one);
+    }
+
+    fn taken(&self) -> Option<(Duration, bool)> {
+        let first = self.cpu.is_some()
+            || (self.spans.len() >= 2 && crate::calibrate::take::kept_busy(&self.spans));
+        self.total.map(|total| (total, first))
+    }
+}
+
+#[must_use]
 pub const fn frames_cost(cells: u64, frames: u32) -> Cost {
     Cost {
         kind: Priced::Frame,
@@ -883,10 +952,36 @@ pub(super) const fn wedged_after(_: &Server<'_>, _: u32) -> bool {
     false
 }
 
+#[cfg(feature = "faults")]
+fn forgotten(server: &mut Server<'_>, held: &Json) -> Result<(), Failed> {
+    let armed = server
+        .book
+        .faults
+        .lock()
+        .map(|mut faults| std::mem::take(&mut faults.forget_bricks))
+        .unwrap_or(false);
+    if armed {
+        server.world(held)?.world.forget_bricks();
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "faults"))]
+const fn forgotten(_: &mut Server<'_>, _: &Json) -> Result<(), Failed> {
+    Ok(())
+}
+
 fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
     let frames = int(held, "frames")?;
+    forgotten(server, held)?;
     let cells = world_frame_cells(&server.world(held)?.world);
+    let (key, fallback) = {
+        let live = server.world(held)?;
+        (frame_key(live), by_fallback(&live.world))
+    };
+    let mut sound = Sound::of(server.host, !server.knows(&key));
+    let mut ran = Duration::ZERO;
     let owed = server.owed(number)?;
     let mut pace = server
         .book
@@ -921,12 +1016,15 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         }
         let began = server.now();
         faults::stall(server.time(), step);
-        let ran = server.world(held)?.world.step(step);
+        sound.before();
+        let stepped = server.world(held)?.world.step(step);
         let took = server.since(began);
-        if let Err(why) = ran {
+        if let Err(why) = stepped {
             failure = Some(why);
             break;
         }
+        sound.after(&server.world(held)?.world, step);
+        ran = ran.saturating_add(took);
         if wedged_after(server, batch) {
             failure = Some(Box::new(crate::host::Error::Wedged { after: took }));
             break;
@@ -984,6 +1082,14 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     if let Some(held) = server.book.held.get_mut(&number) {
         held.pace = pace;
+    }
+    if done > 0 && failure.is_none() && !fallback {
+        server.sampled(
+            &key,
+            (cells.saturating_mul(u64::from(done)), batch),
+            ran,
+            sound.taken(),
+        );
     }
     if pending > 0 {
         journal = server
