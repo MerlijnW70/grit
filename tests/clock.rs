@@ -572,31 +572,225 @@ fn sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+const ALLOWED: &[(&str, &str, &str, usize)] = &[
+    ("src/credit.rs", "use Instant", "", 1),
+    ("src/credit.rs", "Instant::now", "Marker::submitted", 1),
+    ("src/credit.rs", "::now(", "Marker::submitted", 1),
+    ("src/credit.rs", ".elapsed()", "Marker::submitted", 1),
+    ("src/live.rs", "Instant::now", "cheaper", 2),
+    ("src/live.rs", "::now(", "cheaper", 2),
+    ("src/live.rs", ".elapsed()", "cheaper", 2),
+    ("src/resident.rs", "use Instant", "", 1),
+    ("src/resident.rs", "Instant::now", "Resident::write", 1),
+    ("src/resident.rs", "::now(", "Resident::write", 1),
+    ("src/resident.rs", ".elapsed()", "Resident::write", 1),
+    ("src/resident.rs", "Instant::now", "Resident::fetched", 1),
+    ("src/resident.rs", "::now(", "Resident::fetched", 1),
+    ("src/resident.rs", ".elapsed()", "Resident::fetched", 1),
+    ("src/resident.rs", "Instant::now", "Resident::start", 1),
+    ("src/resident.rs", "::now(", "Resident::start", 1),
+    ("src/resident.rs", ".elapsed()", "Resident::land", 1),
+    ("src/resident.rs", "Instant::now", "Resident::run_times", 1),
+    ("src/resident.rs", "::now(", "Resident::run_times", 1),
+    ("src/resident.rs", ".elapsed()", "Resident::run_times", 1),
+    ("src/serve.rs", "Instant::now", "gauged", 1),
+    ("src/serve.rs", "::now(", "gauged", 1),
+    ("src/serve.rs", ".elapsed()", "gauged", 1),
+    ("src/serve.rs", "Instant::now", "walked", 1),
+    ("src/serve.rs", "::now(", "walked", 1),
+    ("src/serve.rs", ".elapsed()", "walked", 1),
+    ("src/serve3/budget.rs", "use Instant", "", 1),
+    ("src/serve3/budget.rs", "real(", "Guard::default", 1),
+    ("src/serve3/exec.rs", "use Instant", "", 1),
+    ("src/serve3/exec.rs", "sleep(", "watch", 1),
+    ("src/serve3/exec.rs", "sleep(", "held_for_queued", 1),
+    ("src/serve3/exec.rs", "recv_timeout(LANDING)", "work", 1),
+    ("src/serve3/mod.rs", "use Instant", "", 1),
+    ("src/serve3/mod.rs", "real(", "Book::new", 1),
+    ("src/serve3/mod.rs", "real(", "Book::empty", 1),
+    ("src/serve3/mod.rs", "recv_timeout(left)", "Book::landed", 1),
+];
+
+const SPELLED: [&str; 7] = [
+    "Instant::now",
+    "::now(",
+    ".elapsed()",
+    "SystemTime",
+    "park_timeout",
+    "Instant as",
+    "UNIX_EPOCH",
+];
+
+fn ident(byte: Option<&u8>) -> bool {
+    byte.is_some_and(|one| one.is_ascii_alphanumeric() || *one == b'_')
+}
+
+fn tokens(line: &str, token: &str) -> usize {
+    let bytes = line.as_bytes();
+    line.match_indices(token)
+        .filter(|(at, _)| {
+            let before = at.checked_sub(1).and_then(|one| bytes.get(one));
+            let open = token.ends_with('(');
+            !ident(before) && (open || !ident(bytes.get(at + token.len())))
+        })
+        .count()
+}
+
+fn sleeps(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    line.match_indices("sleep(")
+        .filter(|(at, _)| {
+            let before = at.checked_sub(1).and_then(|one| bytes.get(one));
+            before != Some(&b'.') && !ident(before)
+        })
+        .count()
+}
+
+fn kinds(line: &str, server: bool) -> Vec<(String, usize)> {
+    let mut found: Vec<(String, usize)> = SPELLED
+        .iter()
+        .map(|spelled| ((*spelled).to_owned(), line.matches(spelled).count()))
+        .collect();
+    found.push(("sleep(".to_owned(), sleeps(line)));
+    let waits = line.matches("recv_timeout").count();
+    let named = ["recv_timeout(LANDING)", "recv_timeout(left)"]
+        .into_iter()
+        .find(|wait| line.contains(wait))
+        .filter(|_| waits == 1)
+        .unwrap_or("recv_timeout");
+    found.push((named.to_owned(), waits));
+    let trimmed = line.trim_start();
+    let import = (trimmed.starts_with("use ") || trimmed.starts_with("pub use "))
+        && tokens(line, "Instant") > 0;
+    found.push(("use Instant".to_owned(), usize::from(import)));
+    if server {
+        found.push(("Real".to_owned(), tokens(line, "Real")));
+        found.push(("real(".to_owned(), tokens(line, "real(")));
+    } else {
+        found.push(("clock::".to_owned(), line.matches("clock::").count()));
+    }
+    found.retain(|(_, count)| *count > 0);
+    found
+}
+
+fn named(line: &str) -> Option<String> {
+    let at = line.find("fn ")?;
+    let before = at.checked_sub(1).and_then(|one| line.as_bytes().get(one));
+    if ident(before) {
+        return None;
+    }
+    let rest = line.get(at + 3..)?;
+    let name: String = rest
+        .chars()
+        .take_while(|one| one.is_ascii_alphanumeric() || *one == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn implemented(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("impl")?;
+    let rest = rest.strip_prefix(char::is_whitespace).or_else(|| {
+        rest.strip_prefix('<')
+            .and_then(|generic| generic.split_once('>').map(|(_, after)| after))
+    })?;
+    let rest = rest.split_once(" for ").map_or(rest, |(_, of)| of);
+    let name: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|one| one.is_ascii_alphanumeric() || *one == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 #[test]
 fn the_server_reads_time_only_through_its_clock() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut found = vec![root.join("serve.rs")];
-    sources(&root.join("serve3"), &mut found);
-    assert!(found.len() > 10, "{found:?}");
-    let mut reading = Vec::new();
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = crate_root.join("src");
+    let mut found = Vec::new();
+    sources(&root, &mut found);
+    assert!(found.len() > 40, "{found:?}");
+    let mut seen: std::collections::BTreeMap<(String, String, String), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut scanned = 0_usize;
     for path in found {
+        let relative = path
+            .strip_prefix(crate_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative.starts_with("src/bin/") || relative == "src/clock.rs" {
+            continue;
+        }
+        scanned += 1;
+        let server = relative == "src/serve.rs" || relative.starts_with("src/serve3/");
         let text = std::fs::read_to_string(&path).unwrap();
+        let mut function = String::new();
+        let mut owner = String::new();
         for (at, line) in text.lines().enumerate() {
-            let polled = line.trim() == "std::thread::sleep(WATCH);";
-            let reported = path.ends_with("serve.rs")
-                && (line.contains("let began = std::time::Instant::now();")
-                    || line.contains("longest = longest.max(began.elapsed());"));
-            let reads = ["Instant::now", ".elapsed()", "thread::sleep(", "SystemTime"]
-                .iter()
-                .any(|call| line.contains(call));
-            if reads && !polled && !reported {
-                reading.push(format!("{}:{}: {}", path.display(), at + 1, line.trim()));
+            if line == "}" {
+                owner.clear();
+                function.clear();
+                continue;
+            }
+            if let Some(name) = implemented(line) {
+                owner = name;
+                function.clear();
+            }
+            if let Some(name) = named(line) {
+                function = if owner.is_empty() {
+                    name
+                } else {
+                    format!("{owner}::{name}")
+                };
+            }
+            let trimmed = line.trim_start();
+            let import = trimmed.starts_with("use ") || trimmed.starts_with("pub use ");
+            for (kind, count) in kinds(line, server) {
+                let place = if import && kind == "use Instant" {
+                    String::new()
+                } else {
+                    function.clone()
+                };
+                seen.entry((relative.clone(), kind, place))
+                    .or_default()
+                    .extend(std::iter::repeat_n(at + 1, count));
             }
         }
     }
+    assert!(scanned > 30, "only {scanned} sources scanned");
+    let allowed: std::collections::BTreeMap<(String, String, String), usize> = ALLOWED
+        .iter()
+        .map(|(file, kind, place, count)| {
+            (
+                ((*file).to_owned(), (*kind).to_owned(), (*place).to_owned()),
+                *count,
+            )
+        })
+        .collect();
+    let mut wrong = Vec::new();
+    for (key, lines) in &seen {
+        let wanted = allowed.get(key).copied().unwrap_or(0);
+        if lines.len() != wanted {
+            wrong.push(format!(
+                "{} in {:?}: {} of {:?} at lines {lines:?}, and {wanted} are allowed",
+                key.0,
+                key.2,
+                lines.len(),
+                key.1
+            ));
+        }
+    }
+    for (key, wanted) in &allowed {
+        if !seen.contains_key(key) {
+            wrong.push(format!(
+                "{} in {:?}: no {:?}, and the allowlist names {wanted}",
+                key.0, key.2, key.1
+            ));
+        }
+    }
     assert!(
-        reading.is_empty(),
+        wrong.is_empty(),
         "time read outside the server's clock:\n{}",
-        reading.join("\n")
+        wrong.join("\n")
     );
 }
