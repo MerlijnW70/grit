@@ -560,3 +560,43 @@ mod faked {
         );
     }
 }
+
+fn sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            sources(&path, found);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            found.push(path);
+        }
+    }
+}
+
+#[test]
+fn the_server_reads_time_only_through_its_clock() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = vec![root.join("serve.rs")];
+    sources(&root.join("serve3"), &mut found);
+    assert!(found.len() > 10, "{found:?}");
+    let mut reading = Vec::new();
+    for path in found {
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (at, line) in text.lines().enumerate() {
+            let polled = line.trim() == "std::thread::sleep(WATCH);";
+            let reported = path.ends_with("serve.rs")
+                && (line.contains("let began = std::time::Instant::now();")
+                    || line.contains("longest = longest.max(began.elapsed());"));
+            let reads = ["Instant::now", ".elapsed()", "thread::sleep(", "SystemTime"]
+                .iter()
+                .any(|call| line.contains(call));
+            if reads && !polled && !reported {
+                reading.push(format!("{}:{}: {}", path.display(), at + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        reading.is_empty(),
+        "time read outside the server's clock:\n{}",
+        reading.join("\n")
+    );
+}
