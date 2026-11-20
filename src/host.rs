@@ -440,6 +440,8 @@ pub struct Host {
     tick: f32,
     timing: bool,
     wedged: AtomicBool,
+    on_cpu: bool,
+    stamps_read: AtomicBool,
     owing: AtomicUsize,
     sparse: bool,
     strict: bool,
@@ -669,6 +671,8 @@ impl Host {
         let name = unsafe { name_of(&instance, physical) };
         let limits = unsafe { limits_of(&instance, physical) };
         let (tick, timing) = unsafe { timestamps(&instance, physical, family) };
+        let on_cpu = unsafe { instance.get_physical_device_properties(physical) }.device_type
+            == vk::PhysicalDeviceType::CPU;
 
         let priorities = [1.0_f32];
         let has = unsafe { instance.get_physical_device_features(physical) };
@@ -735,6 +739,7 @@ impl Host {
             limits,
             tick,
             timing,
+            on_cpu,
             sparse,
             strict,
             int64,
@@ -744,8 +749,17 @@ impl Host {
             presents,
             dots,
             wedged: AtomicBool::new(false),
+            stamps_read: AtomicBool::new(false),
             owing: AtomicUsize::new(0),
         })
+    }
+
+    pub fn read_stamps(&self) {
+        self.stamps_read.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn frame_stamps(&self) -> bool {
+        self.timing && (!self.on_cpu || self.stamps_read.load(Ordering::SeqCst))
     }
 
     pub(crate) fn wedge(&self) {

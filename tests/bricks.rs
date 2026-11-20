@@ -1441,6 +1441,7 @@ fn seed_seconds_a_brick(host: &Host, bricks: u64) -> f64 {
     let (passes, stages) = bricks::arranged(&Sand, &pool, &plan, true).unwrap();
     let sizes = pool.sizes(&Sand, &plan);
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+    host.read_stamps();
     let mut held = host.resident(&sizes, &modules).unwrap();
     clear(&mut held, &sizes);
     held.write(PARAMS as usize, &[u32::MAX]).unwrap();

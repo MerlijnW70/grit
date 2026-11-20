@@ -739,7 +739,11 @@ impl Host {
             made.fence = self.fence()?;
             for slot in &mut made.slots {
                 slot.fence = self.fence()?;
-                slot.queries = self.queries();
+                slot.queries = if self.frame_stamps() {
+                    self.queries()
+                } else {
+                    None
+                };
             }
         }
         made.built = true;

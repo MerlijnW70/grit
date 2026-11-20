@@ -710,6 +710,7 @@ impl<'host> Walk<'host> {
         sizes[TANGENT as usize] = plan_sizes[STATE as usize];
         sizes[CARRIED as usize] = plan_sizes[STATE as usize];
 
+        host.read_stamps();
         let mut resident = host.resident(&sizes, &modules).unwrap();
         for (binding, words) in sizes.iter().enumerate() {
             resident.write(binding, &vec![0_u32; *words]).unwrap();
@@ -1040,6 +1041,7 @@ fn what_a_listed_frame_spends_and_where() {
     sizes[TANGENT as usize] = plan_sizes[STATE as usize];
     sizes[CARRIED as usize] = plan_sizes[STATE as usize];
 
+    host.read_stamps();
     let mut resident = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
         resident.write(binding, &vec![0_u32; *words]).unwrap();

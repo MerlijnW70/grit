@@ -50,6 +50,7 @@ fn cost(host: &Host, width: u32, grid: Grid, coarse: bool) -> (u32, u32, Duratio
     let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
 
+    host.read_stamps();
     let mut resident = host.resident(&sizes, &modules).unwrap();
     for (binding, held) in sizes.iter().enumerate() {
         resident.write(binding, &vec![0_u32; *held]).unwrap();
@@ -299,6 +300,7 @@ fn the_cheaper_arrangement_is_the_one_the_clock_named() {
 
     let modules: Vec<&[u32]> = both.passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
+    host.read_stamps();
     let mut held = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
         held.write(binding, &vec![0_u32; *words]).unwrap();

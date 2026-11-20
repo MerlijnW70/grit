@@ -98,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(host) = Host::open()? else {
         return Err("no Vulkan device".into());
     };
+    host.read_stamps();
     let width = host.width();
     let groups = u32::try_from(INVOCATIONS)? / width;
     if groups > host.limits().groups {

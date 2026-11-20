@@ -57,6 +57,7 @@ const SWITCHED: [usize; 6] = [1, 2, 4, 8, 16, 32];
 fn switched(host: &Host, width: u32, n: usize, live: bool) -> f64 {
     let module = nothing(width).unwrap();
     let modules: Vec<&[u32]> = vec![&module; n];
+    host.read_stamps();
     let mut held = host.resident(&[4, 3 * n], &modules).unwrap();
     let mut counts = vec![0_u32; 3 * n];
     for i in 0..n {
@@ -87,6 +88,7 @@ fn switched(host: &Host, width: u32, n: usize, live: bool) -> f64 {
 fn spread(host: &Host, width: u32, n: usize, writes: bool) -> f64 {
     let module = nothing(width).unwrap();
     let modules: Vec<&[u32]> = vec![&module; n];
+    host.read_stamps();
     let mut held = host.resident(&[4, 3 * n.max(1)], &modules).unwrap();
     let mut counts = vec![0_u32; 3 * n];
     for i in 0..n {
@@ -126,6 +128,7 @@ fn what_a_submission_costs_before_it_holds_anything() {
     let width = host.width();
     let module = nothing(width).unwrap();
     let every: Vec<&[u32]> = vec![&module; PASSES];
+    host.read_stamps();
     let mut held = host.resident(&[1], &every).unwrap();
     held.write(0, &[0]).unwrap();
 

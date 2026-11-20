@@ -67,6 +67,7 @@ fn a_frame_can_be_taken_apart_stage_by_stage() {
     let one = mark(width).unwrap();
     let two = bump(width).unwrap();
     let modules: Vec<&[u32]> = vec![&one, &one, &one, &two];
+    host.read_stamps();
     let mut held = host.resident(&[4], &modules).unwrap();
     held.write(0, &[0, 0, 0, 0]).unwrap();
 
@@ -103,6 +104,7 @@ fn a_frame_at_the_last_stage_that_profiles_is_timed_all_the_way_down() {
     let module = bump(width).unwrap();
     let many = grit::resident::STAGES;
     let modules: Vec<&[u32]> = vec![&module; many];
+    host.read_stamps();
     let mut held = host.resident(&[4], &modules).unwrap();
     held.write(0, &[0, 0, 0, 0]).unwrap();
 
@@ -498,6 +500,7 @@ fn a_stage_with_nothing_left_in_it_is_not_a_stage_that_is_timed() {
     let width = host.width();
     let module = bump(width).unwrap();
     let modules: Vec<&[u32]> = vec![&module, &module, &module];
+    host.read_stamps();
     let mut held = host.resident(&[4], &modules).unwrap();
     held.write(0, &[0, 0, 0, 0]).unwrap();
 
@@ -602,6 +605,7 @@ fn the_time_a_repeated_frame_reports_is_the_time_of_one_of_them() {
     };
     let width = host.width();
     let module = bump(width).unwrap();
+    host.read_stamps();
     let mut held = host.resident(&[4], &[&module]).unwrap();
     held.write(0, &[0, 0, 0, 0]).unwrap();
 

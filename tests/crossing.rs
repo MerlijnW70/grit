@@ -111,6 +111,7 @@ fn priced(host: &Host, width: u32, grid: Grid, coarse: bool, frames: u32) -> Pri
     let sizes = plan.sizes();
 
     let clock = Instant::now();
+    host.read_stamps();
     let mut resident = host.resident(&sizes, &modules).unwrap();
     let made = clock.elapsed();
 
@@ -271,6 +272,7 @@ fn by_measurement(host: &Host, width: u32, grid: Grid, frames: u32, budget: u32)
     let both = grit::live::both(width, grid, &plan, None).unwrap();
     let modules: Vec<&[u32]> = both.passes.iter().map(Vec::as_slice).collect();
     let sizes = plan.sizes();
+    host.read_stamps();
     let mut resident = host.resident(&sizes, &modules).unwrap();
     seeded(&mut resident, grid, &plan, &sizes);
 

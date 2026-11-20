@@ -788,6 +788,7 @@ fn round_of(host: &Host, shape: Netlist, many: u32, rounds: u32) -> Vec<Sent> {
         many as usize,
         1,
     ];
+    host.read_stamps();
     let mut resident = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
         resident.write(binding, &vec![0_u32; *words]).unwrap();

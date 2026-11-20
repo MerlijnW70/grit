@@ -173,6 +173,7 @@ fn what_a_tick_costs() {
     let modules: Vec<&[u32]> = vec![&tick];
     let stage: Vec<Groups> = vec![Groups::Fixed(1)];
 
+    host.read_stamps();
     let mut held = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
         held.write(binding, &vec![0_u32; *words]).unwrap();

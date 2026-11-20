@@ -96,6 +96,7 @@ fn main() -> Result<(), Failed> {
         println!("no Vulkan device");
         return Ok(());
     };
+    host.read_stamps();
     match asked.rule.as_str() {
         "sand" => run(&host, &Sand, &sanded(), &asked),
         "heat" => run(&host, &Heat, &heated(), &asked),

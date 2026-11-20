@@ -707,6 +707,7 @@ fn what_the_flag_costs() {
     let modules: Vec<&[u32]> = vec![&decay];
     let list: Vec<u32> = (0..plan.blocks).collect();
 
+    host.read_stamps();
     let mut held = host.resident(&sizes, &modules).unwrap();
     for (binding, words) in sizes.iter().enumerate() {
         held.write(binding, &vec![0_u32; *words]).unwrap();

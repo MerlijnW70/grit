@@ -2346,7 +2346,9 @@ fn reached(grid: Grid, slope: &[i32], at: usize) -> u32 {
 }
 
 fn device(host: Option<&Host>) -> Result<&Host, Box<dyn std::error::Error>> {
-    host.ok_or_else(|| Box::new(crate::host::Error::NoComputeDevice).into())
+    let host = host.ok_or_else(|| Box::new(crate::host::Error::NoComputeDevice))?;
+    host.read_stamps();
+    Ok(host)
 }
 
 fn slid(host: Option<&Host>, held: &Json) -> Result<Json, Box<dyn std::error::Error>> {

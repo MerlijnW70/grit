@@ -227,6 +227,7 @@ fn main() -> Result<(), Failed> {
         println!("no Vulkan device");
         return Ok(());
     };
+    host.read_stamps();
     if asked.engine {
         return engined(&host, &asked);
     }
