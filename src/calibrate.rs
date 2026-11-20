@@ -86,18 +86,12 @@ pub fn device(host: &Host) -> Device {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Meter<'host> {
-    Stamps,
-    Cpu(&'host cpu::Driver),
-}
+pub type Meter<'host> = &'host cpu::Driver;
 
 #[must_use]
 pub fn meter(host: &Host) -> Option<Meter<'_>> {
     if host.on_cpu() {
-        host.driver_threads().map(Meter::Cpu)
-    } else if host.timed() {
-        Some(Meter::Stamps)
+        host.driver_threads()
     } else {
         None
     }

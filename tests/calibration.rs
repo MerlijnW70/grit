@@ -306,10 +306,9 @@ mod device {
 
     use grit::Host;
     use grit::branch::{Made, World};
-    use grit::calibrate::take::{COPY_LARGE, Plan, Solved, measured, plan};
+    use grit::calibrate::take::{COPY_LARGE, PLAN, Plan, Solved, measured};
     use grit::calibrate::{
-        self, FILE, Key, Meter, Rate, Sample, Table, faults, held, inject, load, read, shared,
-        taken,
+        self, FILE, Key, Rate, Sample, Table, faults, held, inject, load, read, shared, taken,
     };
     use grit::clock::{Fake, Time};
     use grit::serve3::budget::world_cost;
@@ -477,7 +476,7 @@ mod device {
                 let made = Made {
                     rule: "sand",
                     params: &[],
-                    size: plan(calibrate::meter(&host).unwrap()).large,
+                    size: PLAN.large,
                     sparse: false,
                     slots: None,
                 };
@@ -832,19 +831,18 @@ mod device {
             took.as_millis()
         );
         let table = read(&got.table);
-        let Some(meter) = calibrate::meter(&host) else {
-            assert!(table.is_empty());
-            return;
-        };
-        let plan = plan(meter);
-        if let Meter::Stamps = meter {
+        if calibrate::meter(&host).is_none() {
             assert!(
-                table
-                    .rates()
-                    .all(|(key, _)| matches!(key, Key::Frame { sparse: false, .. })),
-                "on a GPU only dense frames have a sound source"
+                table.is_empty(),
+                "a device without a sound time source keeps every rate unknown"
             );
+            eprintln!(
+                "C4 {}: no sound time source, every rate stays unknown",
+                device.name
+            );
+            return;
         }
+        let plan = PLAN;
         let mut failures = Vec::new();
         let mut checked = 0;
         for (key, rate) in table.rates() {

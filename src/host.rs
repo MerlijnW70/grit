@@ -929,11 +929,6 @@ impl Host {
         self.threads.as_ref()
     }
 
-    #[must_use]
-    pub const fn timed(&self) -> bool {
-        self.timing
-    }
-
     pub(crate) unsafe fn submit(
         &self,
         _turn: &Turn<'_>,

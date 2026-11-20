@@ -633,7 +633,6 @@ pub struct Resident<'host> {
     poked: u64,
     patience: Duration,
     device: Option<Duration>,
-    ticks: Option<(u64, u64)>,
     spans: Vec<Duration>,
     reused: u64,
     warmed: Duration,
@@ -993,7 +992,6 @@ impl<'host> Resident<'host> {
             poked: 0,
             patience: Resident::patience_of(std::env::var("GRIT_PATIENCE_SECS").ok().as_deref()),
             device: None,
-            ticks: None,
             spans: Vec::new(),
             reused: 0,
             warmed: Duration::ZERO,
@@ -2074,7 +2072,6 @@ impl Resident<'_> {
             slot.flight = None;
         }
         self.device = self.timed(at);
-        self.ticks = self.ticked(at);
         self.spans = self.split(at);
         Ok((began.elapsed(), out, at))
     }
@@ -2146,24 +2143,6 @@ impl Resident<'_> {
                 Duration::from_nanos((ticks as f64 * f64::from(tick)) as u64)
             })
             .collect()
-    }
-
-    #[must_use]
-    pub const fn on_device_ticks(&self) -> Option<(u64, u64)> {
-        self.ticks
-    }
-
-    fn ticked(&self, at: usize) -> Option<(u64, u64)> {
-        let pool = self.slots.get(at)?.queries?;
-        let mut stamps = [0_u64; 2];
-        unsafe {
-            self.host
-                .device()
-                .get_query_pool_results(pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64)
-                .ok()?;
-        }
-        let [first, last] = stamps;
-        (last >= first).then_some((first, last))
     }
 
     fn timed(&self, at: usize) -> Option<Duration> {

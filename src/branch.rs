@@ -896,16 +896,6 @@ impl<'host> World<'host> {
     }
 
     #[must_use]
-    pub const fn on_device(&self) -> Option<std::time::Duration> {
-        self.live.on_device()
-    }
-
-    #[must_use]
-    pub const fn on_device_ticks(&self) -> Option<(u64, u64)> {
-        self.live.on_device_ticks()
-    }
-
-    #[must_use]
     pub const fn host(&self) -> &'host Host {
         self.host
     }

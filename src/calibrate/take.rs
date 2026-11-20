@@ -21,23 +21,12 @@ pub struct Plan {
     pub frames: u32,
 }
 
-#[must_use]
-pub const fn plan(meter: Meter<'_>) -> Plan {
-    match meter {
-        Meter::Stamps => Plan {
-            small: [64, 64, 64],
-            large: [128, 128, 128],
-            sparse: LARGE,
-            frames: 32,
-        },
-        Meter::Cpu(_) => Plan {
-            small: SMALL,
-            large: LARGE,
-            sparse: LARGE,
-            frames: 8,
-        },
-    }
-}
+pub const PLAN: Plan = Plan {
+    small: SMALL,
+    large: LARGE,
+    sparse: LARGE,
+    frames: 8,
+};
 
 pub const COPY_LARGE: [u32; 3] = [96, 96, 96];
 
@@ -65,22 +54,14 @@ const fn made<'made>(
 }
 
 fn timed<T>(
-    meter: Meter<'_>,
+    driver: Meter<'_>,
     run: impl FnOnce() -> Result<T, Failed>,
 ) -> Result<(T, Option<Duration>), Failed> {
-    match meter {
-        Meter::Cpu(driver) => {
-            let from = driver.mark();
-            faults::held();
-            let out = run()?;
-            let to = driver.closing();
-            Ok((out, from.zip(to).map(|(from, to)| driver.between(from, to))))
-        }
-        Meter::Stamps => {
-            faults::held();
-            Ok((run()?, None))
-        }
-    }
+    let from = driver.mark();
+    faults::held();
+    let out = run()?;
+    let to = driver.closing();
+    Ok((out, from.zip(to).map(|(from, to)| driver.between(from, to))))
 }
 
 fn least(held: &mut Option<Sample>, units: u64, submits: u32, time: Option<Duration>) {
@@ -129,10 +110,9 @@ fn spread(world: &World<'_>, count: usize) -> Vec<([u32; 3], u32)> {
 }
 
 fn ran(world: &mut World<'_>, meter: Meter<'_>, size: [u32; 3]) -> Result<Option<Sample>, Failed> {
-    let frames = plan(meter).frames;
+    let frames = PLAN.frames;
     world.step(1)?;
     let mut best = None;
-    let mut spans = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         let cells = match world.pool() {
             Some(pool) => {
@@ -142,43 +122,9 @@ fn ran(world: &mut World<'_>, meter: Meter<'_>, size: [u32; 3]) -> Result<Option
             None => cells_of(size),
         };
         let ((), time) = timed(meter, || world.step(frames))?;
-        let time = match meter {
-            Meter::Cpu(_) => time,
-            Meter::Stamps => {
-                spans.push(world.on_device_ticks());
-                world.on_device().map(|frame| frame * frames)
-            }
-        };
         least(&mut best, cells.saturating_mul(u64::from(frames)), 1, time);
     }
-    if let Meter::Stamps = meter
-        && !kept_busy(&spans)
-    {
-        return Ok(None);
-    }
     Ok(best)
-}
-
-#[must_use]
-pub fn kept_busy(spans: &[Option<(u64, u64)>]) -> bool {
-    let Some(spans) = spans.iter().copied().collect::<Option<Vec<_>>>() else {
-        return false;
-    };
-    let busy: u64 = spans
-        .iter()
-        .map(|(first, last)| last.saturating_sub(*first))
-        .sum();
-    let mut idle = 0_u64;
-    for pair in spans.windows(2) {
-        let [(_, last), (next, _)] = pair else {
-            return false;
-        };
-        let Some(gap) = next.checked_sub(*last) else {
-            return false;
-        };
-        idle = idle.saturating_add(gap);
-    }
-    !spans.is_empty() && idle <= busy
 }
 
 fn frames(
@@ -193,7 +139,7 @@ fn frames(
         large,
         sparse: spread_over,
         ..
-    } = plan(meter);
+    } = PLAN;
     if sparse {
         let Ok(mut world) = World::create(host, &made(rule, params, spread_over, true)) else {
             return Ok(None);
@@ -355,42 +301,36 @@ pub fn measured(host: &Host) -> Result<BTreeMap<Key, Solved>, Failed> {
         return Ok(found);
     };
     let _sole = host.sole()?;
-    let layouts: &[bool] = match meter {
-        Meter::Stamps => &[false],
-        Meter::Cpu(_) => &[false, true],
-    };
     for rule in crate::serve3::rules_on(Some(host)) {
         let params = vec![0_u32; rule.params()];
-        for &sparse in layouts {
+        for sparse in [false, true] {
             if let Some(solved) = frames(host, meter, (rule.name(), &params), sparse)? {
                 found.insert(Key::rule(rule.name(), sparse), solved);
             }
         }
     }
-    if let Meter::Cpu(_) = meter {
-        for sparse in [false, true] {
-            let built = pair(&[
-                built(host, meter, (SMALL, 2), sparse)?,
-                built(host, meter, (COPY_LARGE, 1), sparse)?,
-            ]);
-            if let Some(solved) = built {
-                found.insert(Key::Build { sparse }, solved);
-            }
-            if let Some(solved) = written(host, meter, sparse)? {
-                found.insert(Key::Write { sparse }, solved);
-            }
+    for sparse in [false, true] {
+        let built = pair(&[
+            built(host, meter, (SMALL, 2), sparse)?,
+            built(host, meter, (COPY_LARGE, 1), sparse)?,
+        ]);
+        if let Some(solved) = built {
+            found.insert(Key::Build { sparse }, solved);
         }
-        for (key, how, repeats) in [
-            (Key::Fork, Copying::Fork, [4, 1]),
-            (Key::Restore, Copying::Restore, [4, 1]),
-        ] {
-            let copies = pair(&[
-                copied(host, meter, (SMALL, repeats[0]), how)?,
-                copied(host, meter, (COPY_LARGE, repeats[1]), how)?,
-            ]);
-            if let Some(solved) = copies {
-                found.insert(key, solved);
-            }
+        if let Some(solved) = written(host, meter, sparse)? {
+            found.insert(Key::Write { sparse }, solved);
+        }
+    }
+    for (key, how, repeats) in [
+        (Key::Fork, Copying::Fork, [4, 1]),
+        (Key::Restore, Copying::Restore, [4, 1]),
+    ] {
+        let copies = pair(&[
+            copied(host, meter, (SMALL, repeats[0]), how)?,
+            copied(host, meter, (COPY_LARGE, repeats[1]), how)?,
+        ]);
+        if let Some(solved) = copies {
+            found.insert(key, solved);
         }
     }
     Ok(found)

@@ -872,7 +872,6 @@ struct Sound<'host> {
     needed: bool,
     total: Option<Duration>,
     mark: Option<crate::calibrate::cpu::Mark>,
-    spans: Vec<Option<(u64, u64)>>,
 }
 
 impl<'host> Sound<'host> {
@@ -884,7 +883,6 @@ impl<'host> Sound<'host> {
             needed,
             total: Some(Duration::ZERO),
             mark: None,
-            spans: Vec::new(),
         }
     }
 
@@ -895,25 +893,20 @@ impl<'host> Sound<'host> {
         };
     }
 
-    fn after(&mut self, world: &World<'_>, frames: u32) {
-        if self.cpu.is_none() {
-            self.spans.push(world.on_device_ticks());
-        }
-        let measured = crate::calibrate::scripted_sound().unwrap_or_else(|| match self.cpu {
-            Some(driver) => self
-                .mark
-                .take()
-                .zip(driver.closing())
-                .map(|(from, to)| driver.between(from, to)),
-            None => world.on_device().map(|frame| frame * frames),
+    fn after(&mut self) {
+        let measured = crate::calibrate::scripted_sound().unwrap_or_else(|| {
+            self.cpu.and_then(|driver| {
+                self.mark
+                    .take()
+                    .zip(driver.closing())
+                    .map(|(from, to)| driver.between(from, to))
+            })
         });
         self.total = self.total.zip(measured).map(|(all, one)| all + one);
     }
 
     fn taken(&self) -> Option<(Duration, bool)> {
-        let first = self.cpu.is_some()
-            || (self.spans.len() >= 2 && crate::calibrate::take::kept_busy(&self.spans));
-        self.total.map(|total| (total, first))
+        self.total.map(|total| (total, true))
     }
 }
 
@@ -1023,7 +1016,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             failure = Some(why);
             break;
         }
-        sound.after(&server.world(held)?.world, step);
+        sound.after();
         ran = ran.saturating_add(took);
         if wedged_after(server, batch) {
             failure = Some(Box::new(crate::host::Error::Wedged { after: took }));
