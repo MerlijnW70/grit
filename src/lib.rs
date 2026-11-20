@@ -2,10 +2,7 @@ pub mod bake;
 pub mod batch;
 pub mod board;
 pub mod bricks;
-#[cfg(feature = "faults")]
 pub mod clock;
-#[cfg(not(feature = "faults"))]
-pub(crate) mod clock;
 pub mod compact;
 pub mod gate;
 pub mod geometry;
