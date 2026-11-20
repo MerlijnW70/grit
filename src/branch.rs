@@ -895,6 +895,26 @@ impl<'host> World<'host> {
         self.seen
     }
 
+    #[must_use]
+    pub const fn on_device(&self) -> Option<std::time::Duration> {
+        self.live.on_device()
+    }
+
+    #[must_use]
+    pub const fn on_device_ticks(&self) -> Option<(u64, u64)> {
+        self.live.on_device_ticks()
+    }
+
+    #[must_use]
+    pub const fn host(&self) -> &'host Host {
+        self.host
+    }
+
+    #[cfg(feature = "faults")]
+    pub const fn forget_bricks(&mut self) {
+        self.seen = None;
+    }
+
     pub fn write(&mut self, cells: &[([u32; 3], u32)]) -> Result<(), Failed> {
         self.write_plane(0, cells)
     }

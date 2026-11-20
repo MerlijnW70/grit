@@ -417,7 +417,25 @@ impl From<simdr::lanes::LaneError> for Error {
 }
 
 pub(crate) struct Turn<'host> {
-    _held: std::sync::MutexGuard<'host, ()>,
+    _held: std::sync::MutexGuard<'host, Option<std::thread::ThreadId>>,
+}
+
+pub struct Sole<'host> {
+    host: &'host Host,
+    _forming: crate::resident::Forming,
+}
+
+impl Drop for Sole<'_> {
+    fn drop(&mut self) {
+        let mut held = self
+            .host
+            .ordered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *held = None;
+        drop(held);
+        self.host.calm.notify_all();
+    }
 }
 
 pub struct Host {
@@ -432,7 +450,8 @@ pub struct Host {
     /// from one host will submit from two threads and be allowed to. What that
     /// costs is measurable -- two of six parallel runs of `tests/dispatch.rs`
     /// at a subgroup of 16 came back with a pass having run once too often.
-    ordered: std::sync::Mutex<()>,
+    ordered: std::sync::Mutex<Option<std::thread::ThreadId>>,
+    calm: std::sync::Condvar,
     family: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
     name: String,
@@ -441,6 +460,8 @@ pub struct Host {
     timing: bool,
     wedged: AtomicBool,
     on_cpu: bool,
+    driver: u32,
+    threads: Option<crate::calibrate::cpu::Driver>,
     stamps_read: AtomicBool,
     owing: AtomicUsize,
     sparse: bool,
@@ -535,6 +556,8 @@ impl Host {
 
     fn made(pattern: Option<&str>, presenting: bool) -> Result<Option<Self>, Error> {
         let _forming = crate::resident::forming();
+        let before = crate::calibrate::cpu::seen();
+        let creator = crate::calibrate::cpu::own_name();
         let entry = match unsafe { ash::Entry::load() } {
             Ok(entry) => entry,
             Err(ash::LoadingError::LibraryLoadFailure(_)) => return Ok(None),
@@ -554,7 +577,18 @@ impl Host {
             Err(code) => return Err(Error::NoInstance(code)),
         };
 
-        unsafe { Self::on(entry, instance, pattern, windowed) }.map(Some)
+        let mut host = unsafe { Self::on(entry, instance, pattern, windowed) }?;
+        if host.on_cpu
+            && let Some(creator) = creator
+        {
+            host.threads = crate::calibrate::cpu::Driver::found(
+                &before,
+                &crate::calibrate::cpu::seen(),
+                &creator,
+                crate::calibrate::cpu::lanes(),
+            );
+        }
+        Ok(Some(host))
     }
 
     #[must_use]
@@ -673,6 +707,7 @@ impl Host {
         let (tick, timing) = unsafe { timestamps(&instance, physical, family) };
         let on_cpu = unsafe { instance.get_physical_device_properties(physical) }.device_type
             == vk::PhysicalDeviceType::CPU;
+        let driver = unsafe { instance.get_physical_device_properties(physical) }.driver_version;
 
         let priorities = [1.0_f32];
         let has = unsafe { instance.get_physical_device_features(physical) };
@@ -732,7 +767,8 @@ impl Host {
             instance,
             device,
             queue,
-            ordered: std::sync::Mutex::new(()),
+            ordered: std::sync::Mutex::new(None),
+            calm: std::sync::Condvar::new(),
             family,
             memory,
             name,
@@ -740,6 +776,8 @@ impl Host {
             tick,
             timing,
             on_cpu,
+            driver,
+            threads: None,
             sparse,
             strict,
             int64,
@@ -838,12 +876,62 @@ impl Host {
     /// A poisoned lock is taken anyway: it guards an order, not a value, and a
     /// panic in one thread is no reason for every later submission to refuse.
     pub(crate) fn ordered(&self) -> Turn<'_> {
-        Turn {
-            _held: self
-                .ordered
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        let me = std::thread::current().id();
+        let mut held = self
+            .ordered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while held.is_some_and(|sole| sole != me) {
+            held = self
+                .calm
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        Turn { _held: held }
+    }
+
+    pub fn sole(&self) -> Result<Sole<'_>, Error> {
+        let forming = crate::resident::forming_sole();
+        let me = std::thread::current().id();
+        let mut held = self
+            .ordered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while held.is_some_and(|sole| sole != me) {
+            held = self
+                .calm
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *held = Some(me);
+        let idle = unsafe { self.device.queue_wait_idle(self.queue) };
+        drop(held);
+        let sole = Sole {
+            host: self,
+            _forming: forming,
+        };
+        idle?;
+        Ok(sole)
+    }
+
+    #[must_use]
+    pub const fn on_cpu(&self) -> bool {
+        self.on_cpu
+    }
+
+    #[must_use]
+    pub const fn driver_version(&self) -> u32 {
+        self.driver
+    }
+
+    #[must_use]
+    pub const fn driver_threads(&self) -> Option<&crate::calibrate::cpu::Driver> {
+        self.threads.as_ref()
+    }
+
+    #[must_use]
+    pub const fn timed(&self) -> bool {
+        self.timing
     }
 
     pub(crate) unsafe fn submit(

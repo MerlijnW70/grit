@@ -269,6 +269,7 @@ pub struct Book {
     epochs: u64,
     writing: Option<Writing>,
     time: Arc<dyn Time>,
+    calibration: Option<crate::calibrate::Shared>,
     #[cfg(feature = "faults")]
     faults: Arc<std::sync::Mutex<Faults>>,
 }
@@ -302,6 +303,7 @@ pub struct Faults {
     pub held_replays: u32,
     pub held_by: Duration,
     pub stray_walk: bool,
+    pub forget_bricks: bool,
     pub wedge_after_runs: Option<u64>,
     pub stall_every: Duration,
     pub idle_done: u32,
@@ -394,6 +396,7 @@ impl Book {
             epochs: 0,
             writing: None,
             time,
+            calibration: None,
             #[cfg(feature = "faults")]
             faults: Arc::default(),
         })
@@ -427,6 +430,7 @@ impl Book {
             epochs: 0,
             writing: None,
             time,
+            calibration: None,
             #[cfg(feature = "faults")]
             faults: Arc::default(),
         }
@@ -435,6 +439,17 @@ impl Book {
     #[must_use]
     pub fn time(&self) -> Arc<dyn Time> {
         Arc::clone(&self.time)
+    }
+
+    #[must_use]
+    pub fn calibrated(mut self, table: crate::calibrate::Shared) -> Self {
+        self.calibration = Some(table);
+        self
+    }
+
+    #[must_use]
+    pub fn calibration(&self) -> Option<crate::calibrate::Table> {
+        self.calibration.as_ref().map(crate::calibrate::read)
     }
 
     #[cfg(feature = "faults")]
@@ -917,6 +932,58 @@ impl<'host> Server<'host> {
     }
 
     #[must_use]
+    pub fn calibration(&self) -> Option<crate::calibrate::Table> {
+        self.book.calibration()
+    }
+
+    pub(super) fn knows(&self, key: &crate::calibrate::Key) -> bool {
+        self.book.calibration.as_ref().is_none_or(|shared| {
+            shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .table()
+                .rate(key)
+                .is_some()
+        })
+    }
+
+    pub(super) fn sampled(
+        &self,
+        key: &crate::calibrate::Key,
+        work: (u64, u32),
+        wall: Duration,
+        sound: Option<(Duration, bool)>,
+    ) {
+        let Some(shared) = self.book.calibration.as_ref() else {
+            return;
+        };
+        let mut held = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (units, submits) = work;
+        if let Some((time, first)) = sound {
+            held.lower(
+                key,
+                crate::calibrate::Sample {
+                    units,
+                    submits,
+                    time,
+                },
+                first,
+            );
+        }
+        held.lower(
+            key,
+            crate::calibrate::Sample {
+                units,
+                submits,
+                time: wall,
+            },
+            false,
+        );
+    }
+
+    #[must_use]
     pub fn tally(&self, kind: cost::Priced) -> cost::Cost {
         self.book.stats.priced.of(kind)
     }
@@ -942,6 +1009,11 @@ impl<'host> Server<'host> {
         }
         let was_lost = book.lost;
         book.lost = false;
+        if book.calibration.is_none()
+            && let Some(host) = host
+        {
+            book.calibration = crate::calibrate::shared(&crate::calibrate::device(host));
+        }
         let clock = Clock::of(book.time(), book.time.now(), budget::BUDGET_MS);
         let mut server = Self {
             host,
