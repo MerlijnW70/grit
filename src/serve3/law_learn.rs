@@ -61,6 +61,7 @@ pub enum Point {
     Calibration,
     Build,
     Submission,
+    Submitted,
     Expansion,
     Count,
 }
@@ -72,6 +73,7 @@ impl Point {
             Self::Calibration => "calibration",
             Self::Build => "build",
             Self::Submission => "submission",
+            Self::Submitted => "submitted",
             Self::Expansion => "expansion",
             Self::Count => "count",
         }
@@ -83,8 +85,9 @@ impl Point {
             Self::Calibration => 0,
             Self::Build => 1,
             Self::Submission => 2,
-            Self::Expansion => 3,
-            Self::Count => 4,
+            Self::Submitted => 3,
+            Self::Expansion => 4,
+            Self::Count => 5,
         }
     }
 }
@@ -112,7 +115,7 @@ pub mod faults {
         static KERNEL: Cell<usize> = const { Cell::new(0) };
         static BUILT: Cell<u64> = const { Cell::new(0) };
         static SUBMITTED: Cell<u64> = const { Cell::new(0) };
-        static REACHED: Cell<[u64; 5]> = const { Cell::new([0; 5]) };
+        static REACHED: Cell<[u64; 6]> = const { Cell::new([0; 6]) };
         static PASSED: RefCell<Passed> = const { RefCell::new(None) };
         static CEILING: Cell<Option<u64>> = const { Cell::new(None) };
         static SLOW: Cell<Duration> = const { Cell::new(Duration::ZERO) };
@@ -222,12 +225,13 @@ pub mod faults {
     pub(super) const fn kernel(_: usize) {}
 
     #[cfg(feature = "faults")]
-    pub(super) fn submitting() {
+    pub(super) fn submitted() {
         SUBMITTED.set(SUBMITTED.get().saturating_add(1));
+        passing(Point::Submitted);
     }
 
     #[cfg(not(feature = "faults"))]
-    pub(super) const fn submitting() {}
+    pub(super) const fn submitted() {}
 
     #[cfg(feature = "faults")]
     #[must_use]
@@ -257,7 +261,7 @@ pub mod faults {
         KERNEL.set(0);
         BUILT.set(0);
         SUBMITTED.set(0);
-        REACHED.set([0; 5]);
+        REACHED.set([0; 6]);
     }
 
     #[cfg(feature = "faults")]
@@ -368,11 +372,11 @@ impl Watch<'_> {
 
 impl Halt for Watch<'_> {
     fn halted(&mut self) -> bool {
-        if self.braked(Point::Submission) {
-            return true;
-        }
-        faults::submitting();
-        false
+        self.braked(Point::Submission)
+    }
+
+    fn submitted(&mut self) {
+        faults::submitted();
     }
 
     fn building(&mut self) -> bool {

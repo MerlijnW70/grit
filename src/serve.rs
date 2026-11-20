@@ -568,6 +568,7 @@ pub fn walked(
         let began = std::time::Instant::now();
         let round = submits.submitted(step)?;
         longest = longest.max(began.elapsed());
+        halt.submitted();
         pace.learn(round);
         gone += step;
     }
@@ -592,6 +593,8 @@ pub trait Halt {
     }
 
     fn kernel(&mut self, _: usize) {}
+
+    fn submitted(&mut self) {}
 }
 
 pub struct Never;

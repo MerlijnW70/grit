@@ -1175,7 +1175,7 @@ mod faulted {
         grit::Resident::patience_of(std::env::var("GRIT_PATIENCE_SECS").ok().as_deref())
     }
 
-    fn frozen(host: &Host) -> (Json, [u64; 5], u64, u64) {
+    fn frozen(host: &Host) -> (Json, [u64; 6], u64, u64) {
         let (mut mcp, fake) = timed(host);
         disarm();
         rounds_each_submission(1);
@@ -1184,6 +1184,7 @@ mod faulted {
             Point::Calibration,
             Point::Build,
             Point::Submission,
+            Point::Submitted,
             Point::Expansion,
             Point::Count,
         ]
@@ -1473,6 +1474,7 @@ mod faulted {
         let (calibrated, built, submitted) = (counts[0], counts[1], counts[2]);
         assert_eq!(built, made, "every build point was followed by a build");
         assert_eq!(submitted, sent, "every submission point by a submission");
+        assert_eq!(counts[3], sent, "every submission was counted once");
         assert!(
             built >= 4 && submitted >= 200,
             "{built} builds, {submitted} submissions"
@@ -1524,13 +1526,15 @@ mod faulted {
             return;
         };
         let (_, counts, _, sent) = frozen(&host);
-        assert_eq!(counts[2], sent);
-        for ordinal in [25, sent / 50 / 2 * 50 + 17] {
-            let (_, at, _, after) = braked_at(&host, Point::Submission, ordinal);
+        assert_eq!(counts[3], sent);
+        for ordinal in [24, sent / 50 / 2 * 50 + 17] {
+            let (_, at, _, after) = braked_at(&host, Point::Submitted, ordinal);
             assert_eq!(at, ordinal + 1);
             assert_eq!(
-                after, ordinal,
-                "the deadline passed before submission {ordinal}, inside a look of 50"
+                after,
+                ordinal + 1,
+                "the deadline passed during submission {}, inside a look of 50, and a later one started",
+                ordinal + 1
             );
         }
     }
@@ -1541,9 +1545,9 @@ mod faulted {
             return;
         };
         let (full, counts, _, _) = frozen(&host);
-        assert!(counts[4] >= 1, "the count was checked");
+        assert!(counts[5] >= 1, "the count was checked");
         let (got, at, _, _) = braked_at(&host, Point::Count, 0);
-        assert_eq!(at, counts[4]);
+        assert_eq!(at, counts[5]);
         assert_eq!(written(&result(&got, false)), written(&full));
     }
 
