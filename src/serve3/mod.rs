@@ -1079,7 +1079,8 @@ impl<'host> Server<'host> {
         )?;
         let built = self
             .replayed_world(host, &ledger, &mut pace, bytes)
-            .and_then(|world| {
+            .and_then(|mut world| {
+                world.pool_use()?;
                 let rule = law::listed(host, &world)?;
                 Ok(Live { world, rule })
             });
