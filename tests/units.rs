@@ -1044,4 +1044,41 @@ mod served {
             assert_eq!(again.costs(), pure_costs(again), "world {number}");
         }
     }
+
+    #[test]
+    fn review_r1_a_sparse_step_right_after_a_rebuild() {
+        let Some(host) = common::device("review r1") else {
+            return;
+        };
+        let per = brick_cells(&host);
+        let mut units = Vec::new();
+        for rebuilt in [false, true] {
+            let dir = scratch(if rebuilt { "review-r1b" } else { "review-r1a" });
+            let fake = Arc::new(Fake::new());
+            let mut server = timed(&host, &kept(&dir), &fake);
+            let (world, _) = sparse(&mut server);
+            let after = call(&mut server, "grit_world_write", &cells(world, 20, 32, 3));
+            let held = held_bricks(&after);
+            let number = u32::try_from(world).unwrap();
+            if rebuilt {
+                let book = server.into_book();
+                server = Server::resumed(Some(&host), book).0;
+            }
+            let told = step(&mut server, world, 30);
+            let ledger = server.ledger(number).unwrap().clone();
+            let last = *ledger.costs().last().unwrap();
+            eprintln!(
+                "R1 rebuilt={rebuilt} per={per} held_before={held} last={last:?} restored={:?} tally={:?}",
+                told.get("restored").map(written),
+                told.get("tally").map(written)
+            );
+            let read = Keep::at(&dir).unwrap().earlier();
+            eprintln!("R1 journal costs={:?}", read[0].1.costs());
+            units.push(last.units);
+        }
+        assert_eq!(
+            units[0], units[1],
+            "the same step of the same world state has one price"
+        );
+    }
 }
