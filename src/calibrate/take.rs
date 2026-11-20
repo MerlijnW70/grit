@@ -283,7 +283,6 @@ fn written(host: &Host, meter: Meter<'_>, sparse: bool) -> Result<Option<Solved>
 enum Copying {
     Fork,
     Restore,
-    Image,
 }
 
 fn copied(
@@ -295,7 +294,7 @@ fn copied(
     let mut source = World::create(host, &made("sand", &[], size, false))?;
     let mut target = match how {
         Copying::Restore => Some(World::create(host, &made("sand", &[], size, false))?),
-        Copying::Fork | Copying::Image => None,
+        Copying::Fork => None,
     };
     let units = world_cost(source.sizes());
     let mut best = None;
@@ -320,15 +319,6 @@ fn copied(
                 .1
             }
             (Copying::Restore, None) => None,
-            (Copying::Image, _) => {
-                let (images, time) = timed(meter, || {
-                    (0..repeats)
-                        .map(|_| source.image())
-                        .collect::<Result<Vec<_>, _>>()
-                })?;
-                drop(images);
-                time
-            }
         };
         least(
             &mut best,
@@ -393,7 +383,6 @@ pub fn measured(host: &Host) -> Result<BTreeMap<Key, Solved>, Failed> {
         for (key, how, repeats) in [
             (Key::Fork, Copying::Fork, [4, 1]),
             (Key::Restore, Copying::Restore, [4, 1]),
-            (Key::Snapshot { file: false }, Copying::Image, [16, 4]),
         ] {
             let copies = pair(&[
                 copied(host, meter, (SMALL, repeats[0]), how)?,
