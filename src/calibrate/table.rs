@@ -191,14 +191,9 @@ impl Rate {
         }
         let per_unit = t1.mul_add(s2, -(t2 * s1)) / det;
         let per_submit = u1.mul_add(t2, -(u2 * t1)) / det;
-        if !per_unit.is_finite() || per_unit <= 0.0 {
+        if !per_unit.is_finite() || per_unit <= 0.0 || per_submit < 0.0 {
             return None;
         }
-        let (per_unit, per_submit) = if per_submit < 0.0 {
-            ((t1 / u1).min(t2 / u2), 0.0)
-        } else {
-            (per_unit, per_submit)
-        };
         let rate = Self {
             per_unit_fs: floored(per_unit * FEMTOS as f64)?,
             per_submit_ns: floored(per_submit)?,

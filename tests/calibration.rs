@@ -135,6 +135,22 @@ fn two_sizes_solve_to_the_terms_that_made_them() {
         "a larger run that took no longer gives no per-unit term: unknown"
     );
     assert_eq!(Rate::solved(flat, flat), None);
+    assert_eq!(
+        Rate::solved(
+            Sample {
+                units: 1 << 24,
+                submits: 16,
+                time: Duration::from_millis(2),
+            },
+            Sample {
+                units: 1 << 26,
+                submits: 4,
+                time: Duration::from_millis(64),
+            }
+        ),
+        None,
+        "two sizes that need a negative fixed term do not fit the model: unknown"
+    );
 }
 
 #[test]
@@ -771,15 +787,15 @@ mod device {
                 }
                 (u64::from(count), u32::try_from(calls).unwrap())
             }
-            Key::Fork | Key::Restore | Key::Snapshot { file: false } => {
+            Key::Fork | Key::Restore => {
                 let mut source = World::create(host, &sand(false)).unwrap();
                 let mut target = World::create(host, &sand(false)).unwrap();
                 for _ in 0..3 {
                     let began = Instant::now();
-                    match key {
-                        Key::Fork => drop(source.fork().unwrap()),
-                        Key::Restore => target.restore(&mut source).unwrap(),
-                        _ => drop(source.image().unwrap()),
+                    if *key == Key::Fork {
+                        drop(source.fork().unwrap());
+                    } else {
+                        target.restore(&mut source).unwrap();
                     }
                     times.push(began.elapsed());
                 }
