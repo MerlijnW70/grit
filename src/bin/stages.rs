@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(host) = Host::open()? else {
         return Ok(());
     };
+    host.read_stamps();
     let width = host.width();
     println!("{} {width}", host.name());
 
