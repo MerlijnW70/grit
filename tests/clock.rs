@@ -581,6 +581,14 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/live.rs", "::now(", "cheaper", 2),
     ("src/live.rs", ".elapsed()", "cheaper", 2),
     ("src/resident.rs", "use Instant", "", 1),
+    (
+        "src/resident.rs",
+        "Instant::now",
+        "Host::buffers_in_with",
+        1,
+    ),
+    ("src/resident.rs", "::now(", "Host::buffers_in_with", 1),
+    ("src/resident.rs", ".elapsed()", "Host::buffers_in_with", 1),
     ("src/resident.rs", "Instant::now", "Resident::write", 1),
     ("src/resident.rs", "::now(", "Resident::write", 1),
     ("src/resident.rs", ".elapsed()", "Resident::write", 1),
@@ -605,13 +613,15 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/exec.rs", "sleep(", "watch", 1),
     ("src/serve3/exec.rs", "sleep(", "held_for_queued", 1),
     ("src/serve3/exec.rs", "recv_timeout(LANDING)", "work", 1),
+    ("src/serve3/law_learn.rs", ".warmed()", "calibrated", 1),
     ("src/serve3/mod.rs", "use Instant", "", 1),
     ("src/serve3/mod.rs", "real(", "Book::new", 1),
     ("src/serve3/mod.rs", "real(", "Book::empty", 1),
     ("src/serve3/mod.rs", "recv_timeout(left)", "Book::landed", 1),
 ];
 
-const SPELLED: [&str; 7] = [
+const SPELLED: [&str; 8] = [
+    ".warmed()",
     "Instant::now",
     "::now(",
     ".elapsed()",
