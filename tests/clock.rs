@@ -607,6 +607,7 @@ mod faked {
         );
         asked(&mut server, "grit_world_fork", &one(world, budget));
         asked(&mut server, "grit_world_open", &kept_world(budget));
+        asked(&mut server, "grit_describe", "{}");
         drop(server);
         let _ = std::fs::remove_dir_all(&root);
         (answers, took)
@@ -617,7 +618,7 @@ mod faked {
         let Some(host) = device("k2 waiting") else {
             return;
         };
-        let named = ["build", "write", "step", "fork", "replay"];
+        let named = ["build", "write", "step", "fork", "replay", "describe"];
         let mut plain = Vec::new();
         for budget in BUDGETS {
             let fake = Arc::new(Fake::new());
@@ -636,7 +637,7 @@ mod faked {
                     "{name} at budget {budget}: real time spent at the clock reads changed the answer"
                 );
                 assert!(
-                    took[at] >= FLOOR,
+                    *name == "describe" || took[at] >= FLOOR,
                     "{name} at budget {budget} took {:?}, under {FLOOR:?}",
                     took[at]
                 );
