@@ -648,7 +648,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     };
     let took = server.since(began);
     server.book.rates.measure(Work::build(sparse), bytes, took);
-    server.sampled(&Key::Build { sparse }, (bytes, 1), took, None);
+    server.sampled(&Key::Build { sparse }, (bytes, 0, 1), took, None);
     server.priced(build_cost(bytes));
     let id = server.number()?;
     let pace = first_pace(&world);
@@ -749,7 +749,7 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             .measure(Work::write(sparse), 16 * chunk as u64, took);
         server.sampled(
             &Key::Write { sparse },
-            (u64::try_from(chunk).unwrap_or(u64::MAX), 1),
+            (u64::try_from(chunk).unwrap_or(u64::MAX), 0, 1),
             took,
             None,
         );
@@ -1059,7 +1059,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if done > 0 && failure.is_none() && !fallback {
         server.sampled(
             &key,
-            (cells.saturating_mul(u64::from(done)), batch),
+            (cells.saturating_mul(u64::from(done)), done, batch),
             ran,
             sound.taken(),
         );

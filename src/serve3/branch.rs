@@ -558,7 +558,12 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let fork = live.world.fork()?;
     let took = server.since(began);
     server.book.rates.measure(work, source.bytes, took);
-    server.sampled(&crate::calibrate::Key::Fork, (source.bytes, 1), took, None);
+    server.sampled(
+        &crate::calibrate::Key::Fork,
+        (source.bytes, 0, 1),
+        took,
+        None,
+    );
     server.priced(fork_cost(source.bytes));
     let rule = super::law::listed(host, &fork)?;
     let id = server.number()?;
@@ -629,7 +634,7 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     done?;
     let took = server.since(began);
     server.book.rates.measure(work, size, took);
-    server.sampled(&crate::calibrate::Key::Restore, (size, 1), took, None);
+    server.sampled(&crate::calibrate::Key::Restore, (size, 0, 1), took, None);
     server.priced(restore_cost(size));
     let taken = server
         .book

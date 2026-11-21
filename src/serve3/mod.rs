@@ -954,7 +954,7 @@ impl<'host> Server<'host> {
     pub(super) fn sampled(
         &self,
         key: &crate::calibrate::Key,
-        work: (u64, u32),
+        work: (u64, u32, u32),
         wall: Duration,
         sound: Option<Duration>,
     ) {
@@ -964,26 +964,26 @@ impl<'host> Server<'host> {
         let mut held = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (units, submits) = work;
+        let (units, frames, submits) = work;
         if let Some(time) = sound {
             held.lower(
                 key,
                 crate::calibrate::Sample {
                     units,
+                    frames,
                     submits,
                     time,
                 },
-                false,
             );
         }
         held.lower(
             key,
             crate::calibrate::Sample {
                 units,
+                frames,
                 submits,
                 time: wall,
             },
-            false,
         );
     }
 

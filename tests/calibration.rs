@@ -6,6 +6,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use grit::calibrate::take::{Pass, Passes};
 use grit::calibrate::{Device, FILE, Key, Moved, Rate, Sample, Table, load};
 
 fn device_named(name: &str) -> Device {
@@ -74,7 +75,8 @@ fn random_table(rng: &mut Rng, device: Device) -> Table {
         table.set(
             key,
             Rate {
-                per_unit_fs: 1 + rng.below(1 << 40),
+                per_unit_fs: rng.below(1 << 40),
+                per_frame_ns: rng.below(1 << 32),
                 per_submit_ns: rng.below(1 << 32),
             },
         );
@@ -100,69 +102,136 @@ fn every_key_names_itself_back() {
     }
 }
 
-#[test]
-fn three_runs_solve_to_floor_terms() {
-    let rate = Rate {
-        per_unit_fs: 2_500,
-        per_submit_ns: 40_000,
-    };
-    let at = |units: u64, submits: u32| Sample {
-        units,
-        submits,
-        time: rate.predict(units, submits),
-    };
-    let small = at(262_144 * 8, 1);
-    let large = at(2_097_152 * 8, 1);
-    let short = at(262_144, 1);
-    let solved = Rate::floor(small, large, short).unwrap();
-    assert!(solved.per_unit_fs.abs_diff(2_500) <= 1, "{solved:?}");
-    assert!(solved.per_submit_ns.abs_diff(40_000) <= 1, "{solved:?}");
-    for point in [small, large, short] {
-        assert!(solved.predict(point.units, point.submits) <= point.time);
+fn framed(frames: u32, time: Duration) -> Sample {
+    Sample {
+        units: 262_144 * u64::from(frames),
+        frames,
+        submits: 1,
+        time,
     }
-    let per_frame = Duration::from_micros(12);
-    let framed = |units: u64, frames: u32| Sample {
-        units: units * u64::from(frames),
-        submits: 1,
-        time: rate.predict(units * u64::from(frames), 1) + per_frame * (frames - 1),
-    };
-    let solved = Rate::floor(framed(262_144, 8), framed(2_097_152, 8), framed(262_144, 1)).unwrap();
-    assert!(solved.per_unit_fs.abs_diff(2_500) <= 1, "{solved:?}");
+}
+
+#[test]
+fn two_runs_solve_to_floor_terms() {
+    let first = Duration::from_nanos(6_700);
+    let further = Duration::from_nanos(6_155);
+    let at = |frames: u32| framed(frames, first + further * (frames - 1));
+    let rate = Rate::framed(at(1), at(32)).unwrap();
+    assert_eq!(
+        rate,
+        Rate {
+            per_unit_fs: 0,
+            per_frame_ns: 6_155,
+            per_submit_ns: 6_700,
+        }
+    );
+    for frames in [1_u32, 2, 8, 32, 64, 1000] {
+        assert_eq!(
+            rate.predict(262_144 * u64::from(frames), frames, 1),
+            at(frames).time,
+            "{frames} frames"
+        );
+    }
+    assert_eq!(
+        rate.predict(1 << 40, 1, 1),
+        first,
+        "no rate grows with cells"
+    );
+    assert_eq!(
+        rate.predict(0, 64, 2),
+        first * 2 + further * 62,
+        "a step of F frames in S submits is S per-submit and F - S per-frame terms"
+    );
+    assert_eq!(
+        rate.predict(0, 1, 3),
+        first * 3,
+        "fewer frames than submits"
+    );
+    let flat = Rate::framed(at(1), framed(32, first / 2)).unwrap();
+    assert_eq!(flat.per_frame_ns, 0, "a per-frame term is never below 0");
+    assert_eq!(flat.per_submit_ns, 6_700);
+    for wrong in [
+        (at(2), at(32)),
+        (at(1), at(1)),
+        (
+            Sample {
+                submits: 2,
+                ..at(1)
+            },
+            at(32),
+        ),
+        (
+            at(1),
+            Sample {
+                submits: 2,
+                ..at(32)
+            },
+        ),
+        (framed(1, Duration::ZERO), at(32)),
+        (at(1), framed(32, Duration::ZERO)),
+    ] {
+        assert_eq!(Rate::framed(wrong.0, wrong.1), None, "{wrong:?}");
+    }
+    let empty = Sample { units: 0, ..at(32) };
     assert!(
-        solved.per_submit_ns.abs_diff(40_000) <= 1,
-        "the fixed term comes from the one-frame run: {solved:?}"
+        empty.valid(),
+        "a sample of a world with no brick held is valid"
     );
+    assert!(Rate::framed(Sample { units: 0, ..at(1) }, empty).is_some());
+}
+
+fn pass(short: u64, long: u64) -> Pass {
+    Pass {
+        short: framed(1, Duration::from_nanos(short)),
+        long: framed(32, Duration::from_nanos(long)),
+    }
+}
+
+#[test]
+fn a_first_rate_needs_two_passes_that_agree() {
+    let key = Key::rule("sand", false);
+    let other = Key::rule("sand", true);
+    let keys = [key.clone(), other.clone()];
+    let slow = pass(13_000, 400_000);
+    let fast = pass(6_700, 197_000);
+    let near = pass(7_000, 210_000);
+    let mut passes = Passes::default();
+    passes.add(&key, slow);
+    assert_eq!(passes.agreed(&key), None, "one pass is not a rate");
+    passes.add(&key, fast);
+    assert_eq!(passes.agreed(&key), None, "slow then fast do not agree");
     assert!(
-        solved.predict(2_097_152 * 64, 1) < framed(2_097_152, 64).time,
-        "a long step is under-predicted by its extra frame overheads"
+        passes.solved().is_empty(),
+        "slow, fast and then out of budget stores nothing"
     );
-    let flat = Sample {
-        units: 2_097_152,
-        submits: 1,
-        time: Duration::from_micros(10),
-    };
-    let wide = Sample {
-        units: 262_144,
-        submits: 1,
-        time: Duration::from_micros(11),
-    };
-    let unresolved = Rate::floor(wide, flat, wide).unwrap();
+    passes.add(&key, near);
+    let (rate, samples) = passes.agreed(&key).unwrap();
+    assert_eq!(rate.per_submit_ns, 6_700, "the least over the two passes");
+    assert_eq!(rate.per_frame_ns, (197_000 - 6_700) / 31);
     assert_eq!(
-        unresolved.per_unit_fs, 0,
-        "a per-unit term the sizes do not resolve is stored as zero"
+        samples,
+        vec![
+            framed(1, Duration::from_nanos(6_700)),
+            framed(32, Duration::from_nanos(197_000))
+        ]
     );
-    assert!(unresolved.per_submit_ns > 0);
-    let same = Rate::floor(flat, flat, flat).unwrap();
-    assert_eq!(
-        same.per_unit_fs, 0,
-        "two sizes with the same units resolve no per-unit term"
-    );
-    assert!(same.predict(flat.units, flat.submits) <= flat.time);
-    assert_eq!(
-        Rate::floor(at(1, 1), at(512, 16), at(1, 1)),
-        None,
-        "the two sizes must have the same submits"
-    );
+    assert!(!passes.settled(&keys), "a key with no pass is not settled");
+    passes.add(&other, fast);
+    passes.add(&other, pass(6_700, 247_000));
+    assert!(!passes.settled(&keys), "1.254x apart at the long point");
+    passes.add(&other, pass(6_700, 246_000));
+    assert!(passes.settled(&keys));
+    assert_eq!(passes.solved().len(), 2);
+    passes.add(&key, slow);
+    assert_eq!(passes.agreed(&key), None, "only the last two passes count");
+    assert!(!passes.settled(&keys));
+    let agree = grit::calibrate::take::agree;
+    assert!(agree(Duration::from_nanos(4), Duration::from_nanos(5)));
+    assert!(!agree(
+        Duration::from_nanos(4_000),
+        Duration::from_nanos(5_001)
+    ));
+    assert!(!agree(Duration::ZERO, Duration::ZERO));
 }
 
 #[test]
@@ -175,6 +244,7 @@ fn c2_scripted_samples_never_raise_a_rate() {
             key.clone(),
             Rate {
                 per_unit_fs: 5_000_000,
+                per_frame_ns: 60_000,
                 per_submit_ns: 100_000,
             },
         );
@@ -184,20 +254,24 @@ fn c2_scripted_samples_never_raise_a_rate() {
         let key = &keys[usize::try_from(rng.below(keys.len() as u64)).unwrap()];
         let sample = Sample {
             units: rng.below(1 << 30),
+            frames: u32::try_from(rng.below(200)).unwrap(),
             submits: u32::try_from(rng.below(100)).unwrap(),
             time: Duration::from_nanos(rng.below(10_000_000_000)),
         };
-        let sound = rng.below(2) == 0;
         let before = table.rate(key).unwrap();
-        let moved = table.lower(key, sample, sound);
+        let moved = table.lower(key, sample);
         let after = table.rate(key).unwrap();
         assert!(
-            after.per_unit_fs <= before.per_unit_fs && after.per_submit_ns <= before.per_submit_ns,
+            after.per_unit_fs <= before.per_unit_fs
+                && after.per_frame_ns <= before.per_frame_ns
+                && after.per_submit_ns <= before.per_submit_ns,
             "round {round}: {before:?} rose to {after:?} on {sample:?}"
         );
-        for units in [1_u64, 1 << 10, 1 << 20, 1 << 30, 1 << 40] {
-            for submits in [0_u32, 1, 64] {
-                assert!(after.predict(units, submits) <= before.predict(units, submits));
+        for units in [0_u64, 1, 1 << 10, 1 << 20, 1 << 30, 1 << 40] {
+            for (frames, submits) in [(0_u32, 0_u32), (1, 1), (64, 1), (64, 2), (1000, 16)] {
+                assert!(
+                    after.predict(units, frames, submits) <= before.predict(units, frames, submits)
+                );
             }
         }
         match moved {
@@ -205,12 +279,11 @@ fn c2_scripted_samples_never_raise_a_rate() {
                 lowered += 1;
                 assert!(sample.valid(), "round {round}");
                 assert!(
-                    after.predict(sample.units, sample.submits) <= sample.time,
+                    after.predict(sample.units, sample.frames, sample.submits) <= sample.time,
                     "round {round}: lowered to {after:?}, still above {sample:?}"
                 );
             }
             Moved::Unchanged => assert_eq!(before, after, "round {round}"),
-            Moved::First => panic!("round {round}: a known rate was set again"),
         }
     }
     assert!(
@@ -219,32 +292,47 @@ fn c2_scripted_samples_never_raise_a_rate() {
     );
     let mut empty = Table::new(device_named("unknown"));
     let key = Key::rule("sand", false);
-    let sample = Sample {
-        units: 1 << 20,
-        submits: 1,
-        time: Duration::from_millis(3),
-    };
-    assert_eq!(empty.lower(&key, sample, false), Moved::Unchanged);
-    assert_eq!(empty.rate(&key), None, "wall time never sets a first rate");
-    for invalid in [
-        Sample { units: 0, ..sample },
+    for sample in [
+        framed(8, Duration::from_millis(3)),
+        framed(8, Duration::from_nanos(1)),
+        framed(8, Duration::ZERO),
         Sample {
-            time: Duration::ZERO,
-            ..sample
+            units: 0,
+            ..framed(8, Duration::from_millis(3))
         },
     ] {
-        assert_eq!(empty.lower(&key, invalid, true), Moved::Unchanged);
-        assert_eq!(empty.rate(&key), None);
+        assert_eq!(empty.lower(&key, sample), Moved::Unchanged);
+        assert_eq!(empty.rate(&key), None, "a sample never sets a first rate");
     }
-    assert_eq!(empty.lower(&key, sample, true), Moved::First);
-    let first = empty.rate(&key).unwrap();
-    assert!(first.predict(sample.units, sample.submits) <= sample.time);
-    let slower = Sample {
-        time: Duration::from_millis(30),
-        ..sample
+    let known = Rate {
+        per_unit_fs: 0,
+        per_frame_ns: 6_000,
+        per_submit_ns: 7_000,
     };
-    assert_eq!(empty.lower(&key, slower, true), Moved::Unchanged);
-    assert_eq!(empty.rate(&key), Some(first));
+    empty.set(key.clone(), known);
+    assert_eq!(
+        empty.lower(&key, framed(8, Duration::from_millis(3))),
+        Moved::Unchanged,
+        "a slower sample leaves the rate"
+    );
+    assert_eq!(
+        empty.lower(&key, framed(8, Duration::ZERO)),
+        Moved::Unchanged
+    );
+    assert_eq!(empty.rate(&key), Some(known));
+    assert_eq!(
+        empty.lower(&key, framed(8, Duration::from_nanos(24_500))),
+        Moved::Lowered
+    );
+    assert_eq!(
+        empty.rate(&key),
+        Some(Rate {
+            per_unit_fs: 0,
+            per_frame_ns: 3_000,
+            per_submit_ns: 3_500,
+        }),
+        "a sample of half the predicted time halves every term"
+    );
 }
 
 #[test]
@@ -280,7 +368,8 @@ fn c3_a_damaged_or_foreign_file_is_refused_by_name() {
     table.set(
         Key::rule("sand", false),
         Rate {
-            per_unit_fs: 123_456,
+            per_unit_fs: 0,
+            per_frame_ns: 123_456,
             per_submit_ns: 7_890,
         },
     );
@@ -295,11 +384,21 @@ fn c3_a_damaged_or_foreign_file_is_refused_by_name() {
     refused(&dir, &device, "checksum");
     std::fs::write(
         &path,
-        whole.replace("\"calibration\":1", "\"calibration\":2"),
+        whole.replace("\"calibration\":2", "\"calibration\":3"),
     )
     .unwrap();
-    refused(&dir, &device, "version 2");
-    std::fs::write(&path, whole.replace("\"calibration\":1,", "")).unwrap();
+    refused(&dir, &device, "version 3");
+    let older = whole
+        .replace("\"calibration\":2", "\"calibration\":1")
+        .replace(",\"per_frame_ns\":123456", "");
+    assert_ne!(older, whole);
+    std::fs::write(&path, older).unwrap();
+    refused(
+        &dir,
+        &device,
+        "is calibration version 1, and this server reads version 2",
+    );
+    std::fs::write(&path, whole.replace("\"calibration\":2,", "")).unwrap();
     refused(&dir, &device, "no calibration version");
     let other = random_table(&mut rng, device_named("another card"));
     other.save(&dir).unwrap();
@@ -314,8 +413,8 @@ mod device {
     use std::time::{Duration, Instant};
 
     use grit::calibrate::{
-        self, Device, FILE, Key, Rate, Table, faults, held, inject, load, read, shared, still,
-        taken,
+        self, Device, FILE, Key, Rate, Table, faults, held, inject, load, missing, read, shared,
+        still, taken, up_front,
     };
     use grit::clock::{Fake, Time};
     use grit::serve3::{Book, Server};
@@ -360,7 +459,8 @@ mod device {
         let dense = Key::rule("sand", false);
         let sparse = Key::rule("sand", true);
         let high = Rate {
-            per_unit_fs: 1_000_000_000_000,
+            per_unit_fs: 0,
+            per_frame_ns: 1_000_000_000,
             per_submit_ns: 1_000_000_000,
         };
         let mut table = Table::new(calibrate::device(&host));
@@ -393,7 +493,9 @@ mod device {
             call(&mut server, "grit_world_step", &step);
             let now = rate_of(&server, &dense).unwrap();
             assert!(
-                now.per_unit_fs <= last.per_unit_fs && now.per_submit_ns <= last.per_submit_ns,
+                now.per_unit_fs <= last.per_unit_fs
+                    && now.per_frame_ns <= last.per_frame_ns
+                    && now.per_submit_ns <= last.per_submit_ns,
                 "round {round}: {last:?} rose to {now:?}"
             );
             if now != last {
@@ -440,7 +542,7 @@ mod device {
         );
         faults::script([]);
         assert!(
-            rate_of(&server, &sparse).unwrap().per_unit_fs < before.per_unit_fs,
+            rate_of(&server, &sparse).unwrap().per_frame_ns < before.per_frame_ns,
             "the same step with its bricks known is a sample and lowers the rate"
         );
         let heat = Key::rule("heat", false);
@@ -477,7 +579,8 @@ mod device {
             ..mine.clone()
         };
         let old = Rate {
-            per_unit_fs: 7,
+            per_unit_fs: 0,
+            per_frame_ns: 7,
             per_submit_ns: 7,
         };
         let mut foreign = Table::new(other);
@@ -493,7 +596,8 @@ mod device {
         own.set(
             Key::rule("sand", false),
             Rate {
-                per_unit_fs: 9,
+                per_unit_fs: 0,
+                per_frame_ns: 9,
                 per_submit_ns: 9,
             },
         );
@@ -522,7 +626,8 @@ mod device {
         let _alone = alone();
         let key = Key::rule("sand", false);
         let high = Rate {
-            per_unit_fs: 1_000_000_000_000,
+            per_unit_fs: 0,
+            per_frame_ns: 1_000_000_000,
             per_submit_ns: 1_000_000_000,
         };
         let mut table = Table::new(calibrate::device(&host));
@@ -567,7 +672,8 @@ mod device {
         table.set(
             Key::rule("sand", false),
             Rate {
-                per_unit_fs: 1,
+                per_unit_fs: 0,
+                per_frame_ns: 1,
                 per_submit_ns: 2,
             },
         );
@@ -583,7 +689,8 @@ mod device {
         other.set(
             Key::Fork,
             Rate {
-                per_unit_fs: 3,
+                per_unit_fs: 0,
+                per_frame_ns: 3,
                 per_submit_ns: 4,
             },
         );
@@ -618,6 +725,71 @@ mod device {
         let again = taken(&host, Some(&dir)).unwrap();
         assert!(!again.calibrated && again.refused.is_none());
         assert_eq!(read(&again.table), fresh);
+        calibrate::forget(&device);
+    }
+
+    #[test]
+    fn an_incomplete_calibration_is_never_stored() {
+        let Some(host) = common::device("incomplete") else {
+            return;
+        };
+        let _alone = alone();
+        if host.on_cpu() {
+            assert!(up_front(&host).is_empty());
+            return;
+        }
+        let device = calibrate::device(&host);
+        calibrate::forget(&device);
+        let dir = scratch("incomplete");
+        faults::device_wait(Some(Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(2500));
+        })));
+        let began = Instant::now();
+        let gave_up = std::panic::catch_unwind(|| taken(&host, Some(&dir)));
+        faults::device_wait(None);
+        let gave_up = gave_up.unwrap().unwrap();
+        eprintln!("a calibration that gave up took {:?}", began.elapsed());
+        assert!(gave_up.calibrated);
+        let partial = read(&gave_up.table);
+        assert!(
+            !missing(&partial, &host).is_empty(),
+            "the device-wait hook did not make the calibration give up: {partial:?}"
+        );
+        assert!(
+            !dir.join(FILE).exists(),
+            "a table that lacks an up-front key was written"
+        );
+        let again = taken(&host, Some(&dir)).unwrap();
+        assert!(
+            again.calibrated,
+            "an incomplete table in memory is calibrated again"
+        );
+        let whole = read(&again.table);
+        assert_eq!(
+            missing(&whole, &host),
+            Vec::<Key>::new(),
+            "a quiet calibration knows every up-front key"
+        );
+        assert_eq!(load(&dir, &device), Ok(Some(whole.clone())));
+        calibrate::forget(&device);
+        let first = up_front(&host)[0].clone();
+        let mut lacking = Table::new(device.clone());
+        for (key, rate) in whole.rates() {
+            if *key != first {
+                lacking.set(key.clone(), *rate);
+            }
+        }
+        lacking.save(&dir).unwrap();
+        let reloaded = taken(&host, Some(&dir)).unwrap();
+        let why = reloaded.refused.clone().unwrap();
+        assert!(
+            why.starts_with(FILE)
+                && why.contains(&first.name())
+                && why.contains("calibrated again"),
+            "{why}"
+        );
+        assert!(reloaded.calibrated);
+        assert!(missing(&read(&reloaded.table), &host).is_empty());
         calibrate::forget(&device);
     }
 }

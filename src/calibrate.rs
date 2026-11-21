@@ -15,6 +15,7 @@ pub struct Held {
     table: Table,
     dir: Option<PathBuf>,
     still: bool,
+    whole: bool,
 }
 
 impl Held {
@@ -28,11 +29,11 @@ impl Held {
         *self.table.device() == device(host)
     }
 
-    pub fn lower(&mut self, key: &Key, sample: Sample, sound: bool) -> Moved {
+    pub fn lower(&mut self, key: &Key, sample: Sample) -> Moved {
         if self.still {
             return Moved::Unchanged;
         }
-        let moved = self.table.lower(key, sample, sound);
+        let moved = self.table.lower(key, sample);
         if moved != Moved::Unchanged
             && let Some(dir) = &self.dir
         {
@@ -56,6 +57,7 @@ pub fn held(table: Table, dir: Option<&Path>) -> Shared {
         table,
         dir: dir.map(Path::to_path_buf),
         still: false,
+        whole: true,
     }))
 }
 
@@ -65,6 +67,7 @@ pub fn still(table: Table) -> Shared {
         table,
         dir: None,
         still: true,
+        whole: true,
     }))
 }
 
@@ -116,6 +119,34 @@ pub fn times(host: &Host) -> bool {
     !host.on_cpu() && host.timed()
 }
 
+#[must_use]
+pub fn up_front(host: &Host) -> Vec<Key> {
+    if !times(host) {
+        return Vec::new();
+    }
+    let layouts: &[bool] = if host.sparse() {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    crate::serve3::rules_on(Some(host))
+        .iter()
+        .flat_map(|rule| layouts.iter().map(|sparse| Key::rule(rule.name(), *sparse)))
+        .collect()
+}
+
+#[must_use]
+pub fn missing(table: &Table, host: &Host) -> Vec<Key> {
+    up_front(host)
+        .into_iter()
+        .filter(|key| table.rate(key).is_none())
+        .collect()
+}
+
+fn named(keys: &[Key]) -> String {
+    keys.iter().map(Key::name).collect::<Vec<_>>().join(", ")
+}
+
 #[derive(Debug)]
 pub struct Taken {
     pub table: Shared,
@@ -149,7 +180,9 @@ pub fn load(dir: &Path, device: &Device) -> Result<Option<Table>, String> {
 
 pub fn taken(host: &Host, dir: Option<&Path>) -> Result<Taken, crate::branch::Failed> {
     let device = device(host);
-    if let Some(table) = shared(&device) {
+    if let Some(table) = shared(&device)
+        && table.lock().unwrap_or_else(PoisonError::into_inner).whole
+    {
         return Ok(Taken {
             table,
             refused: None,
@@ -160,23 +193,37 @@ pub fn taken(host: &Host, dir: Option<&Path>) -> Result<Taken, crate::branch::Fa
     if let Some(dir) = dir {
         match load(dir, &device) {
             Ok(Some(table)) => {
-                let shared = held(table, Some(dir));
-                tables().insert(device, Arc::clone(&shared));
-                return Ok(Taken {
-                    table: shared,
-                    refused: None,
-                    calibrated: false,
-                });
+                let lacking = missing(&table, host);
+                if lacking.is_empty() {
+                    let shared = held(table, Some(dir));
+                    tables().insert(device, Arc::clone(&shared));
+                    return Ok(Taken {
+                        table: shared,
+                        refused: None,
+                        calibrated: false,
+                    });
+                }
+                refused = Some(format!(
+                    "{FILE} lacks the rates of {}, so it was ignored and the device calibrated again",
+                    named(&lacking)
+                ));
             }
             Ok(None) => {}
             Err(why) => refused = Some(why),
         }
     }
     let table = take::calibrated(host)?;
-    if let Some(dir) = dir {
+    let whole = missing(&table, host).is_empty();
+    let kept = dir.filter(|_| whole);
+    if let Some(dir) = kept {
         table.save(dir)?;
     }
-    let shared = held(table, dir);
+    let shared = Arc::new(Mutex::new(Held {
+        table,
+        dir: kept.map(Path::to_path_buf),
+        still: false,
+        whole,
+    }));
     tables().insert(device, Arc::clone(&shared));
     Ok(Taken {
         table: shared,

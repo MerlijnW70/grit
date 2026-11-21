@@ -6,7 +6,7 @@ use crate::wire::{self, Json, map, text};
 
 pub const FILE: &str = "calibration.json";
 
-pub const VERSION: i64 = 1;
+pub const VERSION: i64 = 2;
 
 const FEMTOS: u128 = 1_000_000;
 
@@ -131,6 +131,7 @@ impl Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
     pub units: u64,
+    pub frames: u32,
     pub submits: u32,
     pub time: Duration,
 }
@@ -138,81 +139,56 @@ pub struct Sample {
 impl Sample {
     #[must_use]
     pub const fn valid(&self) -> bool {
-        self.units > 0 && !self.time.is_zero()
+        !self.time.is_zero()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rate {
     pub per_unit_fs: u64,
+    pub per_frame_ns: u64,
     pub per_submit_ns: u64,
-}
-
-fn floored(value: f64) -> Option<u64> {
-    if !value.is_finite() || value < 0.0 || value >= u64::MAX as f64 {
-        return None;
-    }
-    Some(value.floor() as u64)
 }
 
 impl Rate {
     #[must_use]
-    pub fn nanos(&self, units: u64, submits: u32) -> u128 {
+    pub fn nanos(&self, units: u64, frames: u32, submits: u32) -> u128 {
+        let further = u128::from(frames.saturating_sub(submits));
         u128::from(units)
             .saturating_mul(u128::from(self.per_unit_fs))
             .div_euclid(FEMTOS)
             .saturating_add(u128::from(submits).saturating_mul(u128::from(self.per_submit_ns)))
+            .saturating_add(further.saturating_mul(u128::from(self.per_frame_ns)))
     }
 
     #[must_use]
-    pub fn predict(&self, units: u64, submits: u32) -> Duration {
-        Duration::from_nanos(u64::try_from(self.nanos(units, submits)).unwrap_or(u64::MAX))
+    pub fn predict(&self, units: u64, frames: u32, submits: u32) -> Duration {
+        Duration::from_nanos(u64::try_from(self.nanos(units, frames, submits)).unwrap_or(u64::MAX))
     }
 
     #[must_use]
-    pub fn floor(small: Sample, large: Sample, short: Sample) -> Option<Self> {
-        if [small, large, short].iter().any(|one| one.time.is_zero())
-            || small.submits != large.submits
-            || short.submits == 0
+    pub fn framed(short: Sample, long: Sample) -> Option<Self> {
+        if !short.valid()
+            || !long.valid()
+            || short.frames != 1
+            || short.submits != 1
+            || long.submits != 1
+            || long.frames <= 1
         {
             return None;
         }
-        let (u1, t1) = (small.units as f64, small.time.as_nanos() as f64);
-        let (u2, t2) = (large.units as f64, large.time.as_nanos() as f64);
-        let (u0, t0) = (short.units as f64, short.time.as_nanos() as f64);
-        let mut per_unit = if u2 > u1 {
-            ((t2 - t1) / (u2 - u1)).max(0.0)
-        } else {
-            0.0
-        };
-        for (units, time) in [(u0, t0), (u1, t1), (u2, t2)] {
-            if units > 0.0 {
-                per_unit = per_unit.min(time / units);
-            }
-        }
-        let per_submit = (per_unit.mul_add(-u0, t0) / f64::from(short.submits)).max(0.0);
-        let rate = Self {
-            per_unit_fs: floored(per_unit * FEMTOS as f64)?,
-            per_submit_ns: floored(per_submit)?,
-        };
-        (rate.per_unit_fs > 0 || rate.per_submit_ns > 0).then_some(rate)
-    }
-
-    #[must_use]
-    pub fn first(sample: Sample) -> Option<Self> {
-        if !sample.valid() {
-            return None;
-        }
-        let fs = sample
+        let first = short.time.as_nanos();
+        let further = long
             .time
             .as_nanos()
-            .saturating_mul(FEMTOS)
-            .div_euclid(u128::from(sample.units));
+            .saturating_sub(first)
+            .div_euclid(u128::from(long.frames - 1));
         let rate = Self {
-            per_unit_fs: u64::try_from(fs).ok()?,
-            per_submit_ns: 0,
+            per_unit_fs: 0,
+            per_frame_ns: u64::try_from(further).ok()?,
+            per_submit_ns: u64::try_from(first).ok()?,
         };
-        (rate.per_unit_fs > 0).then_some(rate)
+        (rate.per_submit_ns > 0).then_some(rate)
     }
 
     #[must_use]
@@ -220,7 +196,7 @@ impl Rate {
         if !sample.valid() {
             return None;
         }
-        let predicted = self.nanos(sample.units, sample.submits);
+        let predicted = self.nanos(sample.units, sample.frames, sample.submits);
         let taken = sample.time.as_nanos();
         if taken >= predicted || predicted == 0 {
             return None;
@@ -232,6 +208,7 @@ impl Rate {
         };
         let lower = Self {
             per_unit_fs: scaled(self.per_unit_fs),
+            per_frame_ns: scaled(self.per_frame_ns),
             per_submit_ns: scaled(self.per_submit_ns),
         };
         (lower != *self).then_some(lower)
@@ -248,7 +225,6 @@ pub struct Table {
 pub enum Moved {
     Unchanged,
     Lowered,
-    First,
 }
 
 impl Table {
@@ -288,24 +264,12 @@ impl Table {
         self.rates.is_empty()
     }
 
-    pub fn lower(&mut self, key: &Key, sample: Sample, sound: bool) -> Moved {
-        match self.rates.get(key).copied() {
-            Some(rate) => match rate.lowered(sample) {
-                Some(lower) => {
-                    self.rates.insert(key.clone(), lower);
-                    Moved::Lowered
-                }
-                None => Moved::Unchanged,
-            },
-            None if sound => match Rate::first(sample) {
-                Some(rate) => {
-                    self.rates.insert(key.clone(), rate);
-                    Moved::First
-                }
-                None => Moved::Unchanged,
-            },
-            None => Moved::Unchanged,
-        }
+    pub fn lower(&mut self, key: &Key, sample: Sample) -> Moved {
+        let Some(lower) = self.rates.get(key).and_then(|rate| rate.lowered(sample)) else {
+            return Moved::Unchanged;
+        };
+        self.rates.insert(key.clone(), lower);
+        Moved::Lowered
     }
 
     fn body(&self) -> Json {
@@ -327,6 +291,7 @@ impl Table {
                             map(vec![
                                 ("key", text(&key.name())),
                                 ("per_unit_fs", wide(rate.per_unit_fs)),
+                                ("per_frame_ns", wide(rate.per_frame_ns)),
                                 ("per_submit_ns", wide(rate.per_submit_ns)),
                             ])
                         })
@@ -388,6 +353,7 @@ impl Table {
                 .ok_or_else(|| format!("is damaged: {named:?} is not a rate key"))?;
             let rate = Rate {
                 per_unit_fs: large(one, "per_unit_fs")?,
+                per_frame_ns: large(one, "per_frame_ns")?,
                 per_submit_ns: large(one, "per_submit_ns")?,
             };
             if table.rates.insert(key, rate).is_some() {
