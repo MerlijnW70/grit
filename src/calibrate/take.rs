@@ -361,15 +361,26 @@ impl Warm<'_, '_> {
         loop {
             self.hold()?;
             let filler = self.fill()?;
+            let primer_from = world.frame();
             world.step(frames)?;
             let primer = self.note(world.on_device_ticks())?;
             faults::held();
+            let timed_from = world.frame();
             world.step(frames)?;
             faults::timed();
             let timed = self.note(world.on_device_ticks())?;
             self.tried = self.tried.saturating_add(1);
             if primed(filler, primer, timed, gap) && self.window.busy() {
                 self.counted = self.counted.saturating_add(1);
+                faults::primed(
+                    frames,
+                    (primer_from, timed_from, world.frame()),
+                    (
+                        primer.0.saturating_sub(filler.1),
+                        timed.0.saturating_sub(primer.1),
+                    ),
+                    gap,
+                );
                 return world
                     .on_device()
                     .map(|frame| frame * frames)

@@ -284,6 +284,38 @@ pub mod faults {
         TIMED.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Primed {
+        pub frames: u32,
+        pub primer_from: u32,
+        pub timed_from: u32,
+        pub until: u32,
+        pub gaps: (u64, u64),
+        pub limit: u64,
+    }
+
+    const PRIMED_MOST: usize = 100_000;
+
+    static PRIMED: Mutex<Vec<Primed>> = Mutex::new(Vec::new());
+
+    pub(crate) fn primed(frames: u32, counted: (u32, u32, u32), gaps: (u64, u64), limit: u64) {
+        let mut held = PRIMED.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.len() < PRIMED_MOST {
+            held.push(Primed {
+                frames,
+                primer_from: counted.0,
+                timed_from: counted.1,
+                until: counted.2,
+                gaps,
+                limit,
+            });
+        }
+    }
+
+    pub fn primed_runs() -> Vec<Primed> {
+        std::mem::take(&mut *PRIMED.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
     pub(crate) fn scripted() -> Option<Option<Duration>> {
         let mut held = SOUND.lock().unwrap_or_else(PoisonError::into_inner);
         if held.is_empty() {
@@ -302,6 +334,8 @@ pub(crate) mod faults {
     pub(crate) const fn waited() {}
 
     pub(crate) const fn timed() {}
+
+    pub(crate) const fn primed(_: u32, _: (u32, u32, u32), _: (u64, u64), _: u64) {}
 
     pub(crate) const fn scripted() -> Option<Option<Duration>> {
         None

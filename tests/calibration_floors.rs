@@ -464,6 +464,46 @@ mod device {
     }
 
     #[test]
+    fn c10_every_counted_run_was_primed_back_to_back() {
+        let Some(host) = gpu("c10") else {
+            return;
+        };
+        let _alone = alone();
+        let _ = faults::primed_runs();
+        let got = timed("c10", &host);
+        let runs = faults::primed_runs();
+        assert_eq!(
+            runs.len(),
+            got.counted as usize,
+            "one record per counted run"
+        );
+        assert!(!runs.is_empty());
+        let widest = runs
+            .iter()
+            .map(|one| one.gaps.0.max(one.gaps.1))
+            .max()
+            .unwrap();
+        eprintln!(
+            "C10 {}: {} counted runs, widest gap {widest} ticks, limit {} ticks",
+            host.name(),
+            runs.len(),
+            runs[0].limit
+        );
+        for one in &runs {
+            assert_eq!(
+                one.timed_from - one.primer_from,
+                one.frames,
+                "the same frames of the same world ran directly before the timed run: {one:?}"
+            );
+            assert_eq!(one.until - one.timed_from, one.frames, "{one:?}");
+            assert!(
+                one.gaps.0 <= one.limit && one.gaps.1 <= one.limit,
+                "a counted run had a gap above GAP: {one:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sparse_keys_are_calibrated_on_worlds_as_built() {
         let Some(host) = gpu("sparse as built") else {
             return;
