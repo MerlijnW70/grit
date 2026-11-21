@@ -13,6 +13,7 @@ mod faked {
 
     use grit::Host;
     use grit::clock::{Fake, Time};
+    use grit::serve3::law_learn::faults::{disarm, rounds_each_submission};
     use grit::serve3::{Options, Server};
     use grit::wire::{Json, read, written};
 
@@ -65,9 +66,12 @@ mod faked {
             "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{{\"name\":\"grit_law_learn\",\"arguments\":{}}}}}",
             arguments(budget)
         );
+        disarm();
+        rounds_each_submission(1);
         let began = Instant::now();
         let got = server.heard(&line).unwrap();
         let took = began.elapsed();
+        disarm();
         let told = got
             .get("result")
             .and_then(|result| result.get("structuredContent"))
