@@ -194,6 +194,28 @@ pub mod faults {
         held.reverse();
     }
 
+    static NOTES: Mutex<(String, Vec<String>)> = Mutex::new((String::new(), Vec::new()));
+
+    pub(crate) fn named(key: &str) {
+        let mut held = NOTES.lock().unwrap_or_else(PoisonError::into_inner);
+        key.clone_into(&mut held.0);
+    }
+
+    pub(crate) fn noted([own, serial, pool]: [u64; 3]) {
+        let mut held = NOTES.lock().unwrap_or_else(PoisonError::into_inner);
+        let line = format!(
+            "{} caller={own} serial={serial} pool_per_lane={pool} total={}",
+            held.0,
+            own.saturating_add(serial).saturating_add(pool)
+        );
+        held.1.push(line);
+    }
+
+    #[must_use]
+    pub fn notes() -> Vec<String> {
+        std::mem::take(&mut NOTES.lock().unwrap_or_else(PoisonError::into_inner).1)
+    }
+
     pub(crate) fn scripted() -> Option<Option<Duration>> {
         let mut held = SOUND.lock().unwrap_or_else(PoisonError::into_inner);
         if held.is_empty() {
@@ -208,6 +230,10 @@ pub(crate) mod faults {
     use std::time::Duration;
 
     pub(crate) const fn held() {}
+
+    pub(crate) const fn named(_: &str) {}
+
+    pub(crate) const fn noted(_: [u64; 3]) {}
 
     pub(crate) const fn scripted() -> Option<Option<Duration>> {
         None

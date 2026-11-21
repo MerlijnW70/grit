@@ -61,6 +61,9 @@ fn timed<T>(
     faults::held();
     let out = run()?;
     let to = driver.closing();
+    if let Some((from, to)) = from.zip(to) {
+        faults::noted(driver.parts(from, to));
+    }
     Ok((out, from.zip(to).map(|(from, to)| driver.between(from, to))))
 }
 
@@ -304,12 +307,14 @@ pub fn measured(host: &Host) -> Result<BTreeMap<Key, Solved>, Failed> {
     for rule in crate::serve3::rules_on(Some(host)) {
         let params = vec![0_u32; rule.params()];
         for sparse in [false, true] {
+            faults::named(&Key::rule(rule.name(), sparse).name());
             if let Some(solved) = frames(host, meter, (rule.name(), &params), sparse)? {
                 found.insert(Key::rule(rule.name(), sparse), solved);
             }
         }
     }
     for sparse in [false, true] {
+        faults::named(&Key::Build { sparse }.name());
         let built = pair(&[
             built(host, meter, (SMALL, 2), sparse)?,
             built(host, meter, (COPY_LARGE, 1), sparse)?,
@@ -317,6 +322,7 @@ pub fn measured(host: &Host) -> Result<BTreeMap<Key, Solved>, Failed> {
         if let Some(solved) = built {
             found.insert(Key::Build { sparse }, solved);
         }
+        faults::named(&Key::Write { sparse }.name());
         if let Some(solved) = written(host, meter, sparse)? {
             found.insert(Key::Write { sparse }, solved);
         }
@@ -325,6 +331,7 @@ pub fn measured(host: &Host) -> Result<BTreeMap<Key, Solved>, Failed> {
         (Key::Fork, Copying::Fork, [4, 1]),
         (Key::Restore, Copying::Restore, [4, 1]),
     ] {
+        faults::named(&key.name());
         let copies = pair(&[
             copied(host, meter, (SMALL, repeats[0]), how)?,
             copied(host, meter, (COPY_LARGE, repeats[1]), how)?,

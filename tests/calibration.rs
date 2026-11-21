@@ -389,6 +389,12 @@ mod device {
         }
     }
 
+    fn noted(label: &str) {
+        for line in faults::notes() {
+            eprintln!("{label} run {line}");
+        }
+    }
+
     fn calibrated(host: &Host) -> Option<BTreeMap<Key, Solved>> {
         if calibrate::meter(host).is_none() {
             eprintln!(
@@ -413,14 +419,17 @@ mod device {
             return;
         };
         let _alone = alone();
+        let _ = faults::notes();
         let Some(base) = calibrated(&host) else {
             return;
         };
+        noted("base");
         faults::hold(Some(Arc::new(|| {
             std::thread::sleep(Duration::from_millis(15));
         })));
         let held = measured(&host);
         faults::hold(None);
+        noted("contended");
         at_most_half_again("c1 hold", &base, &held.unwrap());
     }
 
@@ -430,9 +439,11 @@ mod device {
             return;
         };
         let _alone = alone();
+        let _ = faults::notes();
         let Some(base) = calibrated(&host) else {
             return;
         };
+        noted("base");
         let stop = Arc::new(AtomicBool::new(false));
         let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let load: Vec<_> = (0..2 * cores)
@@ -453,6 +464,7 @@ mod device {
             .collect();
         let loaded = measured(&host);
         stop.store(true, Ordering::Relaxed);
+        noted("contended");
         for one in load {
             let _ = one.join();
         }
@@ -466,9 +478,11 @@ mod device {
             return;
         };
         let _alone = alone();
+        let _ = faults::notes();
         let Some(base) = calibrated(&host) else {
             return;
         };
+        noted("base");
         let stop = AtomicBool::new(false);
         let steps = std::sync::atomic::AtomicU64::new(0);
         let loaded = std::thread::scope(|scope| {
@@ -491,6 +505,7 @@ mod device {
             }
             let loaded = measured(&host);
             stop.store(true, Ordering::Relaxed);
+            noted("contended");
             busy.join().unwrap();
             loaded
         });

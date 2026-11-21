@@ -155,10 +155,17 @@ impl Driver {
     }
 
     #[must_use]
+    pub fn parts(&self, from: Mark, to: Mark) -> [u64; 3] {
+        [
+            to.own.saturating_sub(from.own),
+            to.serial.saturating_sub(from.serial),
+            to.pool.saturating_sub(from.pool) / u64::from(self.lanes.max(1)),
+        ]
+    }
+
+    #[must_use]
     pub fn between(&self, from: Mark, to: Mark) -> Duration {
-        let own = to.own.saturating_sub(from.own);
-        let serial = to.serial.saturating_sub(from.serial);
-        let pool = to.pool.saturating_sub(from.pool) / u64::from(self.lanes.max(1));
+        let [own, serial, pool] = self.parts(from, to);
         Duration::from_nanos(own.saturating_add(serial).saturating_add(pool))
     }
 }
