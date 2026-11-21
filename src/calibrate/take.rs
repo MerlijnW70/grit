@@ -20,6 +20,10 @@ pub const FILLER: [u32; 3] = [128, 128, 128];
 
 pub const WORLD: [u32; 3] = [64, 64, 64];
 
+pub const SIDES: [u32; 3] = [16, 64, 256];
+
+pub const GAP: Duration = Duration::from_micros(500);
+
 pub const FRAMES: u32 = 32;
 
 pub type Solved = (Rate, Vec<Sample>);
@@ -53,7 +57,7 @@ fn frame_cells(world: &mut World<'_>) -> Result<u64, Failed> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Pass {
+pub struct Pair {
     pub short: Sample,
     pub long: Sample,
 }
@@ -64,7 +68,16 @@ pub fn agree(one: Duration, other: Duration) -> bool {
     low > 0 && high.saturating_mul(4) <= low.saturating_mul(5)
 }
 
-impl Pass {
+const fn follows(before: (u64, u64), after: (u64, u64), gap: u64) -> bool {
+    after.0 >= before.1 && after.0 - before.1 <= gap
+}
+
+#[must_use]
+pub const fn primed(filler: (u64, u64), primer: (u64, u64), timed: (u64, u64), gap: u64) -> bool {
+    follows(filler, primer, gap) && follows(primer, timed, gap)
+}
+
+impl Pair {
     #[must_use]
     pub fn agrees(&self, other: &Self) -> bool {
         agree(self.short.time, other.short.time) && agree(self.long.time, other.long.time)
@@ -83,6 +96,35 @@ impl Pass {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pass {
+    pub sizes: Vec<Pair>,
+}
+
+impl Pass {
+    #[must_use]
+    pub fn agrees(&self, other: &Self) -> bool {
+        !self.sizes.is_empty()
+            && self.sizes.len() == other.sizes.len()
+            && self
+                .sizes
+                .iter()
+                .zip(&other.sizes)
+                .all(|(one, two)| one.agrees(two))
+    }
+
+    fn least(&self, other: &Self) -> Self {
+        Self {
+            sizes: self
+                .sizes
+                .iter()
+                .zip(&other.sizes)
+                .map(|(one, two)| one.least(*two))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Passes {
     held: BTreeMap<Key, (Option<Pass>, Pass)>,
@@ -91,8 +133,10 @@ pub struct Passes {
 
 impl Passes {
     pub fn add(&mut self, key: &Key, pass: Pass) {
-        let before = self.held.get(key).map(|(_, last)| *last);
-        self.first.entry(key.clone()).or_insert(pass);
+        let before = self.held.remove(key).map(|(_, last)| last);
+        self.first
+            .entry(key.clone())
+            .or_insert_with(|| pass.clone());
         self.held.insert(key.clone(), (before, pass));
     }
 
@@ -104,8 +148,22 @@ impl Passes {
         if !before.agrees(last) {
             return None;
         }
-        let least = before.least(*last);
-        Rate::framed(least.short, least.long).map(|rate| (rate, vec![least.short, least.long]))
+        let least = before.least(last);
+        let pairs: Vec<(Sample, Sample)> = least
+            .sizes
+            .iter()
+            .map(|pair| (pair.short, pair.long))
+            .collect();
+        Rate::framed(&pairs).map(|rate| {
+            (
+                rate,
+                least
+                    .sizes
+                    .iter()
+                    .flat_map(|pair| [pair.short, pair.long])
+                    .collect(),
+            )
+        })
     }
 
     #[must_use]
@@ -136,6 +194,8 @@ pub struct Measured {
     pub first: BTreeMap<Key, Pass>,
     pub ended: Ended,
     pub passes: u32,
+    pub tried: u32,
+    pub counted: u32,
     pub warm: Duration,
     pub made: Duration,
     pub timed: Duration,
@@ -148,6 +208,8 @@ impl Measured {
             first: BTreeMap::new(),
             ended,
             passes: 0,
+            tried: 0,
+            counted: 0,
             warm: Duration::ZERO,
             made: Duration::ZERO,
             timed: Duration::ZERO,
@@ -252,6 +314,8 @@ struct Warm<'host, 'world> {
     filler: &'world mut World<'host>,
     since: Option<u64>,
     steps: u32,
+    tried: u32,
+    counted: u32,
 }
 
 impl Warm<'_, '_> {
@@ -260,7 +324,7 @@ impl Warm<'_, '_> {
         self.steps = 0;
     }
 
-    fn note(&mut self, span: Option<(u64, u64)>) -> Result<(), Stop> {
+    fn note(&mut self, span: Option<(u64, u64)>) -> Result<(u64, u64), Stop> {
         let Some((first, last)) = span else {
             return Err(Stop::Lost);
         };
@@ -274,10 +338,10 @@ impl Warm<'_, '_> {
         if self.clock.used > self.window.ticks(BUDGET) {
             return Err(Stop::Spent);
         }
-        Ok(())
+        Ok((first, last))
     }
 
-    fn fill(&mut self) -> Result<(), Stop> {
+    fn fill(&mut self) -> Result<(u64, u64), Stop> {
         self.filler.step(FRAMES)?;
         let span = self.filler.on_device_ticks();
         self.note(span)
@@ -293,14 +357,19 @@ impl Warm<'_, '_> {
 
     fn timed(&mut self, world: &mut World<'_>, frames: u32) -> Result<Duration, Stop> {
         self.begin();
+        let gap = self.window.ticks(GAP);
         loop {
             self.hold()?;
-            self.fill()?;
+            let filler = self.fill()?;
+            world.step(frames)?;
+            let primer = self.note(world.on_device_ticks())?;
             faults::held();
             world.step(frames)?;
             faults::timed();
-            self.note(world.on_device_ticks())?;
-            if self.window.busy() {
+            let timed = self.note(world.on_device_ticks())?;
+            self.tried = self.tried.saturating_add(1);
+            if primed(filler, primer, timed, gap) && self.window.busy() {
+                self.counted = self.counted.saturating_add(1);
                 return world
                     .on_device()
                     .map(|frame| frame * frames)
@@ -311,12 +380,10 @@ impl Warm<'_, '_> {
 }
 
 fn point(warm: &mut Warm<'_, '_>, world: &mut World<'_>, frames: u32) -> Result<Sample, Stop> {
-    let mut units = 0_u64;
+    let units = frame_cells(world)?.saturating_mul(u64::from(frames));
     let mut least: Option<Duration> = None;
     for _ in 0..RUNS {
-        let cells = frame_cells(world)?;
         let time = warm.timed(world, frames)?;
-        units = units.max(cells.saturating_mul(u64::from(frames)));
         least = Some(least.map_or(time, |held| held.min(time)));
     }
     Ok(Sample {
@@ -327,14 +394,18 @@ fn point(warm: &mut Warm<'_, '_>, world: &mut World<'_>, frames: u32) -> Result<
     })
 }
 
-fn pass(warm: &mut Warm<'_, '_>, world: &mut World<'_>) -> Result<Pass, Stop> {
-    Ok(Pass {
-        short: point(warm, world, 1)?,
-        long: point(warm, world, FRAMES)?,
-    })
+fn pass(warm: &mut Warm<'_, '_>, worlds: &mut [World<'_>]) -> Result<Pass, Stop> {
+    let mut sizes = Vec::with_capacity(worlds.len());
+    for world in worlds {
+        sizes.push(Pair {
+            short: point(warm, world, 1)?,
+            long: point(warm, world, FRAMES)?,
+        });
+    }
+    Ok(Pass { sizes })
 }
 
-fn prepared(host: &Host) -> Result<Vec<(Key, World<'_>)>, Failed> {
+fn prepared(host: &Host) -> Result<Vec<(Key, Vec<World<'_>>)>, Failed> {
     let rules = crate::serve3::rules_on(Some(host));
     let mut prepared = Vec::new();
     for key in super::up_front(host) {
@@ -349,9 +420,15 @@ fn prepared(host: &Host) -> Result<Vec<(Key, World<'_>)>, Failed> {
             continue;
         };
         let params = vec![0_u32; rule.params()];
-        if let Ok(mut world) = World::create(host, &made(name, &params, WORLD, *sparse)) {
-            world.step(1)?;
-            prepared.push((key, world));
+        let mut worlds = Vec::new();
+        for side in SIDES {
+            if let Ok(mut world) = World::create(host, &made(name, &params, [side; 3], *sparse)) {
+                world.step(1)?;
+                worlds.push(world);
+            }
+        }
+        if !worlds.is_empty() {
+            prepared.push((key, worlds));
         }
     }
     Ok(prepared)
@@ -380,6 +457,8 @@ pub fn measured(host: &Host) -> Result<Measured, Failed> {
         filler: &mut filler,
         since: None,
         steps: 0,
+        tried: 0,
+        counted: 0,
     };
     if let Some(span) = origin {
         warm.clock.add(span);
@@ -401,7 +480,7 @@ pub fn measured(host: &Host) -> Result<Measured, Failed> {
         for (key, world) in &mut worlds {
             match pass(&mut warm, world) {
                 Ok(one) => passes.add(key, one),
-                Err(Stop::Lost) => return Ok(Measured::none(Ended::Lost)),
+                Err(Stop::Lost) => break 'passes Ended::Lost,
                 Err(Stop::Spent) => break 'passes Ended::Spent,
                 Err(Stop::Failed(why)) => return Err(why),
             }
@@ -414,10 +493,16 @@ pub fn measured(host: &Host) -> Result<Measured, Failed> {
     let gap = warm.clock.gap;
     let used = warm.clock.used;
     Ok(Measured {
-        rates: passes.solved(),
+        rates: if ended == Ended::Lost {
+            BTreeMap::new()
+        } else {
+            passes.solved()
+        },
         first: passes.first,
         ended,
         passes: count,
+        tried: warm.tried,
+        counted: warm.counted,
         warm: warm
             .window
             .time(warmed.saturating_sub(before).saturating_sub(gap)),

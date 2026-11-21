@@ -6,7 +6,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use grit::calibrate::take::{Pass, Passes};
+use grit::calibrate::take::{GAP, Pair, Pass, Passes, primed};
 use grit::calibrate::{Device, FILE, Key, Moved, Rate, Sample, Table, load};
 
 fn device_named(name: &str) -> Device {
@@ -116,7 +116,7 @@ fn two_runs_solve_to_floor_terms() {
     let first = Duration::from_nanos(6_700);
     let further = Duration::from_nanos(6_155);
     let at = |frames: u32| framed(frames, first + further * (frames - 1));
-    let rate = Rate::framed(at(1), at(32)).unwrap();
+    let rate = Rate::framed(&[(at(1), at(32))]).unwrap();
     assert_eq!(
         rate,
         Rate {
@@ -147,7 +147,7 @@ fn two_runs_solve_to_floor_terms() {
         first * 3,
         "fewer frames than submits"
     );
-    let flat = Rate::framed(at(1), framed(32, first / 2)).unwrap();
+    let flat = Rate::framed(&[(at(1), framed(32, first / 2))]).unwrap();
     assert_eq!(flat.per_frame_ns, 0, "a per-frame term is never below 0");
     assert_eq!(flat.per_submit_ns, 6_700);
     for wrong in [
@@ -170,21 +170,126 @@ fn two_runs_solve_to_floor_terms() {
         (framed(1, Duration::ZERO), at(32)),
         (at(1), framed(32, Duration::ZERO)),
     ] {
-        assert_eq!(Rate::framed(wrong.0, wrong.1), None, "{wrong:?}");
+        assert_eq!(Rate::framed(&[wrong]), None, "{wrong:?}");
     }
     let empty = Sample { units: 0, ..at(32) };
     assert!(
         empty.valid(),
         "a sample of a world with no brick held is valid"
     );
-    assert!(Rate::framed(Sample { units: 0, ..at(1) }, empty).is_some());
+    assert!(Rate::framed(&[(Sample { units: 0, ..at(1) }, empty)]).is_some());
+    assert_eq!(Rate::framed(&[]), None, "no size, no rate");
+    assert_eq!(
+        Rate::framed(&[(at(1), at(32)), (at(2), at(32))]),
+        None,
+        "one wrong size refuses the rate"
+    );
+}
+
+fn pair(short: u64, long: u64) -> Pair {
+    Pair {
+        short: framed(1, Duration::from_nanos(short)),
+        long: framed(32, Duration::from_nanos(long)),
+    }
 }
 
 fn pass(short: u64, long: u64) -> Pass {
     Pass {
-        short: framed(1, Duration::from_nanos(short)),
-        long: framed(32, Duration::from_nanos(long)),
+        sizes: vec![pair(short, long)],
     }
+}
+
+#[test]
+fn terms_are_the_least_over_world_sizes() {
+    let sizes = [
+        (
+            framed(1, Duration::from_nanos(4_600)),
+            framed(32, Duration::from_nanos(4_600 + 31 * 4_500)),
+        ),
+        (
+            framed(1, Duration::from_nanos(15_500)),
+            framed(32, Duration::from_nanos(15_500 + 31 * 14_600)),
+        ),
+        (
+            framed(1, Duration::from_nanos(11_200)),
+            framed(32, Duration::from_nanos(11_200 + 31 * 9_100)),
+        ),
+    ];
+    let rate = Rate::framed(&sizes).unwrap();
+    assert_eq!(
+        rate.per_submit_ns, 4_600,
+        "per_submit is the least 1-frame time"
+    );
+    assert_eq!(
+        rate.per_frame_ns, 4_500,
+        "per_frame is the least per-frame step"
+    );
+    assert_eq!(rate.per_unit_fs, 0);
+    let crossed = [
+        (
+            framed(1, Duration::from_nanos(5_000)),
+            framed(32, Duration::from_nanos(5_000 + 31 * 20_000)),
+        ),
+        (
+            framed(1, Duration::from_nanos(30_000)),
+            framed(32, Duration::from_nanos(30_000 + 31 * 7_000)),
+        ),
+    ];
+    let rate = Rate::framed(&crossed).unwrap();
+    assert_eq!(
+        (rate.per_submit_ns, rate.per_frame_ns),
+        (5_000, 7_000),
+        "each term is the least over the sizes on its own"
+    );
+    for (set, rate) in [
+        (&sizes[..], Rate::framed(&sizes).unwrap()),
+        (&crossed[..], rate),
+    ] {
+        for (short, long) in set {
+            assert!(rate.predict(short.units, 1, 1) <= short.time);
+            assert!(rate.predict(long.units, 32, 1) <= long.time);
+        }
+    }
+    for one in &sizes {
+        let alone = Rate::framed(&[*one]).unwrap();
+        let least = Rate::framed(&sizes).unwrap();
+        assert!(
+            least.per_submit_ns <= alone.per_submit_ns && least.per_frame_ns <= alone.per_frame_ns
+        );
+    }
+}
+
+#[test]
+fn a_timed_run_counts_only_primed_and_back_to_back() {
+    let gap = 500;
+    let filler = (1_000, 2_000);
+    let primer = (2_000 + gap, 3_000);
+    let timed = (3_000 + gap, 4_000);
+    assert!(
+        primed(filler, primer, timed, gap),
+        "gaps of exactly GAP count"
+    );
+    assert!(
+        primed(filler, (2_000, 3_000), (3_000, 4_000), gap),
+        "no gap counts"
+    );
+    assert!(
+        !primed(filler, (2_001 + gap, 3_000), (3_000, 4_000), gap),
+        "GAP + 1 tick before the primer does not count"
+    );
+    assert!(
+        !primed(filler, (2_000, 3_000), (3_001 + gap, 4_000), gap),
+        "GAP + 1 tick before the timed run does not count"
+    );
+    assert!(
+        !primed(filler, (1_999, 3_000), (3_000, 4_000), gap),
+        "a primer that starts before the filler ends is not back to back"
+    );
+    assert!(
+        !primed(filler, (2_000, 3_000), (2_999, 4_000), gap),
+        "a timed run that starts before the primer ends is not back to back"
+    );
+    assert_eq!(GAP, Duration::from_micros(500));
 }
 
 #[test]
@@ -196,15 +301,15 @@ fn a_first_rate_needs_two_passes_that_agree() {
     let fast = pass(6_700, 197_000);
     let near = pass(7_000, 210_000);
     let mut passes = Passes::default();
-    passes.add(&key, slow);
+    passes.add(&key, slow.clone());
     assert_eq!(passes.agreed(&key), None, "one pass is not a rate");
-    passes.add(&key, fast);
+    passes.add(&key, fast.clone());
     assert_eq!(passes.agreed(&key), None, "slow then fast do not agree");
     assert!(
         passes.solved().is_empty(),
         "slow, fast and then out of budget stores nothing"
     );
-    passes.add(&key, near);
+    passes.add(&key, near.clone());
     let (rate, samples) = passes.agreed(&key).unwrap();
     assert_eq!(rate.per_submit_ns, 6_700, "the least over the two passes");
     assert_eq!(rate.per_frame_ns, (197_000 - 6_700) / 31);
@@ -216,13 +321,41 @@ fn a_first_rate_needs_two_passes_that_agree() {
         ]
     );
     assert!(!passes.settled(&keys), "a key with no pass is not settled");
-    passes.add(&other, fast);
+    passes.add(&other, fast.clone());
     passes.add(&other, pass(6_700, 247_000));
     assert!(!passes.settled(&keys), "1.254x apart at the long point");
     passes.add(&other, pass(6_700, 246_000));
     assert!(passes.settled(&keys));
     assert_eq!(passes.solved().len(), 2);
-    passes.add(&key, slow);
+    let three = Key::rule("heat", false);
+    let sized = |middle: u64| Pass {
+        sizes: vec![
+            pair(4_600, 144_000),
+            pair(middle, 467_000),
+            pair(11_200, 293_000),
+        ],
+    };
+    passes.add(&three, sized(15_500));
+    passes.add(&three, sized(19_500));
+    assert_eq!(
+        passes.agreed(&three),
+        None,
+        "two passes that differ by 1.258x at one point of one size do not agree"
+    );
+    passes.add(&three, sized(19_000));
+    let (rate, samples) = passes.agreed(&three).unwrap();
+    assert_eq!(samples.len(), 6, "every point of every size");
+    assert_eq!(rate.per_submit_ns, 4_600);
+    assert_eq!(rate.per_frame_ns, (144_000 - 4_600) / 31);
+    let mut fewer = sized(19_000);
+    fewer.sizes.pop();
+    passes.add(&three, fewer);
+    assert_eq!(
+        passes.agreed(&three),
+        None,
+        "passes over different sizes do not agree"
+    );
+    passes.add(&key, slow.clone());
     assert_eq!(passes.agreed(&key), None, "only the last two passes count");
     assert!(!passes.settled(&keys));
     let agree = grit::calibrate::take::agree;

@@ -167,26 +167,32 @@ impl Rate {
     }
 
     #[must_use]
-    pub fn framed(short: Sample, long: Sample) -> Option<Self> {
-        if !short.valid()
-            || !long.valid()
-            || short.frames != 1
-            || short.submits != 1
-            || long.submits != 1
-            || long.frames <= 1
-        {
-            return None;
+    pub fn framed(sizes: &[(Sample, Sample)]) -> Option<Self> {
+        let mut first: Option<u128> = None;
+        let mut further: Option<u128> = None;
+        for (short, long) in sizes {
+            if !short.valid()
+                || !long.valid()
+                || short.frames != 1
+                || short.submits != 1
+                || long.submits != 1
+                || long.frames <= 1
+            {
+                return None;
+            }
+            let one = short.time.as_nanos();
+            let each = long
+                .time
+                .as_nanos()
+                .saturating_sub(one)
+                .div_euclid(u128::from(long.frames - 1));
+            first = Some(first.map_or(one, |held| held.min(one)));
+            further = Some(further.map_or(each, |held| held.min(each)));
         }
-        let first = short.time.as_nanos();
-        let further = long
-            .time
-            .as_nanos()
-            .saturating_sub(first)
-            .div_euclid(u128::from(long.frames - 1));
         let rate = Self {
             per_unit_fs: 0,
-            per_frame_ns: u64::try_from(further).ok()?,
-            per_submit_ns: u64::try_from(first).ok()?,
+            per_frame_ns: u64::try_from(further?).ok()?,
+            per_submit_ns: u64::try_from(first?).ok()?,
         };
         (rate.per_submit_ns > 0).then_some(rate)
     }

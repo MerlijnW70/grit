@@ -221,8 +221,9 @@ mod device {
                     began.elapsed() <= POINT_MOST,
                     "a reference floor took more than {POINT_MOST:?} after {done} runs"
                 );
-                self.filler.step(FRAMES).unwrap();
                 units = units.max(units_of(world, frames));
+                self.filler.step(FRAMES).unwrap();
+                world.step(frames).unwrap();
                 let started = Instant::now();
                 world.step(frames).unwrap();
                 wall = wall.min(started.elapsed());
@@ -259,6 +260,12 @@ mod device {
             let mut far = largest(host, name, &params, 256, false).unwrap();
             taker.measure(&dense, "far", &mut far, LONG);
             drop(far);
+            let mut mid = World::create(host, &made(name, &params, [32; 3], false)).unwrap();
+            taker.measure(&dense, "mid", &mut mid, LONG);
+            drop(mid);
+            let mut slab = World::create(host, &made(name, &params, [128, 128, 8], false)).unwrap();
+            taker.measure(&dense, "slab", &mut slab, LONG);
+            drop(slab);
             if !host.sparse() {
                 continue;
             }
@@ -309,12 +316,16 @@ mod device {
 
     fn report(label: &str, host: &Host, got: &Measured, took: Duration) {
         eprintln!(
-            "CAL {label} {}: {} keys of {}, ended {:?} after {} passes in {took:?}; device clock: warm {:?}, worlds {:?}, passes {:?}",
+            "CAL {label} {}: {} keys of {}, ended {:?} after {} passes in {took:?}; timed runs {} tried, {} counted, {} did not count ({:.1}%); device clock: warm {:?}, worlds {:?}, passes {:?}",
             host.name(),
             got.rates.len(),
             up_front(host).len(),
             got.ended,
             got.passes,
+            got.tried,
+            got.counted,
+            got.tried - got.counted,
+            100.0 * f64::from(got.tried - got.counted) / f64::from(got.tried.max(1)),
             got.warm,
             got.made,
             got.timed
@@ -763,15 +774,16 @@ mod device {
         got.first
             .iter()
             .filter_map(|(key, pass)| {
-                let (rate, _) = got.rates.get(key)?;
-                let ratio = |sample: Sample| {
-                    sample.time.as_secs_f64()
-                        / rate
-                            .predict(sample.units, sample.frames, 1)
-                            .as_secs_f64()
-                            .max(1e-12)
+                let (_, samples) = got.rates.get(key)?;
+                let ratio = |sample: Sample, last: &Sample| {
+                    sample.time.as_secs_f64() / last.time.as_secs_f64().max(1e-12)
                 };
-                Some(ratio(pass.short).max(ratio(pass.long)))
+                pass.sizes
+                    .iter()
+                    .flat_map(|pair| [pair.short, pair.long])
+                    .zip(samples)
+                    .map(|(first, last)| ratio(first, last))
+                    .reduce(f64::max)
             })
             .fold(0.0_f64, f64::max)
     }
