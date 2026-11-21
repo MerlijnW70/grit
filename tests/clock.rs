@@ -1215,7 +1215,7 @@ fn placed(tokens: &[Token]) -> Vec<Place> {
     places
 }
 
-const WAITS: [&str; 10] = [
+const WAITS: [&str; 12] = [
     "sleep",
     "sleep_ms",
     "sleep_until",
@@ -1226,6 +1226,8 @@ const WAITS: [&str; 10] = [
     "wait_timeout_while",
     "park_timeout",
     "park_timeout_ms",
+    "wait_for_fences",
+    "acquire_next_image",
 ];
 
 const SOURCES: [&str; 16] = [
@@ -1360,9 +1362,37 @@ fn time_imports(tokens: &[Token], places: &[Place]) -> Vec<usize> {
     found
 }
 
+fn braced(tokens: &[Token]) -> Vec<bool> {
+    let mut open: Vec<&str> = Vec::new();
+    let mut found = Vec::with_capacity(tokens.len());
+    for one in tokens {
+        found.push(open.last() == Some(&"{"));
+        match one.text.as_str() {
+            "{" => open.push("{"),
+            "(" => open.push("("),
+            "[" => open.push("["),
+            "}" | ")" | "]" => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+fn field_named(tokens: &[Token], inside: &[bool], at: usize) -> bool {
+    let before = at.checked_sub(1).map_or("", |one| word_at(tokens, one));
+    let after = word_at(tokens, at + 1);
+    inside.get(at).copied().unwrap_or(false)
+        && matches!(before, "{" | ",")
+        && matches!(after, "," | "}" | ":" | ".")
+        && !(after == ":" && word_at(tokens, at + 2) == ":")
+}
+
 fn kinds_at(
     tokens: &[Token],
     places: &[Place],
+    inside: &[bool],
     at: usize,
     carriers: &[String],
     server: bool,
@@ -1429,7 +1459,9 @@ fn kinds_at(
     if server
         && carriers.iter().any(|one| one == word)
         && !defined
-        && (matches!(before, "." | "::") || after == "(")
+        && (matches!(before, "." | "::")
+            || after == "("
+            || (!place.function.is_empty() && field_named(tokens, inside, at)))
     {
         found.push(format!("carrier {word}"));
     }
@@ -1587,7 +1619,46 @@ fn returned(tokens: &[Token], from: usize, owner: &str) -> Vec<Token> {
     kind
 }
 
-fn carried(text: &str) -> Vec<String> {
+type Shapes = (Vec<(String, Vec<Field>)>, Vec<(String, Vec<Token>)>);
+
+fn tuple_fields(tokens: &[Token], open: usize) -> Vec<Field> {
+    let end = closing(tokens, open);
+    let mut found = Vec::new();
+    let mut at = open + 1;
+    while at < end {
+        if word_at(tokens, at) == "#" {
+            at = closing(tokens, at + 1) + 1;
+            continue;
+        }
+        let mut shown = false;
+        if word_at(tokens, at) == "pub" {
+            shown = true;
+            at += 1;
+            if word_at(tokens, at) == "(" {
+                at = closing(tokens, at) + 1;
+            }
+        }
+        let mut depth = 0_i32;
+        let mut kind = Vec::new();
+        while at < end {
+            match word_at(tokens, at) {
+                "<" | "(" | "[" => depth += 1,
+                ">" | ")" | "]" => depth -= 1,
+                "," if depth == 0 => break,
+                _ => {}
+            }
+            if let Some(one) = tokens.get(at) {
+                kind.push(one.clone());
+            }
+            at += 1;
+        }
+        found.push((found.len().to_string(), shown, kind));
+        at += 1;
+    }
+    found
+}
+
+fn shapes(text: &str) -> Shapes {
     let tokens = lexed(text);
     let places = placed(&tokens);
     let mut structs: Vec<(String, Vec<Field>)> = Vec::new();
@@ -1600,6 +1671,16 @@ fn carried(text: &str) -> Vec<String> {
                     word_at(&tokens, at + 1).to_owned(),
                     fields(&tokens, open, false),
                 ));
+            }
+            "struct" if word_at(&tokens, open) == "(" => {
+                let name = word_at(&tokens, at + 1).to_owned();
+                let inside = tuple_fields(&tokens, open);
+                for (_, shown, kind) in &inside {
+                    if *shown {
+                        held.push((name.clone(), kind.clone()));
+                    }
+                }
+                structs.push((name, inside));
             }
             "enum" if word_at(&tokens, open) == "{" && visible(&tokens, at) => {
                 let end = closing(&tokens, open);
@@ -1634,29 +1715,39 @@ fn carried(text: &str) -> Vec<String> {
             _ => {}
         }
     }
+    (structs, held)
+}
+
+fn timed_types(all: &[Shapes]) -> std::collections::BTreeSet<String> {
     let mut timed = std::collections::BTreeSet::new();
     loop {
         let before = timed.len();
-        for (name, inside) in &structs {
-            if inside
-                .iter()
-                .any(|(_, shown, kind)| *shown && holds_time(kind, &timed))
-            {
-                timed.insert(name.clone());
+        for (structs, _) in all {
+            for (name, inside) in structs {
+                if inside
+                    .iter()
+                    .any(|(_, shown, kind)| *shown && holds_time(kind, &timed))
+                {
+                    timed.insert(name.clone());
+                }
             }
         }
         if timed.len() == before {
-            break;
+            return timed;
         }
     }
+}
+
+fn carried(shaped: &Shapes, timed: &std::collections::BTreeSet<String>) -> Vec<String> {
+    let (structs, held) = shaped;
     let mut found: Vec<String> = structs
         .iter()
         .flat_map(|(_, inside)| inside.iter())
-        .filter(|(_, shown, kind)| *shown && holds_time(kind, &timed))
+        .filter(|(name, shown, kind)| *shown && identifier(name) && holds_time(kind, timed))
         .map(|(name, _, _)| name.clone())
         .chain(
             held.iter()
-                .filter(|(_, kind)| holds_time(kind, &timed))
+                .filter(|(_, kind)| holds_time(kind, timed))
                 .map(|(name, _)| name.clone()),
         )
         .collect();
@@ -1694,8 +1785,15 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/credit.rs", "Instant", "Marker::submitted", 1),
     ("src/credit.rs", "elapsed", "Marker::submitted", 1),
     ("src/credit.rs", "use time item", "", 1),
+    ("src/host.rs", "wait_for_fences", "Host::wait", 1),
     ("src/live.rs", "Instant", "cheaper", 2),
     ("src/live.rs", "elapsed", "cheaper", 2),
+    (
+        "src/render3/swapchain.rs",
+        "acquire_next_image",
+        "Presenter::present",
+        1,
+    ),
     ("src/resident.rs", "Instant", "Host::buffers_in_with", 1),
     ("src/resident.rs", "Instant", "Resident::fetched", 1),
     ("src/resident.rs", "Instant", "Resident::run_times", 1),
@@ -1727,7 +1825,9 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/resident.rs", "use time item", "", 1),
     ("src/serve.rs", "Instant", "gauged", 1),
     ("src/serve.rs", "Instant", "walked", 1),
+    ("src/serve.rs", "carrier frames", "poured", 1),
     ("src/serve.rs", "carrier listed", "credit_answer", 2),
+    ("src/serve.rs", "carrier listed", "credit_tool", 1),
     ("src/serve.rs", "carrier listed", "poured", 1),
     ("src/serve.rs", "carrier listed", "sown", 1),
     ("src/serve.rs", "carrier on_device", "Staged::on_device", 1),
@@ -1743,9 +1843,10 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve.rs", "carrier staged_frames", "poured", 1),
     ("src/serve.rs", "elapsed", "gauged", 1),
     ("src/serve.rs", "elapsed", "walked", 1),
+    ("src/serve3/back.rs", "carrier after", "walked", 1),
     ("src/serve3/back.rs", "carrier frame", "Strayed::refusal", 1),
     ("src/serve3/back.rs", "carrier frame", "Strayed::told", 1),
-    ("src/serve3/back.rs", "carrier frame", "probed", 1),
+    ("src/serve3/back.rs", "carrier frame", "probed", 2),
     ("src/serve3/back.rs", "carrier frame", "walked", 3),
     (
         "src/serve3/back.rs",
@@ -1753,9 +1854,10 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
         "Strayed::refusal",
         1,
     ),
+    ("src/serve3/back.rs", "carrier frames", "probed", 1),
     ("src/serve3/back.rs", "carrier listed", "walked", 1),
     ("src/serve3/branch.rs", "carrier frame", "forked", 1),
-    ("src/serve3/branch.rs", "carrier frame", "opened_file", 2),
+    ("src/serve3/branch.rs", "carrier frame", "opened_file", 3),
     ("src/serve3/branch.rs", "carrier frame", "opened_kept", 1),
     ("src/serve3/branch.rs", "carrier frame", "restored", 2),
     ("src/serve3/branch.rs", "carrier frame", "saved", 1),
@@ -1774,6 +1876,8 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ),
     ("src/serve3/budget.rs", "carrier frames", "Pace::batch", 2),
     ("src/serve3/budget.rs", "carrier frames", "Pace::cost", 1),
+    ("src/serve3/budget.rs", "carrier frames", "Pace::first", 1),
+    ("src/serve3/budget.rs", "carrier frames", "Pace::ran", 1),
     ("src/serve3/budget.rs", "carrier frames", "apart", 4),
     ("src/serve3/budget.rs", "carrier frames", "predicted", 2),
     ("src/serve3/budget.rs", "carrier frames", "split", 4),
@@ -1790,9 +1894,16 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/gradient.rs", "carrier frame", "started", 1),
     ("src/serve3/gradient.rs", "carrier frames", "descended", 1),
     ("src/serve3/gradient.rs", "carrier frames", "graded", 1),
+    ("src/serve3/gradient.rs", "carrier frames", "posed", 1),
     ("src/serve3/gradient.rs", "carrier frames", "walk", 1),
     ("src/serve3/gradient.rs", "carrier listed", "descended", 2),
     ("src/serve3/gradient.rs", "carrier listed", "graded", 1),
+    (
+        "src/serve3/journal.rs",
+        "carrier frame",
+        "Ledger::created",
+        1,
+    ),
     (
         "src/serve3/journal.rs",
         "carrier frame",
@@ -1809,10 +1920,11 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
         "src/serve3/journal.rs",
         "carrier frame",
         "Ledger::snapped",
-        1,
+        2,
     ),
+    ("src/serve3/journal.rs", "carrier frame", "base_of", 1),
     ("src/serve3/journal.rs", "carrier frame", "base_record", 1),
-    ("src/serve3/journal.rs", "carrier frame", "rebuilt", 10),
+    ("src/serve3/journal.rs", "carrier frame", "rebuilt", 12),
     ("src/serve3/journal.rs", "carrier frame", "state_of", 1),
     ("src/serve3/law.rs", "carrier frame", "params_written", 1),
     ("src/serve3/law.rs", "carrier listed", "params_written", 1),
@@ -1825,6 +1937,7 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/law_learn.rs", "carrier warmed", "calibrated", 1),
     ("src/serve3/learn.rs", "carrier frame", "started", 1),
     ("src/serve3/learn.rs", "carrier frames", "objective_of", 1),
+    ("src/serve3/learn.rs", "carrier frames", "posed", 1),
     ("src/serve3/learn.rs", "carrier frames", "scored", 1),
     ("src/serve3/learn.rs", "carrier frames", "searched", 1),
     ("src/serve3/learn.rs", "carrier listed", "scored", 1),
@@ -1832,20 +1945,20 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/mod.rs", "Book::empty", "Server::new", 1),
     ("src/serve3/mod.rs", "Book::new", "Server::with", 1),
     ("src/serve3/mod.rs", "Guard {", "Server::guard", 1),
-    ("src/serve3/mod.rs", "carrier frame", "Book::landed", 1),
+    ("src/serve3/mod.rs", "carrier frame", "Book::landed", 2),
     ("src/serve3/mod.rs", "carrier frame", "Server::pending", 1),
     ("src/serve3/mod.rs", "carrier frame", "Server::rebuild", 2),
     (
         "src/serve3/mod.rs",
         "carrier frame",
         "Server::snap_attempt",
-        1,
+        3,
     ),
     (
         "src/serve3/mod.rs",
         "carrier frame",
         "Server::snap_behind",
-        1,
+        2,
     ),
     ("src/serve3/mod.rs", "carrier listed", "Server::rebuild", 1),
     ("src/serve3/mod.rs", "real", "Book::empty", 1),
@@ -1857,6 +1970,7 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/mod.rs", "sleep", "Server::snap_attempt", 1),
     ("src/serve3/mod.rs", "sleep", "Server::snap_behind", 1),
     ("src/serve3/mod.rs", "use time item", "", 1),
+    ("src/serve3/tools.rs", "carrier after", "stepped", 1),
     ("src/serve3/tools.rs", "carrier frame", "created", 1),
     ("src/serve3/tools.rs", "carrier frame", "read", 1),
     ("src/serve3/tools.rs", "carrier frame", "sliced", 1),
@@ -1882,14 +1996,23 @@ fn carriers_named() -> Vec<String> {
 
 #[test]
 fn every_carrier_of_a_measured_duration_is_listed() {
+    let shaped: Vec<(String, Shapes)> = scanned()
+        .into_iter()
+        .map(|(relative, text)| {
+            let shape = shapes(&text);
+            (relative, shape)
+        })
+        .collect();
+    let all: Vec<Shapes> = shaped.iter().map(|(_, shape)| shape.clone()).collect();
+    let timed = timed_types(&all);
     let mut derived = Vec::new();
     let mut files = 0_usize;
-    for (relative, text) in scanned() {
-        if !carrier_file(&relative) {
+    for (relative, shape) in &shaped {
+        if !carrier_file(relative) {
             continue;
         }
         files += 1;
-        for name in carried(&text) {
+        for name in carried(shape, &timed) {
             derived.push((relative.clone(), name));
         }
     }
@@ -1930,6 +2053,7 @@ fn the_server_reads_time_only_through_its_clock() {
         let server = server_file(&relative);
         let tokens = lexed(&text);
         let places = placed(&tokens);
+        let inside = braced(&tokens);
         let mut kinds: Vec<(usize, String)> = Vec::new();
         for (at, _, words) in defaulted(&tokens) {
             if let Some(held) = words.iter().find(|word| real.contains(*word)) {
@@ -1937,7 +2061,7 @@ fn the_server_reads_time_only_through_its_clock() {
             }
         }
         for at in 0..tokens.len() {
-            for kind in kinds_at(&tokens, &places, at, &carriers, server) {
+            for kind in kinds_at(&tokens, &places, &inside, at, &carriers, server) {
                 kinds.push((at, kind));
             }
         }
