@@ -610,6 +610,11 @@ mod faked {
         asked(&mut server, "grit_describe", "{}");
         drop(server);
         let _ = std::fs::remove_dir_all(&root);
+        let named = root.file_name().unwrap().to_string_lossy().into_owned();
+        let answers = answers
+            .into_iter()
+            .map(|one| one.replace(&named, "grit-clock-k2wait"))
+            .collect();
         (answers, took)
     }
 
