@@ -15,11 +15,12 @@ mod faked {
     use std::sync::mpsc::Receiver;
 
     use grit::Host;
+    use grit::calibrate::{Key, Rate, Table, held};
     use grit::clock::{Fake, Time, aside, point, serving};
     use grit::serve3::exec::Exec;
     use grit::serve3::journal::{Entry, Keep, Ledger, Made};
     use grit::serve3::tools::faults;
-    use grit::serve3::{Options, Server};
+    use grit::serve3::{Book, Options, Server};
     use grit::wire::{Json, written};
 
     use super::common::device;
@@ -582,10 +583,30 @@ mod faked {
 
     const FLOOR: Duration = Duration::from_millis(20);
 
-    fn paths(host: &Host, time: Arc<dyn Time>, budget: u64) -> (Vec<String>, Vec<Duration>) {
+    const SOUND: Duration = Duration::from_micros(250);
+
+    fn table(host: &Host) -> Table {
+        let mut table = Table::new(grit::calibrate::device(host));
+        let high = Rate {
+            per_unit_fs: 1_000_000,
+            per_frame_ns: 1_000_000,
+            per_submit_ns: 1_000_000,
+        };
+        table.set(Key::rule("sand", false), high);
+        table
+    }
+
+    fn paths(
+        host: &Host,
+        time: Arc<dyn Time>,
+        budget: u64,
+    ) -> (Vec<String>, Vec<Duration>, Option<Table>) {
         let root = root("k2wait");
         let options = kept(&root);
-        let mut server = Server::timed(Some(host), &options, time).unwrap();
+        let book = Book::timed(&options, time)
+            .unwrap()
+            .calibrated(held(table(host), None));
+        let mut server = Server::resumed(Some(host), book).0;
         let mut answers = Vec::new();
         let mut took = Vec::new();
         let mut asked = |server: &mut Server<'_>, name: &str, arguments: &str| {
@@ -608,6 +629,7 @@ mod faked {
         asked(&mut server, "grit_world_fork", &one(world, budget));
         asked(&mut server, "grit_world_open", &kept_world(budget));
         asked(&mut server, "grit_describe", "{}");
+        let calibration = server.calibration();
         drop(server);
         let _ = std::fs::remove_dir_all(&root);
         let named = root.file_name().unwrap().to_string_lossy().into_owned();
@@ -615,7 +637,7 @@ mod faked {
             .into_iter()
             .map(|one| one.replace(&named, "grit-clock-k2wait"))
             .collect();
-        (answers, took)
+        (answers, took, calibration)
     }
 
     #[test]
@@ -624,17 +646,24 @@ mod faked {
             return;
         };
         let named = ["build", "write", "step", "fork", "replay", "describe"];
+        grit::calibrate::faults::script(std::iter::repeat_n(SOUND, 200_000));
         let mut plain = Vec::new();
         for budget in BUDGETS {
             let fake = Arc::new(Fake::new());
-            let (answers, _) = paths(&host, Arc::clone(&fake) as Arc<dyn Time>, budget);
+            let (answers, _, table) = paths(&host, Arc::clone(&fake) as Arc<dyn Time>, budget);
             assert_eq!(fake.elapsed(), Duration::ZERO);
             let waiting = Arc::new(Waiting::new(WAITED, WAITED));
-            let (delayed, took) = paths(&host, Arc::clone(&waiting) as Arc<dyn Time>, budget);
+            let (delayed, took, moved) =
+                paths(&host, Arc::clone(&waiting) as Arc<dyn Time>, budget);
+            assert!(table.is_some(), "the session held no calibration table");
+            assert_eq!(
+                table, moved,
+                "budget {budget}: real time spent at the clock reads moved the calibration table"
+            );
             let (waits, waited) = waiting.waited();
             assert_eq!(waiting.fake().elapsed(), Duration::ZERO);
             eprintln!(
-                "k2 waiting, budget {budget}: {waits} waits, {waited:?} in all, calls took {took:?}"
+                "k2 waiting, budget {budget}: {waits} waits, {waited:?} in all, calls took {took:?}, table {moved:?}"
             );
             for (at, name) in named.iter().enumerate() {
                 assert_eq!(
