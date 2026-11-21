@@ -20,7 +20,7 @@ pub const FILLER: [u32; 3] = [128, 128, 128];
 
 pub const WORLD: [u32; 3] = [64, 64, 64];
 
-pub const SIDES: [u32; 3] = [16, 64, 256];
+pub const SIDES: [u32; 1] = [16];
 
 pub const GAP: Duration = Duration::from_micros(500);
 

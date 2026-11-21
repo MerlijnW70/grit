@@ -266,6 +266,9 @@ mod device {
             let mut slab = World::create(host, &made(name, &params, [128, 128, 8], false)).unwrap();
             taker.measure(&dense, "slab", &mut slab, LONG);
             drop(slab);
+            let mut least = World::create(host, &made(name, &params, [16; 3], false)).unwrap();
+            taker.measure(&dense, "least", &mut least, 1);
+            drop(least);
             if !host.sparse() {
                 continue;
             }

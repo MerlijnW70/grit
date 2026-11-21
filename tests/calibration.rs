@@ -6,7 +6,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use grit::calibrate::take::{GAP, Pair, Pass, Passes, primed};
+use grit::calibrate::take::{GAP, Pair, Pass, Passes, SIDES, primed};
 use grit::calibrate::{Device, FILE, Key, Moved, Rate, Sample, Table, load};
 
 fn device_named(name: &str) -> Device {
@@ -257,6 +257,15 @@ fn terms_are_the_least_over_world_sizes() {
             least.per_submit_ns <= alone.per_submit_ns && least.per_frame_ns <= alone.per_frame_ns
         );
     }
+}
+
+#[test]
+fn calibration_runs_at_the_smallest_band_only() {
+    assert_eq!(
+        SIDES,
+        [16],
+        "one calibration world per key, in the smallest band, keeps a cold first start under 5 s"
+    );
 }
 
 #[test]
