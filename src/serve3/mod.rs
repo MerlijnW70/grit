@@ -1633,6 +1633,8 @@ impl<'host> Server<'host> {
             let thread = std::thread::Builder::new()
                 .name("grit-snapshot".to_owned())
                 .spawn(move || {
+                    #[cfg(feature = "faults")]
+                    let _aside = crate::clock::aside();
                     time.sleep(slow);
                     let got = stored(&keep, number, &image)
                         .map_err(|why| refused_with(why.as_ref()).0.message);
@@ -2001,6 +2003,8 @@ impl<'host> Server<'host> {
     }
 
     fn run_tool(&mut self, tool: &Tool, arguments: &Json) -> Json {
+        #[cfg(feature = "faults")]
+        let _serving = crate::clock::serving();
         let given =
             match schema::checked(tool.name, &input(&(tool.shown)()), arguments, Check::Whole) {
                 Ok(given) => given,
@@ -2055,6 +2059,7 @@ impl<'host> Server<'host> {
                 host.wedge();
             }
         }
+        crate::clock::point(self.time(), "call");
         let number = number_of(&given, "world");
         let ran = (tool.run)(self, &given);
         let lost = (!wedged_before && self.wedged())

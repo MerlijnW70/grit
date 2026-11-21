@@ -1302,6 +1302,7 @@ pub fn rebuilt<'host>(
                 goal: ledger.frame,
             }) as super::Failed
         };
+        crate::clock::point(guard.time.as_ref(), "entry");
         if let Some(stop) = guard.stop() {
             return Err(halted(stop, world.frame()));
         }

@@ -30,28 +30,119 @@ pub fn real() -> Arc<dyn Time> {
 }
 
 #[cfg(feature = "faults")]
-pub use fake::Fake;
+pub use fake::{Aside, Fake, Serving, aside, point, serving};
+
+#[cfg(not(feature = "faults"))]
+pub(crate) fn point(_: &dyn Time, _: &'static str) {}
 
 #[cfg(feature = "faults")]
 mod fake {
+    use std::cell::Cell;
     use std::collections::VecDeque;
-    use std::sync::{Mutex, PoisonError};
+    use std::marker::PhantomData;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
     use std::time::{Duration, Instant};
 
     use super::Time;
+
+    thread_local! {
+        static SERVING: Cell<u32> = const { Cell::new(0) };
+        static ASIDE: Cell<u32> = const { Cell::new(0) };
+    }
+
+    type Armed = Vec<(usize, Weak<Mutex<Held>>)>;
+
+    static ARMED: Mutex<Armed> = Mutex::new(Vec::new());
+
+    fn armed() -> MutexGuard<'static, Armed> {
+        ARMED.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[derive(Debug)]
+    pub struct Serving {
+        held: PhantomData<*const ()>,
+    }
+
+    #[must_use]
+    pub fn serving() -> Serving {
+        SERVING.set(SERVING.get().saturating_add(1));
+        Serving { held: PhantomData }
+    }
+
+    impl Drop for Serving {
+        fn drop(&mut self) {
+            SERVING.set(SERVING.get().saturating_sub(1));
+        }
+    }
+
+    fn served() -> bool {
+        SERVING.get() > 0
+    }
+
+    #[derive(Debug)]
+    pub struct Aside {
+        held: PhantomData<*const ()>,
+    }
+
+    #[must_use]
+    pub fn aside() -> Aside {
+        ASIDE.set(ASIDE.get().saturating_add(1));
+        Aside { held: PhantomData }
+    }
+
+    impl Drop for Aside {
+        fn drop(&mut self) {
+            ASIDE.set(ASIDE.get().saturating_sub(1));
+        }
+    }
+
+    fn set_aside() -> bool {
+        ASIDE.get() > 0
+    }
+
+    fn key(time: &dyn Time) -> usize {
+        std::ptr::from_ref(time).cast::<()>().addr()
+    }
+
+    pub fn point(time: &dyn Time, name: &'static str) {
+        if !served() {
+            return;
+        }
+        let found = armed()
+            .iter()
+            .filter(|(at, _)| *at == key(time))
+            .find_map(|(_, held)| held.upgrade());
+        let Some(held) = found else {
+            return;
+        };
+        let mut held = held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.passed.push(name);
+        let step = held
+            .points
+            .iter_mut()
+            .find(|(named, _)| *named == name)
+            .and_then(|(_, steps)| steps.pop_front());
+        if let Some(step) = step {
+            held.at = held.at.saturating_add(step);
+            held.steps = held.steps.saturating_add(1);
+        }
+    }
 
     #[derive(Debug, Default)]
     struct Held {
         at: Duration,
         script: VecDeque<Duration>,
+        points: Vec<(&'static str, VecDeque<Duration>)>,
+        passed: Vec<&'static str>,
         reads: u64,
+        steps: u64,
         slept: Duration,
     }
 
     #[derive(Debug)]
     pub struct Fake {
         base: Instant,
-        held: Mutex<Held>,
+        held: Arc<Mutex<Held>>,
     }
 
     impl Default for Fake {
@@ -60,16 +151,23 @@ mod fake {
         }
     }
 
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            let own = Arc::downgrade(&self.held);
+            armed().retain(|(_, held)| held.strong_count() > 0 && !held.ptr_eq(&own));
+        }
+    }
+
     impl Fake {
         #[must_use]
         pub fn new() -> Self {
             Self {
                 base: Instant::now(),
-                held: Mutex::new(Held::default()),
+                held: Arc::default(),
             }
         }
 
-        fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        fn held(&self) -> MutexGuard<'_, Held> {
             self.held.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
@@ -82,9 +180,37 @@ mod fake {
             self.held().script = steps.into_iter().collect();
         }
 
+        pub fn at(&self, point: &'static str, steps: impl IntoIterator<Item = Duration>) {
+            let steps: VecDeque<Duration> = steps.into_iter().collect();
+            {
+                let mut held = self.held();
+                held.points.retain(|(named, _)| *named != point);
+                held.points.push((point, steps));
+            }
+            let own = Arc::downgrade(&self.held);
+            let place = key(self);
+            let mut armed = armed();
+            armed.retain(|(_, held)| held.strong_count() > 0 && !held.ptr_eq(&own));
+            armed.push((place, own));
+        }
+
         #[must_use]
         pub fn scripted(&self) -> usize {
             self.held().script.len()
+        }
+
+        #[must_use]
+        pub fn waiting(&self, point: &'static str) -> usize {
+            self.held()
+                .points
+                .iter()
+                .find(|(named, _)| *named == point)
+                .map_or(0, |(_, steps)| steps.len())
+        }
+
+        #[must_use]
+        pub fn passed(&self) -> Vec<&'static str> {
+            self.held().passed.clone()
         }
 
         #[must_use]
@@ -98,6 +224,11 @@ mod fake {
         }
 
         #[must_use]
+        pub fn steps(&self) -> u64 {
+            self.held().steps
+        }
+
+        #[must_use]
         pub fn slept(&self) -> Duration {
             self.held().slept
         }
@@ -107,15 +238,20 @@ mod fake {
         fn now(&self) -> Instant {
             let mut held = self.held();
             held.reads = held.reads.saturating_add(1);
-            if let Some(step) = held.script.pop_front() {
+            if served()
+                && let Some(step) = held.script.pop_front()
+            {
                 held.at = held.at.saturating_add(step);
+                held.steps = held.steps.saturating_add(1);
             }
             self.base.checked_add(held.at).unwrap_or(self.base)
         }
 
         fn sleep(&self, time: Duration) {
             let mut held = self.held();
-            held.at = held.at.saturating_add(time);
+            if !set_aside() {
+                held.at = held.at.saturating_add(time);
+            }
             held.slept = held.slept.saturating_add(time);
         }
     }
