@@ -48,7 +48,7 @@ mod faked {
             .take(8)
             .map(|pair| {
                 format!(
-                    "{{\"size\":[32,32,1],\"input\":{},\"output\":{}}}",
+                    "{{\"size\":[32,32,1],\"input\":[{}],\"output\":[{}]}}",
                     grids(pair.get("input").unwrap()),
                     grids(pair.get("output").unwrap())
                 )
