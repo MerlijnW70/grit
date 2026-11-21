@@ -13,7 +13,6 @@ fn device_named(name: &str) -> Device {
         name: name.to_owned(),
         driver: 7,
         width: 4,
-        threads: 8,
     }
 }
 
@@ -102,7 +101,7 @@ fn every_key_names_itself_back() {
 }
 
 #[test]
-fn two_sizes_solve_to_the_terms_that_made_them() {
+fn three_runs_solve_to_floor_terms() {
     let rate = Rate {
         per_unit_fs: 2_500,
         per_submit_ns: 40_000,
@@ -112,44 +111,57 @@ fn two_sizes_solve_to_the_terms_that_made_them() {
         submits,
         time: rate.predict(units, submits),
     };
-    let solved = Rate::solved(at(262_144, 1), at(2_097_152, 1)).unwrap();
+    let small = at(262_144 * 8, 1);
+    let large = at(2_097_152 * 8, 1);
+    let short = at(262_144, 1);
+    let solved = Rate::floor(small, large, short).unwrap();
     assert!(solved.per_unit_fs.abs_diff(2_500) <= 1, "{solved:?}");
     assert!(solved.per_submit_ns.abs_diff(40_000) <= 1, "{solved:?}");
-    let chunks = Rate::solved(at(1, 1), at(512, 16)).unwrap();
-    assert!(chunks.per_submit_ns.abs_diff(40_000) <= 1, "{chunks:?}");
+    for point in [small, large, short] {
+        assert!(solved.predict(point.units, point.submits) <= point.time);
+    }
+    let per_frame = Duration::from_micros(12);
+    let framed = |units: u64, frames: u32| Sample {
+        units: units * u64::from(frames),
+        submits: 1,
+        time: rate.predict(units * u64::from(frames), 1) + per_frame * (frames - 1),
+    };
+    let solved = Rate::floor(framed(262_144, 8), framed(2_097_152, 8), framed(262_144, 1)).unwrap();
+    assert!(solved.per_unit_fs.abs_diff(2_500) <= 1, "{solved:?}");
+    assert!(
+        solved.per_submit_ns.abs_diff(40_000) <= 1,
+        "the fixed term comes from the one-frame run: {solved:?}"
+    );
+    assert!(
+        solved.predict(2_097_152 * 64, 1) < framed(2_097_152, 64).time,
+        "a long step is under-predicted by its extra frame overheads"
+    );
     let flat = Sample {
         units: 2_097_152,
         submits: 1,
         time: Duration::from_micros(10),
     };
+    let wide = Sample {
+        units: 262_144,
+        submits: 1,
+        time: Duration::from_micros(11),
+    };
+    let unresolved = Rate::floor(wide, flat, wide).unwrap();
     assert_eq!(
-        Rate::solved(
-            Sample {
-                units: 262_144,
-                submits: 1,
-                time: Duration::from_micros(11),
-            },
-            flat
-        ),
-        None,
-        "a larger run that took no longer gives no per-unit term: unknown"
+        unresolved.per_unit_fs, 0,
+        "a per-unit term the sizes do not resolve is stored as zero"
     );
-    assert_eq!(Rate::solved(flat, flat), None);
+    assert!(unresolved.per_submit_ns > 0);
+    let same = Rate::floor(flat, flat, flat).unwrap();
     assert_eq!(
-        Rate::solved(
-            Sample {
-                units: 1 << 24,
-                submits: 16,
-                time: Duration::from_millis(2),
-            },
-            Sample {
-                units: 1 << 26,
-                submits: 4,
-                time: Duration::from_millis(64),
-            }
-        ),
+        same.per_unit_fs, 0,
+        "two sizes with the same units resolve no per-unit term"
+    );
+    assert!(same.predict(flat.units, flat.submits) <= flat.time);
+    assert_eq!(
+        Rate::floor(at(1, 1), at(512, 16), at(1, 1)),
         None,
-        "two sizes that need a negative fixed term do not fit the model: unknown"
+        "the two sizes must have the same submits"
     );
 }
 
@@ -244,7 +256,6 @@ fn c3_a_table_written_and_read_back_is_equal() {
             name: format!("device \"{round}\" \\ ü"),
             driver: u32::try_from(rng.below(u64::from(u32::MAX))).unwrap(),
             width: u32::try_from(rng.below(64)).unwrap(),
-            threads: u32::try_from(rng.below(64)).unwrap(),
         };
         let table = random_table(&mut rng, device.clone());
         assert_eq!(Table::read(&table.written()), Ok(table.clone()));
@@ -299,19 +310,14 @@ fn c3_a_damaged_or_foreign_file_is_refused_by_name() {
 
 #[cfg(feature = "faults")]
 mod device {
-    use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
-    use grit::Host;
-    use grit::branch::{Made, World};
-    use grit::calibrate::take::{COPY_LARGE, PLAN, Plan, Solved, measured};
     use grit::calibrate::{
-        self, FILE, Key, Rate, Sample, Table, faults, held, inject, load, read, shared, taken,
+        self, Device, FILE, Key, Rate, Table, faults, held, inject, load, read, shared, still,
+        taken,
     };
     use grit::clock::{Fake, Time};
-    use grit::serve3::budget::world_cost;
     use grit::serve3::{Book, Server};
     use grit::wire::{Json, written};
 
@@ -321,199 +327,6 @@ mod device {
 
     fn alone() -> std::sync::MutexGuard<'static, ()> {
         ONE.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn shown(label: &str, found: &BTreeMap<Key, Solved>) {
-        for (key, (rate, [small, large])) in found {
-            eprintln!(
-                "{label} {} per_unit_fs={} per_submit_ns={} small=({} units, {} submits, {:?}) large=({} units, {} submits, {:?})",
-                key.name(),
-                rate.per_unit_fs,
-                rate.per_submit_ns,
-                small.units,
-                small.submits,
-                small.time,
-                large.units,
-                large.submits,
-                large.time
-            );
-        }
-    }
-
-    fn at_most_half_again(
-        label: &str,
-        base: &BTreeMap<Key, Solved>,
-        other: &BTreeMap<Key, Solved>,
-    ) {
-        shown(&format!("{label} base"), base);
-        shown(&format!("{label} contended"), other);
-        let mut compared = 0;
-        let mut unknown = 0;
-        let mut failures = Vec::new();
-        for (key, (rate, points)) in base {
-            let Some((contended, _)) = other.get(key) else {
-                eprintln!("{label} {} unknown under contention", key.name());
-                unknown += 1;
-                continue;
-            };
-            for point in points {
-                let calm = rate.nanos(point.units, point.submits);
-                let pressed = contended.nanos(point.units, point.submits);
-                compared += 1;
-                eprintln!(
-                    "{label} {} at {} units: contended/uncontended = {:.3}",
-                    key.name(),
-                    point.units,
-                    pressed as f64 / calm.max(1) as f64
-                );
-                if pressed.saturating_mul(2) > calm.saturating_mul(3) {
-                    failures.push(format!(
-                        "{} at {} units, {} submits: {pressed} ns under contention against {calm} ns",
-                        key.name(),
-                        point.units,
-                        point.submits
-                    ));
-                }
-            }
-        }
-        eprintln!(
-            "{label}: {} keys calibrated uncontended, {unknown} unknown under contention, {compared} points compared",
-            base.len()
-        );
-        assert!(failures.is_empty(), "{label}: {failures:#?}");
-        for key in other.keys().filter(|key| !base.contains_key(*key)) {
-            eprintln!(
-                "{label} {} known only under contention: its quiet calibration found no per-unit term",
-                key.name()
-            );
-        }
-    }
-
-    fn noted(label: &str) {
-        for line in faults::notes() {
-            eprintln!("{label} run {line}");
-        }
-    }
-
-    fn calibrated(host: &Host) -> Option<BTreeMap<Key, Solved>> {
-        if calibrate::meter(host).is_none() {
-            eprintln!(
-                "{}: no sound time source on this device, so every rate stays unknown",
-                host.name()
-            );
-            assert!(measured(host).unwrap().is_empty());
-            return None;
-        }
-        let found = measured(host).unwrap();
-        assert!(
-            found.keys().any(|key| matches!(key, Key::Frame { .. })),
-            "{}: no frame rate calibrated",
-            host.name()
-        );
-        Some(found)
-    }
-
-    #[test]
-    fn c1_the_calibrating_thread_held_off_its_cpu_raises_no_rate() {
-        let Some(host) = common::device("c1 hold") else {
-            return;
-        };
-        let _alone = alone();
-        let _ = faults::notes();
-        let Some(base) = calibrated(&host) else {
-            return;
-        };
-        noted("base");
-        faults::hold(Some(Arc::new(|| {
-            std::thread::sleep(Duration::from_millis(15));
-        })));
-        let held = measured(&host);
-        faults::hold(None);
-        noted("contended");
-        at_most_half_again("c1 hold", &base, &held.unwrap());
-    }
-
-    #[test]
-    fn c1_real_cpu_load_raises_no_rate() {
-        let Some(host) = common::device("c1 load") else {
-            return;
-        };
-        let _alone = alone();
-        let _ = faults::notes();
-        let Some(base) = calibrated(&host) else {
-            return;
-        };
-        noted("base");
-        let stop = Arc::new(AtomicBool::new(false));
-        let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        let load: Vec<_> = (0..2 * cores)
-            .map(|seed| {
-                let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    let mut spin = seed as u64 | 1;
-                    while !stop.load(Ordering::Relaxed) {
-                        for _ in 0..10_000 {
-                            spin ^= spin << 13;
-                            spin ^= spin >> 7;
-                            spin ^= spin << 17;
-                        }
-                    }
-                    spin
-                })
-            })
-            .collect();
-        let loaded = measured(&host);
-        stop.store(true, Ordering::Relaxed);
-        noted("contended");
-        for one in load {
-            let _ = one.join();
-        }
-        eprintln!("c1 load: {} spinning threads on {cores} cores", 2 * cores);
-        at_most_half_again("c1 load", &base, &loaded.unwrap());
-    }
-
-    #[test]
-    fn c1_another_world_stepping_on_the_same_host_raises_no_rate() {
-        let Some(host) = common::device("c1 other world") else {
-            return;
-        };
-        let _alone = alone();
-        let _ = faults::notes();
-        let Some(base) = calibrated(&host) else {
-            return;
-        };
-        noted("base");
-        let stop = AtomicBool::new(false);
-        let steps = std::sync::atomic::AtomicU64::new(0);
-        let loaded = std::thread::scope(|scope| {
-            let busy = scope.spawn(|| {
-                let made = Made {
-                    rule: "sand",
-                    params: &[],
-                    size: PLAN.large,
-                    sparse: false,
-                    slots: None,
-                };
-                let mut world = World::create(&host, &made).unwrap();
-                while !stop.load(Ordering::Relaxed) {
-                    world.step(64).unwrap();
-                    steps.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-            while steps.load(Ordering::Relaxed) < 2 {
-                std::thread::yield_now();
-            }
-            let loaded = measured(&host);
-            stop.store(true, Ordering::Relaxed);
-            noted("contended");
-            busy.join().unwrap();
-            loaded
-        });
-        eprintln!(
-            "c1 other world: the other world ran {} steps of 64 frames",
-            steps.load(Ordering::Relaxed)
-        );
-        at_most_half_again("c1 other world", &base, &loaded.unwrap());
     }
 
     fn rate_of(server: &Server<'_>, key: &Key) -> Option<Rate> {
@@ -630,6 +443,117 @@ mod device {
             rate_of(&server, &sparse).unwrap().per_unit_fs < before.per_unit_fs,
             "the same step with its bricks known is a sample and lowers the rate"
         );
+        let heat = Key::rule("heat", false);
+        let warm = world_of(&call(
+            &mut server,
+            "grit_world_create",
+            "{\"wide\":16,\"deep\":16,\"tall\":16,\"rule\":\"heat\",\"params\":[0,0,0],\"budget_ms\":600000}",
+        ));
+        fake.script(std::iter::repeat_n(Duration::from_secs(1), 64));
+        faults::script(std::iter::repeat_n(Duration::from_secs(5), 64));
+        call(
+            &mut server,
+            "grit_world_step",
+            &format!("{{\"world\":{warm},\"frames\":4,\"budget_ms\":600000}}"),
+        );
+        faults::script([]);
+        assert_eq!(
+            rate_of(&server, &heat),
+            None,
+            "a finished step never sets a first rate, however its time was measured"
+        );
+    }
+
+    #[test]
+    fn c3_a_table_of_another_device_is_never_used_on_resume() {
+        let Some(host) = common::device("c3 other device") else {
+            return;
+        };
+        let _alone = alone();
+        let mine = calibrate::device(&host);
+        calibrate::forget(&mine);
+        let other = Device {
+            name: format!("{} elsewhere", mine.name),
+            ..mine.clone()
+        };
+        let old = Rate {
+            per_unit_fs: 7,
+            per_submit_ns: 7,
+        };
+        let mut foreign = Table::new(other);
+        foreign.set(Key::rule("sand", false), old);
+        let book = Book::empty().calibrated(held(foreign.clone(), None));
+        let server = Server::resumed(Some(&host), book).0;
+        assert_eq!(
+            server.calibration(),
+            None,
+            "a table taken on another device key is not used"
+        );
+        let mut own = Table::new(mine.clone());
+        own.set(
+            Key::rule("sand", false),
+            Rate {
+                per_unit_fs: 9,
+                per_submit_ns: 9,
+            },
+        );
+        let _ = inject(own.clone());
+        let book = Book::empty().calibrated(held(foreign, None));
+        let server = Server::resumed(Some(&host), book).0;
+        assert_eq!(
+            server.calibration(),
+            Some(own),
+            "the host's own table replaces the other device's"
+        );
+        let book = server.into_book();
+        assert_ne!(
+            book.calibration()
+                .and_then(|table| table.rate(&Key::rule("sand", false))),
+            Some(old)
+        );
+        calibrate::forget(&mine);
+    }
+
+    #[test]
+    fn a_still_table_keeps_its_rates_against_real_samples() {
+        let Some(host) = common::device("still table") else {
+            return;
+        };
+        let _alone = alone();
+        let key = Key::rule("sand", false);
+        let high = Rate {
+            per_unit_fs: 1_000_000_000_000,
+            per_submit_ns: 1_000_000_000,
+        };
+        let mut table = Table::new(calibrate::device(&host));
+        table.set(key.clone(), high);
+        let fake = Arc::new(Fake::new());
+        let time: Arc<dyn Time> = Arc::clone(&fake) as Arc<dyn Time>;
+        let book = Book::empty_timed(time).calibrated(still(table.clone()));
+        let mut server = Server::resumed(Some(&host), book).0;
+        let world = world_of(&call(
+            &mut server,
+            "grit_world_create",
+            "{\"wide\":32,\"deep\":32,\"tall\":32,\"rule\":\"sand\",\"params\":[],\"budget_ms\":600000}",
+        ));
+        fake.script(std::iter::repeat_n(Duration::from_micros(1), 64));
+        faults::script(std::iter::repeat_n(Duration::from_nanos(1), 64));
+        call(
+            &mut server,
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":8,\"budget_ms\":600000}}"),
+        );
+        call(
+            &mut server,
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":8,\"budget_ms\":600000}}"),
+        );
+        faults::script([]);
+        assert_eq!(
+            server.calibration(),
+            Some(table),
+            "a still table is never lowered"
+        );
     }
 
     #[test]
@@ -695,194 +619,5 @@ mod device {
         assert!(!again.calibrated && again.refused.is_none());
         assert_eq!(read(&again.table), fresh);
         calibrate::forget(&device);
-    }
-
-    fn third(size: [u32; 3]) -> [u32; 3] {
-        size.map(|side| side * 3 / 4)
-    }
-
-    fn middle(mut times: Vec<Duration>) -> Duration {
-        times.sort_unstable();
-        times[times.len() / 2]
-    }
-
-    fn plain_frames(host: &Host, plan: Plan, rule: &str, sparse: bool) -> Option<Sample> {
-        let rules = grit::serve3::rules_on(Some(host));
-        let params = vec![0_u32; rules.iter().find(|one| one.name() == rule)?.params()];
-        let size = if sparse {
-            plan.sparse
-        } else {
-            third(plan.large)
-        };
-        let made = Made {
-            rule,
-            params: &params,
-            size,
-            sparse,
-            slots: None,
-        };
-        let mut world = World::create(host, &made).unwrap();
-        if let Some(pool) = world.pool() {
-            let sides = pool.sides();
-            let lattice = [0, 1, 2].map(|axis| size[axis] / sides[axis]);
-            let count = pool.capacity() / 2;
-            let cells: Vec<([u32; 3], u32)> = (0..lattice[0] * lattice[1] * lattice[2])
-                .take(count as usize)
-                .map(|at| {
-                    let (x, y, z) = (
-                        at % lattice[0],
-                        at / lattice[0] % lattice[1],
-                        at / (lattice[0] * lattice[1]),
-                    );
-                    ([x * sides[0], y * sides[1], z * sides[2]], 1)
-                })
-                .collect();
-            world.write(&cells).unwrap();
-        }
-        world.step(1).unwrap();
-        let mut times = Vec::new();
-        let mut units = 0;
-        for _ in 0..3 {
-            let cells = match world.pool() {
-                Some(pool) => {
-                    u64::from(world.pool_use().unwrap().unwrap().held) * pool.cells() as u64
-                }
-                None => size.iter().map(|side| u64::from(*side)).product(),
-            };
-            units = cells * u64::from(plan.frames);
-            let began = Instant::now();
-            world.step(plan.frames).unwrap();
-            times.push(began.elapsed());
-        }
-        Some(Sample {
-            units,
-            submits: 1,
-            time: middle(times),
-        })
-    }
-
-    fn plain(host: &Host, plan: Plan, key: &Key) -> Option<Sample> {
-        let size = third(COPY_LARGE);
-        let sand = |sparse| Made {
-            rule: "sand",
-            params: &[],
-            size,
-            sparse,
-            slots: None,
-        };
-        let mut times = Vec::new();
-        let (units, submits) = match key {
-            Key::Frame {
-                sparse,
-                by: calibrate::By::Rule(rule),
-            } => return plain_frames(host, plan, rule, *sparse),
-            Key::Build { sparse } => {
-                let mut units = 0;
-                for _ in 0..3 {
-                    let began = Instant::now();
-                    let world = World::create(host, &sand(*sparse)).unwrap();
-                    times.push(began.elapsed());
-                    units = world_cost(world.sizes());
-                }
-                (units, 1)
-            }
-            Key::Write { sparse } => {
-                let mut world = World::create(host, &sand(*sparse)).unwrap();
-                let (count, calls) = if *sparse { (512, 1) } else { (256, 8) };
-                let cells: Vec<([u32; 3], u32)> = (0..count)
-                    .map(|at: u32| ([at % 16, at / 16 % 16, at / 256], 1))
-                    .collect();
-                for _ in 0..3 {
-                    let began = Instant::now();
-                    for piece in cells.chunks(cells.len() / calls) {
-                        world.write(piece).unwrap();
-                    }
-                    times.push(began.elapsed());
-                }
-                (u64::from(count), u32::try_from(calls).unwrap())
-            }
-            Key::Fork | Key::Restore => {
-                let mut source = World::create(host, &sand(false)).unwrap();
-                let mut target = World::create(host, &sand(false)).unwrap();
-                for _ in 0..3 {
-                    let began = Instant::now();
-                    if *key == Key::Fork {
-                        drop(source.fork().unwrap());
-                    } else {
-                        target.restore(&mut source).unwrap();
-                    }
-                    times.push(began.elapsed());
-                }
-                (world_cost(source.sizes()), 1)
-            }
-            _ => return None,
-        };
-        Some(Sample {
-            units,
-            submits,
-            time: middle(times),
-        })
-    }
-
-    #[test]
-    fn c4_each_calibrated_rate_predicts_a_plain_run_within_ten_times() {
-        let Some(host) = common::device("c4 plausible") else {
-            return;
-        };
-        let _alone = alone();
-        let device = calibrate::device(&host);
-        calibrate::forget(&device);
-        let began = Instant::now();
-        let got = taken(&host, None).unwrap();
-        let took = began.elapsed();
-        calibrate::forget(&device);
-        assert!(got.calibrated);
-        eprintln!(
-            "STARTUP {} driver {} width {} threads {}: calibration took {} ms",
-            device.name,
-            device.driver,
-            device.width,
-            device.threads,
-            took.as_millis()
-        );
-        let table = read(&got.table);
-        if calibrate::meter(&host).is_none() {
-            assert!(
-                table.is_empty(),
-                "a device without a sound time source keeps every rate unknown"
-            );
-            eprintln!(
-                "C4 {}: no sound time source, every rate stays unknown",
-                device.name
-            );
-            return;
-        }
-        let plan = PLAN;
-        let mut failures = Vec::new();
-        let mut checked = 0;
-        for (key, rate) in table.rates() {
-            let Some(run) = plain(&host, plan, key) else {
-                failures.push(format!("{}: no plain run", key.name()));
-                continue;
-            };
-            let predicted = rate.predict(run.units, run.submits);
-            let ratio = run.time.as_secs_f64() / predicted.as_secs_f64().max(1e-12);
-            eprintln!(
-                "C4 {} {}: predicted {:?} for {} units and {} submits, the plain run took {:?}, ratio {:.2}",
-                device.name,
-                key.name(),
-                predicted,
-                run.units,
-                run.submits,
-                run.time,
-                ratio
-            );
-            checked += 1;
-            if !(0.1..=10.0).contains(&ratio) {
-                failures.push(format!("{}: ratio {ratio:.2}", key.name()));
-            }
-        }
-        assert!(checked > 0);
-        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

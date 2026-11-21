@@ -941,7 +941,7 @@ impl<'host> Server<'host> {
     }
 
     pub(super) fn knows(&self, key: &crate::calibrate::Key) -> bool {
-        self.book.calibration.as_ref().is_none_or(|shared| {
+        self.book.calibration.as_ref().is_some_and(|shared| {
             shared
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -956,7 +956,7 @@ impl<'host> Server<'host> {
         key: &crate::calibrate::Key,
         work: (u64, u32),
         wall: Duration,
-        sound: Option<(Duration, bool)>,
+        sound: Option<Duration>,
     ) {
         let Some(shared) = self.book.calibration.as_ref() else {
             return;
@@ -965,7 +965,7 @@ impl<'host> Server<'host> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (units, submits) = work;
-        if let Some((time, first)) = sound {
+        if let Some(time) = sound {
             held.lower(
                 key,
                 crate::calibrate::Sample {
@@ -973,7 +973,7 @@ impl<'host> Server<'host> {
                     submits,
                     time,
                 },
-                first,
+                false,
             );
         }
         held.lower(
@@ -1013,11 +1013,14 @@ impl<'host> Server<'host> {
         }
         let was_lost = book.lost;
         book.lost = false;
-        if book.calibration.is_none()
-            && let Some(host) = host
-        {
-            book.calibration = crate::calibrate::shared(&crate::calibrate::device(host));
-        }
+        book.calibration = match host {
+            Some(host) => book
+                .calibration
+                .take()
+                .filter(|table| crate::calibrate::fits(table, host))
+                .or_else(|| crate::calibrate::shared(&crate::calibrate::device(host))),
+            None => None,
+        };
         let clock = Clock::of(book.time(), book.time.now(), budget::BUDGET_MS);
         let mut server = Self {
             host,

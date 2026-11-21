@@ -461,7 +461,6 @@ pub struct Host {
     wedged: AtomicBool,
     on_cpu: bool,
     driver: u32,
-    threads: Option<crate::calibrate::cpu::Driver>,
     stamps_read: AtomicBool,
     owing: AtomicUsize,
     sparse: bool,
@@ -556,8 +555,6 @@ impl Host {
 
     fn made(pattern: Option<&str>, presenting: bool) -> Result<Option<Self>, Error> {
         let _forming = crate::resident::forming();
-        let before = crate::calibrate::cpu::seen();
-        let creator = crate::calibrate::cpu::own_name();
         let entry = match unsafe { ash::Entry::load() } {
             Ok(entry) => entry,
             Err(ash::LoadingError::LibraryLoadFailure(_)) => return Ok(None),
@@ -577,18 +574,7 @@ impl Host {
             Err(code) => return Err(Error::NoInstance(code)),
         };
 
-        let mut host = unsafe { Self::on(entry, instance, pattern, windowed) }?;
-        if host.on_cpu
-            && let Some(creator) = creator
-        {
-            host.threads = crate::calibrate::cpu::Driver::found(
-                &before,
-                &crate::calibrate::cpu::seen(),
-                &creator,
-                crate::calibrate::cpu::lanes(),
-            );
-        }
-        Ok(Some(host))
+        unsafe { Self::on(entry, instance, pattern, windowed) }.map(Some)
     }
 
     #[must_use]
@@ -777,7 +763,6 @@ impl Host {
             timing,
             on_cpu,
             driver,
-            threads: None,
             sparse,
             strict,
             int64,
@@ -925,8 +910,8 @@ impl Host {
     }
 
     #[must_use]
-    pub const fn driver_threads(&self) -> Option<&crate::calibrate::cpu::Driver> {
-        self.threads.as_ref()
+    pub const fn timed(&self) -> bool {
+        self.timing
     }
 
     pub(crate) unsafe fn submit(

@@ -867,46 +867,27 @@ pub(super) fn frame_key(live: &super::Live<'_>) -> Key {
     }
 }
 
-struct Sound<'host> {
-    cpu: Option<&'host crate::calibrate::cpu::Driver>,
+struct Sound {
     needed: bool,
     total: Option<Duration>,
-    mark: Option<crate::calibrate::cpu::Mark>,
 }
 
-impl<'host> Sound<'host> {
-    fn of(host: Option<&'host Host>, needed: bool) -> Self {
+impl Sound {
+    fn of(host: Option<&Host>, needed: bool) -> Self {
         Self {
-            cpu: host
-                .filter(|host| host.on_cpu())
-                .and_then(Host::driver_threads),
-            needed,
+            needed: needed && host.is_some_and(crate::calibrate::times),
             total: Some(Duration::ZERO),
-            mark: None,
         }
     }
 
-    fn before(&mut self) {
-        self.mark = match self.cpu {
-            Some(driver) if self.needed => driver.mark(),
-            _ => None,
-        };
-    }
-
-    fn after(&mut self) {
-        let measured = crate::calibrate::scripted_sound().unwrap_or_else(|| {
-            self.cpu.and_then(|driver| {
-                self.mark
-                    .take()
-                    .zip(driver.closing())
-                    .map(|(from, to)| driver.between(from, to))
-            })
-        });
+    fn after(&mut self, world: &World<'_>, frames: u32) {
+        let measured = crate::calibrate::scripted_sound()
+            .unwrap_or_else(|| world.on_device().map(|frame| frame * frames));
         self.total = self.total.zip(measured).map(|(all, one)| all + one);
     }
 
-    fn taken(&self) -> Option<(Duration, bool)> {
-        self.total.map(|total| (total, true))
+    const fn taken(&self) -> Option<Duration> {
+        if self.needed { self.total } else { None }
     }
 }
 
@@ -973,7 +954,7 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         let live = server.world(held)?;
         (frame_key(live), by_fallback(&live.world))
     };
-    let mut sound = Sound::of(server.host, !server.knows(&key));
+    let mut sound = Sound::of(server.host, server.knows(&key));
     let mut ran = Duration::ZERO;
     let owed = server.owed(number)?;
     let mut pace = server
@@ -1009,14 +990,13 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         }
         let began = server.now();
         faults::stall(server.time(), step);
-        sound.before();
         let stepped = server.world(held)?.world.step(step);
         let took = server.since(began);
         if let Err(why) = stepped {
             failure = Some(why);
             break;
         }
-        sound.after();
+        sound.after(&server.world(held)?.world, step);
         ran = ran.saturating_add(took);
         if wedged_after(server, batch) {
             failure = Some(Box::new(crate::host::Error::Wedged { after: took }));

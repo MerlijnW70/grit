@@ -1,42 +1,30 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use crate::branch::{Failed, Made, World};
 use crate::host::Host;
-use crate::serve3::budget::world_cost;
 
-use super::{Key, Meter, Rate, Sample, Table, device, faults, meter};
+use super::{Key, Rate, Sample, Table, device, faults, times};
 
 pub const RUNS: usize = 5;
 
-pub const SMALL: [u32; 3] = [32, 32, 32];
+pub const WINDOW: Duration = Duration::from_millis(600);
 
-pub const LARGE: [u32; 3] = [64, 64, 64];
+pub const WARM_MOST: Duration = Duration::from_millis(1500);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Plan {
-    pub small: [u32; 3],
-    pub large: [u32; 3],
-    pub sparse: [u32; 3],
-    pub frames: u32,
-}
+pub const WARM_STEPS: u32 = 4096;
 
-pub const PLAN: Plan = Plan {
-    small: SMALL,
-    large: LARGE,
-    sparse: LARGE,
-    frames: 8,
-};
+pub const SMALL: [u32; 3] = [64, 64, 64];
 
-pub const COPY_LARGE: [u32; 3] = [96, 96, 96];
+pub const LARGE: [u32; 3] = [128, 128, 128];
 
-pub const WRITE_CHUNK: usize = 32;
+pub const SPARSE: [u32; 3] = [64, 64, 64];
 
-pub const WRITE_CHUNKS: usize = 16;
-
-const SPARSE_CELLS: [usize; 2] = [64, 1024];
+pub const FRAMES: u32 = 32;
 
 const SPARSE_BRICKS: u32 = 2;
+
+pub type Solved = (Rate, Vec<Sample>);
 
 const fn made<'made>(
     rule: &'made str,
@@ -53,37 +41,17 @@ const fn made<'made>(
     }
 }
 
-fn timed<T>(
-    driver: Meter<'_>,
-    run: impl FnOnce() -> Result<T, Failed>,
-) -> Result<(T, Option<Duration>), Failed> {
-    let from = driver.mark();
-    faults::held();
-    let out = run()?;
-    let to = driver.closing();
-    if let Some((from, to)) = from.zip(to) {
-        faults::noted(driver.parts(from, to));
-    }
-    Ok((out, from.zip(to).map(|(from, to)| driver.between(from, to))))
-}
-
-fn least(held: &mut Option<Sample>, units: u64, submits: u32, time: Option<Duration>) {
-    let Some(time) = time else {
-        return;
-    };
-    let sample = Sample {
-        units,
-        submits,
-        time,
-    };
-    if sample.valid() && held.is_none_or(|best| sample.time < best.time) {
-        *held = Some(sample);
-    }
-}
-
-fn cells_of(size: [u32; 3]) -> u64 {
-    size.iter()
-        .fold(1_u64, |all, side| all.saturating_mul(u64::from(*side)))
+fn frame_cells(world: &mut World<'_>) -> Result<u64, Failed> {
+    Ok(match world.pool() {
+        Some(pool) => {
+            let held = world.pool_use()?.map_or(0, |used| used.held);
+            u64::from(held).saturating_mul(u64::try_from(pool.cells()).unwrap_or(u64::MAX))
+        }
+        None => world
+            .size()
+            .iter()
+            .fold(1_u64, |all, side| all.saturating_mul(u64::from(*side))),
+    })
 }
 
 fn spread(world: &World<'_>, count: usize) -> Vec<([u32; 3], u32)> {
@@ -112,182 +80,228 @@ fn spread(world: &World<'_>, count: usize) -> Vec<([u32; 3], u32)> {
     cells
 }
 
-fn ran(world: &mut World<'_>, meter: Meter<'_>, size: [u32; 3]) -> Result<Option<Sample>, Failed> {
-    let frames = PLAN.frames;
-    world.step(1)?;
-    let mut best = None;
-    for _ in 0..RUNS {
-        let cells = match world.pool() {
-            Some(pool) => {
-                let held = world.pool_use()?.map_or(0, |used| used.held);
-                u64::from(held).saturating_mul(u64::try_from(pool.cells()).unwrap_or(u64::MAX))
-            }
-            None => cells_of(size),
-        };
-        let ((), time) = timed(meter, || world.step(frames))?;
-        least(&mut best, cells.saturating_mul(u64::from(frames)), 1, time);
-    }
-    Ok(best)
+#[must_use]
+pub fn seeded(size: [u32; 3]) -> Vec<([u32; 3], u32)> {
+    let [wide, deep, tall] = size.map(|side| side.max(1));
+    let mut state = 0x9E37_79B9_u32;
+    let count = wide.saturating_mul(deep).saturating_mul(tall) / 10;
+    (0..count)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (
+                [state % wide, (state >> 7) % deep, (state >> 14) % tall],
+                1 + (state >> 21) % 3,
+            )
+        })
+        .collect()
 }
 
-fn frames(
-    host: &Host,
-    meter: Meter<'_>,
-    (rule, params): (&str, &[u32]),
-    sparse: bool,
-) -> Result<Option<Solved>, Failed> {
-    let mut points = Vec::new();
-    let Plan {
-        small,
-        large,
-        sparse: spread_over,
-        ..
-    } = PLAN;
-    if sparse {
-        let Ok(mut world) = World::create(host, &made(rule, params, spread_over, true)) else {
-            return Ok(None);
-        };
-        let room = world.pool().map_or(0, |pool| pool.capacity());
-        for bricks in [SPARSE_BRICKS.min(room), room] {
-            let cells = spread(&world, usize::try_from(bricks).unwrap_or(0));
-            world.write(&cells)?;
-            points.push(ran(&mut world, meter, spread_over)?);
+struct Window {
+    spans: VecDeque<(u64, u64)>,
+    tick: f64,
+}
+
+impl Window {
+    fn of(host: &Host) -> Self {
+        Self {
+            spans: VecDeque::new(),
+            tick: f64::from(host.ticking().0).max(f64::MIN_POSITIVE),
         }
-    } else {
-        for size in [small, large] {
-            let Ok(mut world) = World::create(host, &made(rule, params, size, false)) else {
+    }
+
+    fn ticks(&self, time: Duration) -> u64 {
+        (time.as_nanos() as f64 / self.tick) as u64
+    }
+
+    fn push(&mut self, span: Option<(u64, u64)>) -> bool {
+        let Some((first, last)) = span else {
+            return false;
+        };
+        if self.spans.back().is_some_and(|(_, end)| first < *end) {
+            self.spans.clear();
+        }
+        self.spans.push_back((first, last));
+        let reach = self.ticks(WINDOW).saturating_mul(2);
+        while self
+            .spans
+            .front()
+            .is_some_and(|(_, end)| last.saturating_sub(*end) > reach)
+        {
+            self.spans.pop_front();
+        }
+        true
+    }
+
+    fn busy(&self) -> bool {
+        let Some(&(_, end)) = self.spans.back() else {
+            return false;
+        };
+        let width = self.ticks(WINDOW);
+        let Some(from) = end.checked_sub(width) else {
+            return false;
+        };
+        let held: u64 = self
+            .spans
+            .iter()
+            .map(|(first, last)| last.saturating_sub((*first).max(from)))
+            .sum();
+        held.saturating_mul(2) >= width
+    }
+}
+
+struct Warm<'host, 'world> {
+    window: Window,
+    filler: &'world mut World<'host>,
+    since: Option<u64>,
+    steps: u32,
+}
+
+impl Warm<'_, '_> {
+    fn begin(&mut self) {
+        self.since = None;
+        self.steps = 0;
+    }
+
+    fn spent(&mut self, span: Option<(u64, u64)>) -> bool {
+        let Some((first, last)) = span else {
+            return false;
+        };
+        let since = *self.since.get_or_insert(first);
+        self.steps = self.steps.saturating_add(1);
+        last.saturating_sub(since) <= self.window.ticks(WARM_MOST) && self.steps <= WARM_STEPS
+    }
+
+    fn fill(&mut self) -> Result<bool, Failed> {
+        self.filler.step(FRAMES)?;
+        let span = self.filler.on_device_ticks();
+        Ok(self.window.push(span) && self.spent(span))
+    }
+
+    fn hold(&mut self) -> Result<bool, Failed> {
+        faults::waited();
+        while !self.window.busy() {
+            if !self.fill()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn timed(&mut self, world: &mut World<'_>, frames: u32) -> Result<Option<Duration>, Failed> {
+        self.begin();
+        loop {
+            if !self.hold()? || !self.fill()? {
                 return Ok(None);
-            };
-            points.push(ran(&mut world, meter, size)?);
+            }
+            faults::held();
+            world.step(frames)?;
+            faults::timed();
+            let span = world.on_device_ticks();
+            if !self.window.push(span) || !self.spent(span) {
+                return Ok(None);
+            }
+            if self.window.busy() {
+                return Ok(world.on_device().map(|frame| frame * frames));
+            }
         }
     }
-    Ok(pair(&points))
 }
 
-fn built(
-    host: &Host,
-    meter: Meter<'_>,
-    (size, repeats): ([u32; 3], u32),
-    sparse: bool,
-) -> Result<Option<Sample>, Failed> {
-    let mut best = None;
-    for _ in 0..RUNS {
-        let (worlds, time) = timed(meter, || {
-            (0..repeats)
-                .map(|_| World::create(host, &made("sand", &[], size, sparse)))
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        let units = worlds.first().map_or(0, |world| world_cost(world.sizes()));
-        least(
-            &mut best,
-            units.saturating_mul(u64::from(repeats)),
-            repeats,
-            time,
-        );
-        drop(worlds);
+#[derive(Debug)]
+struct Lost;
+
+impl std::fmt::Display for Lost {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("the device could not be kept busy")
     }
-    Ok(best)
 }
 
-fn written(host: &Host, meter: Meter<'_>, sparse: bool) -> Result<Option<Solved>, Failed> {
-    let mut world = World::create(host, &made("sand", &[], LARGE, sparse))?;
-    let mut points = Vec::new();
-    let plans: [(usize, usize, usize); 2] = if sparse {
-        [(SPARSE_CELLS[0], 1, 8), (SPARSE_CELLS[1], 1, 1)]
-    } else {
-        [(1, 1, 16), (WRITE_CHUNK * WRITE_CHUNKS, WRITE_CHUNKS, 1)]
-    };
-    for (count, calls, repeats) in plans {
-        let side = LARGE[0];
-        let cells: Vec<([u32; 3], u32)> = (0..count)
-            .map(|at| {
-                let at = u32::try_from(at).unwrap_or(0);
-                ([at % 16, (at / 16) % 16, at / 256 % side], 1)
-            })
-            .collect();
-        let chunk = cells.len().div_ceil(calls).max(1);
-        let mut best = None;
-        for _ in 0..RUNS {
-            let ((), time) = timed(meter, || {
-                for _ in 0..repeats {
-                    for piece in cells.chunks(chunk) {
-                        world.write(piece)?;
-                    }
-                }
-                Ok(())
-            })?;
-            least(
-                &mut best,
-                u64::try_from(count.saturating_mul(repeats)).unwrap_or(u64::MAX),
-                u32::try_from(calls.saturating_mul(repeats)).unwrap_or(u32::MAX),
-                time,
-            );
-        }
-        points.push(best);
-    }
-    Ok(pair(&points))
-}
+impl std::error::Error for Lost {}
 
-#[derive(Clone, Copy)]
-enum Copying {
-    Fork,
-    Restore,
-}
-
-fn copied(
-    host: &Host,
-    meter: Meter<'_>,
-    (size, repeats): ([u32; 3], u32),
-    how: Copying,
-) -> Result<Option<Sample>, Failed> {
-    let mut source = World::create(host, &made("sand", &[], size, false))?;
-    let mut target = match how {
-        Copying::Restore => Some(World::create(host, &made("sand", &[], size, false))?),
-        Copying::Fork => None,
-    };
-    let units = world_cost(source.sizes());
-    let mut best = None;
+fn point(warm: &mut Warm<'_, '_>, world: &mut World<'_>, frames: u32) -> Result<Sample, Failed> {
+    world.step(1)?;
+    let mut units = 0_u64;
+    let mut least: Option<Duration> = None;
     for _ in 0..RUNS {
-        let time = match (how, target.as_mut()) {
-            (Copying::Fork, _) => {
-                let (forks, time) = timed(meter, || {
-                    (0..repeats)
-                        .map(|_| source.fork())
-                        .collect::<Result<Vec<_>, _>>()
-                })?;
-                drop(forks);
-                time
-            }
-            (Copying::Restore, Some(target)) => {
-                timed(meter, || {
-                    for _ in 0..repeats {
-                        target.restore(&mut source)?;
-                    }
-                    Ok(())
-                })?
-                .1
-            }
-            (Copying::Restore, None) => None,
+        let cells = frame_cells(world)?;
+        let Some(time) = warm.timed(world, frames)? else {
+            return Err(Box::new(Lost));
         };
-        least(
-            &mut best,
-            units.saturating_mul(u64::from(repeats)),
-            repeats,
-            time,
-        );
+        units = units.max(cells.saturating_mul(u64::from(frames)));
+        least = Some(least.map_or(time, |held| held.min(time)));
     }
-    Ok(best)
+    Ok(Sample {
+        units,
+        submits: 1,
+        time: least.unwrap_or_default(),
+    })
 }
 
-pub type Solved = (Rate, [Sample; 2]);
+struct Worlds<'host> {
+    key: Key,
+    small: World<'host>,
+    large: Option<World<'host>>,
+}
 
-fn pair(points: &[Option<Sample>]) -> Option<Solved> {
-    match points {
-        [Some(small), Some(large)] => {
-            Rate::solved(*small, *large).map(|rate| (rate, [*small, *large]))
+fn prepared(host: &Host) -> Result<Vec<Worlds<'_>>, Failed> {
+    let mut prepared = Vec::new();
+    for rule in crate::serve3::rules_on(Some(host)) {
+        let params = vec![0_u32; rule.params()];
+        let name = rule.name();
+        if let (Ok(small), Ok(large)) = (
+            World::create(host, &made(name, &params, SMALL, false)),
+            World::create(host, &made(name, &params, LARGE, false)),
+        ) {
+            prepared.push(Worlds {
+                key: Key::rule(name, false),
+                small,
+                large: Some(large),
+            });
         }
-        _ => None,
+        if let Ok(world) = World::create(host, &made(name, &params, SPARSE, true)) {
+            prepared.push(Worlds {
+                key: Key::rule(name, true),
+                small: world,
+                large: None,
+            });
+        }
     }
+    for one in &mut prepared {
+        one.small.step(1)?;
+        if let Some(large) = one.large.as_mut() {
+            large.step(1)?;
+        }
+    }
+    Ok(prepared)
+}
+
+fn frame_key(warm: &mut Warm<'_, '_>, worlds: &mut Worlds<'_>) -> Result<Option<Solved>, Failed> {
+    let small_world = &mut worlds.small;
+    let (small, short, large) = match worlds.large.as_mut() {
+        Some(large_world) => {
+            let small = point(warm, small_world, FRAMES)?;
+            let short = point(warm, small_world, 1)?;
+            let large = point(warm, large_world, FRAMES)?;
+            (small, short, large)
+        }
+        None => {
+            let room = small_world.pool().map_or(0, |pool| pool.capacity());
+            let few = spread(
+                small_world,
+                usize::try_from(SPARSE_BRICKS.min(room)).unwrap_or(0),
+            );
+            small_world.write(&few)?;
+            let small = point(warm, small_world, FRAMES)?;
+            let short = point(warm, small_world, 1)?;
+            let many = spread(small_world, usize::try_from(room).unwrap_or(0));
+            small_world.write(&many)?;
+            let large = point(warm, small_world, FRAMES)?;
+            (small, short, large)
+        }
+    };
+    Ok(Rate::floor(small, large, short).map(|rate| (rate, vec![small, large, short])))
 }
 
 pub fn calibrated(host: &Host) -> Result<Table, Failed> {
@@ -300,44 +314,31 @@ pub fn calibrated(host: &Host) -> Result<Table, Failed> {
 
 pub fn measured(host: &Host) -> Result<BTreeMap<Key, Solved>, Failed> {
     let mut found = BTreeMap::new();
-    let Some(meter) = meter(host) else {
+    if !times(host) {
         return Ok(found);
-    };
+    }
     let _sole = host.sole()?;
-    for rule in crate::serve3::rules_on(Some(host)) {
-        let params = vec![0_u32; rule.params()];
-        for sparse in [false, true] {
-            faults::named(&Key::rule(rule.name(), sparse).name());
-            if let Some(solved) = frames(host, meter, (rule.name(), &params), sparse)? {
-                found.insert(Key::rule(rule.name(), sparse), solved);
+    let mut filler = World::create(host, &made("sand", &[], LARGE, false))?;
+    filler.write(&seeded(LARGE))?;
+    let mut warm = Warm {
+        window: Window::of(host),
+        filler: &mut filler,
+        since: None,
+        steps: 0,
+    };
+    warm.begin();
+    if !warm.hold()? {
+        return Ok(found);
+    }
+    let mut worlds = prepared(host)?;
+    for one in &mut worlds {
+        match frame_key(&mut warm, one) {
+            Ok(Some(solved)) => {
+                found.insert(one.key.clone(), solved);
             }
-        }
-    }
-    for sparse in [false, true] {
-        faults::named(&Key::Build { sparse }.name());
-        let built = pair(&[
-            built(host, meter, (SMALL, 2), sparse)?,
-            built(host, meter, (COPY_LARGE, 1), sparse)?,
-        ]);
-        if let Some(solved) = built {
-            found.insert(Key::Build { sparse }, solved);
-        }
-        faults::named(&Key::Write { sparse }.name());
-        if let Some(solved) = written(host, meter, sparse)? {
-            found.insert(Key::Write { sparse }, solved);
-        }
-    }
-    for (key, how, repeats) in [
-        (Key::Fork, Copying::Fork, [4, 1]),
-        (Key::Restore, Copying::Restore, [4, 1]),
-    ] {
-        faults::named(&key.name());
-        let copies = pair(&[
-            copied(host, meter, (SMALL, repeats[0]), how)?,
-            copied(host, meter, (COPY_LARGE, repeats[1]), how)?,
-        ]);
-        if let Some(solved) = copies {
-            found.insert(key, solved);
+            Ok(None) => {}
+            Err(why) if why.downcast_ref::<Lost>().is_some() => return Ok(BTreeMap::new()),
+            Err(why) => return Err(why),
         }
     }
     Ok(found)

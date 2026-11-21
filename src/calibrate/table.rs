@@ -15,7 +15,6 @@ pub struct Device {
     pub name: String,
     pub driver: u32,
     pub width: u32,
-    pub threads: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -171,34 +170,32 @@ impl Rate {
     }
 
     #[must_use]
-    pub fn solved(small: Sample, large: Sample) -> Option<Self> {
-        if !small.valid() || !large.valid() {
+    pub fn floor(small: Sample, large: Sample, short: Sample) -> Option<Self> {
+        if [small, large, short].iter().any(|one| one.time.is_zero())
+            || small.submits != large.submits
+            || short.submits == 0
+        {
             return None;
         }
-        let (u1, s1, t1) = (
-            small.units as f64,
-            f64::from(small.submits),
-            small.time.as_nanos() as f64,
-        );
-        let (u2, s2, t2) = (
-            large.units as f64,
-            f64::from(large.submits),
-            large.time.as_nanos() as f64,
-        );
-        let det = u1.mul_add(s2, -(u2 * s1));
-        if det == 0.0 {
-            return None;
+        let (u1, t1) = (small.units as f64, small.time.as_nanos() as f64);
+        let (u2, t2) = (large.units as f64, large.time.as_nanos() as f64);
+        let (u0, t0) = (short.units as f64, short.time.as_nanos() as f64);
+        let mut per_unit = if u2 > u1 {
+            ((t2 - t1) / (u2 - u1)).max(0.0)
+        } else {
+            0.0
+        };
+        for (units, time) in [(u0, t0), (u1, t1), (u2, t2)] {
+            if units > 0.0 {
+                per_unit = per_unit.min(time / units);
+            }
         }
-        let per_unit = t1.mul_add(s2, -(t2 * s1)) / det;
-        let per_submit = u1.mul_add(t2, -(u2 * t1)) / det;
-        if !per_unit.is_finite() || per_unit <= 0.0 || per_submit < 0.0 {
-            return None;
-        }
+        let per_submit = (per_unit.mul_add(-u0, t0) / f64::from(short.submits)).max(0.0);
         let rate = Self {
             per_unit_fs: floored(per_unit * FEMTOS as f64)?,
             per_submit_ns: floored(per_submit)?,
         };
-        (rate.per_unit_fs > 0).then_some(rate)
+        (rate.per_unit_fs > 0 || rate.per_submit_ns > 0).then_some(rate)
     }
 
     #[must_use]
@@ -319,7 +316,6 @@ impl Table {
                     ("name", text(&self.device.name)),
                     ("driver", Json::Int(i64::from(self.device.driver))),
                     ("width", Json::Int(i64::from(self.device.width))),
-                    ("threads", Json::Int(i64::from(self.device.threads))),
                 ]),
             ),
             (
@@ -380,7 +376,6 @@ impl Table {
                 .to_owned(),
             driver: small(device, "driver")?,
             width: small(device, "width")?,
-            threads: small(device, "threads")?,
         };
         let mut table = Self::new(device);
         let listed = body

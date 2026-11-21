@@ -1,4 +1,3 @@
-pub mod cpu;
 pub mod table;
 pub mod take;
 
@@ -15,6 +14,7 @@ pub use table::{By, Device, FILE, Key, Moved, Rate, Sample, Table, VERSION};
 pub struct Held {
     table: Table,
     dir: Option<PathBuf>,
+    still: bool,
 }
 
 impl Held {
@@ -23,7 +23,15 @@ impl Held {
         &self.table
     }
 
+    #[must_use]
+    pub fn fits(&self, host: &Host) -> bool {
+        *self.table.device() == device(host)
+    }
+
     pub fn lower(&mut self, key: &Key, sample: Sample, sound: bool) -> Moved {
+        if self.still {
+            return Moved::Unchanged;
+        }
         let moved = self.table.lower(key, sample, sound);
         if moved != Moved::Unchanged
             && let Some(dir) = &self.dir
@@ -47,7 +55,25 @@ pub fn held(table: Table, dir: Option<&Path>) -> Shared {
     Arc::new(Mutex::new(Held {
         table,
         dir: dir.map(Path::to_path_buf),
+        still: false,
     }))
+}
+
+#[must_use]
+pub fn still(table: Table) -> Shared {
+    Arc::new(Mutex::new(Held {
+        table,
+        dir: None,
+        still: true,
+    }))
+}
+
+#[must_use]
+pub fn fits(shared: &Shared, host: &Host) -> bool {
+    shared
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .fits(host)
 }
 
 #[must_use]
@@ -82,19 +108,12 @@ pub fn device(host: &Host) -> Device {
         name: host.name().to_owned(),
         driver: host.driver_version(),
         width: host.width(),
-        threads: host.driver_threads().map_or(0, cpu::Driver::lanes),
     }
 }
 
-pub type Meter<'host> = &'host cpu::Driver;
-
 #[must_use]
-pub fn meter(host: &Host) -> Option<Meter<'_>> {
-    if host.on_cpu() {
-        host.driver_threads()
-    } else {
-        None
-    }
+pub fn times(host: &Host) -> bool {
+    !host.on_cpu() && host.timed()
 }
 
 #[derive(Debug)]
@@ -121,8 +140,8 @@ pub fn load(dir: &Path, device: &Device) -> Result<Option<Table>, String> {
     if table.device() != device {
         let other = table.device();
         return Err(format!(
-            "{FILE} holds the rates of another device ({}, driver {}, width {}, threads {}), so it was ignored and the device calibrated again",
-            other.name, other.driver, other.width, other.threads
+            "{FILE} holds the rates of another device ({}, driver {}, width {}), so it was ignored and the device calibrated again",
+            other.name, other.driver, other.width
         ));
     }
     Ok(Some(table))
@@ -177,6 +196,19 @@ pub mod faults {
 
     static SOUND: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
 
+    static WAIT: Mutex<Option<Hold>> = Mutex::new(None);
+
+    pub fn device_wait(wait: Option<Hold>) {
+        *WAIT.lock().unwrap_or_else(PoisonError::into_inner) = wait;
+    }
+
+    pub(crate) fn waited() {
+        let wait = WAIT.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(wait) = wait {
+            wait();
+        }
+    }
+
     pub fn hold(held: Option<Hold>) {
         *HOLD.lock().unwrap_or_else(PoisonError::into_inner) = held;
     }
@@ -194,26 +226,15 @@ pub mod faults {
         held.reverse();
     }
 
-    static NOTES: Mutex<(String, Vec<String>)> = Mutex::new((String::new(), Vec::new()));
+    static TIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    pub(crate) fn named(key: &str) {
-        let mut held = NOTES.lock().unwrap_or_else(PoisonError::into_inner);
-        key.clone_into(&mut held.0);
-    }
-
-    pub(crate) fn noted([own, serial, pool]: [u64; 3]) {
-        let mut held = NOTES.lock().unwrap_or_else(PoisonError::into_inner);
-        let line = format!(
-            "{} caller={own} serial={serial} pool_per_lane={pool} total={}",
-            held.0,
-            own.saturating_add(serial).saturating_add(pool)
-        );
-        held.1.push(line);
+    pub(crate) fn timed() {
+        TIMED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[must_use]
-    pub fn notes() -> Vec<String> {
-        std::mem::take(&mut NOTES.lock().unwrap_or_else(PoisonError::into_inner).1)
+    pub fn timed_runs() -> u64 {
+        TIMED.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn scripted() -> Option<Option<Duration>> {
@@ -231,9 +252,9 @@ pub(crate) mod faults {
 
     pub(crate) const fn held() {}
 
-    pub(crate) const fn named(_: &str) {}
+    pub(crate) const fn waited() {}
 
-    pub(crate) const fn noted(_: [u64; 3]) {}
+    pub(crate) const fn timed() {}
 
     pub(crate) const fn scripted() -> Option<Option<Duration>> {
         None
