@@ -405,7 +405,11 @@ fn pass(warm: &mut Warm<'_, '_>, worlds: &mut [World<'_>]) -> Result<Pass, Stop>
     Ok(Pass { sizes })
 }
 
-fn prepared(host: &Host) -> Result<Vec<(Key, Vec<World<'_>>)>, Failed> {
+fn prepared<'host>(
+    host: &'host Host,
+    clock: &mut Clocked,
+    budget: u64,
+) -> Result<Vec<(Key, Vec<World<'host>>)>, Stop> {
     let rules = crate::serve3::rules_on(Some(host));
     let mut prepared = Vec::new();
     for key in super::up_front(host) {
@@ -424,6 +428,10 @@ fn prepared(host: &Host) -> Result<Vec<(Key, Vec<World<'_>>)>, Failed> {
         for side in SIDES {
             if let Ok(mut world) = World::create(host, &made(name, &params, [side; 3], *sparse)) {
                 world.step(1)?;
+                clock.add(world.on_device_ticks().ok_or(Stop::Lost)?);
+                if clock.used > budget {
+                    return Err(Stop::Spent);
+                }
                 worlds.push(world);
             }
         }
@@ -450,21 +458,29 @@ pub fn measured(host: &Host) -> Result<Measured, Failed> {
     let mut filler = World::create(host, &made("sand", &[], FILLER, false))?;
     filler.step(1)?;
     let origin = filler.on_device_ticks();
-    let mut worlds = prepared(host)?;
+    let window = Window::of(host);
+    let mut clock = Clocked::default();
+    if let Some(span) = origin {
+        clock.add(span);
+    }
+    let before = clock.used;
+    let mut worlds = match prepared(host, &mut clock, window.ticks(BUDGET)) {
+        Ok(worlds) => worlds,
+        Err(Stop::Lost) => return Ok(Measured::none(Ended::Lost)),
+        Err(Stop::Spent) => return Ok(Measured::none(Ended::Spent)),
+        Err(Stop::Failed(why)) => return Err(why),
+    };
+    let created = clock.used;
+    clock.marked = true;
     let mut warm = Warm {
-        window: Window::of(host),
-        clock: Clocked::default(),
+        window,
+        clock,
         filler: &mut filler,
         since: None,
         steps: 0,
         tried: 0,
         counted: 0,
     };
-    if let Some(span) = origin {
-        warm.clock.add(span);
-    }
-    let before = warm.clock.used;
-    warm.clock.marked = true;
     warm.begin();
     match warm.hold() {
         Ok(()) => {}
@@ -505,8 +521,10 @@ pub fn measured(host: &Host) -> Result<Measured, Failed> {
         counted: warm.counted,
         warm: warm
             .window
-            .time(warmed.saturating_sub(before).saturating_sub(gap)),
-        made: warm.window.time(gap),
+            .time(warmed.saturating_sub(created).saturating_sub(gap)),
+        made: warm
+            .window
+            .time(created.saturating_sub(before).saturating_add(gap)),
         timed: warm.window.time(used.saturating_sub(warmed)),
     })
 }
