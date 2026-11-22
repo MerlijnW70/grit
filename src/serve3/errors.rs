@@ -74,9 +74,11 @@ pub enum Code {
     Asymmetric,
     Unsolved,
     LearnLimit,
+    CountReads,
+    NotCounting,
 }
 
-pub const CODES: [Code; 70] = [
+pub const CODES: [Code; 72] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -147,6 +149,8 @@ pub const CODES: [Code; 70] = [
     Code::Asymmetric,
     Code::Unsolved,
     Code::LearnLimit,
+    Code::CountReads,
+    Code::NotCounting,
 ];
 
 impl Code {
@@ -223,6 +227,8 @@ impl Code {
             Self::Asymmetric => "asymmetric",
             Self::Unsolved => "unsolved",
             Self::LearnLimit => "learn_limit",
+            Self::CountReads => "count_reads",
+            Self::NotCounting => "not_counting",
         }
     }
 
@@ -406,6 +412,12 @@ impl Code {
             }
             Self::LearnLimit => {
                 "Give fewer reads or example cells, fewer rows to search, or at least as many gates as writes; grit_describe names learn_inputs, learn_cells and learn_examples."
+            }
+            Self::CountReads => {
+                "Give rule totalistic or outer exactly one read, the bit whose places it counts, or use rule minimal or symmetric."
+            }
+            Self::NotCounting => {
+                "Use rule minimal or symmetric, or fix the examples that give one count two outputs; counts names each with a row for each output."
             }
         }
     }
