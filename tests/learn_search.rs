@@ -1723,19 +1723,23 @@ mod faulted {
         }
     }
 
+    fn frozen(one: &Session, whole: &[(Vec<u32>, u64)], budget: u64) {
+        for got in &one.got {
+            assert_ne!(text_at(got, "stopped"), "budget", "budget {budget}");
+            assert_eq!(trail_of(got), whole, "budget {budget}: the whole search");
+        }
+        assert_eq!(one.told.elapsed, [Duration::ZERO; 2], "budget {budget}");
+        assert_eq!(one.told.slept, [Duration::ZERO; 2], "budget {budget}");
+        assert_eq!(one.told.answers[0], one.told.answers[1]);
+    }
+
     #[test]
     fn s4_a_search_on_a_frozen_clock_answers_alike_at_any_budget_and_stops_on_none() {
         let case = case();
         let whole = searched_whole(&case);
         let held = [1, LONG].map(|budget| twice(&case, budget, false));
         for (budget, one) in [1, LONG].iter().zip(&held) {
-            for got in &one.got {
-                assert_ne!(text_at(got, "stopped"), "budget", "budget {budget}");
-                assert_eq!(trail_of(got), whole, "budget {budget}: the whole search");
-            }
-            assert_eq!(one.told.elapsed, [Duration::ZERO; 2], "budget {budget}");
-            assert_eq!(one.told.slept, [Duration::ZERO; 2], "budget {budget}");
-            assert_eq!(one.told.answers[0], one.told.answers[1]);
+            frozen(one, &whole, *budget);
         }
         assert_eq!(
             held[0].told, held[1].told,
@@ -1749,6 +1753,7 @@ mod faulted {
         let whole = searched_whole(&case);
         let generation = climbed(&whole);
         let runs = 1 + POPULATION * u32::try_from(generation).unwrap();
+        let mut still = Vec::new();
         for (budget, stall) in [
             (1, false),
             (LONG, false),
@@ -1768,6 +1773,9 @@ mod faulted {
                 "budget {budget}: {waits} waits, {waited:?} in all, the calls took {:?}",
                 delayed.took
             );
+            if !stall {
+                frozen(&delayed, &whole, budget);
+            }
             assert_eq!(
                 plain.told, delayed.told,
                 "budget {budget}: real time spent at the clock moved the search"
@@ -1777,7 +1785,14 @@ mod faulted {
                     assert!(*took >= FLOOR, "budget {budget}: the call took {took:?}");
                 }
             }
+            if !stall {
+                still.push(delayed.told);
+            }
         }
+        assert_eq!(
+            still[0], still[1],
+            "under the waiting clock a frozen clock answered differently at budgets of 1 ms and {LONG} ms"
+        );
     }
 
     #[test]

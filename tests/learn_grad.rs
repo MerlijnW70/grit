@@ -2718,6 +2718,20 @@ mod faulted {
         }
     }
 
+    fn frozen(one: &Session, whole: &Descent, budget: u64) {
+        for got in &one.got {
+            assert_eq!(
+                text_at(got, "stopped"),
+                settled_name(whole.settled),
+                "budget {budget}"
+            );
+            assert_eq!(trail_of(got), whole.trail, "budget {budget}: the library");
+        }
+        assert_eq!(one.told.elapsed, [Duration::ZERO; 2], "budget {budget}");
+        assert_eq!(one.told.slept, [Duration::ZERO; 2], "budget {budget}");
+        assert_eq!(one.told.answers[0], one.told.answers[1]);
+    }
+
     #[test]
     fn g4_a_descent_on_a_frozen_clock_answers_alike_at_any_budget_and_stops_on_none() {
         let Some(host) = device("learn_grad frozen") else {
@@ -2727,17 +2741,7 @@ mod faulted {
         let whole = library(&case, 12);
         let held = [1, 600_000].map(|budget| twice(&host, &case, budget, false));
         for (budget, one) in [1, 600_000].iter().zip(&held) {
-            for got in &one.got {
-                assert_eq!(
-                    text_at(got, "stopped"),
-                    settled_name(whole.settled),
-                    "budget {budget}"
-                );
-                assert_eq!(trail_of(got), whole.trail, "budget {budget}: the library");
-            }
-            assert_eq!(one.told.elapsed, [Duration::ZERO; 2], "budget {budget}");
-            assert_eq!(one.told.slept, [Duration::ZERO; 2], "budget {budget}");
-            assert_eq!(one.told.answers[0], one.told.answers[1]);
+            frozen(one, &whole, *budget);
         }
         assert_eq!(
             held[0].told, held[1].told,
@@ -2753,6 +2757,7 @@ mod faulted {
         let case = turning();
         let whole = library(&case, 12);
         let walks = u32::try_from(climbs(&whole) + 1).unwrap();
+        let mut still = Vec::new();
         for (budget, stall) in [
             (1, false),
             (600_000, false),
@@ -2775,6 +2780,9 @@ mod faulted {
                 "budget {budget}: {waits} waits, {waited:?} in all, the calls took {:?}",
                 delayed.took
             );
+            if !stall {
+                frozen(&delayed, &whole, budget);
+            }
             assert_eq!(
                 plain.told, delayed.told,
                 "budget {budget}: real time spent at the clock moved the descent"
@@ -2784,7 +2792,14 @@ mod faulted {
                     assert!(*took >= FLOOR, "budget {budget}: the call took {took:?}");
                 }
             }
+            if !stall {
+                still.push(delayed.told);
+            }
         }
+        assert_eq!(
+            still[0], still[1],
+            "under the waiting clock a frozen clock answered differently at budgets of 1 ms and 600000 ms"
+        );
     }
 
     #[test]
