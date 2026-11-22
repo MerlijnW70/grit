@@ -52,12 +52,6 @@ fn pinned(stencil: Stencil, places: &[u32], copies: usize, others: &[u32]) {
     assert_eq!(moves.len(), copies, "{}", stencil.name());
     let gates = and_of(inputs, places);
     let law = stencil::symmetrised(inputs, 1, &gates, &moves);
-    assert_eq!(
-        law.len(),
-        copies * gates.len() + (copies - 1),
-        "{}: one copy of the circuit per move and one or for each copy after the first",
-        stencil.name()
-    );
     let pattern = places.iter().fold(0, |held, place| held | (1 << place));
     let images: BTreeSet<u32> = moves
         .iter()
@@ -90,6 +84,12 @@ fn pinned(stencil: Stencil, places: &[u32], copies: usize, others: &[u32]) {
             stencil.name()
         );
     }
+    assert_eq!(
+        law.len(),
+        copies * gates.len() + (copies - 1),
+        "{}: one copy of the circuit per move and one or for each copy after the first",
+        stencil.name()
+    );
 }
 
 #[test]
