@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 mod common;
+#[cfg(feature = "faults")]
+mod delayed;
 mod halo_grad;
 
 use common::device;
@@ -2394,11 +2396,14 @@ mod faulted {
     use std::time::{Duration, Instant};
 
     use grit::Host;
+    use grit::clock::{Fake, Time};
     use grit::serve3::Options;
     use grit::serve3::exec::Exec;
 
     use grit::serve3::gradient::faults::{cancel_after, disarm};
     use grit::serve3::tools::faults::{disarm as unstall, stall_every};
+
+    use super::delayed::Waiting;
 
     struct Run {
         exec: Exec,
@@ -2438,6 +2443,10 @@ mod faulted {
     }
 
     const WALK_FLOOR: Duration = Duration::from_millis(1000);
+
+    const WAITED: Duration = Duration::from_millis(4);
+
+    const FLOOR: Duration = Duration::from_millis(20);
 
     struct Case {
         text: String,
@@ -2542,6 +2551,132 @@ mod faulted {
         assert_eq!(int_at(got, "steps"), i64::try_from(walked - 1).unwrap());
     }
 
+    fn stopped_early(got: &Json, whole: &Descent, walked: usize) {
+        let trail = trail_of(got);
+        assert_eq!(trail.len(), walked, "{}", written(got));
+        assert_eq!(trail[..], whole.trail[..walked], "a prefix of the library");
+        assert_eq!(text_at(got, "stopped"), "budget");
+        let (best, lowest) = best_of(&trail);
+        assert_eq!(
+            words_of(got.get("params").unwrap()),
+            best,
+            "the best so far"
+        );
+        assert_eq!(whole_of(got.get("objective").unwrap()), lowest);
+        assert_eq!(int_at(got, "steps"), i64::try_from(walked - 1).unwrap());
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Told {
+        answers: Vec<String>,
+        walks: Vec<u64>,
+        elapsed: Vec<Duration>,
+        slept: Vec<Duration>,
+        steps: u64,
+    }
+
+    struct Session {
+        got: Vec<Json>,
+        took: Vec<Duration>,
+        told: Told,
+    }
+
+    #[derive(Debug)]
+    struct Switched {
+        waiting: Waiting,
+        on: AtomicBool,
+    }
+
+    impl Time for Switched {
+        fn now(&self) -> Instant {
+            if self.on.load(Ordering::SeqCst) {
+                self.waiting.now()
+            } else {
+                self.waiting.fake().now()
+            }
+        }
+
+        fn sleep(&self, time: Duration) {
+            if self.on.load(Ordering::SeqCst) {
+                self.waiting.sleep(time);
+            } else {
+                self.waiting.fake().sleep(time);
+            }
+        }
+    }
+
+    fn session(
+        host: &Host,
+        time: Arc<dyn Time>,
+        fake: &Fake,
+        on: &dyn Fn(bool),
+        (case, budget, stall): (&Case, u64, bool),
+    ) -> Session {
+        let mut server = Server::timed(Some(host), &Options::default(), time).unwrap();
+        let worlds = opened(&mut server, case);
+        let before = kept(&mut server, &worlds);
+        let mut got = Vec::new();
+        let mut took = Vec::new();
+        let mut told = Told {
+            answers: Vec::new(),
+            walks: Vec::new(),
+            elapsed: Vec::new(),
+            slept: Vec::new(),
+            steps: 0,
+        };
+        if stall {
+            stall_every(WALK_FLOOR);
+        }
+        on(true);
+        for _ in 0..2 {
+            let (at, slept, ran) = (fake.elapsed(), fake.slept(), walks().unwrap());
+            let began = Instant::now();
+            let one =
+                answer(&server.ask("grit_law_descend", &asked(case, &worlds, Some(12), budget)));
+            took.push(began.elapsed());
+            told.elapsed.push(fake.elapsed() - at);
+            told.slept.push(fake.slept() - slept);
+            told.walks.push(walks().unwrap() - ran);
+            assert_eq!(
+                u64::try_from(trail_of(&one).len()).unwrap(),
+                *told.walks.last().unwrap(),
+                "the trail holds every walk made"
+            );
+            told.answers.push(written(&one));
+            got.push(one);
+        }
+        on(false);
+        unstall();
+        assert_eq!(kept(&mut server, &worlds), before, "no world moved");
+        told.steps = fake.steps();
+        Session { got, took, told }
+    }
+
+    fn faked(host: &Host, case: &Case, budget: u64, stall: bool) -> Session {
+        let fake = Arc::new(Fake::new());
+        session(
+            host,
+            Arc::clone(&fake) as Arc<dyn Time>,
+            &fake,
+            &|_| {},
+            (case, budget, stall),
+        )
+    }
+
+    fn twice(host: &Host, case: &Case, budget: u64, stall: bool) -> Session {
+        let first = faked(host, case, budget, stall);
+        let second = faked(host, case, budget, stall);
+        assert_eq!(
+            first.told, second.told,
+            "budget {budget}: one session twice in one process"
+        );
+        first
+    }
+
+    fn ms(time: Duration) -> u64 {
+        u64::try_from(time.as_millis()).unwrap()
+    }
+
     #[test]
     fn g4_a_descent_stopped_by_its_budget_returns_the_best_so_far_and_the_same_again() {
         let Some(host) = device("learn_grad budget stop") else {
@@ -2550,34 +2685,106 @@ mod faulted {
         let case = turning();
         let whole = library(&case, 12);
         let walked = climbs(&whole) + 1;
-        let mut server = Server::new(Some(&host));
-        let worlds = opened(&mut server, &case);
-        let before = kept(&mut server, &worlds);
-        let budget = WALK_FLOOR * u32::try_from(walked).unwrap() + WALK_FLOOR / 2;
-        stall_every(WALK_FLOOR);
-        let mut answers = Vec::new();
-        for _ in 0..2 {
-            let began = Instant::now();
-            let got = answer(&server.ask(
-                "grit_law_descend",
-                &asked(
-                    &case,
-                    &worlds,
-                    Some(12),
-                    u64::try_from(budget.as_millis()).unwrap(),
-                ),
-            ));
+        let walks = u32::try_from(walked).unwrap();
+        for (budget, made) in [
+            (WALK_FLOOR * walks + WALK_FLOOR / 2, walks),
+            (WALK_FLOOR * walks, walks),
+            (WALK_FLOOR * walks - Duration::from_millis(1), walks - 1),
+        ] {
+            let held = twice(&host, &case, ms(budget), true);
             println!(
-                "stopped by a budget of {budget:?} after {:?}: {}",
-                began.elapsed(),
-                written(&got)
+                "a budget of {budget:?} made {:?} walks in {:?} of fake time",
+                held.told.walks, held.told.elapsed
             );
-            stopped_part_way(&got, &whole, walked, "budget");
-            answers.push(written(&got));
+            for got in &held.got {
+                if made == walks {
+                    stopped_part_way(got, &whole, walked, "budget");
+                } else {
+                    stopped_early(got, &whole, walked - 1);
+                }
+            }
+            assert_eq!(
+                held.told.walks,
+                [u64::from(made); 2],
+                "a budget of {budget:?} makes floor(budget / walk) walks of {WALK_FLOOR:?}"
+            );
+            assert_eq!(held.told.elapsed, [WALK_FLOOR * made; 2], "{budget:?}");
+            assert_eq!(held.told.slept, [WALK_FLOOR * made; 2], "{budget:?}");
+            assert_eq!(held.told.steps, 0);
+            assert_eq!(
+                held.told.answers[0], held.told.answers[1],
+                "the same inputs, the same answer"
+            );
         }
-        unstall();
-        assert_eq!(answers[0], answers[1], "the same inputs, the same answer");
-        assert_eq!(kept(&mut server, &worlds), before, "no world moved");
+    }
+
+    #[test]
+    fn g4_a_descent_on_a_frozen_clock_answers_alike_at_any_budget_and_stops_on_none() {
+        let Some(host) = device("learn_grad frozen") else {
+            return;
+        };
+        let case = turning();
+        let whole = library(&case, 12);
+        let held = [1, 600_000].map(|budget| twice(&host, &case, budget, false));
+        for (budget, one) in [1, 600_000].iter().zip(&held) {
+            for got in &one.got {
+                assert_eq!(
+                    text_at(got, "stopped"),
+                    settled_name(whole.settled),
+                    "budget {budget}"
+                );
+                assert_eq!(trail_of(got), whole.trail, "budget {budget}: the library");
+            }
+            assert_eq!(one.told.elapsed, [Duration::ZERO; 2], "budget {budget}");
+            assert_eq!(one.told.slept, [Duration::ZERO; 2], "budget {budget}");
+            assert_eq!(one.told.answers[0], one.told.answers[1]);
+        }
+        assert_eq!(
+            held[0].told, held[1].told,
+            "a frozen clock answered differently at budgets of 1 ms and 600000 ms"
+        );
+    }
+
+    #[test]
+    fn g4_a_descent_under_a_waiting_clock_answers_as_on_the_fake_clock() {
+        let Some(host) = device("learn_grad waiting") else {
+            return;
+        };
+        let case = turning();
+        let whole = library(&case, 12);
+        let walks = u32::try_from(climbs(&whole) + 1).unwrap();
+        for (budget, stall) in [
+            (1, false),
+            (600_000, false),
+            (ms(WALK_FLOOR * walks + WALK_FLOOR / 2), true),
+        ] {
+            let plain = faked(&host, &case, budget, stall);
+            let switched = Arc::new(Switched {
+                waiting: Waiting::new(WAITED, WAITED),
+                on: AtomicBool::new(false),
+            });
+            let delayed = session(
+                &host,
+                Arc::clone(&switched) as Arc<dyn Time>,
+                switched.waiting.fake(),
+                &|on| switched.on.store(on, Ordering::SeqCst),
+                (&case, budget, stall),
+            );
+            let (waits, waited) = switched.waiting.waited();
+            println!(
+                "budget {budget}: {waits} waits, {waited:?} in all, the calls took {:?}",
+                delayed.took
+            );
+            assert_eq!(
+                plain.told, delayed.told,
+                "budget {budget}: real time spent at the clock moved the descent"
+            );
+            if budget == 1 {
+                for took in &delayed.took {
+                    assert!(*took >= FLOOR, "budget {budget}: the call took {took:?}");
+                }
+            }
+        }
     }
 
     #[test]

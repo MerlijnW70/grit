@@ -2,6 +2,9 @@
 
 mod common;
 
+#[cfg(feature = "faults")]
+mod delayed;
+
 use common::device;
 
 use std::io::{BufRead, BufReader, Write};
@@ -1507,12 +1510,19 @@ mod faulted {
     use std::time::{Duration, Instant};
 
     use grit::Host;
+    use grit::clock::{Fake, Time};
     use grit::serve3::Options;
     use grit::serve3::exec::Exec;
     use grit::serve3::learn::faults::{cancel_after, disarm};
     use grit::serve3::tools::faults::{disarm as unstall, stall_every};
 
+    use super::delayed::Waiting;
+
     const RUN_FLOOR: Duration = Duration::from_millis(500);
+
+    const WAITED: Duration = Duration::from_millis(4);
+
+    const FLOOR: Duration = Duration::from_millis(20);
 
     const POPULATION: u32 = 4;
 
@@ -1558,35 +1568,216 @@ mod faulted {
         heat_case(8, 0x4EA7, &HEAT_TRUTH, &HEAT_GUESS, HEAT_FRAMES)
     }
 
-    #[test]
-    fn s4_a_search_stopped_by_its_budget_answers_the_best_so_far_and_the_same_again() {
-        let case = case();
-        let mut server = Server::new(None);
+    fn stopped_inside(case: &Case, got: &Json, whole: &[(Vec<u32>, u64)], generation: usize) {
+        let trail = trail_of(got);
+        assert_eq!(text_at(got, "stopped"), "budget", "{}", written(got));
+        assert_eq!(
+            trail[..],
+            whole[..generation],
+            "a prefix of the whole search"
+        );
+        assert_eq!(
+            int_at(got, "generations"),
+            i64::try_from(generation - 1).unwrap()
+        );
+        let (best, lowest) = earliest_lowest(&whole[..generation]);
+        assert!(
+            whole[generation].1 > lowest,
+            "every child of generation {generation} is worse than the best before it"
+        );
+        assert_eq!(
+            words_of(got.get("params").unwrap()),
+            best,
+            "the best so far"
+        );
+        assert_eq!(whole_of(got.get("objective").unwrap()), lowest);
+        assert_eq!(case.expected(&best), lowest);
+        assert!(got.get("hint").is_some());
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Told {
+        answers: Vec<String>,
+        runs: Vec<u64>,
+        elapsed: Vec<Duration>,
+        slept: Vec<Duration>,
+        steps: u64,
+    }
+
+    struct Session {
+        got: Vec<Json>,
+        took: Vec<Duration>,
+        told: Told,
+    }
+
+    fn session(time: Arc<dyn Time>, fake: &Fake, case: &Case, budget: u64, stall: bool) -> Session {
+        let mut server = Server::timed(None, &Options::default(), time).unwrap();
+        let mut got = Vec::new();
+        let mut took = Vec::new();
+        let mut told = Told {
+            answers: Vec::new(),
+            runs: Vec::new(),
+            elapsed: Vec::new(),
+            slept: Vec::new(),
+            steps: 0,
+        };
+        if stall {
+            stall_every(RUN_FLOOR);
+        }
+        for _ in 0..2 {
+            let (at, slept, ran) = (fake.elapsed(), fake.slept(), runs().unwrap());
+            let began = Instant::now();
+            let one = answer(&call(&mut server, "grit_learn_params", &args(case, budget)));
+            took.push(began.elapsed());
+            told.elapsed.push(fake.elapsed() - at);
+            told.slept.push(fake.slept() - slept);
+            told.runs.push(runs().unwrap() - ran);
+            assert_eq!(
+                whole_of(one.get("scored").unwrap()),
+                *told.runs.last().unwrap(),
+                "scored counts the runs made"
+            );
+            told.answers.push(written(&one));
+            got.push(one);
+        }
+        unstall();
+        told.steps = fake.steps();
+        Session { got, took, told }
+    }
+
+    fn faked(case: &Case, budget: u64, stall: bool) -> Session {
+        let fake = Arc::new(Fake::new());
+        session(
+            Arc::clone(&fake) as Arc<dyn Time>,
+            &fake,
+            case,
+            budget,
+            stall,
+        )
+    }
+
+    fn twice(case: &Case, budget: u64, stall: bool) -> Session {
+        let first = faked(case, budget, stall);
+        let second = faked(case, budget, stall);
+        assert_eq!(
+            first.told, second.told,
+            "budget {budget}: one session twice in one process"
+        );
+        first
+    }
+
+    fn searched_whole(case: &Case) -> Vec<(Vec<u32>, u64)> {
+        let fake = Arc::new(Fake::new());
+        let mut server = Server::timed(
+            None,
+            &Options::default(),
+            Arc::clone(&fake) as Arc<dyn Time>,
+        )
+        .unwrap();
         let whole = trail_of(&answer(&call(
             &mut server,
             "grit_learn_params",
-            &args(&case, LONG),
+            &args(case, LONG),
         )));
+        assert_eq!(fake.elapsed(), Duration::ZERO);
+        whole
+    }
+
+    fn ms(time: Duration) -> u64 {
+        u64::try_from(time.as_millis()).unwrap()
+    }
+
+    #[test]
+    fn s4_a_search_stopped_by_its_budget_answers_the_best_so_far_and_the_same_again() {
+        let case = case();
+        let whole = searched_whole(&case);
         let generation = climbed(&whole);
         assert!(generation <= 6, "{generation}");
         let runs = 1 + POPULATION * u32::try_from(generation).unwrap();
-        let budget = RUN_FLOOR * runs + RUN_FLOOR / 2;
-        let mut server = Server::new(None);
-        stall_every(RUN_FLOOR);
-        let mut answers = Vec::new();
-        for _ in 0..2 {
-            let began = Instant::now();
-            let got = answer(&call(
-                &mut server,
-                "grit_learn_params",
-                &args(&case, u64::try_from(budget.as_millis()).unwrap()),
-            ));
-            println!("a budget of {budget:?} stopped after {:?}", began.elapsed());
-            stopped_at(&got, &whole, generation, "budget");
-            answers.push(written(&got));
+        for (budget, made) in [
+            (RUN_FLOOR * runs + RUN_FLOOR / 2, runs),
+            (RUN_FLOOR * runs, runs),
+            (RUN_FLOOR * runs - Duration::from_millis(1), runs - 1),
+        ] {
+            let held = twice(&case, ms(budget), true);
+            println!(
+                "a budget of {budget:?} made {:?} runs in {:?} of fake time",
+                held.told.runs, held.told.elapsed
+            );
+            for got in &held.got {
+                if made == runs {
+                    stopped_at(got, &whole, generation, "budget");
+                } else {
+                    stopped_inside(&case, got, &whole, generation);
+                }
+            }
+            assert_eq!(
+                held.told.runs,
+                [u64::from(made); 2],
+                "a budget of {budget:?} makes floor(budget / run) runs of {RUN_FLOOR:?}"
+            );
+            assert_eq!(held.told.elapsed, [RUN_FLOOR * made; 2], "{budget:?}");
+            assert_eq!(held.told.slept, [RUN_FLOOR * made; 2], "{budget:?}");
+            assert_eq!(held.told.steps, 0);
+            assert_eq!(held.told.answers[0], held.told.answers[1]);
         }
-        unstall();
-        assert_eq!(answers[0], answers[1]);
+    }
+
+    #[test]
+    fn s4_a_search_on_a_frozen_clock_answers_alike_at_any_budget_and_stops_on_none() {
+        let case = case();
+        let whole = searched_whole(&case);
+        let held = [1, LONG].map(|budget| twice(&case, budget, false));
+        for (budget, one) in [1, LONG].iter().zip(&held) {
+            for got in &one.got {
+                assert_ne!(text_at(got, "stopped"), "budget", "budget {budget}");
+                assert_eq!(trail_of(got), whole, "budget {budget}: the whole search");
+            }
+            assert_eq!(one.told.elapsed, [Duration::ZERO; 2], "budget {budget}");
+            assert_eq!(one.told.slept, [Duration::ZERO; 2], "budget {budget}");
+            assert_eq!(one.told.answers[0], one.told.answers[1]);
+        }
+        assert_eq!(
+            held[0].told, held[1].told,
+            "a frozen clock answered differently at budgets of 1 ms and {LONG} ms"
+        );
+    }
+
+    #[test]
+    fn s4_a_search_under_a_waiting_clock_answers_as_on_the_fake_clock() {
+        let case = case();
+        let whole = searched_whole(&case);
+        let generation = climbed(&whole);
+        let runs = 1 + POPULATION * u32::try_from(generation).unwrap();
+        for (budget, stall) in [
+            (1, false),
+            (LONG, false),
+            (ms(RUN_FLOOR * runs + RUN_FLOOR / 2), true),
+        ] {
+            let plain = faked(&case, budget, stall);
+            let waiting = Arc::new(Waiting::new(WAITED, WAITED));
+            let delayed = session(
+                Arc::clone(&waiting) as Arc<dyn Time>,
+                waiting.fake(),
+                &case,
+                budget,
+                stall,
+            );
+            let (waits, waited) = waiting.waited();
+            println!(
+                "budget {budget}: {waits} waits, {waited:?} in all, the calls took {:?}",
+                delayed.took
+            );
+            assert_eq!(
+                plain.told, delayed.told,
+                "budget {budget}: real time spent at the clock moved the search"
+            );
+            if budget == 1 {
+                for took in &delayed.took {
+                    assert!(*took >= FLOOR, "budget {budget}: the call took {took:?}");
+                }
+            }
+        }
     }
 
     #[test]
