@@ -979,16 +979,18 @@ fn sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
 struct Token {
     text: String,
     line: usize,
+    column: usize,
 }
 
 const fn ident_start(one: char) -> bool {
     one.is_ascii_alphabetic() || one == '_'
 }
 
-fn token(text: &str, line: usize) -> Token {
+fn token(text: &str, at: proc_macro2::LineColumn) -> Token {
     Token {
         text: text.to_owned(),
-        line,
+        line: at.line,
+        column: at.column + 1,
     }
 }
 
@@ -1023,7 +1025,7 @@ fn flattened(stream: proc_macro2::TokenStream, found: &mut Vec<Token>) {
     let trees: Vec<TokenTree> = stream.into_iter().collect();
     let mut at = 0;
     while let Some(tree) = trees.get(at) {
-        let line = tree.span().start().line;
+        let line = tree.span().start();
         match tree {
             TokenTree::Group(group) if documented(group) => {
                 if found.last().is_some_and(|one| one.text == "!") {
@@ -1041,11 +1043,11 @@ fn flattened(stream: proc_macro2::TokenStream, found: &mut Vec<Token>) {
                     Delimiter::None => ("", ""),
                 };
                 if !open.is_empty() {
-                    found.push(token(open, group.span_open().start().line));
+                    found.push(token(open, group.span_open().start()));
                 }
                 flattened(group.stream(), found);
                 if !close.is_empty() {
-                    found.push(token(close, group.span_close().start().line));
+                    found.push(token(close, group.span_close().start()));
                 }
             }
             TokenTree::Ident(ident) => {
@@ -1297,6 +1299,7 @@ struct Role {
     field: bool,
     header: bool,
     aliased: bool,
+    in_macro: bool,
 }
 
 fn ended(tokens: &[Token], from: usize, stops: &[&str]) -> usize {
@@ -1304,10 +1307,12 @@ fn ended(tokens: &[Token], from: usize, stops: &[&str]) -> usize {
     let mut at = from;
     while at < tokens.len() {
         let word = word_at(tokens, at);
+        if depth <= 0 && stops.contains(&word) {
+            return at;
+        }
         match word {
             "(" | "[" => depth += 1,
             ")" | "]" => depth -= 1,
-            _ if depth <= 0 && stops.contains(&word) => return at,
             _ => {}
         }
         at += 1;
@@ -1320,6 +1325,19 @@ fn roles(tokens: &[Token]) -> Vec<Role> {
     for (at, one) in tokens.iter().enumerate() {
         let named = identifier(word_at(tokens, at + 1));
         let before = at.checked_sub(1).map_or("", |back| word_at(tokens, back));
+        if identifier(&one.text) && word_at(tokens, at + 1) == "!" {
+            let open = if one.text == "macro_rules" {
+                at + 3
+            } else {
+                at + 2
+            };
+            if matches!(word_at(tokens, open), "(" | "[" | "{") {
+                let shut = closing(tokens, open);
+                for role in found.get_mut(at..=shut).into_iter().flatten() {
+                    role.in_macro = true;
+                }
+            }
+        }
         if one.text == "impl" && matches!(before, "" | "}" | ";" | "{" | "]" | "unsafe") {
             let end = ended(tokens, at, &["{", ";"]);
             for role in found.get_mut(at..end).into_iter().flatten() {
@@ -1576,6 +1594,7 @@ fn kinds_at(
         }
         let made_here = in_body
             || role.returns
+            || role.in_macro
             || !(role.signature || role.field || role.header || role.aliased);
         if word == "Guard" && made_here && !place.importing && found.is_empty() {
             found.push("Guard".to_owned());
@@ -1612,7 +1631,7 @@ fn kinds_at(
         && (matches!(before, "." | "::")
             || after == "("
             || place.importing
-            || (!place.function.is_empty() && field_named(tokens, inside, at)))
+            || (!role.field && field_named(tokens, inside, at)))
     {
         found.push(format!("carrier {word}"));
     }
@@ -1754,6 +1773,7 @@ struct Shapes {
     enums: Vec<(String, Vec<Names>)>,
     aliases: Vec<(String, Names)>,
     held: Vec<(String, Names)>,
+    functions: Vec<(String, Option<String>, Names)>,
 }
 
 fn owner_of(kind: &syn::Type) -> String {
@@ -1801,23 +1821,23 @@ fn widened(mut names: Names, bounds: &[(String, Names)]) -> Names {
     names
 }
 
-fn signed(shape: &mut Shapes, signature: &syn::Signature, owner: &str) {
+fn signed(shape: &mut Shapes, signature: &syn::Signature, owner: &str, path: Option<String>) {
     let name = signature.ident.to_string();
     let bounds = bounded(signature);
+    let mut carried: Names = Vec::new();
     if let syn::ReturnType::Type(_, kind) = &signature.output {
-        let names = widened(collected(kind, owner).names, &bounds);
-        shape.held.push((name.clone(), names));
+        carried.extend(widened(collected(kind, owner).names, &bounds));
     }
     for input in &signature.inputs {
         if let syn::FnArg::Typed(typed) = input {
             let found = collected(&typed.ty, owner);
             if found.writes {
-                shape
-                    .held
-                    .push((name.clone(), widened(found.names, &bounds)));
+                carried.extend(widened(found.names, &bounds));
             }
         }
     }
+    shape.held.push((name.clone(), carried.clone()));
+    shape.functions.push((name, path, carried));
 }
 
 fn renamed(tree: &syn::UseTree, shape: &mut Shapes) {
@@ -1835,22 +1855,25 @@ fn renamed(tree: &syn::UseTree, shape: &mut Shapes) {
     }
 }
 
-fn structured(shape: &mut Shapes, item: &syn::ItemStruct) {
-    let name = item.ident.to_string();
+fn fielded<'a>(
+    shape: &mut Shapes,
+    name: &str,
+    fields: impl Iterator<Item = &'a syn::Field>,
+) -> Vec<Field> {
     let mut inside = Vec::new();
-    for (index, field) in item.fields.iter().enumerate() {
-        let names = collected(&field.ty, &name).names;
+    for (index, field) in fields.enumerate() {
+        let names = collected(&field.ty, name).names;
         let visible = shown(&field.vis);
         if let Some(ident) = &field.ident {
             inside.push((ident.to_string(), visible, names));
         } else {
             if visible {
-                shape.held.push((name.clone(), names.clone()));
+                shape.held.push((name.to_owned(), names.clone()));
             }
             inside.push((index.to_string(), visible, names));
         }
     }
-    shape.structs.push((name, inside));
+    inside
 }
 
 fn enumerated(shape: &mut Shapes, item: &syn::ItemEnum) {
@@ -1872,50 +1895,142 @@ fn enumerated(shape: &mut Shapes, item: &syn::ItemEnum) {
     shape.enums.push((name, parts));
 }
 
-fn itemised(list: &[syn::Item], shape: &mut Shapes) {
+fn spelled(stream: proc_macro2::TokenStream, names: &mut Names) {
+    for tree in stream {
+        match tree {
+            proc_macro2::TokenTree::Ident(ident) => {
+                let text = ident.to_string();
+                names.push(text.strip_prefix("r#").unwrap_or(&text).to_owned());
+            }
+            proc_macro2::TokenTree::Group(group) => spelled(group.stream(), names),
+            proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => {}
+        }
+    }
+}
+
+fn opaque(shape: &mut Shapes, name: String, macro_tokens: Option<&syn::Macro>, visit: Names) {
+    let mut names = visit;
+    if let Some(called) = macro_tokens {
+        spelled(called.tokens.clone(), &mut names);
+    }
+    shape.held.push((name, names));
+}
+
+fn called(mac: &syn::Macro, ident: Option<&syn::Ident>) -> String {
+    let name = ident.map_or_else(
+        || {
+            mac.path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_default()
+        },
+        ToString::to_string,
+    );
+    format!("{name}!")
+}
+
+fn implemented_items(shape: &mut Shapes, item: &syn::ItemImpl, module: &str) {
+    let owner = owner_of(&item.self_ty);
+    let traited = item.trait_.is_some();
+    for inner in &item.items {
+        match inner {
+            syn::ImplItem::Fn(method) if traited || shown(&method.vis) => {
+                let path = (!traited).then(|| format!("{module}::{owner}::{}", method.sig.ident));
+                signed(shape, &method.sig, &owner, path);
+            }
+            syn::ImplItem::Const(constant) if traited || shown(&constant.vis) => {
+                shape.held.push((
+                    constant.ident.to_string(),
+                    collected(&constant.ty, &owner).names,
+                ));
+            }
+            syn::ImplItem::Type(kind) => shape
+                .aliases
+                .push((kind.ident.to_string(), collected(&kind.ty, &owner).names)),
+            syn::ImplItem::Macro(mac) => opaque(
+                shape,
+                called(&mac.mac, None),
+                Some(&mac.mac),
+                vec![owner.clone()],
+            ),
+            syn::ImplItem::Verbatim(tokens) => {
+                let mut names = Vec::new();
+                spelled(tokens.clone(), &mut names);
+                shape.held.push(("verbatim".to_owned(), names));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn traited_items(shape: &mut Shapes, item: &syn::ItemTrait, module: &str) {
+    let visible = shown(&item.vis);
+    let owner = item.ident.to_string();
+    for inner in &item.items {
+        match inner {
+            syn::TraitItem::Fn(method) if visible => {
+                let path = Some(format!("{module}::{owner}::{}", method.sig.ident));
+                signed(shape, &method.sig, "", path);
+            }
+            syn::TraitItem::Const(constant) if visible => {
+                shape.held.push((
+                    constant.ident.to_string(),
+                    collected(&constant.ty, "").names,
+                ));
+            }
+            syn::TraitItem::Type(kind) => {
+                let mut names = Collected::default();
+                for bound in &kind.bounds {
+                    syn::visit::Visit::visit_type_param_bound(&mut names, bound);
+                }
+                if let Some((_, fallback)) = &kind.default {
+                    names.names.extend(collected(fallback, "").names);
+                }
+                shape.aliases.push((kind.ident.to_string(), names.names));
+            }
+            syn::TraitItem::Macro(mac) => {
+                opaque(shape, called(&mac.mac, None), Some(&mac.mac), Vec::new());
+            }
+            syn::TraitItem::Verbatim(tokens) => {
+                let mut names = Vec::new();
+                spelled(tokens.clone(), &mut names);
+                shape.held.push(("verbatim".to_owned(), names));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn itemised(list: &[syn::Item], shape: &mut Shapes, module: &str) {
     for item in list {
         match item {
-            syn::Item::Fn(one) if shown(&one.vis) => signed(shape, &one.sig, ""),
-            syn::Item::Impl(one) => {
-                let owner = owner_of(&one.self_ty);
-                for inner in &one.items {
-                    match inner {
-                        syn::ImplItem::Fn(method) if one.trait_.is_some() || shown(&method.vis) => {
-                            signed(shape, &method.sig, &owner);
-                        }
-                        syn::ImplItem::Type(kind) => shape
-                            .aliases
-                            .push((kind.ident.to_string(), collected(&kind.ty, &owner).names)),
-                        _ => {}
-                    }
-                }
+            syn::Item::Fn(one) if shown(&one.vis) => {
+                let path = Some(format!("{module}::{}", one.sig.ident));
+                signed(shape, &one.sig, "", path);
             }
-            syn::Item::Trait(one) => {
-                for inner in &one.items {
-                    match inner {
-                        syn::TraitItem::Fn(method) if shown(&one.vis) => {
-                            signed(shape, &method.sig, "");
-                        }
-                        syn::TraitItem::Type(kind) => {
-                            let mut names = Collected::default();
-                            for bound in &kind.bounds {
-                                syn::visit::Visit::visit_type_param_bound(&mut names, bound);
-                            }
-                            if let Some((_, fallback)) = &kind.default {
-                                names.names.extend(collected(fallback, "").names);
-                            }
-                            shape.aliases.push((kind.ident.to_string(), names.names));
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            syn::Item::Impl(one) => implemented_items(shape, one, module),
+            syn::Item::Trait(one) => traited_items(shape, one, module),
             syn::Item::Static(one) if shown(&one.vis) => {
                 shape
                     .held
                     .push((one.ident.to_string(), collected(&one.ty, "").names));
             }
-            syn::Item::Struct(one) => structured(shape, one),
+            syn::Item::Const(one) if shown(&one.vis) => {
+                shape
+                    .held
+                    .push((one.ident.to_string(), collected(&one.ty, "").names));
+            }
+            syn::Item::Struct(one) => {
+                let name = one.ident.to_string();
+                let inside = fielded(shape, &name, one.fields.iter());
+                shape.structs.push((name, inside));
+            }
+            syn::Item::Union(one) => {
+                let name = one.ident.to_string();
+                let inside = fielded(shape, &name, one.fields.named.iter());
+                shape.structs.push((name, inside));
+            }
             syn::Item::Enum(one) => enumerated(shape, one),
             syn::Item::Type(one) => {
                 shape
@@ -1925,22 +2040,55 @@ fn itemised(list: &[syn::Item], shape: &mut Shapes) {
             syn::Item::Use(one) => renamed(&one.tree, shape),
             syn::Item::Mod(one) => {
                 if let Some((_, inner)) = &one.content {
-                    itemised(inner, shape);
+                    itemised(inner, shape, &format!("{module}::{}", one.ident));
                 }
+            }
+            syn::Item::Macro(one) => {
+                opaque(
+                    shape,
+                    called(&one.mac, one.ident.as_ref()),
+                    Some(&one.mac),
+                    Vec::new(),
+                );
+            }
+            syn::Item::ForeignMod(one) => {
+                let mut names = Collected::default();
+                syn::visit::Visit::visit_item_foreign_mod(&mut names, one);
+                shape.held.push(("extern".to_owned(), names.names));
+            }
+            syn::Item::Verbatim(tokens) => {
+                let mut names = Vec::new();
+                spelled(tokens.clone(), &mut names);
+                shape.held.push(("verbatim".to_owned(), names));
             }
             _ => {}
         }
     }
 }
 
-fn shapes(text: &str, carrier: bool) -> Shapes {
+fn module_of(relative: &str) -> String {
+    let inner = relative
+        .strip_prefix("src/")
+        .unwrap_or(relative)
+        .trim_end_matches(".rs");
+    let mut parts: Vec<&str> = inner.split('/').collect();
+    if matches!(parts.last(), Some(&("mod" | "lib"))) {
+        parts.pop();
+    }
+    std::iter::once("grit")
+        .chain(parts)
+        .collect::<Vec<&str>>()
+        .join("::")
+}
+
+fn shapes(text: &str, relative: &str) -> Shapes {
     let file =
         syn::parse_file(text).unwrap_or_else(|error| panic!("not a Rust source file: {error}"));
     let mut shape = Shapes {
-        carrier,
+        carrier: carrier_file(relative),
         ..Shapes::default()
     };
-    itemised(&file.items, &mut shape);
+    itemised(&file.items, &mut shape, &module_of(relative));
     shape
 }
 
@@ -2034,6 +2182,10 @@ const CARRIERS: &[(&str, &str)] = &[
     ("src/calibrate.rs", "scripted_sound"),
     ("src/calibrate/table.rs", "predict"),
     ("src/calibrate/table.rs", "time"),
+    ("src/calibrate/take.rs", "BUDGET"),
+    ("src/calibrate/take.rs", "GAP"),
+    ("src/calibrate/take.rs", "WARM_MOST"),
+    ("src/calibrate/take.rs", "WINDOW"),
     ("src/calibrate/take.rs", "agreed"),
     ("src/calibrate/take.rs", "first"),
     ("src/calibrate/take.rs", "long"),
@@ -2049,6 +2201,7 @@ const CARRIERS: &[(&str, &str)] = &[
     ("src/live.rs", "cheaper"),
     ("src/live.rs", "every"),
     ("src/live.rs", "listed"),
+    ("src/resident.rs", "PATIENCE"),
     ("src/resident.rs", "copying"),
     ("src/resident.rs", "frame"),
     ("src/resident.rs", "frame_reading"),
@@ -2070,11 +2223,113 @@ const CARRIERS: &[(&str, &str)] = &[
 ];
 
 const ALLOWED: &[(&str, &str, &str, usize)] = &[
+    (
+        "src/board.rs",
+        "calls grit::resident::Resident::staged",
+        "Board::carry",
+        1,
+    ),
+    (
+        "src/board.rs",
+        "calls grit::resident::Resident::staged",
+        "Board::run",
+        1,
+    ),
+    (
+        "src/branch.rs",
+        "calls grit::resident::Resident::copying",
+        "World::read_waits",
+        1,
+    ),
+    (
+        "src/branch.rs",
+        "calls grit::resident::Resident::on_device",
+        "World::on_device",
+        1,
+    ),
+    (
+        "src/branch.rs",
+        "calls grit::resident::Resident::on_device_ticks",
+        "World::on_device_ticks",
+        1,
+    ),
+    (
+        "src/branch.rs",
+        "calls grit::resident::Resident::staged_frames",
+        "World::step",
+        1,
+    ),
     ("src/branch.rs", "on_device_ticks", "", 1),
     (
         "src/branch.rs",
         "on_device_ticks",
         "World::on_device_ticks",
+        1,
+    ),
+    (
+        "src/branch/back.rs",
+        "calls grit::resident::Resident::staged_frames",
+        "World::back",
+        1,
+    ),
+    (
+        "src/calibrate.rs",
+        "calls grit::calibrate::faults::scripted",
+        "scripted_sound",
+        1,
+    ),
+    (
+        "src/calibrate/take.rs",
+        "calls grit::branch::World::on_device_ticks",
+        "Warm::fill",
+        1,
+    ),
+    (
+        "src/calibrate/take.rs",
+        "calls grit::branch::World::on_device_ticks",
+        "Warm::timed",
+        2,
+    ),
+    (
+        "src/calibrate/take.rs",
+        "calls grit::branch::World::on_device_ticks",
+        "measured",
+        1,
+    ),
+    (
+        "src/calibrate/take.rs",
+        "calls grit::branch::World::on_device_ticks",
+        "prepared",
+        1,
+    ),
+    (
+        "src/calibrate/take.rs",
+        "calls grit::calibrate::take::Passes::agreed",
+        "Passes::settled",
+        1,
+    ),
+    (
+        "src/calibrate/take.rs",
+        "calls grit::calibrate::take::Passes::agreed",
+        "Passes::solved",
+        1,
+    ),
+    (
+        "src/calibrate/take.rs",
+        "calls grit::calibrate::take::Passes::solved",
+        "measured",
+        1,
+    ),
+    (
+        "src/calibrate/take.rs",
+        "calls grit::calibrate::take::measured",
+        "calibrated",
+        1,
+    ),
+    (
+        "src/calibrate/take.rs",
+        "calls grit::host::Host::ticking",
+        "Window::of",
         1,
     ),
     ("src/calibrate/take.rs", "on_device_ticks", "Warm::fill", 1),
@@ -2083,15 +2338,82 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/calibrate/take.rs", "on_device_ticks", "prepared", 1),
     ("src/calibrate/take.rs", "ticking", "Window::of", 1),
     ("src/credit.rs", "Instant", "Marker::submitted", 1),
+    (
+        "src/credit.rs",
+        "calls grit::resident::Resident::on_device",
+        "Marker::submitted",
+        1,
+    ),
+    (
+        "src/credit.rs",
+        "calls grit::resident::Resident::staged_frames",
+        "Marker::submitted",
+        1,
+    ),
+    (
+        "src/credit.rs",
+        "calls std::time::Instant::elapsed",
+        "Marker::submitted",
+        1,
+    ),
+    (
+        "src/credit.rs",
+        "calls std::time::Instant::now",
+        "Marker::submitted",
+        1,
+    ),
     ("src/credit.rs", "elapsed", "Marker::submitted", 1),
     ("src/credit.rs", "use time item", "", 1),
+    (
+        "src/host.rs",
+        "calls ash::Device::wait_for_fences",
+        "Host::wait",
+        1,
+    ),
     ("src/host.rs", "ticking", "", 1),
     ("src/host.rs", "wait_for_fences", "Host::wait", 1),
     ("src/live.rs", "Instant", "cheaper", 2),
+    (
+        "src/live.rs",
+        "calls grit::resident::Resident::on_device",
+        "cheaper",
+        2,
+    ),
+    (
+        "src/live.rs",
+        "calls grit::resident::Resident::staged",
+        "cheaper",
+        2,
+    ),
+    (
+        "src/live.rs",
+        "calls grit::resident::Resident::staged_frames",
+        "cheaper",
+        2,
+    ),
+    (
+        "src/live.rs",
+        "calls std::time::Instant::elapsed",
+        "cheaper",
+        2,
+    ),
+    ("src/live.rs", "calls std::time::Instant::now", "cheaper", 2),
     ("src/live.rs", "elapsed", "cheaper", 2),
+    (
+        "src/question.rs",
+        "calls grit::resident::Resident::frame_reading",
+        "Questions::spread",
+        1,
+    ),
     (
         "src/render3/swapchain.rs",
         "acquire_next_image",
+        "Presenter::present",
+        1,
+    ),
+    (
+        "src/render3/swapchain.rs",
+        "calls ash::khr::swapchain::Device::acquire_next_image",
         "Presenter::present",
         1,
     ),
@@ -2100,6 +2422,156 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/resident.rs", "Instant", "Resident::run_times", 1),
     ("src/resident.rs", "Instant", "Resident::start", 1),
     ("src/resident.rs", "Instant", "Resident::write", 1),
+    (
+        "src/resident.rs",
+        "calls ash::Device::cmd_write_timestamp",
+        "Resident::run_times",
+        4,
+    ),
+    (
+        "src/resident.rs",
+        "calls ash::Device::get_query_pool_results",
+        "Resident::split",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls ash::Device::get_query_pool_results",
+        "Resident::ticked",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls ash::Device::get_query_pool_results",
+        "Resident::timed",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::host::Host::ticking",
+        "Host::queries",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::host::Host::ticking",
+        "Resident::split",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::host::Host::ticking",
+        "Resident::timed",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::resident::Resident::patience_of",
+        "Resident::building",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::resident::Resident::staged",
+        "Resident::frame",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::resident::Resident::staged_frames",
+        "Resident::frames",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::resident::Resident::staged_reading",
+        "Resident::frame_reading",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::resident::Resident::wait",
+        "Resident::staged",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::resident::Resident::wait",
+        "Resident::staged_frames",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::resident::Resident::wait_reading",
+        "Resident::staged_reading",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls grit::resident::Resident::wait_reading_both",
+        "Resident::staged_reading_both",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::elapsed",
+        "Host::buffers_in_with",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::elapsed",
+        "Resident::fetched",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::elapsed",
+        "Resident::land",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::elapsed",
+        "Resident::run_times",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::elapsed",
+        "Resident::write",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::now",
+        "Host::buffers_in_with",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::now",
+        "Resident::fetched",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::now",
+        "Resident::run_times",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::now",
+        "Resident::start",
+        1,
+    ),
+    (
+        "src/resident.rs",
+        "calls std::time::Instant::now",
+        "Resident::write",
+        1,
+    ),
     (
         "src/resident.rs",
         "cmd_write_timestamp",
@@ -2136,6 +2608,56 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/resident.rs", "use time item", "", 1),
     ("src/serve.rs", "Instant", "gauged", 1),
     ("src/serve.rs", "Instant", "walked", 1),
+    (
+        "src/serve.rs",
+        "calls grit::resident::Resident::on_device",
+        "Staged::on_device",
+        1,
+    ),
+    (
+        "src/serve.rs",
+        "calls grit::resident::Resident::on_device",
+        "gauged",
+        1,
+    ),
+    (
+        "src/serve.rs",
+        "calls grit::resident::Resident::on_device",
+        "spent_on",
+        1,
+    ),
+    (
+        "src/serve.rs",
+        "calls grit::resident::Resident::staged_frames",
+        "Staged::submitted",
+        1,
+    ),
+    (
+        "src/serve.rs",
+        "calls grit::resident::Resident::staged_frames",
+        "gauged",
+        1,
+    ),
+    (
+        "src/serve.rs",
+        "calls grit::resident::Resident::staged_frames",
+        "poured",
+        1,
+    ),
+    (
+        "src/serve.rs",
+        "calls std::time::Instant::elapsed",
+        "gauged",
+        1,
+    ),
+    (
+        "src/serve.rs",
+        "calls std::time::Instant::elapsed",
+        "walked",
+        1,
+    ),
+    ("src/serve.rs", "calls std::time::Instant::now", "gauged", 1),
+    ("src/serve.rs", "calls std::time::Instant::now", "walked", 1),
     ("src/serve.rs", "carrier first", "credit_answer", 3),
     ("src/serve.rs", "carrier first", "poured", 2),
     ("src/serve.rs", "carrier first", "settled", 1),
@@ -2198,6 +2720,24 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/budget.rs", "Guard {", "Guard::default", 1),
     (
         "src/serve3/budget.rs",
+        "calls grit::clock::real",
+        "Guard::default",
+        1,
+    ),
+    (
+        "src/serve3/budget.rs",
+        "calls std::time::Instant::saturating_duration_since",
+        "Clock::left",
+        1,
+    ),
+    (
+        "src/serve3/budget.rs",
+        "calls std::time::Instant::saturating_duration_since",
+        "Guard::left",
+        1,
+    ),
+    (
+        "src/serve3/budget.rs",
         "carrier frame",
         "Halted::refusal",
         1,
@@ -2230,6 +2770,49 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/budget.rs", "use time item", "", 1),
     ("src/serve3/exec.rs", "Book::new", "Exec::spawn", 1),
     ("src/serve3/exec.rs", "Server::new", "Exec::spawned", 1),
+    (
+        "src/serve3/exec.rs",
+        "calls grit::serve3::Book::new",
+        "Exec::spawn",
+        1,
+    ),
+    (
+        "src/serve3/exec.rs",
+        "calls grit::serve3::Server::new",
+        "Exec::spawned",
+        1,
+    ),
+    (
+        "src/serve3/exec.rs",
+        "calls std::sync::mpsc::Receiver::recv_timeout",
+        "work",
+        1,
+    ),
+    (
+        "src/serve3/exec.rs",
+        "calls std::thread::sleep",
+        "held_for_queued",
+        1,
+    ),
+    ("src/serve3/exec.rs", "calls std::thread::sleep", "watch", 1),
+    (
+        "src/serve3/exec.rs",
+        "calls std::time::Instant::saturating_duration_since",
+        "Flight::charged",
+        1,
+    ),
+    (
+        "src/serve3/exec.rs",
+        "calls std::time::Instant::saturating_duration_since",
+        "Shared::running",
+        1,
+    ),
+    (
+        "src/serve3/exec.rs",
+        "calls std::time::Instant::saturating_duration_since",
+        "work",
+        1,
+    ),
     ("src/serve3/exec.rs", "carrier time", "Exec::read", 1),
     ("src/serve3/exec.rs", "carrier time", "Exec::spawned", 2),
     ("src/serve3/exec.rs", "carrier time", "Shared::running", 2),
@@ -2324,6 +2907,18 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
         "Lawful::bricked_sizes",
         1,
     ),
+    (
+        "src/serve3/law_learn.rs",
+        "calls grit::resident::Resident::patience",
+        "calibrated",
+        1,
+    ),
+    (
+        "src/serve3/law_learn.rs",
+        "calls grit::resident::Resident::warmed",
+        "calibrated",
+        1,
+    ),
     ("src/serve3/law_learn.rs", "carrier first", "learned", 1),
     (
         "src/serve3/law_learn.rs",
@@ -2365,6 +2960,60 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/mod.rs", "Book::new", "Server::with", 1),
     ("src/serve3/mod.rs", "Guard", "Server::guard", 1),
     ("src/serve3/mod.rs", "Guard {", "Server::guard", 1),
+    (
+        "src/serve3/mod.rs",
+        "calls grit::clock::fake::aside",
+        "Server::snap_behind",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "calls grit::clock::fake::serving",
+        "Server::run_tool",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "calls grit::clock::real",
+        "Book::empty",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "calls grit::clock::real",
+        "Book::new",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "calls grit::serve3::Book::empty",
+        "Server::new",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "calls grit::serve3::Book::new",
+        "Server::with",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "calls std::sync::mpsc::Receiver::recv_timeout",
+        "Book::landed",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "calls std::time::Instant::saturating_duration_since",
+        "Book::landed",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "calls std::time::Instant::saturating_duration_since",
+        "Server::owed",
+        1,
+    ),
     ("src/serve3/mod.rs", "carrier frame", "Book::landed", 2),
     ("src/serve3/mod.rs", "carrier frame", "Server::pending", 1),
     ("src/serve3/mod.rs", "carrier frame", "Server::rebuild", 2),
@@ -2507,6 +3156,12 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/mod.rs", "sleep", "Server::snap_behind", 1),
     ("src/serve3/mod.rs", "use time item", "", 1),
     ("src/serve3/schema.rs", "carrier first", "near", 1),
+    (
+        "src/serve3/tools.rs",
+        "calls grit::calibrate::scripted_sound",
+        "Sound::after",
+        1,
+    ),
     ("src/serve3/tools.rs", "carrier after", "stepped", 2),
     ("src/serve3/tools.rs", "carrier first", "first_pace", 1),
     ("src/serve3/tools.rs", "carrier frame", "created", 1),
@@ -2539,6 +3194,162 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/tools.rs", "sleep", "stall", 3),
     ("src/serve3/transport.rs", "carrier listed", "respond", 1),
 ];
+
+fn crate_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn configured() -> Vec<String> {
+    let path = crate_root().join("tests").join("clock").join("clippy.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path:?}: {error}"));
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("{ path = \"")
+            .or_else(|| line.strip_prefix('"'));
+        if let Some(path) = rest.and_then(|rest| rest.split('"').next()) {
+            found.push(path.to_owned());
+        }
+    }
+    found
+}
+
+type Hit = (String, usize, usize, String);
+
+fn primary(span: &grit::wire::Json) -> Option<(String, usize, usize)> {
+    let file = span.get("file_name")?.text()?.replace('\\', "/");
+    if file.starts_with("src/") {
+        let line = usize::try_from(span.get("line_start")?.int()?).ok()?;
+        let column = usize::try_from(span.get("column_start")?.int()?).ok()?;
+        return Some((file, line, column));
+    }
+    primary(span.get("expansion")?.get("span")?)
+}
+
+fn linted(features: &[&str]) -> (Vec<Hit>, Vec<String>, std::time::Duration) {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let target = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("clock-clippy");
+    let began = std::time::Instant::now();
+    let output = std::process::Command::new(&cargo)
+        .args(["clippy", "--locked", "--lib", "--message-format=json"])
+        .args(features)
+        .args([
+            "--",
+            "-A",
+            "clippy::all",
+            "-W",
+            "clippy::disallowed_methods",
+            "-W",
+            "clippy::disallowed_types",
+        ])
+        .current_dir(crate_root())
+        .env("CLIPPY_CONF_DIR", crate_root().join("tests").join("clock"))
+        .env("CARGO_TARGET_DIR", &target)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {cargo} clippy: {error}"));
+    let took = began.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "cargo clippy {features:?} failed; the guard needs clippy wherever tests run:\n{}",
+        stderr
+            .lines()
+            .rev()
+            .take(30)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut hits = Vec::new();
+    let mut broken = Vec::new();
+    let mut finished = false;
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let message = grit::wire::read(line).unwrap_or_else(|error| {
+            panic!("clippy wrote a line that is not JSON ({error:?}): {line}")
+        });
+        let reason = message.get("reason").and_then(grit::wire::Json::text);
+        if reason == Some("build-finished") {
+            finished = message.get("success") == Some(&grit::wire::Json::Bool(true));
+            continue;
+        }
+        if reason != Some("compiler-message") {
+            continue;
+        }
+        let Some(inner) = message.get("message") else {
+            continue;
+        };
+        let said = inner
+            .get("message")
+            .and_then(grit::wire::Json::text)
+            .unwrap_or_default();
+        if said.contains("does not refer to") || said.contains("clippy.toml") {
+            broken.push(said.to_owned());
+        }
+        let code = inner
+            .get("code")
+            .and_then(|code| code.get("code"))
+            .and_then(grit::wire::Json::text)
+            .unwrap_or_default();
+        let verb = match code {
+            "clippy::disallowed_methods" => "calls",
+            "clippy::disallowed_types" => "names",
+            _ => continue,
+        };
+        let path = said.split('`').nth(1).unwrap_or(said);
+        let spans = inner
+            .get("spans")
+            .and_then(grit::wire::Json::list)
+            .unwrap_or_default();
+        let found = spans
+            .iter()
+            .filter(|span| span.get("is_primary") == Some(&grit::wire::Json::Bool(true)))
+            .find_map(primary);
+        match found {
+            Some((file, line, column)) => hits.push((file, line, column, format!("{verb} {path}"))),
+            None => broken.push(format!("{said}: no span in src/")),
+        }
+    }
+    assert!(finished, "cargo clippy {features:?} did not finish a build");
+    (hits, broken, took)
+}
+
+fn resolved() -> Vec<Hit> {
+    let mut all: std::collections::BTreeSet<Hit> = std::collections::BTreeSet::new();
+    let mut broken = Vec::new();
+    for features in [
+        &["--features", "faults"][..],
+        &["--no-default-features"][..],
+    ] {
+        let (hits, wrong, took) = linted(features);
+        eprintln!("clippy {features:?}: {} hits in {took:?}", hits.len());
+        all.extend(hits);
+        broken.extend(wrong);
+    }
+    broken.sort();
+    broken.dedup();
+    assert!(
+        broken.is_empty(),
+        "tests/clock/clippy.toml names a path clippy cannot resolve, or a hit has no place:\n{}",
+        broken.join("\n")
+    );
+    all.into_iter()
+        .filter(|(file, ..)| file != "src/clock.rs" && !file.starts_with("src/bin/"))
+        .collect()
+}
+
+fn token_at(tokens: &[Token], line: usize, column: usize) -> usize {
+    tokens
+        .iter()
+        .position(|one| (one.line, one.column) >= (line, column))
+        .unwrap_or(tokens.len().saturating_sub(1))
+}
 
 fn carriers_named() -> Vec<String> {
     let mut names: Vec<String> = CARRIERS
@@ -2610,7 +3421,7 @@ fn every_carrier_of_a_measured_duration_is_listed() {
     let shaped: Vec<(String, Shapes)> = scanned()
         .into_iter()
         .map(|(relative, text)| {
-            let shape = shapes(&text, carrier_file(&relative));
+            let shape = shapes(&text, &relative);
             (relative, shape)
         })
         .collect();
@@ -2648,6 +3459,40 @@ fn every_carrier_of_a_measured_duration_is_listed() {
         missing.join("\n"),
         gone.join("\n")
     );
+    let listed_for_clippy = configured();
+    let mut reached: Vec<(String, Option<String>)> = Vec::new();
+    for (file, (relative, shape)) in shaped.iter().enumerate() {
+        if !carrier_file(relative) {
+            continue;
+        }
+        for (name, path, names) in &shape.functions {
+            if holds_time(names, file, &all, &timed) {
+                reached.push((format!("{relative}: {name}"), path.clone()));
+            }
+        }
+    }
+    let unlisted: Vec<String> = reached
+        .iter()
+        .filter_map(|(named, path)| match path {
+            Some(path) if listed_for_clippy.contains(path) => None,
+            Some(path) => Some(format!("{named} as {path}")),
+            None => {
+                let covered = reached.iter().any(|(other, other_path)| {
+                    other == named
+                        && other_path
+                            .as_ref()
+                            .is_some_and(|one| listed_for_clippy.contains(one))
+                });
+                (!covered)
+                    .then(|| format!("{named}, a trait impl method with no listed trait method"))
+            }
+        })
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "function carriers not in tests/clock/clippy.toml:\n{}",
+        unlisted.join("\n")
+    );
 }
 
 #[test]
@@ -2659,6 +3504,8 @@ fn the_server_reads_time_only_through_its_clock() {
     let mut files = 0_usize;
     let sources = scanned();
     let real = real_by_default(&sources);
+    let mut parsed: std::collections::BTreeMap<String, (Vec<Token>, Vec<Place>)> =
+        std::collections::BTreeMap::new();
     for (relative, text) in sources {
         files += 1;
         let server = server_file(&relative);
@@ -2692,8 +3539,17 @@ fn the_server_reads_time_only_through_its_clock() {
                 .or_default()
                 .push(line);
         }
+        parsed.insert(relative, (tokens, places));
     }
     assert!(files > 30, "only {files} sources scanned");
+    for (file, line, column, kind) in resolved() {
+        let Some((tokens, places)) = parsed.get(&file) else {
+            panic!("clippy found {kind} in {file}, which the guard did not read");
+        };
+        let at = token_at(tokens, line, column);
+        let place = places.get(at).map(Place::named).unwrap_or_default();
+        seen.entry((file, kind, place)).or_default().push(line);
+    }
     let allowed: std::collections::BTreeMap<(String, String, String), usize> = ALLOWED
         .iter()
         .map(|(file, kind, place, count)| {
