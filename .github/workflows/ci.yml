@@ -86,6 +86,8 @@ jobs:
           ref: ${{ env.SIMDR_REV }}
           path: simdr
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: lavapipe
         run: |
