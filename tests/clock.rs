@@ -1088,6 +1088,7 @@ fn lexed(source: &str) -> Vec<Token> {
 struct Place {
     owner: String,
     function: String,
+    declaring: String,
     importing: bool,
     opens: bool,
 }
@@ -1098,6 +1099,14 @@ impl Place {
             (_, true) => String::new(),
             (true, false) => self.function.clone(),
             (false, false) => format!("{}::{}", self.owner, self.function),
+        }
+    }
+
+    fn declared(&self) -> String {
+        match (self.owner.is_empty(), self.declaring.is_empty()) {
+            (_, true) => String::new(),
+            (true, false) => self.declaring.clone(),
+            (false, false) => format!("{}::{}", self.owner, self.declaring),
         }
     }
 }
@@ -1186,9 +1195,14 @@ fn placed(tokens: &[Token]) -> Vec<Place> {
                 .map(|frame| frame.1.clone())
                 .unwrap_or_default()
         };
+        let declaring = match &pending {
+            Some((false, name)) => name.clone(),
+            _ => String::new(),
+        };
         places.push(Place {
             owner: innermost(true),
             function: innermost(false),
+            declaring,
             importing,
             opens,
         });
@@ -1279,7 +1293,9 @@ fn constructed(tokens: &[Token], at: usize) -> &str {
 #[derive(Debug, Clone, Copy, Default)]
 struct Role {
     signature: bool,
+    returns: bool,
     field: bool,
+    header: bool,
     aliased: bool,
 }
 
@@ -1304,6 +1320,13 @@ fn roles(tokens: &[Token]) -> Vec<Role> {
     for (at, one) in tokens.iter().enumerate() {
         let named = identifier(word_at(tokens, at + 1));
         let before = at.checked_sub(1).map_or("", |back| word_at(tokens, back));
+        if one.text == "impl" && matches!(before, "" | "}" | ";" | "{" | "]" | "unsafe") {
+            let end = ended(tokens, at, &["{", ";"]);
+            for role in found.get_mut(at..end).into_iter().flatten() {
+                role.header = true;
+            }
+            continue;
+        }
         if matches!(before, "::" | ".") || !named {
             continue;
         }
@@ -1317,6 +1340,13 @@ fn roles(tokens: &[Token]) -> Vec<Role> {
                 let end = ended(tokens, at, &["{", ";"]);
                 for role in found.get_mut(at..end).into_iter().flatten() {
                     role.signature = true;
+                }
+                let arrow = ended(tokens, at, &["->", "{", ";"]);
+                if word_at(tokens, arrow) == "->" {
+                    let shut = ended(tokens, arrow, &["where", "{", ";"]);
+                    for role in found.get_mut(arrow..shut).into_iter().flatten() {
+                        role.returns = true;
+                    }
                 }
             }
             "struct" | "enum" | "union" => {
@@ -1544,7 +1574,10 @@ fn kinds_at(
         if (place.importing && after == "as") || (lead == "=" && after == ";") || role.aliased {
             found.push(format!("{word} renamed"));
         }
-        if word == "Guard" && in_body && !place.importing && found.is_empty() {
+        let made_here = in_body
+            || role.returns
+            || !(role.signature || role.field || role.header || role.aliased);
+        if word == "Guard" && made_here && !place.importing && found.is_empty() {
             found.push("Guard".to_owned());
         }
     }
@@ -1735,18 +1768,53 @@ fn owner_of(kind: &syn::Type) -> String {
     }
 }
 
+fn bounded(signature: &syn::Signature) -> Vec<(String, Names)> {
+    let mut found: Vec<(String, Names)> = Vec::new();
+    for param in signature.generics.type_params() {
+        let mut names = Collected::default();
+        for bound in &param.bounds {
+            syn::visit::Visit::visit_type_param_bound(&mut names, bound);
+        }
+        found.push((param.ident.to_string(), names.names));
+    }
+    if let Some(clause) = &signature.generics.where_clause {
+        for predicate in &clause.predicates {
+            if let syn::WherePredicate::Type(typed) = predicate {
+                let mut names = Collected::default();
+                for bound in &typed.bounds {
+                    syn::visit::Visit::visit_type_param_bound(&mut names, bound);
+                }
+                found.push((owner_of(&typed.bounded_ty), names.names));
+            }
+        }
+    }
+    found
+}
+
+fn widened(mut names: Names, bounds: &[(String, Names)]) -> Names {
+    let more: Vec<String> = bounds
+        .iter()
+        .filter(|(param, _)| names.contains(param))
+        .flat_map(|(_, held)| held.iter().cloned())
+        .collect();
+    names.extend(more);
+    names
+}
+
 fn signed(shape: &mut Shapes, signature: &syn::Signature, owner: &str) {
     let name = signature.ident.to_string();
+    let bounds = bounded(signature);
     if let syn::ReturnType::Type(_, kind) = &signature.output {
-        shape
-            .held
-            .push((name.clone(), collected(kind, owner).names));
+        let names = widened(collected(kind, owner).names, &bounds);
+        shape.held.push((name.clone(), names));
     }
     for input in &signature.inputs {
         if let syn::FnArg::Typed(typed) = input {
             let found = collected(&typed.ty, owner);
             if found.writes {
-                shape.held.push((name.clone(), found.names));
+                shape
+                    .held
+                    .push((name.clone(), widened(found.names, &bounds)));
             }
         }
     }
@@ -1811,17 +1879,34 @@ fn itemised(list: &[syn::Item], shape: &mut Shapes) {
             syn::Item::Impl(one) => {
                 let owner = owner_of(&one.self_ty);
                 for inner in &one.items {
-                    if let syn::ImplItem::Fn(method) = inner {
-                        if one.trait_.is_some() || shown(&method.vis) {
+                    match inner {
+                        syn::ImplItem::Fn(method) if one.trait_.is_some() || shown(&method.vis) => {
                             signed(shape, &method.sig, &owner);
                         }
+                        syn::ImplItem::Type(kind) => shape
+                            .aliases
+                            .push((kind.ident.to_string(), collected(&kind.ty, &owner).names)),
+                        _ => {}
                     }
                 }
             }
-            syn::Item::Trait(one) if shown(&one.vis) => {
+            syn::Item::Trait(one) => {
                 for inner in &one.items {
-                    if let syn::TraitItem::Fn(method) = inner {
-                        signed(shape, &method.sig, "");
+                    match inner {
+                        syn::TraitItem::Fn(method) if shown(&one.vis) => {
+                            signed(shape, &method.sig, "");
+                        }
+                        syn::TraitItem::Type(kind) => {
+                            let mut names = Collected::default();
+                            for bound in &kind.bounds {
+                                syn::visit::Visit::visit_type_param_bound(&mut names, bound);
+                            }
+                            if let Some((_, fallback)) = &kind.default {
+                                names.names.extend(collected(fallback, "").names);
+                            }
+                            shape.aliases.push((kind.ident.to_string(), names.names));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2109,6 +2194,7 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/branch.rs", "carrier rates", "opened_file", 2),
     ("src/serve3/branch.rs", "carrier rates", "restored", 1),
     ("src/serve3/branch.rs", "carrier rates", "saved", 1),
+    ("src/serve3/budget.rs", "Guard", "Guard::default", 1),
     ("src/serve3/budget.rs", "Guard {", "Guard::default", 1),
     (
         "src/serve3/budget.rs",
@@ -2277,6 +2363,7 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/learn.rs", "carrier time", "run", 1),
     ("src/serve3/mod.rs", "Book::empty", "Server::new", 1),
     ("src/serve3/mod.rs", "Book::new", "Server::with", 1),
+    ("src/serve3/mod.rs", "Guard", "Server::guard", 1),
     ("src/serve3/mod.rs", "Guard {", "Server::guard", 1),
     ("src/serve3/mod.rs", "carrier frame", "Book::landed", 2),
     ("src/serve3/mod.rs", "carrier frame", "Server::pending", 1),
@@ -2464,6 +2551,61 @@ fn carriers_named() -> Vec<String> {
 }
 
 #[test]
+fn the_guard_reads_the_code_after_every_literal_and_comment_form() {
+    let forms = [
+        (r"b'\\'", "''"),
+        (r"'\''", "''"),
+        (r"'\\'", "''"),
+        (r"b'\''", "''"),
+        (r"'\u{7f}'", "''"),
+        ("'\"'", "''"),
+        (r#""\"""#, "\"\""),
+        (r#""\\""#, "\"\""),
+        (r#"b"\\""#, "\"\""),
+        (r##"r#"a " b"#"##, "\"\""),
+        (r###"br##"q "# r"##"###, "\"\""),
+        (r#"c"\\""#, "\"\""),
+        ("\"two\nlines\"", "\"\""),
+        ("1 /* a /* b */ c */", "0"),
+        ("2 // rest\n", "0"),
+        ("0x1f_u8", "0"),
+        ("1.5e3", "0"),
+    ];
+    for (form, kind) in forms {
+        let source = format!(
+            "fn f() {{\n    let _ = {form};\n    let _ = std::time::Instant::now();\n    let _ = 'x';\n}}\n"
+        );
+        let tokens = lexed(&source);
+        let words: Vec<&str> = tokens.iter().map(|one| one.text.as_str()).collect();
+        let found = words
+            .windows(3)
+            .position(|three| three == ["Instant", "::", "now"]);
+        assert!(
+            found.is_some(),
+            "{form}: the code after it was lost: {words:?}"
+        );
+        let line = found.and_then(|at| tokens.get(at)).map(|one| one.line);
+        let lines = 3 + form.matches('\n').count();
+        assert_eq!(line, Some(lines), "{form}: wrong line: {words:?}");
+        assert_eq!(
+            words.get(8).copied(),
+            Some(kind),
+            "{form}: not one literal: {words:?}"
+        );
+        assert_eq!(words.get(9).copied(), Some(";"), "{form}: {words:?}");
+        let places = placed(&tokens);
+        let inside = braced(&tokens);
+        let role = roles(&tokens);
+        let at = found.unwrap_or_default();
+        assert_eq!(
+            kinds_at(&tokens, &places, &inside, &role, at, &[], false),
+            ["Instant"],
+            "{form}: the guard does not count the read after it"
+        );
+    }
+}
+
+#[test]
 fn every_carrier_of_a_measured_duration_is_listed() {
     let shaped: Vec<(String, Shapes)> = scanned()
         .into_iter()
@@ -2539,7 +2681,12 @@ fn the_server_reads_time_only_through_its_clock() {
             kinds.push((at, "use time item".to_owned()));
         }
         for (at, kind) in kinds {
-            let place = places.get(at).map(Place::named).unwrap_or_default();
+            let held = places.get(at).cloned().unwrap_or_default();
+            let place = if kind == "Guard" && held.function.is_empty() {
+                held.declared()
+            } else {
+                held.named()
+            };
             let line = tokens.get(at).map_or(0, |one| one.line);
             seen.entry((relative.clone(), kind, place))
                 .or_default()
