@@ -199,7 +199,7 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `reads` | `{plane, bit}`, each read at every place; places times reads at most 27 |
 | `writes` | `{plane, bit}`, written at the cell itself |
 | `border` | `zero`: a neighbour past an example's edge reads 0. `wrapped`: an inline example wraps on itself, and a world example's box reads its neighbours from that world |
-| `rule` | `minimal` or `symmetric`, below |
+| `rule` | `minimal`, `symmetric`, `totalistic` or `outer`, below |
 | `examples` | inline `{size, input, output}`, with one word list per read and per write, x fastest, at most 4096 words a list; or `{world, output_world, from, to}` for larger ones, up to 2^20 cells over all examples |
 | `gates`, `crowd`, `rounds`, `seed` | the search's effort, as `grit_least` |
 
@@ -222,4 +222,29 @@ The answer adds `stencil`, `row_order`, `border` and `runs_as` (how to run it so
 
 A call stops on its deadline or cancel only at a brake: before each build that measures the device, before each build of a search and before each device submission of a look. No measured time is compared with the time left. Once the deadline has passed no further submission starts, so an answer can come late by the one submission in flight: a build, or one submission of a look, sized by the device's measured pace. A build's kernel loops over the rows searched, every image of every seen row under `symmetric`, so it does not grow with them. Before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission (where a driver that compiles at its first dispatch, such as lavapipe, compiles), grown with the square of the kernel's words from the closest one measured, stays within half the device's patience (`GRIT_PATIENCE_SECS`). A top rung past that is refused `learn_limit` at `$.gates` with the most gates that fit. That limit is measured on this device at this moment, so it is outside the same-bytes rule below. An answer with `stopped` `ladder` is the same bytes for the same request on the same device; a stop on `budget` or `cancelled` depends on when the deadline passed or the cancel came, and its ladder is a prefix of that answer's ladder. A stopped ladder answers the smallest circuit solved so far, and refuses `budget` or `cancelled` when there is none. A ladder that solves nothing is refused `unsolved` at `$.gates`. The seen rows, and under `symmetric` their images, are refused `learn_limit` before any search when they pass the rows one search kernel holds (WORK / (gates + inputs + outputs) times 32); the expansion stops as soon as it passes them. The expansion checks budget and cancel every 4096 rows. The count of decided rows (at most 2^(inputs - 6) blocks of 64 rows times the inputs plus the law's gates) checks only cancel, every 4096 blocks, and none after a ladder that stopped; otherwise it runs to its end, so a found law is never lost to the deadline. A rung's crowd starts at most at what one device binding holds and doubles up to 65536 or that limit, whichever is less; a lowered crowd is named in `crowd_capped`. Under `symmetric` the ladder starts at most at the gates whose 8 or 48 copies and their ors fit the 600 gates a law always holds (74 for 3x3, 11 for 3x3x3 with one output); a lowered start is named in `gates_capped`. Other refusals: `example`, `outside`, `reversed`, `plane_past`, `halo_written` (a read on a plane a write writes), `bit_shared`, `learn_limit` (inputs past 27, cells past 2^20, rows past one kernel, gates below writes, not even a crowd of 64 fitting one device binding, a top rung whose build the device's evidence puts past half its patience), `no_world`, `chip_too_big` and `no_compute_device`.
 
-The X0b edge task: 24 inline 32x32 pairs, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `zero`. Both rules see 125 rows of 512, refuse nothing, and find the same 4 gates: the centre is 1 and not all four of its orthogonal neighbours are. Under `minimal` that is the law; under `symmetric` it is 8 copies and 7 ors, 39 gates, with the same table. Run it as `runs_as` says: each image at the origin of a 64x64x2 world, plane 0, one step, plane 1 read.
+### Counting laws
+
+`totalistic` and `outer` take exactly one read and decide every row by a count, with no search:
+
+- `totalistic`: output `j` is `T_j[n]`, where `n` counts the stencil's places, centre included, whose read bit is 1: 0 to 9 for 3x3, 0 to 27 for 3x3x3.
+- `outer`: output `j` is `T_j[c][n]`, where `c` is the centre's read bit and `n` counts the other places: 0 to 8 or 0 to 26.
+
+The rows are built and refused (`conflict`) as above. Each table is then read from the seen rows in one pass. Two seen rows with the same `n` (and, for `outer`, the same `c`) but different outputs for one write are refused `not_counting` at `$.rule`. Its `counts` lists, for each such count and write, `count` (and `centre` for `outer`), `write` and `seen`: one row with output 0 and one with output 1, each where it was first seen (`example`, `at`). `not_counting` is how many there are. More than one read is refused `count_reads` at `$.reads`. A count no example showed is decided 0.
+
+The law counts with a gate circuit through the same chip wiring as the other rules: an adder tree sums the counted places, a decoder turns the sum into one line a count, and each output ors the lines whose entry is 1 (or the negated or of those that are 0, when fewer). For 3x3x3 with 8 writes under `outer` it stays under the 600 gates a law always holds, so it never meets `chip_too_big`. A law built this way turns with its input under every move of the stencil, since a count does not see the order of the places.
+
+The answer has the fields above except `found`, and:
+
+| Field | Meaning |
+|---|---|
+| `tables` | per write: `T[n]` for `totalistic`; `[T[0][n], T[1][n]]` for `outer` |
+| `unseen_counts` | per write, in the same shape: the counts no example showed, each decided 0 |
+| `unseen` | as above, with `rule` and `means` naming the counting rule |
+| `ladder` | `[]` |
+| `stopped` | `no_search` |
+
+The call builds no search kernel and has no brake: it reads the rows, then builds the circuit. With inline examples it needs no compute device. The same request gives the same bytes. `gates`, `crowd`, `rounds` and `seed` are not used.
+
+3x3 majority (1 when at least 5 of the 9 places are 1) from 12 random 32x32 examples: `rule` `totalistic` answers `tables` `[[0,0,0,0,0,1,1,1,1,1]]`. Life is `outer` with `[[[0,0,0,1,0,0,0,0,0],[0,0,1,1,0,0,0,0,0]]]`.
+
+The X0b edge task: 24 inline 32x32 pairs, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `zero`. `minimal` and `symmetric` see 125 rows of 512, refuse nothing, and find the same 4 gates: the centre is 1 and not all four of its orthogonal neighbours are. Under `minimal` that is the law; under `symmetric` it is 8 copies and 7 ors, 39 gates, with the same table. Run it as `runs_as` says: each image at the origin of a 64x64x2 world, plane 0, one step, plane 1 read. `totalistic` and `outer` refuse it `not_counting`: a centre with 4 neighbours set is an edge or not by which 4 they are.

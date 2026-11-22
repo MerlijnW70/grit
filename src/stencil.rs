@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::netlist::Gate;
 
@@ -575,4 +575,290 @@ pub fn table(inputs: u32, outputs: u32, gates: &[Gate]) -> Vec<u32> {
     (0..1_u32 << inputs)
         .map(|row| answer(inputs, outputs, gates, row))
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tally {
+    Totalistic,
+    Outer,
+}
+
+impl Tally {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Totalistic => "totalistic",
+            Self::Outer => "outer",
+        }
+    }
+
+    #[must_use]
+    pub fn counted(self, stencil: Stencil) -> Vec<u32> {
+        let centre = stencil.place([0, 0, 0]);
+        (0..stencil.positions())
+            .filter(|place| self == Self::Totalistic || *place != centre)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn counts(self, stencil: Stencil) -> u32 {
+        u32::try_from(self.counted(stencil).len()).unwrap_or(0) + 1
+    }
+
+    #[must_use]
+    pub fn classes(self, stencil: Stencil) -> u32 {
+        match self {
+            Self::Totalistic => self.counts(stencil),
+            Self::Outer => 2 * self.counts(stencil),
+        }
+    }
+
+    #[must_use]
+    pub fn class(self, stencil: Stencil, row: u32) -> u32 {
+        let n = self
+            .counted(stencil)
+            .iter()
+            .filter(|place| (row >> **place) & 1 == 1)
+            .count();
+        let n = u32::try_from(n).unwrap_or(0);
+        match self {
+            Self::Totalistic => n,
+            Self::Outer => {
+                let centre = (row >> stencil.place([0, 0, 0])) & 1;
+                centre * self.counts(stencil) + n
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn rows_in(self, stencil: Stencil, class: u32) -> u64 {
+        let places = u64::from(self.counts(stencil) - 1);
+        let n = u64::from(class % self.counts(stencil));
+        (0..n).fold(1_u64, |held, at| held * (places - at) / (at + 1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Split {
+    pub write: u32,
+    pub class: u32,
+    pub zero: (u32, Seen),
+    pub one: (u32, Seen),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tallied {
+    pub table: Vec<Option<u32>>,
+    pub split: Vec<Split>,
+}
+
+const fn order_of(one: &Seen) -> u128 {
+    ((one.example as u128) << 96)
+        | ((one.at[2] as u128) << 64)
+        | ((one.at[1] as u128) << 32)
+        | one.at[0] as u128
+}
+
+type Marks = Vec<Vec<[Option<(u32, Seen)>; 2]>>;
+
+#[must_use]
+pub fn tallied(
+    tally: Tally,
+    stencil: Stencil,
+    outputs: u32,
+    seen: &BTreeMap<u32, Seen>,
+) -> Tallied {
+    let classes = tally.classes(stencil) as usize;
+    let mut table: Vec<Option<u32>> = vec![None; classes];
+    let mut marks: Marks = vec![vec![[None, None]; outputs as usize]; classes];
+    for (row, one) in seen {
+        let class = tally.class(stencil, *row) as usize;
+        if let Some(slot) = table.get_mut(class) {
+            *slot = Some(one.outputs);
+        }
+        let Some(held) = marks.get_mut(class) else {
+            continue;
+        };
+        for (write, pair) in held.iter_mut().enumerate() {
+            let bit = ((one.outputs >> write) & 1) as usize;
+            if let Some(mark) = pair.get_mut(bit) {
+                let keep = mark
+                    .as_ref()
+                    .is_none_or(|(_, before)| order_of(one) < order_of(before));
+                if keep {
+                    *mark = Some((*row, *one));
+                }
+            }
+        }
+    }
+    let mut split = Vec::new();
+    for (class, held) in marks.iter().enumerate() {
+        for (write, pair) in held.iter().enumerate() {
+            if let [Some(zero), Some(one)] = pair {
+                split.push(Split {
+                    write: u32::try_from(write).unwrap_or(u32::MAX),
+                    class: u32::try_from(class).unwrap_or(u32::MAX),
+                    zero: *zero,
+                    one: *one,
+                });
+            }
+        }
+    }
+    Tallied { table, split }
+}
+
+struct Wires {
+    inputs: u32,
+    gates: Vec<Gate>,
+}
+
+impl Wires {
+    fn gate(&mut self, kind: u32, left: u32, right: u32) -> u32 {
+        let name = self.inputs + u32::try_from(self.gates.len()).unwrap_or(u32::MAX);
+        self.gates.push(Gate { kind, left, right });
+        name
+    }
+
+    fn constant(&mut self, value: bool) -> u32 {
+        self.gate(if value { 15 } else { 0 }, 0, 0)
+    }
+
+    fn summed(&mut self, places: &[u32]) -> Vec<u32> {
+        let mut columns: Vec<VecDeque<u32>> = vec![places.iter().copied().collect()];
+        let mut weight = 0;
+        while let Some(column) = columns.get_mut(weight) {
+            let (sum, carry) = if column.len() >= 3 {
+                let (Some(a), Some(b), Some(c)) =
+                    (column.pop_front(), column.pop_front(), column.pop_front())
+                else {
+                    break;
+                };
+                let ab = self.gate(6, a, b);
+                let sum = self.gate(6, ab, c);
+                let both = self.gate(8, a, b);
+                let other = self.gate(8, ab, c);
+                (sum, self.gate(OR, both, other))
+            } else if column.len() == 2 {
+                let (Some(a), Some(b)) = (column.pop_front(), column.pop_front()) else {
+                    break;
+                };
+                (self.gate(6, a, b), self.gate(8, a, b))
+            } else {
+                weight += 1;
+                continue;
+            };
+            if let Some(column) = columns.get_mut(weight) {
+                column.push_back(sum);
+            }
+            match columns.get_mut(weight + 1) {
+                Some(next) => next.push_back(carry),
+                None => columns.push(VecDeque::from([carry])),
+            }
+        }
+        let mut bits = Vec::with_capacity(columns.len());
+        for column in &columns {
+            let bit = match column.front() {
+                Some(bit) => *bit,
+                None => self.constant(false),
+            };
+            bits.push(bit);
+        }
+        bits
+    }
+
+    fn decoded(&mut self, bits: &[u32], limit: u32) -> Vec<u32> {
+        match bits {
+            [] => vec![self.constant(true)],
+            [bit] => {
+                let not = self.gate(5, *bit, *bit);
+                [not, *bit].into_iter().take(limit as usize).collect()
+            }
+            _ => {
+                let half = bits.len() / 2;
+                let (low, high) = bits.split_at(half);
+                let lows = self.decoded(low, 1 << half);
+                let highs = self.decoded(high, limit.div_ceil(1 << half));
+                let mask = (1_u32 << half) - 1;
+                (0..limit)
+                    .map(|value| {
+                        let left = lows.get((value & mask) as usize).copied().unwrap_or(0);
+                        let right = highs.get((value >> half) as usize).copied().unwrap_or(0);
+                        self.gate(8, left, right)
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn joined(&mut self, lines: &[u32]) -> u32 {
+        let mut held: Option<u32> = None;
+        for line in lines {
+            held = Some(match held {
+                None => *line,
+                Some(before) => self.gate(OR, before, *line),
+            });
+        }
+        held.unwrap_or_else(|| self.constant(false))
+    }
+
+    fn picked(&mut self, lines: &[u32], wanted: &[bool]) -> u32 {
+        let side = |value: bool| -> Vec<u32> {
+            lines
+                .iter()
+                .zip(wanted)
+                .filter(|(_, want)| **want == value)
+                .map(|(line, _)| *line)
+                .collect()
+        };
+        let ones = side(true);
+        let zeros = side(false);
+        if zeros.is_empty() {
+            return self.constant(true);
+        }
+        if ones.len() <= zeros.len() {
+            return self.joined(&ones);
+        }
+        let none = self.joined(&zeros);
+        self.gate(5, none, none)
+    }
+}
+
+#[must_use]
+pub fn tally_gates(tally: Tally, stencil: Stencil, outputs: u32, table: &[u32]) -> Vec<Gate> {
+    let inputs = stencil.positions();
+    let mut wires = Wires {
+        inputs,
+        gates: Vec::new(),
+    };
+    let counts = tally.counts(stencil);
+    let bits = wires.summed(&tally.counted(stencil));
+    let lines = wires.decoded(&bits, counts);
+    let centre = stencil.place([0, 0, 0]);
+    let mut outs = Vec::with_capacity(outputs as usize);
+    for write in 0..outputs {
+        let wanted = |from: u32| -> Vec<bool> {
+            (from..from + counts)
+                .map(|class| {
+                    table
+                        .get(class as usize)
+                        .is_some_and(|word| (word >> write) & 1 == 1)
+                })
+                .collect()
+        };
+        let out = match tally {
+            Tally::Totalistic => wires.picked(&lines, &wanted(0)),
+            Tally::Outer => {
+                let off = wires.picked(&lines, &wanted(0));
+                let on = wires.picked(&lines, &wanted(counts));
+                let lit = wires.gate(8, centre, on);
+                let dark = wires.gate(4, centre, off);
+                wires.gate(OR, lit, dark)
+            }
+        };
+        outs.push(out);
+    }
+    for out in outs {
+        wires.gate(10, out, out);
+    }
+    live(inputs, outputs, &wires.gates)
 }
