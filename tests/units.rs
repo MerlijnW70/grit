@@ -345,6 +345,69 @@ fn u2_more_cells_bytes_frames_or_bricks_never_price_lower() {
     }
 }
 
+fn counted(entry: &Entry) -> u32 {
+    match entry {
+        Entry::Step(count) | Entry::Back(count) => *count,
+        Entry::Write(_) | Entry::WritePlane(..) | Entry::Params(_) => 0,
+    }
+}
+
+#[test]
+fn f1_only_a_step_or_a_walk_carries_frames_in_its_price() {
+    let mut draws = Draws(0x6A09_E667_F3BC_C909);
+    let dense = made([16, 16, 16], false);
+    let sparse = made([32, 32, 32], true);
+    for round in 0..4000 {
+        let cells = match draws.next(3) {
+            0 => 0,
+            1 => u64::MAX - draws.next(2),
+            _ => draws.next(1 << 40),
+        };
+        let frames = match draws.next(3) {
+            0 => u32::MAX - u32::try_from(draws.next(2)).unwrap(),
+            1 => u32::try_from(draws.next(1 << 31)).unwrap(),
+            _ => u32::try_from(draws.next(300)).unwrap(),
+        };
+        let framed = tools::frames_cost(cells, frames);
+        assert_eq!(framed.frames, frames, "round {round}");
+        assert_eq!(framed.kind, Priced::Frame);
+        let count = usize::try_from(draws.next(5000)).unwrap();
+        let bytes = cells;
+        for other in [
+            tools::build_cost(bytes),
+            tools::write_cost(count, false),
+            tools::write_cost(count, true),
+            branch::fork_cost(bytes),
+            branch::restore_cost(bytes),
+            branch::save_cost(bytes),
+            branch::file_cost(bytes),
+            snapshot_cost(bytes),
+            law::params_cost(count),
+        ] {
+            assert_eq!(other.frames, 0, "round {round}: {other:?}");
+        }
+        let cells_listed = vec![([0, 0, 0], 1); count % 64];
+        for made in [&dense, &sparse] {
+            for entry in [
+                Entry::Step(frames),
+                Entry::Back(frames),
+                Entry::Write(cells_listed.clone()),
+                Entry::WritePlane(1, cells_listed.clone()),
+                Entry::Params(vec![0; count % 8]),
+            ] {
+                let bricks = Some((u32::try_from(draws.next(64)).unwrap(), 512));
+                for held in [None, bricks] {
+                    assert_eq!(
+                        priced(made, &entry, held).frames,
+                        counted(&entry),
+                        "round {round}: {entry:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn the_journal_hash_does_not_depend_on_units() {
     let mut plain = Ledger::created(made([16, 16, 16], false));
@@ -581,7 +644,7 @@ mod served {
     use grit::serve3::{Options, Server};
     use grit::wire::{Json, written};
 
-    use super::{MAIN_STATES, MIB, copied_fixture, cost, pure_costs, ran, scratch};
+    use super::{MAIN_STATES, MIB, copied_fixture, cost, counted, pure_costs, ran, scratch};
 
     use super::common;
 
@@ -886,6 +949,9 @@ mod served {
         assert_eq!(live.sum(), read.sum(), "{label}");
         assert_eq!(live.costs(), read.costs(), "{label}");
         assert_eq!(live.units(), read.units(), "{label}");
+        for (entry, cost) in read.entries.iter().zip(read.costs()) {
+            assert_eq!(cost.frames, counted(entry), "{label}: {entry:?}");
+        }
     }
 
     #[test]
@@ -1015,6 +1081,13 @@ mod served {
             );
         }
         assert_eq!(again.tally(Priced::Replay), replayed);
+        let ran: u32 = live
+            .iter()
+            .flat_map(|ledger| &ledger.entries)
+            .map(counted)
+            .sum();
+        assert!(ran > 0);
+        assert_eq!(again.tally(Priced::Replay).frames, ran);
         let reread = Keep::at(&dir).unwrap().earlier();
         for (number, ledger) in numbers.iter().zip(&live) {
             let found = &reread.iter().find(|(one, _)| one == number).unwrap().1;
