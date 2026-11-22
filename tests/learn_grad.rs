@@ -2401,7 +2401,7 @@ mod faulted {
     use grit::serve3::exec::Exec;
 
     use grit::serve3::gradient::faults::{cancel_after, disarm};
-    use grit::serve3::tools::faults::{disarm as unstall, stall_every};
+    use grit::serve3::tools::faults::{disarm as unstall, stall_cells, stall_every};
 
     use super::delayed::Waiting;
 
@@ -2447,6 +2447,8 @@ mod faulted {
     const WAITED: Duration = Duration::from_millis(4);
 
     const FLOOR: Duration = Duration::from_millis(20);
+
+    const CELL_WRITTEN: Duration = Duration::from_micros(1);
 
     struct Case {
         text: String,
@@ -2581,39 +2583,18 @@ mod faulted {
         told: Told,
     }
 
-    #[derive(Debug)]
-    struct Switched {
-        waiting: Waiting,
-        on: AtomicBool,
-    }
-
-    impl Time for Switched {
-        fn now(&self) -> Instant {
-            if self.on.load(Ordering::SeqCst) {
-                self.waiting.now()
-            } else {
-                self.waiting.fake().now()
-            }
-        }
-
-        fn sleep(&self, time: Duration) {
-            if self.on.load(Ordering::SeqCst) {
-                self.waiting.sleep(time);
-            } else {
-                self.waiting.fake().sleep(time);
-            }
-        }
-    }
-
     fn session(
         host: &Host,
         time: Arc<dyn Time>,
         fake: &Fake,
-        on: &dyn Fn(bool),
-        (case, budget, stall): (&Case, u64, bool),
+        case: &Case,
+        budget: u64,
+        stall: bool,
     ) -> Session {
         let mut server = Server::timed(Some(host), &Options::default(), time).unwrap();
+        stall_cells(CELL_WRITTEN);
         let worlds = opened(&mut server, case);
+        unstall();
         let before = kept(&mut server, &worlds);
         let mut got = Vec::new();
         let mut took = Vec::new();
@@ -2627,7 +2608,6 @@ mod faulted {
         if stall {
             stall_every(WALK_FLOOR);
         }
-        on(true);
         for _ in 0..2 {
             let (at, slept, ran) = (fake.elapsed(), fake.slept(), walks().unwrap());
             let began = Instant::now();
@@ -2645,7 +2625,6 @@ mod faulted {
             told.answers.push(written(&one));
             got.push(one);
         }
-        on(false);
         unstall();
         assert_eq!(kept(&mut server, &worlds), before, "no world moved");
         told.steps = fake.steps();
@@ -2658,8 +2637,9 @@ mod faulted {
             host,
             Arc::clone(&fake) as Arc<dyn Time>,
             &fake,
-            &|_| {},
-            (case, budget, stall),
+            case,
+            budget,
+            stall,
         )
     }
 
@@ -2764,18 +2744,16 @@ mod faulted {
             (ms(WALK_FLOOR * walks + WALK_FLOOR / 2), true),
         ] {
             let plain = faked(&host, &case, budget, stall);
-            let switched = Arc::new(Switched {
-                waiting: Waiting::new(WAITED, WAITED),
-                on: AtomicBool::new(false),
-            });
+            let waiting = Arc::new(Waiting::new(WAITED, WAITED));
             let delayed = session(
                 &host,
-                Arc::clone(&switched) as Arc<dyn Time>,
-                switched.waiting.fake(),
-                &|on| switched.on.store(on, Ordering::SeqCst),
-                (&case, budget, stall),
+                Arc::clone(&waiting) as Arc<dyn Time>,
+                waiting.fake(),
+                &case,
+                budget,
+                stall,
             );
-            let (waits, waited) = switched.waiting.waited();
+            let (waits, waited) = waiting.waited();
             println!(
                 "budget {budget}: {waits} waits, {waited:?} in all, the calls took {:?}",
                 delayed.took
