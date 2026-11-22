@@ -954,7 +954,7 @@ impl<'host> Server<'host> {
     pub(super) fn sampled(
         &self,
         key: &crate::calibrate::Key,
-        work: (u64, u32, u32),
+        work: cost::Cost,
         wall: Duration,
         sound: Option<Duration>,
     ) {
@@ -964,24 +964,13 @@ impl<'host> Server<'host> {
         let mut held = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (units, frames, submits) = work;
         if let Some(time) = sound {
-            held.lower(
-                key,
-                crate::calibrate::Sample {
-                    units,
-                    frames,
-                    submits,
-                    time,
-                },
-            );
+            held.lower(key, crate::calibrate::Sample { cost: work, time });
         }
         held.lower(
             key,
             crate::calibrate::Sample {
-                units,
-                frames,
-                submits,
+                cost: work,
                 time: wall,
             },
         );
@@ -2145,9 +2134,8 @@ fn paced(
 #[must_use]
 pub const fn snapshot_cost(bytes: u64) -> cost::Cost {
     cost::Cost {
-        kind: cost::Priced::Snapshot,
         units: bytes,
-        submits: 0,
+        ..cost::Cost::none(cost::Priced::Snapshot)
     }
 }
 

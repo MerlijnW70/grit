@@ -139,6 +139,14 @@ impl Entry {
             Self::Params(params) => 4 * params.len() + 8,
         }
     }
+
+    #[must_use]
+    pub const fn ran(&self) -> u32 {
+        match self {
+            Self::Step(count) | Self::Back(count) => *count,
+            Self::Write(_) | Self::WritePlane(..) | Self::Params(_) => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -237,7 +245,10 @@ impl Ledger {
         self.bytes = self.bytes.saturating_add(entry.bytes());
         self.replay = self.replay.saturating_add(spent);
         self.recorded.push(spent);
-        self.costs.push(cost);
+        self.costs.push(Cost {
+            frames: entry.ran(),
+            ..cost
+        });
         self.entries.push(entry);
     }
 
@@ -1083,6 +1094,7 @@ fn priced_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration, Cost)> {
     let cost = Cost {
         kind,
         units: u64::from(low) | (u64::from(high) << 32),
+        frames: entry.ran(),
         submits,
     };
     Some((entry, spent, cost))

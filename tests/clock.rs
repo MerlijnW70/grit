@@ -2768,6 +2768,8 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/budget.rs", "carrier time", "Guard::stop", 1),
     ("src/serve3/budget.rs", "real", "Guard::default", 1),
     ("src/serve3/budget.rs", "use time item", "", 1),
+    ("src/serve3/cost.rs", "carrier frames", "Cost::none", 1),
+    ("src/serve3/cost.rs", "carrier frames", "Cost::plus", 3),
     ("src/serve3/exec.rs", "Book::new", "Exec::spawn", 1),
     ("src/serve3/exec.rs", "Server::new", "Exec::spawned", 1),
     (
@@ -2881,6 +2883,13 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/journal.rs", "carrier frame", "base_record", 1),
     ("src/serve3/journal.rs", "carrier frame", "rebuilt", 12),
     ("src/serve3/journal.rs", "carrier frame", "state_of", 1),
+    (
+        "src/serve3/journal.rs",
+        "carrier frames",
+        "Ledger::push_priced",
+        1,
+    ),
+    ("src/serve3/journal.rs", "carrier frames", "priced_of", 1),
     ("src/serve3/journal.rs", "carrier made", "Keep::begin", 1),
     (
         "src/serve3/journal.rs",
@@ -3029,7 +3038,6 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
         "Server::snap_behind",
         2,
     ),
-    ("src/serve3/mod.rs", "carrier frames", "Server::sampled", 2),
     ("src/serve3/mod.rs", "carrier listed", "Server::rebuild", 1),
     ("src/serve3/mod.rs", "carrier made", "Book::landed", 2),
     (
@@ -3169,6 +3177,8 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/tools.rs", "carrier frame", "sliced", 1),
     ("src/serve3/tools.rs", "carrier frame", "stepped", 2),
     ("src/serve3/tools.rs", "carrier frame", "written", 1),
+    ("src/serve3/tools.rs", "carrier frames", "frames_cost", 1),
+    ("src/serve3/tools.rs", "carrier frames", "stepped", 1),
     ("src/serve3/tools.rs", "carrier listed", "created", 1),
     ("src/serve3/tools.rs", "carrier listed", "stepped", 1),
     ("src/serve3/tools.rs", "carrier listed", "written", 1),

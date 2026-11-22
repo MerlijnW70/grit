@@ -14,8 +14,17 @@ const MIB: u64 = 1 << 20;
 
 const fn cost(kind: Priced, units: u64, submits: u32) -> Cost {
     Cost {
-        kind,
         units,
+        submits,
+        ..Cost::none(kind)
+    }
+}
+
+const fn ran(units: u64, frames: u32, submits: u32) -> Cost {
+    Cost {
+        kind: Priced::Frame,
+        units,
+        frames,
         submits,
     }
 }
@@ -112,17 +121,17 @@ fn table() -> Vec<(&'static str, Cost, Cost)> {
         (
             "64 frames",
             tools::frames_cost(4096, 64),
-            cost(Priced::Frame, 262_144, 1),
+            ran(262_144, 64, 1),
         ),
         (
             "65 frames",
             tools::frames_cost(4096, 65),
-            cost(Priced::Frame, 266_240, 2),
+            ran(266_240, 65, 2),
         ),
         (
             "100 frames",
             tools::frames_cost(4096, 100),
-            cost(Priced::Frame, 409_600, 2),
+            ran(409_600, 100, 2),
         ),
         ("params 3", law::params_cost(3), cost(Priced::Params, 12, 0)),
         (
@@ -153,22 +162,22 @@ fn table() -> Vec<(&'static str, Cost, Cost)> {
         (
             "dense step entry",
             priced(&dense, &Entry::Step(7), None),
-            cost(Priced::Frame, 28_672, 1),
+            ran(28_672, 7, 1),
         ),
         (
             "dense back entry",
             priced(&dense, &Entry::Back(70), None),
-            cost(Priced::Frame, 286_720, 2),
+            ran(286_720, 70, 2),
         ),
         (
             "sparse step entry with 14 bricks of 512",
             priced(&sparse, &Entry::Step(9), Some((14, 512))),
-            cost(Priced::Frame, 64_512, 1),
+            ran(64_512, 9, 1),
         ),
         (
             "sparse step entry with bricks unknown",
             priced(&sparse, &Entry::Step(9), None),
-            cost(Priced::Frame, 294_912, 1),
+            ran(294_912, 9, 1),
         ),
         (
             "sparse write entry",
@@ -183,7 +192,10 @@ fn table() -> Vec<(&'static str, Cost, Cost)> {
         (
             "replay of write 40, step 100, params 2, back 3",
             replay_cost(&ledger),
-            cost(Priced::Replay, 40 + 409_600 + 8 + 12_288, 2 + 2 + 1),
+            Cost {
+                frames: 100 + 3,
+                ..cost(Priced::Replay, 40 + 409_600 + 8 + 12_288, 2 + 2 + 1)
+            },
         ),
         (
             "ledger units",
@@ -426,10 +438,7 @@ fn u4_a_journal_written_by_main_reads_with_units_from_the_pure_functions() {
         .collect();
     assert_eq!(
         stepped,
-        [
-            cost(Priced::Frame, 32 * 32 * 32 * 30, 1),
-            cost(Priced::Frame, 32 * 32 * 32 * 9, 1),
-        ]
+        [ran(32 * 32 * 32 * 30, 30, 1), ran(32 * 32 * 32 * 9, 9, 1),]
     );
     let snapped = &found[2].1;
     assert!(snapped.sum().is_some(), "world 3 starts from a snapshot");
@@ -572,7 +581,7 @@ mod served {
     use grit::serve3::{Options, Server};
     use grit::wire::{Json, written};
 
-    use super::{MAIN_STATES, MIB, copied_fixture, cost, pure_costs, scratch};
+    use super::{MAIN_STATES, MIB, copied_fixture, cost, pure_costs, ran, scratch};
 
     use super::common;
 
@@ -763,7 +772,7 @@ mod served {
         call(&mut server, "grit_world_write", &cells(world, 40, 16, 1));
         assert_eq!(server.tally(Priced::Write), cost(Priced::Write, 40, 2));
         step(&mut server, world, 100);
-        assert_eq!(server.tally(Priced::Frame), cost(Priced::Frame, 409_600, 2));
+        assert_eq!(server.tally(Priced::Frame), ran(409_600, 100, 2));
         let fork = int_at(
             &call(
                 &mut server,
@@ -806,7 +815,7 @@ mod served {
         let bricked_units = (u64::from(first) * 30 + u64::from(second) * 9) * per;
         assert_eq!(
             server.tally(Priced::Frame),
-            cost(Priced::Frame, 409_600 + bricked_units, 4)
+            ran(409_600 + bricked_units, 100 + 30 + 9, 4)
         );
         let law_world = lawful(&mut server);
         params(&mut server, law_world);
@@ -815,7 +824,7 @@ mod served {
         back(&mut server, law_world, 3);
         assert_eq!(
             server.tally(Priced::Frame),
-            cost(Priced::Frame, 409_600 + bricked_units + 512 * 9, 6)
+            ran(409_600 + bricked_units + 512 * 9, 100 + 30 + 9 + 6 + 3, 6)
         );
         assert_eq!(server.tally(Priced::Snapshot), Cost::none(Priced::Snapshot));
         assert_eq!(server.tally(Priced::Replay), Cost::none(Priced::Replay));

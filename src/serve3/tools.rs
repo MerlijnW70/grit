@@ -648,7 +648,16 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     };
     let took = server.since(began);
     server.book.rates.measure(Work::build(sparse), bytes, took);
-    server.sampled(&Key::Build { sparse }, (bytes, 0, 1), took, None);
+    server.sampled(
+        &Key::Build { sparse },
+        Cost {
+            units: bytes,
+            submits: 1,
+            ..Cost::none(Priced::Build)
+        },
+        took,
+        None,
+    );
     server.priced(build_cost(bytes));
     let id = server.number()?;
     let pace = first_pace(&world);
@@ -749,7 +758,11 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             .measure(Work::write(sparse), 16 * chunk as u64, took);
         server.sampled(
             &Key::Write { sparse },
-            (u64::try_from(chunk).unwrap_or(u64::MAX), 0, 1),
+            Cost {
+                units: u64::try_from(chunk).unwrap_or(u64::MAX),
+                submits: 1,
+                ..Cost::none(Priced::Write)
+            },
             took,
             None,
         );
@@ -815,9 +828,9 @@ const AIM_WRITE: Duration = Duration::from_millis(budget::SUBMIT_MOST_MS / 2);
 #[must_use]
 pub const fn build_cost(bytes: u64) -> Cost {
     Cost {
-        kind: Priced::Build,
         units: bytes,
         submits: 1,
+        ..Cost::none(Priced::Build)
     }
 }
 
@@ -829,9 +842,9 @@ pub fn write_cost(cells: usize, sparse: bool) -> Cost {
         cells.div_ceil(journal::WRITE_CHUNK)
     };
     Cost {
-        kind: Priced::Write,
         units: u64::try_from(cells).unwrap_or(u64::MAX),
         submits: u32::try_from(chunks).unwrap_or(u32::MAX),
+        ..Cost::none(Priced::Write)
     }
 }
 
@@ -896,6 +909,7 @@ pub const fn frames_cost(cells: u64, frames: u32) -> Cost {
     Cost {
         kind: Priced::Frame,
         units: cells.saturating_mul(frames as u64),
+        frames,
         submits: frames.div_ceil(BATCH_MOST),
     }
 }
@@ -1059,7 +1073,12 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if done > 0 && failure.is_none() && !fallback {
         server.sampled(
             &key,
-            (cells.saturating_mul(u64::from(done)), done, batch),
+            Cost {
+                units: cells.saturating_mul(u64::from(done)),
+                frames: done,
+                submits: batch,
+                ..Cost::none(Priced::Frame)
+            },
             ran,
             sound.taken(),
         );
