@@ -985,40 +985,6 @@ const fn ident_start(one: char) -> bool {
     one.is_ascii_alphabetic() || one == '_'
 }
 
-const fn ident_part(one: char) -> bool {
-    one.is_ascii_alphanumeric() || one == '_'
-}
-
-fn quoted(chars: &[char], mut at: usize, line: &mut usize) -> usize {
-    let mut hashes = 0;
-    let raw = chars.get(at) == Some(&'r');
-    if raw {
-        at += 1;
-        while chars.get(at) == Some(&'#') {
-            hashes += 1;
-            at += 1;
-        }
-    }
-    at += 1;
-    while let Some(&one) = chars.get(at) {
-        if one == '\n' {
-            *line += 1;
-        }
-        if !raw && one == '\\' {
-            if chars.get(at + 1) == Some(&'\n') {
-                *line += 1;
-            }
-            at += 2;
-            continue;
-        }
-        if one == '"' && (0..hashes).all(|more| chars.get(at + 1 + more) == Some(&'#')) {
-            return at + 1 + hashes;
-        }
-        at += 1;
-    }
-    at
-}
-
 fn token(text: &str, line: usize) -> Token {
     Token {
         text: text.to_owned(),
@@ -1026,116 +992,95 @@ fn token(text: &str, line: usize) -> Token {
     }
 }
 
-fn lexed(source: &str) -> Vec<Token> {
-    let chars: Vec<char> = source.chars().collect();
-    let mut found = Vec::new();
-    let mut line = 1;
+fn literal_kind(text: &str) -> &'static str {
+    let quoted = ["\"", "r\"", "r#", "b\"", "br", "c\"", "cr"]
+        .iter()
+        .any(|lead| text.starts_with(lead));
+    if quoted {
+        "\"\""
+    } else if text.starts_with('\'') || text.starts_with("b'") {
+        "''"
+    } else {
+        "0"
+    }
+}
+
+fn documented(group: &proc_macro2::Group) -> bool {
+    let inside: Vec<proc_macro2::TokenTree> = group.stream().into_iter().collect();
+    group.delimiter() == proc_macro2::Delimiter::Bracket
+        && matches!(
+            inside.as_slice(),
+            [
+                proc_macro2::TokenTree::Ident(name),
+                proc_macro2::TokenTree::Punct(equals),
+                proc_macro2::TokenTree::Literal(_),
+            ] if name == "doc" && equals.as_char() == '='
+        )
+}
+
+fn flattened(stream: proc_macro2::TokenStream, found: &mut Vec<Token>) {
+    use proc_macro2::{Delimiter, Spacing, TokenTree};
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
     let mut at = 0;
-    while let Some(&one) = chars.get(at) {
-        let next = chars.get(at + 1).copied();
-        if one == '\n' {
-            line += 1;
-            at += 1;
-        } else if one.is_whitespace() {
-            at += 1;
-        } else if one == '/' && next == Some('/') {
-            while chars.get(at).is_some_and(|held| *held != '\n') {
-                at += 1;
-            }
-        } else if one == '/' && next == Some('*') {
-            let mut depth = 0_usize;
-            while let Some(&held) = chars.get(at) {
-                let after = chars.get(at + 1).copied();
-                if held == '/' && after == Some('*') {
-                    depth += 1;
-                    at += 2;
-                } else if held == '*' && after == Some('/') {
-                    depth -= 1;
-                    at += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    if held == '\n' {
-                        line += 1;
-                    }
-                    at += 1;
+    while let Some(tree) = trees.get(at) {
+        let line = tree.span().start().line;
+        match tree {
+            TokenTree::Group(group) if documented(group) => {
+                if found.last().is_some_and(|one| one.text == "!") {
+                    found.pop();
+                }
+                if found.last().is_some_and(|one| one.text == "#") {
+                    found.pop();
                 }
             }
-        } else if one == '"' {
-            let from = line;
-            at = quoted(&chars, at, &mut line);
-            found.push(token("\"\"", from));
-        } else if one == '\'' {
-            let close = if next == Some('\\') {
-                (at + 2..chars.len()).find(|end| chars.get(*end) == Some(&'\''))
-            } else if chars.get(at + 2) == Some(&'\'') {
-                Some(at + 2)
-            } else {
-                None
-            };
-            if let Some(end) = close {
-                at = end + 1;
-                found.push(token("''", line));
-            } else {
-                found.push(token("'", line));
-                at += 1;
-            }
-        } else if ident_start(one) {
-            let begin = at;
-            while chars.get(at).copied().is_some_and(ident_part) {
-                at += 1;
-            }
-            let word: String = chars.get(begin..at).unwrap().iter().collect();
-            let after = chars.get(at).copied();
-            let prefix = matches!(word.as_str(), "r" | "b" | "br" | "c" | "cr");
-            let raw = word.ends_with('r');
-            let raw_string = raw
-                && after == Some('#')
-                && (at..chars.len())
-                    .find(|end| chars.get(*end) != Some(&'#'))
-                    .is_some_and(|end| chars.get(end) == Some(&'"'));
-            if prefix && (after == Some('"') || raw_string) {
-                let from = line;
-                at = quoted(&chars, if raw { at - 1 } else { at }, &mut line);
-                found.push(token("\"\"", from));
-            } else if word == "b" && after == Some('\'') {
-                let end = (at + 2..chars.len())
-                    .find(|end| chars.get(*end) == Some(&'\'') && chars.get(end - 1) != Some(&'\\'))
-                    .unwrap_or(chars.len());
-                at = end + 1;
-                found.push(token("''", line));
-            } else if word == "r" && after == Some('#') {
-                at += 1;
-                let begin = at;
-                while chars.get(at).copied().is_some_and(ident_part) {
-                    at += 1;
+            TokenTree::Group(group) => {
+                let (open, close) = match group.delimiter() {
+                    Delimiter::Parenthesis => ("(", ")"),
+                    Delimiter::Brace => ("{", "}"),
+                    Delimiter::Bracket => ("[", "]"),
+                    Delimiter::None => ("", ""),
+                };
+                if !open.is_empty() {
+                    found.push(token(open, group.span_open().start().line));
                 }
-                let name: String = chars.get(begin..at).unwrap().iter().collect();
-                found.push(token(&name, line));
-            } else {
-                found.push(Token { text: word, line });
+                flattened(group.stream(), found);
+                if !close.is_empty() {
+                    found.push(token(close, group.span_close().start().line));
+                }
             }
-        } else if one.is_ascii_digit() {
-            while chars.get(at).copied().is_some_and(|held| {
-                ident_part(held)
-                    || (held == '.' && chars.get(at + 1).is_some_and(char::is_ascii_digit))
-            }) {
-                at += 1;
+            TokenTree::Ident(ident) => {
+                let text = ident.to_string();
+                found.push(token(text.strip_prefix("r#").unwrap_or(&text), line));
             }
-            found.push(token("0", line));
-        } else {
-            let pair: String = [one, next.unwrap_or(' ')].iter().collect();
-            let joined = matches!(pair.as_str(), "::" | "->" | "=>");
-            if joined {
-                found.push(token(&pair, line));
-                at += 2;
-            } else {
+            TokenTree::Punct(punct) => {
+                let one = punct.as_char();
+                let next = match trees.get(at + 1) {
+                    Some(TokenTree::Punct(after)) => Some(after.as_char()),
+                    _ => None,
+                };
+                let joined = punct.spacing() == Spacing::Joint
+                    && matches!((one, next), (':', Some(':')) | ('-' | '=', Some('>')));
+                if joined {
+                    found.push(token(&format!("{one}{}", next.unwrap_or(' ')), line));
+                    at += 2;
+                    continue;
+                }
                 found.push(token(&one.to_string(), line));
-                at += 1;
+            }
+            TokenTree::Literal(literal) => {
+                found.push(token(literal_kind(&literal.to_string()), line));
             }
         }
+        at += 1;
     }
+}
+
+fn lexed(source: &str) -> Vec<Token> {
+    let stream: proc_macro2::TokenStream = source
+        .parse()
+        .unwrap_or_else(|error| panic!("not Rust tokens: {error:?}"));
+    let mut found = Vec::new();
+    flattened(stream, &mut found);
     found
 }
 
@@ -1206,7 +1151,9 @@ fn placed(tokens: &[Token]) -> Vec<Place> {
             {
                 pending = Some((true, implemented(tokens, at)));
             }
-            "fn" => pending = Some((false, word_at(tokens, at + 1).to_owned())),
+            "fn" if identifier(word_at(tokens, at + 1)) => {
+                pending = Some((false, word_at(tokens, at + 1).to_owned()));
+            }
             "use" => importing = true,
             "(" | "[" => nest += 1,
             ")" | "]" => nest = nest.saturating_sub(1),
@@ -1294,7 +1241,7 @@ const MADE: [(&str, &str); 6] = [
     ("Exec", "spawn"),
 ];
 
-fn led(tokens: &[Token], at: usize) -> &str {
+fn lead_at(tokens: &[Token], at: usize) -> Option<usize> {
     let mut from = at;
     while from >= 2 && word_at(tokens, from - 1) == "::" && identifier(word_at(tokens, from - 2)) {
         from -= 2;
@@ -1302,7 +1249,98 @@ fn led(tokens: &[Token], at: usize) -> &str {
     if from >= 1 && word_at(tokens, from - 1) == "::" {
         from -= 1;
     }
-    from.checked_sub(1).map_or("", |one| word_at(tokens, one))
+    from.checked_sub(1)
+}
+
+fn led(tokens: &[Token], at: usize) -> &str {
+    lead_at(tokens, at).map_or("", |one| word_at(tokens, one))
+}
+
+fn constructed(tokens: &[Token], at: usize) -> &str {
+    let mut walk = at + 1;
+    if word_at(tokens, walk) == "::" && word_at(tokens, walk + 1) == "<" {
+        walk = closing(tokens, walk + 1) + 1;
+    } else if word_at(tokens, walk) == "<" {
+        walk = closing(tokens, walk) + 1;
+    }
+    if let Some(open) = lead_at(tokens, at).filter(|one| word_at(tokens, *one) == "<") {
+        let shut = closing(tokens, open);
+        if shut >= walk {
+            walk = shut + 1;
+        }
+    }
+    if word_at(tokens, walk) == "::" {
+        word_at(tokens, walk + 1)
+    } else {
+        ""
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Role {
+    signature: bool,
+    field: bool,
+    aliased: bool,
+}
+
+fn ended(tokens: &[Token], from: usize, stops: &[&str]) -> usize {
+    let mut depth = 0_i32;
+    let mut at = from;
+    while at < tokens.len() {
+        let word = word_at(tokens, at);
+        match word {
+            "(" | "[" => depth += 1,
+            ")" | "]" => depth -= 1,
+            _ if depth <= 0 && stops.contains(&word) => return at,
+            _ => {}
+        }
+        at += 1;
+    }
+    tokens.len()
+}
+
+fn roles(tokens: &[Token]) -> Vec<Role> {
+    let mut found = vec![Role::default(); tokens.len()];
+    for (at, one) in tokens.iter().enumerate() {
+        let named = identifier(word_at(tokens, at + 1));
+        let before = at.checked_sub(1).map_or("", |back| word_at(tokens, back));
+        if matches!(before, "::" | ".") || !named {
+            continue;
+        }
+        let after_name = if word_at(tokens, at + 2) == "<" {
+            closing(tokens, at + 2) + 1
+        } else {
+            at + 2
+        };
+        match one.text.as_str() {
+            "fn" => {
+                let end = ended(tokens, at, &["{", ";"]);
+                for role in found.get_mut(at..end).into_iter().flatten() {
+                    role.signature = true;
+                }
+            }
+            "struct" | "enum" | "union" => {
+                let open = ended(tokens, after_name, &["{", "(", ";"]);
+                if matches!(word_at(tokens, open), "{" | "(") {
+                    let shut = closing(tokens, open);
+                    for role in found.get_mut(at..=shut).into_iter().flatten() {
+                        role.field = true;
+                    }
+                }
+            }
+            "type" => {
+                let equals = ended(tokens, after_name, &["=", ";"]);
+                if word_at(tokens, equals) == "=" {
+                    let end = ended(tokens, equals, &[";"]);
+                    for role in found.get_mut(equals..end).into_iter().flatten() {
+                        role.aliased = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 type Defaulted = (usize, String, Vec<String>);
@@ -1416,8 +1454,37 @@ fn braced(tokens: &[Token]) -> Vec<bool> {
     found
 }
 
+fn attribute_start(tokens: &[Token], shut: usize) -> Option<usize> {
+    let mut depth = 0_i32;
+    let mut walk = shut;
+    loop {
+        match word_at(tokens, walk) {
+            "]" => depth += 1,
+            "[" => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            break;
+        }
+        walk = walk.checked_sub(1)?;
+    }
+    walk.checked_sub(1)
+        .filter(|one| word_at(tokens, *one) == "#")
+}
+
 fn field_named(tokens: &[Token], inside: &[bool], at: usize) -> bool {
-    let before = at.checked_sub(1).map_or("", |one| word_at(tokens, one));
+    let mut back = at;
+    while let Some(prior) = back.checked_sub(1) {
+        match word_at(tokens, prior) {
+            "ref" | "mut" => back = prior,
+            "]" => match attribute_start(tokens, prior) {
+                Some(hash) => back = hash,
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    let before = back.checked_sub(1).map_or("", |one| word_at(tokens, one));
     let after = word_at(tokens, at + 1);
     inside.get(at).copied().unwrap_or(false)
         && matches!(before, "{" | ",")
@@ -1429,6 +1496,7 @@ fn kinds_at(
     tokens: &[Token],
     places: &[Place],
     inside: &[bool],
+    roles: &[Role],
     at: usize,
     carriers: &[String],
     server: bool,
@@ -1452,8 +1520,15 @@ fn kinds_at(
     if word == "real" && before != "." && !defined {
         found.push("real".to_owned());
     }
+    let role = roles.get(at).copied().unwrap_or_default();
+    let in_body = !place.function.is_empty();
+    let reached = if matches!(word, "Guard" | "Book" | "Server" | "Exec") {
+        constructed(tokens, at)
+    } else {
+        ""
+    };
     for (kind, made) in MADE {
-        if word == kind && after == "::" && then == made {
+        if word == kind && reached == made {
             found.push(format!("{kind}::{made}"));
         }
     }
@@ -1466,13 +1541,18 @@ fn kinds_at(
         if lead == "<" && (after == "as" || (after == ">" && then == "::")) {
             found.push(format!("<{word}>"));
         }
-        if (place.importing && after == "as") || (lead == "=" && after == ";") {
+        if (place.importing && after == "as") || (lead == "=" && after == ";") || role.aliased {
             found.push(format!("{word} renamed"));
+        }
+        if word == "Guard" && in_body && !place.importing && found.is_empty() {
+            found.push("Guard".to_owned());
         }
     }
     if word == "Instant"
         && !place.importing
-        && (after == "::"
+        && (in_body
+            || !(role.signature || role.field)
+            || after == "::"
             || after == "as"
             || after == ";"
             || lead == "="
@@ -1498,6 +1578,7 @@ fn kinds_at(
         && !(after == "::" && then != "<")
         && (matches!(before, "." | "::")
             || after == "("
+            || place.importing
             || (!place.function.is_empty() && field_named(tokens, inside, at)))
     {
         found.push(format!("carrier {word}"));
@@ -1536,30 +1617,6 @@ fn scanned() -> Vec<(String, String)> {
     held
 }
 
-fn holds_time(kind: &[Token], timed: &std::collections::BTreeSet<String>) -> bool {
-    kind.iter()
-        .any(|one| matches!(one.text.as_str(), "Duration" | "Instant") || timed.contains(&one.text))
-}
-
-fn visible(tokens: &[Token], at: usize) -> bool {
-    let mut back = at;
-    while back > 0 {
-        back -= 1;
-        match word_at(tokens, back) {
-            "pub" => return true,
-            "const" | "unsafe" | "async" | "extern" | "\"\"" => {}
-            ")" => {
-                while back > 0 && word_at(tokens, back) != "(" {
-                    back -= 1;
-                }
-                return back > 0 && word_at(tokens, back - 1) == "pub";
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
 fn closing(tokens: &[Token], open: usize) -> usize {
     let (left, right) = match word_at(tokens, open) {
         "(" => ("(", ")"),
@@ -1581,51 +1638,6 @@ fn closing(tokens: &[Token], open: usize) -> usize {
     tokens.len()
 }
 
-type Field = (String, bool, Vec<Token>);
-
-fn fields(tokens: &[Token], open: usize, public: bool) -> Vec<Field> {
-    let end = closing(tokens, open);
-    let mut found = Vec::new();
-    let mut at = open + 1;
-    while at < end {
-        if word_at(tokens, at) == "#" {
-            at = closing(tokens, at + 1) + 1;
-            continue;
-        }
-        let mut shown = public;
-        if word_at(tokens, at) == "pub" {
-            shown = true;
-            at += 1;
-            if word_at(tokens, at) == "(" {
-                at = closing(tokens, at) + 1;
-            }
-        }
-        let name = word_at(tokens, at).to_owned();
-        if word_at(tokens, at + 1) != ":" {
-            at += 1;
-            continue;
-        }
-        let mut walk = at + 2;
-        let mut depth = 0_i32;
-        let mut kind = Vec::new();
-        while walk < end {
-            match word_at(tokens, walk) {
-                "<" | "(" | "[" => depth += 1,
-                ">" | ")" | "]" => depth -= 1,
-                "," if depth == 0 => break,
-                _ => {}
-            }
-            if let Some(one) = tokens.get(walk) {
-                kind.push(one.clone());
-            }
-            walk += 1;
-        }
-        found.push((name, shown, kind));
-        at = walk + 1;
-    }
-    found
-}
-
 fn opened_after(tokens: &[Token], at: usize) -> usize {
     let open = at + 2;
     if word_at(tokens, open) == "<" {
@@ -1635,138 +1647,270 @@ fn opened_after(tokens: &[Token], at: usize) -> usize {
     }
 }
 
-fn returned(tokens: &[Token], from: usize, owner: &str) -> Vec<Token> {
-    let mut kind = Vec::new();
-    let mut walk = from;
-    let mut depth = 0_i32;
-    while let Some(one) = tokens.get(walk) {
-        match one.text.as_str() {
-            "{" | ";" | "where" if depth == 0 => break,
-            "<" | "(" | "[" => depth += 1,
-            ">" | ")" | "]" => depth -= 1,
-            _ => {}
-        }
-        let mut one = one.clone();
-        if one.text == "Self" {
-            owner.clone_into(&mut one.text);
-        }
-        kind.push(one);
-        walk += 1;
-    }
-    kind
+type Names = Vec<String>;
+
+#[derive(Debug, Default)]
+struct Collected {
+    names: Names,
+    writes: bool,
 }
 
-type Shapes = (Vec<(String, Vec<Field>)>, Vec<(String, Vec<Token>)>);
+impl<'ast> syn::visit::Visit<'ast> for Collected {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        let text = ident.to_string();
+        self.names
+            .push(text.strip_prefix("r#").unwrap_or(&text).to_owned());
+    }
 
-fn tuple_fields(tokens: &[Token], open: usize) -> Vec<Field> {
-    let end = closing(tokens, open);
-    let mut found = Vec::new();
-    let mut at = open + 1;
-    while at < end {
-        if word_at(tokens, at) == "#" {
-            at = closing(tokens, at + 1) + 1;
-            continue;
+    fn visit_type_reference(&mut self, node: &'ast syn::TypeReference) {
+        if node.mutability.is_some() {
+            self.writes = true;
         }
-        let mut shown = false;
-        if word_at(tokens, at) == "pub" {
-            shown = true;
-            at += 1;
-            if word_at(tokens, at) == "(" {
-                at = closing(tokens, at) + 1;
-            }
+        syn::visit::visit_type_reference(self, node);
+    }
+
+    fn visit_type_bare_fn(&mut self, node: &'ast syn::TypeBareFn) {
+        self.writes = true;
+        syn::visit::visit_type_bare_fn(self, node);
+    }
+}
+
+const WRITABLE: [&str; 12] = [
+    "Cell",
+    "RefCell",
+    "UnsafeCell",
+    "OnceCell",
+    "OnceLock",
+    "Mutex",
+    "RwLock",
+    "Sender",
+    "SyncSender",
+    "Fn",
+    "FnMut",
+    "FnOnce",
+];
+
+fn collected(kind: &syn::Type, owner: &str) -> Collected {
+    let mut found = Collected::default();
+    syn::visit::Visit::visit_type(&mut found, kind);
+    for name in &mut found.names {
+        if name == "Self" && !owner.is_empty() {
+            owner.clone_into(name);
         }
-        let mut depth = 0_i32;
-        let mut kind = Vec::new();
-        while at < end {
-            match word_at(tokens, at) {
-                "<" | "(" | "[" => depth += 1,
-                ">" | ")" | "]" => depth -= 1,
-                "," if depth == 0 => break,
-                _ => {}
-            }
-            if let Some(one) = tokens.get(at) {
-                kind.push(one.clone());
-            }
-            at += 1;
-        }
-        found.push((found.len().to_string(), shown, kind));
-        at += 1;
+    }
+    if found
+        .names
+        .iter()
+        .any(|name| WRITABLE.contains(&name.as_str()))
+    {
+        found.writes = true;
     }
     found
 }
 
-fn shapes(text: &str) -> Shapes {
-    let tokens = lexed(text);
-    let places = placed(&tokens);
-    let mut structs: Vec<(String, Vec<Field>)> = Vec::new();
-    let mut held: Vec<(String, Vec<Token>)> = Vec::new();
-    for (at, one) in tokens.iter().enumerate() {
-        let open = opened_after(&tokens, at);
-        match one.text.as_str() {
-            "struct" if word_at(&tokens, open) == "{" => {
-                structs.push((
-                    word_at(&tokens, at + 1).to_owned(),
-                    fields(&tokens, open, false),
-                ));
+const fn shown(seen: &syn::Visibility) -> bool {
+    !matches!(seen, syn::Visibility::Inherited)
+}
+
+type Field = (String, bool, Names);
+
+#[derive(Debug, Clone, Default)]
+struct Shapes {
+    carrier: bool,
+    structs: Vec<(String, Vec<Field>)>,
+    enums: Vec<(String, Vec<Names>)>,
+    aliases: Vec<(String, Names)>,
+    held: Vec<(String, Names)>,
+}
+
+fn owner_of(kind: &syn::Type) -> String {
+    match kind {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn signed(shape: &mut Shapes, signature: &syn::Signature, owner: &str) {
+    let name = signature.ident.to_string();
+    if let syn::ReturnType::Type(_, kind) = &signature.output {
+        shape
+            .held
+            .push((name.clone(), collected(kind, owner).names));
+    }
+    for input in &signature.inputs {
+        if let syn::FnArg::Typed(typed) = input {
+            let found = collected(&typed.ty, owner);
+            if found.writes {
+                shape.held.push((name.clone(), found.names));
             }
-            "struct" if word_at(&tokens, open) == "(" => {
-                let name = word_at(&tokens, at + 1).to_owned();
-                let inside = tuple_fields(&tokens, open);
-                for (_, shown, kind) in &inside {
-                    if *shown {
-                        held.push((name.clone(), kind.clone()));
-                    }
-                }
-                structs.push((name, inside));
+        }
+    }
+}
+
+fn renamed(tree: &syn::UseTree, shape: &mut Shapes) {
+    match tree {
+        syn::UseTree::Path(path) => renamed(&path.tree, shape),
+        syn::UseTree::Rename(rename) => shape
+            .aliases
+            .push((rename.rename.to_string(), vec![rename.ident.to_string()])),
+        syn::UseTree::Group(group) => {
+            for one in &group.items {
+                renamed(one, shape);
             }
-            "enum" if word_at(&tokens, open) == "{" && visible(&tokens, at) => {
-                let end = closing(&tokens, open);
-                let mut walk = open + 1;
-                while walk < end {
-                    match word_at(&tokens, walk) {
-                        "{" => {
-                            for (name, _, kind) in fields(&tokens, walk, true) {
-                                held.push((name, kind));
-                            }
-                            walk = closing(&tokens, walk);
+        }
+        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+    }
+}
+
+fn structured(shape: &mut Shapes, item: &syn::ItemStruct) {
+    let name = item.ident.to_string();
+    let mut inside = Vec::new();
+    for (index, field) in item.fields.iter().enumerate() {
+        let names = collected(&field.ty, &name).names;
+        let visible = shown(&field.vis);
+        if let Some(ident) = &field.ident {
+            inside.push((ident.to_string(), visible, names));
+        } else {
+            if visible {
+                shape.held.push((name.clone(), names.clone()));
+            }
+            inside.push((index.to_string(), visible, names));
+        }
+    }
+    shape.structs.push((name, inside));
+}
+
+fn enumerated(shape: &mut Shapes, item: &syn::ItemEnum) {
+    let name = item.ident.to_string();
+    let mut parts = Vec::new();
+    for variant in &item.variants {
+        for field in &variant.fields {
+            let names = collected(&field.ty, &name).names;
+            if shown(&item.vis) {
+                let carrier = field
+                    .ident
+                    .as_ref()
+                    .map_or_else(|| variant.ident.to_string(), ToString::to_string);
+                shape.held.push((carrier, names.clone()));
+            }
+            parts.push(names);
+        }
+    }
+    shape.enums.push((name, parts));
+}
+
+fn itemised(list: &[syn::Item], shape: &mut Shapes) {
+    for item in list {
+        match item {
+            syn::Item::Fn(one) if shown(&one.vis) => signed(shape, &one.sig, ""),
+            syn::Item::Impl(one) => {
+                let owner = owner_of(&one.self_ty);
+                for inner in &one.items {
+                    if let syn::ImplItem::Fn(method) = inner {
+                        if one.trait_.is_some() || shown(&method.vis) {
+                            signed(shape, &method.sig, &owner);
                         }
-                        "(" => walk = closing(&tokens, walk),
-                        _ => {}
                     }
-                    walk += 1;
                 }
             }
-            "fn" if visible(&tokens, at) => {
-                let shut = closing(&tokens, open);
-                if word_at(&tokens, shut + 1) == "->" {
-                    let owner = places
-                        .get(at)
-                        .map(|place| place.owner.as_str())
-                        .unwrap_or("");
-                    held.push((
-                        word_at(&tokens, at + 1).to_owned(),
-                        returned(&tokens, shut + 2, owner),
-                    ));
+            syn::Item::Trait(one) if shown(&one.vis) => {
+                for inner in &one.items {
+                    if let syn::TraitItem::Fn(method) = inner {
+                        signed(shape, &method.sig, "");
+                    }
+                }
+            }
+            syn::Item::Static(one) if shown(&one.vis) => {
+                shape
+                    .held
+                    .push((one.ident.to_string(), collected(&one.ty, "").names));
+            }
+            syn::Item::Struct(one) => structured(shape, one),
+            syn::Item::Enum(one) => enumerated(shape, one),
+            syn::Item::Type(one) => {
+                shape
+                    .aliases
+                    .push((one.ident.to_string(), collected(&one.ty, "").names));
+            }
+            syn::Item::Use(one) => renamed(&one.tree, shape),
+            syn::Item::Mod(one) => {
+                if let Some((_, inner)) = &one.content {
+                    itemised(inner, shape);
                 }
             }
             _ => {}
         }
     }
-    (structs, held)
 }
 
-fn timed_types(all: &[Shapes]) -> std::collections::BTreeSet<String> {
-    let mut timed = std::collections::BTreeSet::new();
+fn shapes(text: &str, carrier: bool) -> Shapes {
+    let file =
+        syn::parse_file(text).unwrap_or_else(|error| panic!("not a Rust source file: {error}"));
+    let mut shape = Shapes {
+        carrier,
+        ..Shapes::default()
+    };
+    itemised(&file.items, &mut shape);
+    shape
+}
+
+type Timed = std::collections::BTreeSet<(usize, String)>;
+
+fn defined(shape: &Shapes, name: &str) -> bool {
+    shape.structs.iter().any(|(one, _)| one == name)
+        || shape.enums.iter().any(|(one, _)| one == name)
+        || shape.aliases.iter().any(|(one, _)| one == name)
+}
+
+fn holds_time(names: &[String], file: usize, all: &[Shapes], timed: &Timed) -> bool {
+    let local = all.get(file);
+    names.iter().any(|one| {
+        if matches!(one.as_str(), "Duration" | "Instant") {
+            return true;
+        }
+        if local.is_some_and(|shape| defined(shape, one)) {
+            return timed.contains(&(file, one.clone()));
+        }
+        timed.iter().any(|(_, name)| name == one)
+    })
+}
+
+fn timed_types(all: &[Shapes]) -> Timed {
+    let mut timed = Timed::new();
     loop {
         let before = timed.len();
-        for (structs, _) in all {
-            for (name, inside) in structs {
+        for (file, shape) in all.iter().enumerate() {
+            let mut found = Vec::new();
+            for (name, inside) in &shape.structs {
                 if inside
                     .iter()
-                    .any(|(_, shown, kind)| *shown && holds_time(kind, &timed))
+                    .any(|(_, visible, names)| *visible && holds_time(names, file, all, &timed))
                 {
-                    timed.insert(name.clone());
+                    found.push(name.clone());
                 }
+            }
+            for (name, names) in &shape.aliases {
+                if holds_time(names, file, all, &timed) {
+                    found.push(name.clone());
+                }
+            }
+            if !shape.carrier {
+                for (name, parts) in &shape.enums {
+                    if parts
+                        .iter()
+                        .any(|names| holds_time(names, file, all, &timed))
+                    {
+                        found.push(name.clone());
+                    }
+                }
+            }
+            for name in found {
+                timed.insert((file, name));
             }
         }
         if timed.len() == before {
@@ -1775,16 +1919,23 @@ fn timed_types(all: &[Shapes]) -> std::collections::BTreeSet<String> {
     }
 }
 
-fn carried(shaped: &Shapes, timed: &std::collections::BTreeSet<String>) -> Vec<String> {
-    let (structs, held) = shaped;
-    let mut found: Vec<String> = structs
+fn carried(file: usize, all: &[Shapes], timed: &Timed) -> Vec<String> {
+    let Some(shape) = all.get(file) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = shape
+        .structs
         .iter()
         .flat_map(|(_, inside)| inside.iter())
-        .filter(|(name, shown, kind)| *shown && identifier(name) && holds_time(kind, timed))
+        .filter(|(name, visible, names)| {
+            *visible && identifier(name) && holds_time(names, file, all, timed)
+        })
         .map(|(name, _, _)| name.clone())
         .chain(
-            held.iter()
-                .filter(|(_, kind)| holds_time(kind, timed))
+            shape
+                .held
+                .iter()
+                .filter(|(_, names)| holds_time(names, file, all, timed))
                 .map(|(name, _)| name.clone()),
         )
         .collect();
@@ -1798,12 +1949,15 @@ const CARRIERS: &[(&str, &str)] = &[
     ("src/calibrate.rs", "scripted_sound"),
     ("src/calibrate/table.rs", "predict"),
     ("src/calibrate/table.rs", "time"),
+    ("src/calibrate/take.rs", "agreed"),
     ("src/calibrate/take.rs", "first"),
     ("src/calibrate/take.rs", "long"),
     ("src/calibrate/take.rs", "made"),
     ("src/calibrate/take.rs", "measured"),
+    ("src/calibrate/take.rs", "rates"),
     ("src/calibrate/take.rs", "short"),
     ("src/calibrate/take.rs", "sizes"),
+    ("src/calibrate/take.rs", "solved"),
     ("src/calibrate/take.rs", "timed"),
     ("src/calibrate/take.rs", "warm"),
     ("src/host.rs", "after"),
@@ -1951,6 +2105,10 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/branch.rs", "carrier made", "opened_kept", 3),
     ("src/serve3/branch.rs", "carrier made", "restored", 1),
     ("src/serve3/branch.rs", "carrier made", "shown_made", 1),
+    ("src/serve3/branch.rs", "carrier rates", "forked", 1),
+    ("src/serve3/branch.rs", "carrier rates", "opened_file", 2),
+    ("src/serve3/branch.rs", "carrier rates", "restored", 1),
+    ("src/serve3/branch.rs", "carrier rates", "saved", 1),
     ("src/serve3/budget.rs", "Guard {", "Guard::default", 1),
     (
         "src/serve3/budget.rs",
@@ -2017,6 +2175,8 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/gradient.rs", "carrier listed", "descended", 2),
     ("src/serve3/gradient.rs", "carrier listed", "graded", 1),
     ("src/serve3/gradient.rs", "carrier made", "moved", 1),
+    ("src/serve3/gradient.rs", "carrier rates", "halted", 1),
+    ("src/serve3/gradient.rs", "carrier rates", "walk", 1),
     ("src/serve3/gradient.rs", "carrier time", "walk", 1),
     (
         "src/serve3/journal.rs",
@@ -2091,6 +2251,13 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
         "calibrated",
         1,
     ),
+    ("src/serve3/law_learn.rs", "carrier solved", "ladder", 1),
+    (
+        "src/serve3/law_learn.rs",
+        "carrier solved",
+        "ladder_shown",
+        1,
+    ),
     ("src/serve3/law_learn.rs", "carrier warmed", "calibrated", 1),
     ("src/serve3/learn.rs", "carrier first", "objective_of", 1),
     ("src/serve3/learn.rs", "carrier first", "posed", 2),
@@ -2105,6 +2272,8 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ("src/serve3/learn.rs", "carrier listed", "scored", 1),
     ("src/serve3/learn.rs", "carrier listed", "searched", 2),
     ("src/serve3/learn.rs", "carrier measured", "objective_of", 1),
+    ("src/serve3/learn.rs", "carrier rates", "halted", 1),
+    ("src/serve3/learn.rs", "carrier rates", "run", 1),
     ("src/serve3/learn.rs", "carrier time", "run", 1),
     ("src/serve3/mod.rs", "Book::empty", "Server::new", 1),
     ("src/serve3/mod.rs", "Book::new", "Server::with", 1),
@@ -2147,6 +2316,51 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     ),
     ("src/serve3/mod.rs", "carrier made", "Server::snap_image", 2),
     ("src/serve3/mod.rs", "carrier made", "base_work", 1),
+    ("src/serve3/mod.rs", "carrier rates", "Book::blank", 1),
+    ("src/serve3/mod.rs", "carrier rates", "Book::kept", 1),
+    ("src/serve3/mod.rs", "carrier rates", "Book::landed", 1),
+    (
+        "src/serve3/mod.rs",
+        "carrier rates",
+        "Server::admits_replay",
+        3,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "carrier rates",
+        "Server::build_least",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "carrier rates",
+        "Server::far_overdue",
+        1,
+    ),
+    ("src/serve3/mod.rs", "carrier rates", "Server::fits", 3),
+    ("src/serve3/mod.rs", "carrier rates", "Server::idle_unit", 1),
+    ("src/serve3/mod.rs", "carrier rates", "Server::overdue", 1),
+    ("src/serve3/mod.rs", "carrier rates", "Server::owed", 4),
+    (
+        "src/serve3/mod.rs",
+        "carrier rates",
+        "Server::replayed_world",
+        5,
+    ),
+    ("src/serve3/mod.rs", "carrier rates", "Server::settle", 1),
+    (
+        "src/serve3/mod.rs",
+        "carrier rates",
+        "Server::snap_attempt",
+        1,
+    ),
+    (
+        "src/serve3/mod.rs",
+        "carrier rates",
+        "Server::snap_estimate",
+        1,
+    ),
+    ("src/serve3/mod.rs", "carrier rates", "Server::status", 1),
     (
         "src/serve3/mod.rs",
         "carrier sizes",
@@ -2222,6 +2436,8 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
         "Sound::after",
         1,
     ),
+    ("src/serve3/tools.rs", "carrier rates", "created", 1),
+    ("src/serve3/tools.rs", "carrier rates", "written", 3),
     (
         "src/serve3/tools.rs",
         "carrier scripted_sound",
@@ -2252,7 +2468,7 @@ fn every_carrier_of_a_measured_duration_is_listed() {
     let shaped: Vec<(String, Shapes)> = scanned()
         .into_iter()
         .map(|(relative, text)| {
-            let shape = shapes(&text);
+            let shape = shapes(&text, carrier_file(&relative));
             (relative, shape)
         })
         .collect();
@@ -2260,12 +2476,12 @@ fn every_carrier_of_a_measured_duration_is_listed() {
     let timed = timed_types(&all);
     let mut derived = Vec::new();
     let mut files = 0_usize;
-    for (relative, shape) in &shaped {
+    for (file, (relative, _)) in shaped.iter().enumerate() {
         if !carrier_file(relative) {
             continue;
         }
         files += 1;
-        for name in carried(shape, &timed) {
+        for name in carried(file, &all, &timed) {
             derived.push((relative.clone(), name));
         }
     }
@@ -2307,6 +2523,7 @@ fn the_server_reads_time_only_through_its_clock() {
         let tokens = lexed(&text);
         let places = placed(&tokens);
         let inside = braced(&tokens);
+        let role = roles(&tokens);
         let mut kinds: Vec<(usize, String)> = Vec::new();
         for (at, _, words) in defaulted(&tokens) {
             if let Some(held) = words.iter().find(|word| real.contains(*word)) {
@@ -2314,7 +2531,7 @@ fn the_server_reads_time_only_through_its_clock() {
             }
         }
         for at in 0..tokens.len() {
-            for kind in kinds_at(&tokens, &places, &inside, at, &carriers, server) {
+            for kind in kinds_at(&tokens, &places, &inside, &role, at, &carriers, server) {
                 kinds.push((at, kind));
             }
         }

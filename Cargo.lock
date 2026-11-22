@@ -155,7 +155,9 @@ version = "0.0.0"
 dependencies = [
  "ash",
  "minifb",
+ "proc-macro2",
  "simdr",
+ "syn 2.0.119",
 ]
 
 [[package]]

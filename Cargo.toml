@@ -17,6 +17,8 @@ minifb = { version = "0.28", default-features = false, features = ["x11"], optio
 
 [dev-dependencies]
 ash = "0.38"
+proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
+syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "visit"] }
 
 [features]
 default = ["window"]
