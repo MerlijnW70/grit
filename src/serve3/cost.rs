@@ -62,6 +62,7 @@ impl Priced {
 pub struct Cost {
     pub kind: Priced,
     pub units: u64,
+    pub frames: u32,
     pub submits: u32,
 }
 
@@ -71,6 +72,7 @@ impl Cost {
         Self {
             kind,
             units: 0,
+            frames: 0,
             submits: 0,
         }
     }
@@ -80,6 +82,7 @@ impl Cost {
         Self {
             kind: self.kind,
             units: self.units.saturating_add(other.units),
+            frames: self.frames.saturating_add(other.frames),
             submits: self.submits.saturating_add(other.submits),
         }
     }

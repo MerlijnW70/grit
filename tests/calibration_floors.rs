@@ -14,6 +14,7 @@ mod device {
     use grit::branch::{Made, World};
     use grit::calibrate::take::{FILLER, FRAMES, Measured, Solved, WORLD, measured};
     use grit::calibrate::{self, Key, Sample, faults, times, up_front};
+    use grit::serve3::cost::{Cost, Priced};
 
     use super::common;
 
@@ -134,6 +135,15 @@ mod device {
     impl Point {
         fn bound(&self) -> bool {
             matches!(self.name, "short" | "long")
+        }
+
+        const fn cost(&self) -> Cost {
+            Cost {
+                kind: Priced::Frame,
+                units: self.units,
+                frames: self.frames,
+                submits: 1,
+            }
         }
     }
 
@@ -314,7 +324,7 @@ mod device {
     fn predicted(found: &BTreeMap<Key, Solved>, one: &Point) -> Option<Duration> {
         found
             .get(&one.key)
-            .map(|(rate, _)| rate.predict(one.units, one.frames, 1))
+            .map(|(rate, _)| rate.predict(&one.cost()))
     }
 
     fn report(label: &str, host: &Host, got: &Measured, took: Duration) {
@@ -521,7 +531,7 @@ mod device {
         for (key, (_, samples)) in sparse {
             for sample in samples {
                 assert_eq!(
-                    sample.units,
+                    sample.cost.units,
                     0,
                     "{}: a calibration run held bricks: {sample:?}",
                     key.name()
@@ -753,7 +763,7 @@ mod device {
                 failures.push(format!("{} unknown", one.key.name()));
                 continue;
             };
-            let guess = rate.predict(one.units, one.frames, 1);
+            let guess = rate.predict(&one.cost());
             let high = guess.as_secs_f64() / one.wall.as_secs_f64();
             let low = one.floor.as_secs_f64() / guess.as_secs_f64().max(1e-12);
             eprintln!(

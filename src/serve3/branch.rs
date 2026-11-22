@@ -148,9 +148,8 @@ fn file_refusal(why: &crate::branch::Refused, name: &str) -> Failed {
 
 const fn copied(kind: Priced, bytes: u64) -> Cost {
     Cost {
-        kind,
         units: bytes,
-        submits: 0,
+        ..Cost::none(kind)
     }
 }
 
@@ -560,7 +559,11 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server.book.rates.measure(work, source.bytes, took);
     server.sampled(
         &crate::calibrate::Key::Fork,
-        (source.bytes, 0, 1),
+        Cost {
+            units: source.bytes,
+            submits: 1,
+            ..Cost::none(Priced::Fork)
+        },
         took,
         None,
     );
@@ -634,7 +637,16 @@ fn restored(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     done?;
     let took = server.since(began);
     server.book.rates.measure(work, size, took);
-    server.sampled(&crate::calibrate::Key::Restore, (size, 0, 1), took, None);
+    server.sampled(
+        &crate::calibrate::Key::Restore,
+        Cost {
+            units: size,
+            submits: 1,
+            ..Cost::none(Priced::Restore)
+        },
+        took,
+        None,
+    );
     server.priced(restore_cost(size));
     let taken = server
         .book

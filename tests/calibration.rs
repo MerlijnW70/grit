@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use grit::calibrate::take::{GAP, Pair, Pass, Passes, SIDES, primed};
 use grit::calibrate::{Device, FILE, Key, Moved, Rate, Sample, Table, load};
+use grit::serve3::cost::{Cost, Priced};
 
 fn device_named(name: &str) -> Device {
     Device {
@@ -102,11 +103,18 @@ fn every_key_names_itself_back() {
     }
 }
 
+const fn work(units: u64, frames: u32, submits: u32) -> Cost {
+    Cost {
+        kind: Priced::Frame,
+        units,
+        frames,
+        submits,
+    }
+}
+
 fn framed(frames: u32, time: Duration) -> Sample {
     Sample {
-        units: 262_144 * u64::from(frames),
-        frames,
-        submits: 1,
+        cost: work(262_144 * u64::from(frames), frames, 1),
         time,
     }
 }
@@ -127,23 +135,23 @@ fn two_runs_solve_to_floor_terms() {
     );
     for frames in [1_u32, 2, 8, 32, 64, 1000] {
         assert_eq!(
-            rate.predict(262_144 * u64::from(frames), frames, 1),
+            rate.predict(&work(262_144 * u64::from(frames), frames, 1)),
             at(frames).time,
             "{frames} frames"
         );
     }
     assert_eq!(
-        rate.predict(1 << 40, 1, 1),
+        rate.predict(&work(1 << 40, 1, 1)),
         first,
         "no rate grows with cells"
     );
     assert_eq!(
-        rate.predict(0, 64, 2),
+        rate.predict(&work(0, 64, 2)),
         first * 2 + further * 62,
         "a step of F frames in S submits is S per-submit and F - S per-frame terms"
     );
     assert_eq!(
-        rate.predict(0, 1, 3),
+        rate.predict(&work(0, 1, 3)),
         first * 3,
         "fewer frames than submits"
     );
@@ -155,7 +163,7 @@ fn two_runs_solve_to_floor_terms() {
         (at(1), at(1)),
         (
             Sample {
-                submits: 2,
+                cost: work(262_144, 1, 2),
                 ..at(1)
             },
             at(32),
@@ -163,7 +171,7 @@ fn two_runs_solve_to_floor_terms() {
         (
             at(1),
             Sample {
-                submits: 2,
+                cost: work(262_144 * 32, 32, 2),
                 ..at(32)
             },
         ),
@@ -172,12 +180,24 @@ fn two_runs_solve_to_floor_terms() {
     ] {
         assert_eq!(Rate::framed(&[wrong]), None, "{wrong:?}");
     }
-    let empty = Sample { units: 0, ..at(32) };
+    let empty = Sample {
+        cost: work(0, 32, 1),
+        ..at(32)
+    };
     assert!(
         empty.valid(),
         "a sample of a world with no brick held is valid"
     );
-    assert!(Rate::framed(&[(Sample { units: 0, ..at(1) }, empty)]).is_some());
+    assert!(
+        Rate::framed(&[(
+            Sample {
+                cost: work(0, 1, 1),
+                ..at(1)
+            },
+            empty
+        )])
+        .is_some()
+    );
     assert_eq!(Rate::framed(&[]), None, "no size, no rate");
     assert_eq!(
         Rate::framed(&[(at(1), at(32)), (at(2), at(32))]),
@@ -246,8 +266,8 @@ fn terms_are_the_least_over_world_sizes() {
         (&crossed[..], rate),
     ] {
         for (short, long) in set {
-            assert!(rate.predict(short.units, 1, 1) <= short.time);
-            assert!(rate.predict(long.units, 32, 1) <= long.time);
+            assert!(rate.predict(&short.cost) <= short.time);
+            assert!(rate.predict(&long.cost) <= long.time);
         }
     }
     for one in &sizes {
@@ -395,9 +415,11 @@ fn c2_scripted_samples_never_raise_a_rate() {
     for round in 0..4000 {
         let key = &keys[usize::try_from(rng.below(keys.len() as u64)).unwrap()];
         let sample = Sample {
-            units: rng.below(1 << 30),
-            frames: u32::try_from(rng.below(200)).unwrap(),
-            submits: u32::try_from(rng.below(100)).unwrap(),
+            cost: work(
+                rng.below(1 << 30),
+                u32::try_from(rng.below(200)).unwrap(),
+                u32::try_from(rng.below(100)).unwrap(),
+            ),
             time: Duration::from_nanos(rng.below(10_000_000_000)),
         };
         let before = table.rate(key).unwrap();
@@ -412,7 +434,8 @@ fn c2_scripted_samples_never_raise_a_rate() {
         for units in [0_u64, 1, 1 << 10, 1 << 20, 1 << 30, 1 << 40] {
             for (frames, submits) in [(0_u32, 0_u32), (1, 1), (64, 1), (64, 2), (1000, 16)] {
                 assert!(
-                    after.predict(units, frames, submits) <= before.predict(units, frames, submits)
+                    after.predict(&work(units, frames, submits))
+                        <= before.predict(&work(units, frames, submits))
                 );
             }
         }
@@ -421,7 +444,7 @@ fn c2_scripted_samples_never_raise_a_rate() {
                 lowered += 1;
                 assert!(sample.valid(), "round {round}");
                 assert!(
-                    after.predict(sample.units, sample.frames, sample.submits) <= sample.time,
+                    after.predict(&sample.cost) <= sample.time,
                     "round {round}: lowered to {after:?}, still above {sample:?}"
                 );
             }
@@ -439,7 +462,7 @@ fn c2_scripted_samples_never_raise_a_rate() {
         framed(8, Duration::from_nanos(1)),
         framed(8, Duration::ZERO),
         Sample {
-            units: 0,
+            cost: work(0, 8, 1),
             ..framed(8, Duration::from_millis(3))
         },
     ] {

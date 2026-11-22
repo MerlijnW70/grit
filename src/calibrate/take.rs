@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::branch::{Failed, Made, World};
 use crate::host::Host;
+use crate::serve3::cost::{Cost, Priced};
 
 use super::{By, Key, Rate, Sample, Table, device, faults, times};
 
@@ -85,9 +86,11 @@ impl Pair {
 
     fn least(self, other: Self) -> Self {
         let less = |one: Sample, two: Sample| Sample {
-            units: one.units.max(two.units),
+            cost: Cost {
+                units: one.cost.units.max(two.cost.units),
+                ..one.cost
+            },
             time: one.time.min(two.time),
-            ..one
         };
         Self {
             short: less(self.short, other.short),
@@ -398,9 +401,12 @@ fn point(warm: &mut Warm<'_, '_>, world: &mut World<'_>, frames: u32) -> Result<
         least = Some(least.map_or(time, |held| held.min(time)));
     }
     Ok(Sample {
-        units,
-        frames,
-        submits: 1,
+        cost: Cost {
+            kind: Priced::Frame,
+            units,
+            frames,
+            submits: 1,
+        },
         time: least.unwrap_or_default(),
     })
 }

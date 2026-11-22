@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::serve3::cost::Cost;
 use crate::wire::{self, Json, map, text};
 
 pub const FILE: &str = "calibration.json";
@@ -130,9 +131,7 @@ impl Key {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
-    pub units: u64,
-    pub frames: u32,
-    pub submits: u32,
+    pub cost: Cost,
     pub time: Duration,
 }
 
@@ -152,18 +151,18 @@ pub struct Rate {
 
 impl Rate {
     #[must_use]
-    pub fn nanos(&self, units: u64, frames: u32, submits: u32) -> u128 {
-        let further = u128::from(frames.saturating_sub(submits));
-        u128::from(units)
+    pub fn nanos(&self, cost: &Cost) -> u128 {
+        let further = u128::from(cost.frames.saturating_sub(cost.submits));
+        u128::from(cost.units)
             .saturating_mul(u128::from(self.per_unit_fs))
             .div_euclid(FEMTOS)
-            .saturating_add(u128::from(submits).saturating_mul(u128::from(self.per_submit_ns)))
+            .saturating_add(u128::from(cost.submits).saturating_mul(u128::from(self.per_submit_ns)))
             .saturating_add(further.saturating_mul(u128::from(self.per_frame_ns)))
     }
 
     #[must_use]
-    pub fn predict(&self, units: u64, frames: u32, submits: u32) -> Duration {
-        Duration::from_nanos(u64::try_from(self.nanos(units, frames, submits)).unwrap_or(u64::MAX))
+    pub fn predict(&self, cost: &Cost) -> Duration {
+        Duration::from_nanos(u64::try_from(self.nanos(cost)).unwrap_or(u64::MAX))
     }
 
     #[must_use]
@@ -173,10 +172,10 @@ impl Rate {
         for (short, long) in sizes {
             if !short.valid()
                 || !long.valid()
-                || short.frames != 1
-                || short.submits != 1
-                || long.submits != 1
-                || long.frames <= 1
+                || short.cost.frames != 1
+                || short.cost.submits != 1
+                || long.cost.submits != 1
+                || long.cost.frames <= 1
             {
                 return None;
             }
@@ -185,7 +184,7 @@ impl Rate {
                 .time
                 .as_nanos()
                 .saturating_sub(one)
-                .div_euclid(u128::from(long.frames - 1));
+                .div_euclid(u128::from(long.cost.frames - 1));
             first = Some(first.map_or(one, |held| held.min(one)));
             further = Some(further.map_or(each, |held| held.min(each)));
         }
@@ -202,7 +201,7 @@ impl Rate {
         if !sample.valid() {
             return None;
         }
-        let predicted = self.nanos(sample.units, sample.frames, sample.submits);
+        let predicted = self.nanos(&sample.cost);
         let taken = sample.time.as_nanos();
         if taken >= predicted || predicted == 0 {
             return None;
