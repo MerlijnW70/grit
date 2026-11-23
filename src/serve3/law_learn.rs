@@ -1806,7 +1806,7 @@ fn vote_shown(voted: &Voted, tally: Tally, stencil: Stencil) -> Vec<(&'static st
         })
         .collect();
     let cells = voted
-        .listed
+        .deviations
         .iter()
         .map(|held| {
             Json::List(
