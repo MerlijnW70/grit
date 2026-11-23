@@ -985,8 +985,40 @@ pub fn machined(
     effort: Effort,
     restart: u32,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
-    machined_within(host, held, traces, effort, restart, &mut Never)?
+    machined_within(host, held, traces, effort, restart, &mut Never, &[])?
         .map_err(|held| refused_overlong(&held))
+}
+
+fn planted(
+    held: Machine,
+    traces: &[(Vec<u32>, Vec<u32>)],
+    wide: u32,
+    crowd: Vec<u32>,
+    sown: &[Vec<u32>],
+) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
+    let shape = held.shape()?;
+    let gates = shape.gates as usize;
+    let many = crowd.len() / gates.max(1);
+    let mut crowd = crowd;
+    let mut scores = vec![0_u32; many];
+    for (who, one) in sown.iter().take(many).enumerate() {
+        let chip = Chip::of(shape, one.clone(), held.named())?;
+        let each: Vec<u32> = traces
+            .iter()
+            .map(|(given, wanted)| held.scored(&chip, given, wanted))
+            .collect();
+        let slots = wide as usize * 32;
+        let total: u32 = (0..slots)
+            .map(|slot| each.get(slot % each.len().max(1)).copied().unwrap_or(0))
+            .sum();
+        if let Some(room) = crowd.get_mut(who * gates..(who + 1) * gates) {
+            room.copy_from_slice(one);
+        }
+        if let Some(score) = scores.get_mut(who) {
+            *score = total;
+        }
+    }
+    Ok((crowd, scores))
 }
 
 fn machined_within(
@@ -996,6 +1028,7 @@ fn machined_within(
     effort: Effort,
     restart: u32,
     halt: &mut dyn Halt,
+    sown: &[Vec<u32>],
 ) -> Result<Result<Ran, Overlong>, Box<dyn std::error::Error>> {
     let shape = held.shape()?;
     let width = host.width();
@@ -1035,6 +1068,7 @@ fn machined_within(
     ];
     let mut resident = host.resident(&sizes, &modules)?;
     let (crowd, seeds) = opening(shape, effort.seed, restart, many);
+    let (crowd, scores) = planted(held, traces, wide, crowd, sown)?;
     resident.write(HELD as usize, &crowd)?;
     for binding in [TRIAL, VALUES, SCORE, BEST] {
         let room = sizes.get(binding as usize).copied().unwrap_or(0);
@@ -1055,7 +1089,7 @@ fn machined_within(
     }
     resident.write(HELD as usize, &crowd)?;
     resident.write(SEED as usize, &seeds)?;
-    resident.write(BEST as usize, &vec![0_u32; many as usize])?;
+    resident.write(BEST as usize, &scores)?;
 
     let over = Groups::Fixed(many.div_ceil(width));
     let turning = [over];
@@ -1104,11 +1138,22 @@ pub fn pressed_machine_halted(
     effort: Effort,
     halt: &mut dyn Halt,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
+    pressed_machine_sown(host, held, traces, effort, halt, &[])
+}
+
+pub fn pressed_machine_sown(
+    host: &Host,
+    held: Machine,
+    traces: &[(Vec<u32>, Vec<u32>)],
+    effort: Effort,
+    halt: &mut dyn Halt,
+    sown: &[Vec<u32>],
+) -> Result<Ran, Box<dyn std::error::Error>> {
     let mut effort = effort;
     let mut restart = 0_u32;
     let mut before: Option<Ran> = None;
     loop {
-        let mut ran = match machined_within(host, held, traces, effort, restart, halt)? {
+        let mut ran = match machined_within(host, held, traces, effort, restart, halt, sown)? {
             Ok(ran) => ran,
             Err(over) => return before.ok_or_else(|| refused_overlong(&over)),
         };

@@ -202,6 +202,7 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `rule` | `minimal`, `symmetric`, `totalistic` or `outer`, below |
 | `examples` | inline `{size, input, output}`, with one word list per read and per write, x fastest, at most 4096 words a list; or `{world, output_world, from, to}` for larger ones, up to 2^20 cells over all examples |
 | `gates`, `crowd`, `rounds`, `seed` | the search's effort, as `grit_least` |
+| `start` | under `minimal` and `symmetric`, a circuit to begin from; see [A start](#a-start) |
 
 The server builds every example cell's row, counts the rows, and refuses `conflict` at `$.examples` when one row is seen with two outputs. The refusal's `rows` lists each such row with every output and where it was first seen. The search is `grit_machine`'s, over the seen rows only, so 27-input stencils work. It walks a gate ladder down from `gates` as `grit_least` does and keeps the smallest circuit that answers every seen row.
 
@@ -221,6 +222,38 @@ The answer adds `stencil`, `row_order`, `border` and `runs_as` (how to run it so
 - `crowd_capped` and `gates_capped`: `{asked, used, why}`, present only when the crowd or the ladder's start was lowered.
 
 A call stops on its deadline or cancel only at a brake: before each build that measures the device, before each build of a search and before each device submission of a look. No measured time is compared with the time left. Once the deadline has passed no further submission starts, so an answer can come late by the one submission in flight: a build, or one submission of a look, sized by the device's measured pace. A build's kernel loops over the rows searched, every image of every seen row under `symmetric`, so it does not grow with them. Before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission (where a driver that compiles at its first dispatch, such as lavapipe, compiles), grown with the square of the kernel's words from the closest one measured, stays within half the device's patience (`GRIT_PATIENCE_SECS`). A top rung past that is refused `learn_limit` at `$.gates` with the most gates that fit. That limit is measured on this device at this moment, so it is outside the same-bytes rule below. An answer with `stopped` `ladder` is the same bytes for the same request on the same device; a stop on `budget` or `cancelled` depends on when the deadline passed or the cancel came, and its ladder is a prefix of that answer's ladder. A stopped ladder answers the smallest circuit solved so far, and refuses `budget` or `cancelled` when there is none. A ladder that solves nothing is refused `unsolved` at `$.gates`. The seen rows, and under `symmetric` their images, are refused `learn_limit` before any search when they pass the rows one search kernel holds (WORK / (gates + inputs + outputs) times 32); the expansion stops as soon as it passes them. The expansion checks budget and cancel every 4096 rows. The count of decided rows (at most 2^(inputs - 6) blocks of 64 rows times the inputs plus the law's gates) checks only cancel, every 4096 blocks, and none after a ladder that stopped; otherwise it runs to its end, so a found law is never lost to the deadline. A rung's crowd starts at most at what one device binding holds and doubles up to 65536 or that limit, whichever is less; a lowered crowd is named in `crowd_capped`. Under `symmetric` the ladder starts at most at the gates whose 8 or 48 copies and their ors fit the 600 gates a law always holds (74 for 3x3, 11 for 3x3x3 with one output); a lowered start is named in `gates_capped`. Other refusals: `example`, `outside`, `reversed`, `plane_past`, `halo_written` (a read on a plane a write writes), `bit_shared`, `learn_limit` (inputs past 27, cells past 2^20, rows past one kernel, gates below writes, not even a crowd of 64 fitting one device binding, a top rung whose build the device's evidence puts past half its patience), `no_world`, `chip_too_big` and `no_compute_device`.
+
+### A start
+
+Under `minimal` and `symmetric`, `start` is a circuit to begin from: `inputs`, `outputs`, `state` (0 if left out; a learned law holds none) and `gates`, as `grit_law_from_chip` takes a chip. The `chip` of an earlier `grit_law_learn` answer passes straight in. Under `symmetric` the law is the or of the start's images, so pass the `found` chip of a symmetric answer; its 8 or 48 copies must fit as `gates` does.
+
+Refused before any device work:
+
+| Code | When | `field` |
+|---|---|---|
+| `start_shape` | `inputs` other than the stencil's places times the reads, `outputs` other than the writes, or `state` other than 0; `inputs` and `outputs` in the refusal are the counts wanted | `$.start` |
+| `chip_refused` | a gate reads a source not before it, or its kind is past 15; the gates hold fewer than `outputs` | `$.start.gates[k]` or `$.start.gates` |
+| `learn_limit` | more live gates than a rung takes: 256, or under `symmetric` the gates whose copies and ors fit a law (74 for 3x3 with one write); `limit` names it | `$.start` |
+| `start_rule` | `start` under `totalistic` or `outer` | `$.start` |
+
+Only live gates count: gates no output reads are dropped first. The server answers the start's law (its live gates under `minimal`, the or of their images under `symmetric`) on the host on every seen row and, under `symmetric`, on every image of one. Under `symmetric` "answers every seen row" is about that or of images, not the circuit alone, so a 3-gate circuit (the centre and not all of north, south and east) holds for the X0b pairs: its images together ask for all four.
+
+- A start that answers every seen row is a solved rung before any search. It is the first entry of `ladder`, `{"gates", "solved": true, "start": true}`; the ladder then walks down from its live gates less one. The answer is never larger than the start, and a stop on `budget` or `cancelled` before a smaller circuit is solved answers the start itself, with that `stopped`. When the expansion of the images is the step that stops, `unseen` has no `by_symmetry`.
+- A start that misses seen rows is no rung. It is one member of the first rung's crowd, padded to the rung's gates with constant gates in front, and the search keeps it unless a candidate scores at least as well: its score is counted on the host and seeded with it. The rest of the crowd is drawn as without a start; the search's neighbour choice spreads the start's offspring, and the random rest keeps the crowd varied. The ladder starts at `gates`, or at the start's live gates when that is larger, and only the first rung is seeded.
+
+The answer adds `start`:
+
+| Field | Meaning |
+|---|---|
+| `gates` | the start's live gates |
+| `solved` | whether it answers every seen row |
+| `checked` | what was checked, in words |
+| `wrong`, `wrong_rows` | the seen rows it answers wrongly; at most 64 listed, each with `row`, `outputs` (wanted), `answered` and where it was first seen (`example`, `at`) |
+| `images_wrong` | under `symmetric`: the images of seen rows it answers wrongly |
+| `changed`, `changed_seen`, `changed_unseen`, `changed_rows` | the rows on which the answer's law decides other than the start's law; at most 64 listed, seen rows first, each with `row`, `seen`, `start` and `law` |
+| `changed_over` | `every row` for 9 inputs or fewer (3x3 with one read), else `the seen rows` |
+
+An answer with `stopped` `ladder`, and the start itself after a stop, are the same bytes for the same request. A request without `start` answers as before.
 
 ### Counting laws
 

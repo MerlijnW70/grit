@@ -466,6 +466,86 @@ pub fn answer(inputs: u32, outputs: u32, gates: &[Gate], row: u32) -> u32 {
         .fold(0, |held, (output, bit)| held | (bit << output))
 }
 
+#[must_use]
+pub fn padded(inputs: u32, gates: &[Gate], budget: u32) -> Vec<Gate> {
+    let lead = budget.saturating_sub(u32::try_from(gates.len()).unwrap_or(u32::MAX));
+    let moved = |source: u32| {
+        if source < inputs {
+            source
+        } else {
+            source + lead
+        }
+    };
+    (0..lead)
+        .map(|_| Gate {
+            kind: 0,
+            left: 0,
+            right: 0,
+        })
+        .chain(gates.iter().map(|gate| Gate {
+            kind: gate.kind,
+            left: moved(gate.left),
+            right: moved(gate.right),
+        }))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Miss {
+    pub row: u32,
+    pub seen: Seen,
+    pub answered: u32,
+}
+
+#[must_use]
+pub fn missed(inputs: u32, outputs: u32, gates: &[Gate], seen: &BTreeMap<u32, Seen>) -> Vec<Miss> {
+    seen.iter()
+        .filter_map(|(row, one)| {
+            let answered = answer(inputs, outputs, gates, *row);
+            (answered != one.outputs).then_some(Miss {
+                row: *row,
+                seen: *one,
+                answered,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Change {
+    pub row: u32,
+    pub seen: bool,
+    pub was: u32,
+    pub now: u32,
+}
+
+#[must_use]
+pub fn changed(
+    inputs: u32,
+    outputs: u32,
+    (before, after): (&[Gate], &[Gate]),
+    seen: &BTreeMap<u32, Seen>,
+    every: bool,
+) -> Vec<Change> {
+    let differing = |row: u32| {
+        let was = answer(inputs, outputs, before, row);
+        let now = answer(inputs, outputs, after, row);
+        (was != now).then_some(Change {
+            row,
+            seen: seen.contains_key(&row),
+            was,
+            now,
+        })
+    };
+    let mut held: Vec<Change> = if every {
+        (0..1_u32 << inputs).filter_map(differing).collect()
+    } else {
+        seen.keys().copied().filter_map(differing).collect()
+    };
+    held.sort_by_key(|one| (!one.seen, one.row));
+    held
+}
+
 const LOW: [u64; 6] = [
     0xAAAA_AAAA_AAAA_AAAA,
     0xCCCC_CCCC_CCCC_CCCC,

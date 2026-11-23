@@ -76,9 +76,11 @@ pub enum Code {
     LearnLimit,
     CountReads,
     NotCounting,
+    StartShape,
+    StartRule,
 }
 
-pub const CODES: [Code; 72] = [
+pub const CODES: [Code; 74] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -151,6 +153,8 @@ pub const CODES: [Code; 72] = [
     Code::LearnLimit,
     Code::CountReads,
     Code::NotCounting,
+    Code::StartShape,
+    Code::StartRule,
 ];
 
 impl Code {
@@ -229,6 +233,8 @@ impl Code {
             Self::LearnLimit => "learn_limit",
             Self::CountReads => "count_reads",
             Self::NotCounting => "not_counting",
+            Self::StartShape => "start_shape",
+            Self::StartRule => "start_rule",
         }
     }
 
@@ -418,6 +424,12 @@ impl Code {
             }
             Self::NotCounting => {
                 "Use rule minimal or symmetric, or fix the examples that give one count two outputs; counts names each with a row for each output."
+            }
+            Self::StartShape => {
+                "Give start as many inputs as the stencil's places times the reads, one output for each write and no state, as the chip of an earlier grit_law_learn answer with the same stencil, reads and writes has."
+            }
+            Self::StartRule => {
+                "Drop start, or use rule minimal or symmetric; totalistic and outer read their tables in one pass with no search to start."
             }
         }
     }

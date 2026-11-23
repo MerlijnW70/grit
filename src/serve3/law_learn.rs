@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::law::chip::{Circuit, Read, Rest, Spot, Wiring};
 use crate::machine::Machine;
-use crate::netlist::Gate;
+use crate::netlist::{Gate, Netlist};
 use crate::serve::{Effort, Halt};
 use crate::stencil::{self, Bit, Border, Rows, Sample, Stencil, Tallied, Tally};
 use crate::wire::{Json, counted, map, text};
@@ -56,11 +56,17 @@ pub const OUTER: &str = "each write's output is T[c][n], c the centre's read bit
 
 pub const NO_SEARCH: &str = "no_search";
 
+pub const STARTED: &str = "the start's law, its live gates under minimal and the or of their images under symmetric, was answered on the host on every seen row and, under symmetric, on every image of one";
+
+pub const CHANGED_EVERY: &str = "every row";
+
+pub const CHANGED_SEEN: &str = "the seen rows";
+
 pub const ZERO_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; to read 0 past an example's edge, write it at the origin of a world at least one cell longer than it along each axis the stencil reads, every other cell of the read planes 0";
 
 pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world whose sides equal its own along each axis the stencil reads (3x3 reads x and y, so its tall is free; a world's tall is at least 2), and a world example's box reads its neighbours from that world";
 
-pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A call stops on its deadline or cancel only at a brake: before each build that measures the device, before each search's build and before each device submission of a look; no measured time is compared with the time left. Once the deadline has passed no further submission starts, so an answer can come late by the one submission in flight: a build, or one submission of a look, sized by the device's measured pace. A build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission, where a driver that compiles at its first dispatch compiles, grown with the square of the kernel's words from the closest one measured, stays within half the device's patience; a top rung past that is refused learn_limit at gates with the most gates that fit, a limit measured on this device at this moment and so outside the same answer below; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion checks budget and cancel every 4096 rows and refuses budget or cancelled. The count of decided rows checks only cancel, every 4096 blocks of 64 rows, and none after a stopped ladder; otherwise it runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so a found law is never lost to the deadline. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on when the deadline passed or the cancel came, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it. Under rule totalistic or outer there is no search, ladder, brake or search kernel, and inline examples need no compute device: each write's table is read from the seen rows in one pass, a count never seen is 0, and the law counts with a gate circuit, an adder tree and a decoder of the count";
+pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A call stops on its deadline or cancel only at a brake: before each build that measures the device, before each search's build and before each device submission of a look; no measured time is compared with the time left. Once the deadline has passed no further submission starts, so an answer can come late by the one submission in flight: a build, or one submission of a look, sized by the device's measured pace. A build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission, where a driver that compiles at its first dispatch compiles, grown with the square of the kernel's words from the closest one measured, stays within half the device's patience; a top rung past that is refused learn_limit at gates with the most gates that fit, a limit measured on this device at this moment and so outside the same answer below; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion checks budget and cancel every 4096 rows and refuses budget or cancelled. The count of decided rows checks only cancel, every 4096 blocks of 64 rows, and none after a stopped ladder; otherwise it runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so a found law is never lost to the deadline. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on when the deadline passed or the cancel came, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it. Under rule totalistic or outer there is no search, ladder, brake or search kernel, and inline examples need no compute device: each write's table is read from the seen rows in one pass, a count never seen is 0, and the law counts with a gate circuit, an adder tree and a decoder of the count. Under rule minimal or symmetric, start is a circuit to begin from, the chip of an earlier answer; it is checked on the host on every seen row before any search: one that answers them all is a solved rung, so the answer is never larger than it and never refused budget or cancelled, and the ladder walks down from its live gates less one; one that misses rows is a member of the first rung's crowd, kept unless a candidate scores at least as well, and the ladder starts at its live gates when gates is fewer";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Point {
@@ -624,9 +630,98 @@ fn learn_shown() -> Json {
                     i64::from(crate::serve::SEEDING),
                 ),
             ),
+            ("start", start_shown()),
         ],
         &["stencil", "reads", "writes", "border", "rule", "examples"],
     )
+}
+
+fn start_shown() -> Json {
+    let gate = object(
+        vec![
+            (
+                "kind",
+                with(
+                    word(),
+                    vec![(
+                        "description",
+                        text("which of the 16 two-input functions, as its truth table"),
+                    )],
+                ),
+            ),
+            (
+                "left",
+                with(
+                    word(),
+                    vec![(
+                        "description",
+                        text("the source it reads first: the inputs, then the gates before it"),
+                    )],
+                ),
+            ),
+            (
+                "right",
+                with(
+                    word(),
+                    vec![("description", text("the source it reads second"))],
+                ),
+            ),
+        ],
+        &["kind", "left", "right"],
+    );
+    let mut shown = object(
+        vec![
+            (
+                "inputs",
+                with(
+                    word(),
+                    vec![(
+                        "description",
+                        text("the stencil's places times the reads, in the row order"),
+                    )],
+                ),
+            ),
+            (
+                "outputs",
+                with(
+                    word(),
+                    vec![("description", text("one for each write, in order"))],
+                ),
+            ),
+            (
+                "state",
+                with(
+                    word(),
+                    vec![
+                        (
+                            "description",
+                            text("a learned law holds none; 0 if left out"),
+                        ),
+                        ("default", Json::Int(0)),
+                    ],
+                ),
+            ),
+            (
+                "gates",
+                list_shown(
+                    gate,
+                    "the circuit's gates as grit_law_learn and grit_law_from_chip list them; the last outputs gates are the outputs",
+                    1,
+                    i64::from(crate::netlist::SOURCES),
+                ),
+            ),
+        ],
+        &["inputs", "outputs", "gates"],
+    );
+    if let Json::Map(fields) = &mut shown {
+        fields.push((
+            "description".to_owned(),
+            text(
+                "rule minimal or symmetric: a circuit to begin from, the chip of an earlier answer with the same stencil, reads and writes; under symmetric its law is the or of its images, so pass the found chip of a symmetric answer. It is checked on the host on every seen row: one that answers them all is a solved rung and the ladder walks down from its live gates less one; one that misses rows is a member of the first rung's crowd, which starts at its live gates when gates is fewer. The answer's start names its live gates, the seen rows it answers wrongly and the rows the answer decides otherwise",
+            ),
+        ));
+    }
+    shown
 }
 
 fn bits_of(held: &Json, key: &str) -> Result<Vec<Bit>, Failed> {
@@ -1113,6 +1208,8 @@ struct Rung {
     rounds: u32,
 }
 
+type Trace = (Vec<u32>, Vec<u32>);
+
 struct Laddered {
     rungs: Vec<Rung>,
     best: Option<(u32, Vec<Gate>)>,
@@ -1123,7 +1220,7 @@ fn ladder(
     host: &crate::host::Host,
     watch: &mut Watch<'_>,
     shape: (u32, u32),
-    traces: &[(Vec<u32>, Vec<u32>)],
+    (traces, sown): (&[Trace], &[Vec<u32>]),
     top: u32,
     effort: Effort,
 ) -> Result<Laddered, Failed> {
@@ -1134,7 +1231,9 @@ fn ladder(
     let mut missed = 0;
     while budget >= outputs.max(1) && missed < PATIENCE && rungs.len() < crate::serve::RUNGS {
         let machine = Machine::over(0, inputs, outputs, budget, chip_kinds(), 1)?;
-        let ran = crate::serve::pressed_machine_halted(host, machine, traces, effort, watch)?;
+        let planted: &[Vec<u32>] = if budget == top { sown } else { &[] };
+        let ran =
+            crate::serve::pressed_machine_sown(host, machine, traces, effort, watch, planted)?;
         if ran.stopped {
             break;
         }
@@ -1268,12 +1367,14 @@ fn kernel_fitting(
     host: &crate::host::Host,
     watch: &mut Watch<'_>,
     shape: (u32, u32),
-    top: u32,
+    (top, field): (u32, &str),
     traces: usize,
-) -> Result<(), Failed> {
+) -> Result<Option<Stop>, Failed> {
     let wide = u32::try_from(traces.div_ceil(32).max(1)).unwrap_or(u32::MAX);
     let least = shape.1.max(1);
-    calibrating(watch)?;
+    if let Some(stop) = calibration_halted(watch) {
+        return Ok(Some(stop));
+    }
     let (first, patience) = calibrated(host, shape, least, wide)?;
     let most = patience / MARGIN;
     let mut evidence = vec![first];
@@ -1283,7 +1384,7 @@ fn kernel_fitting(
             Ok(predicted(evidence, kernel_words(host, shape, gates, wide)?) <= most)
         };
         if fits(top, &evidence)? {
-            return Ok(());
+            return Ok(None);
         }
         let (mut low, mut high) = (least, top);
         while low + 1 < high {
@@ -1303,7 +1404,7 @@ fn kernel_fitting(
                 .map_or((0, Duration::ZERO), |one| (one.words, one.took));
             return Err(limited(
                 Code::LearnLimit,
-                "$.gates",
+                field,
                 format!(
                     "a search kernel of {top} gates over {} inputs and {} outputs is {top_words} words; this device built {} words in {} ms, and with a build growing at most with the square of its words that is about {} ms, past half the {} ms a submission may take on this device; at most {} gates fit, and nothing was searched",
                     shape.0,
@@ -1317,20 +1418,20 @@ fn kernel_fitting(
                 counted(admitted),
             ));
         }
-        calibrating(watch)?;
+        if let Some(stop) = calibration_halted(watch) {
+            return Ok(Some(stop));
+        }
         evidence.push(calibrated(host, shape, low, wide)?.0);
     }
 }
 
-fn calibrating(watch: &mut Watch<'_>) -> Result<(), Failed> {
-    if watch.braked(Point::Calibration) {
-        return Err(halted_refusal(
-            watch.stop.unwrap_or(Stop::Budget),
-            "while measuring how fast this device builds a search kernel",
-        ));
-    }
-    Ok(())
+fn calibration_halted(watch: &mut Watch<'_>) -> Option<Stop> {
+    watch
+        .braked(Point::Calibration)
+        .then(|| watch.stop.unwrap_or(Stop::Budget))
 }
+
+const CALIBRATING: &str = "while measuring how fast this device builds a search kernel";
 
 fn fits_kernel(inputs: u32, outputs: u32, top: u32, traces: usize) -> Result<(), Failed> {
     let fits = rows_most(inputs, outputs, top);
@@ -1482,6 +1583,16 @@ fn counted_law(
     tally: Tally,
 ) -> Result<Json, Failed> {
     let stencil = asked.stencil;
+    if held.get("start").is_some() {
+        return Err(refused(
+            Code::StartRule,
+            "$.start",
+            format!(
+                "rule {} reads each write's table from the seen rows in one pass with no search, so it takes no start; start goes with rule minimal or symmetric",
+                tally.name()
+            ),
+        ));
+    }
     if asked.reads.len() != 1 {
         return Err(limited(
             Code::CountReads,
@@ -1696,14 +1807,38 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             counted(0),
         ));
     }
-    let top = asked_top.min(fits_law);
-    if top < outputs {
+    let capped = asked_top.min(fits_law);
+    if capped < outputs {
         return Err(limited(
             Code::LearnLimit,
             "$.gates",
-            format!("gates is {top}, and each of the {outputs} outputs is a gate"),
+            format!("gates is {capped}, and each of the {outputs} outputs is a gate"),
             counted(outputs),
         ));
+    }
+    let begun = start_of(held, inputs, outputs)?;
+    if let Some(live) = &begun {
+        let most = if symmetric {
+            fits_law.min(GATES_MOST)
+        } else {
+            GATES_MOST
+        };
+        let count = u32::try_from(live.len()).unwrap_or(u32::MAX);
+        if count > most {
+            return Err(limited(
+                Code::LearnLimit,
+                "$.start",
+                format!(
+                    "the start has {count} live gates, more than the {most} a rung of the ladder takes{}; nothing was searched",
+                    if symmetric {
+                        ", since under symmetric the law is the copies of the circuit and their ors and must fit the gates a law always holds"
+                    } else {
+                        ""
+                    }
+                ),
+                counted(most),
+            ));
+        }
     }
     let effort = Effort {
         crowd: int(held, "crowd")?,
@@ -1733,6 +1868,25 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         .iter()
         .map(|places| stencil::inputs_moved(stencil, reads, places))
         .collect();
+    let started = begun.map(|live| {
+        let law = if symmetric {
+            stencil::symmetrised(inputs, outputs, &live, &moves)
+        } else {
+            live.clone()
+        };
+        let misses = stencil::missed(inputs, outputs, &law, &rows.seen);
+        Started { live, law, misses }
+    });
+    let solved = started.as_ref().is_some_and(|one| one.misses.is_empty());
+    let begun_gates = started
+        .as_ref()
+        .map_or(0, |one| u32::try_from(one.live.len()).unwrap_or(u32::MAX));
+    let (top, top_field) = match &started {
+        Some(_) if solved => (begun_gates.saturating_sub(1), "$.start"),
+        Some(_) if begun_gates > capped => (begun_gates, "$.start"),
+        _ => (capped, "$.gates"),
+    };
+    let searching = top >= outputs.max(1);
     fits_kernel(inputs, outputs, top, rows.seen.len())?;
     let most = usize::try_from(rows_most(inputs, outputs, top)).unwrap_or(usize::MAX);
     let mut watch = Watch {
@@ -1744,14 +1898,20 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         faults: server.faults(),
     };
     let mut stopped: Option<Stop> = None;
-    let wanted: std::collections::BTreeMap<u32, u32> = if symmetric {
+    let mut expanding: Option<Stop> = None;
+    let wanted: Option<std::collections::BTreeMap<u32, u32>> = if symmetric {
         let mut halted = || {
             let braked = watch.braked(Point::Expansion);
             stopped = watch.stop;
             braked
         };
-        let orbits = match stencil::orbits(&rows.seen, &moves, most, &mut halted) {
-            Ok(orbits) => orbits,
+        match stencil::orbits(&rows.seen, &moves, most, &mut halted) {
+            Ok(orbits) => {
+                if !orbits.broken.is_empty() {
+                    return Err(asymmetric(&orbits, stencil));
+                }
+                Some(orbits.expanded)
+            }
             Err(stencil::Cut::Rows(count)) => {
                 return Err(limited(
                     Code::LearnLimit,
@@ -1765,37 +1925,102 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
                 ));
             }
             Err(stencil::Cut::Halted) => {
-                return Err(halted_refusal(
-                    stopped.unwrap_or(Stop::Budget),
-                    "while expanding the seen rows under the symmetries",
-                ));
+                let stop = stopped.unwrap_or(Stop::Budget);
+                if !solved {
+                    return Err(halted_refusal(
+                        stop,
+                        "while expanding the seen rows under the symmetries",
+                    ));
+                }
+                expanding = Some(stop);
+                None
             }
-        };
-        if !orbits.broken.is_empty() {
-            return Err(asymmetric(&orbits, stencil));
         }
-        orbits.expanded
     } else {
-        rows.seen
-            .iter()
-            .map(|(row, one)| (*row, one.outputs))
-            .collect()
+        Some(
+            rows.seen
+                .iter()
+                .map(|(row, one)| (*row, one.outputs))
+                .collect(),
+        )
     };
-    let traces: Vec<(Vec<u32>, Vec<u32>)> = wanted
-        .iter()
-        .map(|(row, out)| (vec![*row], vec![*out]))
-        .collect();
-    fits_kernel(inputs, outputs, top, traces.len())?;
-    let crowd_most = crowd_fitting(host, inputs, top, traces.len())?;
-    kernel_fitting(host, &mut watch, (inputs, outputs), top, traces.len())?;
-    watch.crowd_most = crowd_most;
+    let images_wrong = match (&started, &wanted) {
+        (Some(one), Some(wanted)) if symmetric => Some(
+            wanted
+                .iter()
+                .filter(|(row, out)| stencil::answer(inputs, outputs, &one.law, **row) != **out)
+                .count() as u64,
+        ),
+        (Some(_), None) => Some(0),
+        _ => None,
+    };
     let asked_crowd = effort.crowd;
-    let effort = Effort {
-        crowd: effort.crowd.min(crowd_most),
-        ..effort
+    let mut crowd_used = effort.crowd;
+    let laddered = match &wanted {
+        Some(wanted) if searching && expanding.is_none() => {
+            let traces: Vec<(Vec<u32>, Vec<u32>)> = wanted
+                .iter()
+                .map(|(row, out)| (vec![*row], vec![*out]))
+                .collect();
+            fits_kernel(inputs, outputs, top, traces.len())?;
+            let crowd_most = crowd_fitting(host, inputs, top, traces.len())?;
+            match kernel_fitting(
+                host,
+                &mut watch,
+                (inputs, outputs),
+                (top, top_field),
+                traces.len(),
+            )? {
+                Some(stop) => {
+                    if !solved {
+                        return Err(halted_refusal(stop, CALIBRATING));
+                    }
+                    Laddered {
+                        rungs: Vec::new(),
+                        best: None,
+                        stop: Some(stop),
+                    }
+                }
+                None => {
+                    watch.crowd_most = crowd_most;
+                    crowd_used = effort.crowd.min(crowd_most);
+                    let effort = Effort {
+                        crowd: crowd_used,
+                        ..effort
+                    };
+                    let sown: Vec<Vec<u32>> = started
+                        .as_ref()
+                        .filter(|_| !solved)
+                        .map(|one| {
+                            stencil::padded(inputs, &one.live, top)
+                                .iter()
+                                .map(|gate| gate.pack())
+                                .collect()
+                        })
+                        .into_iter()
+                        .collect();
+                    ladder(
+                        host,
+                        &mut watch,
+                        (inputs, outputs),
+                        (&traces, &sown),
+                        top,
+                        effort,
+                    )?
+                }
+            }
+        }
+        _ => Laddered {
+            rungs: Vec::new(),
+            best: None,
+            stop: expanding,
+        },
     };
-    let laddered = ladder(host, &mut watch, (inputs, outputs), &traces, top, effort)?;
-    let Some((found, gates)) = laddered.best else {
+    let begun_best = started
+        .as_ref()
+        .filter(|_| solved)
+        .map(|one| (begun_gates, one.live.clone()));
+    let Some((found, gates)) = laddered.best.clone().or(begun_best) else {
         if let Some(stop) = laddered.stop {
             return Err(refused(
                 stop.code(),
@@ -1818,13 +2043,13 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             .max()
             .unwrap_or(0);
         let of = laddered.rungs.first().map_or(0, |rung| rung.of);
+        let searched = wanted.as_ref().map_or(0, std::collections::BTreeMap::len);
         return Err(Box::new(Told(
             Refusal::new(
                 Code::Unsolved,
                 "$.gates",
                 format!(
-                    "no circuit of at most {top} gates answering every one of the {} rows was found within these rounds and crowd; the best scored {marks} of {of} marks",
-                    traces.len()
+                    "no circuit of at most {top} gates answering every one of the {searched} rows was found within these rounds and crowd; the best scored {marks} of {of} marks"
                 ),
             ),
             vec![("ladder", ladder_shown(&laddered.rungs))],
@@ -1836,7 +2061,15 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     } else {
         kept.clone()
     };
-    for (row, out) in &wanted {
+    let checked_rows: Vec<(u32, u32)> = match &wanted {
+        Some(wanted) => wanted.iter().map(|(row, out)| (*row, *out)).collect(),
+        None => rows
+            .seen
+            .iter()
+            .map(|(row, one)| (*row, one.outputs))
+            .collect(),
+    };
+    for (row, out) in &checked_rows {
         if stencil::answer(inputs, outputs, &law_gates, *row) != *out {
             return Err(format!(
                 "the learned circuit answers row {row} other than the examples; this is a fault of the server"
@@ -1885,7 +2118,7 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ("zeros", Json::List(zeros)),
         ("ones", Json::List(ones)),
     ];
-    if symmetric {
+    if symmetric && let Some(wanted) = &wanted {
         decided.push((
             "by_symmetry",
             exact(
@@ -1910,6 +2143,17 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
                     .collect(),
             ),
         ));
+    }
+    let mut rungs_shown = ladder_shown(&laddered.rungs);
+    if solved && let Json::List(rungs_held) = &mut rungs_shown {
+        rungs_held.insert(
+            0,
+            map(vec![
+                ("gates", counted(begun_gates)),
+                ("solved", Json::Bool(true)),
+                ("start", Json::Bool(true)),
+            ]),
+        );
     }
     answer.extend([
         ("stencil", text(stencil.name())),
@@ -1959,15 +2203,23 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             ]),
         ),
         ("unseen", map(decided)),
-        ("ladder", ladder_shown(&laddered.rungs)),
+        ("ladder", rungs_shown),
         ("stopped", text(laddered.stop.map_or("ladder", Stop::name))),
     ]);
-    if effort.crowd < asked_crowd {
+    if let Some(one) = &started {
+        let every = inputs <= TABLE_INPUTS;
+        let changes = stencil::changed(inputs, outputs, (&one.law, &law_gates), &rows.seen, every);
+        answer.push((
+            "start",
+            start_told(one, (solved, images_wrong), &changes, every),
+        ));
+    }
+    if crowd_used < asked_crowd {
         answer.push((
             "crowd_capped",
             map(vec![
                 ("asked", counted(asked_crowd)),
-                ("used", counted(effort.crowd)),
+                ("used", counted(crowd_used)),
                 (
                     "why",
                     text(
@@ -1977,16 +2229,16 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             ]),
         ));
     }
-    if top < asked_top {
+    if capped < asked_top {
         answer.push((
             "gates_capped",
             map(vec![
                 ("asked", counted(asked_top)),
-                ("used", counted(top)),
+                ("used", counted(capped)),
                 (
                     "why",
                     text(&format!(
-                        "a symmetric law is {copies} copies of the circuit and {} or gates, and a law always holds {} gates, so the ladder starts at {top}",
+                        "a symmetric law is {copies} copies of the circuit and {} or gates, and a law always holds {} gates, so the ladder starts at {capped}",
                         outputs.saturating_mul(copies - 1),
                         crate::law::chip::GATES_SURE
                     )),
@@ -1998,4 +2250,143 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         answer.push(("hint", text(stop.code().hint())));
     }
     Ok(map(answer))
+}
+
+struct Started {
+    live: Vec<Gate>,
+    law: Vec<Gate>,
+    misses: Vec<stencil::Miss>,
+}
+
+fn start_word(one: &Json, key: &str, at: &str) -> Result<u32, Failed> {
+    one.get(key)
+        .and_then(Json::int)
+        .and_then(|held| u32::try_from(held).ok())
+        .ok_or_else(|| {
+            refused(
+                Code::Malformed,
+                &format!("{at}.{key}"),
+                format!("{key} did not reach the tool as its schema names it"),
+            )
+        })
+}
+
+fn start_of(held: &Json, inputs: u32, outputs: u32) -> Result<Option<Vec<Gate>>, Failed> {
+    let Some(given) = held.get("start") else {
+        return Ok(None);
+    };
+    let given_inputs = start_word(given, "inputs", "$.start")?;
+    let given_outputs = start_word(given, "outputs", "$.start")?;
+    let state = match given.get("state") {
+        None => 0,
+        Some(_) => start_word(given, "state", "$.start")?,
+    };
+    if state != 0 || given_inputs != inputs || given_outputs != outputs {
+        return Err(Box::new(Told(
+            Refusal::new(
+                Code::StartShape,
+                "$.start",
+                format!(
+                    "the start has {given_inputs} inputs, {given_outputs} outputs and {state} state bits, and this request's law takes {inputs} inputs (the stencil's places times the reads), {outputs} outputs (one for each write) and no state"
+                ),
+            ),
+            vec![("inputs", counted(inputs)), ("outputs", counted(outputs))],
+        )));
+    }
+    let listed = given
+        .get("gates")
+        .and_then(Json::list)
+        .ok_or_else(|| unread("start.gates"))?;
+    let gates = listed
+        .iter()
+        .enumerate()
+        .map(|(at, one)| {
+            let path = format!("$.start.gates[{at}]");
+            Ok(Gate {
+                kind: start_word(one, "kind", &path)?,
+                left: start_word(one, "left", &path)?,
+                right: start_word(one, "right", &path)?,
+            })
+        })
+        .collect::<Result<Vec<Gate>, Failed>>()?;
+    let count = u32::try_from(gates.len()).unwrap_or(u32::MAX);
+    let shape = Netlist::over(inputs, outputs, count, chip_kinds()).map_err(|why| {
+        refused(
+            Code::ChipRefused,
+            "$.start.gates",
+            format!("the start does not parse: {why}"),
+        )
+    })?;
+    for (at, gate) in gates.iter().enumerate() {
+        if let Err(fault) = shape.checked(u32::try_from(at).unwrap_or(u32::MAX), *gate) {
+            return Err(refused(
+                Code::ChipRefused,
+                &format!("$.start.gates[{at}]"),
+                format!("the start does not parse: gate {at} is not legal: {fault}"),
+            ));
+        }
+    }
+    Ok(Some(stencil::live(inputs, outputs, &gates)))
+}
+
+fn start_told(
+    started: &Started,
+    (solved, images_wrong): (bool, Option<u64>),
+    changes: &[stencil::Change],
+    every: bool,
+) -> Json {
+    let wrong: Vec<Json> = started
+        .misses
+        .iter()
+        .take(LISTED)
+        .map(|one| {
+            map(vec![
+                ("row", counted(one.row)),
+                ("outputs", counted(one.seen.outputs)),
+                ("answered", counted(one.answered)),
+                ("example", counted(one.seen.example)),
+                ("at", super::tools::sized(one.seen.at)),
+            ])
+        })
+        .collect();
+    let shown: Vec<Json> = changes
+        .iter()
+        .take(LISTED)
+        .map(|one| {
+            map(vec![
+                ("row", counted(one.row)),
+                ("seen", Json::Bool(one.seen)),
+                ("start", counted(one.was)),
+                ("law", counted(one.now)),
+            ])
+        })
+        .collect();
+    let on_seen = changes.iter().filter(|one| one.seen).count() as u64;
+    let mut fields = vec![
+        (
+            "gates",
+            counted(u32::try_from(started.live.len()).unwrap_or(u32::MAX)),
+        ),
+        ("solved", Json::Bool(solved)),
+        ("checked", text(STARTED)),
+        ("wrong", exact(started.misses.len() as u64)),
+        ("wrong_rows", Json::List(wrong)),
+    ];
+    if let Some(images) = images_wrong {
+        fields.push(("images_wrong", exact(images)));
+    }
+    fields.extend([
+        ("changed", exact(changes.len() as u64)),
+        ("changed_seen", exact(on_seen)),
+        (
+            "changed_unseen",
+            exact((changes.len() as u64).saturating_sub(on_seen)),
+        ),
+        (
+            "changed_over",
+            text(if every { CHANGED_EVERY } else { CHANGED_SEEN }),
+        ),
+        ("changed_rows", Json::List(shown)),
+    ]);
+    map(fields)
 }
