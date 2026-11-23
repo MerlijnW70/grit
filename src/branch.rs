@@ -896,6 +896,11 @@ impl<'host> World<'host> {
     }
 
     #[must_use]
+    pub fn traffic(&self) -> crate::Traffic {
+        self.live.traffic()
+    }
+
+    #[must_use]
     pub const fn on_device(&self) -> Option<std::time::Duration> {
         self.live.on_device()
     }

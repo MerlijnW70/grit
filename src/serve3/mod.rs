@@ -1196,6 +1196,12 @@ impl<'host> Server<'host> {
         self.book.faults()
     }
 
+    #[cfg(feature = "faults")]
+    #[must_use]
+    pub fn traffic(&self, number: u32) -> Option<crate::Traffic> {
+        self.live.get(&number).map(|live| live.world.traffic())
+    }
+
     /// How many worlds are open.
     #[must_use]
     pub fn open(&self) -> usize {

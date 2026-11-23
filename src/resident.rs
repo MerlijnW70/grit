@@ -453,6 +453,49 @@ struct Held {
     kind: vk::MemoryPropertyFlags,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Traffic {
+    pub submits: u64,
+    pub uploaded: u64,
+    pub downloaded: u64,
+    pub woken: u64,
+}
+
+impl Traffic {
+    #[must_use]
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            submits: self.submits.saturating_sub(earlier.submits),
+            uploaded: self.uploaded.saturating_sub(earlier.uploaded),
+            downloaded: self.downloaded.saturating_sub(earlier.downloaded),
+            woken: self.woken.saturating_sub(earlier.woken),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Moved {
+    submits: std::sync::atomic::AtomicU64,
+    uploaded: std::sync::atomic::AtomicU64,
+    downloaded: std::sync::atomic::AtomicU64,
+    woken: std::sync::atomic::AtomicU64,
+}
+
+impl Moved {
+    fn add(counter: &std::sync::atomic::AtomicU64, by: u64) {
+        counter.fetch_add(by, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Traffic {
+        Traffic {
+            submits: self.submits.load(Ordering::Relaxed),
+            uploaded: self.uploaded.load(Ordering::Relaxed),
+            downloaded: self.downloaded.load(Ordering::Relaxed),
+            woken: self.woken.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Run<'words> {
     pub index: usize,
@@ -637,6 +680,7 @@ pub struct Resident<'host> {
     spans: Vec<Duration>,
     reused: u64,
     warmed: Duration,
+    moved: Moved,
 }
 
 impl Host {
@@ -997,6 +1041,7 @@ impl<'host> Resident<'host> {
             spans: Vec::new(),
             reused: 0,
             warmed: Duration::ZERO,
+            moved: Moved::default(),
         }
     }
 
@@ -1367,6 +1412,7 @@ impl Resident<'_> {
             std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
             self.host.device().unmap_memory(staging);
         }
+        Moved::add(&self.moved.uploaded, from.bytes);
 
         let region = [vk::BufferCopy::default()
             .src_offset(from.from)
@@ -1394,6 +1440,7 @@ impl Resident<'_> {
             std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
             self.host.device().unmap_memory(memory);
         }
+        Moved::add(&self.moved.uploaded, into.bytes);
         Ok(())
     }
 
@@ -1404,6 +1451,15 @@ impl Resident<'_> {
 
     pub const fn direct(&self) -> bool {
         self.direct
+    }
+
+    #[must_use]
+    pub fn traffic(&self) -> Traffic {
+        self.moved.get()
+    }
+
+    pub fn woke(&self, octs: usize) {
+        Moved::add(&self.moved.woken, octs as u64);
     }
 
     pub fn write_at(&mut self, index: usize, at: usize, words: &[u32]) -> Result<(), Error> {
@@ -1425,7 +1481,7 @@ impl Resident<'_> {
                 needed: usize::MAX,
                 staging: words_in(self.room),
             })?;
-            taken.push((held.handle, into, run.words));
+            taken.push((run.index, held.handle, into.from, run.words));
         }
         if taken.is_empty() {
             return Ok(());
@@ -1433,15 +1489,52 @@ impl Resident<'_> {
         if runs.iter().any(|run| self.sparse(run.index)) {
             staged(0, total, self.room)?;
         }
-        if staged(0, total, self.staging.bytes).is_err() {
-            for run in runs {
-                self.written(run.index, run.at, run.words)?;
-            }
-            return Ok(());
-        }
-        let whole = staged(0, total, self.staging.bytes)?;
         self.idle()?;
 
+        let piece = words_in(self.staging.bytes).max(1);
+        let mut batch: Vec<(vk::Buffer, u64, &[u32])> = Vec::new();
+        let mut held_words = 0_usize;
+        let mut covered: std::collections::BTreeMap<(usize, u64), u64> =
+            std::collections::BTreeMap::new();
+        for &(index, handle, from, words) in &taken {
+            let mut along = 0_usize;
+            while along < words.len() {
+                let room = piece - held_words;
+                let part = words
+                    .get(along..along + room.min(words.len() - along))
+                    .unwrap_or_default();
+                let at = from + along as u64 * WORD;
+                let end = at + part.len() as u64 * WORD;
+                let before = covered
+                    .range(..=(index, at))
+                    .next_back()
+                    .is_some_and(|(&(held, _), &stop)| held == index && stop > at);
+                let after = covered.range((index, at)..(index, end)).next().is_some();
+                if (before || after || room == 0) && !batch.is_empty() {
+                    unsafe { self.sent_all(&batch, held_words) }?;
+                    batch.clear();
+                    covered.clear();
+                    held_words = 0;
+                    continue;
+                }
+                covered.insert((index, at), end);
+                batch.push((handle, at, part));
+                held_words += part.len();
+                along += part.len();
+            }
+        }
+        if !batch.is_empty() {
+            unsafe { self.sent_all(&batch, held_words) }?;
+        }
+        Ok(())
+    }
+
+    unsafe fn sent_all(
+        &self,
+        parts: &[(vk::Buffer, u64, &[u32])],
+        total: usize,
+    ) -> Result<(), Error> {
+        let whole = staged(0, total, self.staging.bytes)?;
         let staging = self.staging.memory;
         unsafe {
             let mapped = self.host.device().map_memory(
@@ -1451,23 +1544,25 @@ impl Resident<'_> {
                 vk::MemoryMapFlags::empty(),
             )?;
             let mut along = 0_usize;
-            for &(_, _, words) in &taken {
+            for &(_, _, words) in parts {
                 let into = mapped.cast::<u32>().add(along);
                 std::ptr::copy_nonoverlapping(words.as_ptr(), into, words.len());
                 along += words.len();
             }
             self.host.device().unmap_memory(staging);
         }
+        Moved::add(&self.moved.uploaded, whole.bytes);
 
         let source = self.staging.handle;
         let mut grouped: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
         let mut along = whole.from;
-        for &(handle, into, _) in &taken {
+        for &(handle, into, words) in parts {
+            let bytes = words.len() as u64 * WORD;
             let region = vk::BufferCopy::default()
                 .src_offset(along)
-                .dst_offset(into.from)
-                .size(into.bytes);
-            along += into.bytes;
+                .dst_offset(into)
+                .size(bytes);
+            along += bytes;
             match grouped.iter_mut().find(|held| held.0 == handle) {
                 Some(held) => held.1.push(region),
                 None => grouped.push((handle, vec![region])),
@@ -1766,6 +1861,7 @@ impl Resident<'_> {
         }?;
         self.copying += began.elapsed();
         self.copies += 1;
+        Moved::add(&self.moved.downloaded, into.bytes);
         let memory = self.staging.memory;
         unsafe {
             let mapped = self.host.device().map_memory(
@@ -2235,6 +2331,11 @@ impl Resident<'_> {
                 device.reset_fences(&[facing.fence])?;
                 self.host.submit(&ordered, &submit, facing.fence)?;
             }
+            Moved::add(&self.moved.submits, 1);
+            Moved::add(
+                &self.moved.downloaded,
+                out.iter().map(|&(_, bytes)| bytes).sum(),
+            );
             drop(ordered);
             self.reused += 1;
             return Ok(());
@@ -2406,6 +2507,11 @@ impl Resident<'_> {
             let ordered = self.host.ordered();
             device.reset_fences(&[facing.fence])?;
             self.host.submit(&ordered, &submit, facing.fence)?;
+            Moved::add(&self.moved.submits, 1);
+            Moved::add(
+                &self.moved.downloaded,
+                out.iter().map(|&(_, bytes)| bytes).sum(),
+            );
             drop(ordered);
         }
 
@@ -2452,6 +2558,7 @@ impl Resident<'_> {
             let ordered = self.host.ordered();
             device.reset_fences(&[self.fence])?;
             self.host.submit(&ordered, &submit, self.fence)?;
+            Moved::add(&self.moved.submits, 1);
             self.sending.store(true, Ordering::SeqCst);
             drop(ordered);
         }

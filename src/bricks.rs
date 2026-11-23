@@ -849,7 +849,7 @@ impl Bricks {
         plane: usize,
         cells: &[([u32; 3], u32)],
     ) -> Result<(), Error> {
-        use std::collections::BTreeSet;
+        use std::collections::{BTreeMap, BTreeSet};
 
         if plane >= self.planes() {
             return Err(Error::Overrun {
@@ -879,23 +879,60 @@ impl Bricks {
             });
         }
         self.check(held)?;
-        let mut table = held.read(self.table() as usize, self.table_words())?;
-        let mut header = held.read(self.slots() as usize, HEAD)?;
-        let top = header.get(TOP).copied().unwrap_or_default() as usize;
-        let stack = held.read(self.slots() as usize, HEAD + top)?;
-        let mut top = top;
         let per = self.cells();
         let per_block = self.per_block() as usize;
+        let planes = self.planes();
+        let by = self.octs_bits();
+        let mut touched = BTreeSet::new();
+        for &(point, _) in cells {
+            touched.insert(self.cell_of(point).brick);
+            for phase in 0..2 {
+                touched.insert(self.oct_of(self.holder(point, phase)) >> by);
+            }
+        }
+        let touched: Vec<u32> = touched.into_iter().collect();
+        let table_binding = self.table() as usize;
+        let mut asked = vec![
+            (self.slots() as usize, 0, HEAD),
+            (GRAND as usize, 0, 1),
+            (self.whole_count() as usize, 0, 1),
+        ];
+        for (from, count) in live::spans(&touched) {
+            asked.push((table_binding, from * ENTRY, count * ENTRY));
+        }
+        for filled in 1..planes {
+            for (from, count) in live::spans(&touched) {
+                asked.push((table_binding, self.value_at(filled, from as u32), count));
+            }
+        }
+        let mut table: BTreeMap<usize, u32> = BTreeMap::new();
+        let mut answers = held.read_runs(&asked)?.into_iter();
+        let mut header = answers.next().unwrap_or_default();
+        let octs = first_word(answers.next());
+        let bricks = first_word(answers.next());
+        for (from, _) in live::spans(&touched) {
+            for (at, word) in (from * ENTRY..).zip(answers.next().unwrap_or_default()) {
+                table.insert(at, word);
+            }
+        }
+        for filled in 1..planes {
+            for (from, _) in live::spans(&touched) {
+                let start = self.value_at(filled, from as u32);
+                for (at, word) in (start..).zip(answers.next().unwrap_or_default()) {
+                    table.insert(at, word);
+                }
+            }
+        }
+        let word_at = |table: &BTreeMap<usize, u32>, at: usize, or: u32| {
+            table.get(&at).copied().unwrap_or(or)
+        };
+        let top = header.get(TOP).copied().unwrap_or_default() as usize;
 
         let mut wanted = BTreeSet::new();
         for &(point, word) in cells {
             let Cell { brick, .. } = self.cell_of(point);
-            let entry = brick as usize * ENTRY;
-            let slot = table.get(entry).copied().unwrap_or(UNIFORM);
-            let value = table
-                .get(self.value_at(plane, brick))
-                .copied()
-                .unwrap_or_default();
+            let slot = word_at(&table, brick as usize * ENTRY, UNIFORM);
+            let value = word_at(&table, self.value_at(plane, brick), 0);
             if slot == UNIFORM && word != value {
                 wanted.insert(brick);
             }
@@ -905,69 +942,64 @@ impl Bricks {
                 slots: self.capacity,
             });
         }
+        let wanted: Vec<u32> = wanted.into_iter().collect();
+        let low = top - wanted.len();
+        let mut asked = vec![(self.slots() as usize, HEAD + low, wanted.len())];
+        asked.extend(live::spans(&wanted).map(|(from, count)| (HOT as usize, from, count)));
+        asked.push((DENSE as usize, 0, octs as usize));
+        asked.push((self.whole_list() as usize, 0, bricks as usize));
+        let mut got = held.read_runs(&asked)?;
+        let old_whole = got.pop().unwrap_or_default();
+        let old_listed = got.pop().unwrap_or_default();
+        let mut got = got.into_iter();
+        let stack = got.next().unwrap_or_default();
+        let levels: BTreeMap<u32, u32> = wanted.iter().copied().zip(got.flatten()).collect();
+        let mut listed: BTreeSet<u32> = old_listed.iter().copied().collect();
+        let mut whole: BTreeSet<u32> = old_whole.iter().copied().collect();
 
-        let (octs, bricks) = self.listed(held)?;
-        let mut listed: BTreeSet<u32> = held
-            .read(DENSE as usize, octs as usize)?
-            .into_iter()
-            .collect();
-        let mut whole: BTreeSet<u32> = held
-            .read(self.whole_list() as usize, bricks as usize)?
-            .into_iter()
-            .collect();
-
-        let levels = held.read(HOT as usize, self.count() as usize)?;
+        let mut pool: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        let mut words: BTreeMap<usize, u32> = BTreeMap::new();
+        let mut marks: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        let mut awake: BTreeMap<usize, u32> = BTreeMap::new();
+        let mut entries: BTreeMap<usize, u32> = BTreeMap::new();
+        let mut top = top;
         let mut woken = BTreeSet::new();
         for &(point, word) in cells {
             let Cell { brick, offset } = self.cell_of(point);
             let entry = brick as usize * ENTRY;
-            let slot = table.get(entry).copied().unwrap_or(UNIFORM);
-            let value = table
-                .get(self.value_at(plane, brick))
-                .copied()
-                .unwrap_or_default();
+            let slot = word_at(&table, entry, UNIFORM);
+            let value = word_at(&table, self.value_at(plane, brick), 0);
             let slot = if slot != UNIFORM {
                 Some(slot)
             } else if word == value {
                 None
             } else {
-                let Some(&taken) = top.checked_sub(1).and_then(|at| stack.get(HEAD + at)) else {
+                let Some(&taken) = top
+                    .checked_sub(1)
+                    .and_then(|at| at.checked_sub(low))
+                    .and_then(|at| stack.get(at))
+                else {
                     return Err(Error::PoolFull {
                         slots: self.capacity,
                     });
                 };
                 top -= 1;
-                for filled in 0..self.planes() {
-                    let kept = table
-                        .get(self.value_at(filled, brick))
-                        .copied()
-                        .unwrap_or_default();
-                    live::write_state(
-                        held,
-                        self.windows,
+                for filled in 0..planes {
+                    let kept = word_at(&table, self.value_at(filled, brick), 0);
+                    pool.insert(
                         filled * self.plane_words() + taken as usize * per,
-                        &vec![kept; per],
-                    )?;
+                        vec![kept; per],
+                    );
                 }
-                let level = levels.get(brick as usize).copied().unwrap_or_default();
-                held.write_at(
-                    AWAKE as usize,
-                    taken as usize * per_block,
-                    &vec![level; per_block],
-                )?;
-                if let Some(place) = table.get_mut(entry) {
-                    *place = taken;
-                }
-                held.write_at(self.table() as usize, entry, &[taken])?;
+                let level = levels.get(&brick).copied().unwrap_or_default();
+                marks.insert(taken as usize * per_block, vec![level; per_block]);
+                table.insert(entry, taken);
+                entries.insert(entry, taken);
                 Some(taken)
             };
             if let Some(slot) = slot {
-                live::write_state(
-                    held,
-                    self.windows,
-                    plane * self.plane_words() + slot as usize * per + offset as usize,
-                    &[word],
-                )?;
+                let at = plane * self.plane_words() + slot as usize * per + offset as usize;
+                placed(&mut pool, &mut words, at, word);
             }
             for phase in 0..2 {
                 woken.insert(self.oct_of(self.holder(point, phase)));
@@ -976,36 +1008,117 @@ impl Bricks {
         if let Some(word) = header.get_mut(TOP) {
             *word = u32::try_from(top).unwrap_or(u32::MAX);
         }
-        held.write(self.slots() as usize, &header)?;
 
-        let by = self.octs_bits();
+        let mut hot = BTreeSet::new();
         for &oct in &woken {
             let brick = oct >> by;
-            held.write_at(HOT as usize, brick as usize, &[AWAKE_LEVEL])?;
-            let slot = table
-                .get(brick as usize * ENTRY)
-                .copied()
-                .unwrap_or(UNIFORM);
+            hot.insert(brick);
+            let slot = word_at(&table, brick as usize * ENTRY, UNIFORM);
             if slot == UNIFORM {
                 whole.insert(brick);
                 continue;
             }
             let local = (oct & (self.per_block() - 1)) as usize;
-            held.write_at(
-                AWAKE as usize,
+            placed(
+                &mut marks,
+                &mut awake,
                 slot as usize * per_block + local,
-                &[AWAKE_LEVEL],
-            )?;
+                AWAKE_LEVEL,
+            );
             if !whole.contains(&brick) {
                 listed.insert(oct);
             }
         }
         listed.retain(|oct| !whole.contains(&(oct >> by)));
-        self.list(
-            held,
-            &listed.into_iter().collect::<Vec<_>>(),
-            &whole.into_iter().collect::<Vec<_>>(),
-        )
+        held.woke(woken.len());
+
+        let listed: Vec<u32> = listed.into_iter().collect();
+        let whole: Vec<u32> = whole.into_iter().collect();
+        let hot: Vec<u32> = hot.into_iter().collect();
+        let marked = vec![AWAKE_LEVEL; hot.len()];
+        let mut runs = Vec::new();
+        for (&at, block) in &pool {
+            live::state_runs(self.windows, at, block, &mut runs);
+        }
+        let (word_spans, word_values) = runs_of(&words);
+        for &(at, length, from) in &word_spans {
+            let part = word_values.get(from..from + length).unwrap_or_default();
+            live::state_runs(self.windows, at, part, &mut runs);
+        }
+        for (&at, block) in &marks {
+            runs.push(Run {
+                index: AWAKE as usize,
+                at,
+                words: block,
+            });
+        }
+        let (awake_spans, awake_values) = runs_of(&awake);
+        for &(at, length, from) in &awake_spans {
+            runs.push(Run {
+                index: AWAKE as usize,
+                at,
+                words: awake_values.get(from..from + length).unwrap_or_default(),
+            });
+        }
+        for (from, length) in live::spans(&hot) {
+            runs.push(Run {
+                index: HOT as usize,
+                at: from,
+                words: marked.get(..length).unwrap_or_default(),
+            });
+        }
+        let entry_words: Vec<(usize, [u32; 1])> =
+            entries.iter().map(|(&at, &slot)| (at, [slot])).collect();
+        for (at, slot) in &entry_words {
+            runs.push(Run {
+                index: table_binding,
+                at: *at,
+                words: slot,
+            });
+        }
+        runs.push(Run {
+            index: self.slots() as usize,
+            at: 0,
+            words: &header,
+        });
+        let listed_from = live::changed_from(&old_listed, &listed);
+        let whole_from = live::changed_from(&old_whole, &whole);
+        let counts = self.listing(&listed, &whole);
+        runs.push(Run {
+            index: DENSE as usize,
+            at: listed_from,
+            words: listed.get(listed_from..).unwrap_or_default(),
+        });
+        runs.push(Run {
+            index: self.whole_list() as usize,
+            at: whole_from,
+            words: whole.get(whole_from..).unwrap_or_default(),
+        });
+        runs.push(Run {
+            index: GRAND as usize,
+            at: 0,
+            words: counts.get(..1).unwrap_or_default(),
+        });
+        runs.push(Run {
+            index: self.whole_count() as usize,
+            at: 0,
+            words: counts.get(1..2).unwrap_or_default(),
+        });
+        runs.push(Run {
+            index: crate::layout::INDIRECT as usize,
+            at: 0,
+            words: counts.get(2..).unwrap_or_default(),
+        });
+        runs.retain(|run| !run.words.is_empty());
+        held.write_many(&runs)
+    }
+
+    fn listing(&self, octs: &[u32], bricks: &[u32]) -> [u32; 5] {
+        let octs_count = u32::try_from(octs.len()).unwrap_or(u32::MAX);
+        let bricks_count = u32::try_from(bricks.len()).unwrap_or(u32::MAX);
+        let groups =
+            octs_count.div_ceil(self.subgroup) + bricks_count * (self.per_block() / self.subgroup);
+        [octs_count, bricks_count, groups, 1, 1]
     }
 
     #[must_use]
@@ -2564,6 +2677,38 @@ pub fn arranged<R: Rule>(
     ]);
     stages.extend(closing(bricks, plan, coarse)?);
     Ok(live::staged(stages))
+}
+
+fn placed(
+    blocks: &mut std::collections::BTreeMap<usize, Vec<u32>>,
+    singles: &mut std::collections::BTreeMap<usize, u32>,
+    at: usize,
+    word: u32,
+) {
+    if let Some((&start, block)) = blocks.range_mut(..=at).next_back()
+        && let Some(place) = block.get_mut(at - start)
+    {
+        *place = word;
+        return;
+    }
+    singles.insert(at, word);
+}
+
+fn runs_of(
+    singles: &std::collections::BTreeMap<usize, u32>,
+) -> (Vec<(usize, usize, usize)>, Vec<u32>) {
+    let mut found: Vec<(usize, usize, usize)> = Vec::new();
+    for (along, &at) in singles.keys().enumerate() {
+        match found.last_mut() {
+            Some((start, length, _)) if *start + *length == at => *length += 1,
+            _ => found.push((at, 1, along)),
+        }
+    }
+    (found, singles.values().copied().collect())
+}
+
+fn first_word(words: Option<Vec<u32>>) -> u32 {
+    words.and_then(|held| held.first().copied()).unwrap_or(0)
 }
 
 pub fn whole<R: Rule>(rule: &R, bricks: &Bricks, plan: &Plan) -> Result<Loop, LaneError> {
