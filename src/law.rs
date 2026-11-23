@@ -6,6 +6,7 @@ use crate::rule3::{CORNERS, Declared, Oct, OneStep, Planed, Ruled, Tally};
 use crate::wire::{self, Json};
 
 pub mod adjoint;
+pub mod alternation;
 pub mod chip;
 pub mod dag;
 pub mod expand;
@@ -56,10 +57,16 @@ pub enum Code {
     HaloPlane,
     HaloDeclared,
     HaloWritten,
+    AlternatePlane,
+    AlternateWritten,
+    AlternateUnwritten,
+    AlternateOther,
+    AlternateUnread,
+    AlternateReversible,
 }
 
 impl Code {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 39] = [
         Self::Json,
         Self::Size,
         Self::Trailing,
@@ -93,6 +100,12 @@ impl Code {
         Self::HaloPlane,
         Self::HaloDeclared,
         Self::HaloWritten,
+        Self::AlternatePlane,
+        Self::AlternateWritten,
+        Self::AlternateUnwritten,
+        Self::AlternateOther,
+        Self::AlternateUnread,
+        Self::AlternateReversible,
     ];
 
     #[must_use]
@@ -131,6 +144,12 @@ impl Code {
             Self::HaloPlane => "halo_plane",
             Self::HaloDeclared => "halo_declared",
             Self::HaloWritten => "halo_written",
+            Self::AlternatePlane => "alternate_plane",
+            Self::AlternateWritten => "alternate_written",
+            Self::AlternateUnwritten => "alternate_unwritten",
+            Self::AlternateOther => "alternate_other",
+            Self::AlternateUnread => "alternate_unread",
+            Self::AlternateReversible => "alternate_reversible",
         }
     }
 }
@@ -185,6 +204,7 @@ pub struct Law {
     channels: u32,
     halo: u32,
     reversible: bool,
+    alternate: Option<[u32; 2]>,
     dag: Dag,
     places: Places,
     canonical: String,
@@ -231,12 +251,16 @@ impl Law {
         } else {
             None
         };
+        if let Some(pair) = program.alternate {
+            alternation::checked(pair, &program, &expanded.dag)?;
+        }
         let hash = crate::branch::sha256(canonical.as_bytes());
         Ok(Self {
             name: program.name.to_owned(),
             channels: program.channels,
             halo: program.halo,
             reversible: program.reversible,
+            alternate: program.alternate,
             dag: expanded.dag,
             places,
             canonical,
@@ -286,6 +310,19 @@ impl Law {
     #[must_use]
     pub const fn reversible(&self) -> bool {
         self.reversible
+    }
+
+    #[must_use]
+    pub const fn alternate(&self) -> Option<[u32; 2]> {
+        self.alternate
+    }
+
+    #[must_use]
+    pub const fn current(&self, frame: u32) -> Option<u32> {
+        match self.alternate {
+            Some([even, odd]) => Some(if frame & 1 == 0 { even } else { odd }),
+            None => None,
+        }
     }
 
     #[must_use]
@@ -343,7 +380,10 @@ impl Declared for Law {
     }
 
     fn looks(&self) -> crate::halo::Halo {
-        self.dag.halo()
+        match self.alternate {
+            Some(pair) => alternation::mirrored(self.dag.halo(), pair),
+            None => self.dag.halo(),
+        }
     }
 }
 
@@ -358,7 +398,10 @@ impl OneStep for Law {
         oct: Oct<'_, O::Word>,
         planes: &[[O::Word; CORNERS]],
     ) -> Planed<O::Word> {
-        self.dag.replay_planes(ops, oct, planes)
+        match self.alternate {
+            Some(pair) => alternation::stepped(&self.dag, pair, ops, oct, planes, &[]),
+            None => self.dag.replay_planes(ops, oct, planes),
+        }
     }
 
     fn one_step_halo<O: Ops>(
@@ -368,7 +411,10 @@ impl OneStep for Law {
         planes: &[[O::Word; CORNERS]],
         halo: &[[O::Word; crate::halo::BOX]],
     ) -> Planed<O::Word> {
-        self.dag.replay_halo(ops, oct, planes, halo)
+        match self.alternate {
+            Some(pair) => alternation::stepped(&self.dag, pair, ops, oct, planes, halo),
+            None => self.dag.replay_halo(ops, oct, planes, halo),
+        }
     }
 }
 

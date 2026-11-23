@@ -331,7 +331,7 @@ const KEYS: [&str; 9] = [
     "law", "name", "params", "channels", "halo", "tally", "consts", "defs", "step",
 ];
 
-const OPTIONAL: [&str; 1] = ["reversible"];
+const OPTIONAL: [&str; 2] = ["reversible", "alternate"];
 
 const TALLY_KEYS: [&str; 2] = ["counts", "weighted"];
 
@@ -357,6 +357,7 @@ pub struct Program<'p> {
     pub halo: u32,
     pub tally: Tally,
     pub reversible: bool,
+    pub alternate: Option<[u32; 2]>,
     pub consts: Vec<(&'p str, u32)>,
     pub defs: Vec<Def<'p>>,
     pub named: HashMap<&'p str, usize>,
@@ -506,6 +507,34 @@ fn short(name: &str, path: &Path<'_>) -> Result<(), Refusal> {
     Ok(())
 }
 
+fn paired(json: &Json, path: &Path<'_>) -> Result<[u32; 2], Refusal> {
+    let what = "two planes [a, b]: a looked at and b written on even frames, swapped on odd ones";
+    let Json::List(items) = json else {
+        return Err(refused(Code::Shape, path, what, described(json)));
+    };
+    let [first, second] = items.as_slice() else {
+        return Err(refused(
+            Code::Shape,
+            path,
+            what,
+            format!("a list of {} items", items.len()),
+        ));
+    };
+    let most = u64::from(limits::CHANNELS - 1);
+    let plane = |held: &Json, at: usize| {
+        whole(
+            held,
+            &path.index(at),
+            Code::AlternatePlane,
+            0,
+            most,
+            "a plane",
+        )
+        .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+    };
+    Ok([plane(first, 0)?, plane(second, 1)?])
+}
+
 fn named<'p>(json: &'p Json, path: &Path<'_>, what: &str) -> Result<&'p str, Refusal> {
     match json {
         Json::Text(held) => short(held, path).map(|()| held.as_str()),
@@ -586,6 +615,10 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
                 described(other),
             ));
         }
+    };
+    let alternate = match fields_of(top, "alternate") {
+        None => None,
+        Some(held) => Some(paired(held, &root.key("alternate"))?),
     };
     let consts_path = root.key("consts");
     let Json::Map(const_fields) = field(top, "consts") else {
@@ -683,6 +716,7 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
             weighted,
         },
         reversible,
+        alternate,
         consts,
         defs,
         named: by_name,

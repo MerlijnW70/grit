@@ -123,11 +123,16 @@ pub fn reads(dag: &Dag) -> Reads {
 
 #[must_use]
 pub fn stepped(law: &Law, params: &[u32], value: &[u32]) -> Vec<u32> {
+    stepped_at(law, params, value, 0)
+}
+
+#[must_use]
+pub fn stepped_at(law: &Law, params: &[u32], value: &[u32], frame: u32) -> Vec<u32> {
     let planes = law.planes();
     let word = |plane: usize| value.get(plane).copied().unwrap_or(0);
     let oct = Oct {
         words: [word(0); CORNERS],
-        frame: 0,
+        frame,
         at: [0; 3],
         params,
     };
@@ -151,12 +156,15 @@ pub fn stepped(law: &Law, params: &[u32], value: &[u32]) -> Vec<u32> {
 
 #[must_use]
 pub fn moved(law: &Law, params: &[u32], value: &[u32]) -> Option<Vec<u32>> {
-    let out = stepped(law, params, value);
-    let still = out.chunks(CORNERS).enumerate().all(|(plane, words)| {
-        let held = value.get(plane).copied().unwrap_or(0);
-        words.iter().all(|&word| word == held)
-    });
-    (!still).then_some(out)
+    let parities = if law.alternate().is_some() { 2 } else { 1 };
+    (0..parities).find_map(|frame| {
+        let out = stepped_at(law, params, value, frame);
+        let still = out.chunks(CORNERS).enumerate().all(|(plane, words)| {
+            let held = value.get(plane).copied().unwrap_or(0);
+            words.iter().all(|&word| word == held)
+        });
+        (!still).then_some(out)
+    })
 }
 
 #[must_use]

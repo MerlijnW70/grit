@@ -58,6 +58,35 @@ A host write to a world whose law looks wakes the 27 octs around the oct of each
 
 `tests/halo3/` holds three laws that look: a 2D Sobel edge detector, a 3D 3x3x3 Sobel and a blur over two planes.
 
+## Iterating a law on the device
+
+A law that reads plane `a` and writes plane `b` gives one generation a frame. `alternate` `[a, b]` makes it iterate with no host round trip: frames of even parity (the world's frame counter, bit 0) run the law as written, looking at `a` and writing `b`; frames of odd parity run it with `a` and `b` swapped in its inputs and outputs. After `k` frames from frame 0 generation `k` is on the current plane: `a` at an even frame, `b` at an odd one.
+
+`grit_world_create` takes `alternate` next to `law`; for a `grit_law_learn` answer it is `[the read's plane, the write's plane]`, and the law text is passed unchanged. A law may also carry the key itself. The world's law is then the iterating law, with its own hash; the answer adds `alternate`. The alternation is part of the law's text and its parity is the frame's, so both come back after a journal replay, `grit_world_fork`, `grit_world_restore`, `grit_world_save` and `grit_world_open` (also at an odd frame), `grit_world_params` and a lost device.
+
+1. `grit_law_learn` Life: `stencil` `3x3`, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `rule` `outer`.
+2. `grit_world_create` with `wide` 64, `deep` 64, `tall` 2, its `law` and `alternate` `[0,1]`.
+3. `grit_world_write` the soup with `current` true.
+4. `grit_world_step` 64 frames: `current` 0.
+5. `grit_world_read` with `current` true: generation 64.
+
+`grit_world_read`, `grit_world_slice` and `grit_world_write` take `current` true for the current plane, and their answer names `plane`; `grit_world_step` answers `current`. A world made without `alternate` refuses `current` with `not_iterating` at `$.current`; `current` with a `plane` other than 0 is `malformed` at `$.plane`.
+
+Within a frame the looked-at plane is frozen, as `halo_written` requires. Refused as `law_refused` at `$.alternate`, with the law's own code:
+
+| Code | When |
+|---|---|
+| `alternate_plane` | `a` equals `b`, or either is past `channels` |
+| `alternate_written` | the law writes `a` |
+| `alternate_unwritten` | the law leaves `b` unchanged |
+| `alternate_other` | the law writes a plane besides `b` |
+| `alternate_unread` | the law never reads `a` |
+| `alternate_reversible` | the law is reversible; `grit_world_back` on an iterating world is `not_reversible` |
+
+`alternate` with `rule`, or with a law that carries another `alternate`, is `malformed` at `$.alternate`. A law that looks runs only dense (`halo_sparse`), with or without `alternate`; one that does not look iterates on sparse worlds too.
+
+The quiet class is decided on the law as written, with every uniform value checked at both parities. A listed world steps an oct while it or an oct around it changed in the two frames before; an oct that changed its written plane wakes the octs whose box reads it, so moving patterns are never skipped, and a world that stops changing, a period-2 oscillator included, goes quiet. Its frames are priced as every frame: cells times frames, calibrated under the iterating law's own text.
+
 ## Reversible laws
 
 A law with `"reversible": true` must be a sequence of lifting steps over its words, 8 a plane: each step adds, subtracts or xors to one word, wrapping, a value made only of other words, params, `frame`, `at`, constants and looks at frozen planes. The compiler checks the form, derives the inverse (the steps undone in reverse order) as an ordinary law named with `_back` and its own hash, and refuses anything else with `not_lifting` at the offending step's path: a step that reads its own word, one node written to two words, a word made by another op (`b = f(a)`, `b | f`, `b * 3`).

@@ -797,6 +797,11 @@ impl<'host> World<'host> {
     }
 
     #[must_use]
+    pub fn current(&self) -> Option<u32> {
+        self.law().and_then(|law| law.current(self.frame))
+    }
+
+    #[must_use]
     pub const fn stepping(&self) -> Stepping {
         match &self.rule {
             Stepper::Named(_) => Stepping::Listed,

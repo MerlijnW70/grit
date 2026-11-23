@@ -86,6 +86,9 @@ impl Lawful {
         if let Some(why) = self.class.why() {
             told.push(("quiet_why", text(&why)));
         }
+        if let Some(pair) = self.law.alternate() {
+            told.push(("alternate", Json::List(pair.map(counted).to_vec())));
+        }
         told
     }
 }
@@ -155,6 +158,49 @@ impl Refused {
 
 pub fn compiled(held: &str) -> Result<Law, Failed> {
     let law = Law::compile(held).map_err(|why| Box::new(Refused(why, "$.law")) as Failed)?;
+    law.inverse()
+        .map_err(|why| Box::new(Refused(why, "$.law")) as Failed)?;
+    Ok(law)
+}
+
+const ALTERNATE_CODES: [crate::law::Code; 6] = [
+    crate::law::Code::AlternatePlane,
+    crate::law::Code::AlternateWritten,
+    crate::law::Code::AlternateUnwritten,
+    crate::law::Code::AlternateOther,
+    crate::law::Code::AlternateUnread,
+    crate::law::Code::AlternateReversible,
+];
+
+pub fn alternated(held: &str, pair: [u32; 2]) -> Result<Law, Failed> {
+    let mut json =
+        crate::law::parse::read(held).map_err(|why| Box::new(Refused(why, "$.law")) as Failed)?;
+    let given = Json::List(pair.map(counted).to_vec());
+    if let Json::Map(fields) = &mut json {
+        match fields.iter().find(|(key, _)| key == "alternate") {
+            Some((_, carried)) if *carried != given => {
+                return Err(Box::new(Refusal::new(
+                    Code::Malformed,
+                    "$.alternate",
+                    format!(
+                        "the law already carries alternate {}, and alternate gives {}",
+                        crate::wire::written(carried),
+                        crate::wire::written(&given)
+                    ),
+                )));
+            }
+            Some(_) => {}
+            None => fields.push(("alternate".to_owned(), given)),
+        }
+    }
+    let law = Law::from_json(&json).map_err(|why| {
+        let field = if ALTERNATE_CODES.contains(&why.code) {
+            "$.alternate"
+        } else {
+            "$.law"
+        };
+        Box::new(Refused(why, field)) as Failed
+    })?;
     law.inverse()
         .map_err(|why| Box::new(Refused(why, "$.law")) as Failed)?;
     Ok(law)

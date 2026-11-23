@@ -310,6 +310,24 @@ fn create_shown() -> Json {
                 ),
             ),
             (
+                "alternate",
+                map(vec![
+                    ("type", text("array")),
+                    (
+                        "items",
+                        whole("a plane", 0, i64::from(crate::law::limits::CHANNELS - 1)),
+                    ),
+                    ("minItems", Json::Int(2)),
+                    ("maxItems", Json::Int(2)),
+                    (
+                        "description",
+                        text(
+                            "with law: [a, b] makes the law iterate on the device. Even frames run it as written, looking at a and writing b; odd frames swap a and b. The current generation is on a at an even frame and on b at an odd one. For a grit_law_learn answer give [the read's plane, the write's plane]",
+                        ),
+                    ),
+                ]),
+            ),
+            (
                 "sparse",
                 with(
                     property(
@@ -355,6 +373,7 @@ fn write_shown() -> Json {
         vec![
             ("world", world_number()),
             ("plane", plane_shown()),
+            ("current", current_shown()),
             (
                 "cells",
                 map(vec![
@@ -411,6 +430,7 @@ fn read_shown() -> Json {
             ("from", corner_shown("the least corner, [x, y, z]")),
             ("to", corner_shown("the greatest corner, [x, y, z]")),
             ("plane", plane_shown()),
+            ("current", current_shown()),
         ],
         &["world", "from", "to"],
     )
@@ -454,6 +474,7 @@ fn slice_shown() -> Json {
                 ),
             ),
             ("plane", plane_shown()),
+            ("current", current_shown()),
         ],
         &["world", "at"],
     )
@@ -470,8 +491,36 @@ fn plane_shown() -> Json {
     )
 }
 
+fn current_shown() -> Json {
+    property(
+        "boolean",
+        "true names the current plane of a world made with alternate: a at an even frame, b at an odd one; leave plane out. The answer names plane",
+    )
+}
+
+fn current(held: &Json) -> bool {
+    matches!(held.get("current"), Some(Json::Bool(true)))
+}
+
 fn plane_of(held: &Json, world: &World<'_>) -> Result<u32, Failed> {
     let plane = int(held, "plane")?;
+    if current(held) {
+        let Some(alternating) = world.current() else {
+            return Err(refused(
+                Code::NotIterating,
+                "$.current",
+                "the world was not made with alternate, so it has no current plane".to_owned(),
+            ));
+        };
+        if plane != 0 {
+            return Err(refused(
+                Code::Malformed,
+                "$.plane",
+                "give plane or current, not both".to_owned(),
+            ));
+        }
+        return Ok(alternating);
+    }
     let planes = world.planes();
     if plane >= planes {
         return Err(limited(
@@ -550,6 +599,11 @@ pub(super) fn first_pace(world: &World<'_>) -> Pace {
 
 fn chosen(server: &Server<'_>, held: &Json) -> Result<Box<dyn Listed>, Failed> {
     match (held.get("rule"), held.get("law")) {
+        (Some(_), None) if held.get("alternate").is_some() => Err(refused(
+            Code::Malformed,
+            "$.alternate",
+            "alternate makes a law iterate: give it with law, not with rule".to_owned(),
+        )),
         (Some(_), None) => {
             let mut known = rules_on(server.host);
             let asked = words_of(held, "rule")?;
@@ -560,7 +614,14 @@ fn chosen(server: &Server<'_>, held: &Json) -> Result<Box<dyn Listed>, Failed> {
             Ok(known.swap_remove(at))
         }
         (None, Some(_)) => {
-            let law = super::law::compiled(words_of(held, "law")?)?;
+            let law = match held.get("alternate") {
+                None => super::law::compiled(words_of(held, "law")?)?,
+                Some(pair) => {
+                    let pair = <[u32; 2]>::try_from(ints(pair, "alternate")?.as_slice())
+                        .map_err(|_| unread("alternate"))?;
+                    super::law::alternated(words_of(held, "law")?, pair)?
+                }
+            };
             Ok(Box::new(super::law::Lawful::new(
                 law,
                 crate::law::quiet::Class::Proved,
@@ -805,7 +866,7 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ("frame", counted(frame)),
         ("listed", counted(listed)),
     ];
-    if plane > 0 {
+    if plane > 0 || current(held) {
         answer.insert(1, ("plane", counted(plane)));
     }
     if let Some(used) = live.world.pool_use()? {
@@ -1126,6 +1187,9 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     ];
     if let Some(lawful) = live.rule.lawful() {
         answer.push(("tallied", text(lawful.tallied())));
+        if let Some(alternating) = live.world.current() {
+            answer.push(("current", counted(alternating)));
+        }
     }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
@@ -1201,7 +1265,7 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         *kinds.entry(live.rule.kind(word)).or_insert(0_u32) += 1;
         words.push(counted(word));
     }
-    Ok(map(vec![
+    let mut answer = vec![
         ("world", counted(number)),
         ("frame", counted(live.world.frame())),
         ("from", sized(from)),
@@ -1218,7 +1282,11 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
                     .collect(),
             ),
         ),
-    ]))
+    ];
+    if current(held) {
+        answer.insert(2, ("plane", counted(plane)));
+    }
+    Ok(map(answer))
 }
 
 fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
@@ -1324,6 +1392,9 @@ fn sliced(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ("as", text(shown)),
         ("rows", Json::List(rows)),
     ];
+    if current(held) {
+        answer.insert(2, ("plane", counted(plane)));
+    }
     if let Some(next) = next {
         answer.push(("next", counted(next)));
     }

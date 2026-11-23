@@ -83,9 +83,10 @@ pub enum Code {
     PlacesRule,
     SupportNoise,
     SupportLimit,
+    NotIterating,
 }
 
-pub const CODES: [Code; 79] = [
+pub const CODES: [Code; 80] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -165,6 +166,7 @@ pub const CODES: [Code; 79] = [
     Code::PlacesRule,
     Code::SupportNoise,
     Code::SupportLimit,
+    Code::NotIterating,
 ];
 
 impl Code {
@@ -250,6 +252,7 @@ impl Code {
             Self::PlacesRule => "places_rule",
             Self::SupportNoise => "support_noise",
             Self::SupportLimit => "support_limit",
+            Self::NotIterating => "not_iterating",
         }
     }
 
@@ -460,6 +463,9 @@ impl Code {
             }
             Self::SupportLimit => {
                 "Give min_support from 1 to the stencil's places times 64: 576 for 3x3, 1728 for 3x3x3."
+            }
+            Self::NotIterating => {
+                "Name the plane by number: only a world made with alternate has a current plane."
             }
         }
     }
