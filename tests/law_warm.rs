@@ -30,8 +30,6 @@ const EAST: u32 = 5;
 
 const SOUTH: u32 = 7;
 
-const W9_IMAGES: usize = 3;
-
 struct Rng(u64);
 
 impl Rng {
@@ -1167,13 +1165,17 @@ fn w9_a_start_padded_into_more_gates_keeps_its_marks_over_wrapped_slots() {
     let short = |row: u32| u32::from(majority(row) == 1 && row != 511);
     let start = majority_chip(&mut mcp, &short);
     let live = start.len();
-    let inputs: Vec<(Vec<u32>, [u32; 3])> = majority_inputs().into_iter().take(W9_IMAGES).collect();
+    let mut rng = Rng(310);
+    let inputs: Vec<(Vec<u32>, [u32; 3])> = [850, 300]
+        .iter()
+        .map(|permille| (random_bits(&mut rng, 64, *permille), [8, 8, 1]))
+        .collect();
     let examples = labelled(inputs, &majority);
     let seen = seen_of(&examples);
-    assert_ne!(
+    assert_eq!(
         seen.len() % 32,
-        0,
-        "{} seen rows leave slots to wrap",
+        1,
+        "{} seen rows leave 31 slots to wrap",
         seen.len()
     );
     assert!(seen.contains_key(&511), "the start misses a seen row");
@@ -1188,7 +1190,7 @@ fn w9_a_start_padded_into_more_gates_keeps_its_marks_over_wrapped_slots() {
     assert_eq!(right, u32::try_from(seen.len()).unwrap() - 1);
     assert_eq!(on_slots, right + u32::try_from(wrapped).unwrap());
     let gates = live + 13;
-    for seed in [1, 2, 3, 4] {
+    for seed in 1..=6 {
         let arguments = args(
             "minimal",
             &examples,
