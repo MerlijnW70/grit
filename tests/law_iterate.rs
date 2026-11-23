@@ -1629,7 +1629,7 @@ fn or_law() -> String {
 }
 
 #[test]
-fn i7_a_uniform_value_still_at_one_parity_only_turns_the_class_whole() {
+fn i7_a_uniform_value_still_at_one_parity_only_is_whole_on_the_host() {
     let law = iterating(&or_law(), [0, 1]);
     let held = |value: [u32; 2]| [[value[0]; 8], [value[1]; 8]].concat();
     for (param, value, even, odd) in [
@@ -1661,7 +1661,11 @@ fn i7_a_uniform_value_still_at_one_parity_only_turns_the_class_whole() {
         let class = grit::law::quiet::class(&law, &params, &[value.to_vec()]);
         assert_eq!(class.proved(), !(even || odd), "{case}: {class:?}");
     }
-    let Some(host) = device("law_iterate i7") else {
+}
+
+#[test]
+fn i7_params_that_leave_a_uniform_region_still_at_one_parity_only_are_refused_on_a_sparse_world() {
+    let Some(host) = device("law_iterate i7 params") else {
         return;
     };
     let mut server = Server::new(Some(&host));
