@@ -5,7 +5,7 @@ use crate::machine::Machine;
 use crate::netlist::{Gate, Netlist};
 use crate::serve::{Effort, Halt};
 use crate::stencil::{
-    self, Bit, Border, Deviation, Rows, Sample, Stencil, Tallied, Tally, Voted, Voting,
+    self, Bit, Border, Counting, Deviation, Rows, Sample, Stencil, Tallied, Tally, Voted, Voting,
 };
 use crate::wire::{Json, counted, map, text};
 
@@ -56,6 +56,12 @@ pub const TOTALISTIC: &str = "each write's output is T[n], n the number of the s
 
 pub const OUTER: &str = "each write's output is T[c][n], c the centre's read bit and n the number of the other places whose read bit is 1 (0 to 8 for 3x3, 0 to 26 for 3x3x3); T is read from the seen rows in one pass with no search, and a count the examples never showed is 0";
 
+pub const TOTALISTIC_PLACES: &str = "each write's output is T[n], n the number of the places named in places, centre included, whose read bit is 1; the law reads no other place; T is read from the seen rows in one pass with no search, and a count the examples never showed is 0";
+
+pub const OUTER_PLACES: &str = "each write's output is T[c][n], c the centre's read bit and n the number of the other places named in places whose read bit is 1; the law reads no other place; T is read from the seen rows in one pass with no search, and a count the examples never showed is 0";
+
+pub const SUPPORT_MOST: u32 = 64;
+
 pub const NO_SEARCH: &str = "no_search";
 
 pub const STARTED: &str = "the start's law, its live gates under minimal and the or of their images under symmetric, was answered on the host on every seen row and, under symmetric, on every image of one";
@@ -68,7 +74,7 @@ pub const ZERO_RUNS: &str = "the law reads its neighbours wrapped on the world's
 
 pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world whose sides equal its own along each axis the stencil reads (3x3 reads x and y, so its tall is free; a world's tall is at least 2), and a world example's box reads its neighbours from that world";
 
-pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A call stops on its deadline or cancel only at a brake: before each build that measures the device, before each search's build and before each device submission of a look; no measured time is compared with the time left. Once the deadline has passed no further submission starts, so an answer can come late by the one submission in flight: a build, or one submission of a look, sized by the device's measured pace. A build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission, where a driver that compiles at its first dispatch compiles, grown with the square of the kernel's words from the closest one measured, stays within half the device's patience; a top rung past that is refused learn_limit at gates with the most gates that fit, a limit measured on this device at this moment and so outside the same answer below; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion checks budget and cancel every 4096 rows and refuses budget or cancelled. The count of decided rows checks only cancel, every 4096 blocks of 64 rows, and none after a stopped ladder; otherwise it runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so a found law is never lost to the deadline. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on when the deadline passed or the cancel came, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it. Under rule totalistic or outer there is no search, ladder, brake or search kernel, and inline examples need no compute device: each write's table is read from the seen rows in one pass, a count never seen is 0, and the law counts with a gate circuit, an adder tree and a decoder of the count. Under rule minimal or symmetric, start is a circuit to begin from, the chip of an earlier answer; it is checked on the host on every seen row before any search: one that answers them all is a solved rung, so the answer is never larger than it and never refused budget or cancelled, and the ladder walks down from its live gates less one; one that misses rows is a member of the first rung's crowd, kept unless a candidate scores at least as well, and the ladder starts at its live gates when gates is fewer. Under rule totalistic or outer, noise vote reads the examples cell by cell: each write's entry for a count, and under outer the centre, is the majority of the example cells that show it, a tie is 0 and listed in ties, and a count never seen is 0; no row is refused conflict or not_counting, examples.conflicts stays 0, and every other refusal stands. The answer then adds per write tallies, [zeros, ones] for each count in the shape of tables, ties, deviating, the example cells whose output disagrees with the law, and deviating_cells, at most 64 of them in example order, then z, y, x, each with example, at, count, centre under outer, seen and law; and deviating_share, the deviating cells over the voted cells (the example cells times the writes) as [num, den]. On examples that noise refuse answers, vote answers the same bytes with only these fields added. noise refuse, the default, answers as a request without noise, and noise vote under minimal or symmetric is refused noise_rule at $.noise";
+pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A call stops on its deadline or cancel only at a brake: before each build that measures the device, before each search's build and before each device submission of a look; no measured time is compared with the time left. Once the deadline has passed no further submission starts, so an answer can come late by the one submission in flight: a build, or one submission of a look, sized by the device's measured pace. A build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission, where a driver that compiles at its first dispatch compiles, grown with the square of the kernel's words from the closest one measured, stays within half the device's patience; a top rung past that is refused learn_limit at gates with the most gates that fit, a limit measured on this device at this moment and so outside the same answer below; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion checks budget and cancel every 4096 rows and refuses budget or cancelled. The count of decided rows checks only cancel, every 4096 blocks of 64 rows, and none after a stopped ladder; otherwise it runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so a found law is never lost to the deadline. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on when the deadline passed or the cancel came, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it. Under rule totalistic or outer there is no search, ladder, brake or search kernel, and inline examples need no compute device: each write's table is read from the seen rows in one pass, a count never seen is 0, and the law counts with a gate circuit, an adder tree and a decoder of the count. Under rule minimal or symmetric, start is a circuit to begin from, the chip of an earlier answer; it is checked on the host on every seen row before any search: one that answers them all is a solved rung, so the answer is never larger than it and never refused budget or cancelled, and the ladder walks down from its live gates less one; one that misses rows is a member of the first rung's crowd, kept unless a candidate scores at least as well, and the ladder starts at its live gates when gates is fewer. Under rule totalistic or outer, noise vote reads the examples cell by cell: each write's entry for a count, and under outer the centre, is the majority of the example cells that show it, a tie is 0 and listed in ties, and a count never seen is 0; no row is refused conflict or not_counting, examples.conflicts stays 0, and every other refusal stands. The answer then adds per write tallies, [zeros, ones] for each count in the shape of tables, ties, deviating, the example cells whose output disagrees with the law, and deviating_cells, at most 64 of them in example order, then z, y, x, each with example, at, count, centre under outer, seen and law; and deviating_share, the deviating cells over the voted cells (the example cells times the writes) as [num, den]. On examples that noise refuse answers, vote answers the same bytes with only these fields added. noise refuse, the default, answers as a request without noise, and noise vote under minimal or symmetric is refused noise_rule at $.noise. Under rule totalistic or outer, places names the counted places by a preset: moore, every place, as without places; von_neumann, the centre and its 4 (3x3) or 6 (3x3x3) face neighbours; hex, 3x3 only, places 1, 2, 3, 4, 5, 6, 7, the centre and the axial hex neighbours; or place_list names them as distinct place indices that hold the centre. Under totalistic the count runs over those places, the centre included, and under outer over those other than the centre, which stays the separate bit; the law reads no other place, and the counts, tables, unseen_counts, not_counting and the vote shrink to them. The answer then adds places, the sorted list and the preset if one was given. A preset the stencil lacks, an index outside it, one named twice, a list without the centre, or both places and place_list is refused places; places or place_list under minimal or symmetric is refused places_rule. min_support, 1 if left out and at most the stencil's places times 64, goes with noise vote only and is refused support_noise without it: the answer adds thin, per write in the shape of ties, each count shown by at least one and fewer than min_support example cells, with its count and tally; such a count is still decided by the vote and the law does not change";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Point {
@@ -641,6 +647,30 @@ fn learn_shown() -> Json {
                         &["refuse", "vote"],
                     ),
                     vec![("default", text("refuse"))],
+                ),
+            ),
+            (
+                "places",
+                choice(
+                    "rule totalistic or outer: the places counted, the centre always among them; moore, every place, if left out; von_neumann, the centre and its 4 (3x3) or 6 (3x3x3) face neighbours; hex, 3x3 only, the centre and places 1, 2, 3, 5, 6, 7, the axial hex neighbours (+1,0) (-1,0) (0,+1) (0,-1) (+1,-1) (-1,+1) as (dx, dy). Give this or place_list",
+                    &stencil::PRESETS,
+                ),
+            ),
+            (
+                "place_list",
+                list_shown(
+                    word(),
+                    "rule totalistic or outer: the places counted as stencil place indices in the row order, distinct, in the stencil and with the centre (4 for 3x3, 13 for 3x3x3); give this or places",
+                    1,
+                    27,
+                ),
+            ),
+            (
+                "min_support",
+                whole(
+                    "noise vote: a count shown by fewer example cells than this is listed in thin with its tally; 1 if left out, at most the stencil's places times 64",
+                    1,
+                    27 * i64::from(SUPPORT_MOST),
                 ),
             ),
         ],
@@ -1540,8 +1570,9 @@ fn split_shown(output: u32, (row, seen): (u32, stencil::Seen)) -> Json {
     ])
 }
 
-fn uncounted(tallied: &Tallied, tally: Tally, stencil: Stencil) -> Failed {
-    let counts = tally.counts(stencil);
+fn uncounted(tallied: &Tallied, counting: Counting) -> Failed {
+    let tally = counting.tally;
+    let counts = counting.counts();
     let listed: Vec<Json> = tallied
         .split
         .iter()
@@ -1579,13 +1610,118 @@ fn uncounted(tallied: &Tallied, tally: Tally, stencil: Stencil) -> Failed {
     ))
 }
 
-fn by_count(tally: Tally, stencil: Stencil, each: &dyn Fn(u32) -> Option<Json>) -> Json {
-    let counts = tally.counts(stencil);
+fn by_count(counting: Counting, each: &dyn Fn(u32) -> Option<Json>) -> Json {
+    let counts = counting.counts();
     let row = |from: u32| Json::List((from..from + counts).filter_map(each).collect());
-    match tally {
+    match counting.tally {
         Tally::Totalistic => row(0),
         Tally::Outer => Json::List(vec![row(0), row(counts)]),
     }
+}
+
+struct Masked {
+    mask: u32,
+    preset: Option<&'static str>,
+}
+
+fn places_refused(field: &str, message: String) -> Failed {
+    refused(Code::Places, field, message)
+}
+
+fn masked(held: &Json, stencil: Stencil) -> Result<Option<Masked>, Failed> {
+    let positions = stencil.positions();
+    let centre = stencil.place([0, 0, 0]);
+    match (held.get("places"), held.get("place_list")) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(places_refused(
+            "$.place_list",
+            "places and place_list were both given, and the counted places are named by one of them".to_owned(),
+        )),
+        (Some(one), None) => {
+            let asked = one.text().ok_or_else(|| unread("places"))?;
+            let preset = stencil::PRESETS
+                .iter()
+                .find(|name| **name == asked)
+                .ok_or_else(|| unread("places"))?;
+            let mask = stencil::preset(stencil, preset).ok_or_else(|| {
+                places_refused(
+                    "$.places",
+                    format!(
+                        "places {preset} names a neighbourhood the {} stencil does not have; hex is a 3x3 neighbourhood",
+                        stencil.name()
+                    ),
+                )
+            })?;
+            Ok(Some(Masked {
+                mask,
+                preset: Some(preset),
+            }))
+        }
+        (None, Some(one)) => {
+            let listed = ints(one, "place_list")?;
+            let mut mask = 0_u32;
+            for (at, place) in listed.iter().enumerate() {
+                if *place >= positions {
+                    return Err(places_refused(
+                        &format!("$.place_list[{at}]"),
+                        format!(
+                            "place {place} is not a place of the {} stencil, whose places are 0 to {}",
+                            stencil.name(),
+                            positions - 1
+                        ),
+                    ));
+                }
+                if (mask >> place) & 1 == 1 {
+                    return Err(places_refused(
+                        &format!("$.place_list[{at}]"),
+                        format!("place {place} is named more than once"),
+                    ));
+                }
+                mask |= 1 << place;
+            }
+            if (mask >> centre) & 1 == 0 {
+                return Err(places_refused(
+                    "$.place_list",
+                    format!(
+                        "the centre, place {centre} of the {} stencil, is not named, and a counting law always reads it",
+                        stencil.name()
+                    ),
+                ));
+            }
+            Ok(Some(Masked { mask, preset: None }))
+        }
+    }
+}
+
+fn support_of(held: &Json, stencil: Stencil) -> Result<Option<u32>, Failed> {
+    if held.get("min_support").is_none() {
+        return Ok(None);
+    }
+    let asked = int(held, "min_support")?;
+    let most = stencil.positions() * SUPPORT_MOST;
+    if asked > most {
+        return Err(limited(
+            Code::SupportLimit,
+            "$.min_support",
+            format!(
+                "min_support is {asked}, and the {} stencil takes 1 to {most}, its places times {SUPPORT_MOST}",
+                stencil.name()
+            ),
+            counted(most),
+        ));
+    }
+    Ok(Some(asked))
+}
+
+fn places_shown(counting: Counting, preset: Option<&str>) -> Json {
+    let mut fields = vec![(
+        "list",
+        Json::List(counting.places().into_iter().map(counted).collect()),
+    )];
+    if let Some(name) = preset {
+        fields.push(("preset", text(name)));
+    }
+    map(fields)
 }
 
 fn counted_law(
@@ -1618,6 +1754,15 @@ fn counted_law(
             counted(1),
         ));
     }
+    let given = masked(held, stencil)?;
+    let support = support_of(held, stencil)?;
+    let counting = Counting {
+        tally,
+        stencil,
+        mask: given
+            .as_ref()
+            .map_or(Counting::moore(tally, stencil).mask, |one| one.mask),
+    };
     let inputs = stencil.positions();
     let outputs = u32::try_from(asked.writes.len()).unwrap_or(u32::MAX);
     let channels = channels_of(held, asked)?;
@@ -1627,8 +1772,7 @@ fn counted_law(
     let rows = stencil::rows_of(stencil, &asked.reads, &asked.writes, &samples, asked.border);
     let voted = if vote {
         let voting = Voting {
-            tally,
-            stencil,
+            counting,
             reads: &asked.reads,
             writes: &asked.writes,
             border: asked.border,
@@ -1643,20 +1787,20 @@ fn counted_law(
         if !rows.conflicts.is_empty() {
             return Err(conflicted(&rows));
         }
-        let tallied = stencil::tallied(tally, stencil, outputs, &rows.seen);
+        let tallied = stencil::tallied(counting, outputs, &rows.seen);
         if !tallied.split.is_empty() {
-            return Err(uncounted(&tallied, tally, stencil));
+            return Err(uncounted(&tallied, counting));
         }
         tallied.table
     };
     let table: Vec<u32> = entries.iter().map(|one| one.unwrap_or(0)).collect();
     let law_at = |row: u32| {
         table
-            .get(tally.class(stencil, row) as usize)
+            .get(counting.class(row) as usize)
             .copied()
             .unwrap_or(0)
     };
-    let gates = stencil::tally_gates(tally, stencil, outputs, &table);
+    let gates = stencil::counted_gates(counting, outputs, &table);
     for (row, one) in &rows.seen {
         let wanted = if vote { law_at(*row) } else { one.outputs };
         if stencil::answer(inputs, outputs, &gates, *row) != wanted {
@@ -1676,7 +1820,7 @@ fn counted_law(
     let total = 1_u64 << inputs;
     let seen = u64::try_from(rows.seen.len()).unwrap_or(u64::MAX);
     let unseen = total - seen;
-    let counts = tally.counts(stencil);
+    let counts = counting.counts();
     let mut tables = Vec::with_capacity(outputs as usize);
     let mut never = Vec::with_capacity(outputs as usize);
     let mut ones = Vec::with_capacity(outputs as usize);
@@ -1687,16 +1831,16 @@ fn counted_law(
                 .get(class as usize)
                 .map_or(0, |word| (word >> output) & 1)
         };
-        tables.push(by_count(tally, stencil, &|class| Some(counted(bit(class)))));
-        never.push(by_count(tally, stencil, &|class| {
+        tables.push(by_count(counting, &|class| Some(counted(bit(class)))));
+        never.push(by_count(counting, &|class| {
             entries
                 .get(class as usize)
                 .is_some_and(Option::is_none)
                 .then(|| counted(class % counts))
         }));
-        let all: u64 = (0..tally.classes(stencil))
+        let all: u64 = (0..counting.classes())
             .filter(|class| bit(*class) == 1)
-            .map(|class| tally.rows_in(stencil, class))
+            .map(|class| counting.rows_in(class))
             .sum();
         let on_seen = rows
             .seen
@@ -1712,9 +1856,11 @@ fn counted_law(
         ("rule", text(tally.name())),
         (
             "means",
-            text(match tally {
-                Tally::Totalistic => TOTALISTIC,
-                Tally::Outer => OUTER,
+            text(match (tally, given.is_some()) {
+                (Tally::Totalistic, false) => TOTALISTIC,
+                (Tally::Outer, false) => OUTER,
+                (Tally::Totalistic, true) => TOTALISTIC_PLACES,
+                (Tally::Outer, true) => OUTER_PLACES,
             }),
         ),
         ("zeros", Json::List(zeros)),
@@ -1764,8 +1910,14 @@ fn counted_law(
         ("ladder", Json::List(Vec::new())),
         ("stopped", text(NO_SEARCH)),
     ]);
+    if let Some(one) = &given {
+        answer.push(("places", places_shown(counting, one.preset)));
+    }
     if let Some(one) = &voted {
-        answer.extend(vote_shown(one, tally, stencil));
+        answer.extend(vote_shown(one, counting));
+        if let Some(least) = support {
+            answer.push(("thin", thin_shown(one, counting, least)));
+        }
     }
     Ok(map(answer))
 }
@@ -1784,13 +1936,36 @@ fn deviation_shown(one: &Deviation, tally: Tally, counts: u32) -> Json {
     map(fields)
 }
 
-fn vote_shown(voted: &Voted, tally: Tally, stencil: Stencil) -> Vec<(&'static str, Json)> {
-    let counts = tally.counts(stencil);
+fn thin_shown(voted: &Voted, counting: Counting, least: u32) -> Json {
+    let counts = counting.counts();
+    Json::List(
+        voted
+            .tallies
+            .iter()
+            .map(|held| {
+                by_count(counting, &|class| {
+                    let [zeros, ones] = held.get(class as usize).copied().unwrap_or([0, 0]);
+                    let cells = zeros.saturating_add(ones);
+                    (cells > 0 && cells < u64::from(least)).then(|| {
+                        map(vec![
+                            ("count", counted(class % counts)),
+                            ("tally", Json::List(vec![exact(zeros), exact(ones)])),
+                        ])
+                    })
+                })
+            })
+            .collect(),
+    )
+}
+
+fn vote_shown(voted: &Voted, counting: Counting) -> Vec<(&'static str, Json)> {
+    let tally = counting.tally;
+    let counts = counting.counts();
     let tallies = voted
         .tallies
         .iter()
         .map(|held| {
-            by_count(tally, stencil, &|class| {
+            by_count(counting, &|class| {
                 held.get(class as usize)
                     .map(|pair| Json::List(pair.iter().map(|one| exact(*one)).collect()))
             })
@@ -1800,7 +1975,7 @@ fn vote_shown(voted: &Voted, tally: Tally, stencil: Stencil) -> Vec<(&'static st
         .ties
         .iter()
         .map(|tied| {
-            by_count(tally, stencil, &|class| {
+            by_count(counting, &|class| {
                 tied.contains(&class).then(|| counted(class % counts))
             })
         })
@@ -1873,6 +2048,13 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             _ => return Err(unread("noise")),
         },
     };
+    if !vote && held.get("min_support").is_some() {
+        return Err(refused(
+            Code::SupportNoise,
+            "$.min_support",
+            "min_support marks the counts a vote decides on few example cells, and noise is not vote; min_support goes with noise vote".to_owned(),
+        ));
+    }
     let symmetric = match held.get("rule").and_then(Json::text) {
         Some("symmetric") => true,
         Some("minimal") => false,
@@ -1889,6 +2071,18 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
                 if symmetric { "symmetric" } else { "minimal" }
             ),
         ));
+    }
+    for key in ["places", "place_list"] {
+        if held.get(key).is_some() {
+            return Err(refused(
+                Code::PlacesRule,
+                &format!("$.{key}"),
+                format!(
+                    "rule {} searches for a circuit over every place of the stencil, so it takes no {key}; {key} goes with rule totalistic or outer",
+                    if symmetric { "symmetric" } else { "minimal" }
+                ),
+            ));
+        }
     }
     let reads = u32::try_from(asked.reads.len()).unwrap_or(u32::MAX);
     let outputs = u32::try_from(asked.writes.len()).unwrap_or(u32::MAX);

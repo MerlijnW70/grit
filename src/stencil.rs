@@ -674,47 +674,137 @@ impl Tally {
 
     #[must_use]
     pub fn counted(self, stencil: Stencil) -> Vec<u32> {
-        let centre = stencil.place([0, 0, 0]);
-        (0..stencil.positions())
-            .filter(|place| self == Self::Totalistic || *place != centre)
-            .collect()
+        Counting::moore(self, stencil).counted()
     }
 
     #[must_use]
     pub fn counts(self, stencil: Stencil) -> u32 {
-        u32::try_from(self.counted(stencil).len()).unwrap_or(0) + 1
+        Counting::moore(self, stencil).counts()
     }
 
     #[must_use]
     pub fn classes(self, stencil: Stencil) -> u32 {
-        match self {
-            Self::Totalistic => self.counts(stencil),
-            Self::Outer => 2 * self.counts(stencil),
-        }
+        Counting::moore(self, stencil).classes()
     }
 
     #[must_use]
     pub fn class(self, stencil: Stencil, row: u32) -> u32 {
+        Counting::moore(self, stencil).class(row)
+    }
+
+    #[must_use]
+    pub fn rows_in(self, stencil: Stencil, class: u32) -> u64 {
+        Counting::moore(self, stencil).rows_in(class)
+    }
+}
+
+pub const PRESETS: [&str; 3] = ["moore", "von_neumann", "hex"];
+
+pub const HEX: [[i64; 3]; 6] = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [1, -1, 0],
+    [-1, 1, 0],
+];
+
+#[must_use]
+pub fn preset(stencil: Stencil, name: &str) -> Option<u32> {
+    let every = (1_u32 << stencil.positions()) - 1;
+    let centre = 1_u32 << stencil.place([0, 0, 0]);
+    match name {
+        "moore" => Some(every),
+        "von_neumann" => Some(
+            (0..stencil.positions())
+                .filter(|place| {
+                    stencil
+                        .offset(*place)
+                        .iter()
+                        .map(|one| one.unsigned_abs())
+                        .sum::<u64>()
+                        <= 1
+                })
+                .fold(0, |held, place| held | (1 << place)),
+        ),
+        "hex" if stencil == Stencil::Square => Some(
+            HEX.iter()
+                .fold(centre, |held, at| held | (1 << stencil.place(*at))),
+        ),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counting {
+    pub tally: Tally,
+    pub stencil: Stencil,
+    pub mask: u32,
+}
+
+impl Counting {
+    #[must_use]
+    pub const fn moore(tally: Tally, stencil: Stencil) -> Self {
+        Self {
+            tally,
+            stencil,
+            mask: (1 << stencil.positions()) - 1,
+        }
+    }
+
+    #[must_use]
+    pub fn places(self) -> Vec<u32> {
+        (0..self.stencil.positions())
+            .filter(|place| (self.mask >> place) & 1 == 1)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn counted(self) -> Vec<u32> {
+        let centre = self.stencil.place([0, 0, 0]);
+        self.places()
+            .into_iter()
+            .filter(|place| self.tally == Tally::Totalistic || *place != centre)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn counts(self) -> u32 {
+        u32::try_from(self.counted().len()).unwrap_or(0) + 1
+    }
+
+    #[must_use]
+    pub fn classes(self) -> u32 {
+        match self.tally {
+            Tally::Totalistic => self.counts(),
+            Tally::Outer => 2 * self.counts(),
+        }
+    }
+
+    #[must_use]
+    pub fn class(self, row: u32) -> u32 {
         let n = self
-            .counted(stencil)
+            .counted()
             .iter()
             .filter(|place| (row >> **place) & 1 == 1)
             .count();
         let n = u32::try_from(n).unwrap_or(0);
-        match self {
-            Self::Totalistic => n,
-            Self::Outer => {
-                let centre = (row >> stencil.place([0, 0, 0])) & 1;
-                centre * self.counts(stencil) + n
+        match self.tally {
+            Tally::Totalistic => n,
+            Tally::Outer => {
+                let centre = (row >> self.stencil.place([0, 0, 0])) & 1;
+                centre * self.counts() + n
             }
         }
     }
 
     #[must_use]
-    pub fn rows_in(self, stencil: Stencil, class: u32) -> u64 {
-        let places = u64::from(self.counts(stencil) - 1);
-        let n = u64::from(class % self.counts(stencil));
-        (0..n).fold(1_u64, |held, at| held * (places - at) / (at + 1))
+    pub fn rows_in(self, class: u32) -> u64 {
+        let places = u64::from(self.counts() - 1);
+        let n = u64::from(class % self.counts());
+        let centre = u64::from(self.tally == Tally::Outer);
+        let free = u64::from(self.stencil.positions()) - places - centre;
+        (0..n).fold(1_u64, |held, at| held * (places - at) / (at + 1)) << free
     }
 }
 
@@ -742,17 +832,12 @@ const fn order_of(one: &Seen) -> u128 {
 type Marks = Vec<Vec<[Option<(u32, Seen)>; 2]>>;
 
 #[must_use]
-pub fn tallied(
-    tally: Tally,
-    stencil: Stencil,
-    outputs: u32,
-    seen: &BTreeMap<u32, Seen>,
-) -> Tallied {
-    let classes = tally.classes(stencil) as usize;
+pub fn tallied(counting: Counting, outputs: u32, seen: &BTreeMap<u32, Seen>) -> Tallied {
+    let classes = counting.classes() as usize;
     let mut table: Vec<Option<u32>> = vec![None; classes];
     let mut marks: Marks = vec![vec![[None, None]; outputs as usize]; classes];
     for (row, one) in seen {
-        let class = tally.class(stencil, *row) as usize;
+        let class = counting.class(*row) as usize;
         if let Some(slot) = table.get_mut(class) {
             *slot = Some(one.outputs);
         }
@@ -808,8 +893,7 @@ pub struct Voted {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Voting<'held> {
-    pub tally: Tally,
-    pub stencil: Stencil,
+    pub counting: Counting,
     pub reads: &'held [Bit],
     pub writes: &'held [Bit],
     pub border: Border,
@@ -832,19 +916,19 @@ fn each_cell(samples: &[Sample<'_>], visit: &mut dyn FnMut(u32, [u32; 3], &Sampl
 #[must_use]
 pub fn voted(voting: Voting<'_>, samples: &[Sample<'_>], most: usize) -> Voted {
     let Voting {
-        tally,
-        stencil,
+        counting,
         reads,
         writes,
         border,
     } = voting;
-    let classes = tally.classes(stencil) as usize;
+    let stencil = counting.stencil;
+    let classes = counting.classes() as usize;
     let mut tallies: Vec<Vec<[u64; 2]>> = vec![vec![[0, 0]; classes]; writes.len()];
     let mut shown = vec![false; classes];
     let mut cells = 0_u64;
     each_cell(samples, &mut |_, at, sample| {
         cells += 1;
-        let class = tally.class(stencil, row_at(stencil, reads, sample, at, border)) as usize;
+        let class = counting.class(row_at(stencil, reads, sample, at, border)) as usize;
         if let Some(slot) = shown.get_mut(class) {
             *slot = true;
         }
@@ -878,7 +962,7 @@ pub fn voted(voting: Voting<'_>, samples: &[Sample<'_>], most: usize) -> Voted {
     let mut deviating = vec![0_u64; writes.len()];
     let mut deviations: Vec<Vec<Deviation>> = vec![Vec::new(); writes.len()];
     each_cell(samples, &mut |example, at, sample| {
-        let class = tally.class(stencil, row_at(stencil, reads, sample, at, border));
+        let class = counting.class(row_at(stencil, reads, sample, at, border));
         let law = table.get(class as usize).copied().flatten().unwrap_or(0);
         let outputs = outputs_at(writes, sample, at);
         for (write, (count, held)) in deviating.iter_mut().zip(deviations.iter_mut()).enumerate() {
@@ -1026,13 +1110,19 @@ impl Wires {
 
 #[must_use]
 pub fn tally_gates(tally: Tally, stencil: Stencil, outputs: u32, table: &[u32]) -> Vec<Gate> {
+    counted_gates(Counting::moore(tally, stencil), outputs, table)
+}
+
+#[must_use]
+pub fn counted_gates(counting: Counting, outputs: u32, table: &[u32]) -> Vec<Gate> {
+    let Counting { tally, stencil, .. } = counting;
     let inputs = stencil.positions();
     let mut wires = Wires {
         inputs,
         gates: Vec::new(),
     };
-    let counts = tally.counts(stencil);
-    let bits = wires.summed(&tally.counted(stencil));
+    let counts = counting.counts();
+    let bits = wires.summed(&counting.counted());
     let lines = wires.decoded(&bits, counts);
     let centre = stencil.place([0, 0, 0]);
     let mut outs = Vec::with_capacity(outputs as usize);

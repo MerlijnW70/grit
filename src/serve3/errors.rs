@@ -79,9 +79,13 @@ pub enum Code {
     StartShape,
     StartRule,
     NoiseRule,
+    Places,
+    PlacesRule,
+    SupportNoise,
+    SupportLimit,
 }
 
-pub const CODES: [Code; 75] = [
+pub const CODES: [Code; 79] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -157,6 +161,10 @@ pub const CODES: [Code; 75] = [
     Code::StartShape,
     Code::StartRule,
     Code::NoiseRule,
+    Code::Places,
+    Code::PlacesRule,
+    Code::SupportNoise,
+    Code::SupportLimit,
 ];
 
 impl Code {
@@ -238,6 +246,10 @@ impl Code {
             Self::StartShape => "start_shape",
             Self::StartRule => "start_rule",
             Self::NoiseRule => "noise_rule",
+            Self::Places => "places",
+            Self::PlacesRule => "places_rule",
+            Self::SupportNoise => "support_noise",
+            Self::SupportLimit => "support_limit",
         }
     }
 
@@ -436,6 +448,18 @@ impl Code {
             }
             Self::NoiseRule => {
                 "Drop noise or give it refuse, or use rule totalistic or outer; minimal and symmetric take no vote."
+            }
+            Self::Places => {
+                "Give places a preset the stencil has (hex is 3x3 only), or place_list distinct place indices of the stencil with its centre, not both."
+            }
+            Self::PlacesRule => {
+                "Drop places and place_list, or use rule totalistic or outer; minimal and symmetric read every place."
+            }
+            Self::SupportNoise => {
+                "Drop min_support, or give noise vote; only a vote has counts decided on few cells."
+            }
+            Self::SupportLimit => {
+                "Give min_support from 1 to the stencil's places times 64: 576 for 3x3, 1728 for 3x3x3."
             }
         }
     }

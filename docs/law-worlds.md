@@ -204,6 +204,8 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `gates`, `crowd`, `rounds`, `seed` | the search's effort, as `grit_least` |
 | `start` | under `minimal` and `symmetric`, a circuit to begin from; see [A start](#a-start) |
 | `noise` | under `totalistic` and `outer`: `refuse` (the default) or `vote`; see [Noisy examples](#noisy-examples) |
+| `places`, `place_list` | under `totalistic` and `outer`: the places counted; see [Counted places](#counted-places) |
+| `min_support` | under `noise` `vote`: lists the counts shown by few cells in `thin`; see [Noisy examples](#noisy-examples) |
 
 The server builds every example cell's row, counts the rows, and refuses `conflict` at `$.examples` when one row is seen with two outputs. The refusal's `rows` lists each such row with every output and where it was first seen. The search is `grit_machine`'s, over the seen rows only, so 27-input stencils work. It walks a gate ladder down from `gates` as `grit_least` does and keeps the smallest circuit that answers every seen row.
 
@@ -237,6 +239,7 @@ Refused before any device work:
 | `learn_limit` | more live gates than a rung takes: 256, or under `symmetric` the gates whose copies and ors fit a law (74 for 3x3 with one write); `limit` names it | `$.start` |
 | `start_rule` | `start` under `totalistic` or `outer` | `$.start` |
 | `noise_rule` | `noise` `vote` under `minimal` or `symmetric` | `$.noise` |
+| `places_rule` | `places` or `place_list` under `minimal` or `symmetric` | `$.places` or `$.place_list` |
 
 Only live gates count: gates no output reads are dropped first. The server answers the start's law (its live gates under `minimal`, the or of their images under `symmetric`) on the host on every seen row and, under `symmetric`, on every image of one. Under `symmetric` "answers every seen row" is about that or of images, not the circuit alone, so a 3-gate circuit (the centre and not all of north, south and east) holds for the X0b pairs: its images together ask for all four.
 
@@ -280,6 +283,29 @@ The answer has the fields above except `found`, and:
 
 The call builds no search kernel and has no brake: it reads the rows, then builds the circuit. With inline examples it needs no compute device. The same request gives the same bytes. `gates`, `crowd`, `rounds` and `seed` are not used.
 
+### Counted places
+
+By default a counting law counts every place of the stencil. `places` names a smaller neighbourhood by preset, and `place_list` names one by place indices in the [row order](#row-order). Give one of them, not both.
+
+| `places` | Stencil | Place indices |
+|---|---|---|
+| `moore` | both | every place: the default |
+| `von_neumann` | 3x3 | 1, 3, 4, 5, 7: the centre and its 4 face neighbours |
+| `von_neumann` | 3x3x3 | 4, 10, 12, 13, 14, 16, 22: the centre and its 6 face neighbours |
+| `hex` | 3x3 | 1, 2, 3, 4, 5, 6, 7: the centre and the axial hex neighbours (+1,0) (-1,0) (0,+1) (0,-1) (+1,-1) (-1,+1) as (dx, dy) |
+
+`hex` runs a hex world stored as a 2D grid in axial coordinates, the two diagonal places 0 and 8 left out. Under `totalistic` the count runs over the named places, the centre included. Under `outer` it runs over them less the centre, and the centre stays the separate bit. The law's circuit reads no other place, so the counts, `tables`, `unseen_counts`, `not_counting`, `unseen` and the vote all shrink to the named places. The answer adds `places`: `list`, the sorted indices, and `preset` when one was given. A `place_list` equal to a preset answers the same law.
+
+Refused before any example is read:
+
+| Code | When | `field` |
+|---|---|---|
+| `places` | a preset the stencil lacks (`hex` on 3x3x3) | `$.places` |
+| `places` | an index outside the stencil, or one named twice | `$.place_list[k]` |
+| `places` | a list without the centre (4 for 3x3, 13 for 3x3x3), or both `places` and `place_list` | `$.place_list` |
+
+A request without `places` or `place_list` answers the same bytes as before.
+
 3x3 majority (1 when at least 5 of the 9 places are 1) from 12 random 32x32 examples: `rule` `totalistic` answers `tables` `[[0,0,0,0,0,1,1,1,1,1]]`. Life is `outer` with `[[[0,0,0,1,0,0,0,0,0],[0,0,1,1,0,0,0,0,0]]]`.
 
 The X0b edge task: 24 inline 32x32 pairs, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `zero`. `minimal` and `symmetric` see 125 rows of 512, refuse nothing, and find the same 4 gates: the centre is 1 and not all four of its orthogonal neighbours are. Under `minimal` that is the law; under `symmetric` it is 8 copies and 7 ors, 39 gates, with the same table. Run it as `runs_as` says: each image at the origin of a 64x64x2 world, plane 0, one step, plane 1 read. `totalistic` and `outer` refuse it `not_counting`: a centre with 4 neighbours set is an edge or not by which 4 they are.
@@ -301,6 +327,8 @@ The answer adds:
 | `deviating` | per write, the example cells whose output disagrees with the law |
 | `deviating_cells` | per write, at most 64 of those cells in example order, then z, y, x: `example`, `at`, `count`, `centre` (under `outer`), `seen` and `law` |
 | `deviating_share` | deviating cells over voted cells (example cells times writes), as an exact `[num, den]` |
+
+`min_support`, from 1 (if left out) up to the stencil's places times 64, marks the counts that rest on little evidence. The answer then adds `thin`: per write, in the shape of `ties`, each count shown by at least one and fewer than `min_support` example cells, as `{count, tally}` with `tally` its `[zeros, ones]`. Such a count is still decided by the vote, so the law does not change. `min_support` without `noise` `vote` is refused `support_noise` at `$.min_support`; 0 is refused `malformed` there, and past the stencil's limit (576 for 3x3) `support_limit`.
 
 Where `refuse` answers a law, `vote` answers the same bytes with only these fields added, so `deviating` is 0. `refuse` answers exactly as a request without `noise`. The same request gives the same bytes.
 
