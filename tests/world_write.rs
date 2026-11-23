@@ -350,6 +350,7 @@ mod recorded {
         ),
     ];
 
+    #[cfg(feature = "faults")]
     pub const SERVED: [(&str, &str, &str); 3] = [
         (
             "majority-64x4",
