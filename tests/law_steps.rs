@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use grit::Host;
 use grit::serve3::Server;
+use grit::stencil::{Border, Counting, Sample, Stencil, Tally};
+use grit::steps::{Stepping, searched, table_of};
 use grit::wire::{Json, written};
 
 const LONG: u64 = 600_000;
@@ -34,6 +36,8 @@ const BASE_SHA: [(&str, &str); 5] = [
         "4b17c7eb8a865b5194816657a4683a49cf3b0c0a442fd0f9dc3e32864a086f90",
     ),
 ];
+
+const WORLD_SHA: &str = "206f325a981603aaa8e0375356b05e8fc6633ec9a251d17790ae14ee638d46fd";
 
 const MOORE: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
@@ -713,20 +717,7 @@ fn k2_a_world_example_reads_k_cells_around_its_box_from_its_world() {
         ),
     );
     let world = int_at(&made, "world");
-    for (plane, cells) in [(0, &input), (1, &output)] {
-        let shown: Vec<String> = (0..grid.cells())
-            .filter(|at| cells[*at] != 0)
-            .map(|at| format!("[{},{},0,1]", at % 32, at / 32))
-            .collect();
-        called(
-            &mut server,
-            "grit_world_write",
-            &format!(
-                "{{\"world\":{world},\"plane\":{plane},\"cells\":[{}],\"budget_ms\":{LONG}}}",
-                shown.join(",")
-            ),
-        );
-    }
+    planes_written(&mut server, world, grid, [&input, &output]);
     let arguments = format!(
         "{{\"stencil\":\"3x3\",\"reads\":[{{\"plane\":0,\"bit\":0}}],\"writes\":[{{\"plane\":1,\"bit\":0}}],\"border\":\"wrapped\",\"rule\":\"outer\",\"examples\":[{{\"world\":{world},\"from\":[5,6,0],\"to\":[26,24,0]}}],\"steps\":3,\"budget_ms\":{LONG}}}"
     );
@@ -881,6 +872,455 @@ fn k5_each_wrong_use_of_steps_is_refused_by_its_code_and_field() {
     assert!(int_at(&fits, "consistent") >= 1);
 }
 
+struct Model {
+    size: [usize; 3],
+    wrapped: bool,
+    bits: Vec<u32>,
+    targets: Vec<(usize, bool)>,
+}
+
+impl Model {
+    fn cell(&self, at: [i64; 3]) -> Option<usize> {
+        let mut spot = [0_usize; 3];
+        for ((slot, value), side) in spot.iter_mut().zip(at).zip(self.size) {
+            let side = i64::try_from(side).unwrap();
+            let inside = if (0..side).contains(&value) {
+                value
+            } else if self.wrapped {
+                value.rem_euclid(side)
+            } else {
+                return None;
+            };
+            *slot = usize::try_from(inside).unwrap();
+        }
+        Some((spot[2] * self.size[1] + spot[1]) * self.size[0] + spot[0])
+    }
+
+    fn coords(&self, cell: usize) -> [i64; 3] {
+        let [wide, deep, _] = self.size;
+        [cell % wide, cell / wide % deep, cell / wide / deep].map(|one| i64::try_from(one).unwrap())
+    }
+
+    fn around(&self, offsets: &[[i64; 3]]) -> Vec<Vec<usize>> {
+        (0..self.bits.len())
+            .map(|cell| {
+                let at = self.coords(cell);
+                offsets
+                    .iter()
+                    .filter_map(|step| {
+                        self.cell([at[0] + step[0], at[1] + step[1], at[2] + step[2]])
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Rules {
+    outer: bool,
+    counts: u32,
+    steps: u32,
+}
+
+impl Rules {
+    const fn classes(self) -> u32 {
+        if self.outer {
+            2 * self.counts
+        } else {
+            self.counts
+        }
+    }
+}
+
+fn ran(model: &Model, around: &[Vec<usize>], rules: Rules, code: u64) -> Vec<u32> {
+    let mut held = model.bits.clone();
+    for _ in 0..rules.steps {
+        held = around
+            .iter()
+            .enumerate()
+            .map(|(cell, near)| {
+                let n: u32 = near.iter().map(|one| held[*one]).sum();
+                let class = if rules.outer {
+                    held[cell] * rules.counts + n
+                } else {
+                    n
+                };
+                u32::from((code >> class) & 1 == 1)
+            })
+            .collect();
+    }
+    held
+}
+
+fn offsets_of(cube: bool, mask: u32, outer: bool) -> Vec<[i64; 3]> {
+    let (positions, centre) = if cube { (27, 13) } else { (9, 4) };
+    (0..positions)
+        .filter(|place| (mask >> place) & 1 == 1 && !(outer && *place == centre))
+        .map(|place| {
+            let place = i64::from(place);
+            [
+                place % 3 - 1,
+                place / 3 % 3 - 1,
+                if cube { place / 9 - 1 } else { 0 },
+            ]
+        })
+        .collect()
+}
+
+struct Brute {
+    consistent: u64,
+    codes: Vec<u64>,
+    closest: Option<(u64, u64)>,
+}
+
+fn brute(models: &[(Model, Vec<Vec<usize>>)], rules: Rules) -> Brute {
+    let mut truth = Brute {
+        consistent: 0,
+        codes: Vec::new(),
+        closest: None,
+    };
+    for code in 0..1_u64 << rules.classes() {
+        let wrong: u64 = models
+            .iter()
+            .map(|(model, around)| {
+                let after = ran(model, around, rules, code);
+                model
+                    .targets
+                    .iter()
+                    .filter(|(cell, wanted)| (after[*cell] == 1) != *wanted)
+                    .count() as u64
+            })
+            .sum();
+        if wrong == 0 {
+            truth.consistent += 1;
+            if truth.codes.len() < 16 {
+                truth.codes.push(code);
+            }
+        } else if truth.closest.is_none_or(|held| (wrong, code) < held) {
+            truth.closest = Some((wrong, code));
+        }
+    }
+    truth
+}
+
+struct Shown {
+    size: [u32; 3],
+    input: Vec<u32>,
+    from: [u32; 3],
+    inner: [u32; 3],
+    output: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Inline,
+    Crop,
+    World,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Output {
+    Law,
+    Flipped,
+    Random,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Setup {
+    cube: bool,
+    outer: bool,
+    wrapped: bool,
+    steps: u32,
+    full: bool,
+    output: Output,
+}
+
+struct Trial {
+    stepping: Stepping,
+    rules: Rules,
+    models: Vec<(Model, Vec<Vec<usize>>)>,
+    shown: Vec<Shown>,
+    kinds: Vec<Kind>,
+}
+
+fn side(rng: &mut Rng, least: usize, most: usize) -> usize {
+    least + usize::try_from(rng.below((most - least + 1) as u64)).unwrap()
+}
+
+fn word(rng: &mut Rng, bit: bool, at: u32) -> u32 {
+    let junk = u32::try_from(rng.below(256)).unwrap() & !(1 << at);
+    junk | (u32::from(bit) << at)
+}
+
+fn mask_of(rng: &mut Rng, setup: Setup) -> u32 {
+    loop {
+        let mask = if setup.full {
+            (1 << 9) - 1
+        } else if setup.cube {
+            let places = 1 + rng.below(6);
+            (0..places).fold(0, |held, _| held | 1 << rng.below(27))
+        } else {
+            u32::try_from(rng.below(1 << 9)).unwrap()
+        };
+        if !offsets_of(setup.cube, mask, setup.outer).is_empty() {
+            return mask;
+        }
+    }
+}
+
+fn boxed(model: &Model, from: [i64; 3], inner: [usize; 3]) -> Vec<usize> {
+    let mut cells = Vec::new();
+    for z in 0..inner[2] {
+        for y in 0..inner[1] {
+            for x in 0..inner[0] {
+                let at = [x, y, z].map(|one| i64::try_from(one).unwrap());
+                cells.push(
+                    model
+                        .cell([from[0] + at[0], from[1] + at[1], from[2] + at[2]])
+                        .unwrap(),
+                );
+            }
+        }
+    }
+    cells
+}
+
+fn trial_of(rng: &mut Rng, setup: Setup) -> Trial {
+    let mask = mask_of(rng, setup);
+    let offsets = offsets_of(setup.cube, mask, setup.outer);
+    let rules = Rules {
+        outer: setup.outer,
+        counts: u32::try_from(offsets.len()).unwrap() + 1,
+        steps: setup.steps,
+    };
+    let bit = u32::try_from(rng.below(4)).unwrap();
+    let stencil = if setup.cube {
+        Stencil::Cube
+    } else {
+        Stencil::Square
+    };
+    let tally = if setup.outer {
+        Tally::Outer
+    } else {
+        Tally::Totalistic
+    };
+    let mut trial = Trial {
+        stepping: Stepping {
+            counting: Counting {
+                tally,
+                stencil,
+                mask,
+            },
+            steps: setup.steps,
+            border: if setup.wrapped {
+                Border::Wrapped
+            } else {
+                Border::Zero
+            },
+            read: bit,
+            write: bit,
+        },
+        rules,
+        models: Vec::new(),
+        shown: Vec::new(),
+        kinds: Vec::new(),
+    };
+    let source = rng.below(1 << rules.classes());
+    let axes = if setup.cube { 3 } else { 2 };
+    let most = match (setup.cube, setup.full) {
+        (true, _) => 4,
+        (false, true) => 5,
+        (false, false) => 7,
+    };
+    let pad = setup.steps as usize;
+    for _ in 0..1 + rng.below(3) {
+        let kind = match (setup.wrapped, rng.below(2)) {
+            (_, 0) => Kind::Inline,
+            (false, _) => Kind::Crop,
+            (true, _) => Kind::World,
+        };
+        let least = if kind == Kind::World { 2 } else { 1 };
+        let mut size = [1_usize; 3];
+        for one in size.iter_mut().take(axes) {
+            *one = side(rng, least, most);
+        }
+        let permille = 250 + rng.below(400);
+        let mut model = Model {
+            size,
+            wrapped: setup.wrapped,
+            bits: (0..size.iter().product())
+                .map(|_| u32::from(rng.below(1000) < permille))
+                .collect(),
+            targets: Vec::new(),
+        };
+        let mut from = [0_usize; 3];
+        let mut inner = size;
+        let mut data_from = [0_i64; 3];
+        let mut data_size = size;
+        let mut shown_from = [0_usize; 3];
+        for axis in 0..axes {
+            let whole = size[axis];
+            match kind {
+                Kind::Inline => {}
+                Kind::Crop => {
+                    from[axis] = side(rng, 0, whole - 1);
+                    inner[axis] = side(rng, 1, whole - from[axis]);
+                    shown_from[axis] = from[axis];
+                }
+                Kind::World => {
+                    from[axis] = side(rng, 0, whole - 1);
+                    inner[axis] = side(rng, 1, whole);
+                    data_from[axis] =
+                        i64::try_from(from[axis]).unwrap() - i64::try_from(pad).unwrap();
+                    data_size[axis] = inner[axis] + 2 * pad;
+                    shown_from[axis] = pad;
+                }
+            }
+        }
+        let around = model.around(&offsets);
+        let after = ran(&model, &around, rules, source);
+        let cells = boxed(&model, from.map(|one| i64::try_from(one).unwrap()), inner);
+        let forced = rng.below(cells.len() as u64);
+        model.targets = cells
+            .iter()
+            .enumerate()
+            .map(|(at, cell)| {
+                let wanted = match setup.output {
+                    Output::Law => after[*cell] == 1,
+                    Output::Flipped => {
+                        (after[*cell] == 1) ^ (at as u64 == forced || rng.below(6) == 0)
+                    }
+                    Output::Random => rng.below(2) == 1,
+                };
+                (*cell, wanted)
+            })
+            .collect();
+        let data = boxed(&model, data_from, data_size);
+        let as_u32 = |held: [usize; 3]| held.map(|one| u32::try_from(one).unwrap());
+        let input = data
+            .iter()
+            .map(|cell| word(rng, model.bits[*cell] == 1, bit))
+            .collect();
+        let output = model
+            .targets
+            .iter()
+            .map(|(_, wanted)| word(rng, *wanted, bit))
+            .collect();
+        trial.shown.push(Shown {
+            size: as_u32(data_size),
+            input,
+            from: as_u32(shown_from),
+            inner: as_u32(inner),
+            output,
+        });
+        trial.models.push((model, around));
+        trial.kinds.push(kind);
+    }
+    trial
+}
+
+#[derive(Default, Debug)]
+struct Covered {
+    trials: u64,
+    refused: u64,
+    refused_late: u64,
+    many: u64,
+    sub_boxes: u64,
+    mixed_sizes: u64,
+    partial_batch: u64,
+}
+
+fn checked_against_brute(trial: &Trial, setup: Setup, covered: &mut Covered) {
+    let samples: Vec<Sample<'_>> = trial
+        .shown
+        .iter()
+        .map(|one| Sample {
+            size: one.size,
+            inputs: vec![&one.input[..]],
+            from: one.from,
+            inner: one.inner,
+            outputs: vec![&one.output[..]],
+        })
+        .collect();
+    let found = searched(&trial.stepping, &samples, &mut || false);
+    let truth = brute(&trial.models, trial.rules);
+    let classes = trial.rules.classes();
+    let label = format!(
+        "{setup:?} mask {:#b} classes {classes} kinds {:?} boxes {:?}",
+        trial.stepping.counting.mask,
+        trial.kinds,
+        trial
+            .shown
+            .iter()
+            .map(|one| (one.size, one.from, one.inner))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(trial.stepping.classes(), classes, "{label}");
+    assert!(found.complete, "{label}");
+    assert_eq!(found.checked, 1 << classes, "{label}");
+    let cells: usize = trial.models.iter().map(|(one, _)| one.targets.len()).sum();
+    assert_eq!(found.cells, cells as u64, "{label}");
+    assert_eq!(found.consistent, truth.consistent, "{label}");
+    assert_eq!(found.codes, truth.codes, "{label}");
+    if truth.consistent == 0 {
+        assert_eq!(found.closest, truth.closest, "{label}");
+        let (wrong, code) = found.closest.unwrap();
+        let expected: Vec<u32> = (0..classes)
+            .map(|class| u32::from((code >> class) & 1 == 1))
+            .collect();
+        assert_eq!(table_of(code, classes), expected, "{label}");
+        covered.refused += 1;
+        covered.refused_late += u64::from(code >= 64 && wrong < 64);
+    }
+    covered.trials += 1;
+    covered.many += u64::from(truth.consistent > 16);
+    covered.partial_batch += u64::from(classes < 6);
+    covered.sub_boxes += u64::from(trial.kinds.iter().any(|one| *one != Kind::Inline));
+    covered.mixed_sizes += u64::from(trial.shown.windows(2).any(|two| two[0].size != two[1].size));
+}
+
+#[test]
+fn k7_the_search_equals_a_brute_force_over_every_table_on_small_grids() {
+    let mut rng = Rng(20_261_124);
+    let mut covered = Covered::default();
+    for cube in [false, true] {
+        for outer in [false, true] {
+            for wrapped in [false, true] {
+                for steps in 2..=5 {
+                    for variant in 0..6 {
+                        let setup = Setup {
+                            cube,
+                            outer,
+                            wrapped,
+                            steps,
+                            full: !cube && variant == 0,
+                            output: match variant % 3 {
+                                0 => Output::Flipped,
+                                1 => Output::Law,
+                                _ => Output::Random,
+                            },
+                        };
+                        let trial = trial_of(&mut rng, setup);
+                        checked_against_brute(&trial, setup, &mut covered);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(covered.trials, 192, "{covered:?}");
+    for (what, count) in [
+        ("no table consistent", covered.refused),
+        ("closest past the first batch", covered.refused_late),
+        ("more than 16 consistent", covered.many),
+        ("sub-boxes", covered.sub_boxes),
+        ("examples of different sizes", covered.mixed_sizes),
+        ("fewer than 64 tables", covered.partial_batch),
+    ] {
+        assert!(count >= 16, "{what}: {covered:?}");
+    }
+}
+
 struct Base {
     name: &'static str,
     arguments: String,
@@ -944,6 +1384,103 @@ fn k6_requests_without_steps_or_with_one_step_answer_the_base_bytes() {
                 one.name
             );
         }
+    }
+}
+
+fn dead_with_eight(grid: Grid, cells: &[u32]) -> bool {
+    (0..i64::from(grid.deep)).any(|y| {
+        (0..i64::from(grid.wide)).any(|x| {
+            cells[grid.at(x, y, true).unwrap()] == 0
+                && (0..9).filter(|place| *place != 4).all(|place| {
+                    cells[grid.at(x + place % 3 - 1, y + place / 3 - 1, true).unwrap()] == 1
+                })
+        })
+    })
+}
+
+#[test]
+fn k8_four_soups_two_warmed_seen_every_fourth_frame_leave_life_and_one_free_entry() {
+    let law = life();
+    let pairs = pairs_of(20_261_127, 4, square(), as_rt1(4, 4), &law, true);
+    for pair in &pairs {
+        let mut held = pair.input.clone();
+        for _ in 0..4 {
+            assert!(!dead_with_eight(pair.grid, &held));
+            held = stepped(pair.grid, &held, true, &law);
+        }
+    }
+    let free = law.with(law.code | 1 << 8);
+    assert_eq!(free.code, 6408);
+    assert!(reproduces(&free, &pairs, true, 4));
+    let mut server = Server::new(None);
+    let got = learned(&mut server, &stepped_args(&law, "wrapped", &pairs, 4, ""));
+    found_first(&got, &law, 4);
+    assert_eq!(int_at(&got, "consistent"), 2);
+    assert_eq!(codes_of(&got, &law), vec![law.code, free.code]);
+}
+
+fn planes_written(server: &mut Server<'_>, world: i64, grid: Grid, planes: [&[u32]; 2]) {
+    for (plane, cells) in planes.iter().enumerate() {
+        let shown: Vec<String> = (0..grid.cells())
+            .filter(|at| cells[*at] != 0)
+            .map(|at| format!("[{},{},0,1]", at as u32 % grid.wide, at as u32 / grid.wide))
+            .collect();
+        called(
+            server,
+            "grit_world_write",
+            &format!(
+                "{{\"world\":{world},\"plane\":{plane},\"cells\":[{}],\"budget_ms\":{LONG}}}",
+                shown.join(",")
+            ),
+        );
+    }
+}
+
+fn world_example_request(server: &mut Server<'_>) -> String {
+    let law = life();
+    let grid = square();
+    let pairs = pairs_of(31, 4, grid, warmed(10, 1), &law, true);
+    let carrier = learned(server, &learn_args("outer", "wrapped", &pairs, ""));
+    let made = called(
+        server,
+        "grit_world_create",
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"tall\":2,\"law\":{},\"budget_ms\":{LONG}}}",
+            written(&Json::Text(text_at(&carrier, "law")))
+        ),
+    );
+    let world = int_at(&made, "world");
+    let mut rng = Rng(7_009);
+    let input = soup(&mut rng, grid, 350);
+    let output = applied(grid, &input, true, &law, 1);
+    planes_written(server, world, grid, [&input, &output]);
+    format!(
+        "{{\"stencil\":\"3x3\",\"reads\":[{{\"plane\":0,\"bit\":0}}],\"writes\":[{{\"plane\":1,\"bit\":0}}],\"border\":\"wrapped\",\"rule\":\"outer\",\"examples\":[{{\"world\":{world},\"from\":[5,6,0],\"to\":[26,24,0]}},{{\"world\":{world},\"from\":[0,20,0],\"to\":[31,31,0]}}],\"budget_ms\":{LONG}}}"
+    )
+}
+
+#[test]
+fn k9_a_world_example_at_one_step_answers_the_base_bytes() {
+    let host = device("law_steps k9");
+    let Some(host) = host.as_ref() else {
+        return;
+    };
+    let mut server = Server::new(Some(host));
+    let arguments = world_example_request(&mut server);
+    let one_step = arguments.replace(
+        &format!("\"budget_ms\":{LONG}"),
+        &format!("\"budget_ms\":{LONG},\"steps\":1"),
+    );
+    assert_ne!(one_step, arguments);
+    for arguments in [&arguments, &one_step] {
+        let got = heard(&mut server, arguments);
+        let told = result(&got, false);
+        assert_eq!(shown_of(&told, "tables"), life().shown());
+        assert_eq!(
+            int_at(told.get("examples").unwrap(), "cells"),
+            22 * 19 + 32 * 12
+        );
+        assert_eq!(sha_of(&got), WORLD_SHA, "{}", written(&told));
     }
 }
 
