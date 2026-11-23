@@ -31,7 +31,7 @@ pub mod wire;
 pub mod written;
 
 pub use host::{Error, Host};
-pub use resident::{Groups, Resident, Run, Ticket};
+pub use resident::{Groups, Resident, Run, Ticket, Traffic};
 pub mod branch;
 pub mod credit;
 pub mod question;

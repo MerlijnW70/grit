@@ -665,14 +665,10 @@ pub fn put3_in(
         });
     }
 
-    let grand = held.read(GRAND as usize, 1)?.first().copied().unwrap_or(0);
-    let mut octs: std::collections::BTreeSet<u32> = held
-        .read(DENSE as usize, grand as usize)?
-        .into_iter()
-        .collect();
+    let mut last = std::collections::BTreeMap::new();
     let mut woken = std::collections::BTreeSet::new();
     for &(cell, word) in cells {
-        write_state(held, windows, lifted + cell as usize, &[word])?;
+        last.insert(cell, word);
         for phase in 0..2 {
             let holder = Solid::held(grid, cell, phase).index;
             if placed.around {
@@ -682,33 +678,180 @@ pub fn put3_in(
             }
         }
     }
-
     let by = plan.per_block.trailing_zeros();
-    let hot_grand = held
-        .read(HOT_GRAND as usize, 1)?
-        .first()
-        .copied()
-        .unwrap_or(0);
-    let mut blocks: std::collections::BTreeSet<u32> = held
-        .read(HOT_DENSE as usize, hot_grand as usize)?
-        .into_iter()
-        .collect();
-    for &oct in &woken {
-        held.write_at(AWAKE as usize, oct as usize, &[2])?;
-        held.write_at(HOT as usize, (oct >> by) as usize, &[2])?;
-        blocks.insert(oct >> by);
-    }
-    octs.extend(woken);
-    let list: Vec<u32> = octs.into_iter().collect();
-    let count = u32::try_from(list.len()).unwrap_or(u32::MAX);
-    held.write(DENSE as usize, &list)?;
-    held.write(GRAND as usize, &[count])?;
-    held.write(INDIRECT as usize, &[count.div_ceil(plan.subgroup), 1, 1])?;
+    let blocks: std::collections::BTreeSet<u32> = woken.iter().map(|&oct| oct >> by).collect();
+    let octs: Vec<u32> = woken.into_iter().collect();
     let hot: Vec<u32> = blocks.into_iter().collect();
-    let hot_count = u32::try_from(hot.len()).unwrap_or(u32::MAX);
-    held.write(HOT_DENSE as usize, &hot)?;
-    held.write(HOT_GRAND as usize, &[hot_count])?;
-    held.write(HOT_INDIRECT as usize, &[hot_count, 1, 1])
+
+    let heads = held.read_runs(&[(GRAND as usize, 0, 1), (HOT_GRAND as usize, 0, 1)])?;
+    let grand = first_of(heads.first().cloned());
+    let hot_grand = first_of(heads.get(1).cloned());
+    let every = grand as usize >= grid.blocks() as usize;
+    let hot_every = hot_grand >= plan.blocks;
+    let mut asked = Vec::new();
+    if !every {
+        asked.push((DENSE as usize, 0, grand as usize));
+    }
+    if !hot_every {
+        asked.push((HOT_DENSE as usize, 0, hot_grand as usize));
+    }
+    let mut lists = if asked.is_empty() {
+        Vec::new()
+    } else {
+        held.read_runs(&asked)?
+    }
+    .into_iter();
+    let (old, list) = if every {
+        (Vec::new(), Vec::new())
+    } else {
+        let old = lists.next().unwrap_or_default();
+        let merged = merged(&old, &octs);
+        (old, merged)
+    };
+    let (old_hot, hot_list) = if hot_every {
+        (Vec::new(), Vec::new())
+    } else {
+        let old = lists.next().unwrap_or_default();
+        let merged = merged(&old, &hot);
+        (old, merged)
+    };
+    let count = if every {
+        grand
+    } else {
+        u32::try_from(list.len()).unwrap_or(u32::MAX)
+    };
+    let hot_count = if hot_every {
+        hot_grand
+    } else {
+        u32::try_from(hot_list.len()).unwrap_or(u32::MAX)
+    };
+    let list_from = changed_from(&old, &list);
+    let hot_from = changed_from(&old_hot, &hot_list);
+    let added = list.get(list_from..).unwrap_or_default();
+    let lifted_blocks = hot_list.get(hot_from..).unwrap_or_default();
+
+    let values: Vec<u32> = last.values().copied().collect();
+    let indices: Vec<u32> = last.keys().copied().collect();
+    let widest = octs.len().max(hot.len());
+    let marks = vec![2_u32; widest];
+    let indirect = [count.div_ceil(plan.subgroup), 1, 1];
+    let hot_indirect = [hot_count, 1, 1];
+    let counts = [count, hot_count];
+    let mut runs = Vec::new();
+    let mut along = 0_usize;
+    for (from, length) in spans(&indices) {
+        let words = values.get(along..along + length).unwrap_or_default();
+        state_runs(windows, lifted + from, words, &mut runs);
+        along += length;
+    }
+    for (from, length) in spans(&octs) {
+        runs.push(crate::resident::Run {
+            index: AWAKE as usize,
+            at: from,
+            words: marks.get(..length).unwrap_or_default(),
+        });
+    }
+    for (from, length) in spans(&hot) {
+        runs.push(crate::resident::Run {
+            index: HOT as usize,
+            at: from,
+            words: marks.get(..length).unwrap_or_default(),
+        });
+    }
+    runs.extend([
+        crate::resident::Run {
+            index: DENSE as usize,
+            at: list_from,
+            words: added,
+        },
+        crate::resident::Run {
+            index: GRAND as usize,
+            at: 0,
+            words: counts.get(..1).unwrap_or_default(),
+        },
+        crate::resident::Run {
+            index: INDIRECT as usize,
+            at: 0,
+            words: &indirect,
+        },
+        crate::resident::Run {
+            index: HOT_DENSE as usize,
+            at: hot_from,
+            words: lifted_blocks,
+        },
+        crate::resident::Run {
+            index: HOT_GRAND as usize,
+            at: 0,
+            words: counts.get(1..).unwrap_or_default(),
+        },
+        crate::resident::Run {
+            index: HOT_INDIRECT as usize,
+            at: 0,
+            words: &hot_indirect,
+        },
+    ]);
+    runs.retain(|run| !run.words.is_empty());
+    held.write_many(&runs)?;
+    held.woke(octs.len());
+    Ok(())
+}
+
+fn merged(old: &[u32], octs: &[u32]) -> Vec<u32> {
+    let mut all: std::collections::BTreeSet<u32> = old.iter().copied().collect();
+    all.extend(octs.iter().copied());
+    all.into_iter().collect()
+}
+
+pub(crate) fn changed_from(old: &[u32], new: &[u32]) -> usize {
+    old.iter()
+        .zip(new)
+        .position(|(was, now)| was != now)
+        .unwrap_or_else(|| old.len().min(new.len()))
+}
+
+fn first_of(words: Option<Vec<u32>>) -> u32 {
+    words.and_then(|held| held.first().copied()).unwrap_or(0)
+}
+
+pub(crate) fn spans(sorted: &[u32]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut at = 0_usize;
+    std::iter::from_fn(move || {
+        let first = *sorted.get(at)?;
+        let mut length = 1_usize;
+        while sorted.get(at + length).copied() == first.checked_add(u32::try_from(length).ok()?) {
+            length += 1;
+        }
+        at += length;
+        Some((first as usize, length))
+    })
+}
+
+pub(crate) fn state_runs<'words>(
+    windows: crate::layout::Windows,
+    at: usize,
+    words: &'words [u32],
+    into: &mut Vec<crate::resident::Run<'words>>,
+) {
+    if !windows.is_split() {
+        into.push(crate::resident::Run {
+            index: STATE as usize,
+            at,
+            words,
+        });
+        return;
+    }
+    let mut done = 0_usize;
+    while done < words.len() {
+        let (binding, offset) = windows.place(at + done);
+        let room = windows.span() - offset;
+        let run = room.min(words.len() - done);
+        into.push(crate::resident::Run {
+            index: binding as usize,
+            at: offset,
+            words: words.get(done..done + run).unwrap_or_default(),
+        });
+        done += run;
+    }
 }
 
 /// Writes `words` into `STATE` laid out as `windows`, from word `at`: each
