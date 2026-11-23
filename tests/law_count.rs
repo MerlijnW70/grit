@@ -1154,3 +1154,235 @@ fn r8_a_counting_law_equals_its_table_on_every_row_on_a_world() {
         }
     }
 }
+
+fn refusal(told: &Json, code: &str, field: &str) {
+    assert_eq!(
+        (text_at(told, "refused"), text_at(told, "field")),
+        (code.to_owned(), field.to_owned()),
+        "{}",
+        written(told)
+    );
+}
+
+fn lone_pixel(writes: &dyn Fn([u32; 3]) -> u32) -> Example {
+    let size = [8, 8, 1];
+    let mut input = vec![0_u32; 64];
+    input[stencil::index(size, [4, 4, 0])] = 1;
+    let mut output = vec![0_u32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            output[stencil::index(size, [x, y, 0])] = writes([x, y, 0]);
+        }
+    }
+    Example {
+        size,
+        input,
+        output,
+    }
+}
+
+fn seen_entry(held: &Json) -> (i64, i64, i64, Vec<u32>) {
+    (
+        int_at(held, "output"),
+        int_at(held, "row"),
+        int_at(held, "example"),
+        words(held.get("at").unwrap()),
+    )
+}
+
+#[test]
+fn c1_a_row_seen_with_both_outputs_is_refused_as_a_conflict_under_counting_rules() {
+    let mut mcp = Mcp::new(None);
+    for (stencil, size, at) in [
+        (Stencil::Square, [8, 8, 1], [3, 5, 0]),
+        (Stencil::Cube, [4, 4, 4], [2, 1, 3]),
+    ] {
+        let cells = size.iter().product::<u32>() as usize;
+        let mut output = vec![0_u32; cells];
+        output[stencil::index(size, at)] = 1;
+        let examples = vec![Example {
+            size,
+            input: vec![0; cells],
+            output,
+        }];
+        for tally in [Tally::Totalistic, Tally::Outer] {
+            let told = mcp.no(
+                "grit_law_learn",
+                &args(stencil, tally.name(), "zero", &shown(&examples, 1), 1),
+            );
+            refusal(&told, "conflict", "$.examples");
+            assert_eq!(int_at(&told, "conflicts"), 1, "{}", written(&told));
+            let rows = told.get("rows").and_then(Json::list).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(int_at(&rows[0], "row"), 0);
+            let seen: Vec<(i64, i64, Vec<u32>)> = rows[0]
+                .get("seen")
+                .and_then(Json::list)
+                .unwrap()
+                .iter()
+                .map(|one| {
+                    (
+                        int_at(one, "outputs"),
+                        int_at(one, "example"),
+                        words(one.get("at").unwrap()),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                seen,
+                [(0, 0, vec![0, 0, 0]), (1, 0, at.to_vec())],
+                "{} {}",
+                stencil.name(),
+                tally.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn c2_a_count_split_only_in_the_second_write_is_refused_as_not_counting() {
+    let mut mcp = Mcp::new(None);
+    let near = |at: [u32; 3]| at[0].abs_diff(4) <= 1 && at[1].abs_diff(4) <= 1;
+    let examples = vec![lone_pixel(&|at| {
+        u32::from(near(at)) | u32::from(at == [5, 4, 0]) << 1
+    })];
+    for tally in [Tally::Totalistic, Tally::Outer] {
+        let told = mcp.no(
+            "grit_law_learn",
+            &args(
+                Stencil::Square,
+                tally.name(),
+                "zero",
+                &shown(&examples, 2),
+                2,
+            ),
+        );
+        split_checked(&told, tally, Stencil::Square, &examples, false);
+        assert_eq!(int_at(&told, "not_counting"), 1, "{}", written(&told));
+        let named = &told.get("counts").and_then(Json::list).unwrap()[0];
+        assert_eq!(int_at(named, "write"), 1, "{}", written(&told));
+        assert_eq!(int_at(named, "count"), 1);
+        let centre = (tally == Tally::Outer).then_some(0);
+        assert_eq!(named.get("centre").and_then(Json::int), centre);
+    }
+}
+
+#[test]
+fn c3_the_first_seen_row_of_a_count_is_the_one_listed_for_each_output() {
+    let mut mcp = Mcp::new(None);
+    let examples = vec![lone_pixel(&|at| u32::from(at == [5, 4, 0]))];
+    let first = first_seen(&examples, false, Stencil::Square);
+    assert_eq!(first[&256].1, [3, 3, 0]);
+    assert_eq!(first[&1].1, [5, 5, 0]);
+    for tally in [Tally::Totalistic, Tally::Outer] {
+        let told = mcp.no(
+            "grit_law_learn",
+            &args(
+                Stencil::Square,
+                tally.name(),
+                "zero",
+                &shown(&examples, 1),
+                1,
+            ),
+        );
+        split_checked(&told, tally, Stencil::Square, &examples, false);
+        assert_eq!(int_at(&told, "not_counting"), 1, "{}", written(&told));
+        let named = &told.get("counts").and_then(Json::list).unwrap()[0];
+        let seen: Vec<(i64, i64, i64, Vec<u32>)> = named
+            .get("seen")
+            .and_then(Json::list)
+            .unwrap()
+            .iter()
+            .map(seen_entry)
+            .collect();
+        assert_eq!(
+            seen,
+            [(0, 256, 0, vec![3, 3, 0]), (1, 8, 0, vec![5, 4, 0])],
+            "{}: the row of each output is the one seen first in the examples",
+            tally.name()
+        );
+    }
+}
+
+#[test]
+fn c4_planes_and_bits_are_refused_by_name_under_counting_rules() {
+    let mut mcp = Mcp::new(None);
+    let blank = |writes: u32| {
+        shown(
+            &[Example {
+                size: [4, 4, 1],
+                input: vec![0; 16],
+                output: vec![0; 16],
+            }],
+            writes,
+        )
+    };
+    let request = |rule: &str, reads: &str, writes: &str, count: u32, more: &str| {
+        format!(
+            "{{\"stencil\":\"3x3\",\"reads\":{reads},\"writes\":{writes},\"border\":\"zero\",\"rule\":\"{rule}\",\"examples\":{}{more}}}",
+            blank(count)
+        )
+    };
+    for tally in [Tally::Totalistic, Tally::Outer] {
+        let rule = tally.name();
+        let cases = [
+            (
+                request(
+                    rule,
+                    "[{\"plane\":2,\"bit\":0}]",
+                    "[{\"plane\":1,\"bit\":0}]",
+                    1,
+                    ",\"channels\":2",
+                ),
+                "plane_past",
+                "$.reads[0].plane",
+                Some(1),
+            ),
+            (
+                request(
+                    rule,
+                    "[{\"plane\":0,\"bit\":0}]",
+                    "[{\"plane\":3,\"bit\":0}]",
+                    1,
+                    ",\"channels\":2",
+                ),
+                "plane_past",
+                "$.writes[0].plane",
+                Some(1),
+            ),
+            (
+                request(
+                    rule,
+                    "[{\"plane\":1,\"bit\":0}]",
+                    "[{\"plane\":1,\"bit\":1}]",
+                    1,
+                    "",
+                ),
+                "halo_written",
+                "$.reads[0].plane",
+                None,
+            ),
+            (
+                request(
+                    rule,
+                    "[{\"plane\":0,\"bit\":0}]",
+                    "[{\"plane\":1,\"bit\":0},{\"plane\":1,\"bit\":0}]",
+                    2,
+                    "",
+                ),
+                "bit_shared",
+                "$.writes[1]",
+                None,
+            ),
+        ];
+        for (arguments, code, field, limit) in &cases {
+            let told = mcp.no("grit_law_learn", arguments);
+            refusal(&told, code, field);
+            assert_eq!(
+                told.get("limit").and_then(Json::int),
+                *limit,
+                "{rule} {code}"
+            );
+        }
+    }
+}
