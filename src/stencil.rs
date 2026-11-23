@@ -802,7 +802,7 @@ pub struct Voted {
     pub table: Vec<Option<u32>>,
     pub ties: Vec<Vec<u32>>,
     pub deviating: Vec<u64>,
-    pub listed: Vec<Vec<Deviation>>,
+    pub deviations: Vec<Vec<Deviation>>,
     pub cells: u64,
 }
 
@@ -876,12 +876,12 @@ pub fn voted(voting: Voting<'_>, samples: &[Sample<'_>], most: usize) -> Voted {
         })
         .collect();
     let mut deviating = vec![0_u64; writes.len()];
-    let mut listed: Vec<Vec<Deviation>> = vec![Vec::new(); writes.len()];
+    let mut deviations: Vec<Vec<Deviation>> = vec![Vec::new(); writes.len()];
     each_cell(samples, &mut |example, at, sample| {
         let class = tally.class(stencil, row_at(stencil, reads, sample, at, border));
         let law = table.get(class as usize).copied().flatten().unwrap_or(0);
         let outputs = outputs_at(writes, sample, at);
-        for (write, (count, held)) in deviating.iter_mut().zip(listed.iter_mut()).enumerate() {
+        for (write, (count, held)) in deviating.iter_mut().zip(deviations.iter_mut()).enumerate() {
             let seen = (outputs >> write) & 1;
             let wanted = (law >> write) & 1;
             if seen != wanted {
@@ -903,7 +903,7 @@ pub fn voted(voting: Voting<'_>, samples: &[Sample<'_>], most: usize) -> Voted {
         table,
         ties,
         deviating,
-        listed,
+        deviations,
         cells,
     }
 }
