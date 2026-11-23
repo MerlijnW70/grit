@@ -1,6 +1,7 @@
 pub mod back;
 pub mod fork;
 pub mod format;
+pub mod read;
 
 use std::fs::File;
 use std::io::Write;
@@ -457,6 +458,8 @@ pub struct World<'host> {
     back: Option<Vec<Vec<Groups>>>,
     backward: bool,
     seen: Option<u32>,
+    scanner: read::Scanner,
+    marks: Vec<read::Mark>,
 }
 
 pub(crate) fn ruled(host: &Host, name: &str, params: &[u32]) -> Result<Box<dyn Listed>, Refused> {
@@ -582,8 +585,24 @@ impl<'host> World<'host> {
         host.limits()
             .admits_on(&sizes, None, host.heap())
             .map_err(fitted)?;
+        let source = match pool {
+            Some(held) => read::Source::Sparse(held),
+            None => read::Source::Dense(rule.windows(&plan)),
+        };
+        let size = [grid.wide, grid.deep, grid.tall];
+        let (scanner, scan) = read::scanner(host.width(), sizes.len(), passes.len(), size, source)?;
+        let mut passes = passes;
+        passes.push(scan);
+        let mut stages = stages;
+        stages.push(vec![Groups::Fixed(0)]);
+        let back = back.map(|mut held| {
+            held.push(vec![Groups::Fixed(0)]);
+            held
+        });
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
-        let live = host.resident(&sizes, &modules).map_err(built_from(&rule))?;
+        let live = host
+            .resident(&scanner.bound(&sizes), &modules)
+            .map_err(built_from(&rule))?;
         Ok(Self {
             host,
             rule,
@@ -600,6 +619,8 @@ impl<'host> World<'host> {
             back,
             backward: false,
             seen: None,
+            scanner,
+            marks: Vec::new(),
         })
     }
 

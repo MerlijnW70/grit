@@ -88,6 +88,35 @@ Within a frame the looked-at plane is frozen, as `halo_written` requires. Refuse
 
 The quiet class is decided on the law as written, with every uniform value checked at both parities. A listed world steps an oct while it or an oct around it changed in the two frames before; an oct that changed its written plane wakes the octs whose box reads it, so moving patterns are never skipped, and a world that stops changing, a period-2 oscillator included, goes quiet. Its frames are priced as every frame: cells times frames, calibrated under the iterating law's own text.
 
+## Reading only the set or changed cells
+
+`grit_world_read` takes `form`, for any world:
+
+| `form` | Lists | Box |
+|---|---|---|
+| `dense` (default) | every cell's word, as before | at most 4096 cells |
+| `set` | `[x, y, z, word]` of each cell whose word is not 0 | any size |
+| `changed` | `[x, y, z, word]` of each cell whose word differs from the mark `since` names; a cleared cell is listed with 0 | the mark's |
+
+Cells come x fastest, then y, then z; `count` is how many. `plane` and `current` work as for a dense read. One call lists at most 16384 cells (`limits.set_cells`); past that it is refused `too_many` at `$.to`, with `limit` and `count`, the cells it would list. Nothing is cut short.
+
+`mark` true on a `set` or `changed` read records the box as the read sees it and answers its id as `mark`. A `changed` read compares the device's words now with those recorded words, so it is exact across steps, writes, params, a restore and a fork (a fork starts with its source's marks). Marks live with the open world, at most 16 (`limits.marks_held`), the oldest dropped first. A world opened from a file or after a restart has none.
+
+1. `grit_world_read` the whole current plane with `form` `set`, `current` true and `mark` true.
+2. `grit_world_step` 1 frame.
+3. `grit_world_read` the same box with `form` `changed`, `since` the mark and `mark` true: the cells generation 1 changed, and the next mark.
+
+The read scans the box on the device in one pass and moves 12 bytes plus 8 a listed cell back, whatever the box. Like the dense read it is not priced.
+
+Refusals:
+
+| Code | When | `field` |
+|---|---|---|
+| `read_form` | `since` without `form` `changed`, `changed` without `since`, or `mark` with `form` `dense` | `$.since` or `$.mark` |
+| `mark_unknown` | a mark this world does not hold | `$.since` |
+| `mark_unlike` | a box or plane other than the mark's | `$.from`, `$.to`, `$.plane` or `$.current` |
+| `too_many` | more than 16384 cells to list, or a mark of more than 16384 set cells | `$.to` or `$.mark` |
+
 ## Reversible laws
 
 A law with `"reversible": true` must be a sequence of lifting steps over its words, 8 a plane: each step adds, subtracts or xors to one word, wrapping, a value made only of other words, params, `frame`, `at`, constants and looks at frozen planes. The compiler checks the form, derives the inverse (the steps undone in reverse order) as an ordinary law named with `_back` and its own hash, and refuses anything else with `not_lifting` at the offending step's path: a step that reads its own word, one node written to two words, a word made by another op (`b = f(a)`, `b | f`, `b * 3`).

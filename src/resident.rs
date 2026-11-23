@@ -2002,6 +2002,21 @@ impl Resident<'_> {
         self.wait_reading(ticket)
     }
 
+    pub fn run_reading(
+        &mut self,
+        stages: &[&[Groups]],
+        index: usize,
+        count: usize,
+    ) -> Result<Vec<u32>, Error> {
+        let ticket = self.submit_reading(stages, index, count)?;
+        let (_, mut every) = self.landed(ticket)?;
+        Ok(if every.is_empty() {
+            Vec::new()
+        } else {
+            every.swap_remove(0)
+        })
+    }
+
     fn bounded(&self, index: usize, count: usize) -> Result<(), Error> {
         self.within(index, 0, count).map(|_| ())
     }

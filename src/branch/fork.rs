@@ -36,7 +36,7 @@ impl<'host> World<'host> {
         let modules: Vec<&[u32]> = self.passes.iter().map(Vec::as_slice).collect();
         let mut live = self
             .host
-            .resident(&self.sizes, &modules)
+            .resident(&self.scanner.bound(&self.sizes), &modules)
             .map_err(built_from(&self.rule))?;
         let reach = self.reach()?;
         copied(&mut self.live, &mut live, &self.sizes, reach)?;
@@ -56,6 +56,8 @@ impl<'host> World<'host> {
             back: self.back.clone(),
             backward: self.backward,
             seen: self.seen,
+            scanner: self.scanner,
+            marks: self.marks.clone(),
         })
     }
 

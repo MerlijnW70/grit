@@ -85,9 +85,12 @@ pub enum Code {
     SupportLimit,
     NotIterating,
     PlaneOrCurrent,
+    ReadForm,
+    MarkUnknown,
+    MarkUnlike,
 }
 
-pub const CODES: [Code; 81] = [
+pub const CODES: [Code; 84] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -169,6 +172,9 @@ pub const CODES: [Code; 81] = [
     Code::SupportLimit,
     Code::NotIterating,
     Code::PlaneOrCurrent,
+    Code::ReadForm,
+    Code::MarkUnknown,
+    Code::MarkUnlike,
 ];
 
 impl Code {
@@ -256,6 +262,9 @@ impl Code {
             Self::SupportLimit => "support_limit",
             Self::NotIterating => "not_iterating",
             Self::PlaneOrCurrent => "plane_or_current",
+            Self::ReadForm => "read_form",
+            Self::MarkUnknown => "mark_unknown",
+            Self::MarkUnlike => "mark_unlike",
         }
     }
 
@@ -472,6 +481,15 @@ impl Code {
             }
             Self::PlaneOrCurrent => {
                 "Give plane or current true, not both: current names the plane itself."
+            }
+            Self::ReadForm => {
+                "Give since only with form changed, always with it, and mark only with form set or changed."
+            }
+            Self::MarkUnknown => {
+                "Read with form set and mark true to take a new mark; marks are kept only while the world stays open."
+            }
+            Self::MarkUnlike => {
+                "Read with the from, to and plane or current of the read that took the mark, or take a new mark."
             }
         }
     }

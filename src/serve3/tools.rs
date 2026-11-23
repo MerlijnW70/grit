@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::branch::World;
+use crate::branch::read::{MARKS_HELD, Mark, Plane, SET_MOST};
 use crate::host::Host;
 use crate::wire::{Json, counted, map, text};
 
@@ -18,6 +19,8 @@ use super::{
     Server, Status, Tool, rules, rules_on, shaped,
 };
 use crate::calibrate::Key;
+
+pub const SET_READ: &str = "grit_world_read with form set or changed scans the box on the device in one pass, one lane a cell, and moves 12 bytes plus 8 a listed cell back. Like the dense read it is not priced: no budget is charged for it";
 
 pub const TOOLS: &[Tool] = &[
     Tool {
@@ -431,6 +434,32 @@ fn read_shown() -> Json {
             ("to", corner_shown("the greatest corner, [x, y, z]")),
             ("plane", plane_shown()),
             ("current", current_shown()),
+            (
+                "form",
+                with(
+                    choice(
+                        &format!(
+                            "dense: every cell's word, at most {READ_MOST} cells; set: only the cells whose word is not 0, as [x, y, z, word]; changed: only the cells whose word differs from the mark since names, the same way. A set or changed box may be any size; at most {SET_MOST} cells are listed. dense if left out"
+                        ),
+                        &["dense", "set", "changed"],
+                    ),
+                    vec![("default", text("dense"))],
+                ),
+            ),
+            (
+                "since",
+                property(
+                    "string",
+                    "for form changed: a mark an earlier set or changed read of this world answered, with the same from, to and plane or current",
+                ),
+            ),
+            (
+                "mark",
+                property(
+                    "boolean",
+                    "for form set or changed: record the box as this read sees it and answer its id as mark, for a later since",
+                ),
+            ),
         ],
         &["world", "from", "to"],
     )
@@ -1237,6 +1266,11 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             format!("the box from {from:?} to {to:?} has its first corner past its last"),
         ));
     }
+    let now = live.world.frame();
+    let form = words_of(held, "form")?;
+    if form != "dense" || held.get("since").is_some() || held.get("mark").is_some() {
+        return scanned(live, held, number, now, (from, to), form);
+    }
     let cells: u64 = from
         .iter()
         .zip(to)
@@ -1267,7 +1301,7 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     let mut answer = vec![
         ("world", counted(number)),
-        ("frame", counted(live.world.frame())),
+        ("frame", counted(now)),
         ("from", sized(from)),
         ("to", sized(to)),
         ("cells", Json::List(words)),
@@ -1286,6 +1320,179 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if current(held) {
         answer.insert(2, ("plane", counted(plane)));
     }
+    Ok(map(answer))
+}
+
+fn told(refusal: Refusal, more: Vec<(&'static str, Json)>) -> Failed {
+    Box::new(super::gradient::Told(refusal, more))
+}
+
+fn form_refused(form: &str, since: Option<&str>) -> Option<Failed> {
+    let (field, why) = match (form, since) {
+        ("dense", Some(_)) => ("$.since", "since is for form changed, not dense"),
+        ("dense", None) => ("$.mark", "mark is for form set or changed, not dense"),
+        ("changed", None) => (
+            "$.since",
+            "form changed needs since, a mark an earlier read of this world answered",
+        ),
+        ("set", Some(_)) => (
+            "$.since",
+            "since is for form changed; form set lists every cell whose word is not 0",
+        ),
+        _ => return None,
+    };
+    Some(refused(Code::ReadForm, field, why.to_owned()))
+}
+
+fn marked_cells(
+    live: &Live<'_>,
+    held: &Json,
+    id: &str,
+    (from, to): ([u32; 3], [u32; 3]),
+    reference: Plane,
+) -> Result<Vec<(u32, u32)>, Failed> {
+    let Some(mark) = live.world.mark(id) else {
+        return Err(refused(
+            Code::MarkUnknown,
+            "$.since",
+            format!(
+                "this world holds no mark {}; marks live with the open world, at most {MARKS_HELD} of them, and are not kept by save, open or a restart",
+                errors::shown(id)
+            ),
+        ));
+    };
+    if mark.from != from {
+        return Err(refused(
+            Code::MarkUnlike,
+            "$.from",
+            format!("the mark was read from {:?}, not {from:?}", mark.from),
+        ));
+    }
+    if mark.to != to {
+        return Err(refused(
+            Code::MarkUnlike,
+            "$.to",
+            format!("the mark was read to {:?}, not {to:?}", mark.to),
+        ));
+    }
+    if mark.plane != reference {
+        let (field, was) = match mark.plane {
+            Plane::Current => ("$.current", "the current plane".to_owned()),
+            Plane::Numbered(was) => (
+                if current(held) {
+                    "$.current"
+                } else {
+                    "$.plane"
+                },
+                format!("plane {was}"),
+            ),
+        };
+        return Err(refused(
+            Code::MarkUnlike,
+            field,
+            format!("the mark was read from {was}"),
+        ));
+    }
+    Ok(mark.cells.clone())
+}
+
+fn scanned(
+    live: &mut Live<'_>,
+    held: &Json,
+    world: u32,
+    now: u32,
+    corners: ([u32; 3], [u32; 3]),
+    form: &str,
+) -> Result<Json, Failed> {
+    let (from, to) = corners;
+    let since = held.get("since").and_then(Json::text);
+    let marking = matches!(held.get("mark"), Some(Json::Bool(true)));
+    if let Some(refusal) = form_refused(form, since) {
+        return Err(refusal);
+    }
+    let plane = plane_of(held, &live.world)?;
+    let reference = if current(held) {
+        Plane::Current
+    } else {
+        Plane::Numbered(plane)
+    };
+    let against = match since {
+        Some(id) => marked_cells(live, held, id, corners, reference)?,
+        None => Vec::new(),
+    };
+    let found = live.world.scan(plane, from, to, &against, SET_MOST)?;
+    let Some(cells) = found.cells else {
+        return Err(told(
+            Refusal::new(
+                Code::TooMany,
+                "$.to",
+                format!(
+                    "the box holds {} cells to list, more than the {SET_MOST} one call lists; split the box",
+                    found.count
+                ),
+            )
+            .limited(counted(SET_MOST)),
+            vec![("count", exactly(u128::from(found.count)))],
+        ));
+    };
+    let mut answer = vec![
+        ("world", counted(world)),
+        ("frame", counted(now)),
+        ("form", text(form)),
+        ("from", sized(from)),
+        ("to", sized(to)),
+    ];
+    if current(held) {
+        answer.insert(2, ("plane", counted(plane)));
+    }
+    if let Some(id) = since {
+        answer.push(("since", text(id)));
+    }
+    if marking {
+        let recorded: Vec<(u32, u32)> = if since.is_some() {
+            let mut joined: BTreeMap<u32, u32> = against.iter().copied().collect();
+            joined.extend(cells.iter().copied());
+            joined.into_iter().filter(|&(_, word)| word != 0).collect()
+        } else {
+            cells.clone()
+        };
+        if recorded.len() > SET_MOST as usize {
+            return Err(told(
+                Refusal::new(
+                    Code::TooMany,
+                    "$.mark",
+                    format!(
+                        "the box now holds {} cells whose word is not 0, more than the {SET_MOST} a mark records",
+                        recorded.len()
+                    ),
+                )
+                .limited(counted(SET_MOST)),
+                vec![("count", number(recorded.len()))],
+            ));
+        }
+        let mark = Mark::new(reference, from, to, recorded);
+        answer.push(("mark", text(&mark.id)));
+        live.world.keep_mark(mark);
+    }
+    let [wide, deep, _] = live.world.size();
+    answer.push(("count", number(cells.len())));
+    answer.push((
+        "cells",
+        Json::List(
+            cells
+                .iter()
+                .map(|&(index, word)| {
+                    let row = index / wide;
+                    Json::List(vec![
+                        counted(index % wide),
+                        counted(row % deep),
+                        counted(row / deep),
+                        counted(word),
+                    ])
+                })
+                .collect(),
+        ),
+    ));
     Ok(map(answer))
 }
 
@@ -1458,6 +1665,9 @@ pub fn describe(status: &Status) -> Json {
                 ("id_bytes", number(ID_MOST)),
                 ("depth", number(DEPTH_MOST)),
                 ("read_cells", number(READ_MOST)),
+                ("set_cells", number(SET_MOST)),
+                ("marks_held", number(MARKS_HELD)),
+                ("set_read", text(SET_READ)),
                 ("write_cells", number(READ_MOST)),
                 ("slice_cells", number(SLICE_MOST)),
                 ("step_frames", number(STEP_MOST)),
