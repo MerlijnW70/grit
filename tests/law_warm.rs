@@ -30,6 +30,8 @@ const EAST: u32 = 5;
 
 const SOUTH: u32 = 7;
 
+const W9_IMAGES: usize = 3;
+
 struct Rng(u64);
 
 impl Rng {
@@ -1085,6 +1087,125 @@ fn w7_requests_without_start_answer_the_bytes_of_b806c05() {
         let got = written(&mcp.ok("grit_law_learn", arguments));
         assert!(!got.contains("\"start\""));
         assert_eq!(sha(&got), *pinned, "{got}");
+    }
+}
+
+fn parity_chain() -> Vec<Gate> {
+    (0..8_u32)
+        .map(|at| Gate {
+            kind: 6,
+            left: if at == 0 { 0 } else { 8 + at },
+            right: at + 1,
+        })
+        .collect()
+}
+
+fn ran_first_rung(mcp: &mut Mcp<'_>, arguments: &str) -> Json {
+    let raw = mcp.raw("grit_law_learn", arguments);
+    let failed = raw.get("result").and_then(|one| one.get("isError")) == Some(&Json::Bool(true));
+    let got = result(&raw, failed);
+    if failed {
+        assert_eq!(text_at(&got, "refused"), "unsolved", "{}", written(&got));
+    }
+    ladder_of(&got)[0].clone()
+}
+
+fn slot_marks(start: &dyn Fn(u32) -> u32, seen: &BTreeMap<u32, u32>) -> (u32, u32) {
+    let rows: Vec<(u32, u32)> = seen.iter().map(|(row, out)| (*row, *out)).collect();
+    let right = |(row, out): (u32, u32)| u32::from(start(row) == out);
+    let slots = rows.len().div_ceil(32) * 32;
+    let on_rows = rows.iter().copied().map(right).sum();
+    let on_slots = (0..slots).map(|slot| right(rows[slot % rows.len()])).sum();
+    (on_rows, on_slots)
+}
+
+#[test]
+fn w8_a_sown_start_keeps_its_marks_through_a_few_rounds_at_a_small_crowd() {
+    let Some(host) = device("law_warm w8") else {
+        return;
+    };
+    let mut mcp = Mcp::new(Some(&host));
+    let start = parity_chain();
+    let parity = |row: u32| row.count_ones() & 1;
+    for row in 0..512 {
+        assert_eq!(own_answer(&start, row), parity(row), "row {row}");
+    }
+    let flipped = [383_u32, 447, 479, 503, 507, 509, 510, 511];
+    let truth = |row: u32| parity(row) ^ u32::from(flipped.contains(&row));
+    let examples = labelled(majority_inputs(), &truth);
+    let seen = seen_of(&examples);
+    assert_eq!(seen.len(), 512, "the examples show every row");
+    let (right, _) = slot_marks(&|row| own_answer(&start, row), &seen);
+    assert_eq!(right, 512 - flipped.len() as u32);
+    for seed in [1, 2, 3] {
+        let arguments = args(
+            "minimal",
+            &examples,
+            &format!(
+                ",\"gates\":8,\"crowd\":64,\"rounds\":2,\"seed\":{seed}{}",
+                start_text(&start)
+            ),
+        );
+        let first = ran_first_rung(&mut mcp, &arguments);
+        println!("seed {seed}: first rung {}", written(&first));
+        assert_eq!(int_at(&first, "gates"), 8, "seed {seed}");
+        assert_eq!(int_at(&first, "of"), 512, "seed {seed}");
+        assert!(
+            int_at(&first, "marks") >= i64::from(right),
+            "seed {seed}: the first rung keeps the start's {right} marks: {}",
+            written(&first)
+        );
+    }
+}
+
+#[test]
+fn w9_a_start_padded_into_more_gates_keeps_its_marks_over_wrapped_slots() {
+    let Some(host) = device("law_warm w9") else {
+        return;
+    };
+    let mut mcp = Mcp::new(Some(&host));
+    let short = |row: u32| u32::from(majority(row) == 1 && row != 511);
+    let start = majority_chip(&mut mcp, &short);
+    let live = start.len();
+    let inputs: Vec<(Vec<u32>, [u32; 3])> = majority_inputs().into_iter().take(W9_IMAGES).collect();
+    let examples = labelled(inputs, &majority);
+    let seen = seen_of(&examples);
+    assert_ne!(
+        seen.len() % 32,
+        0,
+        "{} seen rows leave slots to wrap",
+        seen.len()
+    );
+    assert!(seen.contains_key(&511), "the start misses a seen row");
+    let wrapped = seen.len().div_ceil(32) * 32 - seen.len();
+    assert!(
+        seen.iter()
+            .take(wrapped)
+            .all(|(row, out)| own_answer(&start, *row) == *out),
+        "the start answers every wrapped row"
+    );
+    let (right, on_slots) = slot_marks(&|row| own_answer(&start, row), &seen);
+    assert_eq!(right, u32::try_from(seen.len()).unwrap() - 1);
+    assert_eq!(on_slots, right + u32::try_from(wrapped).unwrap());
+    let gates = live + 13;
+    for seed in [1, 2, 3, 4] {
+        let arguments = args(
+            "minimal",
+            &examples,
+            &format!(
+                ",\"gates\":{gates},\"crowd\":64,\"rounds\":1,\"seed\":{seed}{}",
+                start_text(&start)
+            ),
+        );
+        let first = ran_first_rung(&mut mcp, &arguments);
+        println!("seed {seed}: first rung {}", written(&first));
+        assert_eq!(int_at(&first, "gates"), gates as i64, "seed {seed}");
+        assert_eq!(int_at(&first, "of"), seen.len() as i64, "seed {seed}");
+        assert!(
+            int_at(&first, "marks") >= i64::from(right),
+            "seed {seed}: the first rung keeps the padded start's {right} marks: {}",
+            written(&first)
+        );
     }
 }
 
