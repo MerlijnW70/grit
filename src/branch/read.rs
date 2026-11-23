@@ -28,7 +28,6 @@ const VALUES: u32 = 10;
 const STRIDE: u32 = 11;
 const MARKED: u32 = 12;
 const ASKED: u32 = 12;
-const REACH: u32 = 13;
 const HEAD: u32 = 16;
 const ANSWERED: usize = 3;
 const RECORD: u32 = 7;
@@ -422,12 +421,11 @@ fn atomic_at(
 fn tally_cell(
     kernel: &mut Kernel<U32>,
     built: &Built,
-    (lane_at, reach): (Id, Id),
+    begin: Id,
     counter: Id,
 ) -> Result<([Id; 3], Id), LaneError> {
     let uint = kernel.index_type();
-    let along = kernel.module().i_mul(uint, counter, reach)?;
-    let cell = kernel.module().i_add(uint, lane_at, along)?;
+    let cell = kernel.module().i_add(uint, begin, counter)?;
     let (inside, point, index) = placed(kernel, built, cell)?;
     let word = word_at(kernel, built, point, index)?;
     let asked = head(kernel, built.binding, ASKED)?;
@@ -440,7 +438,7 @@ fn tally_cell(
 fn bit_record(
     kernel: &mut Kernel<U32>,
     built: &Built,
-    lanes: (Id, Id),
+    begin: Id,
     bit: Id,
     run: u32,
 ) -> Result<(), LaneError> {
@@ -454,7 +452,7 @@ fn bit_record(
             given: held.len(),
             wanted: RECORD as usize,
         };
-        let (point, word) = tally_cell(kernel, built, lanes, counter)?;
+        let (point, word) = tally_cell(kernel, built, begin, counter)?;
         let shifted = bitwise(kernel, op::SHIFT_RIGHT_LOGICAL, word, bit)?;
         let low = bitwise(kernel, op::BITWISE_AND, shifted, one)?;
         let set = compared(kernel, op::I_NOT_EQUAL, low, nothing)?;
@@ -480,14 +478,21 @@ fn bit_record(
     let along = kernel.module().i_mul(uint, bit, width)?;
     let record = kernel.module().i_add(uint, start, along)?;
     for (slot, value) in (0_u32..).zip(&carried) {
-        let code = match slot {
-            0 => op::ATOMIC_I_ADD,
-            1..=3 => ATOMIC_U_MIN,
-            _ => ATOMIC_U_MAX,
-        };
         let offset = constant(kernel, slot)?;
         let at = kernel.module().i_add(uint, record, offset)?;
-        atomic_at(kernel, code, built.binding, at, *value)?;
+        let (code, beyond) = match slot {
+            0 => {
+                atomic_at(kernel, op::ATOMIC_I_ADD, built.binding, at, *value)?;
+                continue;
+            }
+            1..=3 => (ATOMIC_U_MIN, op::U_LESS_THAN),
+            _ => (ATOMIC_U_MAX, op::U_GREATER_THAN),
+        };
+        let held = kernel.atomic_load_at(built.binding, at)?;
+        let better = compared(kernel, beyond, *value, held)?;
+        lane_if(kernel, better, |kernel| {
+            atomic_at(kernel, code, built.binding, at, *value).map(|_| ())
+        })?;
     }
     Ok(())
 }
@@ -495,11 +500,11 @@ fn bit_record(
 fn tally_module(subgroup: u32, built: &Built, run: u32) -> Result<Vec<u32>, LaneError> {
     let (mut kernel, lane_at) = opened(subgroup, built)?;
     let uint = kernel.index_type();
-    let reach = head(&mut kernel, built.binding, REACH)?;
-    let lanes = (lane_at, reach);
+    let per = constant(&mut kernel, run)?;
+    let begin = kernel.module().i_mul(uint, lane_at, per)?;
     let nothing = constant(&mut kernel, 0)?;
     let held = kernel.repeat_rolled(run, uint, nothing, |kernel, carried, counter| {
-        let (_, word) = tally_cell(kernel, built, lanes, counter)?;
+        let (_, word) = tally_cell(kernel, built, begin, counter)?;
         bitwise(kernel, op::BITWISE_OR, carried, word)
     })?;
     kernel.repeat_rolled(BITS, uint, nothing, |kernel, carried, bit| {
@@ -509,7 +514,7 @@ fn tally_module(subgroup: u32, built: &Built, run: u32) -> Result<Vec<u32>, Lane
         let low = bitwise(kernel, op::BITWISE_AND, shifted, one)?;
         let on = compared(kernel, op::I_NOT_EQUAL, low, zero)?;
         lane_if(kernel, on, |kernel| {
-            bit_record(kernel, built, lanes, bit, run)
+            bit_record(kernel, built, begin, bit, run)
         })?;
         Ok(carried)
     })?;
@@ -629,15 +634,8 @@ impl World<'_> {
         let scanner = self.scanner;
         let per = u64::from(scanner.lanes) * u64::from(scanner.run);
         let groups = u32::try_from(cells.div_ceil(per).max(1))?;
-        let reach = groups
-            .checked_mul(scanner.lanes)
-            .ok_or_else(|| Refused::Malformed {
-                what: format!("{groups} groups of {} lanes", scanner.lanes),
-            })?;
-        for (at, value) in [(ASKED, asked), (REACH, reach)] {
-            if let Some(slot) = words.get_mut(at as usize) {
-                *slot = value;
-            }
+        if let Some(slot) = words.get_mut(ASKED as usize) {
+            *slot = asked;
         }
         for _ in 0..BITS {
             words.extend_from_slice(&[0, u32::MAX, u32::MAX, u32::MAX, 0, 0, 0]);
