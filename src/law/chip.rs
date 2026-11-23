@@ -67,6 +67,30 @@ pub struct Wiring {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Copies {
+    One,
+    Word,
+}
+
+impl Copies {
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::One => 1,
+            Self::Word => BITS,
+        }
+    }
+
+    #[must_use]
+    pub const fn ones(self) -> u32 {
+        match self {
+            Self::One => 1,
+            Self::Word => u32::MAX,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
     Chip,
     Channels,
@@ -108,6 +132,7 @@ pub struct Wired {
     machine: Machine,
     circuit: Circuit,
     wiring: Wiring,
+    copies: Copies,
 }
 
 fn chip_path(why: &NotAChip) -> String {
@@ -316,7 +341,10 @@ fn named(name: &str) -> Json {
     wire::text(name)
 }
 
-fn bit_of(held: Json, bit: u32) -> Json {
+fn bit_of(held: Json, bit: u32, copies: Copies) -> Json {
+    if copies == Copies::Word {
+        return held;
+    }
     let shifted = if bit == 0 {
         held
     } else {
@@ -325,29 +353,30 @@ fn bit_of(held: Json, bit: u32) -> Json {
     op("and", vec![shifted, word(1)])
 }
 
-fn not(held: Json) -> Json {
-    op("xor", vec![held, word(1)])
+fn not(held: Json, ones: u32) -> Json {
+    op("xor", vec![held, word(ones)])
 }
 
 #[must_use]
-pub fn gate_expression(kind: u32, left: Json, right: Json) -> Json {
+pub fn gate_expression(kind: u32, left: Json, right: Json, copies: Copies) -> Json {
+    let ones = copies.ones();
     match kind {
         0 => word(0),
-        1 => not(op("or", vec![left, right])),
-        2 => op("and", vec![left, not(right)]),
-        3 => not(right),
-        4 => op("and", vec![not(left), right]),
-        5 => not(left),
+        1 => not(op("or", vec![left, right]), ones),
+        2 => op("and", vec![left, not(right, ones)]),
+        3 => not(right, ones),
+        4 => op("and", vec![not(left, ones), right]),
+        5 => not(left, ones),
         6 => op("xor", vec![left, right]),
-        7 => not(op("and", vec![left, right])),
+        7 => not(op("and", vec![left, right]), ones),
         8 => op("and", vec![left, right]),
-        9 => not(op("xor", vec![left, right])),
+        9 => not(op("xor", vec![left, right]), ones),
         10 => left,
-        11 => op("or", vec![left, not(right)]),
+        11 => op("or", vec![left, not(right, ones)]),
         12 => right,
-        13 => op("or", vec![not(left), right]),
+        13 => op("or", vec![not(left, ones), right]),
         14 => op("or", vec![left, right]),
-        _ => word(1),
+        _ => word(ones),
     }
 }
 
@@ -360,7 +389,52 @@ impl Wired {
             machine,
             circuit,
             wiring,
+            copies: Copies::One,
         })
+    }
+
+    pub fn parallel(self) -> Result<Self, Refused> {
+        let spots = self
+            .wiring
+            .reads
+            .iter()
+            .map(|read| read.bit)
+            .enumerate()
+            .map(|(at, bit)| (READS, at, bit))
+            .chain(
+                self.wiring
+                    .writes
+                    .iter()
+                    .enumerate()
+                    .map(|(at, spot)| (WRITES, at, spot.bit)),
+            )
+            .chain(
+                self.wiring
+                    .keeps
+                    .iter()
+                    .enumerate()
+                    .map(|(at, spot)| (KEEPS, at, spot.bit)),
+            );
+        for (list, at, bit) in spots {
+            if bit != 0 {
+                return Err(refused(
+                    Fault::Bit,
+                    format!("$.{list}[{at}].bit"),
+                    format!(
+                        "{list}[{at}] names bit {bit}; in parallel form a binding is the whole word of its plane, bit j of it copy j, so every binding names bit 0"
+                    ),
+                ));
+            }
+        }
+        Ok(Self {
+            copies: Copies::Word,
+            ..self
+        })
+    }
+
+    #[must_use]
+    pub const fn copies(&self) -> Copies {
+        self.copies
     }
 
     #[must_use]
@@ -476,11 +550,14 @@ impl Wired {
         for (at, spot) in self.wiring.keeps.iter().enumerate() {
             bind(
                 format!("s{at}"),
-                bit_of(self.own(spot.plane, "c"), spot.bit),
+                bit_of(self.own(spot.plane, "c"), spot.bit, self.copies),
             );
         }
         for (at, read) in self.wiring.reads.iter().enumerate() {
-            bind(format!("i{at}"), bit_of(self.looked(read), read.bit));
+            bind(
+                format!("i{at}"),
+                bit_of(self.looked(read), read.bit, self.copies),
+            );
         }
         for (at, gate) in self.circuit.gates.iter().enumerate() {
             bind(
@@ -489,13 +566,18 @@ impl Wired {
                     gate.kind,
                     named(&self.source(gate.left)),
                     named(&self.source(gate.right)),
+                    self.copies,
                 ),
             );
         }
         let spots = self.spots();
         let mut finals: Vec<(u32, String)> = Vec::new();
         for plane in self.written() {
-            let mut held = match self.wiring.rest {
+            let rest = match self.copies {
+                Copies::One => self.wiring.rest,
+                Copies::Word => Rest::Cleared,
+            };
+            let mut held = match rest {
                 Rest::Kept => {
                     let kept = !self.mask(plane);
                     if kept == 0 {

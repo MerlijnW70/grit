@@ -266,6 +266,7 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `places`, `place_list` | under `totalistic` and `outer`: the places counted; see [Counted places](#counted-places) |
 | `min_support` | under `noise` `vote`: lists the counts shown by few cells in `thin`; see [Noisy examples](#noisy-examples) |
 | `steps` | under `totalistic` and `outer`: k, the law's applications between input and output, 1 if left out; see [Examples k steps apart](#examples-k-steps-apart) |
+| `parallel` | `true`: the law in bit-parallel form, 32 independent copies in one word; see [32 copies in one word](#32-copies-in-one-word) |
 
 The server builds every example cell's row, counts the rows, and refuses `conflict` at `$.examples` when one row is seen with two outputs. The refusal's `rows` lists each such row with every output and where it was first seen. The search is `grit_machine`'s, over the seen rows only, so 27-input stencils work. It walks a gate ladder down from `gates` as `grit_least` does and keeps the smallest circuit that answers every seen row.
 
@@ -438,4 +439,26 @@ A brake before each 64 tables stops on budget or cancel; an answer can come late
 | `steps_space` | more than 18 classes (`limits.law_steps_classes`, 262144 tables): 3x3x3 needs `places` or `place_list`; `space` and `classes` name the size | `$.steps` |
 
 A complete search that finds no table is refused `no_rule_k` at `$.examples`. `closest` names the first table with the fewest wrong example cells as `tables` and its `wrong` cells, with `cells`, `checked`, `space` and `steps`.
+
+### 32 copies in one word
+
+A learned law reads one bit of each read and writes one bit of each write. With `parallel` true, under every rule and with `steps`, `noise` and `start`, the answer is the same circuit in bit-parallel form: each read and each write is the whole word of its plane, and bit j of every word is copy j. Bit j of each written word is the single-bit law applied to bit j of the read words, for every j in 0 to 31, so one world runs 32 independent soups.
+
+- Every read and write names `bit` 0; any other bit is refused `parallel_bit` at `$.reads[k].bit` or `$.writes[k].bit`. Two writes on one plane are then one bit twice, which stays `bit_shared`.
+- Every bit of a written word is a copy's output, so `rest` has no bit to act on and the answer has no `rest`.
+- A NOT is an xor with 4294967295 and a constant 1 gate is 4294967295, so no copy leaks into another; the inputs carry no `and ..., 1` mask and the writes no shift.
+- Learning does not change: the circuit, `tables`, `ladder` and every other field are the same bytes as without `parallel`. Only `law`, `hash` and `nodes` differ, and the answer adds `parallel`: `copies` (32), `bytes` and `nodes` of its law text, and `single` with the `bytes` and `nodes` of the single-bit form. The gates are the same.
+- `parallel` false, or left out, answers the same bytes as before.
+
+It runs with `alternate` as the single-bit law does: `[the read's plane, the write's plane]`, or a `steps` answer's `iterate`.
+
+1. `grit_law_learn` Bays 5766 (B6/S5,6,7): `stencil` `3x3x3`, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `rule` `outer`, `parallel` true.
+2. `grit_world_create` with `wide`, `deep` and `tall` 32, its `law` and `alternate` `[0,1]`.
+3. `grit_world_write` with `current` true each cell's 32 soups as one word, soup j at bit j.
+4. `grit_world_step` 64 frames, then `grit_world_read` with `current` true: bit j of each word is soup j at generation 64.
+
+| Law (3x3 Life / 3x3x3 Bays, outer) | Gates | Bytes, single / parallel | Nodes, single / parallel |
+|---|---|---|---|
+| Life | 39 | 1788 / 1680 | 573 / 405 |
+| Bays 5766 | 127 | 5010 / 4731 | 1605 / 1149 |
 

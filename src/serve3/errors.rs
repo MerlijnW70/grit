@@ -94,9 +94,10 @@ pub enum Code {
     StepsWrites,
     StepsSpace,
     NoRuleK,
+    ParallelBit,
 }
 
-pub const CODES: [Code; 90] = [
+pub const CODES: [Code; 91] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -187,6 +188,7 @@ pub const CODES: [Code; 90] = [
     Code::StepsWrites,
     Code::StepsSpace,
     Code::NoRuleK,
+    Code::ParallelBit,
 ];
 
 impl Code {
@@ -283,6 +285,7 @@ impl Code {
             Self::StepsWrites => "steps_writes",
             Self::StepsSpace => "steps_space",
             Self::NoRuleK => "no_rule_k",
+            Self::ParallelBit => "parallel_bit",
         }
     }
 
@@ -524,6 +527,9 @@ impl Code {
             }
             Self::NoRuleK => {
                 "No counting table applied k times gives every example; check steps, border and the examples, or use another rule; closest names the nearest table and its wrong cells."
+            }
+            Self::ParallelBit => {
+                "Give every read and write bit 0 with parallel true: each is the whole word of its plane, bit j of it copy j; or drop parallel."
             }
         }
     }

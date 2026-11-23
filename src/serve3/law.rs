@@ -7,7 +7,7 @@ use crate::bricks::Bricks;
 use crate::compact::Plan;
 use crate::host::Host;
 use crate::law::Law;
-use crate::law::chip::{self, Circuit, Read, Rest, Spot, Wired, Wiring};
+use crate::law::chip::{self, Circuit, Copies, Read, Rest, Spot, Wired, Wiring};
 use crate::law::quiet::{self, Class};
 use crate::layout::BINDINGS;
 use crate::live::{self, Loop};
@@ -691,14 +691,22 @@ fn from_chip(_: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         keeps: spots_of(held, chip::KEEPS),
         rest,
     };
-    Ok(map(chip_law(circuit, wiring)?))
+    Ok(map(chip_law(circuit, wiring, Copies::One)?))
 }
 
 pub(super) fn chip_law(
     circuit: Circuit,
     wiring: Wiring,
+    copies: Copies,
 ) -> Result<Vec<(&'static str, Json)>, Failed> {
-    let wired = Wired::new(circuit, wiring).map_err(|why| chip_refused(&why))?;
+    let single = Wired::new(circuit, wiring).map_err(|why| chip_refused(&why))?;
+    let wired = match copies {
+        Copies::One => single.clone(),
+        Copies::Word => single
+            .clone()
+            .parallel()
+            .map_err(|why| chip_refused(&why))?,
+    };
     let written = wired.text();
     let law = Law::compile(&written).map_err(|why| too_big(&why, wired.circuit()))?;
     let class = background_class(&law, &[]);
@@ -714,10 +722,7 @@ pub(super) fn chip_law(
             text(if class.proved() { "listed" } else { "whole" }),
         ),
         ("rest", text(wired.wiring().rest.name())),
-        (
-            "nodes",
-            counted(u32::try_from(law.nodes()).unwrap_or(u32::MAX)),
-        ),
+        ("nodes", sized(law.nodes())),
         (
             "gates",
             counted(u32::try_from(wired.circuit().gates.len()).unwrap_or(u32::MAX)),
@@ -726,5 +731,29 @@ pub(super) fn chip_law(
     if let Some(why) = class.why() {
         answer.insert(6, ("quiet_why", text(&why)));
     }
+    if copies == Copies::Word {
+        answer.retain(|(key, _)| *key != "rest");
+        let one = single.text();
+        let one_law = Law::compile(&one).map_err(|why| too_big(&why, single.circuit()))?;
+        answer.push((
+            "parallel",
+            map(vec![
+                ("copies", counted(copies.count())),
+                ("bytes", sized(written.len())),
+                ("nodes", sized(law.nodes())),
+                (
+                    "single",
+                    map(vec![
+                        ("bytes", sized(one.len())),
+                        ("nodes", sized(one_law.nodes())),
+                    ]),
+                ),
+            ]),
+        ));
+    }
     Ok(answer)
+}
+
+fn sized(held: usize) -> Json {
+    counted(u32::try_from(held).unwrap_or(u32::MAX))
 }
