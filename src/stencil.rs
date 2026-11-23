@@ -787,6 +787,127 @@ pub fn tallied(
     Tallied { table, split }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deviation {
+    pub example: u32,
+    pub at: [u32; 3],
+    pub class: u32,
+    pub seen: u32,
+    pub law: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Voted {
+    pub tallies: Vec<Vec<[u64; 2]>>,
+    pub table: Vec<Option<u32>>,
+    pub ties: Vec<Vec<u32>>,
+    pub deviating: Vec<u64>,
+    pub listed: Vec<Vec<Deviation>>,
+    pub cells: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Voting<'held> {
+    pub tally: Tally,
+    pub stencil: Stencil,
+    pub reads: &'held [Bit],
+    pub writes: &'held [Bit],
+    pub border: Border,
+}
+
+fn each_cell(samples: &[Sample<'_>], visit: &mut dyn FnMut(u32, [u32; 3], &Sample<'_>)) {
+    for (example, sample) in samples.iter().enumerate() {
+        let example = u32::try_from(example).unwrap_or(u32::MAX);
+        let [wide, deep, tall] = sample.inner;
+        for z in 0..tall {
+            for y in 0..deep {
+                for x in 0..wide {
+                    visit(example, [x, y, z], sample);
+                }
+            }
+        }
+    }
+}
+
+#[must_use]
+pub fn voted(voting: Voting<'_>, samples: &[Sample<'_>], most: usize) -> Voted {
+    let Voting {
+        tally,
+        stencil,
+        reads,
+        writes,
+        border,
+    } = voting;
+    let classes = tally.classes(stencil) as usize;
+    let mut tallies: Vec<Vec<[u64; 2]>> = vec![vec![[0, 0]; classes]; writes.len()];
+    let mut shown = vec![false; classes];
+    let mut cells = 0_u64;
+    each_cell(samples, &mut |_, at, sample| {
+        cells += 1;
+        let class = tally.class(stencil, row_at(stencil, reads, sample, at, border)) as usize;
+        if let Some(slot) = shown.get_mut(class) {
+            *slot = true;
+        }
+        let outputs = outputs_at(writes, sample, at);
+        for (write, held) in tallies.iter_mut().enumerate() {
+            let bit = ((outputs >> write) & 1) as usize;
+            if let Some(count) = held.get_mut(class).and_then(|pair| pair.get_mut(bit)) {
+                *count += 1;
+            }
+        }
+    });
+    let mut ties: Vec<Vec<u32>> = vec![Vec::new(); writes.len()];
+    let table: Vec<Option<u32>> = shown
+        .iter()
+        .enumerate()
+        .map(|(class, seen)| {
+            seen.then(|| {
+                tallies.iter().zip(ties.iter_mut()).enumerate().fold(
+                    0_u32,
+                    |word, (write, (held, tied))| {
+                        let [zeros, ones] = held.get(class).copied().unwrap_or([0, 0]);
+                        if zeros == ones {
+                            tied.push(u32::try_from(class).unwrap_or(u32::MAX));
+                        }
+                        word | (u32::from(ones > zeros) << write)
+                    },
+                )
+            })
+        })
+        .collect();
+    let mut deviating = vec![0_u64; writes.len()];
+    let mut listed: Vec<Vec<Deviation>> = vec![Vec::new(); writes.len()];
+    each_cell(samples, &mut |example, at, sample| {
+        let class = tally.class(stencil, row_at(stencil, reads, sample, at, border));
+        let law = table.get(class as usize).copied().flatten().unwrap_or(0);
+        let outputs = outputs_at(writes, sample, at);
+        for (write, (count, held)) in deviating.iter_mut().zip(listed.iter_mut()).enumerate() {
+            let seen = (outputs >> write) & 1;
+            let wanted = (law >> write) & 1;
+            if seen != wanted {
+                *count += 1;
+                if held.len() < most {
+                    held.push(Deviation {
+                        example,
+                        at,
+                        class,
+                        seen,
+                        law: wanted,
+                    });
+                }
+            }
+        }
+    });
+    Voted {
+        tallies,
+        table,
+        ties,
+        deviating,
+        listed,
+        cells,
+    }
+}
+
 struct Wires {
     inputs: u32,
     gates: Vec<Gate>,

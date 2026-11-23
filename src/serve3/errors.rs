@@ -78,9 +78,10 @@ pub enum Code {
     NotCounting,
     StartShape,
     StartRule,
+    NoiseRule,
 }
 
-pub const CODES: [Code; 74] = [
+pub const CODES: [Code; 75] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -155,6 +156,7 @@ pub const CODES: [Code; 74] = [
     Code::NotCounting,
     Code::StartShape,
     Code::StartRule,
+    Code::NoiseRule,
 ];
 
 impl Code {
@@ -235,6 +237,7 @@ impl Code {
             Self::NotCounting => "not_counting",
             Self::StartShape => "start_shape",
             Self::StartRule => "start_rule",
+            Self::NoiseRule => "noise_rule",
         }
     }
 
@@ -430,6 +433,9 @@ impl Code {
             }
             Self::StartRule => {
                 "Drop start, or use rule minimal or symmetric; totalistic and outer read their tables in one pass with no search to start."
+            }
+            Self::NoiseRule => {
+                "Drop noise or give it refuse, or use rule totalistic or outer; minimal and symmetric take no vote."
             }
         }
     }
