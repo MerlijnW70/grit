@@ -531,6 +531,10 @@ fn current(held: &Json) -> bool {
     matches!(held.get("current"), Some(Json::Bool(true)))
 }
 
+fn marking(held: &Json) -> bool {
+    matches!(held.get("mark"), Some(Json::Bool(true)))
+}
+
 fn plane_of(held: &Json, world: &World<'_>) -> Result<u32, Failed> {
     let plane = int(held, "plane")?;
     if current(held) {
@@ -1268,7 +1272,7 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     let now = live.world.frame();
     let form = words_of(held, "form")?;
-    if form != "dense" || held.get("since").is_some() || held.get("mark").is_some() {
+    if form != "dense" || held.get("since").is_some() || marking(held) {
         return scanned(live, held, number, now, (from, to), form);
     }
     let cells: u64 = from
@@ -1356,7 +1360,7 @@ fn marked_cells(
             Code::MarkUnknown,
             "$.since",
             format!(
-                "this world holds no mark {}; marks live with the open world, at most {MARKS_HELD} of them, and are not kept by save, open or a restart",
+                "this world holds no mark {}; marks live with the open world, at most {MARKS_HELD} of them, and are not kept by save, open, a restart or a rebuild after a lost device",
                 errors::shown(id)
             ),
         ));
@@ -1376,16 +1380,14 @@ fn marked_cells(
         ));
     }
     if mark.plane != reference {
-        let (field, was) = match mark.plane {
-            Plane::Current => ("$.current", "the current plane".to_owned()),
-            Plane::Numbered(was) => (
-                if current(held) {
-                    "$.current"
-                } else {
-                    "$.plane"
-                },
-                format!("plane {was}"),
-            ),
+        let field = if current(held) {
+            "$.current"
+        } else {
+            "$.plane"
+        };
+        let was = match mark.plane {
+            Plane::Current => "the current plane".to_owned(),
+            Plane::Numbered(was) => format!("plane {was}"),
         };
         return Err(refused(
             Code::MarkUnlike,
@@ -1406,7 +1408,7 @@ fn scanned(
 ) -> Result<Json, Failed> {
     let (from, to) = corners;
     let since = held.get("since").and_then(Json::text);
-    let marking = matches!(held.get("mark"), Some(Json::Bool(true)));
+    let marking = marking(held);
     if let Some(refusal) = form_refused(form, since) {
         return Err(refusal);
     }
@@ -1431,7 +1433,8 @@ fn scanned(
                     found.count
                 ),
             )
-            .limited(counted(SET_MOST)),
+            .limited(counted(SET_MOST))
+            .hinted(errors::FULL_BOX),
             vec![("count", exactly(u128::from(found.count)))],
         ));
     };
@@ -1466,7 +1469,8 @@ fn scanned(
                         recorded.len()
                     ),
                 )
-                .limited(counted(SET_MOST)),
+                .limited(counted(SET_MOST))
+                .hinted(errors::FULL_BOX),
                 vec![("count", number(recorded.len()))],
             ));
         }

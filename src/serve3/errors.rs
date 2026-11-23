@@ -486,7 +486,7 @@ impl Code {
                 "Give since only with form changed, always with it, and mark only with form set or changed."
             }
             Self::MarkUnknown => {
-                "Read with form set and mark true to take a new mark; marks are kept only while the world stays open."
+                "Read with form set and mark true to take a new mark; marks are held in this server's memory only, so a save, an open, a restart and a rebuild after a lost device start without them."
             }
             Self::MarkUnlike => {
                 "Read with the from, to and plane or current of the read that took the mark, or take a new mark."
@@ -501,6 +501,7 @@ pub struct Refusal {
     pub field: String,
     pub limit: Option<Json>,
     pub message: String,
+    pub hint: Option<&'static str>,
 }
 
 impl Refusal {
@@ -511,7 +512,14 @@ impl Refusal {
             field: field.to_owned(),
             limit: None,
             message,
+            hint: None,
         }
+    }
+
+    #[must_use]
+    pub const fn hinted(mut self, hint: &'static str) -> Self {
+        self.hint = Some(hint);
+        self
     }
 
     #[must_use]
@@ -529,7 +537,7 @@ impl Refusal {
         if let Some(limit) = &self.limit {
             told.push(("limit", limit.clone()));
         }
-        told.push(("hint", text(self.code.hint())));
+        told.push(("hint", text(self.hint.unwrap_or_else(|| self.code.hint()))));
         told
     }
 
@@ -546,6 +554,8 @@ impl std::fmt::Display for Refusal {
 }
 
 impl std::error::Error for Refusal {}
+
+pub const FULL_BOX: &str = "Split the box into smaller boxes, or read a box this full with form dense: it answers every cell's word, up to its own limit of cells a call, and costs less than a list once a box is about a quarter set.";
 
 const SHOWN: usize = 64;
 

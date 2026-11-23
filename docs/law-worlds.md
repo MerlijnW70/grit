@@ -98,9 +98,9 @@ The quiet class is decided on the law as written, with every uniform value check
 | `set` | `[x, y, z, word]` of each cell whose word is not 0 | any size |
 | `changed` | `[x, y, z, word]` of each cell whose word differs from the mark `since` names; a cleared cell is listed with 0 | the mark's |
 
-Cells come x fastest, then y, then z; `count` is how many. `plane` and `current` work as for a dense read. One call lists at most 16384 cells (`limits.set_cells`); past that it is refused `too_many` at `$.to`, with `limit` and `count`, the cells it would list. Nothing is cut short.
+Cells come x fastest, then y, then z; `count` is how many. `plane` and `current` work as for a dense read. One call lists at most 16384 cells (`limits.set_cells`); past that it is refused `too_many` at `$.to`, with `limit` and `count`, the cells it would list. Nothing is cut short. A box that full reads cheaper with `form` `dense`, at most 4096 cells a call: a listed cell carries its place as well as its word, so dense reads cost less once about a quarter of a box is set. The refusal's `hint` says so.
 
-`mark` true on a `set` or `changed` read records the box as the read sees it and answers its id as `mark`. A `changed` read compares the device's words now with those recorded words, so it is exact across steps, writes, params, a restore and a fork (a fork starts with its source's marks). Marks live with the open world, at most 16 (`limits.marks_held`), the oldest dropped first. A world opened from a file or after a restart has none.
+`mark` true on a `set` or `changed` read records the box as the read sees it and answers its id as `mark`. A `changed` read compares the device's words now with those recorded words, so it is exact across steps, writes, params, a restore and a fork (a fork starts with its source's marks). Marks live with the open world in the server's memory, at most 16 (`limits.marks_held`), the oldest dropped first. They are not journaled: a world opened from a file, after a restart or rebuilt after a lost device has none, and a `changed` read of an earlier mark is refused `mark_unknown`; take a new mark. `mark` false is the same as leaving it out, on any form.
 
 1. `grit_world_read` the whole current plane with `form` `set`, `current` true and `mark` true.
 2. `grit_world_step` 1 frame.
@@ -112,9 +112,9 @@ Refusals:
 
 | Code | When | `field` |
 |---|---|---|
-| `read_form` | `since` without `form` `changed`, `changed` without `since`, or `mark` with `form` `dense` | `$.since` or `$.mark` |
-| `mark_unknown` | a mark this world does not hold | `$.since` |
-| `mark_unlike` | a box or plane other than the mark's | `$.from`, `$.to`, `$.plane` or `$.current` |
+| `read_form` | `since` without `form` `changed`, `changed` without `since`, or `mark` true with `form` `dense` | `$.since` or `$.mark` |
+| `mark_unknown` | a mark this world does not hold: never taken, dropped past 16, or lost with a save, an open, a restart or a lost device | `$.since` |
+| `mark_unlike` | a box or plane other than the mark's | `$.from` or `$.to`; for the plane, `$.current` when the read gives `current` true, else `$.plane` |
 | `too_many` | more than 16384 cells to list, or a mark of more than 16384 set cells | `$.to` or `$.mark` |
 
 ## Reversible laws
@@ -384,7 +384,7 @@ The answer adds:
 | `tallies` | per write, `[zeros, ones]` for each count, in the shape of `tables`; a write's tallies sum to the example cells |
 | `ties` | per write, the tied counts, in the shape of `unseen_counts` |
 | `deviating` | per write, the example cells whose output disagrees with the law |
-| `deviating_cells` | per write, at most 64 of those cells in example order, then z, y, x: `example`, `at`, `count`, `centre` (under `outer`), `seen` and `law` |
+| `deviating_cells` | per write, at most 64 of those cells in example order, then z, y, x: `example`, `at`, `count`, `centre` (under `outer`), `seen` and `law`; `at` is the cell's place in the example's box, so for a world example it is counted from the example's `from`, not from the world's origin |
 | `deviating_share` | deviating cells over voted cells (example cells times writes), as an exact `[num, den]` |
 
 `min_support`, from 1 (if left out) up to the stencil's places times 64, marks the counts that rest on little evidence. The answer then adds `thin`: per write, in the shape of `ties`, each count shown by at least one and fewer than `min_support` example cells, as `{count, tally}` with `tally` its `[zeros, ones]`. Such a count is still decided by the vote, so the law does not change. `min_support` without `noise` `vote` is refused `support_noise` at `$.min_support`; 0 is refused `malformed` there, and past the stencil's limit (576 for 3x3) `support_limit`.
