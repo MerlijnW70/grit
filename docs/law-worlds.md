@@ -292,6 +292,7 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `places`, `place_list` | under `totalistic` and `outer`: the places counted; see [Counted places](#counted-places) |
 | `min_support` | under `noise` `vote`: lists the counts shown by few cells in `thin`; see [Noisy examples](#noisy-examples) |
 | `steps` | under `totalistic` and `outer`: k, the law's applications between input and output, 1 if left out; see [Examples k steps apart](#examples-k-steps-apart) |
+| `parallel` | `true`: the law in bit-parallel form, 32 independent copies in one word; see [32 copies in one word](#32-copies-in-one-word) |
 
 The server builds every example cell's row, counts the rows, and refuses `conflict` at `$.examples` when one row is seen with two outputs. The refusal's `rows` lists each such row with every output and where it was first seen. The search is `grit_machine`'s, over the seen rows only, so 27-input stencils work. It walks a gate ladder down from `gates` as `grit_least` does and keeps the smallest circuit that answers every seen row.
 
@@ -499,6 +500,30 @@ The answer has `law`, `hash`, `halo`, `quiet`, `stepping` and `nodes` as above, 
 | `symmetry` | `group` (`D4` for 3x3, `Oh`, order 48, for 3x3x3) and `invariant`: per write the place coefficients of each read and their images under every move differ by at most max(2^-k, 6 standard errors of the difference); `deviation`, `tolerance`, `read` and `places` name the pair furthest past it |
 | `iterate` | one read and one write: `alternate`; as many reads as writes: `copy`, the written plane and the read plane to write it back to after each frame |
 
-It needs no device and has no brake. Refused before any example is read: `plane_format` (a bit other than 0, `frac` past 30), `poly_limit` (`poly` past 3), `learn_limit` at `$.reads` (reads times counted places past 27), `linear_rule` (`poly`, `frac`, `clamp` or `range` under another rule), `reversed` (a `clamp` or `range` whose least is past its greatest), `start_rule`, `noise_rule` and `steps_rule`.
+It needs no device and has no brake. Refused before any example is read: `plane_format` (a bit other than 0, `frac` past 30), `poly_limit` (`poly` past 3), `learn_limit` at `$.reads` (reads times counted places past 27), `linear_rule` (`poly`, `frac`, `clamp` or `range` under another rule), `reversed` (a `clamp` or `range` whose least is past its greatest), `start_rule`, `noise_rule`, `steps_rule` and `parallel_rule` (`parallel` true).
 
 Heat from four 64x64 pairs, `alpha` 0.15: `stencil` `3x3`, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `wrapped`, `places` `von_neumann`: the four face coefficients are alpha, the centre 1 - 4 alpha. Run it with `alternate` `[0,1]`. Gray-Scott reads u and v on planes 0 and 1, writes planes 2 and 3, with `poly` 3 and `frac` 14.
+
+### 32 copies in one word
+
+A learned law reads one bit of each read and writes one bit of each write. With `parallel` true, under `minimal`, `symmetric`, `totalistic` and `outer` and with `steps`, `noise` and `start`, the answer is the same circuit in bit-parallel form: each read and each write is the whole word of its plane, and bit j of every word is copy j. Bit j of each written word is the single-bit law applied to bit j of the read words, for every j in 0 to 31, so one world runs 32 independent soups.
+
+- Every read and write names `bit` 0; any other bit is refused `parallel_bit` at `$.reads[k].bit` or `$.writes[k].bit`. Two writes on one plane are then one bit twice, which stays `bit_shared`.
+- Every bit of a written word is a copy's output, so `rest` has no bit to act on and the answer has no `rest`.
+- `linear` already reads and writes whole words as numbers, so `parallel` true with it is refused `parallel_rule` at `$.parallel`.
+- A NOT is an xor with 4294967295 and a constant 1 gate is 4294967295, so no copy leaks into another; the inputs carry no `and ..., 1` mask and the writes no shift.
+- Learning does not change: the circuit, `tables`, `ladder` and every other field are the same bytes as without `parallel`. Only `law`, `hash` and `nodes` differ, and the answer adds `parallel`: `copies` (32), `bytes` and `nodes` of its law text, and `single` with the `bytes` and `nodes` of the single-bit form. The gates are the same.
+- `parallel` false, or left out, answers the same bytes as before.
+
+It runs with `alternate` as the single-bit law does: `[the read's plane, the write's plane]`, or a `steps` answer's `iterate`.
+
+1. `grit_law_learn` Bays 5766 (B6/S5,6,7): `stencil` `3x3x3`, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `rule` `outer`, `parallel` true.
+2. `grit_world_create` with `wide`, `deep` and `tall` 32, its `law` and `alternate` `[0,1]`.
+3. `grit_world_write` with `current` true each cell's 32 soups as one word, soup j at bit j.
+4. `grit_world_step` 64 frames, then `grit_world_read` with `current` true: bit j of each word is soup j at generation 64.
+
+| Law (3x3 Life / 3x3x3 Bays, outer) | Gates | Bytes, single / parallel | Nodes, single / parallel |
+|---|---|---|---|
+| Life | 39 | 1788 / 1680 | 573 / 405 |
+| Bays 5766 | 127 | 5010 / 4731 | 1605 / 1149 |
+

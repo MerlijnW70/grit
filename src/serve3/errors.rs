@@ -99,9 +99,11 @@ pub enum Code {
     IllConditioned,
     FixedRange,
     LinearRule,
+    ParallelBit,
+    ParallelRule,
 }
 
-pub const CODES: [Code; 95] = [
+pub const CODES: [Code; 97] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -197,6 +199,8 @@ pub const CODES: [Code; 95] = [
     Code::IllConditioned,
     Code::FixedRange,
     Code::LinearRule,
+    Code::ParallelBit,
+    Code::ParallelRule,
 ];
 
 impl Code {
@@ -298,6 +302,8 @@ impl Code {
             Self::IllConditioned => "ill_conditioned",
             Self::FixedRange => "fixed_range",
             Self::LinearRule => "linear_rule",
+            Self::ParallelBit => "parallel_bit",
+            Self::ParallelRule => "parallel_rule",
         }
     }
 
@@ -552,6 +558,12 @@ impl Code {
             }
             Self::LinearRule => {
                 "Drop poly, frac, clamp and range, or use rule linear; only a fixed-point law reads them."
+            }
+            Self::ParallelBit => {
+                "Give every read and write bit 0 with parallel true: each is the whole word of its plane, bit j of it copy j; or drop parallel."
+            }
+            Self::ParallelRule => {
+                "Drop parallel under rule linear: a fixed-point law already reads and writes whole words."
             }
         }
     }

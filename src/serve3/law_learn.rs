@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::law::chip::{Circuit, Read, Rest, Spot, Wiring};
+use crate::law::chip::{Circuit, Copies, Read, Rest, Spot, Wiring};
 use crate::machine::Machine;
 use crate::netlist::{Gate, Netlist};
 use crate::serve::{Effort, Halt};
@@ -600,6 +600,16 @@ fn learn_shown() -> Json {
                 ),
             ),
             (
+                "parallel",
+                with(
+                    property(
+                        "boolean",
+                        "rules minimal, symmetric, totalistic and outer: answer the law in bit-parallel form: each read and write is the whole word of its plane at bit 0, and bit j of every word is an independent copy j, so one world runs 32 copies; false if left out",
+                    ),
+                    vec![("default", Json::Bool(false))],
+                ),
+            ),
+            (
                 "name",
                 with(
                     property("string", "the law's name; learned if left out"),
@@ -861,6 +871,7 @@ struct Asked {
     writes: Vec<Bit>,
     border: Border,
     margin: u32,
+    copies: Copies,
 }
 
 fn cells_of(size: [u32; 3]) -> u64 {
@@ -1575,6 +1586,38 @@ fn wiring(asked: &Asked, held: &Json, channels: u32) -> Wiring {
     }
 }
 
+fn copies_of(held: &Json, asked: &Asked) -> Result<Copies, Failed> {
+    match held.get("parallel") {
+        None | Some(Json::Bool(false)) => return Ok(Copies::One),
+        Some(Json::Bool(true)) => {}
+        Some(_) => return Err(unread("parallel")),
+    }
+    let bits = asked
+        .reads
+        .iter()
+        .enumerate()
+        .map(|(at, one)| ("reads", at, one.bit))
+        .chain(
+            asked
+                .writes
+                .iter()
+                .enumerate()
+                .map(|(at, one)| ("writes", at, one.bit)),
+        );
+    for (list, at, bit) in bits {
+        if bit != 0 {
+            return Err(refused(
+                Code::ParallelBit,
+                &format!("$.{list}[{at}].bit"),
+                format!(
+                    "{list}[{at}] names bit {bit}; with parallel true a read or write is the whole word of its plane, bit j of it copy j, so each names bit 0"
+                ),
+            ));
+        }
+    }
+    Ok(Copies::Word)
+}
+
 fn halted_refusal(stop: Stop, when: &str) -> Failed {
     refused(
         stop.code(),
@@ -1863,7 +1906,7 @@ fn counted_law(
         outputs,
         gates: gates.clone(),
     };
-    let mut answer = super::law::chip_law(circuit, wiring(asked, held, channels))?;
+    let mut answer = super::law::chip_law(circuit, wiring(asked, held, channels), asked.copies)?;
     let total = 1_u64 << inputs;
     let seen = u64::try_from(rows.seen.len()).unwrap_or(u64::MAX);
     let unseen = total - seen;
@@ -2288,6 +2331,11 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             _ => return Err(unread("border")),
         },
         margin: 1,
+        copies: Copies::One,
+    };
+    let asked = Asked {
+        copies: copies_of(held, &asked)?,
+        ..asked
     };
     let vote = match held.get("noise") {
         None => false,
@@ -2305,6 +2353,13 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ));
     }
     let linear = held.get("rule").and_then(Json::text) == Some("linear");
+    if linear && asked.copies == Copies::Word {
+        return Err(refused(
+            Code::ParallelRule,
+            "$.parallel",
+            "rule linear reads each whole word as one signed fixed-point number, so a word holds no 32 bits to run as copies; parallel goes with rule minimal, symmetric, totalistic or outer".to_owned(),
+        ));
+    }
     if !linear {
         for key in LINEAR_KEYS {
             if held.get(key).is_some() {
@@ -2691,7 +2746,7 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         outputs,
         gates: law_gates.clone(),
     };
-    let mut answer = super::law::chip_law(circuit, wiring(&asked, held, channels))?;
+    let mut answer = super::law::chip_law(circuit, wiring(&asked, held, channels), asked.copies)?;
     let total = 1_u64 << inputs;
     let seen = u64::try_from(rows.seen.len()).unwrap_or(u64::MAX);
     let unseen = total - seen;
@@ -3194,6 +3249,7 @@ fn stepped_law(
         writes: asked.writes.clone(),
         border: asked.border,
         margin: steps,
+        copies: asked.copies,
     };
     let owned = examples_of(server, &padded, held)?;
     let samples: Vec<Sample<'_>> = owned.iter().map(Owned::sample).collect();
@@ -3289,7 +3345,7 @@ fn stepped_law(
         outputs: 1,
         gates: gates.clone(),
     };
-    let mut answer = super::law::chip_law(circuit, wiring(asked, held, channels))?;
+    let mut answer = super::law::chip_law(circuit, wiring(asked, held, channels), asked.copies)?;
     let write = match asked.writes.as_slice() {
         [one, ..] => *one,
         [] => *read,
