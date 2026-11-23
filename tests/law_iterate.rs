@@ -1613,3 +1613,184 @@ mod pinned {
         }
     }
 }
+
+fn or_law() -> String {
+    let out: Vec<String> = (0..8)
+        .map(|k| {
+            format!(
+                "[\"vec\",[\"at\",[\"at\",\"cells\",{k}],0],[\"or\",[\"at\",[\"at\",\"cells\",{k}],1],[\"and\",[\"at\",[\"at\",\"cells\",{k}],0],[\"param\",0]]]]"
+            )
+        })
+        .collect();
+    format!(
+        "{{\"law\":1,\"name\":\"orr\",\"params\":1,\"channels\":2,\"halo\":0,\"tally\":{{\"counts\":1,\"weighted\":false}},\"consts\":{{}},\"defs\":{{}},\"step\":[\"vec\",[\"vec\",{}],[\"vec\",0]]}}",
+        out.join(",")
+    )
+}
+
+#[test]
+fn i7_a_uniform_value_still_at_one_parity_only_turns_the_class_whole() {
+    let law = iterating(&or_law(), [0, 1]);
+    let held = |value: [u32; 2]| [[value[0]; 8], [value[1]; 8]].concat();
+    for (param, value, even, odd) in [
+        (1_u32, [0_u32, 1], false, true),
+        (1, [1, 0], true, false),
+        (1, [6, 7], false, true),
+        (1, [1, 1], false, false),
+        (1, [0, 0], false, false),
+        (0, [0, 1], false, false),
+        (0, [1, 0], false, false),
+    ] {
+        let case = format!("param {param} value {value:?}");
+        let params = [param];
+        assert_eq!(
+            grit::law::quiet::stepped_at(&law, &params, &value, 0) != held(value),
+            even,
+            "{case} at an even frame"
+        );
+        assert_eq!(
+            grit::law::quiet::stepped_at(&law, &params, &value, 1) != held(value),
+            odd,
+            "{case} at an odd frame"
+        );
+        assert_eq!(
+            grit::law::quiet::moved(&law, &params, &value).is_some(),
+            even || odd,
+            "{case}"
+        );
+        let class = grit::law::quiet::class(&law, &params, &[value.to_vec()]);
+        assert_eq!(class.proved(), !(even || odd), "{case}: {class:?}");
+    }
+    let Some(host) = device("law_iterate i7") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let made = ok(
+        &mut server,
+        "grit_world_create",
+        &format!(
+            "{{\"law\":{},\"params\":[0],\"alternate\":[0,1],\"wide\":32,\"deep\":32,\"tall\":32,\"sparse\":true,\"budget_ms\":{LONG}}}",
+            quoted(&or_law())
+        ),
+    );
+    assert_eq!(text_at(&made, "quiet"), "proved");
+    let world = int_at(&made, "world");
+    let mut cells = Vec::new();
+    for z in 0..16_u32 {
+        for y in 0..16_u32 {
+            for x in 0..16_u32 {
+                cells.push(format!("[{x},{y},{z},1]"));
+            }
+        }
+    }
+    ok(
+        &mut server,
+        "grit_world_write",
+        &format!(
+            "{{\"world\":{world},\"plane\":1,\"cells\":[{}],\"budget_ms\":{LONG}}}",
+            cells.join(",")
+        ),
+    );
+    let step = |server: &mut Server<'_>| {
+        let stepped = ok(
+            server,
+            "grit_world_step",
+            &format!("{{\"world\":{world},\"frames\":1,\"budget_ms\":{LONG}}}"),
+        );
+        int_at(stepped.get("pool_use").unwrap(), "held")
+    };
+    let busy = step(&mut server);
+    let mut quiet = busy;
+    for _ in 0..7 {
+        quiet = step(&mut server);
+    }
+    assert!(
+        busy > 0 && quiet == 0,
+        "the region was never handed back as uniform bricks: {quiet} of {busy} held"
+    );
+    let kept = ok(
+        &mut server,
+        "grit_world_params",
+        &format!("{{\"world\":{world},\"params\":[0]}}"),
+    );
+    assert_eq!(int_at(&kept, "frame"), 8);
+    let refused = no(
+        &mut server,
+        "grit_world_params",
+        &format!("{{\"world\":{world},\"params\":[1]}}"),
+    );
+    let said = written(&refused);
+    assert_eq!(text_at(&refused, "code"), "quiet_refused", "{said}");
+    assert_eq!(text_at(&refused, "field"), "$.params", "{said}");
+    assert!(said.contains("[0, 1]"), "{said}");
+    let read = ok(
+        &mut server,
+        "grit_world_read",
+        &format!("{{\"world\":{world},\"plane\":0,\"from\":[3,4,5],\"to\":[3,4,5]}}"),
+    );
+    assert_eq!(written(read.get("cells").unwrap()), "[0]");
+}
+
+#[test]
+fn i8_a_restore_from_an_odd_fork_into_an_even_world_steps_as_the_host() {
+    let Some(host) = device("law_iterate i8") else {
+        return;
+    };
+    let law = iterating(&learned(&host, Shape::Square, "wrapped"), [0, 1]);
+    let size = [32, 32, 2];
+    for stepping in [Stepping::Listed, Stepping::Whole] {
+        let mut rng = Rng(if stepping == Stepping::Listed {
+            808
+        } else {
+            809
+        });
+        let start = soup(&mut rng, size, 300, 1);
+        let next = |words: &[u32]| generation(Shape::Square, size, words, true, 1);
+        let mut target = world(&host, &law, size, false, stepping);
+        seeded(&mut target, 0, size, &start);
+        target.step(2).unwrap();
+        let mut fork = target.fork().unwrap();
+        fork.step(3).unwrap();
+        target.step(2).unwrap();
+        assert_eq!((fork.frame(), target.frame()), (5, 4));
+        let mut want = start.clone();
+        for _ in 0..5 {
+            want = next(&want);
+        }
+        assert_eq!(current_of(&mut fork, size), want, "{stepping:?} fork at 5");
+        target.restore(&mut fork).unwrap();
+        assert_eq!(target.frame(), 5);
+        assert_eq!(target.current(), Some(1));
+        assert_eq!(current_of(&mut target, size), want, "{stepping:?} restored");
+        for frame in 6..=13_u32 {
+            target.step(1).unwrap();
+            want = next(&want);
+            let got = current_of(&mut target, size);
+            assert!(
+                got == want,
+                "{stepping:?} restored at 5, stepped to {frame}: {}",
+                first_difference(&got, &want, size)
+            );
+        }
+        let mut back = world(&host, &law, size, false, stepping);
+        seeded(&mut back, 0, size, &start);
+        back.step(4).unwrap();
+        let mut odd = back.fork().unwrap();
+        odd.step(3).unwrap();
+        odd.restore(&mut back).unwrap();
+        let mut want = start.clone();
+        for _ in 0..4 {
+            want = next(&want);
+        }
+        for frame in 5..=10_u32 {
+            odd.step(1).unwrap();
+            want = next(&want);
+            let got = current_of(&mut odd, size);
+            assert!(
+                got == want,
+                "{stepping:?} odd world restored from an even one, stepped to {frame}: {}",
+                first_difference(&got, &want, size)
+            );
+        }
+    }
+}
