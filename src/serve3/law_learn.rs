@@ -4,7 +4,9 @@ use crate::law::chip::{Circuit, Read, Rest, Spot, Wiring};
 use crate::machine::Machine;
 use crate::netlist::{Gate, Netlist};
 use crate::serve::{Effort, Halt};
-use crate::stencil::{self, Bit, Border, Rows, Sample, Stencil, Tallied, Tally};
+use crate::stencil::{
+    self, Bit, Border, Deviation, Rows, Sample, Stencil, Tallied, Tally, Voted, Voting,
+};
 use crate::wire::{Json, counted, map, text};
 
 use super::budget::{Guard, Stop};
@@ -66,7 +68,7 @@ pub const ZERO_RUNS: &str = "the law reads its neighbours wrapped on the world's
 
 pub const WRAPPED_RUNS: &str = "the law reads its neighbours wrapped on the world's torus; an inline example wraps on itself, so it runs alike on a world whose sides equal its own along each axis the stencil reads (3x3 reads x and y, so its tall is free; a world's tall is at least 2), and a world example's box reads its neighbours from that world";
 
-pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A call stops on its deadline or cancel only at a brake: before each build that measures the device, before each search's build and before each device submission of a look; no measured time is compared with the time left. Once the deadline has passed no further submission starts, so an answer can come late by the one submission in flight: a build, or one submission of a look, sized by the device's measured pace. A build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission, where a driver that compiles at its first dispatch compiles, grown with the square of the kernel's words from the closest one measured, stays within half the device's patience; a top rung past that is refused learn_limit at gates with the most gates that fit, a limit measured on this device at this moment and so outside the same answer below; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion checks budget and cancel every 4096 rows and refuses budget or cancelled. The count of decided rows checks only cancel, every 4096 blocks of 64 rows, and none after a stopped ladder; otherwise it runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so a found law is never lost to the deadline. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on when the deadline passed or the cancel came, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it. Under rule totalistic or outer there is no search, ladder, brake or search kernel, and inline examples need no compute device: each write's table is read from the seen rows in one pass, a count never seen is 0, and the law counts with a gate circuit, an adder tree and a decoder of the count. Under rule minimal or symmetric, start is a circuit to begin from, the chip of an earlier answer; it is checked on the host on every seen row before any search: one that answers them all is a solved rung, so the answer is never larger than it and never refused budget or cancelled, and the ladder walks down from its live gates less one; one that misses rows is a member of the first rung's crowd, kept unless a candidate scores at least as well, and the ladder starts at its live gates when gates is fewer";
+pub const LEARN: &str = "grit_law_learn builds the stencil's rows from example worlds, refuses a row seen with two outputs (conflict) and, under rule symmetric, rows whose rotations or reflections disagree (asymmetric), then walks a gate ladder down from gates as grit_least does, with grit_machine's search over the seen rows: each rung starts its crowd at most at what one device binding holds and doubles it while unsolved up to 65536 or that limit, whichever is less; the answer names a lowered crowd as crowd_capped. The ladder ends after two failed rungs in a row. The law is the smallest solved circuit, wired as grit_law_from_chip would wire it, with the row order below. A call stops on its deadline or cancel only at a brake: before each build that measures the device, before each search's build and before each device submission of a look; no measured time is compared with the time left. Once the deadline has passed no further submission starts, so an answer can come late by the one submission in flight: a build, or one submission of a look, sized by the device's measured pace. A build cannot stop part way, and its kernel loops over the rows searched (under symmetric every image of every seen row), so it does not grow with them; before the ladder the call builds the kernel of its smallest rung, then larger ones while each build's first submission, where a driver that compiles at its first dispatch compiles, grown with the square of the kernel's words from the closest one measured, stays within half the device's patience; a top rung past that is refused learn_limit at gates with the most gates that fit, a limit measured on this device at this moment and so outside the same answer below; a stopped ladder answers the smallest circuit it solved so far, with stopped budget or cancelled, and refuses budget or cancelled when none. The seen rows, and under symmetric their images, are refused learn_limit before any search when they pass the rows one kernel holds; the expansion stops as soon as it passes them, so it never holds more. The expansion checks budget and cancel every 4096 rows and refuses budget or cancelled. The count of decided rows checks only cancel, every 4096 blocks of 64 rows, and none after a stopped ladder; otherwise it runs to its end, at most two to the inputs less 6 blocks times the inputs plus the law's gates, so a found law is never lost to the deadline. Under symmetric the ladder starts at most at the gates whose copies and ors fit the 600 gates a law always holds, and the answer names a lowered start as gates_capped. The same request gives the same answer on the same device when it answers stopped ladder; a stop on budget or cancel depends on when the deadline passed or the cancel came, and its ladder is a prefix of that answer's ladder, with the smallest circuit solved in it. Under rule totalistic or outer there is no search, ladder, brake or search kernel, and inline examples need no compute device: each write's table is read from the seen rows in one pass, a count never seen is 0, and the law counts with a gate circuit, an adder tree and a decoder of the count. Under rule minimal or symmetric, start is a circuit to begin from, the chip of an earlier answer; it is checked on the host on every seen row before any search: one that answers them all is a solved rung, so the answer is never larger than it and never refused budget or cancelled, and the ladder walks down from its live gates less one; one that misses rows is a member of the first rung's crowd, kept unless a candidate scores at least as well, and the ladder starts at its live gates when gates is fewer. Under rule totalistic or outer, noise vote reads the examples cell by cell: each write's entry for a count, and under outer the centre, is the majority of the example cells that show it, a tie is 0 and listed in ties, and a count never seen is 0; no row is refused conflict or not_counting, examples.conflicts stays 0, and every other refusal stands. The answer then adds per write tallies, [zeros, ones] for each count in the shape of tables, ties, deviating, the example cells whose output disagrees with the law, and deviating_cells, at most 64 of them in example order, then z, y, x, each with example, at, count, centre under outer, seen and law; and deviating_share, the deviating cells over the voted cells (the example cells times the writes) as [num, den]. On examples that noise refuse answers, vote answers the same bytes with only these fields added. noise refuse, the default, answers as a request without noise, and noise vote under minimal or symmetric is refused noise_rule at $.noise";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Point {
@@ -631,6 +633,16 @@ fn learn_shown() -> Json {
                 ),
             ),
             ("start", start_shown()),
+            (
+                "noise",
+                with(
+                    choice(
+                        "rule totalistic or outer: how examples that disagree are taken; refuse, as conflict and not_counting; vote, each count decided by the majority of the example cells that show it, a tie 0, and the cells that disagree with the law listed",
+                        &["refuse", "vote"],
+                    ),
+                    vec![("default", text("refuse"))],
+                ),
+            ),
         ],
         &["stencil", "reads", "writes", "border", "rule", "examples"],
     )
@@ -1581,6 +1593,7 @@ fn counted_law(
     held: &Json,
     asked: &Asked,
     tally: Tally,
+    vote: bool,
 ) -> Result<Json, Failed> {
     let stencil = asked.stencil;
     if held.get("start").is_some() {
@@ -1612,17 +1625,41 @@ fn counted_law(
     let owned = examples_of(server, asked, held)?;
     let samples: Vec<Sample<'_>> = owned.iter().map(Owned::sample).collect();
     let rows = stencil::rows_of(stencil, &asked.reads, &asked.writes, &samples, asked.border);
-    if !rows.conflicts.is_empty() {
-        return Err(conflicted(&rows));
-    }
-    let tallied = stencil::tallied(tally, stencil, outputs, &rows.seen);
-    if !tallied.split.is_empty() {
-        return Err(uncounted(&tallied, tally, stencil));
-    }
-    let table: Vec<u32> = tallied.table.iter().map(|one| one.unwrap_or(0)).collect();
+    let voted = if vote {
+        let voting = Voting {
+            tally,
+            stencil,
+            reads: &asked.reads,
+            writes: &asked.writes,
+            border: asked.border,
+        };
+        Some(stencil::voted(voting, &samples, LISTED))
+    } else {
+        None
+    };
+    let entries = if let Some(one) = &voted {
+        one.table.clone()
+    } else {
+        if !rows.conflicts.is_empty() {
+            return Err(conflicted(&rows));
+        }
+        let tallied = stencil::tallied(tally, stencil, outputs, &rows.seen);
+        if !tallied.split.is_empty() {
+            return Err(uncounted(&tallied, tally, stencil));
+        }
+        tallied.table
+    };
+    let table: Vec<u32> = entries.iter().map(|one| one.unwrap_or(0)).collect();
+    let law_at = |row: u32| {
+        table
+            .get(tally.class(stencil, row) as usize)
+            .copied()
+            .unwrap_or(0)
+    };
     let gates = stencil::tally_gates(tally, stencil, outputs, &table);
     for (row, one) in &rows.seen {
-        if stencil::answer(inputs, outputs, &gates, *row) != one.outputs {
+        let wanted = if vote { law_at(*row) } else { one.outputs };
+        if stencil::answer(inputs, outputs, &gates, *row) != wanted {
             return Err(format!(
                 "the counting circuit answers row {row} other than the examples; this is a fault of the server"
             )
@@ -1652,8 +1689,7 @@ fn counted_law(
         };
         tables.push(by_count(tally, stencil, &|class| Some(counted(bit(class)))));
         never.push(by_count(tally, stencil, &|class| {
-            tallied
-                .table
+            entries
                 .get(class as usize)
                 .is_some_and(Option::is_none)
                 .then(|| counted(class % counts))
@@ -1664,8 +1700,8 @@ fn counted_law(
             .sum();
         let on_seen = rows
             .seen
-            .values()
-            .filter(|one| (one.outputs >> output) & 1 == 1)
+            .keys()
+            .filter(|row| (law_at(**row) >> output) & 1 == 1)
             .count() as u64;
         let decided = all.saturating_sub(on_seen);
         ones.push(exact(decided));
@@ -1728,7 +1764,75 @@ fn counted_law(
         ("ladder", Json::List(Vec::new())),
         ("stopped", text(NO_SEARCH)),
     ]);
+    if let Some(one) = &voted {
+        answer.extend(vote_shown(one, tally, stencil));
+    }
     Ok(map(answer))
+}
+
+fn deviation_shown(one: &Deviation, tally: Tally, counts: u32) -> Json {
+    let mut fields = vec![
+        ("example", counted(one.example)),
+        ("at", super::tools::sized(one.at)),
+        ("count", counted(one.class % counts)),
+    ];
+    if tally == Tally::Outer {
+        fields.push(("centre", counted(one.class / counts)));
+    }
+    fields.push(("seen", counted(one.seen)));
+    fields.push(("law", counted(one.law)));
+    map(fields)
+}
+
+fn vote_shown(voted: &Voted, tally: Tally, stencil: Stencil) -> Vec<(&'static str, Json)> {
+    let counts = tally.counts(stencil);
+    let tallies = voted
+        .tallies
+        .iter()
+        .map(|held| {
+            by_count(tally, stencil, &|class| {
+                held.get(class as usize)
+                    .map(|pair| Json::List(pair.iter().map(|one| exact(*one)).collect()))
+            })
+        })
+        .collect();
+    let ties = voted
+        .ties
+        .iter()
+        .map(|tied| {
+            by_count(tally, stencil, &|class| {
+                tied.contains(&class).then(|| counted(class % counts))
+            })
+        })
+        .collect();
+    let cells = voted
+        .listed
+        .iter()
+        .map(|held| {
+            Json::List(
+                held.iter()
+                    .map(|one| deviation_shown(one, tally, counts))
+                    .collect(),
+            )
+        })
+        .collect();
+    let deviating: u64 = voted.deviating.iter().sum();
+    let voted_cells = voted
+        .cells
+        .saturating_mul(u64::try_from(voted.deviating.len()).unwrap_or(u64::MAX));
+    vec![
+        ("tallies", Json::List(tallies)),
+        ("ties", Json::List(ties)),
+        (
+            "deviating",
+            Json::List(voted.deviating.iter().map(|one| exact(*one)).collect()),
+        ),
+        ("deviating_cells", Json::List(cells)),
+        (
+            "deviating_share",
+            Json::List(vec![exact(deviating), exact(voted_cells)]),
+        ),
+    ]
 }
 
 const fn border_name(border: Border) -> &'static str {
@@ -1761,13 +1865,31 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             _ => return Err(unread("border")),
         },
     };
+    let vote = match held.get("noise") {
+        None => false,
+        Some(one) => match one.text() {
+            Some("refuse") => false,
+            Some("vote") => true,
+            _ => return Err(unread("noise")),
+        },
+    };
     let symmetric = match held.get("rule").and_then(Json::text) {
         Some("symmetric") => true,
         Some("minimal") => false,
-        Some("totalistic") => return counted_law(server, held, &asked, Tally::Totalistic),
-        Some("outer") => return counted_law(server, held, &asked, Tally::Outer),
+        Some("totalistic") => return counted_law(server, held, &asked, Tally::Totalistic, vote),
+        Some("outer") => return counted_law(server, held, &asked, Tally::Outer, vote),
         _ => return Err(unread("rule")),
     };
+    if vote {
+        return Err(refused(
+            Code::NoiseRule,
+            "$.noise",
+            format!(
+                "rule {} searches for a circuit that answers every seen row, so it takes no vote; noise vote goes with rule totalistic or outer",
+                if symmetric { "symmetric" } else { "minimal" }
+            ),
+        ));
+    }
     let reads = u32::try_from(asked.reads.len()).unwrap_or(u32::MAX);
     let outputs = u32::try_from(asked.writes.len()).unwrap_or(u32::MAX);
     let inputs = stencil.positions().saturating_mul(reads);

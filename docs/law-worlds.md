@@ -203,6 +203,7 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `examples` | inline `{size, input, output}`, with one word list per read and per write, x fastest, at most 4096 words a list; or `{world, output_world, from, to}` for larger ones, up to 2^20 cells over all examples |
 | `gates`, `crowd`, `rounds`, `seed` | the search's effort, as `grit_least` |
 | `start` | under `minimal` and `symmetric`, a circuit to begin from; see [A start](#a-start) |
+| `noise` | under `totalistic` and `outer`: `refuse` (the default) or `vote`; see [Noisy examples](#noisy-examples) |
 
 The server builds every example cell's row, counts the rows, and refuses `conflict` at `$.examples` when one row is seen with two outputs. The refusal's `rows` lists each such row with every output and where it was first seen. The search is `grit_machine`'s, over the seen rows only, so 27-input stencils work. It walks a gate ladder down from `gates` as `grit_least` does and keeps the smallest circuit that answers every seen row.
 
@@ -235,6 +236,7 @@ Refused before any device work:
 | `chip_refused` | a gate reads a source not before it, or its kind is past 15; the gates hold fewer than `outputs` | `$.start.gates[k]` or `$.start.gates` |
 | `learn_limit` | more live gates than a rung takes: 256, or under `symmetric` the gates whose copies and ors fit a law (74 for 3x3 with one write); `limit` names it | `$.start` |
 | `start_rule` | `start` under `totalistic` or `outer` | `$.start` |
+| `noise_rule` | `noise` `vote` under `minimal` or `symmetric` | `$.noise` |
 
 Only live gates count: gates no output reads are dropped first. The server answers the start's law (its live gates under `minimal`, the or of their images under `symmetric`) on the host on every seen row and, under `symmetric`, on every image of one. Under `symmetric` "answers every seen row" is about that or of images, not the circuit alone, so a 3-gate circuit (the centre and not all of north, south and east) holds for the X0b pairs: its images together ask for all four.
 
@@ -281,3 +283,25 @@ The call builds no search kernel and has no brake: it reads the rows, then build
 3x3 majority (1 when at least 5 of the 9 places are 1) from 12 random 32x32 examples: `rule` `totalistic` answers `tables` `[[0,0,0,0,0,1,1,1,1,1]]`. Life is `outer` with `[[[0,0,0,1,0,0,0,0,0],[0,0,1,1,0,0,0,0,0]]]`.
 
 The X0b edge task: 24 inline 32x32 pairs, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `zero`. `minimal` and `symmetric` see 125 rows of 512, refuse nothing, and find the same 4 gates: the centre is 1 and not all four of its orthogonal neighbours are. Under `minimal` that is the law; under `symmetric` it is 8 copies and 7 ors, 39 gates, with the same table. Run it as `runs_as` says: each image at the origin of a 64x64x2 world, plane 0, one step, plane 1 read. `totalistic` and `outer` refuse it `not_counting`: a centre with 4 neighbours set is an edge or not by which 4 they are.
+
+### Noisy examples
+
+Real examples are rarely clean: one flipped cell in 16384 is enough for `conflict`. Under `totalistic` and `outer`, `noise` `vote` decides each count by the example cells instead:
+
+- Each example cell is one vote, for its write's output, in its count's class: `n`, and `c` too under `outer`.
+- Each table entry is the majority of its votes. A tie is 0 and listed in `ties`. A count no cell showed is 0 and listed in `unseen_counts`, not in `ties`.
+- No row is refused `conflict` and no count `not_counting`; `examples.conflicts` stays 0. Every other refusal stands.
+
+The answer adds:
+
+| Field | Meaning |
+|---|---|
+| `tallies` | per write, `[zeros, ones]` for each count, in the shape of `tables`; a write's tallies sum to the example cells |
+| `ties` | per write, the tied counts, in the shape of `unseen_counts` |
+| `deviating` | per write, the example cells whose output disagrees with the law |
+| `deviating_cells` | per write, at most 64 of those cells in example order, then z, y, x: `example`, `at`, `count`, `centre` (under `outer`), `seen` and `law` |
+| `deviating_share` | deviating cells over voted cells (example cells times writes), as an exact `[num, den]` |
+
+Where `refuse` answers a law, `vote` answers the same bytes with only these fields added, so `deviating` is 0. `refuse` answers exactly as a request without `noise`. The same request gives the same bytes.
+
+Life from 16 32x32 torus pairs, 5% of the cells flipped in the input and the output: `vote` answers `[[[0,0,0,1,0,0,0,0,0],[0,0,1,1,0,0,0,0,0]]]`, and `deviating` names the cells to distrust. A crop of a larger world with `border` `zero` reads zeros past its edge, so its deviating cells lie on the crop's outer ring.
