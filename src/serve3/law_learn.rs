@@ -84,6 +84,7 @@ pub enum Point {
     Submitted,
     Expansion,
     Count,
+    Search,
 }
 
 impl Point {
@@ -96,6 +97,7 @@ impl Point {
             Self::Submitted => "submitted",
             Self::Expansion => "expansion",
             Self::Count => "count",
+            Self::Search => "search",
         }
     }
 
@@ -108,6 +110,7 @@ impl Point {
             Self::Submitted => 3,
             Self::Expansion => 4,
             Self::Count => 5,
+            Self::Search => 6,
         }
     }
 }
@@ -135,7 +138,7 @@ pub mod faults {
         static KERNEL: Cell<usize> = const { Cell::new(0) };
         static BUILT: Cell<u64> = const { Cell::new(0) };
         static SUBMITTED: Cell<u64> = const { Cell::new(0) };
-        static REACHED: Cell<[u64; 6]> = const { Cell::new([0; 6]) };
+        static REACHED: Cell<[u64; 7]> = const { Cell::new([0; 7]) };
         static PASSED: RefCell<Passed> = const { RefCell::new(None) };
         static CEILING: Cell<Option<u64>> = const { Cell::new(None) };
         static SLOW: Cell<Duration> = const { Cell::new(Duration::ZERO) };
@@ -281,7 +284,7 @@ pub mod faults {
         KERNEL.set(0);
         BUILT.set(0);
         SUBMITTED.set(0);
-        REACHED.set([0; 6]);
+        REACHED.set([0; 7]);
     }
 
     #[cfg(feature = "faults")]
@@ -666,6 +669,14 @@ fn learn_shown() -> Json {
                 ),
             ),
             (
+                "steps",
+                whole(
+                    "rule totalistic or outer: k, how many applications of the law lie between each example's input and output; 1 if left out, at most 8; above 1 every table of the rule is searched",
+                    1,
+                    i64::from(u32::MAX),
+                ),
+            ),
+            (
                 "min_support",
                 whole(
                     "noise vote: a count shown by fewer example cells than this is listed in thin with its tally; 1 if left out, at most the stencil's places times 64",
@@ -814,6 +825,7 @@ struct Asked {
     reads: Vec<Bit>,
     writes: Vec<Bit>,
     border: Border,
+    margin: u32,
 }
 
 fn cells_of(size: [u32; 3]) -> u64 {
@@ -1014,9 +1026,9 @@ fn from_world(
                 inner_from.get_mut(axis),
                 size.get(axis),
             ) {
-                *start = (*start + whole - 1) % whole;
-                *side += 2;
-                *offset = 1;
+                *start = (*start + whole - asked.margin % whole) % whole;
+                *side += 2 * asked.margin;
+                *offset = asked.margin;
             }
         }
         (data_from, data_size, inner_from)
@@ -2039,6 +2051,7 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             Some("zero") => Border::Zero,
             _ => return Err(unread("border")),
         },
+        margin: 1,
     };
     let vote = match held.get("noise") {
         None => false,
@@ -2054,6 +2067,24 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             "$.min_support",
             "min_support marks the counts a vote decides on few example cells, and noise is not vote; min_support goes with noise vote".to_owned(),
         ));
+    }
+    let steps = steps_of(held)?;
+    if steps > 1 {
+        let tally = match held.get("rule").and_then(Json::text) {
+            Some("totalistic") => Tally::Totalistic,
+            Some("outer") => Tally::Outer,
+            Some(rule @ ("minimal" | "symmetric")) => {
+                return Err(refused(
+                    Code::StepsRule,
+                    "$.steps",
+                    format!(
+                        "steps {steps} searches the tables of a counting rule, and rule {rule} searches for a circuit; steps above 1 go with rule totalistic or outer"
+                    ),
+                ));
+            }
+            _ => return Err(unread("rule")),
+        };
+        return stepped_law(server, held, &asked, tally, (steps, vote));
     }
     let symmetric = match held.get("rule").and_then(Json::text) {
         Some("symmetric") => true,
@@ -2705,4 +2736,351 @@ fn start_told(
         ("changed_rows", Json::List(shown)),
     ]);
     map(fields)
+}
+
+pub const STEPS: &str = "steps k from 2 to 8, under rule totalistic or outer, reads each example's output as the read bit after k applications of one counting table, with the example's border at every step: zero reads 0 past the example's box at every step; wrapped wraps an inline example on itself at every step, and reads a world example's box with k cells around it from that world, so it equals k steps of the law on that world. It takes one read and one write on the read's bit. Every table of the rule and its counted places is searched, 2 to the classes of them, at most 18 classes (262144 tables), on the host with no device: 64 tables at a time, each first run on the cells a few probe cells depend on and then on every example cell, a table dropped only once it is wrong on more cells than a table already seen. A table is numbered by the sum of T[class] times 2 to the class, class n under totalistic and the centre times the counts plus n under outer, and tables are taken in ascending number: the law is the first table that gives every example cell, consistent counts them all, consistent_tables lists the first 16 in the shape of tables, checked the tables tried or excluded and space the tables of the rule. The search reads no clock; it passes a brake before each 64 tables, so an answer can come late by the check of 64 tables. A stop on budget or cancel answers what it found, a prefix of the whole search's order, with stopped budget or cancelled and complete false, and refuses budget or cancelled when it found none. A complete search answers stopped complete and complete true, the same bytes for the same request; with no table consistent it is refused no_rule_k at examples, with closest, the first table with the fewest wrong example cells, and its wrong cells. The found law is checked on the host by running it k steps on every example before it is answered. iterate names how to run it: alternate, the read's and the write's planes, and frames k. steps 1 answers as a request without steps. Refused before any example is read: steps past 8 steps_limit, steps above 1 under minimal or symmetric steps_rule, with noise vote steps_noise, without exactly one write on the read's bit steps_writes, and more than 18 classes steps_space with space and classes";
+
+pub const STEPS_ZERO_RUNS: &str = "the law is applied k times and each step read 0 past the example's edge; a world reproduces that where the cells around the example stay 0 for the k steps: create it with alternate, write the input to the read's plane, step k frames and read the current plane";
+
+pub const STEPS_WRAPPED_RUNS: &str = "the law is applied k times on the example's torus; create a world of the example's size (a world example's own world) with alternate, write the input to the read's plane, step k frames and read the current plane";
+
+pub const STEPS_TABLES_MOST: u64 = 1 << crate::steps::CLASSES_MOST;
+
+fn steps_of(held: &Json) -> Result<u32, Failed> {
+    if held.get("steps").is_none() {
+        return Ok(1);
+    }
+    let asked = int(held, "steps")?;
+    let most = crate::steps::STEPS_MOST;
+    if asked > most {
+        return Err(limited(
+            Code::StepsLimit,
+            "$.steps",
+            format!(
+                "steps is {asked}, and a law is learned from examples at most {most} steps apart"
+            ),
+            counted(most),
+        ));
+    }
+    Ok(asked)
+}
+
+const fn steps_runs(border: Border) -> &'static str {
+    match border {
+        Border::Zero => STEPS_ZERO_RUNS,
+        Border::Wrapped => STEPS_WRAPPED_RUNS,
+    }
+}
+
+fn by_code(counting: Counting, code: u64) -> Json {
+    Json::List(vec![by_count(counting, &|class| {
+        Some(counted(crate::steps::entry(code, class)))
+    })])
+}
+
+fn replayed(stepping: &crate::steps::Stepping, samples: &[Sample<'_>], table: &[u32]) -> bool {
+    let counting = stepping.counting;
+    let stencil = counting.stencil;
+    let read = Bit { plane: 0, bit: 0 };
+    samples.iter().all(|sample| {
+        let words: &[u32] = match sample.inputs.as_slice() {
+            [one, ..] => one,
+            [] => &[],
+        };
+        let mut grid: Vec<u32> = words
+            .iter()
+            .map(|word| (word >> stepping.read) & 1)
+            .collect();
+        for _ in 0..stepping.steps {
+            let whole = Sample {
+                size: sample.size,
+                inputs: vec![grid.as_slice()],
+                from: [0; 3],
+                inner: sample.size,
+                outputs: Vec::new(),
+            };
+            let mut next = Vec::with_capacity(grid.len());
+            for z in 0..sample.size[2] {
+                for y in 0..sample.size[1] {
+                    for x in 0..sample.size[0] {
+                        let row = stencil::row_at(
+                            stencil,
+                            std::slice::from_ref(&read),
+                            &whole,
+                            [x, y, z],
+                            stepping.border,
+                        );
+                        let class = counting.class(row) as usize;
+                        next.push(table.get(class).copied().unwrap_or(0));
+                    }
+                }
+            }
+            grid = next;
+        }
+        let wanted: &[u32] = match sample.outputs.as_slice() {
+            [one, ..] => one,
+            [] => &[],
+        };
+        let [wide, deep, tall] = sample.inner;
+        (0..tall).all(|z| {
+            (0..deep).all(|y| {
+                (0..wide).all(|x| {
+                    let inside = [sample.from[0] + x, sample.from[1] + y, sample.from[2] + z];
+                    let got = grid
+                        .get(stencil::index(sample.size, inside))
+                        .copied()
+                        .unwrap_or(0);
+                    let want = wanted
+                        .get(stencil::index(sample.inner, [x, y, z]))
+                        .map_or(0, |word| (word >> stepping.write) & 1);
+                    got == want
+                })
+            })
+        })
+    })
+}
+
+fn stepped_law(
+    server: &mut Server<'_>,
+    held: &Json,
+    asked: &Asked,
+    tally: Tally,
+    (steps, vote): (u32, bool),
+) -> Result<Json, Failed> {
+    let stencil = asked.stencil;
+    if vote {
+        return Err(refused(
+            Code::StepsNoise,
+            "$.noise",
+            format!(
+                "noise vote decides each count by the example cells at one step, and steps is {steps}; a vote over examples k steps apart is not offered, so give noise refuse or steps 1"
+            ),
+        ));
+    }
+    if held.get("start").is_some() {
+        return Err(refused(
+            Code::StartRule,
+            "$.start",
+            format!(
+                "rule {} searches its tables with no circuit to start from; start goes with rule minimal or symmetric",
+                tally.name()
+            ),
+        ));
+    }
+    let [read] = asked.reads.as_slice() else {
+        return Err(limited(
+            Code::CountReads,
+            "$.reads",
+            format!(
+                "rule {} counts the places of one read, and {} reads were given",
+                tally.name(),
+                asked.reads.len()
+            ),
+            counted(1),
+        ));
+    };
+    let given = masked(held, stencil)?;
+    let counting = Counting {
+        tally,
+        stencil,
+        mask: given
+            .as_ref()
+            .map_or(Counting::moore(tally, stencil).mask, |one| one.mask),
+    };
+    if asked.writes.len() != 1 || asked.writes.iter().any(|one| one.bit != read.bit) {
+        return Err(refused(
+            Code::StepsWrites,
+            "$.writes",
+            format!(
+                "a law applied {steps} times reads back what it wrote, so it takes one write on the read's bit {}, and {} writes were given",
+                read.bit,
+                asked.writes.len()
+            ),
+        ));
+    }
+    let stepping = crate::steps::Stepping {
+        counting,
+        steps,
+        border: asked.border,
+        read: read.bit,
+        write: read.bit,
+    };
+    let classes = stepping.classes();
+    let space = stepping.space();
+    if !stepping.fits() {
+        return Err(Box::new(Told(
+            Refusal::new(
+                Code::StepsSpace,
+                "$.steps",
+                format!(
+                    "rule {} over the {} counted places of the {} stencil has {classes} classes, so {space} tables, past the {} tables ({} classes) a search over every table takes; nothing was searched",
+                    tally.name(),
+                    counting.places().len(),
+                    stencil.name(),
+                    STEPS_TABLES_MOST,
+                    crate::steps::CLASSES_MOST
+                ),
+            )
+            .limited(exact(STEPS_TABLES_MOST)),
+            vec![("space", exact(space)), ("classes", counted(classes))],
+        )));
+    }
+    let channels = channels_of(held, asked)?;
+    plane_checks(asked, channels)?;
+    let padded = Asked {
+        stencil,
+        reads: asked.reads.clone(),
+        writes: asked.writes.clone(),
+        border: asked.border,
+        margin: steps,
+    };
+    let owned = examples_of(server, &padded, held)?;
+    let samples: Vec<Sample<'_>> = owned.iter().map(Owned::sample).collect();
+    let mut watch = Watch {
+        guard: server.guard(),
+        host: server.host,
+        stop: None,
+        crowd_most: u32::MAX,
+        #[cfg(feature = "faults")]
+        faults: server.faults(),
+    };
+    let found = {
+        let mut halted = || watch.braked(Point::Search);
+        crate::steps::searched(&stepping, &samples, &mut halted)
+    };
+    let searched = vec![
+        ("checked", exact(found.checked)),
+        ("space", exact(space)),
+        ("steps", counted(steps)),
+    ];
+    let [code, ..] = found.codes.as_slice() else {
+        if !found.complete {
+            let stop = watch.stop.unwrap_or(Stop::Budget);
+            return Err(Box::new(Told(
+                Refusal::new(
+                    stop.code(),
+                    if stop == Stop::Budget {
+                        "$.budget_ms"
+                    } else {
+                        "$"
+                    },
+                    format!(
+                        "the search stopped on {} after {} of {space} tables, before any table applied {steps} times gave every example; nothing was learned",
+                        stop.name(),
+                        found.checked
+                    ),
+                ),
+                searched,
+            )));
+        }
+        let (wrong, near) = found.closest.unwrap_or((found.cells, 0));
+        let mut told = vec![
+            (
+                "closest",
+                map(vec![
+                    ("tables", by_code(counting, near)),
+                    ("wrong", exact(wrong)),
+                ]),
+            ),
+            ("cells", exact(found.cells)),
+        ];
+        told.extend(searched);
+        return Err(Box::new(Told(
+            Refusal::new(
+                Code::NoRuleK,
+                "$.examples",
+                format!(
+                    "none of the {space} tables of rule {} applied {steps} times gives every example; the closest is wrong on {wrong} of {} example cells",
+                    tally.name(),
+                    found.cells
+                ),
+            ),
+            told,
+        )));
+    };
+    let code = *code;
+    let table = crate::steps::table_of(code, classes);
+    if !replayed(&stepping, &samples, &table) {
+        return Err(format!(
+            "the found table {code} applied {steps} times does not give the examples when run again on the host; this is a fault of the server"
+        )
+        .into());
+    }
+    let inputs = stencil.positions();
+    let gates = stencil::counted_gates(counting, 1, &table);
+    if inputs <= TABLE_INPUTS {
+        for row in 0..1_u32 << inputs {
+            let wanted = table
+                .get(counting.class(row) as usize)
+                .copied()
+                .unwrap_or(0);
+            if stencil::answer(inputs, 1, &gates, row) != wanted {
+                return Err(format!(
+                    "the counting circuit answers row {row} other than the table; this is a fault of the server"
+                )
+                .into());
+            }
+        }
+    }
+    let circuit = Circuit {
+        state: 0,
+        inputs,
+        outputs: 1,
+        gates: gates.clone(),
+    };
+    let mut answer = super::law::chip_law(circuit, wiring(asked, held, channels))?;
+    let write = match asked.writes.as_slice() {
+        [one, ..] => *one,
+        [] => *read,
+    };
+    let stopped = watch.stop.filter(|_| !found.complete);
+    answer.extend([
+        ("stencil", text(stencil.name())),
+        ("row_order", text(stencil::ORDER)),
+        ("border", text(border_name(asked.border))),
+        ("runs_as", text(steps_runs(asked.border))),
+        ("examples", map(vec![("cells", exact(found.cells))])),
+        (
+            "chip",
+            map(vec![
+                ("inputs", counted(inputs)),
+                ("outputs", counted(1)),
+                ("gates", gates_shown(&gates)),
+            ]),
+        ),
+        ("tables", by_code(counting, code)),
+        ("steps", counted(steps)),
+        ("consistent", exact(found.consistent)),
+        (
+            "consistent_tables",
+            Json::List(
+                found
+                    .codes
+                    .iter()
+                    .map(|one| by_code(counting, *one))
+                    .collect(),
+            ),
+        ),
+        ("checked", exact(found.checked)),
+        ("space", exact(space)),
+        ("stopped", text(stopped.map_or("complete", Stop::name))),
+        ("complete", Json::Bool(found.complete)),
+        (
+            "iterate",
+            map(vec![
+                (
+                    "alternate",
+                    Json::List(vec![counted(read.plane), counted(write.plane)]),
+                ),
+                ("frames", counted(steps)),
+            ]),
+        ),
+    ]);
+    if let Some(one) = &given {
+        answer.push(("places", places_shown(counting, one.preset)));
+    }
+    if let Some(stop) = stopped {
+        answer.push(("hint", text(stop.code().hint())));
+    }
+    Ok(map(answer))
 }

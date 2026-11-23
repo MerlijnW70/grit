@@ -88,9 +88,15 @@ pub enum Code {
     ReadForm,
     MarkUnknown,
     MarkUnlike,
+    StepsLimit,
+    StepsRule,
+    StepsNoise,
+    StepsWrites,
+    StepsSpace,
+    NoRuleK,
 }
 
-pub const CODES: [Code; 84] = [
+pub const CODES: [Code; 90] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -175,6 +181,12 @@ pub const CODES: [Code; 84] = [
     Code::ReadForm,
     Code::MarkUnknown,
     Code::MarkUnlike,
+    Code::StepsLimit,
+    Code::StepsRule,
+    Code::StepsNoise,
+    Code::StepsWrites,
+    Code::StepsSpace,
+    Code::NoRuleK,
 ];
 
 impl Code {
@@ -265,6 +277,12 @@ impl Code {
             Self::ReadForm => "read_form",
             Self::MarkUnknown => "mark_unknown",
             Self::MarkUnlike => "mark_unlike",
+            Self::StepsLimit => "steps_limit",
+            Self::StepsRule => "steps_rule",
+            Self::StepsNoise => "steps_noise",
+            Self::StepsWrites => "steps_writes",
+            Self::StepsSpace => "steps_space",
+            Self::NoRuleK => "no_rule_k",
         }
     }
 
@@ -490,6 +508,22 @@ impl Code {
             }
             Self::MarkUnlike => {
                 "Read with the from, to and plane or current of the read that took the mark, or take a new mark."
+            }
+            Self::StepsLimit => "Give steps from 1 to 8; grit_describe names law_steps_most.",
+            Self::StepsRule => {
+                "Drop steps or give it 1, or use rule totalistic or outer; only a counting law is searched over its tables."
+            }
+            Self::StepsNoise => {
+                "Drop noise or give it refuse, or give steps 1; a vote over examples k steps apart is not offered."
+            }
+            Self::StepsWrites => {
+                "Give one write on the read's bit: a law applied k times reads back what it wrote."
+            }
+            Self::StepsSpace => {
+                "Count fewer places with places or place_list, so the rule has at most 18 classes; grit_describe names law_steps_classes."
+            }
+            Self::NoRuleK => {
+                "No counting table applied k times gives every example; check steps, border and the examples, or use another rule; closest names the nearest table and its wrong cells."
             }
         }
     }

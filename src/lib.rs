@@ -36,3 +36,4 @@ pub mod branch;
 pub mod credit;
 pub mod question;
 pub mod stencil;
+pub mod steps;

@@ -1716,6 +1716,13 @@ pub fn describe(status: &Status) -> Json {
                 ("learn_cells", number(super::law_learn::CELLS_MOST)),
                 ("learn_examples", number(super::law_learn::EXAMPLES_MOST)),
                 ("learn_inputs", number(super::law_learn::INPUTS_MOST)),
+                ("law_steps", text(super::law_learn::STEPS)),
+                ("law_steps_most", number(crate::steps::STEPS_MOST)),
+                ("law_steps_classes", number(crate::steps::CLASSES_MOST)),
+                (
+                    "law_steps_tables",
+                    number(super::law_learn::STEPS_TABLES_MOST),
+                ),
                 (
                     "law_from_chip_nodes",
                     text(&format!(

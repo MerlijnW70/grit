@@ -265,6 +265,7 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `noise` | under `totalistic` and `outer`: `refuse` (the default) or `vote`; see [Noisy examples](#noisy-examples) |
 | `places`, `place_list` | under `totalistic` and `outer`: the places counted; see [Counted places](#counted-places) |
 | `min_support` | under `noise` `vote`: lists the counts shown by few cells in `thin`; see [Noisy examples](#noisy-examples) |
+| `steps` | under `totalistic` and `outer`: k, the law's applications between input and output, 1 if left out; see [Examples k steps apart](#examples-k-steps-apart) |
 
 The server builds every example cell's row, counts the rows, and refuses `conflict` at `$.examples` when one row is seen with two outputs. The refusal's `rows` lists each such row with every output and where it was first seen. The search is `grit_machine`'s, over the seen rows only, so 27-input stencils work. It walks a gate ladder down from `gates` as `grit_least` does and keeps the smallest circuit that answers every seen row.
 
@@ -392,3 +393,49 @@ The answer adds:
 Where `refuse` answers a law, `vote` answers the same bytes with only these fields added, so `deviating` is 0. `refuse` answers exactly as a request without `noise`. The same request gives the same bytes.
 
 Life from 16 32x32 torus pairs, 5% of the cells flipped in the input and the output: `vote` answers `[[[0,0,0,1,0,0,0,0,0],[0,0,1,1,0,0,0,0,0]]]`, and `deviating` names the cells to distrust. A crop of a larger world with `border` `zero` reads zeros past its edge, so its deviating cells lie on the crop's outer ring.
+
+### Examples k steps apart
+
+Measurements are often taken every few steps. With `steps` k from 2 to 8 (`limits.law_steps_most`), under `totalistic` or `outer`, each example's output is the read bit after k applications of one table, with the example's border at every step:
+
+- `zero`: a neighbour past the example's box reads 0 at every step.
+- `wrapped`: an inline example wraps on itself at every step; a world example's box is read with k cells around it from that world, so it equals k steps of the law on that world.
+
+The answer is one step of the rule. The rows of one step are not seen, so there is no `conflict` or `not_counting`: every table of the rule and its counted places is searched, 2 to the classes of them. A table is numbered by the sum of `T[class]` times 2^class, class `n` under `totalistic` and `c` times the counts plus `n` under `outer`; Life is 6152. Tables are taken in ascending number.
+
+The search runs on the host, needs no device and reads no clock. It takes 64 tables at a time: each is first run on the cells a few probe cells depend on, then on every example cell. A table is dropped only once it is wrong on more cells than a table already seen, so the count of consistent tables and the closest table are exact.
+
+The answer has the fields of a counting law except `unseen`, `unseen_counts` and `ladder`, with `examples` holding `cells`, and adds:
+
+| Field | Meaning |
+|---|---|
+| `steps` | k |
+| `consistent` | the tables whose k-fold application gives every example cell |
+| `consistent_tables` | the first 16 of them, in the shape of `tables`; the law is the first |
+| `checked` | the tables tried or excluded |
+| `space` | the tables of the rule, 2^classes |
+| `stopped` | `complete`, `budget` or `cancelled` |
+| `complete` | whether every table was checked |
+| `iterate` | `alternate` (the read's and the write's planes) and `frames` (k), to run it on a world |
+
+`consistent` above 1 means the data does not pin the rule down. In `tests/law_steps.rs`, Life seen every 4th frame in four seeded 32x32 soups (fill 0.35, two of them after 10 warm-up frames) never shows a dead cell with 8 live neighbours, so `T[0][8]` is free and `consistent` is 2; eight such soups name Life alone.
+
+A brake before each 64 tables stops on budget or cancel; an answer can come late by the check of 64 tables. A stopped search answers what it found, a prefix of the whole search's order, with `complete` false, and refuses `budget` or `cancelled` when it found none. A complete search answers the same bytes for the same request. The found law is run k steps on the host on every example before it is answered.
+
+1. `grit_law_learn` with `stencil` `3x3`, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `wrapped`, `rule` `outer`, `steps` 4 and eight such pairs 4 frames apart: `tables` Life, `consistent` 1.
+2. `grit_world_create` with the example's size, its `law` and `alternate` `[0,1]`.
+3. `grit_world_write` the input, `grit_world_step` 4 frames, `grit_world_read` with `current` true: the example's output.
+
+`steps` 1 answers exactly as a request without `steps`. Refused before any example is read:
+
+| Code | When | `field` |
+|---|---|---|
+| `malformed` | `steps` 0 | `$.steps` |
+| `steps_limit` | `steps` past 8 | `$.steps` |
+| `steps_rule` | `steps` above 1 under `minimal` or `symmetric` | `$.steps` |
+| `steps_noise` | `steps` above 1 with `noise` `vote` | `$.noise` |
+| `steps_writes` | not exactly one write, on the read's bit: the law reads back what it wrote | `$.writes` |
+| `steps_space` | more than 18 classes (`limits.law_steps_classes`, 262144 tables): 3x3x3 needs `places` or `place_list`; `space` and `classes` name the size | `$.steps` |
+
+A complete search that finds no table is refused `no_rule_k` at `$.examples`. `closest` names the first table with the fewest wrong example cells as `tables` and its `wrong` cells, with `cells`, `checked`, `space` and `steps`.
+
