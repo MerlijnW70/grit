@@ -287,7 +287,7 @@ impl<'host> Engine<'host> {
         let parted = self
             .parted("whole grid", &whole)
             .or_else(|| self.parted("listed", listed));
-        self.frame += 1;
+        self.frame = self.frame.wrapping_add(1);
         parted
     }
 
