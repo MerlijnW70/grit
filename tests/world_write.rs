@@ -194,6 +194,227 @@ fn the_first_step_after_writes_does_the_same_work_however_many_were_written() {
     }
 }
 
+const KEEP: &str = r#"{"law":1,"name":"keep","params":0,"channels":1,"halo":0,"tally":{"counts":1,"weighted":false},"consts":{},"defs":{},"step":["let",[["out",["map","w","cells",["sel",["eq","w",0],0,["or","w",1]]]]],["vec","out",["vec",["count",["map","k",["range",8],["ne",["at","cells","k"],["at","out","k"]]]]]]]}"#;
+
+fn keep_world(host: &grit::Host, size: [u32; 3]) -> World<'_> {
+    let law = Law::compile(KEEP).unwrap();
+    World::create_law(
+        host,
+        &law,
+        &Made {
+            rule: law.name(),
+            params: &[],
+            size,
+            sparse: true,
+            slots: None,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_sparse_write_wakes_the_cells_it_writes() {
+    let Some(host) = device("world write sparse wake") else {
+        return;
+    };
+    let size = [64, 64, 32];
+    let mut world = keep_world(&host, size);
+    world.step(3).unwrap();
+    assert_eq!(world.listed().unwrap(), 0, "the world fell quiet");
+    let points = [[5, 9, 3], [40, 17, 20], [63, 63, 31], [0, 0, 0]];
+    let cells: Vec<([u32; 3], u32)> = points.iter().map(|&at| (at, 2)).collect();
+    let moved = written(&mut world, &cells);
+    assert!(moved.woken >= points.len() as u64, "{moved:?}");
+    let listed = world.listed().unwrap();
+    assert!(
+        listed >= points.len() as u32,
+        "a written cell is listed: {listed}"
+    );
+    assert_eq!(world.cells_at(&points).unwrap(), [2; 4]);
+    world.step(1).unwrap();
+    assert_eq!(
+        world.cells_at(&points).unwrap(),
+        [3; 4],
+        "the step after the write steps the written cells"
+    );
+}
+
+#[test]
+fn a_sparse_write_wakes_its_phase_one_holder_in_the_next_brick() {
+    let Some(host) = device("world write sparse holder") else {
+        return;
+    };
+    let size = [64, 64, 32];
+    let mut world = keep_world(&host, size);
+    let last = [size[0] - 1, size[1] - 1, size[2] - 1];
+    let held = [
+        ([1, 4, 4], 1),
+        ([last[0], 4, 4], 1),
+        ([1, 1, 1], 1),
+        (last, 1),
+    ];
+    world.write_plane(0, &held).unwrap();
+    world.step(3).unwrap();
+    assert_eq!(world.listed().unwrap(), 0, "the world fell quiet");
+    let used = world.pool_use().unwrap().unwrap();
+    assert!(used.held >= 2, "{used:?}");
+    let points = [[0, 5, 5], [0, 0, 0]];
+    let cells: Vec<([u32; 3], u32)> = points.iter().map(|&at| (at, 2)).collect();
+    let moved = written(&mut world, &cells);
+    assert_eq!(
+        moved.woken, 4,
+        "each cell wakes its phase 0 oct and its phase 1 oct across the low border: {moved:?}"
+    );
+    assert_eq!(
+        world.listed().unwrap(),
+        4,
+        "each woken oct is listed on its own in its held brick"
+    );
+    assert_eq!(world.pool_use().unwrap().unwrap().held, used.held);
+    world.step(1).unwrap();
+    assert_eq!(world.cells_at(&points).unwrap(), [3, 3]);
+    let kept: Vec<[u32; 3]> = held.iter().map(|&(at, _)| at).collect();
+    assert_eq!(world.cells_at(&kept).unwrap(), [1; 4]);
+}
+
+mod resident_writes {
+    use super::device;
+
+    use std::collections::BTreeSet;
+
+    use grit::compact::Plan;
+    use grit::geometry::Solid;
+    use grit::layout::{
+        BINDINGS, DENSE, Dimension, GRAND, HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT, PIXELS,
+        STATE,
+    };
+    use grit::live;
+    use grit::sand::Grid;
+    use grit::sweep;
+    use grit::{Host, Resident, Run};
+
+    const LAID: u32 = 0xA5A5_A5A5;
+
+    fn dense(host: &Host) -> (Grid, Plan, Resident<'_>) {
+        let width = host.width();
+        let grid = Grid::solid(16, 16, 16).unwrap();
+        let plan = Plan::over_in(
+            width,
+            grid.blocks().div_ceil(sweep::cells(width)),
+            Dimension::Three,
+        )
+        .unwrap();
+        let (passes, _) = live::arranged3(width, grid, &plan, false).unwrap();
+        let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
+        let sizes = plan.sizes();
+        let mut held = host.resident(&sizes, &modules).unwrap();
+        for (binding, &words) in sizes.iter().enumerate().take(BINDINGS as usize) {
+            if binding != PIXELS as usize {
+                held.write(binding, &vec![0_u32; words]).unwrap();
+            }
+        }
+        (grid, plan, held)
+    }
+
+    #[test]
+    fn overlapping_runs_of_one_call_go_in_order_in_separate_submissions() {
+        let Some(host) = device("world write overlapping runs") else {
+            return;
+        };
+        let (_, _, mut held) = dense(&host);
+        held.write(STATE as usize, &[LAID; 32]).unwrap();
+        let state = STATE as usize;
+        let runs = [
+            Run {
+                index: state,
+                at: 0,
+                words: &[1; 8],
+            },
+            Run {
+                index: state,
+                at: 4,
+                words: &[2; 8],
+            },
+            Run {
+                index: state,
+                at: 2,
+                words: &[3; 4],
+            },
+            Run {
+                index: state,
+                at: 20,
+                words: &[4; 4],
+            },
+        ];
+        let before = held.traffic();
+        held.write_many(&runs).unwrap();
+        let moved = held.traffic().since(before);
+        assert_eq!(
+            moved.submits, 3,
+            "a run that overlaps one already in the submission starts the next: {moved:?}"
+        );
+        let mut wanted = vec![LAID; 32];
+        for run in &runs {
+            wanted[run.at..run.at + run.words.len()].copy_from_slice(run.words);
+        }
+        assert_eq!(wanted[..12], [1, 1, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2]);
+        assert_eq!(
+            held.read(state, 32).unwrap(),
+            wanted,
+            "the later of two overlapping runs wins"
+        );
+    }
+
+    #[test]
+    fn a_list_longer_than_every_oct_is_merged_as_the_base_merged_it() {
+        let Some(host) = device("world write long list") else {
+            return;
+        };
+        let width = host.width();
+        let (grid, plan, mut held) = dense(&host);
+        let octs = grid.blocks();
+        let hot_blocks = plan.blocks;
+        held.write(DENSE as usize, &vec![7; octs as usize + 1])
+            .unwrap();
+        held.write(GRAND as usize, &[octs + 1]).unwrap();
+        held.write(HOT_DENSE as usize, &vec![1; hot_blocks as usize + 1])
+            .unwrap();
+        held.write(HOT_GRAND as usize, &[hot_blocks + 1]).unwrap();
+
+        let cell = (7 * 16 + 6) * 16 + 5;
+        live::put3(&mut held, grid, &plan, &[(cell, 2)]).unwrap();
+
+        let by = plan.per_block.trailing_zeros();
+        let mut list = BTreeSet::from([7]);
+        let mut hot = BTreeSet::from([1]);
+        for phase in 0..2 {
+            let oct = Solid::held(grid, cell, phase).index;
+            list.insert(oct);
+            hot.insert(oct >> by);
+        }
+        let list: Vec<u32> = list.into_iter().collect();
+        let hot: Vec<u32> = hot.into_iter().collect();
+        let count = u32::try_from(list.len()).unwrap();
+        let hot_count = u32::try_from(hot.len()).unwrap();
+        assert_eq!(held.read(GRAND as usize, 1).unwrap(), [count]);
+        assert_eq!(held.read(DENSE as usize, list.len()).unwrap(), list);
+        assert_eq!(
+            held.read(INDIRECT as usize, 3).unwrap(),
+            [count.div_ceil(width), 1, 1]
+        );
+        assert_eq!(held.read(HOT_GRAND as usize, 1).unwrap(), [hot_count]);
+        assert_eq!(held.read(HOT_DENSE as usize, hot.len()).unwrap(), hot);
+        assert_eq!(
+            held.read(HOT_INDIRECT as usize, 3).unwrap(),
+            [hot_count, 1, 1]
+        );
+        assert_eq!(
+            held.read(STATE as usize, grid.cells()).unwrap()[cell as usize],
+            2
+        );
+    }
+}
+
 mod library {
     use super::{Law, MAJORITY, MIX, Made, World, device, edges, scattered, words_hash};
 
@@ -218,7 +439,7 @@ mod library {
         .unwrap()
     }
 
-    fn played(world: &mut World<'_>, size: [u32; 3], mask: u32, seed: u64) -> Vec<String> {
+    pub fn played(world: &mut World<'_>, size: [u32; 3], mask: u32, seed: u64) -> Vec<String> {
         let mut seen = Vec::new();
         let note = |world: &mut World<'_>, seen: &mut Vec<String>| {
             let listed = if world.pool().is_some() {
@@ -325,6 +546,44 @@ mod library {
         }
     }
 
+    #[cfg(feature = "faults")]
+    pub fn split_trace(host: &grit::Host, case: &str) -> Vec<String> {
+        let (sparse, seed) = match case {
+            "heat-split-32" => (false, 0x5EED_0932),
+            "heat-split-sparse-32" => (true, 0x5EED_5932),
+            other => panic!("no case {other}"),
+        };
+        let size = [32, 32, 32];
+        let params = grit::rule3::heat::TUNED;
+        let made = Made {
+            rule: "heat",
+            params: &params,
+            size,
+            sparse,
+            slots: None,
+        };
+        let mut world = World::create_split(host, &made, 12).unwrap();
+        assert!(
+            world.sizes().len() > grit::layout::BINDINGS as usize + 1,
+            "{case}: the state is split over windows"
+        );
+        played(&mut world, size, u32::MAX, seed)
+    }
+
+    #[cfg(feature = "faults")]
+    #[test]
+    fn writes_over_split_state_windows_read_back_as_on_the_recorded_base() {
+        let Some(host) = device("world write split windows") else {
+            return;
+        };
+        for (case, want) in super::recorded::SPLIT {
+            let trace = split_trace(&host, case);
+            let got = words_hash_of(&trace);
+            println!("RECORD split {case} {got}");
+            assert_eq!(got, want, "{case}: {trace:?}");
+        }
+    }
+
     pub fn words_hash_of(trace: &[String]) -> String {
         super::hex(&grit::branch::sha256(trace.join("\n").as_bytes()))
     }
@@ -347,6 +606,18 @@ mod recorded {
         (
             "mix-sparse-64",
             "42b09c0f476c2fa3a540de1afa5e078ea03e218d03ed5957a1ef0544ade99868",
+        ),
+    ];
+
+    #[cfg(feature = "faults")]
+    pub const SPLIT: [(&str, &str); 2] = [
+        (
+            "heat-split-32",
+            "7857192a4459f2e6129a174cf31ae8816336dec7fabc1c5b3f4956502aa13f5b",
+        ),
+        (
+            "heat-split-sparse-32",
+            "e97745275727fd18bfa29e69dc46ab3ab7c6aee1d5052a2ba74bb5bd93b07dfd",
         ),
     ];
 
