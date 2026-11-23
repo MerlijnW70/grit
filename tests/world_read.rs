@@ -972,7 +972,7 @@ fn r5_refusals_by_code_and_field() {
         (
             format!("{whole},\"form\":\"changed\",\"plane\":0,\"since\":\"{mark}\""),
             "mark_unlike",
-            "$.current",
+            "$.plane",
         ),
         (
             format!("{whole},\"form\":\"set\",\"plane\":2"),
@@ -1316,5 +1316,440 @@ fn r1_a_plane_past_one_dispatch_is_scanned_to_its_last_cell() {
             assert!(!wanted.is_empty());
             assert!(listed_cells(&got) == wanted, "{sparse} {corner:?}");
         }
+    }
+}
+
+fn held_law(planes: u32) -> String {
+    let cells: Vec<String> = (0..8).map(|k| format!("[\"at\",\"cells\",{k}]")).collect();
+    format!(
+        "{{\"law\":1,\"name\":\"held{planes}\",\"params\":0,\"channels\":{planes},\"halo\":0,\"tally\":{{\"counts\":1,\"weighted\":false}},\"consts\":{{}},\"defs\":{{}},\"step\":[\"vec\",[\"vec\",{}],[\"vec\",0]]}}",
+        cells.join(",")
+    )
+}
+
+fn block(from: [u32; 3], side: u32, word: u32) -> Vec<([u32; 3], u32)> {
+    let mut cells = Vec::new();
+    for z in 0..side {
+        for y in 0..side {
+            for x in 0..side {
+                cells.push(([from[0] + x, from[1] + y, from[2] + z], word));
+            }
+        }
+    }
+    cells
+}
+
+fn pool_held(answer: &Json) -> i64 {
+    int_at(answer.get("pool_use").unwrap(), "held")
+}
+
+fn stepped_held(server: &mut Server<'_>, world: i64, frames: u32) -> i64 {
+    let got = ok(
+        server,
+        "grit_world_step",
+        &format!("{{\"world\":{world},\"frames\":{frames},\"budget_ms\":{LONG}}}"),
+    );
+    pool_held(&got)
+}
+
+fn plane_checked(
+    server: &mut Server<'_>,
+    world: i64,
+    size: [u32; 3],
+    plane: &str,
+    rng: &mut Rng,
+    label: &str,
+) -> usize {
+    let whole = ([0, 0, 0], size.map(|side| side - 1));
+    let inner = ([3, 5, 2], [12, 14, 9]);
+    let was = dense_plane(server, world, size, plane);
+    let mut marks = Vec::new();
+    let mut listed = 0;
+    for corner in [whole, inner] {
+        let held = result(
+            &asked(
+                server,
+                world,
+                plane,
+                corner,
+                "\"form\":\"set\",\"mark\":true",
+            ),
+            false,
+        );
+        let wanted = wanted_set(&was, size, corner.0, corner.1);
+        let cells = listed_cells(&held);
+        assert!(
+            cells == wanted,
+            "{label} set {corner:?}: {} listed, {} wanted",
+            cells.len(),
+            wanted.len()
+        );
+        listed += cells.len();
+        marks.push(text_at(&held, "mark"));
+    }
+    for (corner, mark) in [whole, inner].iter().zip(&marks) {
+        let held = result(
+            &asked(
+                server,
+                world,
+                plane,
+                *corner,
+                &format!("\"form\":\"changed\",\"since\":\"{mark}\""),
+            ),
+            false,
+        );
+        assert_eq!(
+            int_at(&held, "count"),
+            0,
+            "{label} changed {corner:?} with nothing written: {}",
+            written(&held)
+        );
+    }
+    let mut cells: Vec<([u32; 3], u32)> = (0..40)
+        .map(|_| {
+            let at = [0, 1, 2].map(|axis| u32::try_from(rng.below(u64::from(size[axis]))).unwrap());
+            (at, if rng.below(3) == 0 { 0 } else { rng.word() | 1 })
+        })
+        .collect();
+    cells.push(([4, 6, 3], 0));
+    cells.push(([5, 6, 3], 11));
+    write(server, world, plane, &cells);
+    let now = dense_plane(server, world, size, plane);
+    for (corner, mark) in [whole, inner].iter().zip(&marks) {
+        let held = result(
+            &asked(
+                server,
+                world,
+                plane,
+                *corner,
+                &format!("\"form\":\"changed\",\"since\":\"{mark}\""),
+            ),
+            false,
+        );
+        let wanted = wanted_changed(&was, &now, size, corner.0, corner.1);
+        assert!(!wanted.is_empty(), "{label} {corner:?}");
+        assert!(
+            listed_cells(&held) == wanted,
+            "{label} changed after writes {corner:?}: {} listed, {} wanted",
+            listed_cells(&held).len(),
+            wanted.len()
+        );
+    }
+    listed
+}
+
+#[test]
+fn r6_uniform_bricks_of_a_sparse_world_read_their_word_on_every_plane() {
+    let Some(host) = device("world read uniform bricks") else {
+        return;
+    };
+    let size = [32_u32, 32, 32];
+    let mut server = Server::new(Some(&host));
+    let world = int_at(
+        &ok(
+            &mut server,
+            "grit_world_create",
+            &format!(
+                "{{\"law\":{},\"params\":[],\"wide\":32,\"deep\":32,\"tall\":32,\"sparse\":true,\"budget_ms\":{LONG}}}",
+                quoted(KEEP)
+            ),
+        ),
+        "world",
+    );
+    write(&mut server, world, "", &block([0, 0, 0], 16, 7));
+    write(
+        &mut server,
+        world,
+        "",
+        &block([16, 16, 16], 16, 0x8000_0001),
+    );
+    write(
+        &mut server,
+        world,
+        "",
+        &[([20, 3, 30], 5), ([31, 31, 0], 9)],
+    );
+    let busy = stepped_held(&mut server, world, 1);
+    let quiet = stepped_held(&mut server, world, 4);
+    println!("R6 keep: pool held {busy} after 1 frame, {quiet} after 5");
+    assert!(
+        quiet < busy,
+        "the uniform blocks were never handed back to the table: {quiet} of {busy}"
+    );
+    let mut rng = Rng(0x66);
+    let listed = plane_checked(&mut server, world, size, "", &mut rng, "keep");
+    assert!(listed > 2 * 4096, "{listed}");
+
+    let mut server = Server::new(Some(&host));
+    let world = int_at(
+        &ok(
+            &mut server,
+            "grit_world_create",
+            &format!(
+                "{{\"law\":{},\"params\":[],\"wide\":32,\"deep\":32,\"tall\":32,\"sparse\":true,\"budget_ms\":{LONG}}}",
+                quoted(&held_law(3))
+            ),
+        ),
+        "world",
+    );
+    for (plane, from, word) in [
+        (0_u32, [0, 0, 0], 3_u32),
+        (1, [0, 0, 0], 5),
+        (2, [0, 0, 0], 9),
+        (1, [16, 0, 16], 0xFFFF_FFFF),
+        (2, [0, 16, 16], 6),
+    ] {
+        write(
+            &mut server,
+            world,
+            &format!("\"plane\":{plane},"),
+            &block(from, 16, word),
+        );
+    }
+    for plane in 0..3_u32 {
+        write(
+            &mut server,
+            world,
+            &format!("\"plane\":{plane},"),
+            &[([17 + plane, 2, 29], 40 + plane)],
+        );
+    }
+    let busy = stepped_held(&mut server, world, 1);
+    let quiet = stepped_held(&mut server, world, 4);
+    println!("R6 held3: pool held {busy} after 1 frame, {quiet} after 5");
+    assert!(quiet < busy, "{quiet} of {busy}");
+    for plane in 0..3_u32 {
+        let label = format!("held3 plane {plane}");
+        let listed = plane_checked(
+            &mut server,
+            world,
+            size,
+            &format!("\"plane\":{plane},"),
+            &mut rng,
+            &label,
+        );
+        assert!(listed > 4096, "{label}: {listed}");
+    }
+}
+
+#[test]
+fn r8_mark_false_reads_as_no_mark_on_every_form() {
+    let Some(host) = device("world read mark false") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = created(&mut server, &LIFE);
+    let mut rng = Rng(0x88);
+    let soup = seeded(&LIFE, &mut rng, 300);
+    write(&mut server, world, CURRENT, &soup);
+    let (mark, _) = set_mark(&mut server, world);
+    let box_of = corners([2, 3, 0], [20, 9, 1]);
+    for (form, plane) in [
+        ("", CURRENT),
+        ("\"form\":\"dense\",", CURRENT),
+        ("\"form\":\"dense\",", "\"plane\":1,"),
+        ("\"form\":\"set\",", CURRENT),
+        ("\"form\":\"set\",", ""),
+    ] {
+        let plain = ok(
+            &mut server,
+            "grit_world_read",
+            &format!("{{\"world\":{world},{plane}{form}{box_of}}}"),
+        );
+        let unmarked = ok(
+            &mut server,
+            "grit_world_read",
+            &format!("{{\"world\":{world},{plane}{form}{box_of},\"mark\":false}}"),
+        );
+        assert_eq!(written(&unmarked), written(&plain), "{form} {plane}");
+        assert!(unmarked.get("mark").is_none(), "{}", written(&unmarked));
+    }
+    step(&mut server, world, 1);
+    let whole = corners(WHOLE.0, WHOLE.1);
+    let changed = format!("\"form\":\"changed\",\"since\":\"{mark}\"");
+    let plain = ok(
+        &mut server,
+        "grit_world_read",
+        &format!("{{\"world\":{world},{CURRENT}{whole},{changed}}}"),
+    );
+    let unmarked = ok(
+        &mut server,
+        "grit_world_read",
+        &format!("{{\"world\":{world},{CURRENT}{whole},{changed},\"mark\":false}}"),
+    );
+    assert_eq!(written(&unmarked), written(&plain));
+    assert!(int_at(&plain, "count") > 0);
+}
+
+#[test]
+fn r8_a_mark_of_another_plane_is_refused_at_the_field_the_read_names() {
+    let Some(host) = device("world read mark field") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let world = created(&mut server, &LIFE);
+    let mut rng = Rng(0x89);
+    let soup = seeded(&LIFE, &mut rng, 300);
+    write(&mut server, world, CURRENT, &soup);
+    let whole = corners(WHOLE.0, WHOLE.1);
+    let take = |server: &mut Server<'_>, plane: &str| {
+        let held = ok(
+            server,
+            "grit_world_read",
+            &format!("{{\"world\":{world},{plane}{whole},\"form\":\"set\",\"mark\":true}}"),
+        );
+        text_at(&held, "mark")
+    };
+    let on_current = take(&mut server, CURRENT);
+    let on_zero = take(&mut server, "\"plane\":0,");
+    let on_one = take(&mut server, "\"plane\":1,");
+    let cases = [
+        (&on_current, "\"plane\":0,", "$.plane"),
+        (&on_current, "\"plane\":1,", "$.plane"),
+        (&on_current, "", "$.plane"),
+        (&on_current, "\"current\":false,", "$.plane"),
+        (&on_zero, CURRENT, "$.current"),
+        (&on_zero, "\"plane\":1,", "$.plane"),
+        (&on_one, "", "$.plane"),
+        (&on_one, CURRENT, "$.current"),
+        (&on_one, "\"current\":true,\"plane\":0,", "$.current"),
+    ];
+    for (mark, plane, field) in cases {
+        let held = no(
+            &mut server,
+            "grit_world_read",
+            &format!(
+                "{{\"world\":{world},{plane}{whole},\"form\":\"changed\",\"since\":\"{mark}\"}}"
+            ),
+        );
+        refused_at(&held, "mark_unlike", field, &format!("{mark} {plane}"));
+    }
+    for (mark, plane) in [
+        (&on_current, CURRENT),
+        (&on_zero, "\"plane\":0,"),
+        (&on_zero, ""),
+        (&on_one, "\"plane\":1,"),
+    ] {
+        let held = ok(
+            &mut server,
+            "grit_world_read",
+            &format!(
+                "{{\"world\":{world},{plane}{whole},\"form\":\"changed\",\"since\":\"{mark}\"}}"
+            ),
+        );
+        assert_eq!(int_at(&held, "count"), 0, "{mark} {plane}");
+    }
+}
+
+#[test]
+fn r9_a_set_read_past_its_limit_hints_the_dense_read() {
+    let Some(host) = device("world read full box hint") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let size = [64, 32, 32];
+    let world = int_at(
+        &ok(
+            &mut server,
+            "grit_world_create",
+            &format!(
+                "{{\"law\":{},\"params\":[],\"wide\":64,\"deep\":32,\"tall\":32,\"budget_ms\":{LONG}}}",
+                quoted(KEEP)
+            ),
+        ),
+        "world",
+    );
+    filled(&mut server, world, size, SET_MOST);
+    let whole = ([0, 0, 0], [63, 31, 31]);
+    let held = result(
+        &asked(
+            &mut server,
+            world,
+            "",
+            whole,
+            "\"form\":\"set\",\"mark\":true",
+        ),
+        false,
+    );
+    let mark = text_at(&held, "mark");
+    write(&mut server, world, "", &[(place_of(size, 1), 3)]);
+    let told = ok(&mut server, "grit_describe", "{}");
+    let generic = told
+        .get("codes")
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .find(|one| one.get("code").and_then(Json::text) == Some("too_many"))
+        .map(|one| text_at(one, "hint"))
+        .unwrap();
+    for (form, field) in [
+        ("\"form\":\"set\"".to_owned(), "$.to"),
+        (
+            format!("\"form\":\"changed\",\"since\":\"{mark}\",\"mark\":true"),
+            "$.mark",
+        ),
+    ] {
+        let held = result(&asked(&mut server, world, "", whole, &form), true);
+        refused_at(&held, "too_many", field, &form);
+        let hint = text_at(&held, "hint");
+        assert!(hint.contains("form dense"), "{form}: {hint}");
+        assert_ne!(hint, generic, "{form}");
+    }
+    let held = result(
+        &asked(
+            &mut server,
+            world,
+            "",
+            ([0, 0, 0], [63, 31, 2]),
+            "\"form\":\"dense\"",
+        ),
+        true,
+    );
+    refused_at(&held, "too_many", "$.to", "dense over");
+    assert_eq!(text_at(&held, "hint"), generic);
+}
+
+#[cfg(feature = "faults")]
+mod lost {
+    use super::*;
+
+    #[test]
+    fn r7_a_mark_taken_before_a_lost_device_is_refused_by_name_after_the_rebuild() {
+        let Some(host) = device("world read lost marks") else {
+            return;
+        };
+        let mut server = Server::new(Some(&host));
+        let world = created(&mut server, &LIFE);
+        let mut rng = Rng(0x77);
+        let soup = seeded(&LIFE, &mut rng, 400);
+        write(&mut server, world, CURRENT, &soup);
+        let (mark, was) = set_mark(&mut server, world);
+        step(&mut server, world, 3);
+        changed_is(&mut server, world, &mark, &was, "", "before the loss");
+        let before = dense_plane(&mut server, world, LIFE.size, CURRENT);
+        server.faults().lock().unwrap().wedge_before_call = true;
+        let _ = server.heard(&line("grit_describe", "{}"));
+        assert!(server.lost(), "setup: the device was not lost");
+        let book = server.into_book();
+        drop(host);
+        let host = device("world read lost marks again").unwrap();
+        let (mut server, _) = Server::resumed(Some(&host), book);
+        let changed = format!("\"form\":\"changed\",\"since\":\"{mark}\"");
+        let held = result(&asked(&mut server, world, CURRENT, WHOLE, &changed), true);
+        refused_at(&held, "mark_unknown", "$.since", "after the rebuild");
+        let hint = text_at(&held, "hint");
+        assert!(hint.contains("lost device"), "{hint}");
+        let again = asked(&mut server, world, CURRENT, WHOLE, &changed);
+        assert!(
+            written(&again).contains("a rebuild after a lost device"),
+            "{}",
+            written(&again)
+        );
+        let rebuilt = dense_plane(&mut server, world, LIFE.size, CURRENT);
+        assert_eq!(rebuilt, before, "the rebuild replays the world as it was");
+        let (fresh, words) = set_mark(&mut server, world);
+        step(&mut server, world, 2);
+        let (_, now) = changed_is(&mut server, world, &fresh, &words, "", "new mark");
+        assert_ne!(now, words);
     }
 }
