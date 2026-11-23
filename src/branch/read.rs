@@ -1,6 +1,7 @@
 use simdr::kernel::{Kernel, Shape};
 use simdr::lanes::{LaneError, U32};
 use simdr::module::{Id, op};
+use simdr::spec::{MemorySemantics, Scope};
 
 use crate::bricks::{self, Bricks, ENTRY, UNIFORM, VALUE};
 use crate::geometry::Arith;
@@ -26,8 +27,16 @@ const START: u32 = 9;
 const VALUES: u32 = 10;
 const STRIDE: u32 = 11;
 const MARKED: u32 = 12;
+const ASKED: u32 = 12;
+const REACH: u32 = 13;
 const HEAD: u32 = 16;
 const ANSWERED: usize = 3;
+const RECORD: u32 = 7;
+pub const BITS: u32 = 32;
+const TALLY_WORDS: u32 = HEAD + BITS * RECORD;
+const RUN_LEAST: u32 = 32;
+const ATOMIC_U_MIN: u16 = 237;
+const ATOMIC_U_MAX: u16 = 239;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scanner {
@@ -36,6 +45,7 @@ pub struct Scanner {
     cap: u32,
     trips: u32,
     lanes: u32,
+    run: u32,
 }
 
 impl Scanner {
@@ -49,6 +59,7 @@ impl Scanner {
         let mut bound = sizes.to_vec();
         bound.resize(self.binding, 1);
         bound.push(self.words());
+        bound.push(TALLY_WORDS as usize);
         bound
     }
 
@@ -105,6 +116,13 @@ impl Mark {
             cells,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tallied {
+    pub count: u32,
+    pub least: [u32; 3],
+    pub most: [u32; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,7 +291,11 @@ fn marked_word(kernel: &mut Kernel<U32>, built: &Built, index: Id) -> Result<Id,
     Ok(kernel.module().select(uint, hit, word, nothing)?)
 }
 
-fn one_cell(kernel: &mut Kernel<U32>, built: &Built, cell: Id) -> Result<(), LaneError> {
+fn placed(
+    kernel: &mut Kernel<U32>,
+    built: &Built,
+    cell: Id,
+) -> Result<(Id, [Id; 3], Id), LaneError> {
     let uint = kernel.index_type();
     let binding = built.binding;
     let cells = head(kernel, binding, BOX_CELLS)?;
@@ -300,6 +322,12 @@ fn one_cell(kernel: &mut Kernel<U32>, built: &Built, cell: Id) -> Result<(), Lan
     let layer = kernel.module().i_add(uint, layer, point[1])?;
     let index = kernel.module().i_mul(uint, layer, wide_world)?;
     let index = kernel.module().i_add(uint, index, point[0])?;
+    Ok((inside, point, index))
+}
+
+fn one_cell(kernel: &mut Kernel<U32>, built: &Built, cell: Id) -> Result<(), LaneError> {
+    let binding = built.binding;
+    let (inside, point, index) = placed(kernel, built, cell)?;
     let word = word_at(kernel, built, point, index)?;
     let was = marked_word(kernel, built, index)?;
     let other = compared(kernel, op::I_NOT_EQUAL, word, was)?;
@@ -326,7 +354,7 @@ fn one_cell(kernel: &mut Kernel<U32>, built: &Built, cell: Id) -> Result<(), Lan
     })
 }
 
-fn module(subgroup: u32, built: &Built, trips: u32) -> Result<Vec<u32>, LaneError> {
+fn opened(subgroup: u32, built: &Built) -> Result<(Kernel<U32>, Id), LaneError> {
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, built.binding + 1))?;
     let uint = kernel.index_type();
     let group = kernel.workgroup_index();
@@ -348,6 +376,12 @@ fn module(subgroup: u32, built: &Built, trips: u32) -> Result<Vec<u32>, LaneErro
             Ok(())
         })?;
     }
+    Ok((kernel, lane_at))
+}
+
+fn module(subgroup: u32, built: &Built, trips: u32) -> Result<Vec<u32>, LaneError> {
+    let (mut kernel, lane_at) = opened(subgroup, built)?;
+    let uint = kernel.index_type();
     if trips <= 1 {
         one_cell(&mut kernel, built, lane_at)?;
     } else {
@@ -364,17 +398,136 @@ fn module(subgroup: u32, built: &Built, trips: u32) -> Result<Vec<u32>, LaneErro
     kernel.finish()
 }
 
+fn bitwise(kernel: &mut Kernel<U32>, code: u16, left: Id, right: Id) -> Result<Id, LaneError> {
+    let uint = kernel.index_type();
+    Ok(kernel.module().binary(code, uint, left, right)?)
+}
+
+fn atomic_at(
+    kernel: &mut Kernel<U32>,
+    code: u16,
+    binding: u32,
+    index: Id,
+    value: Id,
+) -> Result<Id, LaneError> {
+    let pointer = kernel.element_pointer_to(binding, index)?;
+    let element = kernel.element();
+    let scope = kernel.module().scope(Scope::Device)?;
+    let semantics = kernel.module().memory_semantics(MemorySemantics::None)?;
+    Ok(kernel
+        .module()
+        .atomic(code, element, pointer, scope, semantics, value)?)
+}
+
+fn tally_cell(
+    kernel: &mut Kernel<U32>,
+    built: &Built,
+    (lane_at, reach): (Id, Id),
+    counter: Id,
+) -> Result<([Id; 3], Id), LaneError> {
+    let uint = kernel.index_type();
+    let along = kernel.module().i_mul(uint, counter, reach)?;
+    let cell = kernel.module().i_add(uint, lane_at, along)?;
+    let (inside, point, index) = placed(kernel, built, cell)?;
+    let word = word_at(kernel, built, point, index)?;
+    let asked = head(kernel, built.binding, ASKED)?;
+    let kept = bitwise(kernel, op::BITWISE_AND, word, asked)?;
+    let nothing = constant(kernel, 0)?;
+    let word = kernel.module().select(uint, inside, kept, nothing)?;
+    Ok((point, word))
+}
+
+fn bit_record(
+    kernel: &mut Kernel<U32>,
+    built: &Built,
+    lanes: (Id, Id),
+    bit: Id,
+    run: u32,
+) -> Result<(), LaneError> {
+    let uint = kernel.index_type();
+    let nothing = constant(kernel, 0)?;
+    let one = constant(kernel, 1)?;
+    let full = constant(kernel, u32::MAX)?;
+    let initial = [nothing, full, full, full, nothing, nothing, nothing];
+    let carried = kernel.repeat_rolled_many(run, uint, &initial, |kernel, held, counter| {
+        let missing = || LaneError::BadCarry {
+            given: held.len(),
+            wanted: RECORD as usize,
+        };
+        let (point, word) = tally_cell(kernel, built, lanes, counter)?;
+        let shifted = bitwise(kernel, op::SHIFT_RIGHT_LOGICAL, word, bit)?;
+        let low = bitwise(kernel, op::BITWISE_AND, shifted, one)?;
+        let set = compared(kernel, op::I_NOT_EQUAL, low, nothing)?;
+        let count = held.first().copied().ok_or_else(missing)?;
+        let mut next = vec![kernel.module().i_add(uint, count, low)?];
+        for slot in 1..RECORD as usize {
+            let was = held.get(slot).copied().ok_or_else(missing)?;
+            let at = point.get((slot - 1) % 3).copied().ok_or_else(missing)?;
+            let code = if slot <= 3 {
+                op::U_LESS_THAN
+            } else {
+                op::U_GREATER_THAN
+            };
+            let beyond = compared(kernel, code, at, was)?;
+            let truth = kernel.module().type_bool()?;
+            let taken = kernel.module().logical_and(truth, set, beyond)?;
+            next.push(kernel.module().select(uint, taken, at, was)?);
+        }
+        Ok(next)
+    })?;
+    let width = constant(kernel, RECORD)?;
+    let start = constant(kernel, HEAD)?;
+    let along = kernel.module().i_mul(uint, bit, width)?;
+    let record = kernel.module().i_add(uint, start, along)?;
+    for (slot, value) in (0_u32..).zip(&carried) {
+        let code = match slot {
+            0 => op::ATOMIC_I_ADD,
+            1..=3 => ATOMIC_U_MIN,
+            _ => ATOMIC_U_MAX,
+        };
+        let offset = constant(kernel, slot)?;
+        let at = kernel.module().i_add(uint, record, offset)?;
+        atomic_at(kernel, code, built.binding, at, *value)?;
+    }
+    Ok(())
+}
+
+fn tally_module(subgroup: u32, built: &Built, run: u32) -> Result<Vec<u32>, LaneError> {
+    let (mut kernel, lane_at) = opened(subgroup, built)?;
+    let uint = kernel.index_type();
+    let reach = head(&mut kernel, built.binding, REACH)?;
+    let lanes = (lane_at, reach);
+    let nothing = constant(&mut kernel, 0)?;
+    let held = kernel.repeat_rolled(run, uint, nothing, |kernel, carried, counter| {
+        let (_, word) = tally_cell(kernel, built, lanes, counter)?;
+        bitwise(kernel, op::BITWISE_OR, carried, word)
+    })?;
+    kernel.repeat_rolled(BITS, uint, nothing, |kernel, carried, bit| {
+        let one = constant(kernel, 1)?;
+        let zero = constant(kernel, 0)?;
+        let shifted = bitwise(kernel, op::SHIFT_RIGHT_LOGICAL, held, bit)?;
+        let low = bitwise(kernel, op::BITWISE_AND, shifted, one)?;
+        let on = compared(kernel, op::I_NOT_EQUAL, low, zero)?;
+        lane_if(kernel, on, |kernel| {
+            bit_record(kernel, built, lanes, bit, run)
+        })?;
+        Ok(carried)
+    })?;
+    kernel.finish()
+}
+
 pub(crate) fn scanner(
     subgroup: u32,
     binding: usize,
     pass: usize,
     size: [u32; 3],
     source: Source,
-) -> Result<(Scanner, Vec<u32>), Failed> {
+) -> Result<(Scanner, [Vec<u32>; 2]), Failed> {
     let plane: u64 = size.iter().map(|side| u64::from(*side)).product();
     let cap = u32::try_from(plane.min(u64::from(SET_MOST)))?;
     let reach = u64::from(subgroup.max(1)) * u64::from(bricks::MOST_GROUPS);
     let trips = u32::try_from(plane.div_ceil(reach).max(1))?;
+    let run = u32::try_from(plane.div_ceil(reach).max(u64::from(RUN_LEAST)))?;
     let built = Built {
         binding: u32::try_from(binding)?,
         size,
@@ -382,6 +535,11 @@ pub(crate) fn scanner(
         source,
     };
     let words = module(subgroup, &built, trips)?;
+    let tallied = Built {
+        binding: built.binding + 1,
+        ..built
+    };
+    let tally = tally_module(subgroup, &tallied, run)?;
     Ok((
         Scanner {
             binding,
@@ -389,20 +547,14 @@ pub(crate) fn scanner(
             cap,
             trips,
             lanes: subgroup.max(1),
+            run,
         },
-        words,
+        [words, tally],
     ))
 }
 
 impl World<'_> {
-    pub fn scan(
-        &mut self,
-        plane: u32,
-        from: [u32; 3],
-        to: [u32; 3],
-        against: &[(u32, u32)],
-        most: u32,
-    ) -> Result<Scanned, Failed> {
+    fn located(&self, plane: u32, from: [u32; 3], to: [u32; 3]) -> Result<(Vec<u32>, u64), Failed> {
         if plane >= self.planes() {
             return Err(Box::new(Refused::Malformed {
                 what: format!("plane {plane} is past the world's {} planes", self.planes()),
@@ -417,20 +569,6 @@ impl World<'_> {
         if from.iter().zip(to).any(|(one, other)| *one > other) {
             return Err(Box::new(Refused::Malformed {
                 what: format!("the box from {from:?} to {to:?} has its first corner past its last"),
-            }));
-        }
-        let scanner = self.scanner;
-        let sorted = against.windows(2).all(|pair| match pair {
-            [one, other] => one.0 < other.0,
-            _ => true,
-        });
-        if against.len() > scanner.cap as usize || !sorted {
-            return Err(Box::new(Refused::Malformed {
-                what: format!(
-                    "a mark of {} cells, sorted {sorted}, past the {} a scan compares",
-                    against.len(),
-                    scanner.cap
-                ),
             }));
         }
         let mut sides = [1_u32; 3];
@@ -460,11 +598,97 @@ impl World<'_> {
             (START, start),
             (VALUES, values),
             (STRIDE, stride),
-            (MARKED, u32::try_from(against.len())?),
         ] {
             if let Some(slot) = words.get_mut(at as usize) {
                 *slot = value;
             }
+        }
+        Ok((words, cells))
+    }
+
+    fn flagged(&self, got: &[u32]) -> Result<(), Failed> {
+        if got.get(OVERFLOWED as usize).copied().unwrap_or_default() != 0 {
+            return Err(Box::new(host::Error::PoolFull {
+                slots: self.pool.map_or(0, |held| held.capacity()),
+            }));
+        }
+        if got.get(DROPPED as usize).copied().unwrap_or_default() != 0 {
+            return Err(Box::new(host::Error::LostWrite));
+        }
+        Ok(())
+    }
+
+    pub fn bit_tally(
+        &mut self,
+        plane: u32,
+        from: [u32; 3],
+        to: [u32; 3],
+        asked: u32,
+    ) -> Result<Vec<Tallied>, Failed> {
+        let (mut words, cells) = self.located(plane, from, to)?;
+        let scanner = self.scanner;
+        let per = u64::from(scanner.lanes) * u64::from(scanner.run);
+        let groups = u32::try_from(cells.div_ceil(per).max(1))?;
+        let reach = groups
+            .checked_mul(scanner.lanes)
+            .ok_or_else(|| Refused::Malformed {
+                what: format!("{groups} groups of {} lanes", scanner.lanes),
+            })?;
+        for (at, value) in [(ASKED, asked), (REACH, reach)] {
+            if let Some(slot) = words.get_mut(at as usize) {
+                *slot = value;
+            }
+        }
+        for _ in 0..BITS {
+            words.extend_from_slice(&[0, u32::MAX, u32::MAX, u32::MAX, 0, 0, 0]);
+        }
+        let binding = scanner.binding + 1;
+        self.live.write(binding, &words)?;
+        let quiet = vec![Groups::Fixed(0); scanner.pass + 1];
+        let run = [Groups::Fixed(groups)];
+        let got = self
+            .live
+            .run_reading(&[&quiet, &run], binding, TALLY_WORDS as usize)?;
+        self.flagged(&got)?;
+        let records = got.get(HEAD as usize..).unwrap_or_default();
+        Ok(records
+            .as_chunks::<{ RECORD as usize }>()
+            .0
+            .iter()
+            .map(|record| Tallied {
+                count: record[0],
+                least: [record[1], record[2], record[3]],
+                most: [record[4], record[5], record[6]],
+            })
+            .collect())
+    }
+
+    pub fn scan(
+        &mut self,
+        plane: u32,
+        from: [u32; 3],
+        to: [u32; 3],
+        against: &[(u32, u32)],
+        most: u32,
+    ) -> Result<Scanned, Failed> {
+        let (head_words, cells) = self.located(plane, from, to)?;
+        let scanner = self.scanner;
+        let sorted = against.windows(2).all(|pair| match pair {
+            [one, other] => one.0 < other.0,
+            _ => true,
+        });
+        if against.len() > scanner.cap as usize || !sorted {
+            return Err(Box::new(Refused::Malformed {
+                what: format!(
+                    "a mark of {} cells, sorted {sorted}, past the {} a scan compares",
+                    against.len(),
+                    scanner.cap
+                ),
+            }));
+        }
+        let mut words = head_words;
+        if let Some(slot) = words.get_mut(MARKED as usize) {
+            *slot = u32::try_from(against.len())?;
         }
         for &(index, word) in against {
             words.push(index);
@@ -475,18 +699,12 @@ impl World<'_> {
         let groups = u32::try_from(cells.div_ceil(per).max(1))?;
         let quiet = vec![Groups::Fixed(0); scanner.pass];
         let run = [Groups::Fixed(groups)];
+        let tally = [Groups::Fixed(0)];
         let got = self
             .live
-            .run_reading(&[&quiet, &run], scanner.binding, ANSWERED)?;
+            .run_reading(&[&quiet, &run, &tally], scanner.binding, ANSWERED)?;
         let count = got.first().copied().unwrap_or_default();
-        if got.get(OVERFLOWED as usize).copied().unwrap_or_default() != 0 {
-            return Err(Box::new(host::Error::PoolFull {
-                slots: self.pool.map_or(0, |held| held.capacity()),
-            }));
-        }
-        if got.get(DROPPED as usize).copied().unwrap_or_default() != 0 {
-            return Err(Box::new(host::Error::LostWrite));
-        }
+        self.flagged(&got)?;
         if count > most.min(scanner.cap) {
             return Ok(Scanned {
                 count: u64::from(count),

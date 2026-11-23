@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::branch::World;
-use crate::branch::read::{MARKS_HELD, Mark, Plane, SET_MOST};
+use crate::branch::read::{BITS, MARKS_HELD, Mark, Plane, SET_MOST};
 use crate::host::Host;
 use crate::wire::{Json, counted, map, text};
 
@@ -21,6 +21,8 @@ use super::{
 use crate::calibrate::Key;
 
 pub const SET_READ: &str = "grit_world_read with form set or changed scans the box on the device in one pass, one lane a cell, and moves 12 bytes plus 8 a listed cell back. Like the dense read it is not priced: no budget is charged for it";
+
+pub const TALLY_READ: &str = "grit_world_read with form tally counts each asked bit over the box on the device in one pass and moves 960 bytes back, whatever the box, plane or bits. Like the dense read it is not priced: no budget is charged for it";
 
 pub const TOOLS: &[Tool] = &[
     Tool {
@@ -439,9 +441,9 @@ fn read_shown() -> Json {
                 with(
                     choice(
                         &format!(
-                            "dense: every cell's word, at most {READ_MOST} cells; set: only the cells whose word is not 0, as [x, y, z, word]; changed: only the cells whose word differs from the mark since names, the same way. A set or changed box may be any size; at most {SET_MOST} cells are listed. dense if left out"
+                            "dense: every cell's word, at most {READ_MOST} cells; set: only the cells whose word is not 0, as [x, y, z, word]; changed: only the cells whose word differs from the mark since names, the same way; tally: for each bit bits names, the count of cells with that bit set and the least and greatest corner of those cells. A set, changed or tally box may be any size; at most {SET_MOST} cells are listed. dense if left out"
                         ),
-                        &["dense", "set", "changed"],
+                        &["dense", "set", "changed", "tally"],
                     ),
                     vec![("default", text("dense"))],
                 ),
@@ -458,6 +460,20 @@ fn read_shown() -> Json {
                 property(
                     "boolean",
                     "for form set or changed: record the box as this read sees it and answer its id as mark, for a later since",
+                ),
+            ),
+            (
+                "bits",
+                with(
+                    property(
+                        "array",
+                        "for form tally: the bits to count, each from 0 to 31 and named once; all 32 if left out",
+                    ),
+                    vec![
+                        ("items", word()),
+                        ("minItems", Json::Int(1)),
+                        ("maxItems", Json::Int(i64::from(BITS))),
+                    ],
                 ),
             ),
         ],
@@ -1272,6 +1288,9 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     }
     let now = live.world.frame();
     let form = words_of(held, "form")?;
+    if form == "tally" || held.get("bits").is_some() {
+        return tallied(live, held, number, now, (from, to), form);
+    }
     if form != "dense" || held.get("since").is_some() || marking(held) {
         return scanned(live, held, number, now, (from, to), form);
     }
@@ -1396,6 +1415,89 @@ fn marked_cells(
         ));
     }
     Ok(mark.cells.clone())
+}
+
+fn asked_bits(held: &Json) -> Result<Vec<u32>, Failed> {
+    let Some(named) = held.get("bits") else {
+        return Ok((0..BITS).collect());
+    };
+    let bits = ints(named, "bits")?;
+    let mut seen = 0_u32;
+    for (at, &bit) in bits.iter().enumerate() {
+        if bit >= BITS {
+            return Err(refused(
+                Code::BitPast,
+                &format!("$.bits[{at}]"),
+                format!("bit {bit} is past the {BITS} bits of a word"),
+            ));
+        }
+        if seen & (1 << bit) != 0 {
+            return Err(refused(
+                Code::Malformed,
+                &format!("$.bits[{at}]"),
+                format!("bit {bit} is named twice"),
+            ));
+        }
+        seen |= 1 << bit;
+    }
+    Ok((0..BITS).filter(|bit| seen & (1 << bit) != 0).collect())
+}
+
+fn tallied(
+    live: &mut Live<'_>,
+    held: &Json,
+    world: u32,
+    now: u32,
+    (from, to): ([u32; 3], [u32; 3]),
+    form: &str,
+) -> Result<Json, Failed> {
+    let wrong = |field: &str, why: &str| {
+        Box::new(Refusal::new(Code::ReadForm, field, why.to_owned()).hinted(errors::TALLY_FORM))
+            as Failed
+    };
+    if form != "tally" {
+        return Err(wrong("$.bits", "bits is for form tally"));
+    }
+    if held.get("since").is_some() {
+        return Err(wrong(
+            "$.since",
+            "since is for form changed; form tally counts every cell of the box",
+        ));
+    }
+    if marking(held) {
+        return Err(wrong(
+            "$.mark",
+            "mark is for form set or changed, not tally",
+        ));
+    }
+    let bits = asked_bits(held)?;
+    let plane = plane_of(held, &live.world)?;
+    let asked = bits.iter().fold(0_u32, |mask, bit| mask | (1 << bit));
+    let records = live.world.bit_tally(plane, from, to, asked)?;
+    let mut shown = Vec::new();
+    for bit in bits {
+        let Some(record) = records.get(bit as usize) else {
+            continue;
+        };
+        let mut one = vec![("bit", counted(bit)), ("count", counted(record.count))];
+        if record.count > 0 {
+            one.push(("min", sized(record.least)));
+            one.push(("max", sized(record.most)));
+        }
+        shown.push(map(one));
+    }
+    let mut answer = vec![
+        ("world", counted(world)),
+        ("frame", counted(now)),
+        ("form", text(form)),
+        ("from", sized(from)),
+        ("to", sized(to)),
+        ("bits", Json::List(shown)),
+    ];
+    if current(held) {
+        answer.insert(2, ("plane", counted(plane)));
+    }
+    Ok(map(answer))
 }
 
 fn scanned(
@@ -1672,6 +1774,7 @@ pub fn describe(status: &Status) -> Json {
                 ("set_cells", number(SET_MOST)),
                 ("marks_held", number(MARKS_HELD)),
                 ("set_read", text(SET_READ)),
+                ("tally_read", text(TALLY_READ)),
                 ("write_cells", number(READ_MOST)),
                 ("slice_cells", number(SLICE_MOST)),
                 ("step_frames", number(STEP_MOST)),

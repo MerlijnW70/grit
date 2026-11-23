@@ -590,15 +590,18 @@ impl<'host> World<'host> {
             None => read::Source::Dense(rule.windows(&plan)),
         };
         let size = [grid.wide, grid.deep, grid.tall];
-        let (scanner, scan) = read::scanner(host.width(), sizes.len(), passes.len(), size, source)?;
+        let (scanner, reads) =
+            read::scanner(host.width(), sizes.len(), passes.len(), size, source)?;
         let mut passes = passes;
-        passes.push(scan);
         let mut stages = stages;
-        stages.push(vec![Groups::Fixed(0)]);
-        let back = back.map(|mut held| {
-            held.push(vec![Groups::Fixed(0)]);
-            held
-        });
+        let mut back = back;
+        for module in reads {
+            passes.push(module);
+            stages.push(vec![Groups::Fixed(0)]);
+            if let Some(held) = back.as_mut() {
+                held.push(vec![Groups::Fixed(0)]);
+            }
+        }
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
         let live = host
             .resident(&scanner.bound(&sizes), &modules)

@@ -117,6 +117,32 @@ Refusals:
 | `mark_unlike` | a box or plane other than the mark's | `$.from` or `$.to`; for the plane, `$.current` when the read gives `current` true, else `$.plane` |
 | `too_many` | more than 16384 cells to list, or a mark of more than 16384 set cells | `$.to` or `$.mark` |
 
+## Counting the bits of a box
+
+`grit_world_read` with `form` `tally` answers, for each bit `bits` names, how many cells of the box have that bit set and the least and greatest corner of those cells. A world that holds one pattern per bit, as 32 soups in one world do, learns which patterns died, which grew and where each one lives, without listing a cell.
+
+| Field | Meaning |
+|---|---|
+| `bits` (argument) | 1 to 32 bit numbers, each from 0 to 31 and named once; all 32 if left out |
+| `bits` (answer) | one record a named bit, in ascending order: `bit`, `count`, and, when `count` is above 0, `min` and `max`, each `[x, y, z]` in the world |
+
+`from`, `to`, `plane` and `current` work as for every read, the box may be any size, and it works on every world, rule or law, dense or sparse; a cell of a sparse brick held as one word counts as that word. The answer adds `form` and, with `current`, `plane`.
+
+```json
+{"world":0,"from":[0,0,0],"to":[31,31,31],"current":true,"form":"tally","bits":[0,31]}
+```
+
+The device counts the box in one pass and moves 960 bytes back, whatever the box, plane or bits (`limits.tally_read`). Like the other reads it is not priced.
+
+Refusals:
+
+| Code | When | `field` |
+|---|---|---|
+| `bit_past` | a bit above 31 | `$.bits[k]` |
+| `malformed` | a bit named twice (at its second place), or an empty list | `$.bits[k]` or `$.bits` |
+| `too_many` | more than 32 bits | `$.bits` |
+| `read_form` | `bits` with another form, or `since` or `mark` true with `tally` | `$.bits`, `$.since` or `$.mark` |
+
 ## Reversible laws
 
 A law with `"reversible": true` must be a sequence of lifting steps over its words, 8 a plane: each step adds, subtracts or xors to one word, wrapping, a value made only of other words, params, `frame`, `at`, constants and looks at frozen planes. The compiler checks the form, derives the inverse (the steps undone in reverse order) as an ordinary law named with `_back` and its own hash, and refuses anything else with `not_lifting` at the offending step's path: a step that reads its own word, one node written to two words, a word made by another op (`b = f(a)`, `b | f`, `b * 3`).

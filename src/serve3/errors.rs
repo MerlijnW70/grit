@@ -589,6 +589,8 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+pub const TALLY_FORM: &str = "Give bits only with form tally, and neither since nor mark with it.";
+
 pub const FULL_BOX: &str = "Split the box into smaller boxes, or read a box this full with form dense: it answers every cell's word, up to its own limit of cells a call, and costs less than a list once a box is about a quarter set.";
 
 const SHOWN: usize = 64;
