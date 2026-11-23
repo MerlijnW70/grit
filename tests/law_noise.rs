@@ -1266,3 +1266,144 @@ fn g2_a_vote_that_leaves_rows_unseen_decides_them_as_the_host() {
         unseen.len()
     );
 }
+
+fn zero_pairs(seed: u64, count: usize, size: [u32; 3]) -> Vec<Example> {
+    let mut rng = Rng(seed);
+    let cells = size.iter().product::<u32>() as usize;
+    (0..count)
+        .map(|at| {
+            let input = random_bits(&mut rng, cells, 250 + 60 * at as u64);
+            let output = own_rows(Stencil::Square, size, &input, false)
+                .into_iter()
+                .map(life)
+                .collect();
+            Example {
+                size,
+                input,
+                output,
+            }
+        })
+        .collect()
+}
+
+fn plane_written(mcp: &mut Mcp<'_>, world: u32, plane: u32, cells: &[([u32; 3], u32)]) {
+    let shown: Vec<String> = cells
+        .iter()
+        .map(|(at, word)| format!("[{},{},{},{word}]", at[0], at[1], at[2]))
+        .collect();
+    mcp.ok(
+        "grit_world_write",
+        &format!(
+            "{{\"world\":{world},\"plane\":{plane},\"cells\":[{}],\"budget_ms\":{LONG}}}",
+            shown.join(",")
+        ),
+    );
+}
+
+#[test]
+fn n8_deviating_cells_of_a_world_example_are_placed_in_its_box() {
+    let Some(host) = device("law_noise n8") else {
+        return;
+    };
+    let mut mcp = Mcp::new(Some(&host));
+    let plain = mcp.ok(
+        "grit_law_learn",
+        &args(Stencil::Square, "outer", "wrapped", &life_pairs(), ""),
+    );
+    let law = text_at(&plain, "law");
+    let size = [32_u32, 32, 2];
+    let layer = [32_u32, 32, 1];
+    let from = [5_u32, 7, 0];
+    let side = 20_u32;
+    let to = [from[0] + side - 1, from[1] + side - 1, 0];
+    let mut rng = Rng(TRAIN + 800);
+    let image = random_bits(&mut rng, 32 * 32, 350);
+    let input = world_of(&mut mcp, &law, size, &image);
+    let crop: Vec<u32> = (0..side * side)
+        .map(|at| image[stencil::index(layer, [from[0] + at % side, from[1] + at / side, 0])])
+        .collect();
+    let flips: [[u32; 3]; 4] = [[0, 0, 0], [19, 0, 0], [5, 13, 0], [19, 19, 0]];
+    for (border, inline) in [
+        ("wrapped", life_pairs()),
+        ("zero", zero_pairs(TRAIN + 801, 8, layer)),
+    ] {
+        let truth: Vec<u32> = if border == "wrapped" {
+            let whole = stepped(Stencil::Square, layer, &image, life);
+            (0..side * side)
+                .map(|at| {
+                    whole[stencil::index(layer, [from[0] + at % side, from[1] + at / side, 0])]
+                })
+                .collect()
+        } else {
+            own_rows(Stencil::Square, [side, side, 1], &crop, false)
+                .into_iter()
+                .map(life)
+                .collect()
+        };
+        let output = mcp.world(&law, size);
+        let cells: Vec<([u32; 3], u32)> = (0..side * side)
+            .map(|at| {
+                let place = [at % side, at / side, 0];
+                let flip = u32::from(flips.contains(&place));
+                (
+                    [from[0] + place[0], from[1] + place[1], 0],
+                    truth[at as usize] ^ flip,
+                )
+            })
+            .collect();
+        plane_written(&mut mcp, output, 1, &cells);
+        let world_example = format!(
+            "{{\"world\":{input},\"output_world\":{output},\"from\":[{},{},{}],\"to\":[{},{},{}]}}",
+            from[0], from[1], from[2], to[0], to[1], to[2]
+        );
+        let inline_shown = shown(&inline);
+        let examples = format!(
+            "{},{world_example}]",
+            &inline_shown[..inline_shown.len() - 1]
+        );
+        let got = mcp.ok(
+            "grit_law_learn",
+            &format!(
+                "{{\"stencil\":\"3x3\",\"reads\":[{{\"plane\":0,\"bit\":0}}],\"writes\":[{{\"plane\":1,\"bit\":0}}],\"border\":\"{border}\",\"rule\":\"outer\",\"examples\":{examples}{VOTE},\"budget_ms\":{LONG}}}"
+            ),
+        );
+        assert_eq!(shown_of(&got, "tables"), LIFE_TABLES, "{border}");
+        assert_eq!(shown_of(&got, "deviating"), "[4]", "{border}");
+        let listed = got.get("deviating_cells").and_then(Json::list).unwrap()[0]
+            .list()
+            .unwrap()
+            .to_vec();
+        let example = inline.len() as i64;
+        let places: Vec<(i64, Vec<u32>)> = listed
+            .iter()
+            .map(|one| (int_at(one, "example"), words(one.get("at").unwrap())))
+            .collect();
+        let wanted: Vec<(i64, Vec<u32>)> = flips.iter().map(|at| (example, at.to_vec())).collect();
+        assert_eq!(places, wanted, "{border}");
+        for (one, at) in listed.iter().zip(&flips) {
+            let truth_here = truth[(at[1] * side + at[0]) as usize];
+            assert_eq!(int_at(one, "law"), i64::from(truth_here), "{border} {at:?}");
+            assert_eq!(
+                int_at(one, "seen"),
+                i64::from(truth_here ^ 1),
+                "{border} {at:?}"
+            );
+        }
+        println!("n8 {border}: deviating cells at {places:?}");
+    }
+}
+
+fn world_of(mcp: &mut Mcp<'_>, law: &str, size: [u32; 3], image: &[u32]) -> u32 {
+    let world = mcp.world(law, size);
+    let mut cells = Vec::new();
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let word = image[(y * size[0] + x) as usize];
+            if word != 0 {
+                cells.push(([x, y, 0], word));
+            }
+        }
+    }
+    mcp.write(world, &cells);
+    world
+}

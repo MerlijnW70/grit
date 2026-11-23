@@ -1534,3 +1534,161 @@ fn m7_requests_without_the_new_arguments_answer_the_base_bytes_and_every_answer_
         assert_eq!(one, four, "with no device");
     }
 }
+
+fn unseen_counted(got: &Json, writes: u32, case: &str) -> u64 {
+    let unseen = got.get("unseen").unwrap();
+    let table = words(unseen.get("table").unwrap());
+    let rows = words(unseen.get("unseen_rows").unwrap());
+    assert_eq!(table.len(), 512, "{case}");
+    assert_eq!(int_at(unseen, "rows"), rows.len() as i64, "{case}");
+    let ones: Vec<u32> = (0..writes)
+        .map(|write| {
+            rows.iter()
+                .filter(|row| (table[**row as usize] >> write) & 1 == 1)
+                .count() as u32
+        })
+        .collect();
+    let zeros: Vec<u32> = ones.iter().map(|one| rows.len() as u32 - one).collect();
+    assert_eq!(words(unseen.get("ones").unwrap()), ones, "{case} ones");
+    assert_eq!(words(unseen.get("zeros").unwrap()), zeros, "{case} zeros");
+    ones.iter().map(|one| u64::from(*one)).sum()
+}
+
+#[test]
+fn m8_masked_unseen_ones_and_zeros_count_the_unseen_table() {
+    let mut mcp = Mcp::new(None);
+    let mut every_case = Vec::new();
+    for (at, (preset, mask)) in [("hex", HEX.to_vec()), ("von_neumann", VN_SQUARE.to_vec())]
+        .iter()
+        .enumerate()
+    {
+        for (turn, rule) in [Rule::Totalistic, Rule::Outer].into_iter().enumerate() {
+            let mut rng = Rng(TRAIN + 80 + 2 * at as u64 + turn as u64);
+            let table: Vec<u32> = (0..own_classes(rule, mask))
+                .map(|class| if class == 0 { 0 } else { rng.below(4) })
+                .collect();
+            let inputs = random_inputs(&mut rng, [8, 8, 1], &[300, 600]);
+            let examples = labelled(Stencil::Square, inputs, true, &|row| {
+                table[own_class(rule, Stencil::Square, mask, row) as usize]
+            });
+            let case = format!("{preset} {}", rule.name());
+            let got = mcp.ok(
+                "grit_law_learn",
+                &args(
+                    Stencil::Square,
+                    rule.name(),
+                    "wrapped",
+                    &examples,
+                    2,
+                    &format!(",\"places\":\"{preset}\""),
+                ),
+            );
+            let ones = unseen_counted(&got, 2, &case);
+            let rows = int_at(got.get("unseen").unwrap(), "rows");
+            println!("m8 {case}: {rows} unseen rows, {ones} of them 1 over both writes");
+            assert!(rows > 64, "{case}: only {rows} rows unseen");
+            every_case.push((case, ones));
+        }
+    }
+    for (case, ones) in &every_case {
+        assert!(
+            *ones > 0,
+            "{case}: no unseen row decided 1, so the count is not tested"
+        );
+    }
+}
+
+#[test]
+fn m9_the_centre_alone_counts_one_place_and_an_explicit_moore_is_no_mask() {
+    let mut mcp = Mcp::new(None);
+    for rule in [Rule::Totalistic, Rule::Outer] {
+        for flip in [0_u32, 1] {
+            let mut rng = Rng(TRAIN + 90 + u64::from(flip) + 2 * (rule == Rule::Outer) as u64);
+            let inputs = random_inputs(&mut rng, [32, 32, 1], &[200, 500, 800]);
+            let truth = move |row: u32| ((row >> 4) & 1) ^ flip;
+            let examples = labelled(Stencil::Square, inputs, true, &truth);
+            let case = format!("centre {} flip {flip}", rule.name());
+            let got = mcp.ok(
+                "grit_law_learn",
+                &args(
+                    Stencil::Square,
+                    rule.name(),
+                    "wrapped",
+                    &examples,
+                    1,
+                    ",\"place_list\":[4]",
+                ),
+            );
+            let tables = match rule {
+                Rule::Totalistic => format!("[[{},{}]]", flip, 1 - flip),
+                Rule::Outer => format!("[[[{}],[{}]]]", flip, 1 - flip),
+            };
+            assert_eq!(shown_of(&got, "tables"), tables, "{case}");
+            assert_eq!(shown_of(&got, "places"), "{\"list\":[4]}", "{case}");
+            let never = match rule {
+                Rule::Totalistic => "[[]]",
+                Rule::Outer => "[[[],[]]]",
+            };
+            assert_eq!(shown_of(&got, "unseen_counts"), never, "{case}");
+            let table = words(got.get("unseen").unwrap().get("table").unwrap());
+            for (row, word) in table.iter().enumerate() {
+                assert_eq!(*word, truth(row as u32), "{case} row {row}");
+            }
+            unseen_counted(&got, 1, &case);
+        }
+    }
+    for (at, (stencil, rule)) in [
+        (Stencil::Square, Rule::Totalistic),
+        (Stencil::Square, Rule::Outer),
+        (Stencil::Cube, Rule::Totalistic),
+        (Stencil::Cube, Rule::Outer),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut rng = Rng(TRAIN + 95 + at as u64);
+        let examples = random_counting(&mut rng, rule, stencil, &every(stencil), 2);
+        for noise in ["", ",\"noise\":\"vote\""] {
+            let case = format!("{} {} moore{noise}", stencil.name(), rule.name());
+            let bare = mcp.ok(
+                "grit_law_learn",
+                &args(stencil, rule.name(), "wrapped", &examples, 2, noise),
+            );
+            let named = mcp.ok(
+                "grit_law_learn",
+                &args(
+                    stencil,
+                    rule.name(),
+                    "wrapped",
+                    &examples,
+                    2,
+                    &format!("{noise},\"places\":\"moore\""),
+                ),
+            );
+            for key in ["law", "hash", "chip", "tables", "unseen_counts"] {
+                assert_eq!(shown_of(&named, key), shown_of(&bare, key), "{case} {key}");
+            }
+            let (one, other) = (named.get("unseen").unwrap(), bare.get("unseen").unwrap());
+            for key in ["rows", "rule", "zeros", "ones"] {
+                assert_eq!(
+                    shown_of(one, key),
+                    shown_of(other, key),
+                    "{case} unseen {key}"
+                );
+            }
+            if !noise.is_empty() {
+                for key in ["tallies", "ties", "deviating", "deviating_share"] {
+                    assert_eq!(shown_of(&named, key), shown_of(&bare, key), "{case} {key}");
+                }
+            }
+            assert_eq!(
+                shown_of(&named, "places"),
+                format!(
+                    "{{\"list\":{},\"preset\":\"moore\"}}",
+                    listed(&every(stencil))
+                ),
+                "{case}"
+            );
+        }
+    }
+}
