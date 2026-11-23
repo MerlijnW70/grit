@@ -1023,3 +1023,246 @@ fn n7_the_same_vote_request_answers_the_same_bytes_after_a_restart() {
         assert_eq!(one, four, "with no device");
     }
 }
+
+fn shown_writes(examples: &[Example], writes: u32) -> String {
+    let shown: Vec<String> = examples
+        .iter()
+        .map(|one| {
+            let outs: Vec<String> = (0..writes)
+                .map(|write| {
+                    let held: Vec<u32> =
+                        one.output.iter().map(|word| word & (1 << write)).collect();
+                    listed(&held)
+                })
+                .collect();
+            format!(
+                "{{\"size\":[{},{},{}],\"input\":[{}],\"output\":[{}]}}",
+                one.size[0],
+                one.size[1],
+                one.size[2],
+                listed(&one.input),
+                outs.join(",")
+            )
+        })
+        .collect();
+    format!("[{}]", shown.join(","))
+}
+
+fn args_writes(rule: &str, border: &str, examples: &[Example], writes: u32) -> String {
+    let named: Vec<String> = (0..writes)
+        .map(|bit| format!("{{\"plane\":1,\"bit\":{bit}}}"))
+        .collect();
+    format!(
+        "{{\"stencil\":\"3x3\",\"reads\":[{{\"plane\":0,\"bit\":0}}],\"writes\":[{}],\"border\":\"{border}\",\"rule\":\"{rule}\",\"examples\":{}{VOTE},\"budget_ms\":{LONG}}}",
+        named.join(","),
+        shown_writes(examples, writes)
+    )
+}
+
+fn crowded(row: u32) -> u32 {
+    let centre = (row >> 4) & 1;
+    let around = (row & 0x1FF).count_ones() - centre;
+    centre ^ u32::from(around >= 4)
+}
+
+struct Written {
+    tallies: Vec<Vec<[u64; 2]>>,
+    deviating: Vec<u64>,
+    cells: Vec<Vec<String>>,
+    voted: u64,
+}
+
+fn host_votes(examples: &[Example], wrapped: bool, writes: u32) -> Written {
+    let tally = Tally::Outer;
+    let stencil = Stencil::Square;
+    let classes = own_classes(tally, stencil) as usize;
+    let counts = own_counts(tally, stencil);
+    let mut tallies = vec![vec![[0_u64; 2]; classes]; writes as usize];
+    let mut voted = 0;
+    let rows: Vec<Vec<u32>> = examples
+        .iter()
+        .map(|one| own_rows(stencil, one.size, &one.input, wrapped))
+        .collect();
+    for (one, held) in examples.iter().zip(&rows) {
+        for (row, out) in held.iter().zip(&one.output) {
+            voted += 1;
+            let class = own_class(tally, stencil, *row) as usize;
+            for (write, own) in tallies.iter_mut().enumerate() {
+                own[class][((out >> write) & 1) as usize] += 1;
+            }
+        }
+    }
+    let mut deviating = vec![0_u64; writes as usize];
+    let mut cells = vec![Vec::new(); writes as usize];
+    for (example, (one, held)) in examples.iter().zip(&rows).enumerate() {
+        for (at, (row, out)) in held.iter().zip(&one.output).enumerate() {
+            let class = own_class(tally, stencil, *row);
+            let x = at as u32 % one.size[0];
+            let y = at as u32 / one.size[0];
+            for write in 0..writes as usize {
+                let [zeros, ones] = tallies[write][class as usize];
+                let law = u32::from(ones > zeros);
+                let seen = (out >> write) & 1;
+                if seen != law {
+                    deviating[write] += 1;
+                    if cells[write].len() < 64 {
+                        cells[write].push(format!(
+                            "{{\"example\":{example},\"at\":[{x},{y},0],\"count\":{},\"centre\":{},\"seen\":{seen},\"law\":{law}}}",
+                            class % counts,
+                            class / counts
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Written {
+        tallies,
+        deviating,
+        cells,
+        voted,
+    }
+}
+
+#[test]
+fn g1_a_two_write_vote_tallies_and_deviates_per_write_as_the_host() {
+    let mut mcp = Mcp::new(None);
+    let clean = torus_pairs(Stencil::Square, life, TRAIN + 500, 8, [32, 32, 1], 350);
+    let mut rng = Rng(TRAIN + 501);
+    let examples: Vec<Example> = clean
+        .iter()
+        .map(|one| {
+            let input = flipped(&mut rng, &one.input, 10);
+            let rows = own_rows(Stencil::Square, one.size, &one.input, true);
+            let low = flipped(&mut rng, &one.output, 30);
+            let high = flipped(
+                &mut rng,
+                &rows.iter().map(|row| crowded(*row)).collect::<Vec<_>>(),
+                60,
+            );
+            Example {
+                size: one.size,
+                input,
+                output: low.iter().zip(&high).map(|(a, b)| a | (b << 1)).collect(),
+            }
+        })
+        .collect();
+    let got = mcp.ok(
+        "grit_law_learn",
+        &args_writes("outer", "wrapped", &examples, 2),
+    );
+    let own = host_votes(&examples, true, 2);
+    assert_ne!(own.tallies[0], own.tallies[1], "the writes vote apart");
+    assert_ne!(own.deviating[0], own.deviating[1]);
+    let per_write = |each: &dyn Fn(usize, u32) -> Option<String>| -> String {
+        let held: Vec<String> = (0..2)
+            .map(|write| grouped(Tally::Outer, Stencil::Square, &|class| each(write, class)))
+            .collect();
+        format!("[{}]", held.join(","))
+    };
+    assert_eq!(
+        shown_of(&got, "tallies"),
+        per_write(&|write, class| {
+            let [zeros, ones] = own.tallies[write][class as usize];
+            Some(format!("[{zeros},{ones}]"))
+        }),
+        "tallies"
+    );
+    for held in &own.tallies {
+        let summed: u64 = held.iter().map(|pair| pair[0] + pair[1]).sum();
+        assert_eq!(summed, own.voted, "each write's tallies hold every cell");
+    }
+    assert_eq!(
+        shown_of(&got, "ties"),
+        per_write(&|write, class| {
+            let [zeros, ones] = own.tallies[write][class as usize];
+            (zeros == ones && zeros > 0)
+                .then(|| (class % own_counts(Tally::Outer, Stencil::Square)).to_string())
+        }),
+        "ties"
+    );
+    assert_eq!(
+        shown_of(&got, "tables"),
+        per_write(&|write, class| {
+            let [zeros, ones] = own.tallies[write][class as usize];
+            Some(u32::from(ones > zeros).to_string())
+        }),
+        "tables"
+    );
+    assert_eq!(
+        shown_of(&got, "deviating"),
+        format!("[{},{}]", own.deviating[0], own.deviating[1])
+    );
+    assert_eq!(
+        shown_of(&got, "deviating_cells"),
+        format!(
+            "[[{}],[{}]]",
+            own.cells[0].join(","),
+            own.cells[1].join(",")
+        )
+    );
+    assert_eq!(
+        shown_of(&got, "deviating_share"),
+        format!(
+            "[{},{}]",
+            own.deviating[0] + own.deviating[1],
+            own.voted * 2
+        )
+    );
+    println!(
+        "g1: deviating {:?} of {} cells a write",
+        own.deviating, own.voted
+    );
+}
+
+#[test]
+fn g2_a_vote_that_leaves_rows_unseen_decides_them_as_the_host() {
+    let mut mcp = Mcp::new(None);
+    let clean = torus_pairs(Stencil::Square, life, TRAIN + 600, 4, [8, 8, 1], 350);
+    let (examples, flips) = noisy(&clean, TRAIN + 601, 80, Flip::Output);
+    assert!(flips > 0);
+    let got = mcp.ok(
+        "grit_law_learn",
+        &args(Stencil::Square, "outer", "wrapped", &examples, VOTE),
+    );
+    let own = host_votes(&examples, true, 1);
+    let law = |row: u32| {
+        let [zeros, ones] = own.tallies[0][own_class(Tally::Outer, Stencil::Square, row) as usize];
+        u32::from(ones > zeros)
+    };
+    let mut first: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    for one in &examples {
+        let rows = own_rows(Stencil::Square, one.size, &one.input, true);
+        for (row, out) in rows.iter().zip(&one.output) {
+            first.entry(*row).or_insert(out & 1);
+        }
+    }
+    let unseen: Vec<u32> = (0..512).filter(|row| !first.contains_key(row)).collect();
+    assert!(unseen.len() > 100, "the examples leave rows unseen");
+    let ones = unseen.iter().filter(|row| law(**row) == 1).count();
+    let zeros = unseen.len() - ones;
+    let unseen_shown = got.get("unseen").unwrap();
+    assert_eq!(int_at(unseen_shown, "rows"), unseen.len() as i64);
+    assert_eq!(shown_of(unseen_shown, "ones"), format!("[{ones}]"));
+    assert_eq!(shown_of(unseen_shown, "zeros"), format!("[{zeros}]"));
+    assert_eq!(
+        words(unseen_shown.get("unseen_rows").unwrap()),
+        unseen,
+        "unseen rows"
+    );
+    let table = words(unseen_shown.get("table").unwrap());
+    for row in 0..512_u32 {
+        assert_eq!(table[row as usize], law(row), "row {row}");
+    }
+    let first_ones = first.values().filter(|out| **out == 1).count();
+    let law_ones = first.keys().filter(|row| law(**row) == 1).count();
+    assert_ne!(
+        first_ones, law_ones,
+        "a seen row's first output disagrees with the vote, so the first-seen count differs"
+    );
+    println!(
+        "g2: {} seen rows, {} unseen, {ones} decided 1, first-seen ones {first_ones} vs law {law_ones}",
+        first.len(),
+        unseen.len()
+    );
+}
