@@ -70,7 +70,7 @@ A law that reads plane `a` and writes plane `b` gives one generation a frame. `a
 4. `grit_world_step` 64 frames: `current` 0.
 5. `grit_world_read` with `current` true: generation 64.
 
-`grit_world_read`, `grit_world_slice` and `grit_world_write` take `current` true for the current plane, and their answer names `plane`; `grit_world_step` answers `current`. A world made without `alternate` refuses `current` with `not_iterating` at `$.current`; `current` with a `plane` other than 0 is `malformed` at `$.plane`.
+`grit_world_read`, `grit_world_slice` and `grit_world_write` take `current` true for the current plane, and their answer names `plane`; `grit_world_step` answers `current`. A world made without `alternate` refuses `current` with `not_iterating` at `$.current`; `current` with a `plane` other than 0 is `plane_or_current` at `$.plane`.
 
 Within a frame the looked-at plane is frozen, as `halo_written` requires. Refused as `law_refused` at `$.alternate`, with the law's own code:
 
@@ -82,8 +82,9 @@ Within a frame the looked-at plane is frozen, as `halo_written` requires. Refuse
 | `alternate_other` | the law writes a plane besides `b` |
 | `alternate_unread` | the law never reads `a` |
 | `alternate_reversible` | the law is reversible; `grit_world_back` on an iterating world is `not_reversible` |
+| `alternate_twice` | the law carries an `alternate` other than the argument |
 
-`alternate` with `rule`, or with a law that carries another `alternate`, is `malformed` at `$.alternate`. A law that looks runs only dense (`halo_sparse`), with or without `alternate`; one that does not look iterates on sparse worlds too.
+`alternate` with `rule` is `rule_or_law` at `$.alternate`. A law that looks runs only dense (`halo_sparse`), with or without `alternate`; one that does not look iterates on sparse worlds too.
 
 The quiet class is decided on the law as written, with every uniform value checked at both parities. A listed world steps an oct while it or an oct around it changed in the two frames before; an oct that changed its written plane wakes the octs whose box reads it, so moving patterns are never skipped, and a world that stops changing, a period-2 oscillator included, goes quiet. Its frames are priced as every frame: cells times frames, calibrated under the iterating law's own text.
 

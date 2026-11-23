@@ -163,13 +163,14 @@ pub fn compiled(held: &str) -> Result<Law, Failed> {
     Ok(law)
 }
 
-const ALTERNATE_CODES: [crate::law::Code; 6] = [
+const ALTERNATE_CODES: [crate::law::Code; 7] = [
     crate::law::Code::AlternatePlane,
     crate::law::Code::AlternateWritten,
     crate::law::Code::AlternateUnwritten,
     crate::law::Code::AlternateOther,
     crate::law::Code::AlternateUnread,
     crate::law::Code::AlternateReversible,
+    crate::law::Code::AlternateTwice,
 ];
 
 pub fn alternated(held: &str, pair: [u32; 2]) -> Result<Law, Failed> {
@@ -179,15 +180,17 @@ pub fn alternated(held: &str, pair: [u32; 2]) -> Result<Law, Failed> {
     if let Json::Map(fields) = &mut json {
         match fields.iter().find(|(key, _)| key == "alternate") {
             Some((_, carried)) if *carried != given => {
-                return Err(Box::new(Refusal::new(
-                    Code::Malformed,
-                    "$.alternate",
-                    format!(
-                        "the law already carries alternate {}, and alternate gives {}",
-                        crate::wire::written(carried),
-                        crate::wire::written(&given)
+                let why = crate::law::Refusal {
+                    code: crate::law::Code::AlternateTwice,
+                    path: "$.alternate".to_owned(),
+                    expected: format!(
+                        "the alternate the law carries, {}, or a law without one",
+                        crate::wire::written(carried)
                     ),
-                )));
+                    found: format!("alternate {}", crate::wire::written(&given)),
+                    limit: None,
+                };
+                return Err(Box::new(Refused(why, "$.alternate")));
             }
             Some(_) => {}
             None => fields.push(("alternate".to_owned(), given)),

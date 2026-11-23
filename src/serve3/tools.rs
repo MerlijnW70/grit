@@ -514,7 +514,7 @@ fn plane_of(held: &Json, world: &World<'_>) -> Result<u32, Failed> {
         };
         if plane != 0 {
             return Err(refused(
-                Code::Malformed,
+                Code::PlaneOrCurrent,
                 "$.plane",
                 "give plane or current, not both".to_owned(),
             ));
@@ -600,7 +600,7 @@ pub(super) fn first_pace(world: &World<'_>) -> Pace {
 fn chosen(server: &Server<'_>, held: &Json) -> Result<Box<dyn Listed>, Failed> {
     match (held.get("rule"), held.get("law")) {
         (Some(_), None) if held.get("alternate").is_some() => Err(refused(
-            Code::Malformed,
+            Code::RuleOrLaw,
             "$.alternate",
             "alternate makes a law iterate: give it with law, not with rule".to_owned(),
         )),

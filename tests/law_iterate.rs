@@ -1100,9 +1100,9 @@ fn i5_misuse_is_refused_by_code_and_field() {
     refused(
         &mut server,
         &create(&carried, "[0,1]", ""),
-        "malformed",
+        "law_refused",
         "$.alternate",
-        "",
+        "alternate_twice",
     );
     let bad = format!("{},\"alternate\":[0]}}", &life[..life.len() - 1]);
     let got = no(
@@ -1120,7 +1120,7 @@ fn i5_misuse_is_refused_by_code_and_field() {
         "grit_world_create",
         "{\"wide\":16,\"deep\":16,\"tall\":16,\"rule\":\"sand\",\"alternate\":[0,1]}",
     );
-    assert_eq!(text_at(&got, "code"), "malformed");
+    assert_eq!(text_at(&got, "code"), "rule_or_law");
     assert_eq!(text_at(&got, "field"), "$.alternate");
     let plain = ok(
         &mut server,
@@ -1152,7 +1152,7 @@ fn i5_misuse_is_refused_by_code_and_field() {
             "{{\"world\":{iterating},\"from\":[0,0,0],\"to\":[1,1,0],\"current\":true,\"plane\":1}}"
         ),
     );
-    assert_eq!(text_at(&got, "code"), "malformed");
+    assert_eq!(text_at(&got, "code"), "plane_or_current");
     assert_eq!(text_at(&got, "field"), "$.plane");
     let got = no(
         &mut server,
@@ -1161,7 +1161,7 @@ fn i5_misuse_is_refused_by_code_and_field() {
     );
     assert_eq!(text_at(&got, "code"), "not_reversible");
     println!(
-        "i5 not_iterating at $.current, malformed at $.plane and $.alternate, not_reversible for back"
+        "i5 not_iterating at $.current, plane_or_current at $.plane, rule_or_law at $.alternate, not_reversible for back"
     );
 }
 

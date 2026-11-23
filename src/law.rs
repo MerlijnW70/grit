@@ -63,10 +63,11 @@ pub enum Code {
     AlternateOther,
     AlternateUnread,
     AlternateReversible,
+    AlternateTwice,
 }
 
 impl Code {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::Json,
         Self::Size,
         Self::Trailing,
@@ -106,6 +107,7 @@ impl Code {
         Self::AlternateOther,
         Self::AlternateUnread,
         Self::AlternateReversible,
+        Self::AlternateTwice,
     ];
 
     #[must_use]
@@ -150,6 +152,7 @@ impl Code {
             Self::AlternateOther => "alternate_other",
             Self::AlternateUnread => "alternate_unread",
             Self::AlternateReversible => "alternate_reversible",
+            Self::AlternateTwice => "alternate_twice",
         }
     }
 }

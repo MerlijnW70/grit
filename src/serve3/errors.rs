@@ -84,9 +84,10 @@ pub enum Code {
     SupportNoise,
     SupportLimit,
     NotIterating,
+    PlaneOrCurrent,
 }
 
-pub const CODES: [Code; 80] = [
+pub const CODES: [Code; 81] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -167,6 +168,7 @@ pub const CODES: [Code; 80] = [
     Code::SupportNoise,
     Code::SupportLimit,
     Code::NotIterating,
+    Code::PlaneOrCurrent,
 ];
 
 impl Code {
@@ -253,6 +255,7 @@ impl Code {
             Self::SupportNoise => "support_noise",
             Self::SupportLimit => "support_limit",
             Self::NotIterating => "not_iterating",
+            Self::PlaneOrCurrent => "plane_or_current",
         }
     }
 
@@ -466,6 +469,9 @@ impl Code {
             }
             Self::NotIterating => {
                 "Name the plane by number: only a world made with alternate has a current plane."
+            }
+            Self::PlaneOrCurrent => {
+                "Give plane or current true, not both: current names the plane itself."
             }
         }
     }
