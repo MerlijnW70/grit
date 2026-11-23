@@ -1458,7 +1458,7 @@ impl Resident<'_> {
         self.moved.get()
     }
 
-    pub fn woke(&self, octs: usize) {
+    pub(crate) fn woke(&self, octs: usize) {
         Moved::add(&self.moved.woken, octs as u64);
     }
 

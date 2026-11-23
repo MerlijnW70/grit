@@ -686,8 +686,8 @@ pub fn put3_in(
     let heads = held.read_runs(&[(GRAND as usize, 0, 1), (HOT_GRAND as usize, 0, 1)])?;
     let grand = first_of(heads.first().cloned());
     let hot_grand = first_of(heads.get(1).cloned());
-    let every = grand as usize >= grid.blocks() as usize;
-    let hot_every = hot_grand >= plan.blocks;
+    let every = grand as usize == grid.blocks() as usize;
+    let hot_every = hot_grand == plan.blocks;
     let mut asked = Vec::new();
     if !every {
         asked.push((DENSE as usize, 0, grand as usize));
