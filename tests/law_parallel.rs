@@ -870,7 +870,7 @@ fn stepped(law: &Law, boxes: &[[u32; BOX]]) -> Vec<[u32; CORNERS]> {
 
 #[test]
 fn p0_every_bit_of_a_parallel_chip_law_is_the_single_bit_law_on_the_cpu() {
-    let mut state = 0xB1_7_u64;
+    let mut state = 0xB17_u64;
     let mut kinds = [0_u32; KINDS as usize];
     let mut boxes_checked = 0;
     let (mut wide_nodes, mut single_nodes, mut wide_bytes, mut single_bytes) = (0, 0, 0, 0);
