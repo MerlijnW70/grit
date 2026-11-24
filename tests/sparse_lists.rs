@@ -972,6 +972,26 @@ fn law_start<'host>(
     (world, cells)
 }
 
+fn bricks_in(host: &Host, size: [u32; 3]) -> u32 {
+    let width = host.width();
+    let grid = Grid::solid(size[0], size[1], size[2]).unwrap();
+    Plan::bricked(width, grid.blocks().div_ceil(sweep::cells(width)))
+        .unwrap()
+        .blocks
+}
+
+fn fitting(host: &Host, sides: &[u32]) -> u32 {
+    let width = host.width();
+    sides
+        .iter()
+        .copied()
+        .find(|&side| {
+            let grid = Grid::solid(side, side, side).unwrap();
+            Plan::bricked(width, grid.blocks().div_ceil(sweep::cells(width))).is_ok()
+        })
+        .unwrap()
+}
+
 fn sides_of(host: &Host, size: [u32; 3]) -> [u32; 3] {
     let width = host.width();
     let grid = Grid::solid(size[0], size[1], size[2]).unwrap();
@@ -1298,7 +1318,13 @@ fn s3_gliders_cross_the_torus_seam_on_every_axis_with_a_bounded_pool() {
         return;
     };
     let law = learned_law(&host, Shape::Cube, BAYS);
-    let size = [256, 256, 256];
+    let side = fitting(&host, &[256, 128]);
+    let size = [side; 3];
+    println!(
+        "s3 at width {}: {side}^3, {} bricks",
+        host.width(),
+        bricks_in(&host, size)
+    );
     let flights = [
         (
             "in x and y, falling",
@@ -1308,11 +1334,21 @@ fn s3_gliders_cross_the_torus_seam_on_every_axis_with_a_bounded_pool() {
         ),
         (
             "in x and z, rising",
-            glider_cells(Shape::Cube, [226, 60, 228], [0, 2, 1], [false, false]),
+            glider_cells(
+                Shape::Cube,
+                [side - 30, 60, side - 28],
+                [0, 2, 1],
+                [false, false],
+            ),
             [true, false, true],
             Some((
                 200,
-                glider_cells(Shape::Cube, [120, 180, 60], [1, 2, 0], [false, true]),
+                glider_cells(
+                    Shape::Cube,
+                    [side / 2 - 8, side - 76, 60],
+                    [1, 2, 0],
+                    [false, true],
+                ),
             )),
         ),
         (

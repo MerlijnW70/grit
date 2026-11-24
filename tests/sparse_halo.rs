@@ -770,13 +770,37 @@ fn h2_a_flying_glider_keeps_a_bounded_pool() {
     let Some(host) = device("sparse_halo h2") else {
         return;
     };
-    let life: Vec<[u32; 3]> = glider(Shape::Square, [500, 500, 7], 1)
+    let width = host.width();
+    let fits = |size: [u32; 3]| {
+        let grid = grit::sand::Grid::solid(size[0], size[1], size[2]).unwrap();
+        grit::compact::Plan::bricked(width, grid.blocks().div_ceil(grit::sweep::cells(width)))
+            .map(|plan| plan.blocks)
+            .ok()
+    };
+    let square = [[1024, 1024, 16], [512, 512, 16]]
         .into_iter()
-        .map(|(at, _)| at)
-        .collect();
-    let flight = flown(&host, Shape::Square, LIFE, [1024, 1024, 16], &life, 300);
+        .find(|&size| fits(size).is_some())
+        .unwrap();
+    let cube = [[256, 256, 256], [128, 128, 128]]
+        .into_iter()
+        .find(|&size| fits(size).is_some())
+        .unwrap();
     println!(
-        "h2 Life glider on a sparse 1024x1024x16 world: {} frames equal to the host, moved {:?}, at most {} bricks held (bound at most {}), {} at the end, {} released, {} bricks visited",
+        "h2 at width {width}: Life {square:?} with {:?} bricks, Bays {cube:?} with {:?} bricks",
+        fits(square),
+        fits(cube)
+    );
+    let life: Vec<[u32; 3]> = glider(
+        Shape::Square,
+        [square[0] / 2 - 12, square[1] / 2 - 12, 7],
+        1,
+    )
+    .into_iter()
+    .map(|(at, _)| at)
+    .collect();
+    let flight = flown(&host, Shape::Square, LIFE, square, &life, 300);
+    println!(
+        "h2 Life glider on a sparse {square:?} world: {} frames equal to the host, moved {:?}, at most {} bricks held (bound at most {}), {} at the end, {} released, {} bricks visited",
         flight.frames,
         flight.moved,
         flight.most_held,
@@ -785,13 +809,13 @@ fn h2_a_flying_glider_keeps_a_bounded_pool() {
         flight.released,
         flight.visited
     );
-    let bays: Vec<[u32; 3]> = glider(Shape::Cube, [128, 128, 128], 1)
+    let bays: Vec<[u32; 3]> = glider(Shape::Cube, cube.map(|side| side / 2), 1)
         .into_iter()
         .map(|(at, _)| at)
         .collect();
-    let flight = flown(&host, Shape::Cube, BAYS, [256, 256, 256], &bays, 280);
+    let flight = flown(&host, Shape::Cube, BAYS, cube, &bays, 280);
     println!(
-        "h2 Bays 5766 glider on a sparse 256^3 world: {} frames equal to the host, moved {:?}, at most {} bricks held (bound at most {}), {} at the end, {} released, {} bricks visited",
+        "h2 Bays 5766 glider on a sparse {cube:?} world: {} frames equal to the host, moved {:?}, at most {} bricks held (bound at most {}), {} at the end, {} released, {} bricks visited",
         flight.frames,
         flight.moved,
         flight.most_held,
