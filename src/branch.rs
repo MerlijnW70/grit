@@ -79,9 +79,6 @@ pub enum Refused {
     Io {
         what: String,
     },
-    HaloSparse {
-        law: String,
-    },
 }
 
 impl Refused {
@@ -103,7 +100,6 @@ impl Refused {
             Self::Unlike { .. } => "unlike",
             Self::Outside { .. } => "outside",
             Self::Io { .. } => "io",
-            Self::HaloSparse { .. } => "halo_sparse",
         }
     }
 }
@@ -164,10 +160,6 @@ impl std::fmt::Display for Refused {
                 size[0], size[1], size[2]
             ),
             Self::Io { what } => write!(out, "{what}"),
-            Self::HaloSparse { law } => write!(
-                out,
-                "the law {law} looks at its neighbours, and a sparse world steps only laws that read their own oct; make the world dense"
-            ),
         }
     }
 }
@@ -379,15 +371,6 @@ fn stepper_of(
     }
 }
 
-pub fn looks_dense(law: &crate::law::Law, sparse: bool) -> Result<(), Refused> {
-    if sparse && !crate::rule3::Declared::looks(law).is_empty() {
-        return Err(Refused::HaloSparse {
-            law: law.name().to_owned(),
-        });
-    }
-    Ok(())
-}
-
 fn listed_if_sparse(sparse: bool, stepping: Stepping) -> Result<(), Failed> {
     if sparse && stepping == Stepping::Whole {
         return Err(Box::new(Refused::Malformed {
@@ -554,9 +537,6 @@ impl<'host> World<'host> {
         (grid, plan): (Grid, Plan),
         pool: Option<Bricks>,
     ) -> Result<Self, Failed> {
-        if let (Stepper::Law(law, _), Some(_)) = (&rule, pool.as_ref()) {
-            looks_dense(law, true)?;
-        }
         let ((passes, stages), sizes) = match pool.as_ref() {
             Some(bricks) => (
                 rule.bricked(bricks, &plan)?,
@@ -657,7 +637,6 @@ impl<'host> World<'host> {
             }));
         }
         listed_if_sparse(made.sparse, stepping)?;
-        looks_dense(law, made.sparse)?;
         let rule = lawful(law, made.params, stepping)?;
         Self::made(host, rule, made)
     }
@@ -729,9 +708,6 @@ impl<'host> World<'host> {
     ) -> Result<Self, Failed> {
         listed_if_sparse(matches!(image.state, State::Sparse { .. }), stepping)?;
         let rule = stepper_of(host, &image.law, &image.params, stepping)?;
-        if let Stepper::Law(law, _) = &rule {
-            looks_dense(law, matches!(image.state, State::Sparse { .. }))?;
-        }
         if rule.planes() != image.channels() {
             return Err(Box::new(Refused::Sizes {
                 what: "channels",
@@ -972,8 +948,11 @@ impl<'host> World<'host> {
             return Err(Box::new(Refused::Outside { at, size }));
         }
         self.seen = None;
+        let around = self
+            .law()
+            .is_some_and(|law| !crate::rule3::Declared::looks(law).is_empty());
         match self.pool {
-            Some(bricks) => bricks.put_plane_at(&mut self.live, plane as usize, cells)?,
+            Some(bricks) => bricks.put_plane_in(&mut self.live, plane as usize, cells, around)?,
             None => {
                 let mut indexed = Vec::with_capacity(cells.len());
                 for &(at, word) in cells {
@@ -985,9 +964,7 @@ impl<'host> World<'host> {
                 let placed = live::Placed3 {
                     windows: Some(self.rule.windows(&self.plan)),
                     plane,
-                    around: self
-                        .law()
-                        .is_some_and(|law| !crate::rule3::Declared::looks(law).is_empty()),
+                    around,
                 };
                 live::put3_in(&mut self.live, self.grid, &self.plan, placed, &indexed)?;
             }
