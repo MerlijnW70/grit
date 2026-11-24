@@ -137,9 +137,14 @@ pub fn up_front(host: &Host) -> Vec<Key> {
 
 #[must_use]
 pub fn missing(table: &Table, host: &Host) -> Vec<Key> {
-    up_front(host)
-        .into_iter()
+    absent(table, &up_front(host))
+}
+
+fn absent(table: &Table, wanted: &[Key]) -> Vec<Key> {
+    wanted
+        .iter()
         .filter(|key| table.rate(key).is_none())
+        .cloned()
         .collect()
 }
 
@@ -179,7 +184,20 @@ pub fn load(dir: &Path, device: &Device) -> Result<Option<Table>, String> {
 }
 
 pub fn taken(host: &Host, dir: Option<&Path>) -> Result<Taken, crate::branch::Failed> {
-    let device = device(host);
+    taken_on(
+        device(host),
+        || up_front(host),
+        dir,
+        || take::calibrated(host),
+    )
+}
+
+pub fn taken_on(
+    device: Device,
+    wanted: impl FnOnce() -> Vec<Key>,
+    dir: Option<&Path>,
+    calibrate: impl FnOnce() -> Result<Table, crate::branch::Failed>,
+) -> Result<Taken, crate::branch::Failed> {
     if let Some(table) = shared(&device)
         && table.lock().unwrap_or_else(PoisonError::into_inner).whole
     {
@@ -189,11 +207,12 @@ pub fn taken(host: &Host, dir: Option<&Path>) -> Result<Taken, crate::branch::Fa
             calibrated: false,
         });
     }
+    let wanted = wanted();
     let mut refused = None;
     if let Some(dir) = dir {
         match load(dir, &device) {
             Ok(Some(table)) => {
-                let lacking = missing(&table, host);
+                let lacking = absent(&table, &wanted);
                 if lacking.is_empty() {
                     let shared = held(table, Some(dir));
                     tables().insert(device, Arc::clone(&shared));
@@ -212,8 +231,8 @@ pub fn taken(host: &Host, dir: Option<&Path>) -> Result<Taken, crate::branch::Fa
             Err(why) => refused = Some(why),
         }
     }
-    let table = take::calibrated(host)?;
-    let whole = missing(&table, host).is_empty();
+    let table = calibrate()?;
+    let whole = absent(&table, &wanted).is_empty();
     let kept = dir.filter(|_| whole);
     if let Some(dir) = kept {
         table.save(dir)?;
