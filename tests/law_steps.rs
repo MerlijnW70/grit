@@ -861,7 +861,12 @@ fn k5_each_wrong_use_of_steps_is_refused_by_its_code_and_field() {
         )
     };
     for (rule, space, classes) in [("outer", 1_i64 << 54, 54), ("totalistic", 1 << 28, 28)] {
-        let told = refused_as(&mut server, &cube(rule, ""), "steps_space", "$.steps");
+        let told = refused_as(
+            &mut server,
+            &cube(rule, ",\"search\":\"exhaustive\""),
+            "steps_space",
+            "$.steps",
+        );
         assert_eq!(int_at(&told, "space"), space);
         assert_eq!(int_at(&told, "classes"), classes);
         assert_eq!(int_at(&told, "limit"), SPACE);
