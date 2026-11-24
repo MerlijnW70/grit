@@ -593,7 +593,20 @@ Under `noise` `least_wrong` the score is the wrong example cells after k steps. 
 | `unreached` | entries the answer's own run never uses |
 | `work` | `units`: cell steps scored, each step of a cell scoring up to 64 tables |
 
-An entry is pinned when its margin is above 0 and noise cannot explain it. Flipping the entry changes the law's output on some example cells, and the answer is right on more of them than the flip. Pinned means the chance of the answer being right on that many of them, if each cell were wrong at the answer's own share of wrong cells, is below one in a million. Without noise every entry with a margin is pinned. With noise a count that few cells reach can have a margin of a few cells from flipped cells alone, and stays `null`.
+#### The noise model and pinned entries
+
+The noise model flips each cell of both frames at a rate p. The input frame is seen flipped, so the cells the law ran on are drawn from what the seen input allows. With d the example's own density less the flips, d = (seen density - p) / (1 - 2p), a seen live cell was dead with chance (1 - d)p / ((1 - d)p + d(1 - p)), and a seen dead cell was live with chance dp / (dp + (1 - d)(1 - p)). On sparse inputs most flips make live cells, so a large share of the seen live cells is noise. Flips at rate p leave at least a share p of every seen frame live and at least p dead.
+
+Pinning is judged by surprise under the noise model (see "The most likely table"), whatever the search's own score. An entry is pinned when all of these hold:
+
+- its margin is above 0;
+- the answer's entry makes the examples more likely than the flipped entry by at least 20 nats, again by at least 20 nats under 16 other seeded draws, and by at least 4 standard errors of its sum over blocks. Each example is cut into blocks by halving each axis it spans (up to 8), and the standard error comes from how much the gap varies between blocks: cells of one block share inputs, so their nats are not independent. The draws are a sample, so a gap they make alone does not pin;
+- the answer's own entry fits the cells the flip changes: the answer is wrong on at most the expected count plus four times its square root plus 4, where each cell is wrong with chance p plus (1 - 2p) times the share of 64 draws of the noisy input on which the cell's output moves;
+- the best table found with the other value is less likely than the best table found with the answer's value by the same three tests. The tables come from single-flip descents by surprise: one from the answer, one from the answer with that entry flipped and held, one for each other entry that passed the tests above, plus the other family starts of a local search and, under `likely`, the `least_wrong` answer. Every table a descent scores counts.
+
+The last test is the profile of the entry: seen 2 steps apart on sparse soups, a quite different table can explain the examples as well as the rule, and the entries where they differ stay `null`. The descents are local, so a far table that explains the examples better can still be missed.
+
+The rate is the `noise_estimate` under `least_wrong` and the assumed rate under `likely`; with an estimate of 0 and wrong cells, it is the share of wrong cells. Without noise (no wrong cells under `least_wrong`) the score is wrong cells: an entry with a margin is pinned unless a descent finds a table with no wrong cells and the other value. When `far_above` is true no entry is pinned. The fewest wrong cells can differ from the rule even one step apart: on a 5% soup with 1% flips the flips make births the rule never made. Such entries have a margin but are not pinned.
 
 `exhaustive` adds `tied` (the tables with the least score), `consistent` (the tables with no wrong cells), `checked` and `space`. `local` adds `family` (the best interval table and its score), `moves` (each kept flip: its entries and the score after it) and `checked` (the tables scored).
 
@@ -604,23 +617,23 @@ An entry is pinned when its margin is above 0 and noise cannot explain it. Flipp
 | `flips_per_million` | the cell flip rate on each frame that explains the wrong cells of the half of the example cells with the fewest. Cells are grouped by their input count and the law's output, and each half of the examples picks the groups for the other half. Flips of the input frame are run through the law k steps on 64 seeded draws, so the rate counts what a flipped input cell spreads to |
 | `expected_wrong` | the wrong cells that rate explains over every example cell |
 | `basis_cells` | the cells the rate was fitted on |
-| `far_above` | true when the wrong cells pass twice `expected_wrong` plus four times its square root plus 16; `warning` then says that the data is not this rule with noise |
+| `far_above` | true when the wrong cells pass twice `expected_wrong` plus four times its square root plus 16, or when explaining the half with the fewest needs a rate above what the seen frames allow: the least share of live or dead cells of any seen frame plus four standard errors. `warning` then says that the data is not this rule with noise |
 
-The estimate assumes the same flip rate on both frames. Examples with a clean input frame read as a lower rate.
+The estimate assumes the same flip rate on both frames: examples with a clean input frame read as a lower rate. `far_above` false is no proof that the examples come from a counting rule or that the table is the rule. From 2 steps on, a rule of another family, or a quieter table of the same family, can read as a counting rule with a high flip rate, because the input count of a cell says little about its output two steps on.
 
 #### The most likely table
 
 The fewest wrong cells is the wrong aim when an input flip spreads. Seen 4 steps apart with 0.5% flips on both frames, a 3x3x3 rule's own table is wrong on more cells than quieter tables: every output cell's past holds hundreds of input cells, so a few of them are flipped. `noise` `likely` aims at the table under which the examples are most likely:
 
 1. It runs the `least_wrong` search and starts from a sixteenth of its `flips_per_million`, at least 1.
-2. It searches again, by the same steps, for the table with the least surprise at that rate. Surprise sums, over the example cells, minus the log of the chance the table gives the cell's output, in millionths of a nat. The input frame is flipped at the rate on 16 seeded draws and run k steps, and the output frame is flipped once more.
-3. It fits the rate that gives that table the least surprise, by 12 golden-section steps over an eighth to eight times the rate. When the fit is more than a fifth off, it searches again from that table at the fitted rate, at most three searches in all.
+2. It searches again, by the same steps, for the table with the least surprise at that rate. Surprise sums, over the example cells, minus the log of the chance the table gives the cell's output, in millionths of a nat. The input is drawn from the seen input on 16 seeded draws as the noise model says and run k steps; the chance of a live output is p plus (1 - 2p) times the share of draws that end live, at least one in a million.
+3. It fits the rate that gives that table the least surprise, by 12 golden-section steps over an eighth to eight times the rate, at most the rate the seen frames allow. When the fit is more than a fifth off, it searches again from that table at the fitted rate, at most three searches in all.
 
-The answer adds `assumed_flips_per_million` (the rate of the last search) and `surprise`; `margins`, `family` and `moves` count surprise. An entry is pinned when its margin is at least 20 nats and it also passes the test on wrong cells above. A request whose `least_wrong` answer has no wrong cells answers that table with `assumed_flips_per_million` 0.
+The answer adds `assumed_flips_per_million` (the rate of the last search) and `surprise`; `margins`, `family` and `moves` count surprise. A request whose `least_wrong` noise estimate is 0 answers the `least_wrong` table with `assumed_flips_per_million` 0, whatever its wrong cells.
 
 #### Stopping
 
-A brake before each round of at most 64 batches of 64 tables, each pass of single or pair flips, the margins, the estimate and each search of `likely` stops the search on budget or cancel. A stopped search answers its best table with `stopped` `budget` or `cancelled`, `complete` false, and no `margins`, `pinned` or `noise_estimate`, so it claims no entry. It is refused `budget` or `cancelled` when it scored no table on every example.
+A brake before each round of at most 64 batches of 64 tables, each pass of single or pair flips, the margins, each step of the estimate, each round of the pin descents, each step of the rate fit and each search of `likely` stops the search on budget or cancel. A stop at any brake answers the best table found so far with `stopped` `budget` or `cancelled`, `complete` false, `noise` as asked, and no `margins`, `pinned`, `unpinned`, `unreached`, `noise_estimate` or `warning`, so it claims no entry. Under `likely` a stop before the likelihood search scored a table answers the `least_wrong` table that way. It is refused `budget` or `cancelled` when it scored no table on every example.
 
 1. `grit_law_learn` with `stencil` `3x3x3`, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `wrapped`, `rule` `outer`, `steps` 2, `noise` `least_wrong` and ten noisy 32x32x32 pairs 2 steps apart: `search` `local`, `tables` B5,6/S4,5,6, `noise_estimate` near the data's flip rate, `far_above` false.
 2. Read `pinned`: entries with `null` are not learned. Counts no example reaches, such as 24 to 26 live neighbours, stay `null`.
