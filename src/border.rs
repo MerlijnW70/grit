@@ -84,6 +84,47 @@ impl Absorb {
     }
 }
 
+#[must_use]
+pub fn shell_uniform(bricks: &Bricks, table: &[u32], absorb: Absorb) -> Vec<u32> {
+    let grid = bricks.grid();
+    let size = [grid.wide, grid.deep, grid.tall];
+    let sides = bricks.sides();
+    let lattice = bricks.lattice();
+    let mut found = Vec::new();
+    for brick in 0..bricks.count() {
+        let slot = table
+            .get(brick as usize * ENTRY)
+            .copied()
+            .unwrap_or(UNIFORM);
+        if slot != UNIFORM {
+            continue;
+        }
+        let set = (0..bricks.planes()).any(|plane| {
+            table
+                .get(bricks.value_at(plane, brick))
+                .is_some_and(|value| *value != 0)
+        });
+        if !set {
+            continue;
+        }
+        let point = [
+            brick % lattice[0],
+            brick / lattice[0] % lattice[1],
+            brick / lattice[0] / lattice[1],
+        ];
+        let touches = absorb.cells.iter().zip(point).zip(sides).zip(size).any(
+            |(((&cells, at), brick), side)| {
+                let first = at * brick;
+                cells > 0 && (first < cells || first + brick > side - cells)
+            },
+        );
+        if touches {
+            found.push(brick);
+        }
+    }
+    found
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clearer {
     pub binding: u32,
@@ -772,11 +813,7 @@ fn value_place(
     }
 }
 
-pub fn absorb_sparse(
-    bricks: &Bricks,
-    absorb: Absorb,
-    tiled: bool,
-) -> Result<(Vec<u32>, Groups), LaneError> {
+pub fn absorb_sparse(bricks: &Bricks, absorb: Absorb) -> Result<(Vec<u32>, Groups), LaneError> {
     let subgroup = bricks.subgroup();
     let size = {
         let grid = bricks.grid();
@@ -789,11 +826,7 @@ pub fn absorb_sparse(
     let planes = bricks.planes();
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, bricks.bindings()))?;
     let uint = kernel.index_type();
-    let lane = if tiled {
-        tiled_brick(&mut kernel, bricks)?
-    } else {
-        lane_at(&mut kernel, subgroup)?
-    };
+    let lane = tiled_brick(&mut kernel, bricks)?;
     let count = con(&mut kernel, bricks.count())?;
     let inside = below(&mut kernel, lane, count)?;
     let none = con(&mut kernel, 0)?;
@@ -896,12 +929,7 @@ pub fn absorb_sparse(
             kernel.store_at(bricks.slots(), flag, one)
         })
     })?;
-    let groups = if tiled {
-        bricks.lane_groups()
-    } else {
-        Groups::Fixed(bricks.count().div_ceil(subgroup))
-    };
-    Ok((kernel.finish()?, groups))
+    Ok((kernel.finish()?, bricks.lane_groups()))
 }
 
 fn unit_point(

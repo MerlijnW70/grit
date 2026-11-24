@@ -253,7 +253,7 @@ impl Ledger {
     }
 
     pub fn push(&mut self, entry: Entry, spent: Duration) {
-        let cost = priced(self.made(), &entry, None);
+        let cost = priced_with(self.made(), self.absorb, &entry, None);
         self.push_priced(entry, spent, cost);
     }
 
@@ -681,7 +681,7 @@ impl Keep {
                 .costs
                 .get(at)
                 .copied()
-                .unwrap_or_else(|| priced(ledger.made(), entry, None));
+                .unwrap_or_else(|| priced_with(ledger.made(), ledger.absorb, entry, None));
             record(&mut words, priced_record(entry, spent, cost));
         }
         let path = self.journal(world);
@@ -874,7 +874,7 @@ impl Keep {
             index += 1;
             let read = if tag & PRICED == 0 {
                 entry_of(tag, payload).map(|(entry, spent)| {
-                    let cost = priced(ledger.made(), &entry, None);
+                    let cost = priced_with(ledger.made(), ledger.absorb, &entry, None);
                     (entry, spent, cost)
                 })
             } else if version < FORMAT_VERSION {
@@ -1145,12 +1145,24 @@ fn priced_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration, Cost)> {
 
 #[must_use]
 pub fn priced(made: &Made, entry: &Entry, bricks: Option<(u32, usize)>) -> Cost {
+    priced_with(made, None, entry, bricks)
+}
+
+#[must_use]
+pub fn priced_with(
+    made: &Made,
+    absorb: Option<Absorb>,
+    entry: &Entry,
+    bricks: Option<(u32, usize)>,
+) -> Cost {
     match entry {
         Entry::Write(cells) | Entry::WritePlane(_, cells) => {
             super::tools::write_cost(cells.len(), made.sparse)
         }
         Entry::Step(frames) | Entry::Back(frames) => {
-            super::tools::frames_cost(super::tools::frame_cells(made.size, bricks), *frames)
+            let cells = super::tools::frame_cells(made.size, bricks)
+                .saturating_add(super::tools::absorb_cells(made.size, absorb, bricks));
+            super::tools::frames_cost(cells, *frames)
         }
         Entry::Params(params) => super::law::params_cost(params.len()),
         Entry::Clear { from, to, .. } => {

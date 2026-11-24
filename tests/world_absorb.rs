@@ -562,3 +562,158 @@ fn r4_absorb_is_journaled_through_fork_restore_save_open_and_restart() {
         println!("r4 {} with absorb {shell}: {traced}", case.name);
     }
 }
+
+fn brick_fill(sides: [u32; 3], origin: [u32; 3], word: u32) -> Vec<([u32; 3], u32)> {
+    let mut out = Vec::new();
+    for z in 0..sides[2] {
+        for y in 0..sides[1] {
+            for x in 0..sides[0] {
+                out.push(([origin[0] + x, origin[1] + y, origin[2] + z], word));
+            }
+        }
+    }
+    out
+}
+
+fn stepped_alike<'host>(
+    label: &str,
+    size: [u32; 3],
+    one: &mut World<'host>,
+    other: &mut World<'host>,
+) {
+    assert!(
+        one.cells().unwrap() == other.cells().unwrap(),
+        "{label}: the opened world reads otherwise before a step"
+    );
+    for frame in 1..=6 {
+        one.step(1).unwrap();
+        other.step(1).unwrap();
+        for world in [&mut *one, &mut *other] {
+            let used = world.pool_use().unwrap().unwrap();
+            assert!(
+                !used.overflow && !used.lost,
+                "{label}: frame {frame}: {used:?}"
+            );
+        }
+        let got = other.cells().unwrap();
+        let want = one.cells().unwrap();
+        if let Some(differs) = first_difference(size, &got, &want) {
+            panic!("{label}: frame {frame}: opened against unsaved: {differs}");
+        }
+    }
+}
+
+#[test]
+fn r4_a_still_brick_in_the_shell_opens_and_steps_as_the_unsaved_world() {
+    let Some(host) = device("world_absorb r4 still brick") else {
+        return;
+    };
+    let side = fitting(&host, &[64]);
+    let size = [side; 3];
+    let dir = served::Scratch::new("still-brick");
+    let folder = dir.dir();
+    std::fs::create_dir_all(&folder).unwrap();
+    let bays_wide = learned_law(&bays(), true, BAYS_TABLES);
+    for (label, word, plane) in [
+        ("sand kind 3", 3_u32, 0_u32),
+        ("sand kind 1", 1, 0),
+        ("bays 32 copies, plane 1 only", 0x8000_0001, 1),
+    ] {
+        let make = |absorb| {
+            if label.starts_with("sand") {
+                rule_world(&host, "sand", size, true, absorb)
+            } else {
+                law_world(&host, &bays_wide, size, true, absorb)
+            }
+        };
+        let mut direct = make(Some([2, 2, 2]));
+        let sides = direct.pool().unwrap().sides();
+        let lattice = direct.pool().unwrap().lattice();
+        let corner = [sides[0] * (lattice[0] - 1), sides[1] * 2, 0];
+        let mut fill = brick_fill(sides, [0, 0, 0], word);
+        fill.extend(brick_fill(sides, corner, word));
+        written(&mut direct, plane, &fill);
+        let mut saver = make(Some([2, 2, 2]));
+        written(&mut saver, plane, &fill);
+        let path = folder.join(format!("still-{plane}-{word}.grit"));
+        saver.save(&path).unwrap();
+        let mut opened = World::load(&host, &path).unwrap();
+        assert_eq!(opened.absorb().map(|held| held.cells()), Some([2, 2, 2]));
+        stepped_alike(label, size, &mut direct, &mut opened);
+        println!(
+            "r4 {label}: two full bricks in the shell, saved before a step, open and step as the unsaved world"
+        );
+    }
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn r4_a_still_brick_in_the_shell_replays_from_a_snapshot_after_a_restart() {
+    use std::sync::Arc;
+
+    use grit::clock::Fake;
+
+    let Some(host) = device("world_absorb r4 still brick restart") else {
+        return;
+    };
+    let side = fitting(&host, &[64]);
+    let size = [side; 3];
+    let mut direct = rule_world(&host, "sand", size, true, Some([2, 2, 2]));
+    let sides = direct.pool().unwrap().sides();
+    let fill = brick_fill(sides, [0, 0, 0], 3);
+    written(&mut direct, 0, &fill);
+    let scratch = served::Scratch::new("still-restart");
+    let dir = scratch.dir();
+    let (kept, before) = {
+        let fake = Arc::new(Fake::new());
+        let mut server = pins::timed(&host, &dir, &fake);
+        let made = ok(
+            &mut server,
+            "grit_world_create",
+            &format!(
+                "{{\"wide\":{side},\"deep\":{side},\"tall\":{side},\"rule\":\"sand\",\"sparse\":true,\"absorb\":[2,2,2],\"budget_ms\":600000}}"
+            ),
+        );
+        let world = int_at(&made, "world");
+        served::write(&mut server, world, 0, &fill);
+        ok(
+            &mut server,
+            "grit_world_save",
+            &format!("{{\"world\":{world},\"name\":\"still\"}}"),
+        );
+        let opened = ok(&mut server, "grit_world_open", "{\"name\":\"still\"}");
+        let kept = int_at(&opened, "world");
+        served::step(&mut server, kept, 3);
+        let before = served::every_plane(&mut server, kept, size, 1);
+        drop(server);
+        (kept, before)
+    };
+    direct.step(3).unwrap();
+    let want = direct.cells().unwrap();
+    assert!(
+        before == want,
+        "the opened world stepped otherwise than the unsaved one"
+    );
+    let fake = Arc::new(Fake::new());
+    let mut again = pins::timed(&host, &dir, &fake);
+    let reopened = ok(
+        &mut again,
+        "grit_world_open",
+        &format!("{{\"name\":\"world-{kept}\",\"budget_ms\":600000}}"),
+    );
+    let number = int_at(&reopened, "world");
+    let replayed = served::every_plane(&mut again, number, size, 1);
+    assert!(
+        replayed == want,
+        "the world replayed from its snapshot reads otherwise"
+    );
+    served::step(&mut again, number, 3);
+    direct.step(3).unwrap();
+    assert!(
+        served::every_plane(&mut again, number, size, 1) == direct.cells().unwrap(),
+        "the replayed world steps otherwise"
+    );
+    println!(
+        "r4 sand, a full brick in the shell: open, snapshot replay after a restart and three more frames equal the unsaved world"
+    );
+}

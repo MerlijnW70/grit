@@ -1222,6 +1222,74 @@ impl Bricks {
         held.write_many(&runs)
     }
 
+    pub fn hold_uniform(&self, held: &mut Resident<'_>, bricks: &[u32]) -> Result<(), Error> {
+        if bricks.is_empty() {
+            return Ok(());
+        }
+        self.check(held)?;
+        let mut header = held.read(self.slots() as usize, HEAD)?;
+        let top = header.get(TOP).copied().unwrap_or_default() as usize;
+        if bricks.len() > top {
+            return Err(Error::PoolFull {
+                slots: self.capacity,
+            });
+        }
+        let low = top - bricks.len();
+        let table_binding = self.table() as usize;
+        let mut asked = vec![(self.slots() as usize, HEAD + low, bricks.len())];
+        for &brick in bricks {
+            for plane in 0..self.planes() {
+                asked.push((table_binding, self.value_at(plane, brick), 1));
+            }
+        }
+        let mut answers = held.read_runs(&asked)?.into_iter();
+        let stack = answers.next().unwrap_or_default();
+        let values: Vec<u32> = answers
+            .map(|one| one.first().copied().unwrap_or_default())
+            .collect();
+        let per = self.cells();
+        let mut fills = Vec::with_capacity(bricks.len() * self.planes());
+        let mut entries = Vec::with_capacity(bricks.len());
+        for (index, &brick) in bricks.iter().enumerate() {
+            let Some(&taken) = stack.get(bricks.len() - 1 - index) else {
+                return Err(Error::PoolFull {
+                    slots: self.capacity,
+                });
+            };
+            for plane in 0..self.planes() {
+                let value = values
+                    .get(index * self.planes() + plane)
+                    .copied()
+                    .unwrap_or_default();
+                fills.push((
+                    plane * self.plane_words() + taken as usize * per,
+                    vec![value; per],
+                ));
+            }
+            entries.push((brick as usize * ENTRY, [taken]));
+        }
+        if let Some(word) = header.get_mut(TOP) {
+            *word = u32::try_from(low).unwrap_or(u32::MAX);
+        }
+        let mut runs = Vec::new();
+        for (at, block) in &fills {
+            live::state_runs(self.windows, *at, block, &mut runs);
+        }
+        for (at, slot) in &entries {
+            runs.push(Run {
+                index: table_binding,
+                at: *at,
+                words: slot,
+            });
+        }
+        runs.push(Run {
+            index: self.slots() as usize,
+            at: 0,
+            words: &header,
+        });
+        held.write_many(&runs)
+    }
+
     pub fn wake_bricks(&self, held: &mut Resident<'_>, changed: &[u32]) -> Result<(), Error> {
         use std::collections::{BTreeMap, BTreeSet};
 

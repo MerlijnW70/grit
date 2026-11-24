@@ -467,7 +467,7 @@ fn absorbing(
 ) -> Result<live::Loop, Failed> {
     let (module, groups, marker, after) = match pool {
         Some(bricks) => {
-            let (module, groups) = border::absorb_sparse(bricks, absorb, true)?;
+            let (module, groups) = border::absorb_sparse(bricks, absorb)?;
             (module, groups, bricks::drop_taken(bricks)?, 1)
         }
         None => {
@@ -875,10 +875,10 @@ impl<'host> World<'host> {
                 table,
                 pool,
             } => {
-                let (bricks, packed) = repacked(
+                let (bricks, packed, needs) = repacked(
                     image,
                     (&plan, grid, rule.planes()),
-                    *capacity,
+                    (*capacity, absorb),
                     *sides,
                     table,
                     pool,
@@ -899,6 +899,9 @@ impl<'host> World<'host> {
                 world.parameters()?;
                 bricks
                     .write_packed(&mut world.live, &world.plan, &packed)
+                    .map_err(fitted)?;
+                bricks
+                    .hold_uniform(&mut world.live, &needs)
                     .map_err(fitted)?;
                 world
             }
@@ -1491,11 +1494,11 @@ fn reach_of(bricks: &Bricks, table: &[u32]) -> usize {
 fn repacked(
     image: &Image,
     (plan, grid, planes): (&Plan, Grid, u32),
-    capacity: u32,
+    (capacity, absorb): (u32, Option<Absorb>),
     sides: [u32; 3],
     table: &[u32],
     pool: &[u32],
-) -> Result<(Bricks, Packed), Failed> {
+) -> Result<(Bricks, Packed, Vec<u32>), Failed> {
     let refused = |why: LaneError| Box::new(unfit(why)) as Failed;
     let probe = Bricks::new(grid, plan, most_slots(plan).max(1))
         .and_then(|probe| probe.with_planes(planes))
@@ -1559,13 +1562,17 @@ fn repacked(
             .compose_planes(|brick| source.contents(&probe, brick))
             .map_err(fitted)?
     };
-    let bricks = if packed.held > bricks.capacity() {
-        fits(u64::from(packed.held))?
+    let needs = absorb.map_or_else(Vec::new, |absorb| {
+        border::shell_uniform(&probe, &packed.table, absorb)
+    });
+    let wanted = u64::from(packed.held) + needs.len() as u64;
+    let bricks = if wanted > u64::from(bricks.capacity()) {
+        fits(wanted)?
     } else {
         bricks
     };
     let packed = bricks.restacked(packed).map_err(fitted)?;
-    Ok((bricks, packed))
+    Ok((bricks, packed, needs))
 }
 
 struct Source<'image> {
