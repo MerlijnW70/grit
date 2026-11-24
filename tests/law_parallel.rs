@@ -731,6 +731,15 @@ fn p4_misuse_is_refused_by_code_and_field() {
         "parallel_bit",
         "$.writes[1].bit",
     );
+    let linear = with("\"rule\":\"outer\"", "\"rule\":\"linear\"");
+    refused_at(
+        &mut server,
+        &parallel(&linear),
+        "parallel_rule",
+        "$.parallel",
+    );
+    let numbers = ok(&mut server, "grit_law_learn", &linear);
+    assert!(numbers.get("parallel").is_none());
     let fine = ok(&mut server, "grit_law_learn", &parallel(&base));
     assert_eq!(int_at(fine.get("parallel").unwrap(), "copies"), 32);
     let circuit = Circuit {
@@ -764,7 +773,7 @@ fn p4_misuse_is_refused_by_code_and_field() {
     assert_eq!(wired.copies(), Copies::One);
     assert_eq!(wired.clone().parallel().unwrap().copies(), Copies::Word);
     println!(
-        "p4 parallel_bit (reads, writes, steps, two writes on one plane), rest without effect (kept equals cleared), a non-boolean parallel and the chip-level bit refusal"
+        "p4 parallel_bit (reads, writes, steps, two writes on one plane), parallel_rule under linear, rest without effect (kept equals cleared), a non-boolean parallel and the chip-level bit refusal"
     );
 }
 
