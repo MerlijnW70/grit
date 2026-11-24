@@ -481,6 +481,18 @@ fn uniform_words(cells: &[u32], size: [u32; 3], bricks: &Bricks, brick: u32) -> 
         .collect()
 }
 
+fn tile_box(lattice: [u32; 3], per: u32) -> [u32; 3] {
+    let [wide, deep, tall] = lattice;
+    let mut left = per;
+    let mut out = [wide, deep, tall];
+    for side in &mut out {
+        let taken = left.min(*side);
+        *side /= taken;
+        left /= taken;
+    }
+    out.map(|side| side.max(1))
+}
+
 fn near_bricks(lattice: [u32; 3], brick: u32) -> BTreeSet<u32> {
     let at = [
         brick % lattice[0],
@@ -676,12 +688,14 @@ impl Model {
                 None => self.whole.push(brick),
             }
         }
-        let lattice = self.bricks.lattice();
+        let lattice = tile_box(self.bricks.lattice(), self.per_tile);
         let lit: BTreeSet<u32> = self
             .hot_list
             .iter()
-            .flat_map(|&brick| near_bricks(lattice, brick))
-            .map(|brick| brick / self.per_tile)
+            .map(|&brick| brick / self.per_tile)
+            .collect::<BTreeSet<u32>>()
+            .into_iter()
+            .flat_map(|tile| near_bricks(lattice, tile))
             .collect();
         self.tiles = lit.union(&self.lit_before).copied().collect();
         self.lit_before = lit;
