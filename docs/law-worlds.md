@@ -466,7 +466,9 @@ Measurements are often taken every few steps. With `steps` k from 2 to 8 (`limit
 - `zero`: a neighbour past the example's box reads 0 at every step.
 - `wrapped`: an inline example wraps on itself at every step; a world example's box is read with k cells around it from that world, so it equals k steps of the law on that world.
 
-The answer is one step of the rule. The rows of one step are not seen, so there is no `conflict` or `not_counting`: every table of the rule and its counted places is searched, 2 to the classes of them. A table is numbered by the sum of `T[class]` times 2^class, class `n` under `totalistic` and `c` times the counts plus `n` under `outer`; Life is 6152. Tables are taken in ascending number.
+The law reads its input around each cell and writes its output, so it takes exactly one read and one write, and the write is on the read's bit but on another plane: `reads` `[{"plane":0,"bit":0}]` with `writes` `[{"plane":1,"bit":0}]`. A write on the read's plane is refused `halo_written` (a law may look only at a plane it does not write). The examples' outputs are the read bit after k steps; the answer's `iterate` runs the law with `alternate` on those two planes, so each frame reads the plane the last one wrote.
+
+The answer is one step of the rule. The rows of one step are not seen, so there is no `conflict` or `not_counting`. Up to 18 classes every table of the rule and its counted places is searched, 2 to the classes of them; past that the search is local (see [Large rules and noise](#large-rules-and-noise)). A table is numbered by the sum of `T[class]` times 2^class, class `n` under `totalistic` and `c` times the counts plus `n` under `outer`; Life is 6152. Tables are taken in ascending number.
 
 The search runs on the host, needs no device and reads no clock. It takes 64 tables at a time: each is first run on the cells a few probe cells depend on, then on every example cell. A table is dropped only once it is wrong on more cells than a table already seen, so the count of consistent tables and the closest table are exact.
 
@@ -498,12 +500,79 @@ A brake before each 64 tables stops on budget or cancel; an answer can come late
 | `malformed` | `steps` 0 | `$.steps` |
 | `steps_limit` | `steps` past 8 | `$.steps` |
 | `steps_rule` | `steps` above 1 under `minimal` or `symmetric` | `$.steps` |
-| `steps_noise` | `steps` above 1 with `noise` `vote` | `$.noise` |
+| `steps_noise` | `steps` above 1, or `search`, with `noise` `vote` | `$.noise` |
 | `steps_writes` | not exactly one write, on the read's bit: the law reads back what it wrote | `$.writes` |
-| `steps_space` | more than 18 classes (`limits.law_steps_classes`, 262144 tables): 3x3x3 needs `places` or `place_list`; `space` and `classes` name the size | `$.steps` |
+| `steps_space` | `search` `exhaustive` with more than 18 classes (`limits.law_steps_classes`, 262144 tables); `space` and `classes` name the size | `$.steps` |
+| `search_rule` | `search` under `minimal`, `symmetric` or `linear` | `$.search` |
+| `noise_rule` | `noise` `least_wrong` or `likely` under `minimal`, `symmetric` or `linear` | `$.noise` |
 
 A complete search that finds no table is refused `no_rule_k` at `$.examples`. `closest` names the first table with the fewest wrong example cells as `tables` and its `wrong` cells, with `cells`, `checked`, `space` and `steps`.
 
+
+### Large rules and noise
+
+`search` picks how the tables are searched. `noise` `least_wrong` or `likely` takes noisy examples. Each goes with `totalistic` or `outer` and any `steps` from 1 to 8, and each sends a request with `steps` 1 to this search too.
+
+| `search` | What runs |
+|---|---|
+| `exhaustive` | every table, at most 18 classes; the default up to 18 classes |
+| `local` | the default past 18 classes, such as 3x3x3 Moore under `outer` (54 classes) or `totalistic` (28) |
+
+The local search:
+
+1. Scores every table whose births and survivals (under `outer`) are each one interval of counts or none, or whose live counts (under `totalistic`) are one interval or none. It scores them on a window of the example cells: 143 641 tables for 3x3x3 `outer`.
+2. Scores the 16 best of them on every example cell and starts from the best.
+3. Flips single entries. When no single flip lowers the score, it flips pairs of entries, at least one of them reached by the table's own run. It keeps a flip only when it lowers the score, and stops when neither kind does.
+
+Every table is scored on the host, 64 at a time, by running it k steps on the cells the example cells depend on. The search reads no clock and answers the same bytes for the same request. Under `noise` `refuse` a search that ends with wrong cells is refused `no_rule_k` with `closest` and `search`; a local search is no proof that no table fits.
+
+#### The table with the fewest wrong cells
+
+Under `noise` `least_wrong` the score is the wrong example cells after k steps. Both kinds of search add:
+
+| Field | Meaning |
+|---|---|
+| `search`, `noise` | what ran |
+| `wrong`, `share` | the wrong example cells, and `[wrong, cells]` |
+| `margins` | in the shape of `tables`: how much flipping that entry alone would raise the score. 0 means the data does not pin the entry |
+| `pinned` | in the shape of `tables`: the entry where the data pins it, `null` elsewhere |
+| `unpinned` | entries the answer's own k-step run uses but the data does not pin, each `count` and, under `outer`, `centre` |
+| `unreached` | entries the answer's own run never uses |
+| `work` | `units`: cell steps scored, each step of a cell scoring up to 64 tables |
+
+An entry is pinned when its margin is above 0 and noise cannot explain it. Flipping the entry changes the law's output on some example cells, and the answer is right on more of them than the flip. Pinned means the chance of the answer being right on that many of them, if each cell were wrong at the answer's own share of wrong cells, is below one in a million. Without noise every entry with a margin is pinned. With noise a count that few cells reach can have a margin of a few cells from flipped cells alone, and stays `null`.
+
+`exhaustive` adds `tied` (the tables with the least score), `consistent` (the tables with no wrong cells), `checked` and `space`. `local` adds `family` (the best interval table and its score), `moves` (each kept flip: its entries and the score after it) and `checked` (the tables scored).
+
+`noise_estimate` holds:
+
+| Field | Meaning |
+|---|---|
+| `flips_per_million` | the cell flip rate on each frame that explains the wrong cells of the half of the example cells with the fewest. Cells are grouped by their input count and the law's output, and each half of the examples picks the groups for the other half. Flips of the input frame are run through the law k steps on 64 seeded draws, so the rate counts what a flipped input cell spreads to |
+| `expected_wrong` | the wrong cells that rate explains over every example cell |
+| `basis_cells` | the cells the rate was fitted on |
+| `far_above` | true when the wrong cells pass twice `expected_wrong` plus four times its square root plus 16; `warning` then says that the data is not this rule with noise |
+
+The estimate assumes the same flip rate on both frames. Examples with a clean input frame read as a lower rate.
+
+#### The most likely table
+
+The fewest wrong cells is the wrong aim when an input flip spreads. Seen 4 steps apart with 0.5% flips on both frames, a 3x3x3 rule's own table is wrong on more cells than quieter tables: every output cell's past holds hundreds of input cells, so a few of them are flipped. `noise` `likely` aims at the table under which the examples are most likely:
+
+1. It runs the `least_wrong` search and starts from a sixteenth of its `flips_per_million`, at least 1.
+2. It searches again, by the same steps, for the table with the least surprise at that rate. Surprise sums, over the example cells, minus the log of the chance the table gives the cell's output, in millionths of a nat. The input frame is flipped at the rate on 16 seeded draws and run k steps, and the output frame is flipped once more.
+3. It fits the rate that gives that table the least surprise, by 12 golden-section steps over an eighth to eight times the rate. When the fit is more than a fifth off, it searches again from that table at the fitted rate, at most three searches in all.
+
+The answer adds `assumed_flips_per_million` (the rate of the last search) and `surprise`; `margins`, `family` and `moves` count surprise. An entry is pinned when its margin is at least 20 nats and it also passes the test on wrong cells above. A request whose `least_wrong` answer has no wrong cells answers that table with `assumed_flips_per_million` 0.
+
+#### Stopping
+
+A brake before each round of at most 64 batches of 64 tables, each pass of single or pair flips, the margins, the estimate and each search of `likely` stops the search on budget or cancel. A stopped search answers its best table with `stopped` `budget` or `cancelled`, `complete` false, and no `margins`, `pinned` or `noise_estimate`, so it claims no entry. It is refused `budget` or `cancelled` when it scored no table on every example.
+
+1. `grit_law_learn` with `stencil` `3x3x3`, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `wrapped`, `rule` `outer`, `steps` 2, `noise` `least_wrong` and ten noisy 32x32x32 pairs 2 steps apart: `search` `local`, `tables` B5,6/S4,5,6, `noise_estimate` near the data's flip rate, `far_above` false.
+2. Read `pinned`: entries with `null` are not learned. Counts no example reaches, such as 24 to 26 live neighbours, stay `null`.
+3. With the same pairs 4 steps apart, give `noise` `likely`.
+4. Run the law as in the steps above with `iterate`.
 
 ### Fixed-point linear laws
 
