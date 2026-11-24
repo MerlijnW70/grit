@@ -100,9 +100,10 @@ pub enum Code {
     LinearRule,
     ParallelBit,
     ParallelRule,
+    ClampRange,
 }
 
-pub const CODES: [Code; 96] = [
+pub const CODES: [Code; 97] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -199,6 +200,7 @@ pub const CODES: [Code; 96] = [
     Code::LinearRule,
     Code::ParallelBit,
     Code::ParallelRule,
+    Code::ClampRange,
 ];
 
 impl Code {
@@ -301,6 +303,7 @@ impl Code {
             Self::LinearRule => "linear_rule",
             Self::ParallelBit => "parallel_bit",
             Self::ParallelRule => "parallel_rule",
+            Self::ClampRange => "clamp_range",
         }
     }
 
@@ -558,6 +561,9 @@ impl Code {
             }
             Self::ParallelRule => {
                 "Drop parallel under rule linear: a fixed-point law already reads and writes whole words."
+            }
+            Self::ClampRange => {
+                "Give a clamp that meets limit, the least and greatest word the law writes at its coefficient_frac; a wider range widens it."
             }
         }
     }

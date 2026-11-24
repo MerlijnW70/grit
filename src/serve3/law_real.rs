@@ -953,6 +953,26 @@ fn range_refused(
     }
 }
 
+fn clamp_refused(plan: &Plan<'_>, fixed: &[Fixed]) -> Option<Failed> {
+    let [least, most] = plan.clamp?;
+    let scale = fixed.iter().map(|one| one.scale).max()?;
+    let reach = i64::from(offset(scale));
+    let (low, high) = (-reach, reach - 1);
+    if i64::from(least) <= high && i64::from(most) >= low {
+        return None;
+    }
+    Some(Box::new(
+        Refusal::new(
+            Code::ClampRange,
+            "$.clamp",
+            format!(
+                "clamp [{least}, {most}] holds no word the law can write: at coefficient_frac {scale} every written word is in [{low}, {high}], so the clamp would saturate at its edge instead of holding; give a clamp that meets it, or a wider range"
+            ),
+        )
+        .limited(Json::List(vec![Json::Int(low), Json::Int(high)])),
+    ))
+}
+
 struct Fit {
     coefficients: Vec<f64>,
     bias: f64,
@@ -1115,6 +1135,9 @@ pub fn learned(
             &biases,
         ));
     };
+    if let Some(why) = clamp_refused(plan, &fixed) {
+        return Err(why);
+    }
     let writes = plan.writes.len();
     let mut squares = vec![0.0_f64; writes];
     let mut worst = vec![0_u64; writes];

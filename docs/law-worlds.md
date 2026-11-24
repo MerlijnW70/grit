@@ -483,7 +483,7 @@ A complete search that finds no table is refused `no_rule_k` at `$.examples`. `c
 | `poly` | 1 (default): the read words at the counted places. 2 adds the product of the centres of each two reads and each centre times the sum of a read's other counted places. 3 adds the product of each three centres, so Gray-Scott's u·v² is a term |
 | `frac` | the fractional bits of every read and written word |
 | `places`, `place_list` | the counted places, as for the counting rules |
-| `clamp` | `[least, greatest]` signed words each written word is clamped to |
+| `clamp` | `[least, greatest]` signed words each written word is clamped to; it must meet the words the law can write, else `clamp_range` |
 | `range` | `[least, greatest]` signed words of every read the law never wraps on; it must hold every example input word, else `plane_format` at `$.range`. The examples' own least and greatest if left out |
 
 The fit is exact least squares over every example cell. The normal equations are summed in integers, centred and scaled, and solved in f64 by Cholesky; the answer's `condition` is the ratio of the largest to the smallest eigenvalue of the centred, scaled normal matrix. Past 1e10, or with a term the same on every cell, the request is refused `ill_conditioned` at `$.examples`, with `condition`.
@@ -495,6 +495,10 @@ The law computes, with every add and multiply wrapping on 32 bits:
 
 `C_j` and `B` are the fit's coefficients and bias rounded to `k` fractional bits; `k` is the largest from 30 down whose sum of coefficients times terms over `range` fits one word, so inside `range` no step wraps. On a device the law equals this formula bit for bit. When no `k` fits, or a product passes 31 bits, the request is refused `fixed_range` at `$.frac`, and `limit` names the largest `frac` that fits.
 
+At `k` fractional bits every written word is in `[-2^(31-k), 2^(31-k) - 1]`, so `clamp` is applied in that interval. A `clamp` that meets it holds: every written word is in `clamp`. Each write has its own `k`; a `clamp` wholly outside the narrowest of these intervals is refused `clamp_range` at `$.clamp`, and `limit` names that interval as `[least, greatest]`. A wider `range` lowers `k` and widens it.
+
+These refusals need the examples and are checked in this order; the first that applies is the one named: `ill_conditioned`, then `fixed_range`, then `clamp_range`. `fixed_range` comes after `ill_conditioned` because its `limit` is found from the fit's coefficients, which an ill-conditioned fit does not determine; `clamp_range` needs `k`, which `fixed_range` chooses.
+
 The answer has `law`, `hash`, `halo`, `quiet`, `stepping` and `nodes` as above, and:
 
 | Field | Meaning |
@@ -504,7 +508,7 @@ The answer has `law`, `hash`, `halo`, `quiet`, `stepping` and `nodes` as above, 
 | `bias` | per write: `value` (B over 2^(frac+k)), `fixed` (B), `fit`, `stderr` |
 | `fixed` | `frac`, `coefficient_frac` (k per write), `format`, `rounding`, `range` per read, and `clamp` |
 | `residual` | per write, of the law as it runs on every example cell: `max` and `rms` in words, `sum_squares` exact, `max_real`, `rms_real`, and `fit_rms_real` of the f64 fit. Noise on the outputs shows here |
-| `symmetry` | `group` (`D4` for 3x3, `Oh`, order 48, for 3x3x3) and `invariant`: per write the place coefficients of each read and their images under every move differ by at most max(2^-k, 6 standard errors of the difference); `deviation`, `tolerance`, `read` and `places` name the pair furthest past it |
+| `symmetry` | `group` (`D4` for 3x3, `Oh`, order 48, for 3x3x3) and `invariant`: per write the place coefficients of each read and their images under every move differ by at most max(2^-k, 6 standard errors of the difference); `deviation`, `tolerance`, `read` and `places` name the pair furthest past it. Only place terms are compared: `product`, `cube` and `centre_times_others` terms are left out |
 | `iterate` | one read and one write: `alternate`; as many reads as writes: `copy`, the written plane and the read plane to write it back to after each frame |
 
 It needs no device and has no brake. Refused before any example is read: `plane_format` (a bit other than 0, `frac` past 30), `poly_limit` (`poly` past 3), `learn_limit` at `$.reads` (reads times counted places past 27), `linear_rule` (`poly`, `frac`, `clamp` or `range` under another rule), `reversed` (a `clamp` or `range` whose least is past its greatest), `start_rule`, `noise_rule`, `steps_rule` and `parallel_rule` (`parallel` true).
