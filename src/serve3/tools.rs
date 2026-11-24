@@ -707,7 +707,7 @@ pub(super) fn first_pace(world: &World<'_>) -> Pace {
     Pace::first(cells)
 }
 
-fn chosen(server: &Server<'_>, held: &Json) -> Result<Box<dyn Listed>, Failed> {
+pub(super) fn chosen(server: &Server<'_>, held: &Json) -> Result<Box<dyn Listed>, Failed> {
     match (held.get("rule"), held.get("law")) {
         (Some(_), None) if held.get("alternate").is_some() => Err(refused(
             Code::RuleOrLaw,
@@ -873,7 +873,7 @@ pub fn absorb_shown(absorb: Absorb) -> Json {
     sized(absorb.cells())
 }
 
-fn absorb_of(held: &Json, size: [u32; 3]) -> Result<Option<Absorb>, Failed> {
+pub(super) fn absorb_of(held: &Json, size: [u32; 3]) -> Result<Option<Absorb>, Failed> {
     let Some(given) = held.get("absorb") else {
         return Ok(None);
     };

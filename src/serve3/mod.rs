@@ -34,6 +34,7 @@ pub mod ask;
 pub mod back;
 pub mod branch;
 pub mod budget;
+pub mod check;
 pub mod cost;
 pub mod errors;
 pub mod exec;
@@ -647,7 +648,7 @@ pub struct Server<'host> {
 }
 
 /// The names of the world tools, in the order `tools/list` gives them.
-pub const WORLD_TOOLS: [&str; 21] = [
+pub const WORLD_TOOLS: [&str; 22] = [
     "grit_world_rules",
     "grit_world_create",
     "grit_world_write",
@@ -667,6 +668,7 @@ pub const WORLD_TOOLS: [&str; 21] = [
     "grit_world_back",
     "grit_law_gradient",
     "grit_law_descend",
+    "grit_law_check",
     "grit_law_score",
     "grit_learn_params",
 ];
@@ -680,6 +682,7 @@ fn served() -> impl Iterator<Item = &'static Tool> {
         .chain(branch::TOOLS)
         .chain(back::TOOLS)
         .chain(gradient::TOOLS)
+        .chain(check::TOOLS)
         .chain(learn::TOOLS)
 }
 

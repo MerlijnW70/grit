@@ -103,9 +103,11 @@ pub enum Code {
     ClampRange,
     AbsorbWide,
     WriteForm,
+    CheckStart,
+    CheckTarget,
 }
 
-pub const CODES: [Code; 99] = [
+pub const CODES: [Code; 101] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -205,6 +207,8 @@ pub const CODES: [Code; 99] = [
     Code::ClampRange,
     Code::AbsorbWide,
     Code::WriteForm,
+    Code::CheckStart,
+    Code::CheckTarget,
 ];
 
 impl Code {
@@ -310,6 +314,8 @@ impl Code {
             Self::ClampRange => "clamp_range",
             Self::AbsorbWide => "absorb_wide",
             Self::WriteForm => "write_form",
+            Self::CheckStart => "check_start",
+            Self::CheckTarget => "check_target",
         }
     }
 
@@ -576,6 +582,12 @@ impl Code {
             }
             Self::WriteForm => {
                 "Give cells with form cells, the default; give from and to, and planes, current or bits if you need them, with form clear; not both, and not neither."
+            }
+            Self::CheckStart => {
+                "Give size as grit_world_create answers it, at least one start, and each start exactly one of cells inside its box, dense with every word of its box, or world with from."
+            }
+            Self::CheckTarget => {
+                "Give each target exactly one of cells inside the box, dense with every word of the box, or world with from, at a frame from 0 to frames."
             }
         }
     }

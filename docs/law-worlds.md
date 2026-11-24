@@ -239,6 +239,59 @@ Many params can give objective 0 (heat's `chance` only matters through a 4-bit d
 
 A run costs octs times frames times (law nodes + 128), at most `run_work` (2^26), on a start of at most `run_cells` (32768) words; it cannot stop part way. Refused before any run: `law_refused`, `start` (also a world under a named rule), `params` (also at `$.bounds` for the wrong count), `bounds` (a param outside its bounds, or no param free to move), `reversed`, `outside`, `target_size`, `aim`, `run_limit`, `budget`, and `too_many` for `population` or `generations` past their limit. A device lost during a search does not change its answer, which says `restored`. Neither tool writes a world or its journal. `grit_describe` names the limits under `law_search`.
 
+## Checking a law on many starts
+
+`grit_law_check` runs a law on N starts for `frames` frames on the device and scores each start against its targets, in one call. It replaces create, write, step, read and close for every start.
+
+| Field | Meaning |
+|---|---|
+| `law` or `rule`, `alternate`, `params` | as `grit_world_create` takes them; `params` none if left out |
+| `size` | every start's `[wide, deep, tall]`, a shape `grit_world_create` answers |
+| `sparse`, `absorb` | as `grit_world_create` takes them, for each start's own world |
+| `border` | `wrapped` (default): a start is a torus of its own size. `zero`: every cell outside the start's box reads 0 at every frame |
+| `frames` | k, 1 to 4096 |
+| `reads`, `writes` | the plane a start is written to, and the plane scored and answered; 0 if left out |
+| `current` | true: both are the current plane, at frame 0 and at each target's frame. The default for a law that iterates |
+| `values`, `frac` | `binary` (default) or `real`; `frac`, 16 if left out, the fractional bits of a `real` word |
+| `starts` | each one of `cells` (`[x, y, z, word]`, every other cell 0), `dense` (every word of the box, x fastest) or `world` and `from` (a box of an open world, on its `plane`, its current plane if it iterates, else 0), with `targets` |
+| `targets` | each a box in the same forms, at `frame`, 0 to k; k if left out |
+| `return`, `page` | true: also answer the end states, a page at a time |
+
+Each start equals, bit for bit, a world of its own: `grit_world_create` with the same law, params, size, `sparse`, `alternate` and `absorb`, the start written, stepped k frames and read. Under `border` `zero` that world is twice the start's size on every axis above 2, absorbs half the start's side there (plus `absorb`), and holds the start in its middle; an axis of side 2, the z of a 2D world, wraps.
+
+The answer names `law` (its hash) or `rule`, the arguments it ran with, `run` and, per start, its `fingerprint` and one score per target, in the order given:
+
+| Field | Meaning |
+|---|---|
+| `frame` | the target's frame |
+| `cells`, `right`, `wrong` | the box's cells, and those equal and not equal to the target |
+| `first_wrong` | `at`, `want`, `got` of the first wrong cell, x fastest, then y, then z; left out when none is wrong |
+| `max`, `sum_squares`, `rms` | under `real`: the largest and the summed squared difference of the signed words, and its root mean square, in words |
+| `max_real`, `rms_real` | under `real`: the same decoded, over 2^`frac` |
+
+`totals` sums them over every target; its `max` is the largest. `fingerprint` is the sha256 of the start's end state: the box's words on every plane, plane 0 first, x fastest, each word 4 bytes little-endian, so two runs compare without reading them. `return` answers `[start, x, y, z, word]` of each end-state cell not 0 on the scored plane, 16384 a page, with `page`, `pages` and `count`; each page runs the check again.
+
+Starts share one dense world when the border wraps, no `absorb` is given, the world is dense and the law reads no `at` (and so no `noise`). Each start is then a tile along one axis with a margin of its own torus copies, (1 + `halo`) times k cells wide on each side, rounded up to even: a frame moves what a cell reads by at most 1 + `halo` cells, so in k frames no tile reaches another's start, and the oct grid and the frame's parity are the start's own. A shared world holds at most 2^22 cells and at most 8 times the starts' cells. Every other start runs in a world of its own. `run` names `layout` (`tiled` or `apart`), `worlds`, and for `tiled` its `axis`, `margin` and `starts_per_world`.
+
+A check is priced as the worlds it builds (their bytes), the cells it writes (margins included) and the frames it steps (world cells times k, held bricks on sparse worlds), in the units of `grit_world_create`, `grit_world_write` and `grit_world_step`. Its reads are not priced, as no read is. It stops on budget or cancel only before a build or a batch of frames, and then answers nothing. It writes no journal and leaves no world open.
+
+X1's held check of p1, four 64 by 64 starts 8 frames on, is one call; so are its 12 training pairs, each a start with a target at frame 1.
+
+Refusals, before any device work except `outside` at `$.page`:
+
+| Code | When | `field` |
+|---|---|---|
+| `too_many` | more than 256 starts, more than 2^22 start cells (`limit` the most starts of this size), more than 1024 targets | `$.starts`, `$.starts[k].targets` |
+| `frames` | k past 4096, or start cells times k past 2^32 (`limit` the most frames) | `$.frames` |
+| `check_start` | a `size` no world has (`limit` the shape it would be), no start, a start with other than one form, a cell outside the box, a `dense` of the wrong length (`limit` the box's words) | `$.size`, `$.starts`, `$.starts[k]...` |
+| `check_target` | a target with other than one form, a cell outside the box, a `dense` of the wrong length, a `frame` past k (`limit` k) | `$.starts[k].targets[j]...` |
+| `outside` | `reads` or `writes` past the law's planes (`limit` the last), a `world` box past that world, `page` past the pages | the field |
+| `not_iterating`, `plane_or_current` | `current` without `alternate`; `current` with `reads` or `writes` | `$.current`, `$.reads`, `$.writes` |
+| `params`, `quiet_refused`, `absorb_wide`, `rule_or_law`, `law_refused` | as `grit_world_create` | as there |
+| `malformed` | `frac` without `values` `real` | `$.frac` |
+
+Nothing is cut short: a request past a limit runs nothing.
+
 ## The quiet class
 
 A listed world steps an oct only while it, or an oct around it, changed in the two frames before; a sparse world also keeps an all-one-value brick as a single word and steps it only while it is hot. That gives the cells of stepping every oct only when:
