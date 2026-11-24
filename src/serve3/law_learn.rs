@@ -16,6 +16,7 @@ use super::law_real;
 use super::schema::{choice, object, property, whole, with, word};
 use super::tools::{int, ints, limited, refused, tool, unread};
 use super::{Failed, Server, Tool};
+use crate::steps::least::Search;
 
 pub const TOOLS: &[Tool] = &[Tool {
     name: "grit_law_learn",
@@ -657,8 +658,8 @@ fn learn_shown() -> Json {
                 "noise",
                 with(
                     choice(
-                        "rule totalistic or outer: how examples that disagree are taken; refuse, as conflict and not_counting; vote, each count decided by the majority of the example cells that show it, a tie 0, and the cells that disagree with the law listed",
-                        &["refuse", "vote"],
+                        "rule totalistic or outer: how examples that disagree are taken; refuse, as conflict and not_counting; vote, each count decided by the majority of the example cells that show it, a tie 0, and the cells that disagree with the law listed; least_wrong, with any steps, the table with the fewest wrong example cells after k steps, with margins, the entries the data does not pin and a noise estimate; likely, the same, then the table that makes the examples most likely when cells of both frames flip at the estimated rate",
+                        &["refuse", "vote", "least_wrong", "likely"],
                     ),
                     vec![("default", text("refuse"))],
                 ),
@@ -682,9 +683,16 @@ fn learn_shown() -> Json {
             (
                 "steps",
                 whole(
-                    "rule totalistic or outer: k, how many applications of the law lie between each example's input and output; 1 if left out, at most 8; above 1 every table of the rule is searched",
+                    "rule totalistic or outer: k, how many applications of the law lie between each example's input and output; 1 if left out, at most 8; above 1 the tables of the rule are searched",
                     1,
                     i64::from(u32::MAX),
+                ),
+            ),
+            (
+                "search",
+                choice(
+                    "rule totalistic or outer: how the tables are searched; exhaustive, every table, at most 18 classes, the default up to 18; local, the default past 18, the best interval tables then single and pair flips kept only when they lower the wrong cells",
+                    &["exhaustive", "local"],
                 ),
             ),
             (
@@ -2337,11 +2345,13 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         copies: copies_of(held, &asked)?,
         ..asked
     };
-    let vote = match held.get("noise") {
-        None => false,
+    let (vote, least, likely) = match held.get("noise") {
+        None => (false, false, false),
         Some(one) => match one.text() {
-            Some("refuse") => false,
-            Some("vote") => true,
+            Some("refuse") => (false, false, false),
+            Some("vote") => (true, false, false),
+            Some("least_wrong") => (false, true, false),
+            Some("likely") => (false, true, true),
             _ => return Err(unread("noise")),
         },
     };
@@ -2375,7 +2385,30 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         }
     }
     let steps = steps_of(held)?;
-    if steps > 1 {
+    let search = search_of(held)?;
+    if let Some(rule @ ("minimal" | "symmetric" | "linear")) = held.get("rule").and_then(Json::text)
+    {
+        if search.is_some() {
+            return Err(refused(
+                Code::SearchRule,
+                "$.search",
+                format!(
+                    "search picks how the tables of a counting rule are searched, and rule {rule} has no table; search goes with rule totalistic or outer"
+                ),
+            ));
+        }
+        if least {
+            return Err(refused(
+                Code::NoiseRule,
+                "$.noise",
+                format!(
+                    "noise {} answers a counting table, and rule {rule} has no table; noise least_wrong and likely go with rule totalistic or outer",
+                    if likely { "likely" } else { "least_wrong" }
+                ),
+            ));
+        }
+    }
+    if steps > 1 || least || search.is_some() {
         let tally = match held.get("rule").and_then(Json::text) {
             Some("totalistic") => Tally::Totalistic,
             Some("outer") => Tally::Outer,
@@ -2399,7 +2432,14 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             }
             _ => return Err(unread("rule")),
         };
-        return stepped_law(server, held, &asked, tally, (steps, vote));
+        return stepped_law(
+            server,
+            held,
+            &asked,
+            tally,
+            (steps, vote, least, search),
+            likely,
+        );
     }
     let symmetric = match held.get("rule").and_then(Json::text) {
         Some("symmetric") => true,
@@ -3054,7 +3094,7 @@ fn start_told(
     map(fields)
 }
 
-pub const STEPS: &str = "steps k from 2 to 8, under rule totalistic or outer, reads each example's output as the read bit after k applications of one counting table, with the example's border at every step: zero reads 0 past the example's box at every step; wrapped wraps an inline example on itself at every step, and reads a world example's box with k cells around it from that world, so it equals k steps of the law on that world. It takes one read and one write on the read's bit. Every table of the rule and its counted places is searched, 2 to the classes of them, at most 18 classes (262144 tables), on the host with no device: 64 tables at a time, each first run on the cells a few probe cells depend on and then on every example cell, a table dropped only once it is wrong on more cells than a table already seen. A table is numbered by the sum of T[class] times 2 to the class, class n under totalistic and the centre times the counts plus n under outer, and tables are taken in ascending number: the law is the first table that gives every example cell, consistent counts them all, consistent_tables lists the first 16 in the shape of tables, checked the tables tried or excluded and space the tables of the rule. The search reads no clock; it passes a brake before each 64 tables, so an answer can come late by the check of 64 tables. A stop on budget or cancel answers what it found, a prefix of the whole search's order, with stopped budget or cancelled and complete false, and refuses budget or cancelled when it found none. A complete search answers stopped complete and complete true, the same bytes for the same request; with no table consistent it is refused no_rule_k at examples, with closest, the first table with the fewest wrong example cells, and its wrong cells. The found law is checked on the host by running it k steps on every example before it is answered. iterate names how to run it: alternate, the read's and the write's planes, and frames k. steps 1 answers as a request without steps. Refused before any example is read: steps past 8 steps_limit, steps above 1 under minimal or symmetric steps_rule, with noise vote steps_noise, without exactly one write on the read's bit steps_writes, and more than 18 classes steps_space with space and classes";
+pub const STEPS: &str = "steps k from 2 to 8, under rule totalistic or outer, reads each example's output as the read bit after k applications of one counting table, with the example's border at every step: zero reads 0 past the example's box at every step; wrapped wraps an inline example on itself at every step, and reads a world example's box with k cells around it from that world, so it equals k steps of the law on that world. It takes one read and one write on the read's bit. Every table of the rule and its counted places is searched, 2 to the classes of them, at most 18 classes (262144 tables) unless search is local, on the host with no device: 64 tables at a time, each first run on the cells a few probe cells depend on and then on every example cell, a table dropped only once it is wrong on more cells than a table already seen. A table is numbered by the sum of T[class] times 2 to the class, class n under totalistic and the centre times the counts plus n under outer, and tables are taken in ascending number: the law is the first table that gives every example cell, consistent counts them all, consistent_tables lists the first 16 in the shape of tables, checked the tables tried or excluded and space the tables of the rule. The search reads no clock; it passes a brake before each 64 tables, so an answer can come late by the check of 64 tables. A stop on budget or cancel answers what it found, a prefix of the whole search's order, with stopped budget or cancelled and complete false, and refuses budget or cancelled when it found none. A complete search answers stopped complete and complete true, the same bytes for the same request; with no table consistent it is refused no_rule_k at examples, with closest, the first table with the fewest wrong example cells, and its wrong cells. The found law is checked on the host by running it k steps on every example before it is answered. iterate names how to run it: alternate, the read's and the write's planes, and frames k. steps 1 answers as a request without steps. Refused before any example is read: steps past 8 steps_limit, steps above 1 under minimal or symmetric steps_rule, with noise vote steps_noise, without exactly one write on the read's bit steps_writes (the write is on another plane than the read, at the read's bit, since a write on the read's plane is refused halo_written), and search exhaustive past 18 classes steps_space with space and classes. Past 18 classes, with search local, or with noise least_wrong the search of law_least runs instead";
 
 pub const STEPS_ZERO_RUNS: &str = "the law is applied k times and each step read 0 past the example's edge; a world reproduces that where the cells around the example stay 0 for the k steps: create it with alternate, write the input to the read's plane, step k frames and read the current plane";
 
@@ -3161,16 +3201,21 @@ fn stepped_law(
     held: &Json,
     asked: &Asked,
     tally: Tally,
-    (steps, vote): (u32, bool),
+    (steps, vote, least, search): (u32, bool, bool, Option<Search>),
+    likely: bool,
 ) -> Result<Json, Failed> {
     let stencil = asked.stencil;
     if vote {
         return Err(refused(
             Code::StepsNoise,
             "$.noise",
-            format!(
-                "noise vote decides each count by the example cells at one step, and steps is {steps}; a vote over examples k steps apart is not offered, so give noise refuse or steps 1"
-            ),
+            if steps > 1 {
+                format!(
+                    "noise vote decides each count by the example cells at one step, and steps is {steps}; a vote over examples k steps apart is not offered, so give noise refuse, noise least_wrong or steps 1"
+                )
+            } else {
+                "noise vote decides each count by the example cells at one step with no search, and search was given; give noise least_wrong or drop search".to_owned()
+            },
         ));
     }
     if held.get("start").is_some() {
@@ -3223,7 +3268,12 @@ fn stepped_law(
     };
     let classes = stepping.classes();
     let space = stepping.space();
-    if !stepping.fits() {
+    let mode = match search {
+        Some(asked) => asked,
+        None if stepping.fits() => Search::Exhaustive,
+        None => Search::Local,
+    };
+    if mode == Search::Exhaustive && !stepping.fits() {
         return Err(Box::new(Told(
             Refusal::new(
                 Code::StepsSpace,
@@ -3261,6 +3311,21 @@ fn stepped_law(
         #[cfg(feature = "faults")]
         faults: server.faults(),
     };
+    if least || mode == Search::Local {
+        let shape = Shape {
+            asked,
+            held,
+            channels,
+            given: given.as_ref(),
+        };
+        return least_law(
+            &stepping,
+            &samples,
+            &mut watch,
+            (mode, least, likely),
+            &shape,
+        );
+    }
     let found = {
         let mut halted = || watch.braked(Point::Search);
         crate::steps::searched(&stepping, &samples, &mut halted)
@@ -3394,6 +3459,440 @@ fn stepped_law(
         ),
     ]);
     if let Some(one) = &given {
+        answer.push(("places", places_shown(counting, one.preset)));
+    }
+    if let Some(stop) = stopped {
+        answer.push(("hint", text(stop.code().hint())));
+    }
+    Ok(map(answer))
+}
+
+pub const LEAST: &str = "noise least_wrong or likely, and search, go with rule totalistic or outer and any steps from 1 to 8. search exhaustive tries every table, at most 18 classes, the default up to 18; search local, the default past 18, scores every table whose births (under outer) and survivals are each one interval of counts or none (under totalistic one interval or none) on a window of the example cells, starts from the best of the 16 best scored on every example cell, then flips single entries and, when no single flip lowers the score, pairs of entries with at least one reached, keeping a flip only when it lowers the score, until neither does. Tables are scored on the host, 64 at a time, by running them k steps on the cells the example cells depend on; the search reads no clock and answers the same bytes for the same request. Under noise least_wrong the score is the wrong example cells. The answer adds search, noise, wrong, share as [wrong, cells], margins in the shape of tables (how much flipping each entry alone raises the score), pinned in the shape of tables (the entry where the data pins it, null elsewhere: the margin is above 0 and the chance that the answer is right on as many of the cells the flip changes, each wrong at the answer's share of wrong cells, is below one in a million), unpinned and unreached (entries the answer's own k-step run uses but the data does not pin, and entries it never uses, each count and under outer centre), work units (cell steps scored), and noise_estimate: flips_per_million, the flip rate on each frame that explains the wrong cells of the half of the cells with the fewest, grouped by input count and the law's output, each half of the examples picking the groups for the other, with input flips run k steps through the law on 64 seeded draws; expected_wrong, basis_cells, and far_above, true past twice expected_wrong plus four times its square root plus 16, with warning. exhaustive adds tied, consistent, checked and space; local adds family, moves and checked. noise likely starts from a sixteenth of that rate and searches again by surprise: minus the log chance, in millionths of a nat, of each example cell's output with the input frame flipped at the rate on 16 seeded draws and run k steps and the output flipped once more; it then fits the rate by 12 golden-section steps over an eighth to eight times it and searches again from its answer while the fit is more than a fifth off, at most three searches. It adds assumed_flips_per_million and surprise; margins, family and moves count surprise, and an entry is pinned at 20 nats or more when it also passes the test on wrong cells. A brake before each round of 64 batches, each pass of flips, the margins, the estimate and each search stops on budget or cancel; a stopped search answers its best table with stopped budget or cancelled, complete false and no margins, pinned or noise_estimate, and is refused budget or cancelled when it scored none on every example. Under noise refuse a search that ends with wrong cells is refused no_rule_k with closest and search. search exhaustive past 18 classes is refused steps_space; search, or noise least_wrong or likely, under rule minimal, symmetric or linear is refused search_rule or noise_rule; noise vote with search is refused steps_noise";
+
+pub const LEAST_FAR: &str = "the least-wrong table is wrong on far more example cells than cell flip noise at the estimated rate on both frames explains, so the examples are not this rule with noise: check steps, border, places and the rule, or use another rule";
+
+struct Shape<'call> {
+    asked: &'call Asked,
+    held: &'call Json,
+    channels: u32,
+    given: Option<&'call Masked>,
+}
+
+fn search_of(held: &Json) -> Result<Option<Search>, Failed> {
+    match held.get("search") {
+        None => Ok(None),
+        Some(one) => match one.text() {
+            Some("exhaustive") => Ok(Some(Search::Exhaustive)),
+            Some("local") => Ok(Some(Search::Local)),
+            _ => Err(unread("search")),
+        },
+    }
+}
+
+fn entry_shown(counting: Counting, class: u32) -> Json {
+    let counts = counting.counts();
+    let mut fields = vec![("count", counted(class % counts))];
+    if counting.tally == Tally::Outer {
+        fields.push(("centre", counted(class / counts)));
+    }
+    map(fields)
+}
+
+fn recounted(stepping: &crate::steps::Stepping, samples: &[Sample<'_>], table: &[u32]) -> u64 {
+    let counting = stepping.counting;
+    let stencil = counting.stencil;
+    let read = Bit { plane: 0, bit: 0 };
+    samples
+        .iter()
+        .map(|sample| {
+            let words: &[u32] = match sample.inputs.as_slice() {
+                [one, ..] => one,
+                [] => &[],
+            };
+            let mut grid: Vec<u32> = words
+                .iter()
+                .map(|word| (word >> stepping.read) & 1)
+                .collect();
+            for _ in 0..stepping.steps {
+                let whole = Sample {
+                    size: sample.size,
+                    inputs: vec![grid.as_slice()],
+                    from: [0; 3],
+                    inner: sample.size,
+                    outputs: Vec::new(),
+                };
+                let mut next = Vec::with_capacity(grid.len());
+                for z in 0..sample.size[2] {
+                    for y in 0..sample.size[1] {
+                        for x in 0..sample.size[0] {
+                            let row = stencil::row_at(
+                                stencil,
+                                std::slice::from_ref(&read),
+                                &whole,
+                                [x, y, z],
+                                stepping.border,
+                            );
+                            let class = counting.class(row) as usize;
+                            next.push(table.get(class).copied().unwrap_or(0));
+                        }
+                    }
+                }
+                grid = next;
+            }
+            let wanted: &[u32] = match sample.outputs.as_slice() {
+                [one, ..] => one,
+                [] => &[],
+            };
+            let [wide, deep, tall] = sample.inner;
+            let mut wrong = 0_u64;
+            for z in 0..tall {
+                for y in 0..deep {
+                    for x in 0..wide {
+                        let inside = [sample.from[0] + x, sample.from[1] + y, sample.from[2] + z];
+                        let got = grid
+                            .get(stencil::index(sample.size, inside))
+                            .copied()
+                            .unwrap_or(0);
+                        let want = wanted
+                            .get(stencil::index(sample.inner, [x, y, z]))
+                            .map_or(0, |word| (word >> stepping.write) & 1);
+                        wrong += u64::from(got != want);
+                    }
+                }
+            }
+            wrong
+        })
+        .sum()
+}
+
+fn stop_refused(stop: Stop, message: String, told: Vec<(&'static str, Json)>) -> Failed {
+    Box::new(Told(
+        Refusal::new(
+            stop.code(),
+            if stop == Stop::Budget {
+                "$.budget_ms"
+            } else {
+                "$"
+            },
+            message,
+        ),
+        told,
+    ))
+}
+
+fn moves_shown(
+    counting: Counting,
+    learned: &crate::steps::least::Learned,
+    unit: &'static str,
+) -> Json {
+    Json::List(
+        learned
+            .moves
+            .iter()
+            .map(|one| {
+                map(vec![
+                    (
+                        "flipped",
+                        Json::List(
+                            one.flipped
+                                .iter()
+                                .map(|class| entry_shown(counting, *class))
+                                .collect(),
+                        ),
+                    ),
+                    (unit, exact(one.score)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn doubt_shown(
+    counting: Counting,
+    learned: &crate::steps::least::Learned,
+    answer: &mut Vec<(&'static str, Json)>,
+) {
+    let Some(doubt) = &learned.doubt else {
+        return;
+    };
+    let classes = counting.classes();
+    let margin = |class: u32| doubt.margins.get(class as usize).copied().unwrap_or(0);
+    let used = |class: u32| doubt.used.get(class as usize).copied().unwrap_or(0);
+    let pinned = |class: u32| doubt.pinned.get(class as usize).copied().unwrap_or(false);
+    answer.push((
+        "margins",
+        Json::List(vec![by_count(counting, &|class| {
+            Some(exact(margin(class)))
+        })]),
+    ));
+    answer.push((
+        "pinned",
+        Json::List(vec![by_count(counting, &|class| {
+            Some(if pinned(class) {
+                counted(crate::steps::entry(learned.code, class))
+            } else {
+                Json::Null
+            })
+        })]),
+    ));
+    answer.push((
+        "unpinned",
+        Json::List(
+            (0..classes)
+                .filter(|class| !pinned(*class) && used(*class) > 0)
+                .map(|class| entry_shown(counting, class))
+                .collect(),
+        ),
+    ));
+    answer.push((
+        "unreached",
+        Json::List(
+            (0..classes)
+                .filter(|class| used(*class) == 0)
+                .map(|class| entry_shown(counting, class))
+                .collect(),
+        ),
+    ));
+}
+
+fn least_law(
+    stepping: &crate::steps::Stepping,
+    samples: &[Sample<'_>],
+    watch: &mut Watch<'_>,
+    (mode, least, likely): (Search, bool, bool),
+    shape: &Shape<'_>,
+) -> Result<Json, Failed> {
+    let counting = stepping.counting;
+    let stencil = counting.stencil;
+    let steps = stepping.steps;
+    let classes = stepping.classes();
+    let space = stepping.space();
+    let asked = shape.asked;
+    let learned = {
+        let mut halted = || watch.braked(Point::Search);
+        match (mode, likely) {
+            (_, true) => crate::steps::least::likely(stepping, samples, mode, &mut halted),
+            (Search::Exhaustive, false) => {
+                crate::steps::least::exhaustive(stepping, samples, least, &mut halted)
+            }
+            (Search::Local, false) => {
+                crate::steps::least::local(stepping, samples, least, &mut halted)
+            }
+        }
+    };
+    let Some(learned) = learned else {
+        return Err(
+            "a search thread of the host failed; this is a fault of the server"
+                .to_owned()
+                .into(),
+        );
+    };
+    let Some(learned) = learned else {
+        let stop = watch.stop.unwrap_or(Stop::Budget);
+        return Err(stop_refused(
+            stop,
+            format!(
+                "the {} search stopped on {} before it scored a table on every example; nothing was learned",
+                mode.name(),
+                stop.name()
+            ),
+            vec![("search", text(mode.name())), ("steps", counted(steps))],
+        ));
+    };
+    let table = crate::steps::table_of(learned.code, classes);
+    if recounted(stepping, samples, &table) != learned.wrong {
+        return Err(format!(
+            "the {} search counts {} wrong cells for table {}, and running it again on the host counts otherwise; this is a fault of the server",
+            mode.name(),
+            learned.wrong,
+            learned.code
+        )
+        .into());
+    }
+    let stopped = watch.stop.filter(|_| !learned.complete);
+    let mut searched = vec![
+        ("search", text(mode.name())),
+        ("checked", exact(learned.checked)),
+    ];
+    if mode == Search::Exhaustive {
+        searched.push(("space", exact(space)));
+    }
+    searched.push(("steps", counted(steps)));
+    if !least && learned.wrong > 0 {
+        if let Some(stop) = stopped {
+            return Err(stop_refused(
+                stop,
+                format!(
+                    "the {} search stopped on {} after {} tables, before it found a table that applied {steps} times gives every example; nothing was learned",
+                    mode.name(),
+                    stop.name(),
+                    learned.checked
+                ),
+                searched,
+            ));
+        }
+        let mut told = vec![
+            (
+                "closest",
+                map(vec![
+                    ("tables", by_code(counting, learned.code)),
+                    ("wrong", exact(learned.wrong)),
+                ]),
+            ),
+            ("cells", exact(learned.cells)),
+        ];
+        told.extend(searched);
+        return Err(Box::new(Told(
+            Refusal::new(
+                Code::NoRuleK,
+                "$.examples",
+                format!(
+                    "the {} search found no table of rule {} that applied {steps} times gives every example; the closest it found is wrong on {} of {} example cells; a local search is no proof that none exists, and noise least_wrong answers the table with the fewest wrong cells",
+                    mode.name(),
+                    counting.tally.name(),
+                    learned.wrong,
+                    learned.cells
+                ),
+            ),
+            told,
+        )));
+    }
+    let inputs = stencil.positions();
+    let gates = stencil::counted_gates(counting, 1, &table);
+    if inputs <= TABLE_INPUTS {
+        for row in 0..1_u32 << inputs {
+            let wanted = table
+                .get(counting.class(row) as usize)
+                .copied()
+                .unwrap_or(0);
+            if stencil::answer(inputs, 1, &gates, row) != wanted {
+                return Err(format!(
+                    "the counting circuit answers row {row} other than the table; this is a fault of the server"
+                )
+                .into());
+            }
+        }
+    }
+    let circuit = Circuit {
+        state: 0,
+        inputs,
+        outputs: 1,
+        gates: gates.clone(),
+    };
+    let mut answer = super::law::chip_law(
+        circuit,
+        wiring(asked, shape.held, shape.channels),
+        asked.copies,
+    )?;
+    let (read, write) = match (asked.reads.as_slice(), asked.writes.as_slice()) {
+        ([one, ..], [two, ..]) => (*one, *two),
+        _ => {
+            return Err(
+                "a k-step law has one read and one write; this is a fault of the server"
+                    .to_owned()
+                    .into(),
+            );
+        }
+    };
+    answer.extend([
+        ("stencil", text(stencil.name())),
+        ("row_order", text(stencil::ORDER)),
+        ("border", text(border_name(asked.border))),
+        ("runs_as", text(steps_runs(asked.border))),
+        ("examples", map(vec![("cells", exact(learned.cells))])),
+        (
+            "chip",
+            map(vec![
+                ("inputs", counted(inputs)),
+                ("outputs", counted(1)),
+                ("gates", gates_shown(&gates)),
+            ]),
+        ),
+        ("tables", by_code(counting, learned.code)),
+        ("steps", counted(steps)),
+        ("search", text(mode.name())),
+        (
+            "noise",
+            text(match (least, learned.rate) {
+                (false, _) => "refuse",
+                (true, Some(_)) => "likely",
+                (true, None) => "least_wrong",
+            }),
+        ),
+        ("wrong", exact(learned.wrong)),
+        (
+            "share",
+            Json::List(vec![exact(learned.wrong), exact(learned.cells)]),
+        ),
+    ]);
+    let unit = if learned.rate.is_some() {
+        "surprise"
+    } else {
+        "wrong"
+    };
+    if let Some(rate) = learned.rate {
+        answer.extend([
+            ("assumed_flips_per_million", exact(rate)),
+            ("surprise", exact(learned.score)),
+        ]);
+    } else if likely {
+        answer.push(("assumed_flips_per_million", exact(0)));
+    }
+    match mode {
+        Search::Exhaustive => answer.extend([
+            ("tied", exact(learned.tied)),
+            (
+                "consistent",
+                exact(if learned.wrong == 0 { learned.tied } else { 0 }),
+            ),
+            ("checked", exact(learned.checked)),
+            ("space", exact(space)),
+        ]),
+        Search::Local => {
+            if let Some((code, score)) = learned.family {
+                answer.push((
+                    "family",
+                    map(vec![
+                        ("tables", by_code(counting, code)),
+                        (unit, exact(score)),
+                    ]),
+                ));
+            }
+            answer.push(("moves", moves_shown(counting, &learned, unit)));
+            answer.push(("checked", exact(learned.checked)));
+        }
+    }
+    doubt_shown(counting, &learned, &mut answer);
+    if let Some(noise) = learned.noise {
+        answer.push((
+            "noise_estimate",
+            map(vec![
+                ("flips_per_million", exact(noise.per_million)),
+                ("expected_wrong", exact(noise.expected)),
+                ("basis_cells", exact(noise.basis)),
+                ("far_above", Json::Bool(noise.far_above)),
+            ]),
+        ));
+        if noise.far_above {
+            answer.push(("warning", text(LEAST_FAR)));
+        }
+    }
+    answer.extend([
+        ("work", map(vec![("units", exact(learned.units))])),
+        ("stopped", text(stopped.map_or("complete", Stop::name))),
+        ("complete", Json::Bool(learned.complete)),
+        (
+            "iterate",
+            map(vec![
+                (
+                    "alternate",
+                    Json::List(vec![counted(read.plane), counted(write.plane)]),
+                ),
+                ("frames", counted(steps)),
+            ]),
+        ),
+    ]);
+    if let Some(one) = shape.given {
         answer.push(("places", places_shown(counting, one.preset)));
     }
     if let Some(stop) = stopped {

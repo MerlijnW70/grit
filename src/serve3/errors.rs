@@ -93,6 +93,7 @@ pub enum Code {
     StepsWrites,
     StepsSpace,
     NoRuleK,
+    SearchRule,
     PlaneFormat,
     PolyLimit,
     IllConditioned,
@@ -107,7 +108,7 @@ pub enum Code {
     CheckTarget,
 }
 
-pub const CODES: [Code; 101] = [
+pub const CODES: [Code; 102] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -197,6 +198,7 @@ pub const CODES: [Code; 101] = [
     Code::StepsWrites,
     Code::StepsSpace,
     Code::NoRuleK,
+    Code::SearchRule,
     Code::PlaneFormat,
     Code::PolyLimit,
     Code::IllConditioned,
@@ -304,6 +306,7 @@ impl Code {
             Self::StepsWrites => "steps_writes",
             Self::StepsSpace => "steps_space",
             Self::NoRuleK => "no_rule_k",
+            Self::SearchRule => "search_rule",
             Self::PlaneFormat => "plane_format",
             Self::PolyLimit => "poly_limit",
             Self::IllConditioned => "ill_conditioned",
@@ -550,10 +553,13 @@ impl Code {
                 "Give one write on the read's bit: a law applied k times reads back what it wrote."
             }
             Self::StepsSpace => {
-                "Count fewer places with places or place_list, so the rule has at most 18 classes; grit_describe names law_steps_classes."
+                "Drop search or give it local, or count fewer places with places or place_list, so the rule has at most 18 classes; grit_describe names law_steps_classes."
             }
             Self::NoRuleK => {
                 "No counting table applied k times gives every example; check steps, border and the examples, or use another rule; closest names the nearest table and its wrong cells."
+            }
+            Self::SearchRule => {
+                "Drop search, or use rule totalistic or outer; only a counting law is searched over its tables."
             }
             Self::PlaneFormat => {
                 "Under rule linear give each read and write bit 0, frac from 0 to 30, and a range that holds every example input word: a plane holds one signed fixed-point number in its whole word."
