@@ -227,6 +227,10 @@ fn soup(rng: &mut Rng, size: [u32; 3], permille: u64) -> Vec<u32> {
 }
 
 fn learned_on(server: &mut Server<'_>, shape: Shape, table: Table) -> String {
+    learned_in(server, shape, table, false)
+}
+
+fn learned_in(server: &mut Server<'_>, shape: Shape, table: Table, parallel: bool) -> String {
     let (size, densities): ([u32; 3], &[u64]) = match shape {
         Shape::Square => ([32, 32, 1], &[250, 300, 350, 400, 450, 500, 600, 700, 930]),
         Shape::Cube => ([16, 16, 16], &[120, 180, 220, 260, 320, 400, 930]),
@@ -251,7 +255,7 @@ fn learned_on(server: &mut Server<'_>, shape: Shape, table: Table) -> String {
         server,
         "grit_law_learn",
         &format!(
-            "{{\"stencil\":\"{}\",\"reads\":[{{\"plane\":0,\"bit\":0}}],\"writes\":[{{\"plane\":1,\"bit\":0}}],\"border\":\"wrapped\",\"rule\":\"outer\",\"examples\":[{}],\"budget_ms\":{LONG}}}",
+            "{{\"stencil\":\"{}\",\"reads\":[{{\"plane\":0,\"bit\":0}}],\"writes\":[{{\"plane\":1,\"bit\":0}}],\"border\":\"wrapped\",\"rule\":\"outer\",\"parallel\":{parallel},\"examples\":[{}],\"budget_ms\":{LONG}}}",
             shape.name(),
             examples.join(",")
         ),
@@ -538,8 +542,8 @@ fn scattered(rng: &mut Rng, size: [u32; 3], count: usize, bits: u32) -> Vec<([u3
 }
 
 fn counting_case(host: &Host, shape: Shape, table: Table, bits: u32, full: bool) -> Case {
-    let text = learned(host, shape, table);
-    let text = if bits == 32 { sliced(&text) } else { text };
+    let mut server = Server::new(Some(host));
+    let text = learned_in(&mut server, shape, table, bits == 32);
     let law = iterating(&text, [0, 1]);
     let size = match (shape, full) {
         (Shape::Square, false) => [64, 64, 16],
