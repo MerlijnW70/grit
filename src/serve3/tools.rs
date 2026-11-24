@@ -1819,6 +1819,7 @@ pub fn describe(status: &Status) -> Json {
                 ("learn_examples", number(super::law_learn::EXAMPLES_MOST)),
                 ("learn_inputs", number(super::law_learn::INPUTS_MOST)),
                 ("law_steps", text(super::law_learn::STEPS)),
+                ("law_least", text(super::law_learn::LEAST)),
                 ("law_steps_most", number(crate::steps::STEPS_MOST)),
                 ("law_steps_classes", number(crate::steps::CLASSES_MOST)),
                 ("law_linear", text(super::law_real::LINEAR)),
