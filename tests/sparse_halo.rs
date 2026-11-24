@@ -12,8 +12,6 @@ use grit::wire::{Json, written};
 
 const LONG: u64 = 600_000;
 
-const ALL: i64 = 0xFFFF_FFFF;
-
 const LIFE: Table = Table {
     birth: 1 << 3,
     survive: (1 << 2) | (1 << 3),
@@ -281,52 +279,6 @@ fn table_of(shape: Shape, table: Table) -> String {
         format!("[{}]", shown.join(","))
     };
     format!("[[{},{}]]", row(table.birth), row(table.survive))
-}
-
-fn widened(json: &Json) -> Json {
-    let Json::List(items) = json else {
-        return json.clone();
-    };
-    match items.as_slice() {
-        [Json::Text(op), Json::List(inner), Json::Int(1)]
-            if op == "and"
-                && matches!(inner.first(), Some(Json::Text(head)) if head == "look" || head == "at") =>
-        {
-            Json::List(inner.clone())
-        }
-        [Json::Text(op), one, Json::Int(1)] if op == "xor" => Json::List(vec![
-            Json::Text("xor".to_owned()),
-            widened(one),
-            Json::Int(ALL),
-        ]),
-        [Json::Text(op), Json::List(kept), other]
-            if op == "or"
-                && kept.len() == 3
-                && kept.first() == Some(&Json::Text("and".to_owned()))
-                && kept.get(2) == Some(&Json::Int(ALL - 1)) =>
-        {
-            widened(other)
-        }
-        _ => Json::List(items.iter().map(widened).collect()),
-    }
-}
-
-fn sliced(text: &str) -> String {
-    let json = grit::law::parse::read(text).unwrap();
-    let Json::Map(fields) = json else {
-        panic!("a law is an object");
-    };
-    let out: Vec<(String, Json)> = fields
-        .into_iter()
-        .map(|(key, one)| {
-            if key == "step" {
-                (key, widened(&one))
-            } else {
-                (key, one)
-            }
-        })
-        .collect();
-    written(&Json::Map(out))
 }
 
 fn iterating(text: &str, pair: [u32; 2]) -> Law {
@@ -1280,8 +1232,56 @@ mod pinned {
     use grit::wire::{Json, written};
 
     use super::{
-        BAYS, BLUR, LIFE, LONG, Rng, Scratch, Shape, device, int_at, learned_on, ok, quoted, sliced,
+        BAYS, BLUR, LIFE, LONG, Rng, Scratch, Shape, device, int_at, learned_on, ok, quoted,
     };
+
+    const ALL: i64 = 0xFFFF_FFFF;
+
+    fn widened(json: &Json) -> Json {
+        let Json::List(items) = json else {
+            return json.clone();
+        };
+        match items.as_slice() {
+            [Json::Text(op), Json::List(inner), Json::Int(1)]
+                if op == "and"
+                    && matches!(inner.first(), Some(Json::Text(head)) if head == "look" || head == "at") =>
+            {
+                Json::List(inner.clone())
+            }
+            [Json::Text(op), one, Json::Int(1)] if op == "xor" => Json::List(vec![
+                Json::Text("xor".to_owned()),
+                widened(one),
+                Json::Int(ALL),
+            ]),
+            [Json::Text(op), Json::List(kept), other]
+                if op == "or"
+                    && kept.len() == 3
+                    && kept.first() == Some(&Json::Text("and".to_owned()))
+                    && kept.get(2) == Some(&Json::Int(ALL - 1)) =>
+            {
+                widened(other)
+            }
+            _ => Json::List(items.iter().map(widened).collect()),
+        }
+    }
+
+    fn sliced(text: &str) -> String {
+        let json = grit::law::parse::read(text).unwrap();
+        let Json::Map(fields) = json else {
+            panic!("a law is an object");
+        };
+        let out: Vec<(String, Json)> = fields
+            .into_iter()
+            .map(|(key, one)| {
+                if key == "step" {
+                    (key, widened(&one))
+                } else {
+                    (key, one)
+                }
+            })
+            .collect();
+        written(&Json::Map(out))
+    }
 
     fn hex(sum: &[u8; 32]) -> String {
         sum.iter().map(|byte| format!("{byte:02x}")).collect()
