@@ -63,6 +63,8 @@ A law that looks runs on dense and sparse worlds alike, with the same cells afte
 
 An oct that changes wakes the 27 octs around it, so every oct whose box reads a changed cell steps the next two frames. A woken oct in a one-word brick steps the whole brick; a brick whose cells change takes a slot first. A brick left all one word, and untouched for a frame, returns its slot. So memory follows activity: a glider flying through a large world holds only the few bricks around it, and each step answer names `pool_use`.
 
+A frame visits only the bricks near activity, so its cost follows what changes, not the size of the world.
+
 A host write to a sparse world wakes the 27 octs around each written cell's octs, as on dense. A frame is priced as on any sparse world: held bricks times their cells times frames, calibrated under the law's own text.
 
 ## Iterating a law on the device
