@@ -48,7 +48,6 @@ pub enum Code {
     LawNotBuilt,
     KernelNotBuilt,
     QuietRefused,
-    HaloSparse,
     ChipRefused,
     Unbound,
     Overbound,
@@ -101,7 +100,7 @@ pub enum Code {
     LinearRule,
 }
 
-pub const CODES: [Code; 95] = [
+pub const CODES: [Code; 94] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -146,7 +145,6 @@ pub const CODES: [Code; 95] = [
     Code::LawNotBuilt,
     Code::KernelNotBuilt,
     Code::QuietRefused,
-    Code::HaloSparse,
     Code::ChipRefused,
     Code::Unbound,
     Code::Overbound,
@@ -247,7 +245,6 @@ impl Code {
             Self::LawNotBuilt => "law_not_built",
             Self::KernelNotBuilt => "kernel_not_built",
             Self::QuietRefused => "quiet_refused",
-            Self::HaloSparse => "halo_sparse",
             Self::ChipRefused => "chip_refused",
             Self::Unbound => "unbound",
             Self::Overbound => "overbound",
@@ -413,9 +410,6 @@ impl Code {
             }
             Self::QuietRefused => {
                 "Make the world dense, which steps every oct, or keep params under which the law is proved."
-            }
-            Self::HaloSparse => {
-                "Make the world dense: a law that looks (halo 1) runs only on dense worlds."
             }
             Self::ChipRefused => {
                 "Give a chip as grit_machine takes it: inputs plus state at most 31, at least state plus outputs gates, each gate reading an input or a gate before it, kinds 0 to 15."
