@@ -1086,6 +1086,472 @@ fn t3_existing_reads_answer_as_on_the_recorded_base() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+fn held_world(server: &mut Server<'_>, size: [u32; 3], planes: u32) -> i64 {
+    int_at(
+        &ok(
+            server,
+            "grit_world_create",
+            &format!(
+                "{{\"law\":{},\"params\":[],\"wide\":{},\"deep\":{},\"tall\":{},\"sparse\":false,\"budget_ms\":{LONG}}}",
+                quoted(&held_law(planes)),
+                size[0],
+                size[1],
+                size[2]
+            ),
+        ),
+        "world",
+    )
+}
+
+fn put(words: &mut [u32], size: [u32; 3], cells: &[([u32; 3], u32)]) {
+    for (at, word) in cells {
+        words[((at[2] * size[1] + at[1]) * size[0] + at[0]) as usize] = *word;
+    }
+}
+
+struct Run {
+    row: [u32; 2],
+    from: u32,
+    to: u32,
+    bit: u32,
+}
+
+const RUNS: [Run; 9] = [
+    Run {
+        row: [0, 0],
+        from: 0,
+        to: 63,
+        bit: 0,
+    },
+    Run {
+        row: [1, 0],
+        from: 0,
+        to: 32,
+        bit: 1,
+    },
+    Run {
+        row: [2, 0],
+        from: 5,
+        to: 37,
+        bit: 2,
+    },
+    Run {
+        row: [3, 0],
+        from: 31,
+        to: 127,
+        bit: 3,
+    },
+    Run {
+        row: [4, 1],
+        from: 0,
+        to: 127,
+        bit: 4,
+    },
+    Run {
+        row: [5, 1],
+        from: 32,
+        to: 95,
+        bit: 5,
+    },
+    Run {
+        row: [6, 2],
+        from: 64,
+        to: 127,
+        bit: 6,
+    },
+    Run {
+        row: [7, 3],
+        from: 1,
+        to: 64,
+        bit: 7,
+    },
+    Run {
+        row: [8, 3],
+        from: 30,
+        to: 94,
+        bit: 31,
+    },
+];
+
+#[test]
+fn t5_runs_past_32_set_cells_on_a_row_are_tallied_to_their_last_column() {
+    let Some(host) = device("world tally long runs") else {
+        return;
+    };
+    let size = [128_u32, 16, 4];
+    let mut server = Server::new(Some(&host));
+    let world = held_world(&mut server, size, 1);
+    let mut words = vec![0_u32; (size[0] * size[1] * size[2]) as usize];
+    for run in &RUNS {
+        let cells: Vec<([u32; 3], u32)> = (run.from..=run.to)
+            .map(|x| ([x, run.row[0], run.row[1]], 1 << run.bit))
+            .collect();
+        put(&mut words, size, &cells);
+        write(&mut server, world, "", &cells);
+    }
+    let lower: Vec<([u32; 3], u32)> = (0..128)
+        .map(|x| ([x, 9, 2], u32::MAX))
+        .chain((0..100).map(|x| ([x, 10, 2], 0x0000_FF00)))
+        .collect();
+    put(&mut words, size, &lower);
+    write(&mut server, world, "", &lower);
+    assert_eq!(dense_plane(&mut server, world, size, ""), words);
+    let bits: Vec<u32> = RUNS.iter().map(|run| run.bit).collect();
+    let upper = ([0, 0, 0], [127, 8, 3]);
+    let got = answered(&tallied(&mut server, world, "", upper, Some(&bits)));
+    let mut wanted: Vec<Record> = RUNS
+        .iter()
+        .map(|run| Record {
+            bit: run.bit,
+            count: u64::from(run.to - run.from + 1),
+            least: Some([run.from, run.row[0], run.row[1]]),
+            most: Some([run.to, run.row[0], run.row[1]]),
+        })
+        .collect();
+    wanted.sort_by_key(|record| record.bit);
+    assert_eq!(got, wanted, "each bit is one run");
+    assert_eq!(got, host_tally(&words, size, upper, &bits));
+    let mut asked = 0;
+    for corner in [
+        ([0, 0, 0], [127, 15, 3]),
+        ([0, 0, 0], [63, 15, 3]),
+        ([0, 0, 0], [99, 15, 3]),
+        ([1, 0, 0], [127, 15, 3]),
+        ([33, 0, 0], [127, 15, 3]),
+        ([0, 0, 0], [127, 0, 0]),
+        ([5, 2, 0], [37, 2, 0]),
+        ([0, 3, 0], [126, 7, 3]),
+        ([31, 0, 1], [64, 15, 2]),
+        ([0, 9, 2], [127, 10, 2]),
+    ] {
+        for bits in [
+            None,
+            Some(&bits[..]),
+            Some(&[31_u32][..]),
+            Some(&[8, 0][..]),
+        ] {
+            let got = answered(&tallied(&mut server, world, "", corner, bits));
+            let wanted = host_tally(&words, size, corner, bits.unwrap_or(&ALL));
+            assert!(
+                got == wanted,
+                "{corner:?} {bits:?}:\n got {got:?}\nwant {wanted:?}"
+            );
+            asked += 1;
+        }
+    }
+    println!(
+        "T5 {} runs of 33 to 128 set cells on rows of a 128x16x4 world and two full rows: {asked} tallies equal to the host",
+        RUNS.len()
+    );
+}
+
+fn life_step(size: [u32; 3], words: &[u32]) -> Vec<u32> {
+    let [wide, deep, tall] = size.map(|side| side as usize);
+    let mut out = vec![0_u32; words.len()];
+    for z in 0..tall {
+        for y in 0..deep {
+            for x in 0..wide {
+                let mut around = 0;
+                for dy in [deep - 1, 0, 1] {
+                    for dx in [wide - 1, 0, 1] {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        around += words[(z * deep + (y + dy) % deep) * wide + (x + dx) % wide] & 1;
+                    }
+                }
+                let at = (z * deep + y) * wide + x;
+                out[at] = u32::from(around == 3 || (words[at] & 1 == 1 && around == 2));
+            }
+        }
+    }
+    out
+}
+
+fn life_steps(size: [u32; 3], words: &[u32], frames: u32) -> Vec<u32> {
+    (0..frames).fold(words.to_vec(), |held, _| life_step(size, &held))
+}
+
+fn host_checked(
+    server: &mut Server<'_>,
+    world: i64,
+    size: [u32; 3],
+    (plane, words): (&str, &[u32]),
+    label: &str,
+) -> u64 {
+    assert_eq!(
+        dense_plane(server, world, size, plane),
+        words,
+        "{label}: the dense read is the host's"
+    );
+    let mut counted = 0;
+    for corner in boxes(size) {
+        for bits in BIT_SETS {
+            let got = answered(&tallied(server, world, plane, corner, bits));
+            let wanted = host_tally(words, size, corner, bits.unwrap_or(&ALL));
+            assert!(
+                got == wanted,
+                "{label} {plane} {corner:?} {bits:?}:\n got {got:?}\nwant {wanted:?}"
+            );
+            counted += got.iter().map(|record| record.count).sum::<u64>();
+        }
+    }
+    counted
+}
+
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(label: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "grit-world-tally-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn plane_named(plane: usize) -> String {
+    format!("\"plane\":{plane},")
+}
+
+#[test]
+fn t6_forked_restored_and_opened_dense_worlds_are_tallied_as_the_host() {
+    let Some(host) = device("world tally fork restore open") else {
+        return;
+    };
+    let scratch = Scratch::new("t6");
+    let options = grit::serve3::Options {
+        dir: Some(scratch.0.join("worlds")),
+        memory: None,
+    };
+    let size = [64_u32, 64, 2];
+    let held_size = [32_u32, 32, 16];
+    let current = "\"current\":true,";
+    let mut counted = Vec::new();
+    let (life_kept, held_kept) = {
+        let mut server = Server::with(Some(&host), &options).unwrap();
+        let kind = Kind {
+            name: "life-dense-2d",
+            size,
+            planes: 2,
+            mask: 1,
+            sparse: false,
+            iterating: true,
+        };
+        let source = created(&mut server, &kind);
+        let mut rng = Rng(0x7A6);
+        let mut start = vec![0_u32; (size[0] * size[1] * size[2]) as usize];
+        let mut cells = Vec::new();
+        for z in 0..2 {
+            for y in 8..40 {
+                for x in 10..50 {
+                    if rng.below(100) < 35 {
+                        cells.push(([x, y, z], 1));
+                    }
+                }
+            }
+        }
+        cells.extend((0..48).map(|x| ([x, 52, 1], 1)));
+        cells.extend((3..63).map(|x| ([x, 58, 0], 1)));
+        put(&mut start, size, &cells);
+        write(&mut server, source, current, &cells);
+        step(&mut server, source, 3);
+        let mut model = life_steps(size, &start, 3);
+        counted.push(host_checked(
+            &mut server,
+            source,
+            size,
+            (current, &model),
+            "source at 3",
+        ));
+        let fork = int_at(
+            &ok(
+                &mut server,
+                "grit_world_fork",
+                &format!("{{\"world\":{source}}}"),
+            ),
+            "world",
+        );
+        counted.push(host_checked(
+            &mut server,
+            fork,
+            size,
+            (current, &model),
+            "fork at 3",
+        ));
+        step(&mut server, fork, 5);
+        let forked = life_steps(size, &model, 5);
+        counted.push(host_checked(
+            &mut server,
+            fork,
+            size,
+            (current, &forked),
+            "fork at 8",
+        ));
+        let extra: Vec<([u32; 3], u32)> = (0..40).map(|x| ([x + 12, 2, 0], 1)).collect();
+        put(&mut model, size, &extra);
+        write(&mut server, source, current, &extra);
+        step(&mut server, source, 2);
+        model = life_steps(size, &model, 2);
+        counted.push(host_checked(
+            &mut server,
+            source,
+            size,
+            (current, &model),
+            "source at 5",
+        ));
+        ok(
+            &mut server,
+            "grit_world_restore",
+            &format!("{{\"world\":{source},\"from\":{fork}}}"),
+        );
+        counted.push(host_checked(
+            &mut server,
+            source,
+            size,
+            (current, &forked),
+            "restored at 8",
+        ));
+        step(&mut server, source, 1);
+        let restored = life_steps(size, &forked, 1);
+        counted.push(host_checked(
+            &mut server,
+            source,
+            size,
+            (current, &restored),
+            "restored at 9",
+        ));
+        let mut seen = Seen::default();
+        for reference in references(&kind) {
+            plane_tallied(
+                &mut seen,
+                &mut server,
+                source,
+                size,
+                &reference,
+                "restored life",
+            );
+        }
+        ok(
+            &mut server,
+            "grit_world_save",
+            &format!("{{\"world\":{source},\"name\":\"life\"}}"),
+        );
+
+        let kept = held_world(&mut server, held_size, 3);
+        let mut planes =
+            vec![vec![0_u32; (held_size[0] * held_size[1] * held_size[2]) as usize]; 3];
+        for (plane, words) in planes.iter_mut().enumerate() {
+            let shift = u32::try_from(plane).unwrap();
+            let mut cells: Vec<([u32; 3], u32)> = (0..40)
+                .map(|x| ([x % 32, 3 + shift, x / 32 + shift], 0x8000_0001 >> shift))
+                .collect();
+            cells.extend(block([8 + shift, 16, 4], 8, 0x0F0F_0000 | shift));
+            put(words, held_size, &cells);
+            write(&mut server, kept, &plane_named(plane), &cells);
+        }
+        step(&mut server, kept, 2);
+        let copy = int_at(
+            &ok(
+                &mut server,
+                "grit_world_fork",
+                &format!("{{\"world\":{kept}}}"),
+            ),
+            "world",
+        );
+        let saved = planes.clone();
+        for (plane, words) in planes.iter().enumerate() {
+            counted.push(host_checked(
+                &mut server,
+                copy,
+                held_size,
+                (&plane_named(plane), words),
+                "held fork",
+            ));
+        }
+        for (plane, words) in planes.iter_mut().enumerate() {
+            let cells: Vec<([u32; 3], u32)> = (0..32)
+                .map(|x| ([x, 30, 15], 0xFFFF_FFFF))
+                .chain(std::iter::once(([8, 16, 4], 0)))
+                .collect();
+            put(words, held_size, &cells);
+            write(&mut server, kept, &plane_named(plane), &cells);
+            counted.push(host_checked(
+                &mut server,
+                kept,
+                held_size,
+                (&plane_named(plane), words),
+                "held changed",
+            ));
+        }
+        ok(
+            &mut server,
+            "grit_world_restore",
+            &format!("{{\"world\":{kept},\"from\":{copy}}}"),
+        );
+        for (plane, words) in saved.iter().enumerate() {
+            counted.push(host_checked(
+                &mut server,
+                kept,
+                held_size,
+                (&plane_named(plane), words),
+                "held restored",
+            ));
+        }
+        ok(
+            &mut server,
+            "grit_world_save",
+            &format!("{{\"world\":{kept},\"name\":\"held\"}}"),
+        );
+        (restored, saved)
+    };
+    let mut server = Server::with(Some(&host), &options).unwrap();
+    let opened = ok(&mut server, "grit_world_open", "{\"name\":\"life\"}");
+    let life = int_at(&opened, "world");
+    assert_eq!(int_at(&opened, "frame"), 9);
+    counted.push(host_checked(
+        &mut server,
+        life,
+        size,
+        (current, &life_kept),
+        "opened at 9",
+    ));
+    step(&mut server, life, 4);
+    let later = life_steps(size, &life_kept, 4);
+    counted.push(host_checked(
+        &mut server,
+        life,
+        size,
+        (current, &later),
+        "opened at 13",
+    ));
+    let opened = ok(&mut server, "grit_world_open", "{\"name\":\"held\"}");
+    let held = int_at(&opened, "world");
+    for (plane, words) in held_kept.iter().enumerate() {
+        counted.push(host_checked(
+            &mut server,
+            held,
+            held_size,
+            (&plane_named(plane), words),
+            "held opened",
+        ));
+    }
+    println!("T6 counts per check: {counted:?}");
+    assert!(counted.iter().all(|count| *count > 0), "{counted:?}");
+}
+
 #[cfg(feature = "faults")]
 mod traffic {
     use super::*;
