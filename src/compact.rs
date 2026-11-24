@@ -404,6 +404,7 @@ pub fn scan_at(
         aggregate,
         alone: None,
         along,
+        over: Over::Every,
     };
     match subgroup {
         4 => scanned::<4>(subgroup, at),
@@ -425,6 +426,35 @@ pub fn whole(subgroup: u32, from: u32, into: u32, tier: Tier) -> Result<Vec<u32>
         aggregate: tier.totals,
         alone: Some((tier.totals, tier.grand)),
         along: Along::START,
+        over: Over::Every,
+    };
+    match subgroup {
+        4 => scanned::<4>(subgroup, at),
+        8 => scanned::<8>(subgroup, at),
+        16 => scanned::<16>(subgroup, at),
+        32 => scanned::<32>(subgroup, at),
+        64 => scanned::<64>(subgroup, at),
+        other => Err(LaneError::NoMapping {
+            lanes: other,
+            width: subgroup,
+        }),
+    }
+}
+
+pub fn scan_over(
+    subgroup: u32,
+    from: u32,
+    into: u32,
+    aggregate: u32,
+    over: Over,
+) -> Result<Vec<u32>, LaneError> {
+    let at = Scanning {
+        from,
+        into,
+        aggregate,
+        alone: None,
+        along: Along::START,
+        over,
     };
     match subgroup {
         4 => scanned::<4>(subgroup, at),
@@ -445,6 +475,7 @@ struct Scanning {
     aggregate: u32,
     alone: Option<(u32, u32)>,
     along: Along,
+    over: Over,
 }
 
 fn scanned<const LANES: u32>(subgroup: u32, at: Scanning) -> Result<Vec<u32>, LaneError> {
@@ -454,15 +485,19 @@ fn scanned<const LANES: u32>(subgroup: u32, at: Scanning) -> Result<Vec<u32>, La
         aggregate,
         alone,
         along,
+        over,
     } = at;
     let mut held = vec![from, into, aggregate];
     if let Some((totals, grand)) = alone {
         held.extend([totals, grand]);
     }
+    if let Over::Listed(binding) = over {
+        held.push(binding);
+    }
     let mut kernel = Kernel::<U32>::new(Shape::new(subgroup, subgroup, reaching(&held)))?;
     let uint = kernel.index_type();
 
-    let block = kernel.workgroup_index();
+    let block = owned(&mut kernel, over)?;
     let lane = kernel.local_index();
     let span = kernel.module().constant_u32(sweep::cells(subgroup))?;
     let start = kernel.module().i_mul(uint, block, span)?;
