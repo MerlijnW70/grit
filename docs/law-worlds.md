@@ -284,7 +284,7 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `reads` | `{plane, bit}`, each read at every place; places times reads at most 27 |
 | `writes` | `{plane, bit}`, written at the cell itself |
 | `border` | `zero`: a neighbour past an example's edge reads 0. `wrapped`: an inline example wraps on itself, and a world example's box reads its neighbours from that world |
-| `rule` | `minimal`, `symmetric`, `totalistic` or `outer`, below |
+| `rule` | `minimal`, `symmetric`, `totalistic`, `outer` or `linear`, below |
 | `examples` | inline `{size, input, output}`, with one word list per read and per write, x fastest, at most 4096 words a list; or `{world, output_world, from, to}` for larger ones, up to 2^20 cells over all examples |
 | `gates`, `crowd`, `rounds`, `seed` | the search's effort, as `grit_least` |
 | `start` | under `minimal` and `symmetric`, a circuit to begin from; see [A start](#a-start) |
@@ -465,3 +465,40 @@ A brake before each 64 tables stops on budget or cancel; an answer can come late
 
 A complete search that finds no table is refused `no_rule_k` at `$.examples`. `closest` names the first table with the fewest wrong example cells as `tables` and its `wrong` cells, with `cells`, `checked`, `space` and `steps`.
 
+
+### Fixed-point linear laws
+
+`rule` `linear` learns a law over numbers: heat, concentrations, densities. Each read and written plane holds one signed fixed-point number a cell, the whole 32-bit word in two's complement with `frac` fractional bits (16 if left out, at most 30): the word as a signed integer over 2^`frac`. A read or write names `plane` and `bit` 0.
+
+| Field | Meaning |
+|---|---|
+| `poly` | 1 (default): the read words at the counted places. 2 adds the product of the centres of each two reads and each centre times the sum of a read's other counted places. 3 adds the product of each three centres, so Gray-Scott's u·v² is a term |
+| `frac` | the fractional bits of every read and written word |
+| `places`, `place_list` | the counted places, as for the counting rules |
+| `clamp` | `[least, greatest]` signed words each written word is clamped to |
+| `range` | `[least, greatest]` signed words of every read the law never wraps on; it must hold every example input word, else `plane_format` at `$.range`. The examples' own least and greatest if left out |
+
+The fit is exact least squares over every example cell. The normal equations are summed in integers, centred and scaled, and solved in f64 by Cholesky; the answer's `condition` is the ratio of the largest to the smallest eigenvalue of the centred, scaled normal matrix. Past 1e10, or with a term the same on every cell, the request is refused `ill_conditioned` at `$.examples`, with `condition`.
+
+The law computes, with every add and multiply wrapping on 32 bits:
+
+- `rnd_s(v) = floor(v / 2^s + 1/2)`: round to nearest, ties toward +infinity, as `((v + 2^(s-1) + 2^31) >> s) - 2^(31-s)` with a logical shift. A product term is `rnd_frac` of the 32-bit product; a cube rounds after each product.
+- `y = ((D + sum_j C_j * T_j) >> k) - 2^(31-k)`, with `D = B + 2^(k-1) + 2^31`, then `clamp`.
+
+`C_j` and `B` are the fit's coefficients and bias rounded to `k` fractional bits; `k` is the largest from 30 down whose sum of coefficients times terms over `range` fits one word, so inside `range` no step wraps. On a device the law equals this formula bit for bit. When no `k` fits, or a product passes 31 bits, the request is refused `fixed_range` at `$.frac`, and `limit` names the largest `frac` that fits.
+
+The answer has `law`, `hash`, `halo`, `quiet`, `stepping` and `nodes` as above, and:
+
+| Field | Meaning |
+|---|---|
+| `terms` | in order: `place` (`read`, `place`, `at`), `product` and `cube` (`reads`, the centres multiplied), `centre_times_others` (`reads`: the centre of the first times the sum of the second's other counted places) |
+| `coefficients` | per write, per term: `value` (the exact decimal of `fixed` over 2^k), `fixed` (C_j), `fit` (the f64 solution) and `stderr` |
+| `bias` | per write: `value` (B over 2^(frac+k)), `fixed` (B), `fit`, `stderr` |
+| `fixed` | `frac`, `coefficient_frac` (k per write), `format`, `rounding`, `range` per read, and `clamp` |
+| `residual` | per write, of the law as it runs on every example cell: `max` and `rms` in words, `sum_squares` exact, `max_real`, `rms_real`, and `fit_rms_real` of the f64 fit. Noise on the outputs shows here |
+| `symmetry` | `group` (`D4` for 3x3, `Oh`, order 48, for 3x3x3) and `invariant`: per write the place coefficients of each read and their images under every move differ by at most max(2^-k, 6 standard errors of the difference); `deviation`, `tolerance`, `read` and `places` name the pair furthest past it |
+| `iterate` | one read and one write: `alternate`; as many reads as writes: `copy`, the written plane and the read plane to write it back to after each frame |
+
+It needs no device and has no brake. Refused before any example is read: `plane_format` (a bit other than 0, `frac` past 30), `poly_limit` (`poly` past 3), `learn_limit` at `$.reads` (reads times counted places past 27), `linear_rule` (`poly`, `frac`, `clamp` or `range` under another rule), `reversed` (a `clamp` or `range` whose least is past its greatest), `start_rule`, `noise_rule` and `steps_rule`.
+
+Heat from four 64x64 pairs, `alpha` 0.15: `stencil` `3x3`, `reads` `[{"plane":0,"bit":0}]`, `writes` `[{"plane":1,"bit":0}]`, `border` `wrapped`, `places` `von_neumann`: the four face coefficients are alpha, the centre 1 - 4 alpha. Run it with `alternate` `[0,1]`. Gray-Scott reads u and v on planes 0 and 1, writes planes 2 and 3, with `poly` 3 and `frac` 14.

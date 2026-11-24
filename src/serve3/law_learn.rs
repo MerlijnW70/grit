@@ -12,6 +12,7 @@ use crate::wire::{Json, counted, map, text};
 use super::budget::{Guard, Stop};
 use super::errors::{Code, Refusal};
 use super::gradient::Told;
+use super::law_real;
 use super::schema::{choice, object, property, whole, with, word};
 use super::tools::{int, ints, limited, refused, tool, unread};
 use super::{Failed, Server, Tool};
@@ -567,8 +568,8 @@ fn learn_shown() -> Json {
             (
                 "rule",
                 choice(
-                    "how rows the examples never showed are decided: minimal, the smallest circuit found; symmetric, alike under the stencil's rotations and reflections; totalistic, by the count of places whose read bit is 1; outer, by the centre's bit and the count of the other places. totalistic and outer take one read, read each write's table from the seen rows in one pass with no search, and decide a count never seen 0",
-                    &["minimal", "symmetric", "totalistic", "outer"],
+                    "how rows the examples never showed are decided: minimal, the smallest circuit found; symmetric, alike under the stencil's rotations and reflections; totalistic, by the count of places whose read bit is 1; outer, by the centre's bit and the count of the other places. totalistic and outer take one read, read each write's table from the seen rows in one pass with no search, and decide a count never seen 0. linear reads whole words as signed fixed-point numbers and fits each write as a sum of coefficients times terms plus a bias, by least squares",
+                    &["minimal", "symmetric", "totalistic", "outer", "linear"],
                 ),
             ),
             (
@@ -674,6 +675,40 @@ fn learn_shown() -> Json {
                     "rule totalistic or outer: k, how many applications of the law lie between each example's input and output; 1 if left out, at most 8; above 1 every table of the rule is searched",
                     1,
                     i64::from(u32::MAX),
+                ),
+            ),
+            (
+                "poly",
+                whole(
+                    "rule linear: 1 (if left out) for the counted places only; 2 adds the products of two reads' centres and each centre times the sum of a read's other counted places; 3 adds the products of three centres",
+                    1,
+                    i64::from(u32::MAX),
+                ),
+            ),
+            (
+                "frac",
+                whole(
+                    "rule linear: the fractional bits of the signed fixed-point number in each read and written word; 16 if left out, at most 30",
+                    0,
+                    i64::from(u32::MAX),
+                ),
+            ),
+            (
+                "clamp",
+                list_shown(
+                    whole("a signed word", i64::from(i32::MIN), i64::from(i32::MAX)),
+                    "rule linear: [least, greatest] signed words each written word is clamped to",
+                    2,
+                    2,
+                ),
+            ),
+            (
+                "range",
+                list_shown(
+                    whole("a signed word", i64::from(i32::MIN), i64::from(i32::MAX)),
+                    "rule linear: [least, greatest] signed words of every read the law is built never to wrap on; it must hold every example input word; the examples' own least and greatest if left out",
+                    2,
+                    2,
                 ),
             ),
             (
@@ -1640,7 +1675,7 @@ fn places_refused(field: &str, message: String) -> Failed {
     refused(Code::Places, field, message)
 }
 
-fn masked(held: &Json, stencil: Stencil) -> Result<Option<Masked>, Failed> {
+fn masked(held: &Json, stencil: Stencil, what: &str) -> Result<Option<Masked>, Failed> {
     let positions = stencil.positions();
     let centre = stencil.place([0, 0, 0]);
     match (held.get("places"), held.get("place_list")) {
@@ -1695,7 +1730,7 @@ fn masked(held: &Json, stencil: Stencil) -> Result<Option<Masked>, Failed> {
                 return Err(places_refused(
                     "$.place_list",
                     format!(
-                        "the centre, place {centre} of the {} stencil, is not named, and a counting law always reads it",
+                        "the centre, place {centre} of the {} stencil, is not named, and {what} always reads it",
                         stencil.name()
                     ),
                 ));
@@ -1766,7 +1801,7 @@ fn counted_law(
             counted(1),
         ));
     }
-    let given = masked(held, stencil)?;
+    let given = masked(held, stencil, "a counting law")?;
     let support = support_of(held, stencil)?;
     let counting = Counting {
         tally,
@@ -1934,6 +1969,207 @@ fn counted_law(
     Ok(map(answer))
 }
 
+const LINEAR_KEYS: [&str; 4] = ["poly", "frac", "clamp", "range"];
+
+pub const LINEAR_ITERATE: &str = "after each frame write each written plane's words back to the read plane at the same position in reads, then step again";
+
+fn signed_pair(held: &Json, key: &str) -> Result<Option<[i32; 2]>, Failed> {
+    let Some(one) = held.get(key) else {
+        return Ok(None);
+    };
+    let words = one
+        .list()
+        .ok_or_else(|| unread(key))?
+        .iter()
+        .map(|item| {
+            item.int()
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| unread(key))
+        })
+        .collect::<Result<Vec<i32>, Failed>>()?;
+    let pair = <[i32; 2]>::try_from(words.as_slice()).map_err(|_| unread(key))?;
+    if pair[0] > pair[1] {
+        return Err(refused(
+            Code::Reversed,
+            &format!("$.{key}"),
+            format!(
+                "{key} [{}, {}] has its least past its greatest",
+                pair[0], pair[1]
+            ),
+        ));
+    }
+    Ok(Some(pair))
+}
+
+fn whole_words(spots: &[Bit], key: &str) -> Result<Vec<u32>, Failed> {
+    for (which, spot) in spots.iter().enumerate() {
+        if spot.bit != 0 {
+            return Err(refused(
+                Code::PlaneFormat,
+                &format!("$.{key}[{which}].bit"),
+                format!(
+                    "{key} {which} names bit {}, and under rule linear plane {} holds one signed fixed-point number in its whole word, from bit 0",
+                    spot.bit, spot.plane
+                ),
+            ));
+        }
+    }
+    Ok(spots.iter().map(|one| one.plane).collect())
+}
+
+fn linear_law(
+    server: &mut Server<'_>,
+    held: &Json,
+    asked: &Asked,
+    vote: bool,
+) -> Result<Json, Failed> {
+    let stencil = asked.stencil;
+    if held.get("start").is_some() {
+        return Err(refused(
+            Code::StartRule,
+            "$.start",
+            "rule linear fits its coefficients by least squares with no search, so it takes no start; start goes with rule minimal or symmetric".to_owned(),
+        ));
+    }
+    if vote {
+        return Err(refused(
+            Code::NoiseRule,
+            "$.noise",
+            "rule linear fits by least squares and reports the residual, so it takes no vote; noise vote goes with rule totalistic or outer".to_owned(),
+        ));
+    }
+    let reads = whole_words(&asked.reads, "reads")?;
+    let writes = whole_words(&asked.writes, "writes")?;
+    let poly = match held.get("poly") {
+        None => 1,
+        Some(_) => int(held, "poly")?,
+    };
+    if poly > law_real::POLY_MOST {
+        return Err(limited(
+            Code::PolyLimit,
+            "$.poly",
+            format!(
+                "poly {poly} asks for terms of degree {poly}, and rule linear builds terms up to degree {}",
+                law_real::POLY_MOST
+            ),
+            counted(law_real::POLY_MOST),
+        ));
+    }
+    let frac = match held.get("frac") {
+        None => law_real::FRAC,
+        Some(_) => int(held, "frac")?,
+    };
+    if frac > law_real::FRAC_MOST {
+        return Err(limited(
+            Code::PlaneFormat,
+            "$.frac",
+            format!(
+                "frac {frac} leaves no bit for the sign and the whole part of a 32-bit word; frac goes up to {}",
+                law_real::FRAC_MOST
+            ),
+            counted(law_real::FRAC_MOST),
+        ));
+    }
+    let clamp = signed_pair(held, "clamp")?;
+    let range = signed_pair(held, "range")?;
+    let given = masked(held, stencil, "a linear law")?;
+    let mask = given
+        .as_ref()
+        .map_or((1 << stencil.positions()) - 1, |one| one.mask);
+    let read_count = u32::try_from(reads.len()).unwrap_or(u32::MAX);
+    let places = mask.count_ones();
+    let inputs = places.saturating_mul(read_count);
+    if inputs > INPUTS_MOST {
+        return Err(limited(
+            Code::LearnLimit,
+            "$.reads",
+            format!(
+                "{read_count} reads at {places} counted places of the {} stencil make {inputs} place terms, more than the {INPUTS_MOST} a learned law takes",
+                stencil.name()
+            ),
+            counted(INPUTS_MOST / places.max(1)),
+        ));
+    }
+    let channels = channels_of(held, asked)?;
+    plane_checks(asked, channels)?;
+    let owned = examples_of(server, asked, held)?;
+    if let Some([least, most]) = range {
+        for (at, example) in owned.iter().enumerate() {
+            for (read, words) in example.inputs.iter().enumerate() {
+                if let Some(word) = words
+                    .iter()
+                    .map(|one| one.cast_signed())
+                    .find(|one| *one < least || *one > most)
+                {
+                    return Err(refused(
+                        Code::PlaneFormat,
+                        "$.range",
+                        format!(
+                            "example {at} holds word {word} on read {read}, outside range [{least}, {most}]; the law is built never to wrap inside range, so range must hold every example input word"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    let samples: Vec<Sample<'_>> = owned.iter().map(Owned::sample).collect();
+    let name = held.get("name").and_then(Json::text).unwrap_or("learned");
+    let plan = law_real::Plan {
+        stencil,
+        reads: &reads,
+        writes: &writes,
+        mask,
+        poly,
+        frac,
+        clamp,
+        range,
+        border: asked.border,
+        channels,
+        name,
+    };
+    let mut answer = law_real::learned(&plan, &samples)?;
+    let cells: u64 = owned.iter().map(|one| cells_of(one.inner)).sum();
+    let iterate = match (reads.as_slice(), writes.as_slice()) {
+        ([read], [write]) => map(vec![(
+            "alternate",
+            Json::List(vec![counted(*read), counted(*write)]),
+        )]),
+        _ if reads.len() == writes.len() => map(vec![
+            (
+                "copy",
+                Json::List(
+                    writes
+                        .iter()
+                        .zip(&reads)
+                        .map(|(write, read)| Json::List(vec![counted(*write), counted(*read)]))
+                        .collect(),
+                ),
+            ),
+            ("means", text(LINEAR_ITERATE)),
+        ]),
+        _ => map(Vec::new()),
+    };
+    answer.extend([
+        ("stencil", text(stencil.name())),
+        ("row_order", text(stencil::ORDER)),
+        ("border", text(border_name(asked.border))),
+        ("runs_as", text(runs_as(asked.border))),
+        ("examples", map(vec![("cells", exact(cells))])),
+        ("iterate", iterate),
+        ("ladder", Json::List(Vec::new())),
+        ("stopped", text(NO_SEARCH)),
+    ]);
+    if let Some(one) = &given {
+        let counting = Counting {
+            tally: Tally::Totalistic,
+            stencil,
+            mask,
+        };
+        answer.push(("places", places_shown(counting, one.preset)));
+    }
+    Ok(map(answer))
+}
+
 fn deviation_shown(one: &Deviation, tally: Tally, counts: u32) -> Json {
     let mut fields = vec![
         ("example", counted(one.example)),
@@ -2068,6 +2304,21 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             "min_support marks the counts a vote decides on few example cells, and noise is not vote; min_support goes with noise vote".to_owned(),
         ));
     }
+    let linear = held.get("rule").and_then(Json::text) == Some("linear");
+    if !linear {
+        for key in LINEAR_KEYS {
+            if held.get(key).is_some() {
+                return Err(refused(
+                    Code::LinearRule,
+                    &format!("$.{key}"),
+                    format!(
+                        "{key} shapes a fixed-point law, and rule {} learns a law over bits; {key} goes with rule linear",
+                        held.get("rule").and_then(Json::text).unwrap_or("")
+                    ),
+                ));
+            }
+        }
+    }
     let steps = steps_of(held)?;
     if steps > 1 {
         let tally = match held.get("rule").and_then(Json::text) {
@@ -2082,6 +2333,15 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
                     ),
                 ));
             }
+            Some("linear") => {
+                return Err(refused(
+                    Code::StepsRule,
+                    "$.steps",
+                    format!(
+                        "steps {steps} searches the tables of a counting rule, and rule linear fits one step by least squares; steps above 1 go with rule totalistic or outer"
+                    ),
+                ));
+            }
             _ => return Err(unread("rule")),
         };
         return stepped_law(server, held, &asked, tally, (steps, vote));
@@ -2091,6 +2351,7 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         Some("minimal") => false,
         Some("totalistic") => return counted_law(server, held, &asked, Tally::Totalistic, vote),
         Some("outer") => return counted_law(server, held, &asked, Tally::Outer, vote),
+        Some("linear") => return linear_law(server, held, &asked, vote),
         _ => return Err(unread("rule")),
     };
     if vote {
@@ -2879,7 +3140,7 @@ fn stepped_law(
             counted(1),
         ));
     };
-    let given = masked(held, stencil)?;
+    let given = masked(held, stencil, "a counting law")?;
     let counting = Counting {
         tally,
         stencil,

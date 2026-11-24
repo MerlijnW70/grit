@@ -1822,6 +1822,15 @@ pub fn describe(status: &Status) -> Json {
                 ("law_steps", text(super::law_learn::STEPS)),
                 ("law_steps_most", number(crate::steps::STEPS_MOST)),
                 ("law_steps_classes", number(crate::steps::CLASSES_MOST)),
+                ("law_linear", text(super::law_real::LINEAR)),
+                ("law_linear_format", text(super::law_real::FORMAT)),
+                ("law_linear_rounding", text(super::law_real::ROUNDING)),
+                ("law_linear_poly_most", number(super::law_real::POLY_MOST)),
+                ("law_linear_frac_most", number(super::law_real::FRAC_MOST)),
+                (
+                    "law_linear_condition_most",
+                    text(&format!("{:.0e}", super::law_real::CONDITION_MOST)),
+                ),
                 (
                     "law_steps_tables",
                     number(super::law_learn::STEPS_TABLES_MOST),

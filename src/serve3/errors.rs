@@ -94,9 +94,14 @@ pub enum Code {
     StepsWrites,
     StepsSpace,
     NoRuleK,
+    PlaneFormat,
+    PolyLimit,
+    IllConditioned,
+    FixedRange,
+    LinearRule,
 }
 
-pub const CODES: [Code; 90] = [
+pub const CODES: [Code; 95] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -187,6 +192,11 @@ pub const CODES: [Code; 90] = [
     Code::StepsWrites,
     Code::StepsSpace,
     Code::NoRuleK,
+    Code::PlaneFormat,
+    Code::PolyLimit,
+    Code::IllConditioned,
+    Code::FixedRange,
+    Code::LinearRule,
 ];
 
 impl Code {
@@ -283,6 +293,11 @@ impl Code {
             Self::StepsWrites => "steps_writes",
             Self::StepsSpace => "steps_space",
             Self::NoRuleK => "no_rule_k",
+            Self::PlaneFormat => "plane_format",
+            Self::PolyLimit => "poly_limit",
+            Self::IllConditioned => "ill_conditioned",
+            Self::FixedRange => "fixed_range",
+            Self::LinearRule => "linear_rule",
         }
     }
 
@@ -524,6 +539,19 @@ impl Code {
             }
             Self::NoRuleK => {
                 "No counting table applied k times gives every example; check steps, border and the examples, or use another rule; closest names the nearest table and its wrong cells."
+            }
+            Self::PlaneFormat => {
+                "Under rule linear give each read and write bit 0, frac from 0 to 30, and a range that holds every example input word: a plane holds one signed fixed-point number in its whole word."
+            }
+            Self::PolyLimit => "Give poly 1, 2 or 3; 3 adds the products of three centres.",
+            Self::IllConditioned => {
+                "Give examples whose terms vary independently, or fewer reads, places or poly terms; condition names how close to dependent they are."
+            }
+            Self::FixedRange => {
+                "Lower frac, narrow range or drop poly so the sum of coefficients times terms fits one 32-bit word; limit names the largest frac that fits."
+            }
+            Self::LinearRule => {
+                "Drop poly, frac, clamp and range, or use rule linear; only a fixed-point law reads them."
             }
         }
     }
