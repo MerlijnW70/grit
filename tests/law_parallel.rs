@@ -10,15 +10,17 @@ use grit::Host;
 use grit::branch::{Made, Stepping, World};
 use grit::halo::{self, BOX};
 use grit::law::Law;
-use grit::law::chip::{Circuit, Copies, Read, Rest, Spot, Wired, Wiring};
+use grit::law::chip::{
+    Circuit, Copies, Fault, KEEPS, READS, Read, Rest, Spot, WRITES, Wired, Wiring,
+};
 use grit::netlist::Gate;
 use grit::rule3::{CORNERS, Oct, Rule};
 use grit::serve3::Server;
 use grit::wire::{Json, written};
 
 use pinned::{
-    Counted, LONG, Rng, bays, cells, cube_faces, examples, index, inline, life, majority, moore,
-    neighbour, request, soup,
+    Counted, LONG, Rng, bays, cells, cube_faces, examples, index, inline, life, majority,
+    minimal_request, moore, more_requests, request, soup, spots,
 };
 
 const KINDS: u32 = 16;
@@ -174,18 +176,6 @@ fn world<'host>(host: &'host Host, law: &Law, size: [u32; 3], stepping: Stepping
     .unwrap()
 }
 
-fn spots(size: [u32; 3]) -> Vec<[u32; 3]> {
-    let mut out = Vec::with_capacity(cells(size));
-    for z in 0..size[2] {
-        for y in 0..size[1] {
-            for x in 0..size[0] {
-                out.push([x, y, z]);
-            }
-        }
-    }
-    out
-}
-
 fn whole_plane(world: &mut World<'_>, plane: u32, size: [u32; 3], words: &[u32]) {
     let put: Vec<([u32; 3], u32)> = spots(size)
         .into_iter()
@@ -284,42 +274,6 @@ fn copies_compared(
         cells: cells(size),
         set,
     }
-}
-
-fn minimal_step(cube: bool, size: [u32; 3], words: &[u32], wrapped: bool) -> Vec<u32> {
-    let (up, down) = if cube {
-        ([0, 0, 1], [0, 0, -1])
-    } else {
-        ([0, -1, 0], [0, 1, 0])
-    };
-    spots(size)
-        .into_iter()
-        .map(|at| {
-            let here = words[index(size, at)] & 1;
-            let read = |step: [i64; 3]| {
-                neighbour(size, at, step, wrapped).map_or(0, |spot| words[spot] & 1)
-            };
-            (here ^ read(up)) & (1 ^ read(down))
-        })
-        .collect()
-}
-
-fn minimal_request(cube: bool) -> String {
-    let size = if cube { [8, 8, 8] } else { [32, 32, 1] };
-    let mut rng = Rng(if cube { 0x3D } else { 0x2D });
-    let shown: Vec<String> = [300, 450, 600]
-        .iter()
-        .map(|&permille| {
-            let input = soup(&mut rng, cells(size), permille);
-            let output = minimal_step(cube, size, &input, true);
-            inline(size, &input, &output)
-        })
-        .collect();
-    format!(
-        "{{\"stencil\":\"{}\",\"reads\":[{{\"plane\":0,\"bit\":0}}],\"writes\":[{{\"plane\":1,\"bit\":0}}],\"border\":\"wrapped\",\"rule\":\"minimal\",\"examples\":[{}],\"gates\":4,\"crowd\":2048,\"rounds\":500,\"seed\":7,\"budget_ms\":{LONG}}}",
-        if cube { "3x3x3" } else { "3x3" },
-        shown.join(",")
-    )
 }
 
 fn counted_request(rule: &Counted, more: &str) -> String {
@@ -926,5 +880,244 @@ fn p0_every_bit_of_a_parallel_chip_law_is_the_single_bit_law_on_the_cpu() {
     assert!(kinds.iter().all(|seen| *seen > 0), "{kinds:?}");
     println!(
         "p0 64 drawn chips, {boxes_checked} random boxes, 32 copies each, every gate kind {kinds:?}: equal; nodes {wide_nodes} parallel vs {single_nodes} single, bytes {wide_bytes} vs {single_bytes}"
+    );
+}
+
+fn bit_moved(wiring: &Wiring, list: &str, at: usize, bit: u32) -> Wiring {
+    let mut moved = wiring.clone();
+    match list {
+        READS => moved.reads[at].bit = bit,
+        WRITES => moved.writes[at].bit = bit,
+        _ => moved.keeps[at].bit = bit,
+    }
+    moved
+}
+
+fn parallel_refused(circuit: &Circuit, wiring: Wiring, list: &str, at: usize, bit: u32) {
+    let single = Wired::new(circuit.clone(), wiring).unwrap();
+    assert_eq!(single.copies(), Copies::One);
+    Law::compile(&single.text()).unwrap();
+    let why = single.parallel().unwrap_err();
+    assert_eq!(why.fault, Fault::Bit, "{why:?}");
+    assert_eq!(why.path, format!("$.{list}[{at}].bit"), "{why:?}");
+    assert!(
+        why.message
+            .starts_with(&format!("{list}[{at}] names bit {bit}; in parallel form")),
+        "{}",
+        why.message
+    );
+}
+
+#[test]
+fn p5_the_chip_refuses_a_write_or_keep_bit_past_0_in_parallel_form_by_name() {
+    let mut state = 0x7A3_u64;
+    let mut seen = [0_u32; 3];
+    let mut bits = Vec::new();
+    for _ in 0..96 {
+        let (circuit, wiring) = drawn(&mut state);
+        let bit = 1 + pick(&mut state, 31);
+        bits.push(bit);
+        for (slot, (list, count)) in [
+            (WRITES, wiring.writes.len()),
+            (KEEPS, wiring.keeps.len()),
+            (READS, wiring.reads.len()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for at in 0..count {
+                parallel_refused(&circuit, bit_moved(&wiring, list, at, bit), list, at, bit);
+                seen[slot] += 1;
+            }
+        }
+        if wiring.writes.len() == 2 {
+            let both = bit_moved(&bit_moved(&wiring, WRITES, 1, 31), WRITES, 0, bit);
+            parallel_refused(&circuit, both, WRITES, 0, bit);
+            let later = bit_moved(&wiring, WRITES, 1, bit);
+            parallel_refused(&circuit, later, WRITES, 1, bit);
+        }
+        if !wiring.keeps.is_empty() {
+            let other = 1 + bit % 31;
+            let kept = bit_moved(&wiring, KEEPS, 0, bit);
+            let both = bit_moved(&kept, WRITES, 0, other);
+            parallel_refused(&circuit, both.clone(), WRITES, 0, other);
+            let all = bit_moved(&both, READS, 0, 7);
+            parallel_refused(&circuit, all, READS, 0, 7);
+        }
+        assert_eq!(
+            Wired::new(circuit, wiring)
+                .unwrap()
+                .parallel()
+                .unwrap()
+                .copies(),
+            Copies::Word
+        );
+    }
+    assert!(seen.iter().all(|count| *count >= 32), "{seen:?}");
+    assert!(bits.contains(&31) && bits.contains(&1), "{bits:?}");
+    println!(
+        "p5 96 drawn chips: a write bit refused {} times, a keep bit {} times, a read bit {} times, each by its own path; reads before writes before keeps, the first entry of a list first",
+        seen[0], seen[1], seen[2]
+    );
+}
+
+const MORE_PINS: [(&str, &str, &str); 3] = [
+    (
+        "minimal-square",
+        "8421a9d4d1ec0aff8c26976b3d2b6ac44082356a9db4e78fcddff8afe658e81e",
+        "3e14075c2103ce69c9f1fd4341f0201cadb4ac6bc063f6094fe186c4b85dc1ec",
+    ),
+    (
+        "outer-life-bits-3-to-5",
+        "f792b28df9ebe48c2964e269346b74d5a2243ff3752c7664a529d5c5c1049926",
+        "c8b7f3dc2f5d43c6ab7505c69db254c7999f14953f4709184f40d1fb9cb7fed4",
+    ),
+    (
+        "outer-life-rest-cleared",
+        "24264f5e2d0b9404a83c53f5fb709f8f12a045da75f456044a12a58b1b65ffe1",
+        "267238dee561b99534769dfe21a9a95ccb56e4bdb4ba044d0ee7fa65e9b26dde",
+    ),
+];
+
+fn learned_bytes(server: &mut Server<'_>, arguments: &str) -> (bool, String) {
+    let got = server.heard(&line("grit_law_learn", arguments)).unwrap();
+    let held = got.get("result").unwrap();
+    let error = held.get("isError") == Some(&Json::Bool(true));
+    (error, written(held.get("structuredContent").unwrap()))
+}
+
+fn sum_of(text: &str) -> String {
+    hex(&grit::branch::sha256(text.as_bytes()))
+}
+
+fn pinned_pair(server: &mut Server<'_>, at: usize) -> (Json, bool, Json) {
+    let (name, arguments) = more_requests().swap_remove(at);
+    let (pinned, single, wide) = MORE_PINS[at];
+    assert_eq!(name, pinned);
+    let (error, answer) = learned_bytes(server, &arguments);
+    assert!(!error, "{name}: {answer}");
+    let (wide_error, wide_answer) = learned_bytes(server, &parallel(&arguments));
+    println!(
+        "p6 {name}: single sha256 {}, {} bytes; parallel sha256 {}, {} bytes, refused {wide_error}",
+        sum_of(&answer),
+        answer.len(),
+        sum_of(&wide_answer),
+        wide_answer.len()
+    );
+    assert_eq!(
+        sum_of(&answer),
+        single,
+        "{name}: single, recorded on 64b0d1a"
+    );
+    assert_eq!(
+        sum_of(&wide_answer),
+        wide,
+        "{name}: parallel, recorded on a016951"
+    );
+    let off = format!("{},\"parallel\":false}}", &arguments[..arguments.len() - 1]);
+    assert_eq!(
+        learned_bytes(server, &off),
+        (false, answer.clone()),
+        "{name}: parallel false"
+    );
+    (
+        grit::wire::read(&answer).unwrap(),
+        wide_error,
+        grit::wire::read(&wide_answer).unwrap(),
+    )
+}
+
+fn junk_boxes(state: &mut u64) -> Vec<[u32; BOX]> {
+    (0..2)
+        .map(|plane| {
+            core::array::from_fn(|_| {
+                let word = u32::try_from(next(state) >> 32).unwrap();
+                if plane == 0 { word & 1 } else { word }
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn p6_a_moved_bit_and_a_cleared_rest_answer_the_recorded_bytes() {
+    let mut server = Server::new(None);
+    assert_eq!(more_requests().len(), MORE_PINS.len());
+    let (moved, moved_refused, refusal) = pinned_pair(&mut server, 1);
+    assert!(moved_refused, "a moved bit has no parallel form");
+    assert_eq!(text_at(&refusal, "code"), "parallel_bit");
+    assert_eq!(text_at(&refusal, "field"), "$.reads[0].bit");
+    assert_eq!(text_at(&moved, "rest"), "kept");
+    let (cleared, cleared_refused, cleared_wide) = pinned_pair(&mut server, 2);
+    assert!(!cleared_refused);
+    assert_eq!(text_at(&cleared, "rest"), "cleared");
+    assert!(cleared_wide.get("rest").is_none());
+    assert_eq!(int_at(cleared_wide.get("parallel").unwrap(), "copies"), 32);
+    let kept_request = more_requests()[2]
+        .1
+        .replace("\"rest\":\"cleared\"", "\"rest\":\"kept\"");
+    let kept = ok(&mut server, "grit_law_learn", &kept_request);
+    assert_eq!(text_at(&kept, "rest"), "kept");
+    let cleared_law = Law::compile(&text_at(&cleared, "law")).unwrap();
+    let kept_law = Law::compile(&text_at(&kept, "law")).unwrap();
+    let moved_law = Law::compile(&text_at(&moved, "law")).unwrap();
+    let mut state = 0x6E57_u64;
+    let mut kept_rest = 0;
+    let mut moved_set = 0;
+    for _ in 0..64 {
+        let boxes = junk_boxes(&mut state);
+        let got = stepped(&cleared_law, &boxes);
+        let kept_got = stepped(&kept_law, &boxes);
+        let shifted: Vec<[u32; BOX]> = boxes
+            .iter()
+            .enumerate()
+            .map(|(plane, one)| {
+                if plane == 0 {
+                    one.map(|word| (word << 3) | 0xFFFF_0000)
+                } else {
+                    *one
+                }
+            })
+            .collect();
+        let moved_got = stepped(&moved_law, &shifted);
+        for corner in 0..CORNERS {
+            let own = boxes[1][halo::looked(corner, [0, 0, 0]).unwrap()];
+            assert_eq!(
+                got[1][corner] >> 1,
+                0,
+                "the rest of the written word is cleared"
+            );
+            assert_eq!(kept_got[1][corner] & !1, own & !1, "kept keeps the rest");
+            assert_eq!(got[1][corner], kept_got[1][corner] & 1);
+            assert_eq!(
+                moved_got[1][corner],
+                (own & !(1 << 5)) | ((got[1][corner] & 1) << 5),
+                "the moved law is the same law on bit 3 into bit 5, the rest kept"
+            );
+            kept_rest += u32::from(own >> 1 != 0);
+            moved_set += got[1][corner] & 1;
+        }
+    }
+    assert!(kept_rest > 400, "{kept_rest}");
+    assert!(moved_set > 16, "{moved_set}");
+    println!(
+        "p6 rest cleared: bits 1 to 31 of every written word are 0 on 512 junk corners, kept keeps them; the bit 3 to 5 law equals it on bit 5"
+    );
+}
+
+#[test]
+fn p7_a_minimal_answer_and_its_parallel_form_are_the_recorded_bytes() {
+    let Some(host) = device("law_parallel p7 minimal pinned") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let (minimal, refused, wide) = pinned_pair(&mut server, 0);
+    assert_eq!(text_at(minimal.get("unseen").unwrap(), "rule"), "minimal");
+    assert!(!refused);
+    assert_eq!(int_at(wide.get("parallel").unwrap(), "copies"), 32);
+    assert!(wide.get("rest").is_none());
+    assert_eq!(
+        written(minimal.get("chip").unwrap()),
+        written(wide.get("chip").unwrap()),
+        "the same circuit"
     );
 }

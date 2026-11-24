@@ -257,3 +257,97 @@ pub fn requests() -> Vec<(&'static str, String)> {
         ),
     ]
 }
+
+pub fn spots(size: [u32; 3]) -> Vec<[u32; 3]> {
+    let mut out = Vec::with_capacity(cells(size));
+    for z in 0..size[2] {
+        for y in 0..size[1] {
+            for x in 0..size[0] {
+                out.push([x, y, z]);
+            }
+        }
+    }
+    out
+}
+
+pub fn minimal_step(cube: bool, size: [u32; 3], words: &[u32], wrapped: bool) -> Vec<u32> {
+    let (up, down) = if cube {
+        ([0, 0, 1], [0, 0, -1])
+    } else {
+        ([0, -1, 0], [0, 1, 0])
+    };
+    spots(size)
+        .into_iter()
+        .map(|at| {
+            let here = words[index(size, at)] & 1;
+            let read = |step: [i64; 3]| {
+                neighbour(size, at, step, wrapped).map_or(0, |spot| words[spot] & 1)
+            };
+            (here ^ read(up)) & (1 ^ read(down))
+        })
+        .collect()
+}
+
+pub fn minimal_request(cube: bool) -> String {
+    let size = if cube { [8, 8, 8] } else { [32, 32, 1] };
+    let mut rng = Rng(if cube { 0x3D } else { 0x2D });
+    let shown: Vec<String> = [300, 450, 600]
+        .iter()
+        .map(|&permille| {
+            let input = soup(&mut rng, cells(size), permille);
+            let output = minimal_step(cube, size, &input, true);
+            inline(size, &input, &output)
+        })
+        .collect();
+    format!(
+        "{{\"stencil\":\"{}\",\"reads\":[{{\"plane\":0,\"bit\":0}}],\"writes\":[{{\"plane\":1,\"bit\":0}}],\"border\":\"wrapped\",\"rule\":\"minimal\",\"examples\":[{}],\"gates\":4,\"crowd\":2048,\"rounds\":500,\"seed\":7,\"budget_ms\":{LONG}}}",
+        if cube { "3x3x3" } else { "3x3" },
+        shown.join(",")
+    )
+}
+
+pub fn life_bits(seed: u64, (read, write): (u32, u32), junk: bool) -> String {
+    let size = [32, 32, 1];
+    let mut rng = Rng(seed);
+    let mut shown = Vec::new();
+    for permille in [250_u64, 350, 450, 600] {
+        let input = soup(&mut rng, cells(size), permille);
+        let output = counted_step(&life(), size, &input, true);
+        let mut moved = |words: &[u32], bit: u32| -> Vec<u32> {
+            words
+                .iter()
+                .map(|one| {
+                    let other = if junk {
+                        u32::try_from(rng.next() >> 32).unwrap() & !(1 << bit)
+                    } else {
+                        0
+                    };
+                    (one << bit) | other
+                })
+                .collect()
+        };
+        let input = moved(&input, read);
+        let output = moved(&output, write);
+        shown.push(inline(size, &input, &output));
+    }
+    format!("[{}]", shown.join(","))
+}
+
+pub fn more_requests() -> Vec<(&'static str, String)> {
+    let moved = request(&life(), "wrapped", &life_bits(0xB6, (3, 5), true), "")
+        .replacen("\"plane\":0,\"bit\":0", "\"plane\":0,\"bit\":3", 1)
+        .replacen("\"plane\":1,\"bit\":0", "\"plane\":1,\"bit\":5", 1);
+    vec![
+        ("minimal-square", minimal_request(false)),
+        ("outer-life-bits-3-to-5", moved),
+        (
+            "outer-life-rest-cleared",
+            request(
+                &life(),
+                "wrapped",
+                &life_bits(0xB7, (0, 0), false),
+                ",\"rest\":\"cleared\"",
+            ),
+        ),
+    ]
+}
