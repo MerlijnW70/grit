@@ -52,11 +52,18 @@ Rules, each refused by its own code at the path of the look or of `halo`:
 | `halo_constant` | a plane, offset or corner known only when the law runs |
 | `halo_plane` | a plane past `channels` |
 | `halo_written` | a look at a plane the law writes: only a frozen plane, whose 8 out words are its input words unchanged, may be looked at |
-| `halo_sparse` | (world) a sparse world, at create (`$.sparse`) or open (`$.name`); make it dense |
 
 A host write to a world whose law looks wakes the 27 octs around the oct of each phase that holds the cell, so every oct whose 4x4x4 box holds the cell steps next frame. The quiet class is decided as below, with the looked cells part of the oct's input: a law that reads neither `frame` nor `at` gives the same output for the same box, so it keeps the box contract and steps listed; any other law steps whole.
 
 `tests/halo3/` holds three laws that look: a 2D Sobel edge detector, a 3D 3x3x3 Sobel and a blur over two planes.
+
+### On sparse worlds
+
+A law that looks runs on dense and sparse worlds alike, with the same cells after every frame. A sparse world reads an oct's 4x4x4 box through its brick table: a cell of a held brick is its word, a cell of a brick held as one word is that word, on each plane, across brick borders and the torus seam.
+
+An oct that changes wakes the 27 octs around it, so every oct whose box reads a changed cell steps the next two frames. A woken oct in a one-word brick steps the whole brick; a brick whose cells change takes a slot first. A brick left all one word, and untouched for a frame, returns its slot. So memory follows activity: a glider flying through a large world holds only the few bricks around it, and each step answer names `pool_use`.
+
+A host write to a sparse world wakes the 27 octs around each written cell's octs, as on dense. A frame is priced as on any sparse world: held bricks times their cells times frames, calibrated under the law's own text.
 
 ## Iterating a law on the device
 
@@ -84,7 +91,7 @@ Within a frame the looked-at plane is frozen, as `halo_written` requires. Refuse
 | `alternate_reversible` | the law is reversible; `grit_world_back` on an iterating world is `not_reversible` |
 | `alternate_twice` | the law carries an `alternate` other than the argument |
 
-`alternate` with `rule` is `rule_or_law` at `$.alternate`. A law that looks runs only dense (`halo_sparse`), with or without `alternate`; one that does not look iterates on sparse worlds too.
+`alternate` with `rule` is `rule_or_law` at `$.alternate`. A law iterates on dense and sparse worlds, whether it looks or not.
 
 The quiet class is decided on the law as written, with every uniform value checked at both parities. A listed world steps an oct while it or an oct around it changed in the two frames before; an oct that changed its written plane wakes the octs whose box reads it, so moving patterns are never skipped, and a world that stops changing, a period-2 oscillator included, goes quiet. Its frames are priced as every frame: cells times frames, calibrated under the iterating law's own text.
 
