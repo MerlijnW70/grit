@@ -768,7 +768,6 @@ fn the_declared_halo_is_whether_a_look_leaves_the_oct() {
     let law = compiled(&probe(2, 0, 0, inside));
     assert_eq!(law.halo(), 0);
     assert!(law.looks().is_empty());
-    assert!(branch::looks_dense(&law, true).is_ok());
     let twin = compiled(&probe(
         2,
         0,
@@ -808,7 +807,6 @@ fn the_declared_halo_is_whether_a_look_leaves_the_oct() {
         let law = compiled(text);
         assert_eq!(law.halo(), halo);
         assert_eq!(law.halo() == 1, !law.looks().is_empty());
-        assert!(branch::looks_dense(&law, true).is_err());
     }
     for corner in 0..CORNERS {
         for dx in [-1_i32, 0, 1] {
@@ -1053,16 +1051,19 @@ fn a_halo_law_that_reads_the_frame_is_whole_and_equals_the_cpu_dense() {
 }
 
 #[test]
-fn a_sparse_world_refuses_a_law_that_looks() {
+fn a_sparse_world_makes_a_law_that_looks() {
     let Some(host) = device("halo sparse") else {
         return;
     };
     let law = compiled(EDGE);
-    let why = World::create_law(&host, &law, &made(&law, &[2], true))
-        .err()
-        .unwrap();
-    let refused = why.downcast_ref::<branch::Refused>().unwrap();
-    assert_eq!(refused.name(), "halo_sparse", "{refused}");
+    let mut sized = made(&law, &[2], true);
+    sized.size = [32, 32, 32];
+    let world = World::create_law(&host, &law, &sized);
+    assert!(
+        world.is_ok(),
+        "{:?}",
+        world.err().map(|why| why.to_string())
+    );
     let width = host.width();
     let (grid, _) = grids((32, 32, 32));
     let plan = Plan::over_in(
@@ -1075,8 +1076,8 @@ fn a_sparse_world_refuses_a_law_that_looks() {
         .unwrap()
         .with_planes(2)
         .unwrap();
-    assert!(grit::bricks::arranged(&law, &pool, &plan, true).is_err());
-    assert!(grit::bricks::whole(&law, &pool, &plan).is_err());
+    assert!(grit::bricks::arranged(&law, &pool, &plan, true).is_ok());
+    assert!(grit::bricks::whole(&law, &pool, &plan).is_ok());
 }
 
 fn line(id: i64, name: &str, arguments: &str) -> String {
@@ -1419,7 +1420,7 @@ fn a_crash_and_replay_of_a_dense_halo_world_gives_the_cpu_run() {
 }
 
 #[test]
-fn a_sparse_world_and_a_sparse_file_refuse_a_halo_law_through_the_tools() {
+fn a_sparse_world_and_a_sparse_file_take_a_halo_law_through_the_tools() {
     let Some(host) = device("halo sparse tools") else {
         return;
     };
@@ -1434,26 +1435,24 @@ fn a_sparse_world_and_a_sparse_file_refuse_a_halo_law_through_the_tools() {
         )
         .unwrap(),
     );
+    let cube = |text: String| {
+        text.replace(
+            &format!(
+                "\"wide\":{},\"deep\":{},\"tall\":{}",
+                SHAPE.0, SHAPE.1, SHAPE.2
+            ),
+            "\"wide\":32,\"deep\":32,\"tall\":32",
+        )
+    };
     let told = result(
-        &server.asked("grit_world_create", &making(EDGE, &[2], true)),
-        true,
+        &server.asked("grit_world_create", &cube(making(EDGE, &[2], true))),
+        false,
     );
-    assert_eq!(text_at(&told, "code"), "halo_sparse", "{}", written(&told));
-    assert_eq!(text_at(&told, "field"), "$.sparse");
-    assert!(text_at(&told, "hint").contains("dense"));
+    assert_eq!(text_at(&told, "quiet"), "proved", "{}", written(&told));
     let flat = "{\"law\":1,\"name\":\"edge2d\",\"params\":1,\"channels\":2,\"halo\":0,\"tally\":{\"counts\":1,\"weighted\":false},\"consts\":{},\"defs\":{},\"step\":[\"vec\",\"cells\",[\"vec\",[\"param\",0]]]}";
     let world = int_at(
         &result(
-            &server.asked(
-                "grit_world_create",
-                &making(flat, &[0], true).replace(
-                    &format!(
-                        "\"wide\":{},\"deep\":{},\"tall\":{}",
-                        SHAPE.0, SHAPE.1, SHAPE.2
-                    ),
-                    "\"wide\":32,\"deep\":32,\"tall\":32",
-                ),
-            ),
+            &server.asked("grit_world_create", &cube(making(flat, &[0], true))),
             false,
         ),
         "world",
@@ -1469,15 +1468,10 @@ fn a_sparse_world_and_a_sparse_file_refuse_a_halo_law_through_the_tools() {
     branch::format::store(&path, &image).unwrap();
     let told = result(
         &server.asked("grit_world_open", "{\"name\":\"sparse\"}"),
-        true,
+        false,
     );
-    assert_eq!(text_at(&told, "code"), "halo_sparse", "{}", written(&told));
-    assert_eq!(text_at(&told, "field"), "$.name");
-    let why = World::open(&host, &image).err().unwrap();
-    assert_eq!(
-        why.downcast_ref::<branch::Refused>().unwrap().name(),
-        "halo_sparse"
-    );
+    assert!(int_at(&told, "world") > world, "{}", written(&told));
+    assert!(World::open(&host, &image).is_ok());
     let described = result(&server.asked("grit_describe", "{}"), false);
     let codes: Vec<String> = described
         .get("codes")
@@ -1486,13 +1480,13 @@ fn a_sparse_world_and_a_sparse_file_refuse_a_halo_law_through_the_tools() {
         .iter()
         .map(|one| text_at(one, "code"))
         .collect();
-    assert!(codes.iter().any(|one| one == "halo_sparse"));
+    assert!(!codes.iter().any(|one| one == "halo_sparse"));
     let look = text_at(described.get("limits").unwrap(), "law_look");
     for needed in [
         "[\"look\", plane, dx, dy, dz, corner]",
         "frozen",
         "halo_written",
-        "dense",
+        "dense and sparse",
     ] {
         assert!(look.contains(needed), "{needed}: {look}");
     }

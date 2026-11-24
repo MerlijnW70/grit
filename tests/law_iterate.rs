@@ -1089,13 +1089,15 @@ fn i5_misuse_is_refused_by_code_and_field() {
         "$.alternate",
         "alternate_reversible",
     );
-    refused(
+    let sparse = ok(
         &mut server,
-        &create(&life, "[0,1]", ",\"sparse\":true"),
-        "halo_sparse",
-        "$.sparse",
-        "",
+        "grit_world_create",
+        &format!(
+            "{{\"wide\":32,\"deep\":32,\"tall\":16,\"law\":{},\"alternate\":[0,1],\"sparse\":true}}",
+            quoted(&life)
+        ),
     );
+    assert_eq!(written(sparse.get("alternate").unwrap()), "[0,1]");
     let carried = format!("{},\"alternate\":[1,0]}}", &life[..life.len() - 1]);
     refused(
         &mut server,
