@@ -708,6 +708,8 @@ fn k5_what_is_still_out_of_reach_is_refused_by_name() {
 
 const NOISES: [u64; 3] = [0, 5_000, 10_000];
 
+const CORE_USED: u64 = 1_000;
+
 const SOUPS: [u64; 4] = [100, 250, 150, 300];
 
 fn bays() -> Rule {
@@ -781,15 +783,23 @@ fn k1_large_rules_seen_every_k_steps_are_recovered_on_every_pinned_entry() {
                 } else {
                     assert!(got.rate.is_some(), "{label}");
                 }
-                let pinned = got
-                    .doubt
-                    .as_ref()
-                    .unwrap()
-                    .margins
-                    .iter()
-                    .filter(|one| **one > 0)
-                    .count();
-                assert!(pinned >= 6, "{label}: only {pinned} entries pinned");
+                let doubt = got.doubt.as_ref().unwrap();
+                let core: Vec<u32> = (0..rule.classes())
+                    .filter(|class| {
+                        (rule.code >> class) & 1 == 1 && doubt.used[*class as usize] >= CORE_USED
+                    })
+                    .collect();
+                assert!(
+                    !core.is_empty(),
+                    "{label}: the data reaches no live entry of the rule"
+                );
+                for class in &core {
+                    assert!(
+                        doubt.pinned[*class as usize] && (got.code >> class) & 1 == 1,
+                        "{label}: live entry {class}, used {} times, is not learned",
+                        doubt.used[*class as usize]
+                    );
+                }
             }
         }
     }
@@ -828,8 +838,6 @@ fn doubt_checked(label: &str, rule: &Rule, pairs: &[Pair], steps: u32, got: &Jso
     let margins = margins_of(rule, got.get("margins").unwrap());
     let pinned = flat_of(got.get("pinned").unwrap());
     let reached = reached_of(&answer, pairs, steps);
-    let cells: u64 = pairs.iter().map(|one| one.size.cells() as u64).sum();
-    let share = wrong as f64 / cells as f64;
     let predicted: Vec<Vec<u8>> = pairs
         .iter()
         .map(|one| applied(one.size, &one.input, true, &answer, steps))
@@ -855,20 +863,20 @@ fn doubt_checked(label: &str, rule: &Rule, pairs: &[Pair], steps: u32, got: &Jso
                     .count() as u64
             })
             .sum();
-        let agreeing = (moved + u64::try_from(margin.max(0)).unwrap()).div_ceil(2);
-        let claimed = margin > 0 && tail(moved, agreeing, share) < 1e-6;
+        let claimed = pinned[class as usize] != Json::Null;
         if claimed {
+            assert!(
+                margin > 0 && moved > 0,
+                "{label}: entry {class} margin {margin} over {moved} changed cells is claimed"
+            );
             assert_eq!(
                 pinned[class as usize].int(),
                 Some(i64::from((code >> class) & 1 == 1)),
-                "{label}: entry {class} margin {margin} over {moved} changed cells"
+                "{label}: entry {class}"
             );
-        } else {
-            assert_eq!(
-                pinned[class as usize],
-                Json::Null,
-                "{label}: entry {class} margin {margin} over {moved} changed cells is claimed"
-            );
+        }
+        if wrong == 0 {
+            assert_eq!(claimed, margin > 0, "{label}: entry {class} without noise");
         }
         if !reached[class as usize] {
             assert_eq!(
@@ -890,29 +898,6 @@ fn doubt_checked(label: &str, rule: &Rule, pairs: &[Pair], steps: u32, got: &Jso
         unpinned,
         "{label}"
     );
-}
-
-fn tail(trials: u64, least: u64, share: f64) -> f64 {
-    if least == 0 {
-        return 1.0;
-    }
-    if share <= 0.0 {
-        return 0.0;
-    }
-    let mut ln_term = 0.0_f64;
-    for at in 0..least {
-        ln_term += ((trials - at) as f64).ln() - ((at + 1) as f64).ln();
-    }
-    ln_term += least as f64 * share.ln() + (trials - least) as f64 * (1.0 - share).ln();
-    let mut total = 0.0;
-    for hits in least..=trials {
-        total += ln_term.exp();
-        if hits < trials {
-            ln_term += ((trials - hits) as f64).ln() - ((hits + 1) as f64).ln() + share.ln()
-                - (1.0 - share).ln();
-        }
-    }
-    total
 }
 
 fn moves_checked(label: &str, rule: &Rule, pairs: &[Pair], steps: u32, got: &Json) {
@@ -1371,5 +1356,213 @@ mod braked {
             written(&again),
             "a complete search is the same bytes"
         );
+    }
+}
+
+fn falsely_pinned(rule: &Rule, got: &Learned) -> Vec<u32> {
+    let Some(doubt) = got.doubt.as_ref() else {
+        return Vec::new();
+    };
+    (0..rule.classes())
+        .filter(|class| doubt.pinned[*class as usize] && ((got.code ^ rule.code) >> class) & 1 == 1)
+        .collect()
+}
+
+fn pinned_count(got: &Learned) -> usize {
+    got.doubt
+        .as_ref()
+        .map_or(0, |doubt| doubt.pinned.iter().filter(|one| **one).count())
+}
+
+#[test]
+fn k2_no_entry_is_pinned_against_the_rule_on_sparse_or_dense_inputs_in_either_mode() {
+    let odd = Rule::of(Tally::Outer, true, &moore(true), &[5, 6, 10], &[4, 5, 6]);
+    let sparse = [20_u64, 30, 40, 50, 20, 30, 40, 50];
+    let dense = [100_u64, 250, 150, 300];
+    let mut cases: Vec<(String, Rule, Vec<u64>, u32)> = Vec::new();
+    for (name, rule) in [("b56_s456", x1_rule()), ("bays_5766", bays())] {
+        for steps in 1..=4_u32 {
+            cases.push((
+                format!("{name} sparse k {steps}"),
+                rule.clone(),
+                sparse.to_vec(),
+                steps,
+            ));
+            cases.push((
+                format!("{name} dense k {steps}"),
+                rule.clone(),
+                dense.to_vec(),
+                steps,
+            ));
+        }
+    }
+    cases.push((
+        "b5_6_10_s456 10% k 1".to_owned(),
+        odd.clone(),
+        vec![100; 8],
+        1,
+    ));
+    cases.push(("b5_6_10_s456 8% k 1".to_owned(), odd, vec![80; 8], 1));
+    for (at, (label, rule, densities, steps)) in cases.iter().enumerate() {
+        let pairs = pairs_of(
+            47_000 + at as u64,
+            densities,
+            Size([32, 32, 32]),
+            rule,
+            (*steps, true, 10_000),
+        );
+        let fewest = local_learned(rule, &pairs, *steps, true);
+        let likely = likely_learned(rule, &pairs, *steps, least::Search::Local);
+        let wrongly = falsely_pinned(rule, &fewest);
+        let wrongly_likely = falsely_pinned(rule, &likely);
+        eprintln!(
+            "PINS {label}: least_wrong pinned {} false {:?} far_above {} | likely pinned {} false {:?} rate {:?} recovered {}",
+            pinned_count(&fewest),
+            wrongly,
+            fewest.noise.is_some_and(|one| one.far_above),
+            pinned_count(&likely),
+            wrongly_likely,
+            likely.rate,
+            likely.code == rule.code
+        );
+        assert!(fewest.complete && likely.complete, "{label}");
+        assert!(
+            wrongly.is_empty(),
+            "{label}: least_wrong pins {wrongly:?} against the rule"
+        );
+        assert!(
+            wrongly_likely.is_empty(),
+            "{label}: likely pins {wrongly_likely:?} against the rule"
+        );
+    }
+}
+
+#[cfg(feature = "faults")]
+mod stopped_everywhere {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use grit::clock::{Fake, Time};
+    use grit::serve3::Options;
+    use grit::serve3::law_learn::Point;
+    use grit::serve3::law_learn::faults::{deadline_passed_at, disarm, reached};
+
+    fn timed() -> (Server<'static>, Arc<Fake>) {
+        let fake = Arc::new(Fake::new());
+        let time: Arc<dyn Time> = fake.clone();
+        (
+            Server::timed(None, &Options::default(), time).unwrap(),
+            fake,
+        )
+    }
+
+    fn arguments(noise: &str) -> String {
+        let rule = life();
+        let pairs = pairs_of(
+            48_000,
+            &[350, 300, 400],
+            Size([32, 32, 1]),
+            &rule,
+            (3, true, 5_000),
+        );
+        learn_args(
+            &rule,
+            "wrapped",
+            &pairs,
+            3,
+            &format!(",\"noise\":\"{noise}\",\"search\":\"local\""),
+        )
+    }
+
+    #[test]
+    fn a_stop_at_any_brake_of_either_mode_claims_nothing() {
+        for noise in ["least_wrong", "likely"] {
+            let (mut server, _fake) = timed();
+            disarm();
+            let whole = answered(&mut server, &arguments(noise));
+            let brakes = reached(Point::Search);
+            disarm();
+            assert_eq!(text_at(&whole, "stopped"), "complete", "{noise}");
+            assert_eq!(text_at(&whole, "noise"), noise);
+            assert!(whole.get("pinned").is_some(), "{noise}");
+            assert!(brakes > 4, "{noise}: {brakes} brakes");
+            let mut answered_late = 0;
+            for ordinal in 0..brakes {
+                let (mut server, fake) = timed();
+                disarm();
+                deadline_passed_at(Point::Search, ordinal, Arc::clone(&fake), LONG + 1);
+                let (refused, late) = content(&heard(&mut server, &arguments(noise)));
+                disarm();
+                let label = format!("{noise} stopped at brake {ordinal} of {brakes}");
+                if refused {
+                    assert_eq!(text_at(&late, "refused"), "budget", "{label}");
+                    continue;
+                }
+                answered_late += 1;
+                assert_eq!(
+                    text_at(&late, "stopped"),
+                    "budget",
+                    "{label}: {}",
+                    written(&late)
+                );
+                assert_eq!(late.get("complete"), Some(&Json::Bool(false)), "{label}");
+                assert_eq!(text_at(&late, "noise"), noise, "{label}");
+                assert!(late.get("hint").is_some(), "{label}");
+                for key in [
+                    "margins",
+                    "pinned",
+                    "unpinned",
+                    "unreached",
+                    "noise_estimate",
+                    "warning",
+                    "assumed_flips_per_million",
+                ] {
+                    if key == "assumed_flips_per_million" && late.get("surprise").is_some() {
+                        continue;
+                    }
+                    assert!(
+                        late.get(key).is_none(),
+                        "{label}: a stopped search shows {key}"
+                    );
+                }
+            }
+            assert!(answered_late > 0, "{noise}: no brake answered a table");
+        }
+    }
+}
+
+#[test]
+fn k3_the_fewest_wrong_cells_pin_nothing_false_or_are_far_above_in_the_noisy_cells_past_two_steps()
+{
+    for (name, rule) in [
+        ("b56_s456", x1_rule()),
+        ("bays_5766", bays()),
+        ("totalistic_3d", total3()),
+    ] {
+        for steps in [3_u32, 4] {
+            for (at, noise) in NOISES.iter().enumerate().skip(1) {
+                let label = format!("{name} k {steps} noise {noise} per million");
+                let seed = 41_000 + u64::from(steps) * 10 + at as u64;
+                let pairs = matrix_pairs(&rule, seed, steps, *noise);
+                let got = local_learned(&rule, &pairs, steps, true);
+                let noise = got.noise.unwrap();
+                let wrongly = falsely_pinned(&rule, &got);
+                eprintln!(
+                    "FEWEST {label}: pinned {} false {wrongly:?} estimate {} far_above {}",
+                    pinned_count(&got),
+                    noise.per_million,
+                    noise.far_above
+                );
+                assert!(got.complete, "{label}");
+                assert!(
+                    wrongly.is_empty(),
+                    "{label}: pins {wrongly:?} against the rule"
+                );
+                if noise.far_above {
+                    assert_eq!(pinned_count(&got), 0, "{label}: far above yet pinned");
+                }
+            }
+        }
     }
 }
