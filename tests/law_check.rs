@@ -407,9 +407,9 @@ fn c2_x1_checks_are_one_call_each() {
         let start = layer(&mut rng, size, 300);
         let mut after = lift(&host_run(&p1, plane, &start[..count(plane)], 1));
         let mut flipped = 0;
-        for at in 0..count(plane) {
+        for word in after.iter_mut().take(count(plane)) {
             if rng.below(100) == 0 {
-                after[at] ^= 1;
+                *word ^= 1;
                 flipped += 1;
             }
         }
