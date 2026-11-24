@@ -1,5 +1,7 @@
 use crate::stencil::{Border, Counting, Sample, Tally, index};
 
+pub mod least;
+
 pub const STEPS_MOST: u32 = 8;
 
 pub const CLASSES_MOST: u32 = 18;
@@ -116,6 +118,7 @@ struct Field {
     near: [[Vec<u32>; 3]; 3],
     deltas: Vec<isize>,
     seed: Vec<u32>,
+    bits: Vec<u64>,
     targets: Vec<(usize, bool)>,
 }
 
@@ -202,6 +205,7 @@ fn field_of(stepping: &Stepping, kernel: &Kernel, sample: &Sample<'_>) -> Field 
         near,
         deltas: kernel.sized(size),
         seed: Vec::new(),
+        bits: Vec::new(),
         targets: Vec::new(),
     };
     let words = sample.inputs.first().copied().unwrap_or(&[]);
@@ -230,6 +234,7 @@ fn field_of(stepping: &Stepping, kernel: &Kernel, sample: &Sample<'_>) -> Field 
         seed.push(class);
     }
     field.seed = seed;
+    field.bits = bits;
     let wanted = sample.outputs.first().copied().unwrap_or(&[]);
     let [wide, deep, tall] = sample.inner;
     for z in 0..tall {
@@ -415,6 +420,15 @@ struct Lanes {
 }
 
 impl Lanes {
+    fn charged(&mut self, lane: usize, amount: u64, best: u64) {
+        if let Some(count) = self.wrong.get_mut(lane) {
+            *count = count.saturating_add(amount);
+            if *count > best {
+                self.alive &= !(1_u64 << lane);
+            }
+        }
+    }
+
     fn missed(&mut self, missing: u64, best: u64) {
         let mut left = missing & self.alive;
         while left != 0 {
