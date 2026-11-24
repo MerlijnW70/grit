@@ -12,7 +12,7 @@ mod device {
 
     use grit::Host;
     use grit::branch::{Made, World};
-    use grit::calibrate::take::{FILLER, FRAMES, Measured, Solved, WORLD, measured};
+    use grit::calibrate::take::{Ended, FILLER, FRAMES, Measured, Solved, WORLD, measured};
     use grit::calibrate::{self, Key, Sample, faults, times, up_front};
     use grit::serve3::cost::{Cost, Priced};
 
@@ -408,6 +408,46 @@ mod device {
         got
     }
 
+    fn whole_or_named(label: &str, host: &Host, got: &Measured) -> bool {
+        let wanted = up_front(host);
+        let foreign: Vec<String> = got
+            .rates
+            .keys()
+            .filter(|key| !wanted.contains(key))
+            .map(Key::name)
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "{label}: rates of keys that are not up front: {foreign:?}"
+        );
+        let lacks: Vec<String> = wanted
+            .iter()
+            .filter(|key| !got.rates.contains_key(*key))
+            .map(Key::name)
+            .collect();
+        match got.ended {
+            Ended::Agreed => assert!(
+                lacks.is_empty(),
+                "{label}: the calibration ended Agreed and lacks {lacks:?}"
+            ),
+            Ended::Lost => assert!(
+                got.rates.is_empty(),
+                "{label}: the calibration ended Lost and kept {} rates",
+                got.rates.len()
+            ),
+            Ended::Spent => {}
+            Ended::Untimed => panic!("{label}: a device that takes timing ended Untimed"),
+        }
+        if !lacks.is_empty() {
+            eprintln!(
+                "INCOMPLETE {label} {}: ended {:?}, lacks {lacks:?}; only what holds under load was checked",
+                host.name(),
+                got.ended
+            );
+        }
+        lacks.is_empty()
+    }
+
     fn deterministic(
         label: &str,
         host: &Host,
@@ -422,6 +462,10 @@ mod device {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "quiet"),
+        ignore = "needs a quiet machine: the nightly full check runs it with --features faults,quiet"
+    )]
     fn c7_a_quiet_calibration_knows_every_up_front_key() {
         let Some(host) = common::device("c7") else {
             return;
@@ -477,6 +521,10 @@ mod device {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "quiet"),
+        ignore = "needs a quiet machine: the nightly full check runs it with --features faults,quiet"
+    )]
     fn c10_every_counted_run_was_primed_back_to_back() {
         let Some(host) = gpu("c10") else {
             return;
@@ -517,6 +565,10 @@ mod device {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "quiet"),
+        ignore = "needs a quiet machine: the nightly full check runs it with --features faults,quiet"
+    )]
     fn sparse_keys_are_calibrated_on_worlds_as_built() {
         let Some(host) = gpu("sparse as built") else {
             return;
@@ -541,6 +593,10 @@ mod device {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "quiet"),
+        ignore = "needs a quiet machine: the nightly full check runs it with --features faults,quiet"
+    )]
     fn c9_start_up_stays_under_the_cap() {
         let Some(host) = gpu("c9") else {
             return;
@@ -717,6 +773,10 @@ mod device {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "quiet"),
+        ignore = "needs a quiet machine: the nightly full check runs it with --features faults,quiet"
+    )]
     fn c1_real_cpu_load_stays_under_the_margin() {
         let Some(host) = gpu("c1 load") else {
             return;
@@ -746,6 +806,10 @@ mod device {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "quiet"),
+        ignore = "needs a quiet machine: the nightly full check runs it with --features faults,quiet"
+    )]
     fn c4_each_rate_is_plausible_against_plain_runs() {
         let Some(host) = gpu("c4") else {
             return;
@@ -842,6 +906,10 @@ mod device {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "quiet"),
+        ignore = "needs a quiet machine: the nightly full check runs it with --features faults,quiet"
+    )]
     fn c6_idle_and_busy_calibrations_agree() {
         let Some(host) = gpu("c6") else {
             return;
@@ -864,6 +932,180 @@ mod device {
                 first_over(&busy)
             );
             failures.extend(agree(&format!("c6 round {round}"), &points, &idle, &busy));
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn c7_a_calibration_knows_every_up_front_key_or_names_what_it_lacks() {
+        let Some(host) = common::device("c7 any load") else {
+            return;
+        };
+        let _alone = alone();
+        if host.on_cpu() {
+            let before = faults::timed_runs();
+            assert!(!times(&host), "a CPU device has no time source");
+            assert!(up_front(&host).is_empty());
+            let got = measured(&host).unwrap();
+            assert!(got.rates.is_empty());
+            assert_eq!(got.ended, Ended::Untimed);
+            let device = calibrate::device(&host);
+            calibrate::forget(&device);
+            let taken = calibrate::taken(&host, None).unwrap();
+            assert!(calibrate::read(&taken.table).is_empty());
+            calibrate::forget(&device);
+            assert_eq!(
+                faults::timed_runs(),
+                before,
+                "no calibration work ran on a CPU device"
+            );
+            return;
+        }
+        let wanted: Vec<Key> = grit::serve3::rules_on(Some(&host))
+            .iter()
+            .flat_map(|rule| {
+                [false, true]
+                    .into_iter()
+                    .filter(|sparse| !sparse || host.sparse())
+                    .map(|sparse| Key::rule(rule.name(), sparse))
+            })
+            .collect();
+        assert_eq!(up_front(&host), wanted);
+        let got = timed("c7 any load", &host);
+        whole_or_named("c7 any load", &host, &got);
+    }
+
+    #[test]
+    fn c10_under_any_load_every_counted_run_was_primed_back_to_back() {
+        let Some(host) = gpu("c10 any load") else {
+            return;
+        };
+        let _alone = alone();
+        let _ = faults::primed_runs();
+        let got = timed("c10 any load", &host);
+        let runs = faults::primed_runs();
+        assert_eq!(
+            runs.len(),
+            got.counted as usize,
+            "one record per counted run"
+        );
+        if whole_or_named("c10 any load", &host, &got) {
+            assert!(!runs.is_empty(), "a whole calibration counted no run");
+        }
+        for one in &runs {
+            assert_eq!(
+                one.timed_from - one.primer_from,
+                one.frames,
+                "the same frames of the same world ran directly before the timed run: {one:?}"
+            );
+            assert_eq!(one.until - one.timed_from, one.frames, "{one:?}");
+            assert!(
+                one.gaps.0 <= one.limit && one.gaps.1 <= one.limit,
+                "a counted run had a gap above GAP: {one:?}"
+            );
+        }
+        eprintln!(
+            "C10 any load {}: {} counted runs, ended {:?}",
+            host.name(),
+            runs.len(),
+            got.ended
+        );
+    }
+
+    #[test]
+    fn under_any_load_sparse_keys_are_calibrated_on_worlds_as_built() {
+        let Some(host) = gpu("sparse as built, any load") else {
+            return;
+        };
+        let _alone = alone();
+        let got = timed("as built any load", &host);
+        let whole = whole_or_named("as built any load", &host, &got);
+        let sparse: Vec<_> = got
+            .rates
+            .iter()
+            .filter(|(key, _)| matches!(key, Key::Frame { sparse: true, .. }))
+            .collect();
+        if whole {
+            assert_eq!(sparse.is_empty(), !host.sparse());
+        }
+        for (key, (_, samples)) in sparse {
+            for sample in samples {
+                assert_eq!(
+                    sample.cost.units,
+                    0,
+                    "{}: a calibration run held bricks: {sample:?}",
+                    key.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn c1_under_any_load_real_cpu_load_stays_under_the_margin() {
+        let Some(host) = gpu("c1 load, any load") else {
+            return;
+        };
+        let _alone = alone();
+        let points = floors(&host);
+        let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let half = loaded(&host, &points, "half", (cores / 2).max(1), cores);
+        whole_or_named("c1 load half, any load", &host, &half);
+        let mut failures = one_sided("c1 load half", &host, &points, &half.rates, SMOKE);
+        let over = loaded(&host, &points, "over", 2 * cores, cores);
+        whole_or_named("c1 load over, any load", &host, &over);
+        failures.extend(one_sided(
+            "c1 load over",
+            &host,
+            &points,
+            &over.rates,
+            SMOKE,
+        ));
+        assert!(failures.is_empty(), "c1 load: {failures:#?}");
+    }
+
+    #[test]
+    fn c4_under_any_load_each_known_rate_is_plausible_against_plain_runs() {
+        let Some(host) = gpu("c4 any load") else {
+            return;
+        };
+        let _alone = alone();
+        let device = calibrate::device(&host);
+        calibrate::forget(&device);
+        let got = calibrate::taken(&host, None).unwrap();
+        calibrate::forget(&device);
+        let points = floors(&host);
+        let table = calibrate::read(&got.table);
+        let lacks = calibrate::missing(&table, &host);
+        if !lacks.is_empty() {
+            eprintln!(
+                "INCOMPLETE c4 any load {}: lacks {:?}; only known rates were checked",
+                host.name(),
+                lacks.iter().map(Key::name).collect::<Vec<_>>()
+            );
+        }
+        let mut failures = Vec::new();
+        for one in &points {
+            let Some(rate) = table.rate(&one.key) else {
+                assert!(lacks.contains(&one.key), "{} unknown", one.key.name());
+                continue;
+            };
+            let guess = rate.predict(&one.cost());
+            let high = guess.as_secs_f64() / one.wall.as_secs_f64();
+            let low = one.floor.as_secs_f64() / guess.as_secs_f64().max(1e-12);
+            if high > 3.0 {
+                failures.push(format!(
+                    "{} {}: P/wall {high:.3} above 3",
+                    one.key.name(),
+                    one.name
+                ));
+            }
+            if one.bound() && low > 10.0 {
+                failures.push(format!(
+                    "{} {}: R/P {low:.3} above 10 (low side)",
+                    one.key.name(),
+                    one.name
+                ));
+            }
         }
         assert!(failures.is_empty(), "{failures:#?}");
     }

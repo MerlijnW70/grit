@@ -572,6 +572,247 @@ fn c3_a_damaged_or_foreign_file_is_refused_by_name() {
     assert_eq!(load(&dir, &device), Ok(Some(table)));
 }
 
+fn scripted_keys() -> Vec<Key> {
+    vec![
+        Key::rule("sand", false),
+        Key::rule("sand", true),
+        Key::rule("heat", false),
+        Key::rule("heat", true),
+    ]
+}
+
+fn rated(device: Device, keys: &[Key], step: u64) -> Table {
+    let mut table = Table::new(device);
+    for (at, key) in (1_u64..).zip(keys) {
+        table.set(
+            key.clone(),
+            Rate {
+                per_unit_fs: 0,
+                per_frame_ns: 1_000 * at + step,
+                per_submit_ns: 2_000 * at + step,
+            },
+        );
+    }
+    table
+}
+
+fn logic_device(label: &str) -> Device {
+    device_named(&format!("logic {label} {}", std::process::id()))
+}
+
+fn bytes_of(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(FILE)).ok()
+}
+
+const DAMAGED: &str = "{\"calibration\":1,\"body\":{}";
+
+fn taken_now(
+    device: &Device,
+    dir: Option<&Path>,
+    table: &Table,
+    asked: &mut u32,
+    calibrated: &mut u32,
+) -> grit::calibrate::Taken {
+    grit::calibrate::taken_on(
+        device.clone(),
+        || {
+            *asked += 1;
+            scripted_keys()
+        },
+        dir,
+        || {
+            *calibrated += 1;
+            Ok(table.clone())
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_damaged_file_is_refused_by_name_and_a_whole_calibration_stored_and_used() {
+    use grit::calibrate::{forget, read};
+    let device = logic_device("damaged");
+    forget(&device);
+    let dir = scratch("logic-damaged");
+    std::fs::write(dir.join(FILE), DAMAGED).unwrap();
+    let whole = rated(device.clone(), &scripted_keys(), 0);
+    let (mut asked, mut calibrated) = (0, 0);
+    let got = taken_now(&device, Some(&dir), &whole, &mut asked, &mut calibrated);
+    let why = got.refused.clone().unwrap();
+    assert!(
+        why.starts_with(FILE) && why.contains("is not JSON") && why.contains("calibrated again"),
+        "{why}"
+    );
+    assert!(got.calibrated);
+    assert_eq!((asked, calibrated), (1, 1));
+    assert_eq!(read(&got.table), whole);
+    assert_eq!(bytes_of(&dir), Some(whole.written()));
+    assert_eq!(load(&dir, &device), Ok(Some(whole.clone())));
+    let again = taken_now(&device, Some(&dir), &whole, &mut asked, &mut calibrated);
+    assert!(!again.calibrated && again.refused.is_none());
+    assert_eq!(
+        (asked, calibrated),
+        (1, 1),
+        "a whole table in memory is used as it is, before the up-front keys are even listed"
+    );
+    let key = Key::rule("heat", true);
+    let before = read(&got.table).rate(&key).unwrap();
+    let moved = got
+        .table
+        .lock()
+        .unwrap()
+        .lower(&key, framed(32, Duration::from_nanos(1_000)));
+    assert_eq!(moved, Moved::Lowered);
+    let lowered = read(&got.table);
+    assert!(lowered.rate(&key).unwrap().per_frame_ns < before.per_frame_ns);
+    assert_eq!(
+        bytes_of(&dir),
+        Some(lowered.written()),
+        "a lowered rate of a stored table is stored"
+    );
+    forget(&device);
+    let resumed = taken_now(&device, Some(&dir), &whole, &mut asked, &mut calibrated);
+    assert!(!resumed.calibrated && resumed.refused.is_none());
+    assert_eq!((asked, calibrated), (2, 1));
+    assert_eq!(read(&resumed.table), lowered);
+    forget(&device);
+}
+
+#[test]
+fn an_incomplete_calibration_is_never_stored_and_is_calibrated_again() {
+    use grit::calibrate::{forget, read};
+    let device = logic_device("incomplete");
+    forget(&device);
+    let keys = scripted_keys();
+    let first = keys[0].clone();
+    let whole = rated(device.clone(), &keys, 0);
+    let partial = rated(device.clone(), &keys[1..], 5);
+    let dir = scratch("logic-incomplete");
+    std::fs::write(dir.join(FILE), DAMAGED).unwrap();
+    let (mut asked, mut calibrated) = (0, 0);
+    let got = taken_now(&device, Some(&dir), &partial, &mut asked, &mut calibrated);
+    assert!(got.calibrated);
+    assert!(got.refused.clone().unwrap().contains("is not JSON"));
+    assert_eq!(read(&got.table), partial);
+    assert_eq!(
+        bytes_of(&dir).as_deref(),
+        Some(DAMAGED),
+        "an incomplete calibration was written over the file"
+    );
+    let key = Key::rule("heat", true);
+    let moved = got
+        .table
+        .lock()
+        .unwrap()
+        .lower(&key, framed(32, Duration::from_nanos(1_000)));
+    assert_eq!(moved, Moved::Lowered);
+    assert_eq!(
+        bytes_of(&dir).as_deref(),
+        Some(DAMAGED),
+        "a lowered rate of an incomplete table was stored"
+    );
+    let again = taken_now(&device, Some(&dir), &whole, &mut asked, &mut calibrated);
+    assert!(
+        again.calibrated,
+        "an incomplete table in memory is calibrated again"
+    );
+    assert_eq!(calibrated, 2);
+    assert!(again.refused.clone().unwrap().contains("is not JSON"));
+    assert_eq!(bytes_of(&dir), Some(whole.written()));
+    forget(&device);
+    let mut lacking = Table::new(device.clone());
+    for (one, rate) in whole.rates().filter(|(one, _)| **one != first) {
+        lacking.set(one.clone(), *rate);
+    }
+    lacking.save(&dir).unwrap();
+    let reloaded = taken_now(&device, Some(&dir), &partial, &mut asked, &mut calibrated);
+    let why = reloaded.refused.clone().unwrap();
+    assert!(
+        why.starts_with(FILE)
+            && why.contains("lacks the rates of")
+            && why.contains(&first.name())
+            && why.contains("calibrated again"),
+        "{why}"
+    );
+    assert!(reloaded.calibrated);
+    assert_eq!(calibrated, 3);
+    assert_eq!(
+        bytes_of(&dir),
+        Some(lacking.written()),
+        "an incomplete calibration was written over a file that lacked a key"
+    );
+    forget(&device);
+    rated(device_named("another card"), &keys, 0)
+        .save(&dir)
+        .unwrap();
+    let foreign = taken_now(&device, Some(&dir), &whole, &mut asked, &mut calibrated);
+    assert!(
+        foreign
+            .refused
+            .clone()
+            .unwrap()
+            .contains("another device (another card")
+    );
+    assert!(foreign.calibrated);
+    assert_eq!(load(&dir, &device), Ok(Some(whole.clone())));
+    forget(&device);
+    let bare = taken_now(&device, None, &whole, &mut asked, &mut calibrated);
+    assert!(bare.calibrated && bare.refused.is_none());
+    assert_eq!(read(&bare.table), whole);
+    forget(&device);
+}
+
+const RECORDED: &str = r#"{"calibration":2,"body":{"device":{"name":"scripted run","driver":7,"width":32},"rates":[{"key":"frame/dense/rule/heat","per_unit_fs":0,"per_frame_ns":5698,"per_submit_ns":6501},{"key":"frame/dense/rule/sand","per_unit_fs":0,"per_frame_ns":5666,"per_submit_ns":6565},{"key":"frame/sparse/rule/heat","per_unit_fs":0,"per_frame_ns":22052,"per_submit_ns":29477},{"key":"frame/sparse/rule/sand","per_unit_fs":0,"per_frame_ns":22205,"per_submit_ns":29605}]},"sum":"cb92dc2c351824947d1ccd39443e1133d926d5cbe43b37f564062ec46c01058f"}"#;
+
+fn scripted_sample(frames: u32, nanos: u64) -> Sample {
+    Sample {
+        cost: work(4096 * u64::from(frames), frames, 1),
+        time: Duration::from_nanos(nanos),
+    }
+}
+
+#[test]
+fn a_scripted_calibration_stores_the_bytes_recorded_on_base() {
+    use grit::calibrate::{forget, read};
+    let device = Device {
+        name: "scripted run".to_owned(),
+        driver: 7,
+        width: 32,
+    };
+    forget(&device);
+    let floors = [6_528_u64, 29_568, 6_464, 29_440]
+        .into_iter()
+        .zip([5_666_u64, 22_205, 5_698, 22_052]);
+    let mut passes = Passes::default();
+    for (key, (short, each)) in scripted_keys().iter().zip(floors) {
+        let long = short + 31 * each;
+        for (scale, extra) in [(11_u64, 0_u64), (10, 37)] {
+            passes.add(
+                key,
+                Pass {
+                    sizes: vec![Pair {
+                        short: scripted_sample(1, short * scale / 10 + extra),
+                        long: scripted_sample(32, long * scale / 10 + extra),
+                    }],
+                },
+            );
+        }
+    }
+    let dir = scratch("scripted-run");
+    let got = grit::calibrate::taken_on(device.clone(), scripted_keys, Some(&dir), || {
+        let mut table = Table::new(device.clone());
+        for (key, (rate, _)) in passes.solved() {
+            table.set(key, rate);
+        }
+        Ok(table)
+    })
+    .unwrap();
+    assert!(got.calibrated && got.refused.is_none());
+    assert_eq!(bytes_of(&dir).as_deref(), Some(RECORDED));
+    assert_eq!(Table::read(RECORDED), Ok(read(&got.table)));
+    forget(&device);
+}
+
 #[cfg(feature = "faults")]
 mod device {
     use std::sync::{Arc, Mutex, PoisonError};
@@ -867,7 +1108,141 @@ mod device {
         assert!(shared(&device).is_none());
     }
 
+    fn incomplete(label: &str, lacks: &[Key]) {
+        eprintln!(
+            "INCOMPLETE {label}: the calibration lacks {:?}, so the store was checked to be refused",
+            lacks.iter().map(Key::name).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
+    fn c3_on_the_device_a_damaged_file_is_refused_and_only_a_whole_calibration_replaces_it() {
+        let Some(host) = common::device("c3 damaged, any load") else {
+            return;
+        };
+        let _alone = alone();
+        let device = calibrate::device(&host);
+        calibrate::forget(&device);
+        let dir = scratch("damaged-any-load");
+        let damaged = "{\"calibration\":1,\"body\":{}";
+        std::fs::write(dir.join(FILE), damaged).unwrap();
+        let got = taken(&host, Some(&dir)).unwrap();
+        let why = got.refused.clone().unwrap();
+        assert!(
+            why.starts_with(FILE) && why.contains("is not JSON"),
+            "{why}"
+        );
+        assert!(got.calibrated);
+        let fresh = read(&got.table);
+        let lacks = missing(&fresh, &host);
+        if lacks.is_empty() {
+            assert_eq!(load(&dir, &device), Ok(Some(fresh.clone())));
+            calibrate::forget(&device);
+            let again = taken(&host, Some(&dir)).unwrap();
+            assert!(!again.calibrated && again.refused.is_none());
+            assert_eq!(read(&again.table), fresh);
+        } else {
+            incomplete("c3 damaged", &lacks);
+            assert_eq!(
+                std::fs::read_to_string(dir.join(FILE)).unwrap(),
+                damaged,
+                "an incomplete calibration replaced the damaged file"
+            );
+            let why = load(&dir, &device).unwrap_err();
+            assert!(why.contains("is not JSON"), "{why}");
+        }
+        calibrate::forget(&device);
+    }
+
+    #[test]
+    fn on_the_device_an_incomplete_calibration_is_never_stored() {
+        let Some(host) = common::device("incomplete, any load") else {
+            return;
+        };
+        let _alone = alone();
+        if host.on_cpu() {
+            assert!(up_front(&host).is_empty());
+            return;
+        }
+        let device = calibrate::device(&host);
+        calibrate::forget(&device);
+        let dir = scratch("incomplete-any-load");
+        faults::device_wait(Some(Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(2500));
+        })));
+        let gave_up = std::panic::catch_unwind(|| taken(&host, Some(&dir)));
+        faults::device_wait(None);
+        let gave_up = gave_up.unwrap().unwrap();
+        assert!(gave_up.calibrated);
+        let partial = read(&gave_up.table);
+        assert!(
+            !missing(&partial, &host).is_empty(),
+            "the device-wait hook did not make the calibration give up: {partial:?}"
+        );
+        assert!(
+            !dir.join(FILE).exists(),
+            "a table that lacks an up-front key was written"
+        );
+        let again = taken(&host, Some(&dir)).unwrap();
+        assert!(
+            again.calibrated,
+            "an incomplete table in memory is calibrated again"
+        );
+        let fresh = read(&again.table);
+        let lacks = missing(&fresh, &host);
+        if lacks.is_empty() {
+            assert_eq!(load(&dir, &device), Ok(Some(fresh)));
+        } else {
+            incomplete("incomplete again", &lacks);
+            assert!(
+                !dir.join(FILE).exists(),
+                "a table that lacks an up-front key was written"
+            );
+        }
+        calibrate::forget(&device);
+        let wanted = up_front(&host);
+        let first = wanted[0].clone();
+        let mut lacking = Table::new(device.clone());
+        for (at, key) in (1_u64..).zip(&wanted[1..]) {
+            lacking.set(
+                key.clone(),
+                Rate {
+                    per_unit_fs: 0,
+                    per_frame_ns: 1_000 * at,
+                    per_submit_ns: 2_000 * at,
+                },
+            );
+        }
+        lacking.save(&dir).unwrap();
+        let reloaded = taken(&host, Some(&dir)).unwrap();
+        let why = reloaded.refused.clone().unwrap();
+        assert!(
+            why.starts_with(FILE)
+                && why.contains(&first.name())
+                && why.contains("calibrated again"),
+            "{why}"
+        );
+        assert!(reloaded.calibrated);
+        let fresh = read(&reloaded.table);
+        let lacks = missing(&fresh, &host);
+        if lacks.is_empty() {
+            assert_eq!(load(&dir, &device), Ok(Some(fresh)));
+        } else {
+            incomplete("incomplete after a lacking file", &lacks);
+            assert_eq!(
+                std::fs::read_to_string(dir.join(FILE)).unwrap(),
+                lacking.written(),
+                "an incomplete calibration replaced a file that lacked a key"
+            );
+        }
+        calibrate::forget(&device);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "quiet"),
+        ignore = "needs a quiet machine: the nightly full check runs it with --features faults,quiet"
+    )]
     fn c3_a_damaged_file_is_refused_by_name_and_the_device_calibrated_again() {
         let Some(host) = common::device("c3 damaged") else {
             return;
@@ -894,6 +1269,10 @@ mod device {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "quiet"),
+        ignore = "needs a quiet machine: the nightly full check runs it with --features faults,quiet"
+    )]
     fn an_incomplete_calibration_is_never_stored() {
         let Some(host) = common::device("incomplete") else {
             return;
