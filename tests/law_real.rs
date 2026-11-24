@@ -1547,3 +1547,321 @@ fn r5_describe_names_the_linear_limits_and_codes() {
         assert!(codes.iter().any(|one| one == code), "{code}");
     }
 }
+
+const SKEW: f64 = 0.003_456_789;
+
+fn skewed(alpha: f64) -> Vec<([i64; 3], f64)> {
+    vec![
+        ([0, 0, 0], 1.0 - 4.0 * alpha),
+        ([1, 0, 0], alpha - SKEW),
+        ([-1, 0, 0], alpha + SKEW),
+        ([0, 1, 0], alpha),
+        ([0, -1, 0], alpha),
+    ]
+}
+
+fn noisy_skewed(rng: &mut Rng, sigma: f64, frac: u32) -> Vec<String> {
+    let size = [64, 64, 1];
+    let weights = skewed(ALPHA5);
+    (0..4)
+        .map(|_| {
+            let input = field(rng, 64 * 64, 0.0, 1.0, frac);
+            let clean = stencil_step(size, &reals(&input, frac), &weights, 0.0);
+            let noisy: Vec<f64> = clean
+                .iter()
+                .map(|one| one + sigma * gaussian(rng))
+                .collect();
+            inline(size, &[input], &[words_of(&noisy, frac)])
+        })
+        .collect()
+}
+
+#[test]
+fn r7_an_asymmetric_law_under_one_percent_noise_is_reported_not_symmetric() {
+    let mut mcp = Mcp::new(None);
+    let frac = 16;
+    let sigma = 0.01;
+    let mut rng = Rng(701);
+    let examples = noisy_skewed(&mut rng, sigma, frac);
+    let learned = mcp.learn(&linear_args(
+        "3x3",
+        &[0],
+        &[1],
+        &examples,
+        ",\"places\":\"von_neumann\"",
+    ));
+    recovered(&learned, &skewed(ALPHA5), false, &[1, 3, 4, 5, 7]);
+    let rms = real_at(learned.residual(0), "rms_real");
+    assert!(
+        (rms / sigma - 1.0).abs() < 0.03,
+        "rms {rms} at sigma {sigma}"
+    );
+    let symmetry = learned.answer.get("symmetry").unwrap();
+    assert!(!learned.invariant(), "{}", written(symmetry));
+    let one = &symmetry.get("writes").and_then(Json::list).unwrap()[0];
+    assert_eq!(one.get("invariant"), Some(&Json::Bool(false)));
+    let places: Vec<i64> = one
+        .get("places")
+        .and_then(Json::list)
+        .unwrap()
+        .iter()
+        .map(|place| place.int().unwrap())
+        .collect();
+    let mut sorted = places.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, [3, 5], "west and east: {}", written(one));
+    let deviation = real_at(one, "deviation");
+    let tolerance = real_at(one, "tolerance");
+    let west = learned.place(0, 0, [-1, 0, 0]).unwrap();
+    let east = learned.place(0, 0, [1, 0, 0]).unwrap();
+    assert!(
+        (deviation - (west.fit - east.fit).abs()).abs() < 1e-9,
+        "{deviation} {} {}",
+        west.fit,
+        east.fit
+    );
+    assert!(
+        (deviation - 2.0 * SKEW).abs() <= 6.0 * (west.stderr + east.stderr),
+        "the deviation is the skew: {deviation}"
+    );
+    let floor = 1.0 / scaled(learned.scales[0]);
+    assert!(tolerance > 4.0 * floor, "{tolerance} {floor}");
+    let pair = (west.stderr.powi(2) + east.stderr.powi(2)).sqrt();
+    assert!(
+        tolerance > 4.0 * pair && tolerance < 8.0 * pair,
+        "about 6 standard errors of the difference: {tolerance}, {pair}"
+    );
+    let ratio = deviation / tolerance;
+    eprintln!(
+        "r7 skew {SKEW}: deviation {deviation:.4e}, tolerance {tolerance:.4e}, ratio {ratio:.3}"
+    );
+    assert!(
+        ratio > 2.0 && ratio < 5.0,
+        "past the tolerance and inside ten times it: {ratio}"
+    );
+    let mut rng = Rng(701);
+    let level = noisy_examples(&mut rng, sigma, frac);
+    let even = mcp.learn(&linear_args(
+        "3x3",
+        &[0],
+        &[1],
+        &level,
+        ",\"places\":\"von_neumann\"",
+    ));
+    assert!(even.invariant(), "the same noise without skew is symmetric");
+}
+
+#[test]
+fn r8_a_clamp_at_the_edge_of_the_written_words_holds_on_the_device() {
+    let Some(host) = device("r8_a_clamp_at_the_edge_of_the_written_words_holds_on_the_device")
+    else {
+        return;
+    };
+    let mut mcp = Mcp::new(Some(&host));
+    let mut rng = Rng(802);
+    let frac = 16;
+    let examples = heat_examples(&mut rng, [64, 64, 1], 2, &five_point(ALPHA5), frac);
+    let places = ",\"places\":\"von_neumann\"";
+    let open = mcp.learn(&linear_args("3x3", &[0], &[1], &examples, places));
+    let [low, high] = reach(open.scales[0]);
+    let (int_low, int_high) = (i64::from(i32::MIN), i64::from(i32::MAX));
+    let size = [32, 32, 2];
+    let input = field(&mut rng, 32 * 32 * 2, 0.0, 1.0, frac);
+    let mut held = Vec::new();
+    for clamp in [
+        [high, int_high],
+        [int_low, low],
+        [low, low],
+        [int_low, int_high],
+        [3000, 40_000],
+    ] {
+        let learned = mcp.learn(&linear_args(
+            "3x3",
+            &[0],
+            &[1],
+            &examples,
+            &clamped(places, clamp),
+        ));
+        let world = mcp.world(&learned.law, size, "");
+        mcp.write(world, 0, size, &input);
+        mcp.step(world, 1);
+        let got = mcp.read(world, 1, size);
+        mcp.close(world);
+        let host_words = learned.stepped(size, std::slice::from_ref(&input));
+        let free = open.stepped(size, std::slice::from_ref(&input));
+        assert!(
+            got == host_words[0],
+            "{clamp:?}: device and host formula differ"
+        );
+        for (word, unclamped) in got.iter().zip(&free[0]) {
+            let word = i64::from(word.cast_signed());
+            let unclamped = i64::from(unclamped.cast_signed());
+            assert!((low..=high).contains(&unclamped), "{unclamped}");
+            assert_eq!(word, unclamped.clamp(clamp[0], clamp[1]), "{clamp:?}");
+        }
+        held.push(
+            got.iter()
+                .filter(|one| clamp.contains(&i64::from(one.cast_signed())))
+                .count(),
+        );
+    }
+    assert_eq!(held[0], 32 * 32 * 2, "every word is the upper edge");
+    assert_eq!(held[1], 32 * 32 * 2, "every word is the lower edge");
+    assert_eq!(held[2], 32 * 32 * 2);
+    assert!(held[4] > 0, "{held:?}");
+    eprintln!("r8 device: written words in [{low}, {high}], words at a clamp bound {held:?}");
+}
+
+fn two_writes(rng: &mut Rng, frac: u32) -> Vec<String> {
+    let size = [64, 64, 1];
+    let heat = five_point(ALPHA5);
+    let small = vec![([0, 0, 0], 0.010_123_4), ([1, 0, 0], -0.004_321)];
+    (0..3)
+        .map(|_| {
+            let input = field(rng, 64 * 64, 0.0, 1.0, frac);
+            let real = reals(&input, frac);
+            let first = words_of(&stencil_step(size, &real, &heat, 0.0), frac);
+            let second = words_of(&stencil_step(size, &real, &small, 0.0), frac);
+            inline(size, &[input], &[first, second])
+        })
+        .collect()
+}
+
+fn reach(scale: u32) -> [i64; 2] {
+    let half = 1_i64 << (31 - scale);
+    [-half, half - 1]
+}
+
+fn limit_of(told: &Json) -> [i64; 2] {
+    let held = told.get("limit").and_then(Json::list).unwrap();
+    [held[0].int().unwrap(), held[1].int().unwrap()]
+}
+
+fn clamped(more: &str, clamp: [i64; 2]) -> String {
+    format!("{more},\"clamp\":[{},{}]", clamp[0], clamp[1])
+}
+
+#[test]
+fn r8_a_clamp_that_meets_no_word_the_law_writes_is_refused_by_name() {
+    let mut mcp = Mcp::new(None);
+    let mut rng = Rng(801);
+    let frac = 16;
+    let examples = heat_examples(&mut rng, [64, 64, 1], 2, &five_point(ALPHA5), frac);
+    let places = ",\"places\":\"von_neumann\"";
+    let args = |clamp: [i64; 2]| linear_args("3x3", &[0], &[1], &examples, &clamped(places, clamp));
+    let open = mcp.learn(&linear_args("3x3", &[0], &[1], &examples, places));
+    let scale = open.scales[0];
+    let [low, high] = reach(scale);
+    eprintln!("r8 coefficient_frac {scale}: written words in [{low}, {high}]");
+    let (int_low, int_high) = (i64::from(i32::MIN), i64::from(i32::MAX));
+    for clamp in [
+        [high + 1, int_high],
+        [high + 1, high + 1],
+        [int_low, low - 1],
+        [low - 1, low - 1],
+        [high + 1000, high + 2000],
+    ] {
+        let told = mcp.refused(&args(clamp), "clamp_range", "$.clamp");
+        assert_eq!(limit_of(&told), [low, high], "{clamp:?}");
+        assert!(
+            text_at(&told, "message").contains(&format!("[{low}, {high}]")),
+            "{}",
+            written(&told)
+        );
+        assert!(text_at(&told, "hint").ends_with('.'));
+    }
+    for clamp in [
+        [high, int_high],
+        [high, high],
+        [int_low, low],
+        [low, low],
+        [int_low, int_high],
+        [low - 1, high + 1],
+        [-1024, 3072],
+    ] {
+        let learned = mcp.learn(&args(clamp));
+        assert_eq!(learned.scales, open.scales, "{clamp:?}: the clamp leaves k");
+        assert_eq!(learned.clamp, Some(clamp));
+    }
+    let examples = two_writes(&mut rng, frac);
+    let open = mcp.learn(&linear_args("3x3", &[0], &[1, 2], &examples, places));
+    let [wide, narrow] = [open.scales[0], open.scales[1]];
+    assert!(narrow > wide, "{:?}", open.scales);
+    let [low, high] = reach(narrow);
+    let [_, wide_high] = reach(wide);
+    for (clamp, refused) in [
+        ([high + 1, wide_high], true),
+        ([int_low, low - 1], true),
+        ([high, wide_high], false),
+    ] {
+        let more = clamped(places, clamp);
+        let request = linear_args("3x3", &[0], &[1, 2], &examples, &more);
+        if refused {
+            let told = mcp.refused(&request, "clamp_range", "$.clamp");
+            assert_eq!(limit_of(&told), [low, high], "the narrowest of the writes");
+        } else {
+            assert_eq!(mcp.learn(&request).scales, open.scales);
+        }
+    }
+    eprintln!(
+        "r8 two writes, coefficient_frac {wide} and {narrow}: a clamp past [{low}, {high}] refused"
+    );
+}
+
+#[test]
+fn r9_ill_conditioned_is_named_before_fixed_range_whatever_the_order() {
+    let mut mcp = Mcp::new(None);
+    let mut rng = Rng(901);
+    let size = [16, 16, 1];
+    let input = field(&mut rng, 256, 0.0, 1.0, 16);
+    let other = field(&mut rng, 256, 0.0, 1.0, 16);
+    let output = words_of(
+        &stencil_step(size, &reals(&input, 16), &five_point(ALPHA5), 0.0),
+        16,
+    );
+    let near: Vec<u32> = input
+        .iter()
+        .map(|one| one + u32::from(rng.below(64) == 0))
+        .collect();
+    let pair = |second: &[u32], swapped: bool| {
+        let reads = if swapped {
+            vec![second.to_vec(), input.clone()]
+        } else {
+            vec![input.clone(), second.to_vec()]
+        };
+        vec![inline(size, &reads, std::slice::from_ref(&output))]
+    };
+    let places = ",\"places\":\"von_neumann\"";
+    let lead = |examples: &[String], more: &str| {
+        let after = linear_args("3x3", &[0, 1], &[2], examples, more);
+        let before = after
+            .replacen(more, "", 1)
+            .replacen("{", &format!("{{{},", &more[1..]), 1);
+        assert_ne!(after, before);
+        [after, before]
+    };
+    for swapped in [false, true] {
+        let free = pair(&other, swapped);
+        for request in lead(&free, &format!("{places},\"poly\":2")) {
+            mcp.refused(&request, "fixed_range", "$.frac");
+        }
+        for (label, second) in [
+            ("identical", input.clone()),
+            ("near", near.clone()),
+            ("flat", vec![77; 256]),
+        ] {
+            let examples = pair(&second, swapped);
+            for request in lead(&examples, places) {
+                mcp.refused(&request, "ill_conditioned", "$.examples");
+            }
+            for request in lead(&examples, &format!("{places},\"poly\":2"))
+                .into_iter()
+                .chain(lead(&examples, &format!(",\"poly\":2{places}")))
+            {
+                let told = mcp.refused(&request, "ill_conditioned", "$.examples");
+                assert!(told.get("condition").is_some(), "{label}");
+                assert!(told.get("limit").and_then(Json::text).is_some(), "{label}");
+            }
+        }
+    }
+}
