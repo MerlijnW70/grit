@@ -30,6 +30,8 @@ Each section is a 4-byte ASCII tag, a `u64` count of payload words, then the pay
 | dense, law | `LAW `, `DENS`, `SUM ` |
 | sparse, law | `LAW `, `TABL`, `POOL`, `SUM ` |
 
+A world made with `absorb` has an `ABSB` section right after `RULE` or `LAW `; a world without one has none, so its file is as before.
+
 | Tag | Payload words | Payload |
 |---|---|---|
 | `RULE` | 1 + ⌈n/4⌉ | `n`, the text's byte count, then the text, zero-padded to a word: the canonical JSON `{"params":P,"rule":"<name>"}` (sorted keys, no spaces) |
@@ -37,6 +39,7 @@ Each section is a 4-byte ASCII tag, a `u64` count of payload words, then the pay
 | `DENS` | k·x·y·z | plane by plane, each plane every cell, x fastest, then y, then z |
 | `TABL` | (k+1)·bricks | first per brick its slot and its plane 0 value, then for each plane from 1 to k−1 one value per brick |
 | `POOL` | k·held·c | plane by plane, each plane the held bricks' cells, held brick `h` at `h`·c |
+| `ABSB` | 3 | the cells the border absorbs on x, y and z: not all 0, and twice each less than its side |
 | `SUM ` | 8 | 32 bytes: sha256 of every byte before the `SUM ` tag |
 
 `c` is the cells per brick, `bricks` is x·y·z / c, `held` the held bricks.

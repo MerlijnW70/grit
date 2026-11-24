@@ -3,6 +3,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::border::Absorb;
 use crate::wire::{self, Json};
 
 use super::Refused;
@@ -19,6 +20,7 @@ pub const TABLE: [u8; 4] = *b"TABL";
 pub const POOL: [u8; 4] = *b"POOL";
 pub const DENSE: [u8; 4] = *b"DENS";
 pub const SUM: [u8; 4] = *b"SUM ";
+pub const ABSORB: [u8; 4] = *b"ABSB";
 
 pub const UNIFORM: u32 = u32::MAX;
 
@@ -550,6 +552,14 @@ pub fn text_words(text: &str) -> Vec<u32> {
 }
 
 pub fn encode<W: Write>(image: &Image, out: W) -> io::Result<(W, u64)> {
+    encode_with(image, None, out)
+}
+
+pub fn encode_with<W: Write>(
+    image: &Image,
+    absorb: Option<Absorb>,
+    out: W,
+) -> io::Result<(W, u64)> {
     let mut sealing = Sealing {
         out,
         hash: Sha256::new(),
@@ -577,6 +587,9 @@ pub fn encode<W: Write>(image: &Image, out: W) -> io::Result<(W, u64)> {
         image.law.tag(),
         &text_words(&image.law.canonical(image.params.len())),
     )?;
+    if let Some(absorb) = absorb {
+        sealing.section(ABSORB, &absorb.cells())?;
+    }
     match &image.state {
         State::Dense(cells) => sealing.section(DENSE, cells)?,
         State::Sparse { table, pool, .. } => {
@@ -706,6 +719,15 @@ fn sized(what: &'static str, header: u64, found: u64) -> Refused {
 }
 
 pub fn decode<R: Read>(input: R, length: u64) -> Result<Image, Refused> {
+    match decode_with(input, length)? {
+        (image, None) => Ok(image),
+        (_, Some(_)) => Err(malformed(
+            "the world absorbs at its border; read it with decode_with, which keeps the border",
+        )),
+    }
+}
+
+pub fn decode_with<R: Read>(input: R, length: u64) -> Result<(Image, Option<Absorb>), Refused> {
     let mut taking = Taking {
         input,
         hash: Sha256::new(),
@@ -783,13 +805,44 @@ pub fn decode<R: Read>(input: R, length: u64) -> Result<Image, Refused> {
     judged(header, sections)
 }
 
-fn judged(header: Header, sections: Vec<([u8; 4], Vec<u32>)>) -> Result<Image, Refused> {
+fn absorbed(
+    header: &Header,
+    sections: &mut Vec<([u8; 4], Vec<u32>)>,
+) -> Result<Option<Absorb>, Refused> {
+    let Some(at) = sections.iter().position(|(tag, _)| *tag == ABSORB) else {
+        return Ok(None);
+    };
+    if at != 1 {
+        return Err(malformed(
+            "the border section comes right after the law section",
+        ));
+    }
+    let (_, payload) = sections.remove(at);
+    let cells = <[u32; 3]>::try_from(payload.as_slice())
+        .map_err(|_| sized("border", 3, payload.len() as u64))?;
+    let absorb = Absorb::new(cells)
+        .ok_or_else(|| malformed("the border section absorbs no cells on any axis"))?;
+    if let Some(axis) = absorb.too_wide(header.size) {
+        return Err(malformed(format!(
+            "the border absorbs {} cells on axis {axis} of a side of {}",
+            cells.get(axis).copied().unwrap_or_default(),
+            header.size.get(axis).copied().unwrap_or_default()
+        )));
+    }
+    Ok(Some(absorb))
+}
+
+fn judged(
+    header: Header,
+    mut sections: Vec<([u8; 4], Vec<u32>)>,
+) -> Result<(Image, Option<Absorb>), Refused> {
     if let Some((tag, _)) = sections
         .iter()
-        .find(|(tag, _)| ![RULE, LAW, TABLE, POOL, DENSE].contains(tag))
+        .find(|(tag, _)| ![RULE, LAW, TABLE, POOL, DENSE, ABSORB].contains(tag))
     {
         return Err(Refused::Section { tag: *tag });
     }
+    let absorb = absorbed(&header, &mut sections)?;
     if header.channels == 0 || header.channels > MOST_CHANNELS {
         return Err(malformed(format!(
             "the world has {} channels, and version {VERSION} holds 1 to {MOST_CHANNELS}",
@@ -881,13 +934,16 @@ fn judged(header: Header, sections: Vec<([u8; 4], Vec<u32>)>) -> Result<Image, R
     } else {
         sparse_state(&header, cells, payloads.next(), payloads.next())?
     };
-    Ok(Image {
-        law,
-        params: header.params,
-        frame: header.frame,
-        size: header.size,
-        state,
-    })
+    Ok((
+        Image {
+            law,
+            params: header.params,
+            frame: header.frame,
+            size: header.size,
+            state,
+        },
+        absorb,
+    ))
 }
 
 fn too_many(what: &str) -> Refused {
@@ -1045,6 +1101,12 @@ pub fn fetch(path: &Path) -> Result<Image, Refused> {
     decode(BufReader::with_capacity(1 << 20, file), length)
 }
 
+pub fn fetch_with(path: &Path) -> Result<(Image, Option<Absorb>), Refused> {
+    let file = File::open(path).map_err(|why| failed(&why))?;
+    let length = file.metadata().map_err(|why| failed(&why))?.len();
+    decode_with(BufReader::with_capacity(1 << 20, file), length)
+}
+
 static TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 #[must_use]
@@ -1087,7 +1149,23 @@ pub fn store(path: &Path, image: &Image) -> Result<u64, Refused> {
     store_with(path, image, |file| file)
 }
 
+pub fn store_absorbing(path: &Path, image: &Image, absorb: Option<Absorb>) -> Result<u64, Refused> {
+    stored(path, (image, absorb), |file| file)
+}
+
 pub fn store_with<W, F>(path: &Path, image: &Image, wrap: F) -> Result<u64, Refused>
+where
+    W: Write,
+    F: FnOnce(File) -> W,
+{
+    stored(path, (image, None), wrap)
+}
+
+pub fn stored<W, F>(
+    path: &Path,
+    (image, absorb): (&Image, Option<Absorb>),
+    wrap: F,
+) -> Result<u64, Refused>
 where
     W: Write,
     F: FnOnce(File) -> W,
@@ -1095,7 +1173,7 @@ where
     let (temporary, file) = fresh(path).map_err(|why| failed(&why))?;
     let written = (|| -> io::Result<u64> {
         let out = BufWriter::with_capacity(1 << 20, wrap(file));
-        let (out, written) = encode(image, out)?;
+        let (out, written) = encode_with(image, absorb, out)?;
         let inner = out.into_inner().map_err(io::IntoInnerError::into_error)?;
         drop(inner);
         OpenOptions::new()

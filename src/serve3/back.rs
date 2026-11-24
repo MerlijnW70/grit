@@ -248,6 +248,13 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let home = matches!(held.get("home"), Some(Json::Bool(true)));
     let live = server.world(held)?;
     let rule = live.world.rule().to_owned();
+    if live.world.absorb().is_some() {
+        return Err(refused(
+            Code::NotReversible,
+            "$.world",
+            "the world absorbs at its border, which loses what leaves it, so it has no inverse to walk back with; nothing ran".to_owned(),
+        ));
+    }
     let inverse = match live.world.law().map(crate::law::Law::inverse) {
         Some(Ok(Some(inverse))) if live.world.reversible() => inverse.hex(),
         _ => return Err(not_reversible(&rule)),
@@ -440,7 +447,7 @@ fn checked(server: &mut Server<'_>, number: u32, start: &Image, done: u32) -> Re
         Err(why) if super::lost_device(why.as_ref()) => return Err(why),
         Err(why) => why,
     };
-    let rebuilt = super::law::opened(host, start)?;
+    let rebuilt = super::law::opened(host, start, None)?;
     server.world_at(number, "$.world")?.world = rebuilt;
     Err(why)
 }

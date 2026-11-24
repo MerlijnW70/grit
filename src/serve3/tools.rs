@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::border::{Absorb, Box3};
 use crate::branch::World;
 use crate::branch::read::{BITS, MARKS_HELD, Mark, Plane, SET_MOST};
 use crate::host::Host;
@@ -351,6 +352,21 @@ fn create_shown() -> Json {
                 ),
             ),
             (
+                "absorb",
+                map(vec![
+                    ("type", text("array")),
+                    ("items", whole("cells", 0, i64::from(u32::MAX))),
+                    ("minItems", Json::Int(3)),
+                    ("maxItems", Json::Int(3)),
+                    (
+                        "description",
+                        text(
+                            "[x, y, z]: after every frame, on the device, zero every plane of every cell within that many cells of the world's edge on that axis, so what flies out never comes back. 0 leaves an axis wrapped, as when left out. The answer names it",
+                        ),
+                    ),
+                ]),
+            ),
+            (
                 "params",
                 map(vec![
                     ("type", text("array")),
@@ -373,12 +389,54 @@ fn write_shown() -> Json {
     tool(
         "grit_world_write",
         &format!(
-            "Set cells of one plane between frames and wake them, so the next frame steps them. At most {READ_MOST} cells a call; the last write to a cell wins."
+            "Set cells of one plane between frames and wake them, so the next frame steps them. At most {READ_MOST} cells a call; the last write to a cell wins. Form clear zeroes bits of a box instead."
         ),
         vec![
             ("world", world_number()),
             ("plane", plane_shown()),
             ("current", current_shown()),
+            (
+                "form",
+                with(
+                    choice(
+                        "cells: set the cells listed; clear: zero the bits named in bits of every cell of the box from to to, corners included, on the planes named in planes (every plane if left out, the current one with current true), and wake what changed. A box whose from is past its to on an axis wraps across the world's seam there. cells if left out",
+                        &["cells", "clear"],
+                    ),
+                    vec![("default", text("cells"))],
+                ),
+            ),
+            (
+                "from",
+                corner_shown("for form clear: the box's first corner, [x, y, z]"),
+            ),
+            (
+                "to",
+                corner_shown("for form clear: the box's last corner, [x, y, z]"),
+            ),
+            (
+                "planes",
+                with(
+                    property(
+                        "array",
+                        "for form clear: the planes to clear, each named once; every plane if left out",
+                    ),
+                    vec![("items", word()), ("minItems", Json::Int(1))],
+                ),
+            ),
+            (
+                "bits",
+                with(
+                    property(
+                        "array",
+                        "for form clear: the bits to zero, each from 0 to 31 and named once; all 32 if left out",
+                    ),
+                    vec![
+                        ("items", word()),
+                        ("minItems", Json::Int(1)),
+                        ("maxItems", Json::Int(i64::from(BITS))),
+                    ],
+                ),
+            ),
             (
                 "cells",
                 map(vec![
@@ -392,7 +450,10 @@ fn write_shown() -> Json {
                             ("maxItems", Json::Int(4)),
                         ]),
                     ),
-                    ("description", text("each [x, y, z, word]")),
+                    (
+                        "description",
+                        text("each [x, y, z, word]; with form cells, the default"),
+                    ),
                     (
                         "maxItems",
                         Json::Int(i64::try_from(READ_MOST).unwrap_or(i64::MAX)),
@@ -400,7 +461,7 @@ fn write_shown() -> Json {
                 ]),
             ),
         ],
-        &["world", "cells"],
+        &["world"],
     )
 }
 
@@ -742,17 +803,19 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     };
     let (grid, sizes) = shaped(host, rule.as_ref(), &made)?;
     made.size = [grid.wide, grid.deep, grid.tall];
+    let absorb = absorb_of(held, made.size)?;
     let bytes = admitted(server, host, &sizes, "the world")?;
     server.fits(Work::build(sparse), bytes, "building the world")?;
     let began = server.now();
     server.slowly(Work::build(sparse));
     let world = match rule.lawful() {
-        None => World::create(host, &made.branch())?,
-        Some(lawful) => World::create_law_stepped(
+        None => World::create_absorbing(host, &made.branch(), absorb)?,
+        Some(lawful) => World::create_law_absorbing(
             host,
             lawful.law(),
             &made.branch(),
             super::law::stepping_of(lawful.class(), sparse),
+            absorb,
         )?,
     };
     let took = server.since(began);
@@ -791,18 +854,71 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if let Some(lawful) = live.rule.lawful() {
         answer.extend(lawful.told());
     }
+    if let Some(absorb) = absorb {
+        answer.push(("absorb", absorb_shown(absorb)));
+    }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
     }
-    let ledger = Ledger::created(made).with_law(law);
+    let ledger = Ledger::created(made).with_law(law).with_absorb(absorb);
     if let Some(note) = server.adopt(id, live, ledger, bytes, pace) {
         answer.push(("journal", note));
     }
     Ok(map(answer))
 }
 
+#[must_use]
+pub fn absorb_shown(absorb: Absorb) -> Json {
+    sized(absorb.cells())
+}
+
+fn absorb_of(held: &Json, size: [u32; 3]) -> Result<Option<Absorb>, Failed> {
+    let Some(given) = held.get("absorb") else {
+        return Ok(None);
+    };
+    let cells =
+        <[u32; 3]>::try_from(ints(given, "absorb")?.as_slice()).map_err(|_| unread("absorb"))?;
+    let absorb = Absorb::new(cells);
+    if let Some(axis) = absorb.and_then(|absorb| absorb.too_wide(size)) {
+        let side = size.get(axis).copied().unwrap_or(2);
+        return Err(limited(
+            Code::AbsorbWide,
+            &format!("$.absorb[{axis}]"),
+            format!(
+                "absorbing {} cells at both ends of axis {axis} leaves no inside in its side of {side} cells",
+                cells.get(axis).copied().unwrap_or_default()
+            ),
+            counted((side / 2).saturating_sub(1)),
+        ));
+    }
+    Ok(absorb)
+}
+
+const CLEARING: [&str; 4] = ["from", "to", "planes", "bits"];
+
+fn clearing(held: &Json) -> bool {
+    held.get("form").and_then(Json::text) == Some("clear")
+}
+
 fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
+    if clearing(held) {
+        return cleared(server, held);
+    }
+    if let Some(key) = CLEARING.iter().find(|key| held.get(key).is_some()) {
+        return Err(refused(
+            Code::WriteForm,
+            &format!("$.{key}"),
+            format!("{key} belongs to form clear; form cells takes cells"),
+        ));
+    }
+    if held.get("cells").is_none() {
+        return Err(refused(
+            Code::WriteForm,
+            "$.cells",
+            "form cells needs cells, each [x, y, z, word]; form clear zeroes a box".to_owned(),
+        ));
+    }
     let number = int(held, "world")?;
     let live = server.world(held)?;
     let size = live.world.size();
@@ -932,6 +1048,142 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     Ok(map(answer))
 }
 
+fn cleared_planes(held: &Json, world: &World<'_>) -> Result<u32, Failed> {
+    let planes = world.planes();
+    match (held.get("planes"), current(held)) {
+        (Some(_), true) => Err(refused(
+            Code::WriteForm,
+            "$.current",
+            "give planes or current true, not both".to_owned(),
+        )),
+        (None, true) => Ok(1 << plane_of(held, world)?),
+        (None, false) => Ok(u32::try_from((1_u64 << planes) - 1).unwrap_or(u32::MAX)),
+        (Some(named), false) => {
+            let mut seen = 0_u32;
+            for (at, &plane) in ints(named, "planes")?.iter().enumerate() {
+                if plane >= planes {
+                    return Err(limited(
+                        Code::Outside,
+                        &format!("$.planes[{at}]"),
+                        format!("plane {plane} is past the world's {planes} planes"),
+                        counted(planes.saturating_sub(1)),
+                    ));
+                }
+                if seen & (1 << plane) != 0 {
+                    return Err(refused(
+                        Code::Malformed,
+                        &format!("$.planes[{at}]"),
+                        format!("plane {plane} is named twice"),
+                    ));
+                }
+                seen |= 1 << plane;
+            }
+            Ok(seen)
+        }
+    }
+}
+
+fn bit_list(mask: u32) -> Json {
+    Json::List(
+        (0..BITS)
+            .filter(|bit| mask & (1 << bit) != 0)
+            .map(counted)
+            .collect(),
+    )
+}
+
+fn cleared(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
+    let number = int(held, "world")?;
+    if held.get("cells").is_some() {
+        return Err(refused(
+            Code::WriteForm,
+            "$.cells",
+            "form clear zeroes a box and takes no cells; give from and to".to_owned(),
+        ));
+    }
+    if let Some(key) = ["from", "to"].iter().find(|key| held.get(key).is_none()) {
+        return Err(refused(
+            Code::WriteForm,
+            &format!("$.{key}"),
+            format!("form clear needs {key}, a corner of the box it zeroes"),
+        ));
+    }
+    let from = corner(held, "from")?;
+    let to = corner(held, "to")?;
+    let live = server.world(held)?;
+    let size = live.world.size();
+    inside(size, from, "from", "$.from")?;
+    inside(size, to, "to", "$.to")?;
+    if int(held, "plane")? != 0 {
+        return Err(refused(
+            Code::WriteForm,
+            "$.plane",
+            "form clear takes planes, a list, or current true".to_owned(),
+        ));
+    }
+    let planes = cleared_planes(held, &live.world)?;
+    let bits = asked_bits(held)?
+        .iter()
+        .fold(0_u32, |mask, bit| mask | (1 << bit));
+    let owed = server.owed(number)?;
+    let began = server.now();
+    let done = server.world(held)?.world.clear(from, to, planes, bits);
+    let spent = server.since(began);
+    let done = match done {
+        Ok(done) => done,
+        Err(why) => {
+            let (refusal, _) = super::refused_with(why.as_ref());
+            if super::lost_device(why.as_ref()) {
+                let mut refusal = refusal;
+                refusal.code = Code::DeviceLost;
+                return Err(Box::new(Lost(refusal)));
+            }
+            return Err(Box::new(refusal));
+        }
+    };
+    let window = Box3::spanning(from, to, size);
+    let entry = Entry::Clear {
+        from,
+        to,
+        planes,
+        bits,
+    };
+    let journal = server
+        .journaled(number, entry, spent, clear_cost(window.cells()))
+        .or(owed);
+    let snapshot = server.settle(number);
+    let mut answer = vec![
+        ("world", counted(number)),
+        ("form", text("clear")),
+        ("from", sized(from)),
+        ("to", sized(to)),
+        ("planes", bit_list(planes)),
+        ("bits", bit_list(bits)),
+        (
+            "cleared",
+            Json::Int(i64::try_from(done.words).unwrap_or(i64::MAX)),
+        ),
+    ];
+    let live = server.world(held)?;
+    if let Some(used) = live.world.pool_use()? {
+        answer.push(("sparse", Json::Bool(true)));
+        answer.push(("pool_use", super::pooled(used)));
+    }
+    if let Some(note) = journal.or(snapshot) {
+        answer.push(("journal", note));
+    }
+    Ok(map(answer))
+}
+
+#[must_use]
+pub fn clear_cost(cells: u64) -> Cost {
+    Cost {
+        units: cells,
+        submits: 1,
+        ..Cost::none(Priced::Write)
+    }
+}
+
 const AIM_WRITE: Duration = Duration::from_millis(budget::SUBMIT_MOST_MS / 2);
 
 #[must_use]
@@ -973,7 +1225,17 @@ pub fn world_frame_cells(world: &World<'_>) -> u64 {
         .pool()
         .zip(world.bricks_seen())
         .map(|(pool, held)| (held, pool.cells()));
-    frame_cells(world.size(), bricks)
+    let cells = frame_cells(world.size(), bricks);
+    cells.saturating_add(absorb_cells(world.size(), world.absorb(), bricks))
+}
+
+#[must_use]
+pub fn absorb_cells(size: [u32; 3], absorb: Option<Absorb>, bricks: Option<(u32, usize)>) -> u64 {
+    match (absorb, bricks) {
+        (None, _) => 0,
+        (Some(_), Some(_)) => frame_cells(size, bricks),
+        (Some(absorb), None) => absorb.shell(size),
+    }
 }
 
 #[must_use]

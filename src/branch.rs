@@ -1,4 +1,5 @@
 pub mod back;
+pub mod clear;
 pub mod fork;
 pub mod format;
 pub mod read;
@@ -9,6 +10,7 @@ use std::path::Path;
 
 use simdr::lanes::LaneError;
 
+use crate::border::{self, Absorb, Clearer};
 use crate::bricks::{self, Bricks, Content, ENTRY, Packed, UNIFORM};
 use crate::compact::{Plan, TooBig};
 use crate::host::{self, Host};
@@ -443,6 +445,74 @@ pub struct World<'host> {
     seen: Option<u32>,
     scanner: read::Scanner,
     marks: Vec<read::Mark>,
+    absorb: Option<Absorb>,
+    clearer: Clearer,
+}
+
+fn dense_of(rule: &Stepper, grid: Grid, plan: &Plan) -> border::Dense {
+    border::Dense {
+        subgroup: plan.subgroup,
+        grid,
+        windows: rule.windows(plan),
+        planes: rule.planes(),
+    }
+}
+
+fn absorbing(
+    (mut passes, mut stages): live::Loop,
+    rule: &Stepper,
+    (grid, plan): (Grid, &Plan),
+    pool: Option<&Bricks>,
+    absorb: Absorb,
+) -> Result<live::Loop, Failed> {
+    let (module, groups, marker, after) = match pool {
+        Some(bricks) => {
+            let (module, groups) = border::absorb_sparse(bricks, absorb, true)?;
+            (module, groups, bricks::drop_taken(bricks)?, 1)
+        }
+        None => {
+            let (module, groups) = border::absorb_dense(&dense_of(rule, grid, plan), absorb)?;
+            (module, groups, live::tick(plan.subgroup)?, 2)
+        }
+    };
+    let mut at = 0_usize;
+    let mut found = None;
+    for (index, stage) in stages.iter().enumerate() {
+        if passes.get(at) == Some(&marker) {
+            found = Some(index + after);
+            break;
+        }
+        at += stage.len();
+    }
+    let index = found
+        .filter(|&index| index <= stages.len())
+        .ok_or_else(|| {
+            Box::new(Refused::Malformed {
+                what: "the frame has no stepping stage for the border to follow".to_owned(),
+            }) as Failed
+        })?;
+    let flat: usize = stages.iter().take(index).map(Vec::len).sum();
+    passes.insert(flat, module);
+    stages.insert(index, vec![groups]);
+    Ok((passes, stages))
+}
+
+fn bound_of(scanner: &read::Scanner, sizes: &[usize]) -> Vec<usize> {
+    let mut bound = scanner.bound(sizes);
+    bound.push(Clearer::words());
+    bound
+}
+
+fn fitting(absorb: Option<Absorb>, size: [u32; 3]) -> Result<(), Failed> {
+    if let Some(axis) = absorb.and_then(|absorb| absorb.too_wide(size)) {
+        return Err(Box::new(Refused::Malformed {
+            what: format!(
+                "a border of {:?} cells leaves no inside on axis {axis} of a world of {size:?} cells",
+                absorb.map(|absorb| absorb.cells()).unwrap_or_default()
+            ),
+        }));
+    }
+    Ok(())
 }
 
 pub(crate) fn ruled(host: &Host, name: &str, params: &[u32]) -> Result<Box<dyn Listed>, Refused> {
@@ -535,8 +605,9 @@ impl<'host> World<'host> {
         rule: Stepper,
         params: Vec<u32>,
         (grid, plan): (Grid, Plan),
-        pool: Option<Bricks>,
+        (pool, absorb): (Option<Bricks>, Option<Absorb>),
     ) -> Result<Self, Failed> {
+        fitting(absorb, [grid.wide, grid.deep, grid.tall])?;
         let ((passes, stages), sizes) = match pool.as_ref() {
             Some(bricks) => (
                 rule.bricked(bricks, &plan)?,
@@ -544,7 +615,21 @@ impl<'host> World<'host> {
             ),
             None => (rule.wired(host.width(), grid, &plan)?, rule.laid(&plan)),
         };
-        let (passes, stages, back) = match rule.inverse()? {
+        let inverse = match absorb {
+            Some(_) => None,
+            None => rule.inverse()?,
+        };
+        let (passes, stages) = match absorb {
+            Some(absorb) => absorbing(
+                (passes, stages),
+                &rule,
+                (grid, &plan),
+                pool.as_ref(),
+                absorb,
+            )?,
+            None => (passes, stages),
+        };
+        let (passes, stages, back) = match inverse {
             Some(inverse) => {
                 let (undone, after) = match pool.as_ref() {
                     Some(bricks) => (
@@ -575,16 +660,25 @@ impl<'host> World<'host> {
         let mut passes = passes;
         let mut stages = stages;
         let mut back = back;
-        for module in reads {
+        let clearing = u32::try_from(scanner.bound(&sizes).len())?;
+        let cleared = match pool.as_ref() {
+            Some(bricks) => border::clear_sparse(bricks, clearing)?,
+            None => border::clear_dense(&dense_of(&rule, grid, &plan), clearing)?,
+        };
+        for module in reads.into_iter().chain([cleared]) {
             passes.push(module);
             stages.push(vec![Groups::Fixed(0)]);
             if let Some(held) = back.as_mut() {
                 held.push(vec![Groups::Fixed(0)]);
             }
         }
+        let clearer = Clearer {
+            binding: clearing,
+            pass: passes.len() - 1,
+        };
         let modules: Vec<&[u32]> = passes.iter().map(Vec::as_slice).collect();
         let live = host
-            .resident(&scanner.bound(&sizes), &modules)
+            .resident(&bound_of(&scanner, &sizes), &modules)
             .map_err(built_from(&rule))?;
         Ok(Self {
             host,
@@ -604,12 +698,22 @@ impl<'host> World<'host> {
             seen: None,
             scanner,
             marks: Vec::new(),
+            absorb,
+            clearer,
         })
     }
 
     pub fn create(host: &'host Host, made: &Made<'_>) -> Result<Self, Failed> {
+        Self::create_absorbing(host, made, None)
+    }
+
+    pub fn create_absorbing(
+        host: &'host Host,
+        made: &Made<'_>,
+        absorb: Option<Absorb>,
+    ) -> Result<Self, Failed> {
         let rule = Stepper::Named(ruled(host, made.rule, made.params)?);
-        Self::made(host, rule, made)
+        Self::made(host, rule, made, absorb)
     }
 
     pub fn create_law(
@@ -631,6 +735,16 @@ impl<'host> World<'host> {
         made: &Made<'_>,
         stepping: Stepping,
     ) -> Result<Self, Failed> {
+        Self::create_law_absorbing(host, law, made, stepping, None)
+    }
+
+    pub fn create_law_absorbing(
+        host: &'host Host,
+        law: &crate::law::Law,
+        made: &Made<'_>,
+        stepping: Stepping,
+        absorb: Option<Absorb>,
+    ) -> Result<Self, Failed> {
         if made.rule != law.name() {
             return Err(Box::new(Refused::Rule {
                 name: made.rule.to_owned(),
@@ -638,7 +752,7 @@ impl<'host> World<'host> {
         }
         listed_if_sparse(made.sparse, stepping)?;
         let rule = lawful(law, made.params, stepping)?;
-        Self::made(host, rule, made)
+        Self::made(host, rule, made, absorb)
     }
 
     #[cfg(feature = "faults")]
@@ -653,13 +767,18 @@ impl<'host> World<'host> {
             )?),
             None => None,
         };
-        Self::made_from(host, rule, made, (grid, plan), pool)
+        Self::made_from(host, rule, made, (grid, plan), (pool, None))
     }
 
-    fn made(host: &'host Host, rule: Stepper, made: &Made<'_>) -> Result<Self, Failed> {
+    fn made(
+        host: &'host Host,
+        rule: Stepper,
+        made: &Made<'_>,
+        absorb: Option<Absorb>,
+    ) -> Result<Self, Failed> {
         let shape = planned(host.width(), made.size, made.sparse)?;
         let pool = pool_for(&shape, made, &rule)?;
-        Self::made_from(host, rule, made, shape, pool)
+        Self::made_from(host, rule, made, shape, (pool, absorb))
     }
 
     fn made_from(
@@ -667,9 +786,9 @@ impl<'host> World<'host> {
         rule: Stepper,
         made: &Made<'_>,
         shape: (Grid, Plan),
-        pool: Option<Bricks>,
+        held: (Option<Bricks>, Option<Absorb>),
     ) -> Result<Self, Failed> {
-        let mut world = Self::built(host, rule, made.params.to_vec(), shape, pool)?;
+        let mut world = Self::built(host, rule, made.params.to_vec(), shape, held)?;
         zeroed(&mut world.live, &world.sizes, None)?;
         world.parameters()?;
         match world.pool {
@@ -706,6 +825,15 @@ impl<'host> World<'host> {
         image: &Image,
         stepping: Stepping,
     ) -> Result<Self, Failed> {
+        Self::open_absorbing(host, image, stepping, None)
+    }
+
+    pub fn open_absorbing(
+        host: &'host Host,
+        image: &Image,
+        stepping: Stepping,
+        absorb: Option<Absorb>,
+    ) -> Result<Self, Failed> {
         listed_if_sparse(matches!(image.state, State::Sparse { .. }), stepping)?;
         let rule = stepper_of(host, &image.law, &image.params, stepping)?;
         if rule.planes() != image.channels() {
@@ -733,7 +861,8 @@ impl<'host> World<'host> {
         }
         let mut world = match &image.state {
             State::Dense(cells) => {
-                let mut world = Self::built(host, rule, image.params.clone(), shape, None)?;
+                let mut world =
+                    Self::built(host, rule, image.params.clone(), shape, (None, absorb))?;
                 let windows = world.rule.windows(&world.plan);
                 zeroed(&mut world.live, &world.sizes, Some((windows, cells.len())))?;
                 live::write_state(&mut world.live, windows, 0, cells)?;
@@ -754,7 +883,13 @@ impl<'host> World<'host> {
                     table,
                     pool,
                 )?;
-                let mut world = Self::built(host, rule, image.params.clone(), shape, Some(bricks))?;
+                let mut world = Self::built(
+                    host,
+                    rule,
+                    image.params.clone(),
+                    shape,
+                    (Some(bricks), absorb),
+                )?;
                 let reach = packed.pool.len();
                 zeroed(
                     &mut world.live,
@@ -893,6 +1028,11 @@ impl<'host> World<'host> {
     #[must_use]
     pub const fn pool(&self) -> Option<Bricks> {
         self.pool
+    }
+
+    #[must_use]
+    pub const fn absorb(&self) -> Option<Absorb> {
+        self.absorb
     }
 
     #[must_use]
@@ -1283,7 +1423,7 @@ impl<'host> World<'host> {
 
     pub fn save(&mut self, path: &Path) -> Result<u64, Failed> {
         let image = self.image()?;
-        Ok(format::store(path, &image)?)
+        Ok(format::store_absorbing(path, &image, self.absorb)?)
     }
 
     pub fn save_with<W, F>(&mut self, path: &Path, wrap: F) -> Result<u64, Failed>
@@ -1292,7 +1432,7 @@ impl<'host> World<'host> {
         F: FnOnce(File) -> W,
     {
         let image = self.image()?;
-        Ok(format::store_with(path, &image, wrap)?)
+        Ok(format::stored(path, (&image, self.absorb), wrap)?)
     }
 
     pub fn listed(&mut self) -> Result<u32, Failed> {
@@ -1322,8 +1462,8 @@ impl<'host> World<'host> {
     }
 
     pub fn load(host: &'host Host, path: &Path) -> Result<Self, Failed> {
-        let image = format::fetch(path)?;
-        Self::open(host, &image)
+        let (image, absorb) = format::fetch_with(path)?;
+        Self::open_absorbing(host, &image, Stepping::Listed, absorb)
     }
 }
 

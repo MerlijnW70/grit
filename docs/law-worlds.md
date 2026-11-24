@@ -152,6 +152,35 @@ Refusals:
 | `too_many` | more than 32 bits | `$.bits` |
 | `read_form` | `bits` with another form, or `since` or `mark` true with `tally` | `$.bits`, `$.since` or `$.mark` |
 
+## Absorbing borders
+
+`grit_world_create` takes `absorb`, `[x, y, z]`: after every frame, on the device, every plane of every cell within that many cells of the world's edge on that axis is zeroed. An axis given 0 wraps as before; a 2D world gives `[n, n, 0]`. Rule and law worlds, dense and sparse, `alternate` and `parallel` all take it, and the answer names it. All 0, or left out, is a world without a border.
+
+A world with `absorb` holds, after every frame, the cells of the same world without it whose border is zeroed by host writes after every frame. A cell the border zeroes wakes the octs around it, as a write does. What flies into the border never comes back across the seam. A Life glider stops at the border as a 2 by 2 block, and a Bays 5766 glider as a 2 by 2 by 2 cube: the zeroed cells are a dead wall, and that is what such ships leave on one. On a sparse world the bricks a ship crossed are released by the quiet path; only the bricks of what stays are held.
+
+A frame of a dense world with `absorb` is priced as its cells plus the border's cells; one of a sparse world as twice its held bricks' cells. The border is journaled, saved (section `ABSB` of the world file), forked and opened with the world. `grit_world_restore` refuses `unlike` between worlds with different borders, and `grit_world_back` refuses `not_reversible`: a border loses what it zeroes.
+
+| Code | When | `field` |
+|---|---|---|
+| `absorb_wide` | twice an axis's border reaches its side, so no inside is left; `limit` is the widest that fits | `$.absorb[k]` |
+
+## Clearing bits of a box
+
+`grit_world_write` with `form` `clear` zeroes, on the device, the bits `bits` names (all 32 if left out) of every cell from `from` to `to`, corners included, on the planes `planes` names (every plane if left out; with `current` true the current plane). A box whose `from` is past its `to` on an axis wraps across the seam there. It wakes what changed, as a write does, and the answer names `cleared`, the words it changed.
+
+```json
+{"world":0,"form":"clear","from":[0,0,0],"to":[255,255,255],"bits":[7]}
+```
+
+Copy 7 of a 32-copy `parallel` world is then empty; the other 31 step on as if nothing happened. On a sparse world a cleared brick that is left one word is released by the quiet path. A brick held as one word that the box covers takes its new word; one it covers in part takes a slot. The device work follows the box: one lane per oct of the box on a dense world, one per brick on a sparse one, in passes of at most 16384. A clear is priced by its box's cells and journaled; replay, fork, save, open and a restart give the same bits.
+
+| Code | When | `field` |
+|---|---|---|
+| `outside` | a corner past the world, or a plane past its planes | `$.from`, `$.to` or `$.planes[k]` |
+| `bit_past` | a bit above 31 | `$.bits[k]` |
+| `malformed` | a bit or plane named twice | `$.bits[k]` or `$.planes[k]` |
+| `write_form` | `cells` with form `clear`, or neither `cells` nor form `clear` (a write without `cells` was `malformed` before `cells` became optional); `from`, `to`, `planes` or `bits` with form `cells`; `from` or `to` left out; `planes` with `current` true; `plane` with form `clear` | the field named |
+
 ## Reversible laws
 
 A law with `"reversible": true` must be a sequence of lifting steps over its words, 8 a plane: each step adds, subtracts or xors to one word, wrapping, a value made only of other words, params, `frame`, `at`, constants and looks at frozen planes. The compiler checks the form, derives the inverse (the steps undone in reverse order) as an ordinary law named with `_back` and its own hash, and refuses anything else with `not_lifting` at the offending step's path: a step that reads its own word, one node written to two words, a word made by another op (`b = f(a)`, `b | f`, `b * 3`).

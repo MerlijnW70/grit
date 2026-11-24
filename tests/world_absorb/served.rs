@@ -279,3 +279,24 @@ pub fn glider_3d(at: [u32; 3], flip: [bool; 2]) -> Vec<[u32; 3]> {
     }
     out
 }
+
+pub fn set_total(words: &[u32]) -> usize {
+    words.iter().filter(|word| **word != 0).count()
+}
+
+pub fn glider_along(at: [u32; 3], axes: [usize; 3], flip: [bool; 2]) -> Vec<[u32; 3]> {
+    let flat = [[1_u32, 0], [2, 1], [0, 2], [1, 2], [2, 2]];
+    let mut out = Vec::new();
+    for [a, b] in flat {
+        let a = if flip[0] { 2 - a } else { a };
+        let b = if flip[1] { 2 - b } else { b };
+        for c in [0, 1] {
+            let mut cell = at;
+            cell[axes[0]] += a;
+            cell[axes[1]] += b;
+            cell[axes[2]] += c;
+            out.push(cell);
+        }
+    }
+    out
+}

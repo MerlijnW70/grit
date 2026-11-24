@@ -2,7 +2,7 @@ use crate::layout::Windows;
 use crate::live;
 use crate::resident::Resident;
 
-use super::{Failed, Refused, World, built_from};
+use super::{Failed, Refused, World, bound_of, built_from};
 
 fn copied(
     from: &mut Resident<'_>,
@@ -36,7 +36,7 @@ impl<'host> World<'host> {
         let modules: Vec<&[u32]> = self.passes.iter().map(Vec::as_slice).collect();
         let mut live = self
             .host
-            .resident(&self.scanner.bound(&self.sizes), &modules)
+            .resident(&bound_of(&self.scanner, &self.sizes), &modules)
             .map_err(built_from(&self.rule))?;
         let reach = self.reach()?;
         copied(&mut self.live, &mut live, &self.sizes, reach)?;
@@ -58,6 +58,8 @@ impl<'host> World<'host> {
             seen: self.seen,
             scanner: self.scanner,
             marks: self.marks.clone(),
+            absorb: self.absorb,
+            clearer: self.clearer,
         })
     }
 
@@ -73,6 +75,9 @@ impl<'host> World<'host> {
         }
         if self.pool != from.pool {
             return unlike("layouts");
+        }
+        if self.absorb != from.absorb {
+            return unlike("borders");
         }
         if self.sizes != from.sizes || self.passes != from.passes {
             return unlike("bindings");

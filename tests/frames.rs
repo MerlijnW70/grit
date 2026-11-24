@@ -213,7 +213,7 @@ fn read_copy(fixture: &Path, label: &str) -> Vec<(u32, Ledger)> {
 fn counted(entry: &Entry) -> u32 {
     match entry {
         Entry::Step(count) | Entry::Back(count) => *count,
-        Entry::Write(_) | Entry::WritePlane(..) | Entry::Params(_) => 0,
+        Entry::Write(_) | Entry::WritePlane(..) | Entry::Params(_) | Entry::Clear { .. } => 0,
     }
 }
 

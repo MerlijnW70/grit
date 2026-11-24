@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::border::{Absorb, Box3};
 use crate::branch::format::{Image, Sha256, State, UNIFORM, brick_cells};
 use crate::branch::{self, World};
 use crate::host::Host;
@@ -58,6 +59,10 @@ const BACK: u32 = 7;
 const FORMAT: u32 = 8;
 
 const WRITE_PLANE: u32 = 9;
+
+const CLEAR: u32 = 10;
+
+const ABSORB: u32 = 11;
 
 pub const FORMAT_VERSION: u32 = 2;
 
@@ -127,6 +132,12 @@ pub enum Entry {
     Step(u32),
     Params(Vec<u32>),
     Back(u32),
+    Clear {
+        from: [u32; 3],
+        to: [u32; 3],
+        planes: u32,
+        bits: u32,
+    },
 }
 
 impl Entry {
@@ -137,6 +148,7 @@ impl Entry {
             Self::WritePlane(_, cells) => 16 * cells.len() + 12,
             Self::Step(_) | Self::Back(_) => 8,
             Self::Params(params) => 4 * params.len() + 8,
+            Self::Clear { .. } => 36,
         }
     }
 
@@ -144,7 +156,7 @@ impl Entry {
     pub const fn ran(&self) -> u32 {
         match self {
             Self::Step(count) | Self::Back(count) => *count,
-            Self::Write(_) | Self::WritePlane(..) | Self::Params(_) => 0,
+            Self::Write(_) | Self::WritePlane(..) | Self::Params(_) | Self::Clear { .. } => 0,
         }
     }
 }
@@ -153,6 +165,7 @@ impl Entry {
 pub struct Ledger {
     pub base: Base,
     pub law: Option<Arc<str>>,
+    pub absorb: Option<Absorb>,
     pub entries: Vec<Entry>,
     pub frame: u32,
     recorded: Vec<Duration>,
@@ -169,6 +182,7 @@ impl Ledger {
         Self {
             base: Base::Created(made),
             law: None,
+            absorb: None,
             entries: Vec::new(),
             frame: 0,
             recorded: Vec::new(),
@@ -186,6 +200,7 @@ impl Ledger {
             frame: snap.frame,
             base: Base::Snapshot(snap),
             law: None,
+            absorb: None,
             entries: Vec::new(),
             recorded: Vec::new(),
             costs: Vec::new(),
@@ -194,6 +209,12 @@ impl Ledger {
             replay: Duration::ZERO,
             snapping: Duration::ZERO,
         }
+    }
+
+    #[must_use]
+    pub const fn with_absorb(mut self, absorb: Option<Absorb>) -> Self {
+        self.absorb = absorb;
+        self
     }
 
     #[must_use]
@@ -240,7 +261,7 @@ impl Ledger {
         match entry {
             Entry::Step(frames) => self.frame = self.frame.wrapping_add(frames),
             Entry::Back(frames) => self.frame = self.frame.wrapping_sub(frames),
-            Entry::Write(_) | Entry::WritePlane(..) | Entry::Params(_) => {}
+            Entry::Write(_) | Entry::WritePlane(..) | Entry::Params(_) | Entry::Clear { .. } => {}
         }
         self.bytes = self.bytes.saturating_add(entry.bytes());
         self.replay = self.replay.saturating_add(spent);
@@ -651,6 +672,9 @@ impl Keep {
         if let Some(law) = &ledger.law {
             record(&mut words, (LAW, text_words(law)));
         }
+        if let Some(absorb) = ledger.absorb {
+            record(&mut words, (ABSORB, absorb.cells().to_vec()));
+        }
         for (at, entry) in ledger.entries.iter().enumerate() {
             let spent = ledger.recorded.get(at).copied().unwrap_or_default();
             let cost = ledger
@@ -835,6 +859,13 @@ impl Keep {
         records.at = ahead;
         if let Some((LAW, payload)) = records.next() {
             ledger.law = Some(Arc::from(text_of(payload)?));
+            index += 1;
+            ahead = records.at;
+        }
+        records.at = ahead;
+        if let Some((ABSORB, payload)) = records.next() {
+            let cells = <[u32; 3]>::try_from(payload).ok()?;
+            ledger.absorb = Some(Absorb::new(cells)?);
             index += 1;
             ahead = records.at;
         }
@@ -1072,6 +1103,18 @@ fn entry_record(entry: &Entry, spent: Duration) -> (u32, Vec<u32>) {
             words.push(micros);
             (PARAMS, words)
         }
+        Entry::Clear {
+            from,
+            to,
+            planes,
+            bits,
+        } => {
+            let mut words = Vec::with_capacity(9);
+            words.extend_from_slice(from);
+            words.extend_from_slice(to);
+            words.extend_from_slice(&[*planes, *bits, micros]);
+            (CLEAR, words)
+        }
     }
 }
 
@@ -1087,7 +1130,7 @@ fn priced_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration, Cost)> {
     let [low, high, submits] = <[u32; PRICE_WORDS]>::try_from(price).ok()?;
     let (entry, spent) = entry_of(tag, payload)?;
     let kind = match entry {
-        Entry::Write(_) | Entry::WritePlane(..) => Priced::Write,
+        Entry::Write(_) | Entry::WritePlane(..) | Entry::Clear { .. } => Priced::Write,
         Entry::Step(_) | Entry::Back(_) => Priced::Frame,
         Entry::Params(_) => Priced::Params,
     };
@@ -1110,6 +1153,9 @@ pub fn priced(made: &Made, entry: &Entry, bricks: Option<(u32, usize)>) -> Cost 
             super::tools::frames_cost(super::tools::frame_cells(made.size, bricks), *frames)
         }
         Entry::Params(params) => super::law::params_cost(params.len()),
+        Entry::Clear { from, to, .. } => {
+            super::tools::clear_cost(Box3::spanning(*from, *to, made.size).cells())
+        }
     }
 }
 
@@ -1162,6 +1208,18 @@ fn entry_of(tag: u32, payload: &[u32]) -> Option<(Entry, Duration)> {
         PARAMS => Some((Entry::Params(payload.to_vec()), spent)),
         BACK => match payload {
             [frames] => Some((Entry::Back(*frames), spent)),
+            _ => None,
+        },
+        CLEAR => match payload {
+            [x, y, z, a, b, c, planes, bits] => Some((
+                Entry::Clear {
+                    from: [*x, *y, *z],
+                    to: [*a, *b, *c],
+                    planes: *planes,
+                    bits: *bits,
+                },
+                spent,
+            )),
             _ => None,
         },
         _ => None,
@@ -1270,11 +1328,11 @@ pub fn rebuilt<'host>(
     let began = guard.time.now();
     let mut world = match &ledger.base {
         Base::Created(made) => match &ledger.law {
-            None => World::create(host, &made.branch())?,
-            Some(law) => super::law::made_world(host, law, made)?,
+            None => World::create_absorbing(host, &made.branch(), ledger.absorb)?,
+            Some(law) => super::law::made_world(host, law, made, ledger.absorb)?,
         },
         Base::Snapshot(snap) => match (&snap.image, keep) {
-            (Some(image), _) => super::law::opened(host, image)?,
+            (Some(image), _) => super::law::opened(host, image, ledger.absorb)?,
             (None, Some(keep)) => {
                 let path = keep.snapshot(&snap.sum);
                 if tail_sum(&path).ok() != Some(snap.sum) {
@@ -1288,10 +1346,10 @@ pub fn rebuilt<'host>(
                     )));
                 }
                 let reading = guard.time.now();
-                let image = crate::branch::format::fetch(&path)?;
+                let (image, absorb) = crate::branch::format::fetch_with(&path)?;
                 timings.file_bytes = fs::metadata(&path).map_or(0, |found| found.len());
                 timings.file = guard.time.since(reading);
-                super::law::opened(host, &image)?
+                super::law::opened(host, &image, absorb)?
             }
             (None, None) => {
                 return Err(Box::new(Refusal::new(
@@ -1343,6 +1401,14 @@ pub fn rebuilt<'host>(
                 timings.write_bytes = timings.write_bytes.saturating_add(entry.bytes() as u64);
             }
             Entry::Params(params) => super::law::reparam(&mut world, params)?,
+            Entry::Clear {
+                from,
+                to,
+                planes,
+                bits,
+            } => {
+                world.clear(*from, *to, *planes, *bits)?;
+            }
             Entry::Back(frames) => {
                 let mut done = 0_u32;
                 while done < *frames {

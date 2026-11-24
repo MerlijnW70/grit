@@ -205,7 +205,8 @@ fn saved(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     server.slowly(Work::Save);
     let live = server.world(held)?;
     let image = live.world.image()?;
-    let bytes = format::store(&path, &image).map_err(|why| file_refusal(&why, &name))?;
+    let bytes = format::store_absorbing(&path, &image, live.world.absorb())
+        .map_err(|why| file_refusal(&why, &name))?;
     server
         .book
         .rates
@@ -275,8 +276,8 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
     let pending = keep
         .copied(&path, server.book.next)
         .map_err(|why| super::io_refusal(&why))?;
-    let image = match format::fetch(&pending) {
-        Ok(image) => image,
+    let (image, absorb) = match format::fetch_with(&pending) {
+        Ok(opened) => opened,
         Err(why) => {
             let _ = std::fs::remove_file(&pending);
             return Err(file_refusal(&why, name));
@@ -299,7 +300,7 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         server.fits(work, bytes, "building the world from the file")?;
         let began = server.now();
         server.slowly(work);
-        let world = super::law::opened(host, &image)?;
+        let world = super::law::opened(host, &image, absorb)?;
         server.book.rates.measure(work, bytes, server.since(began));
         server.priced(super::tools::build_cost(bytes));
         let rule = super::law::listed(host, &world)?;
@@ -341,6 +342,9 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
     if let Some(lawful) = live.rule.lawful() {
         answer.extend(lawful.told());
     }
+    if let Some(absorb) = absorb {
+        answer.push(("absorb", super::tools::absorb_shown(absorb)));
+    }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
@@ -351,7 +355,8 @@ fn opened_file(server: &mut Server<'_>, name: &str) -> Result<Json, Failed> {
         made: Made::of_image(&image),
         image: None,
     }))
-    .with_law(law);
+    .with_law(law)
+    .with_absorb(absorb);
     if let Some(note) = server.adopt(id, live, ledger, bytes, pace) {
         answer.push(("journal", note));
     }
@@ -429,6 +434,9 @@ fn opened_kept(server: &mut Server<'_>, number: u32) -> Result<Json, Failed> {
     ];
     if let Some(lawful) = live.rule.lawful() {
         answer.extend(lawful.told());
+    }
+    if let Some(absorb) = live.world.absorb() {
+        answer.push(("absorb", super::tools::absorb_shown(absorb)));
     }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
@@ -582,6 +590,9 @@ fn forked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     ];
     if let Some(lawful) = live.rule.lawful() {
         answer.extend(lawful.told());
+    }
+    if let Some(absorb) = live.world.absorb() {
+        answer.push(("absorb", super::tools::absorb_shown(absorb)));
     }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));

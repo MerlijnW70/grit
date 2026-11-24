@@ -240,23 +240,33 @@ pub fn made_world<'host>(
     host: &'host Host,
     held: &str,
     made: &Made,
+    absorb: Option<crate::border::Absorb>,
 ) -> Result<World<'host>, Failed> {
     let law = compiled(held)?;
     let class = background_class(&law, &made.params);
-    World::create_law_stepped(host, &law, &made.branch(), stepping_of(&class, made.sparse))
+    World::create_law_absorbing(
+        host,
+        &law,
+        &made.branch(),
+        stepping_of(&class, made.sparse),
+        absorb,
+    )
 }
 
 pub fn opened<'host>(
     host: &'host Host,
     image: &crate::branch::Image,
+    absorb: Option<crate::border::Absorb>,
 ) -> Result<World<'host>, Failed> {
     match &image.law {
-        crate::branch::Law::Rule { .. } => World::open(host, image),
+        crate::branch::Law::Rule { .. } => {
+            World::open_absorbing(host, image, Stepping::Listed, absorb)
+        }
         crate::branch::Law::Law { canonical, .. } => {
             let law = compiled(canonical)?;
             let class = background_class(&law, &image.params);
             let sparse = matches!(image.state, crate::branch::State::Sparse { .. });
-            World::open_stepped(host, image, stepping_of(&class, sparse))
+            World::open_absorbing(host, image, stepping_of(&class, sparse), absorb)
         }
     }
 }

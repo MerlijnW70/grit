@@ -101,9 +101,11 @@ pub enum Code {
     ParallelBit,
     ParallelRule,
     ClampRange,
+    AbsorbWide,
+    WriteForm,
 }
 
-pub const CODES: [Code; 97] = [
+pub const CODES: [Code; 99] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -201,6 +203,8 @@ pub const CODES: [Code; 97] = [
     Code::ParallelBit,
     Code::ParallelRule,
     Code::ClampRange,
+    Code::AbsorbWide,
+    Code::WriteForm,
 ];
 
 impl Code {
@@ -304,6 +308,8 @@ impl Code {
             Self::ParallelBit => "parallel_bit",
             Self::ParallelRule => "parallel_rule",
             Self::ClampRange => "clamp_range",
+            Self::AbsorbWide => "absorb_wide",
+            Self::WriteForm => "write_form",
         }
     }
 
@@ -564,6 +570,12 @@ impl Code {
             }
             Self::ClampRange => {
                 "Give a clamp that meets limit, the least and greatest word the law writes at its coefficient_frac; a wider range widens it."
+            }
+            Self::AbsorbWide => {
+                "Absorb fewer cells on that axis, at most limit: the border at both ends must leave an inside, or give 0 to let the axis wrap."
+            }
+            Self::WriteForm => {
+                "Give cells with form cells, the default; give from and to, and planes, current or bits if you need them, with form clear; not both, and not neither."
             }
         }
     }

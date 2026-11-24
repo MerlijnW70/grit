@@ -246,6 +246,11 @@ impl Bricks {
     }
 
     #[must_use]
+    pub const fn subgroup(&self) -> u32 {
+        self.subgroup
+    }
+
+    #[must_use]
     pub const fn bits(&self) -> [u32; 3] {
         self.bits
     }
@@ -1215,6 +1220,136 @@ impl Bricks {
         });
         runs.retain(|run| !run.words.is_empty());
         held.write_many(&runs)
+    }
+
+    pub fn wake_bricks(&self, held: &mut Resident<'_>, changed: &[u32]) -> Result<(), Error> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use crate::layout::{AWAKE, HOT};
+
+        let mut woken = BTreeSet::new();
+        for &brick in changed {
+            woken.extend(self.around_brick(brick));
+        }
+        let woken: Vec<u32> = woken.into_iter().collect();
+        if woken.is_empty() {
+            return Ok(());
+        }
+        let table_binding = self.table() as usize;
+        let mut asked = vec![
+            (GRAND as usize, 0, 1),
+            (self.whole_count() as usize, 0, 1),
+            (self.tile_args() as usize, 0, 1),
+        ];
+        for (from, count) in live::spans(&woken) {
+            asked.push((table_binding, from * ENTRY, count * ENTRY));
+        }
+        let mut answers = held.read_runs(&asked)?.into_iter();
+        let octs = first_word(answers.next());
+        let bricks = first_word(answers.next());
+        let lit_count = first_word(answers.next());
+        let mut slots: BTreeMap<u32, u32> = BTreeMap::new();
+        for (from, _) in live::spans(&woken) {
+            let entries = answers.next().unwrap_or_default();
+            for (brick, entry) in (from..).zip(entries.chunks(ENTRY)) {
+                let slot = entry.first().copied().unwrap_or(UNIFORM);
+                slots.insert(u32::try_from(brick).unwrap_or(u32::MAX), slot);
+            }
+        }
+        let mut got = held.read_runs(&[
+            (DENSE as usize, 0, octs as usize),
+            (self.whole_list() as usize, 0, bricks as usize),
+            (self.tile_list() as usize, 0, lit_count as usize),
+        ])?;
+        let old_tiles = got.pop().unwrap_or_default();
+        let old_whole = got.pop().unwrap_or_default();
+        let old_listed = got.pop().unwrap_or_default();
+        let by = self.octs_bits();
+        let mut whole: BTreeSet<u32> = old_whole.iter().copied().collect();
+        whole.extend(woken.iter().copied());
+        let listed: Vec<u32> = old_listed
+            .iter()
+            .copied()
+            .filter(|oct| !whole.contains(&(oct >> by)))
+            .collect();
+        let whole: Vec<u32> = whole.into_iter().collect();
+        let mut tiles: BTreeSet<u32> = old_tiles.iter().copied().collect();
+        for &brick in &woken {
+            tiles.extend(self.around_brick(brick).map(|near| near / self.per_block()));
+        }
+        let tiles: Vec<u32> = tiles.into_iter().collect();
+        let tile_words = self.tile_words(&tiles);
+        let per_block = self.per_block() as usize;
+        let mut taken: Vec<u32> = slots
+            .values()
+            .copied()
+            .filter(|&slot| slot != UNIFORM)
+            .collect();
+        taken.sort_unstable();
+        taken.dedup();
+        let longest = live::spans(&taken)
+            .map(|(_, length)| length)
+            .max()
+            .unwrap_or(0);
+        let marks = vec![AWAKE_LEVEL; per_block * longest.max(woken.len())];
+        let mut runs = Vec::new();
+        for (first, length) in live::spans(&taken) {
+            runs.push(Run {
+                index: AWAKE as usize,
+                at: first * per_block,
+                words: marks.get(..length * per_block).unwrap_or_default(),
+            });
+        }
+        for (from, length) in live::spans(&woken) {
+            runs.push(Run {
+                index: HOT as usize,
+                at: from,
+                words: marks.get(..length).unwrap_or_default(),
+            });
+        }
+        let listed_from = live::changed_from(&old_listed, &listed);
+        let whole_from = live::changed_from(&old_whole, &whole);
+        let counts = self.listing(&listed, &whole);
+        runs.push(Run {
+            index: DENSE as usize,
+            at: listed_from,
+            words: listed.get(listed_from..).unwrap_or_default(),
+        });
+        runs.push(Run {
+            index: self.whole_list() as usize,
+            at: whole_from,
+            words: whole.get(whole_from..).unwrap_or_default(),
+        });
+        runs.push(Run {
+            index: GRAND as usize,
+            at: 0,
+            words: counts.get(..1).unwrap_or_default(),
+        });
+        runs.push(Run {
+            index: self.whole_count() as usize,
+            at: 0,
+            words: counts.get(1..2).unwrap_or_default(),
+        });
+        runs.push(Run {
+            index: crate::layout::INDIRECT as usize,
+            at: 0,
+            words: counts.get(2..).unwrap_or_default(),
+        });
+        let tiles_from = live::changed_from(&old_tiles, &tiles);
+        runs.push(Run {
+            index: self.tile_list() as usize,
+            at: tiles_from,
+            words: tiles.get(tiles_from..).unwrap_or_default(),
+        });
+        runs.push(Run {
+            index: self.tile_args() as usize,
+            at: 0,
+            words: &tile_words,
+        });
+        runs.retain(|run| !run.words.is_empty());
+        held.write_many(&runs)?;
+        held.woke(woken.len() * per_block);
+        Ok(())
     }
 
     #[must_use]

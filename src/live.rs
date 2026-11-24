@@ -644,7 +644,6 @@ pub fn put3_in(
     cells: &[(u32, u32)],
 ) -> Result<(), crate::Error> {
     use crate::geometry::Solid;
-    use crate::layout::{HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT};
 
     fits("live::put3", grid, plan).map_err(crate::Error::Lane)?;
     let past = grid.cells();
@@ -678,9 +677,30 @@ pub fn put3_in(
             }
         }
     }
-    let by = plan.per_block.trailing_zeros();
-    let blocks: std::collections::BTreeSet<u32> = woken.iter().map(|&oct| oct >> by).collect();
     let octs: Vec<u32> = woken.into_iter().collect();
+    let values: Vec<u32> = last.values().copied().collect();
+    let indices: Vec<u32> = last.keys().copied().collect();
+    let mut runs = Vec::new();
+    let mut along = 0_usize;
+    for (from, length) in spans(&indices) {
+        let words = values.get(along..along + length).unwrap_or_default();
+        state_runs(windows, lifted + from, words, &mut runs);
+        along += length;
+    }
+    woke3(held, grid, plan, &octs, runs)
+}
+
+pub fn woke3(
+    held: &mut crate::Resident<'_>,
+    grid: Grid,
+    plan: &crate::compact::Plan,
+    octs: &[u32],
+    given: Vec<crate::resident::Run<'_>>,
+) -> Result<(), crate::Error> {
+    use crate::layout::{HOT_DENSE, HOT_GRAND, HOT_INDIRECT, INDIRECT};
+
+    let by = plan.per_block.trailing_zeros();
+    let blocks: std::collections::BTreeSet<u32> = octs.iter().map(|&oct| oct >> by).collect();
     let hot: Vec<u32> = blocks.into_iter().collect();
 
     let heads = held.read_runs(&[(GRAND as usize, 0, 1), (HOT_GRAND as usize, 0, 1)])?;
@@ -705,7 +725,7 @@ pub fn put3_in(
         (Vec::new(), Vec::new())
     } else {
         let old = lists.next().unwrap_or_default();
-        let merged = merged(&old, &octs);
+        let merged = merged(&old, octs);
         (old, merged)
     };
     let (old_hot, hot_list) = if hot_every {
@@ -730,21 +750,14 @@ pub fn put3_in(
     let added = list.get(list_from..).unwrap_or_default();
     let lifted_blocks = hot_list.get(hot_from..).unwrap_or_default();
 
-    let values: Vec<u32> = last.values().copied().collect();
-    let indices: Vec<u32> = last.keys().copied().collect();
     let widest = octs.len().max(hot.len());
     let marks = vec![2_u32; widest];
     let indirect = [count.div_ceil(plan.subgroup), 1, 1];
     let hot_indirect = [hot_count, 1, 1];
     let counts = [count, hot_count];
-    let mut runs = Vec::new();
-    let mut along = 0_usize;
-    for (from, length) in spans(&indices) {
-        let words = values.get(along..along + length).unwrap_or_default();
-        state_runs(windows, lifted + from, words, &mut runs);
-        along += length;
-    }
-    for (from, length) in spans(&octs) {
+    let mut runs = Vec::with_capacity(given.len() + 8);
+    runs.extend(given);
+    for (from, length) in spans(octs) {
         runs.push(crate::resident::Run {
             index: AWAKE as usize,
             at: from,

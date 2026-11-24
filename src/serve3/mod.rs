@@ -1573,9 +1573,14 @@ impl<'host> Server<'host> {
         self.time().sleep(self.slow_idle());
         let frame = image.frame;
         let keep = self.book.keep.clone();
+        let absorb = self
+            .book
+            .held
+            .get(&number)
+            .and_then(|held| held.ledger.absorb);
         let snap = match keep.as_ref() {
             Some(keep) => journal::Snap {
-                sum: stored(keep, number, &image)?,
+                sum: stored(keep, number, (&image, absorb))?,
                 frame,
                 made,
                 image: None,
@@ -1621,6 +1626,7 @@ impl<'host> Server<'host> {
                 .get(&number)
                 .ok_or("the world has no journal")?;
             let (epoch, from, bytes) = (held.epoch, held.ledger.entries.len(), held.bytes);
+            let absorb = held.ledger.absorb;
             let frame = image.frame;
             let slow = self.slow_idle();
             let time = self.book.time();
@@ -1631,7 +1637,7 @@ impl<'host> Server<'host> {
                     #[cfg(feature = "faults")]
                     let _aside = crate::clock::aside();
                     time.sleep(slow);
-                    let got = stored(&keep, number, &image)
+                    let got = stored(&keep, number, (&image, absorb))
                         .map_err(|why| refused_with(why.as_ref()).0.message);
                     let _ = sender.send((got, time.now()));
                 })
@@ -2153,9 +2159,13 @@ fn base_work(ledger: &Ledger) -> budget::Work {
     }
 }
 
-fn stored(keep: &Keep, number: u32, image: &crate::branch::Image) -> Result<[u8; 32], Failed> {
+fn stored(
+    keep: &Keep,
+    number: u32,
+    (image, absorb): (&crate::branch::Image, Option<crate::border::Absorb>),
+) -> Result<[u8; 32], Failed> {
     let pending = keep.pending(number);
-    crate::branch::format::store(&pending, image)?;
+    crate::branch::format::store_absorbing(&pending, image, absorb)?;
     let (sum, _) = keep.settle(&pending).map_err(|why| {
         let _ = std::fs::remove_file(&pending);
         io_refusal(&why)

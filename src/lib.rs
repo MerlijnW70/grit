@@ -1,6 +1,7 @@
 pub mod bake;
 pub mod batch;
 pub mod board;
+pub mod border;
 pub mod bricks;
 pub mod calibrate;
 pub mod clock;

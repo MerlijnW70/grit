@@ -348,7 +348,7 @@ fn u2_more_cells_bytes_frames_or_bricks_never_price_lower() {
 fn counted(entry: &Entry) -> u32 {
     match entry {
         Entry::Step(count) | Entry::Back(count) => *count,
-        Entry::Write(_) | Entry::WritePlane(..) | Entry::Params(_) => 0,
+        Entry::Write(_) | Entry::WritePlane(..) | Entry::Params(_) | Entry::Clear { .. } => 0,
     }
 }
 

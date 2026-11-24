@@ -644,9 +644,10 @@ impl World<'_> {
         self.live.write(binding, &words)?;
         let quiet = vec![Groups::Fixed(0); scanner.pass + 1];
         let run = [Groups::Fixed(groups)];
+        let rest = self.after_scanner();
         let got = self
             .live
-            .run_reading(&[&quiet, &run], binding, TALLY_WORDS as usize)?;
+            .run_reading(&[&quiet, &run, &rest], binding, TALLY_WORDS as usize)?;
         self.flagged(&got)?;
         let records = got.get(HEAD as usize..).unwrap_or_default();
         Ok(records
@@ -698,9 +699,10 @@ impl World<'_> {
         let quiet = vec![Groups::Fixed(0); scanner.pass];
         let run = [Groups::Fixed(groups)];
         let tally = [Groups::Fixed(0)];
-        let got = self
-            .live
-            .run_reading(&[&quiet, &run, &tally], scanner.binding, ANSWERED)?;
+        let rest = self.after_scanner();
+        let got =
+            self.live
+                .run_reading(&[&quiet, &run, &tally, &rest], scanner.binding, ANSWERED)?;
         let count = got.first().copied().unwrap_or_default();
         self.flagged(&got)?;
         if count > most.min(scanner.cap) {
@@ -725,6 +727,10 @@ impl World<'_> {
             count: u64::from(count),
             cells: Some(found),
         })
+    }
+
+    fn after_scanner(&self) -> Vec<Groups> {
+        vec![Groups::Fixed(0); self.passes.len().saturating_sub(self.scanner.pass + 2)]
     }
 
     #[must_use]
