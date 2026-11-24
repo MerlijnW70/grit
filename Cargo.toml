@@ -25,6 +25,7 @@ default = ["window"]
 window = ["dep:minifb"]
 deep = []
 faults = []
+quiet = []
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
