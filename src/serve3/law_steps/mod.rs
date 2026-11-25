@@ -331,10 +331,21 @@ enum FracAsked {
 }
 
 fn frac_asked(held: &Json) -> Result<Option<FracAsked>, Failed> {
-    match held.get("law_frac") {
-        None => Ok(None),
-        Some(Json::Text(one)) if one == "auto" => Ok(Some(FracAsked::Automatic)),
-        Some(_) => {
+    let automatic = match held.get("auto_frac") {
+        None => false,
+        Some(Json::Bool(one)) => *one,
+        Some(_) => return Err(unread("auto_frac")),
+    };
+    match (automatic, held.get("law_frac")) {
+        (true, Some(_)) => Err(refused(
+            Code::Malformed,
+            "$.auto_frac",
+            "auto_frac true chooses the law's frac, and law_frac names one; give one of them"
+                .to_owned(),
+        )),
+        (true, None) => Ok(Some(FracAsked::Automatic)),
+        (false, None) => Ok(None),
+        (false, Some(_)) => {
             let frac = int(held, "law_frac")?;
             if frac > fixed::FRAC_MOST {
                 return Err(limited(
@@ -356,7 +367,7 @@ pub fn bits_refused(most: u32) -> Failed {
     Box::new(
         Refusal::new(
             Code::CoefficientBits,
-            "$.law_frac",
+            "$.auto_frac",
             format!(
                 "no frac from 0 to {} keeps {BITS_LEAST} fractional bits in every coefficient over the range; the most any frac keeps is {most}; narrow range, lower poly or give law_frac",
                 fixed::FRAC_MOST
@@ -376,7 +387,7 @@ pub fn bits_warning(scales: &[u32]) -> Option<Json> {
             (
                 "message",
                 text(&format!(
-                    "a coefficient keeps {least} fractional bits, fewer than {BITS_LEAST}: each is rounded to 2^-{least}, which shows as drift over many steps; lower frac or give law_frac auto"
+                    "a coefficient keeps {least} fractional bits, fewer than {BITS_LEAST}: each is rounded to 2^-{least}, which shows as drift over many steps; lower frac or give auto_frac true"
                 )),
             ),
         ])
@@ -526,7 +537,8 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
                 return Err(refused(
                     Code::Params,
                     "$.law_frac",
-                    "params hold a law whose frac is frac; law_frac goes with a fit".to_owned(),
+                    "params hold a law whose frac is frac; law_frac and auto_frac go with a fit"
+                        .to_owned(),
                 ));
             }
         }
@@ -1244,17 +1256,17 @@ fn amplification(basis: &Basis, reals: &Reals, write: usize) -> f64 {
             for kz in 0..steps {
                 let wave = [kx, ky, kz]
                     .map(|one| f64::from(one) * std::f64::consts::TAU / f64::from(period));
-                let (mut real, mut imaginary) = (0.0, 0.0);
+                let (mut cosines, mut sines) = (0.0, 0.0);
                 for (offset, value) in &places {
                     let phase: f64 = offset
                         .iter()
                         .zip(wave)
                         .map(|(one, by)| *one as f64 * by)
                         .sum();
-                    real += value * phase.cos();
-                    imaginary += value * phase.sin();
+                    cosines += value * phase.cos();
+                    sines += value * phase.sin();
                 }
-                most = most.max(real.hypot(imaginary));
+                most = most.max(cosines.hypot(sines));
             }
         }
     }

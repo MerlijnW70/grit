@@ -34,7 +34,7 @@ const RECORDED: [(&str, &str); 6] = [
     ),
     (
         "tools-list",
-        "0f40f4b3ef3138e21906bd00d2e4affd95400bd7a0e6364eda0646fc0c401eb0",
+        "76b571ed14845a820671faa7ce57685de6c2a3175ff973e3f5bfa8523682c19f",
     ),
     (
         "describe",

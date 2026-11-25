@@ -514,7 +514,7 @@ fn excited(steps: u32, side: usize, shots_count: usize, settle: usize, seed: u64
             side,
             &training,
             &format!(
-                ",\"steps\":{steps},\"hidden\":1,\"poly\":3,\"frac\":{frac},\"range\":{range},\"settle\":{settle},\"law_frac\":\"auto\""
+                ",\"steps\":{steps},\"hidden\":1,\"poly\":3,\"frac\":{frac},\"range\":{range},\"settle\":{settle},\"auto_frac\":true"
             ),
         ),
     );
@@ -917,7 +917,7 @@ fn v4_automatic_frac_keeps_twelve_coefficient_bits_or_refuses_and_a_low_frac_is_
         &learn_line(
             side,
             &shots,
-            ",\"steps\":2,\"frac\":16,\"range\":[-6554,72090],\"law_frac\":\"auto\"",
+            ",\"steps\":2,\"frac\":16,\"range\":[-6554,72090],\"auto_frac\":true",
         ),
         false,
     );
@@ -951,12 +951,12 @@ fn v4_automatic_frac_keeps_twelve_coefficient_bits_or_refuses_and_a_low_frac_is_
     let wide = learn_line(
         side,
         &coarse,
-        ",\"steps\":2,\"frac\":4,\"range\":[-1073741824,1073741824],\"law_frac\":\"auto\"",
+        ",\"steps\":2,\"frac\":4,\"range\":[-1073741824,1073741824],\"auto_frac\":true",
     );
     let refused = result(&wide, true);
     println!("v4 wide range: {}", written(&refused));
     assert_eq!(text_at(&refused, "code"), "coefficient_bits");
-    assert_eq!(text_at(&refused, "field"), "$.law_frac");
+    assert_eq!(text_at(&refused, "field"), "$.auto_frac");
     let x1 = {
         let frac = 24;
         let pairs: Vec<String> = drift_shots(side, frac, 4, 42)

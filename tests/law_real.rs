@@ -1423,9 +1423,9 @@ fn r5_refusals_name_their_code_and_field() {
         "$.poly",
     );
     mcp.refused(
-        &linear_args("3x3", &[0], &[1], &one, ",\"steps\":2"),
+        &linear_args("3x3", &[0], &[1], &one, ",\"law_frac\":12"),
         "steps_rule",
-        "$.steps",
+        "$.law_frac",
     );
     mcp.refused(
         &linear_args("3x3", &[0], &[1], &one, ",\"noise\":\"vote\""),
