@@ -206,7 +206,7 @@ fn posed_shown() -> Vec<(&'static str, Json)> {
 fn gradient_shown() -> Json {
     tool(
         "grit_law_gradient",
-        "Exact gradient of a reversible or iterating law's params: the objective |cells - target| over a box after n frames, and d objective / d param times 2^64 per param.",
+        "Exact gradient of a reversible or iterating law's params: |cells - target| over a box after n frames, and d objective / d param times 2^64 per param.",
         posed_shown(),
         &["frames", "aim"],
     )
@@ -224,7 +224,7 @@ fn descend_shown() -> Json {
     ));
     tool(
         "grit_law_descend",
-        "Descend a reversible or iterating law's params by exact gradients toward the aim, keeping only lower points: never worse than the start, a local optimum at best. Returns the best params, objective, trail and stop.",
+        "Descend a reversible or iterating law's params by exact gradients, keeping only lower points: never worse than the start, a local optimum at best. Returns params, objective, trail and stop.",
         properties,
         &["frames", "aim", "steps"],
     )
