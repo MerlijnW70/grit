@@ -49,6 +49,12 @@ pub const WRITTEN_BYTES: u64 = 48;
 
 pub const SHOWN_BYTES: u64 = 1024;
 
+pub const ENGINE_FIXED: u64 = 256 << 20;
+
+pub const ENGINE_LARGEST: u64 = 16;
+
+pub const ENGINE_KEPT: u64 = 8;
+
 pub const CHECK: &str = "grit_law_check runs a law or rule on many starts for frames frames on the device and scores each start against its targets, in one call. A start is a box of the world's shape (size, as grit_world_create answers it), written to the plane reads, or the current plane at frame 0; its end state and its targets are on the plane writes, or the current plane at each target's frame. Under border wrapped a start is a torus of its own size; under border zero every cell outside its box reads 0 at every frame, as a world twice its size on every axis above 2 with that half absorbed. Each start equals, bit for bit, a world of its own made by grit_world_create with the same law, params, size, sparse, alternate and absorb, written, stepped and read. Starts share one dense world when the border wraps, no absorb is given and the law reads no at: each start is a tile with a margin of its own torus copies, (1 + halo) times frames cells wide on each side of one axis, so no tile reaches another within frames frames; every other start runs in a world of its own. Scores per target: cells, right, wrong and the first wrong cell (x fastest, then y, then z); under values real also the max and rms error in words and decoded with frac. Priced as the worlds it builds (bytes), the cells it writes, margins included, and the frames it steps (world cells times frames, held bricks on sparse worlds); its reads are not priced, as no read is. It stops only on budget or cancel before a build or a step, and then answers nothing";
 
 pub const FINGERPRINT: &str = "sha256 of the start's end state: the box's words on every plane, plane 0 first, x fastest, then y, then z, each word 4 bytes little-endian";
@@ -825,13 +831,19 @@ fn bounded(
     let starts = many.saturating_mul(box_bytes);
     let mut targets = 0_u64;
     let mut scores = 0_u64;
+    let mut heaviest = (0_usize, 0_u64);
     let mut from_worlds = listed_starts.iter().any(|one| one.get("world").is_some());
-    for one in listed_starts {
+    for (at, one) in listed_starts.iter().enumerate() {
+        let mut own = 0_u64;
         for target in one.get("targets").and_then(Json::list).unwrap_or_default() {
             let (bytes, world) = form_bytes(target, box_bytes);
-            targets = targets.saturating_add(bytes);
+            own = own.saturating_add(bytes);
             scores = scores.saturating_add(1);
             from_worlds |= world;
+        }
+        targets = targets.saturating_add(own);
+        if own > heaviest.1 {
+            heaviest = (at, own);
         }
     }
     let ends = if giving { starts } else { 0 };
@@ -849,11 +861,24 @@ fn bounded(
             cells
                 .saturating_mul(u64::from(ask.planes))
                 .saturating_mul(WORD_BYTES)
-                .saturating_add(box_bytes)
+                .saturating_add(box_bytes.saturating_mul(2))
                 .saturating_add(written.saturating_mul(WRITTEN_BYTES))
         })
         .max()
         .unwrap_or_default();
+    let planes_of = |size: &[u32; 3]| count_of(*size).saturating_mul(u64::from(ask.planes));
+    let largest = groups
+        .iter()
+        .map(|(size, _, _)| planes_of(size))
+        .max()
+        .unwrap_or_default();
+    let every = groups
+        .iter()
+        .map(|(size, _, _)| planes_of(size))
+        .fold(0_u64, u64::saturating_add);
+    let engine = ENGINE_FIXED
+        .saturating_add(largest.saturating_mul(ENGINE_LARGEST))
+        .saturating_add(every.saturating_sub(largest).saturating_mul(ENGINE_KEPT));
     let shown = many
         .saturating_add(scores)
         .saturating_mul(SHOWN_BYTES)
@@ -862,15 +887,23 @@ fn bounded(
         } else {
             0
         });
-    let held = starts.saturating_add(targets).saturating_add(ends);
-    let total = held.saturating_add(reads.max(runs).max(shown));
+    let once = reads.max(runs).max(shown);
+    let total = starts
+        .saturating_add(targets)
+        .saturating_add(ends)
+        .saturating_add(engine)
+        .saturating_add(once);
     if total > HOST_MOST {
+        let field = if targets > starts.max(ends).max(engine).max(once) {
+            format!("$.starts[{}].targets", heaviest.0)
+        } else {
+            "$.starts".to_owned()
+        };
         return Err(limited(
             Code::TooMany,
-            "$.starts",
+            &field,
             format!(
-                "the check would hold {total} bytes of host memory, past the {HOST_MOST} one check holds: starts {starts}, targets {targets}, end states {ends}, and at most {} at once to read boxes of worlds, run a world or answer; nothing ran",
-                reads.max(runs).max(shown)
+                "the check would hold {total} bytes of host memory, past the {HOST_MOST} one check holds: starts {starts}, targets {targets}, end states {ends}, the worlds it builds {engine}, and at most {once} at once to read boxes of worlds, run a world or answer; nothing ran"
             ),
             Json::Int(i64::try_from(HOST_MOST)?),
         ));

@@ -1024,17 +1024,15 @@ fn c1_a_zero_border_start_steps_as_life_with_a_dead_outside() {
             let mut whole = dead.clone();
             whole.resize(count(size), 0);
             states.push((at, whole));
-            dead = counted_step(&life(), plane, &dead, false);
-            torus = counted_step(&life(), plane, &torus, true);
+            if at < steps {
+                dead = counted_step(&life(), plane, &dead, false);
+                torus = counted_step(&life(), plane, &torus, true);
+            }
         }
         let label = format!("life zero {size:?} k={steps}");
         let end = states.last().unwrap().1.clone();
-        let mut wrapped_end = states[0].1[..count(plane)].to_vec();
-        for _ in 0..steps {
-            wrapped_end = counted_step(&life(), plane, &wrapped_end, true);
-        }
         assert_ne!(
-            wrapped_end,
+            torus,
             end[..count(plane)],
             "{label}: the border must matter"
         );
@@ -1066,7 +1064,6 @@ fn c1_a_zero_border_start_steps_as_life_with_a_dead_outside() {
             .map(|(spot, word)| (0, spot, word))
             .collect();
         assert!(got == wanted, "{label}: returned cells differ");
-        let _ = torus;
     }
 }
 
@@ -1087,8 +1084,8 @@ fn c3_targets_of_every_form_count_against_the_host_memory_limit() {
     let from_world = "{\"world\":999,\"from\":[0,0,0]}";
     let worlds = |many: usize| vec![from_world; many].join(",");
     let big = "[256,128,128]";
-    assert_eq!(256 * mib + 48 * 16 * mib, most);
-    let got = no(&mut server, "grit_law_check", &ask(big, &worlds(48), ""));
+    assert_eq!(656 * mib + 23 * 16 * mib, most);
+    let got = no(&mut server, "grit_law_check", &ask(big, &worlds(23), ""));
     assert_eq!(
         (text_at(&got, "code"), text_at(&got, "field")),
         (
@@ -1100,12 +1097,12 @@ fn c3_targets_of_every_form_count_against_the_host_memory_limit() {
     );
     let got = refused_with(
         &mut server,
-        &ask(big, &worlds(49), ""),
+        &ask(big, &worlds(24), ""),
         "too_many",
         "$.starts",
     );
     assert_eq!(int_at(&got, "limit") as u64, most);
-    let counted = (256 + 49 * 16) * mib;
+    let counted = (656 + 24 * 16) * mib;
     assert!(
         text_at(&got, "message").contains(&counted.to_string()),
         "{}",
@@ -1113,7 +1110,7 @@ fn c3_targets_of_every_form_count_against_the_host_memory_limit() {
     );
     let got = refused_with(
         &mut server,
-        &ask(big, &worlds(48), ",\"return\":true"),
+        &ask(big, &worlds(23), ",\"return\":true"),
         "too_many",
         "$.starts",
     );
@@ -1131,6 +1128,64 @@ fn c3_targets_of_every_form_count_against_the_host_memory_limit() {
         &mut server,
         &ask("[64,64,64]", &worlds(1024), ""),
         "too_many",
-        "$.starts",
+        "$.starts[0].targets",
+    );
+    refused_with(
+        &mut server,
+        &format!(
+            "{{\"law\":{law},\"alternate\":[0,1],\"size\":[64,64,64],\"frames\":1,\"starts\":[{{\"cells\":[],\"targets\":[{}]}},{{\"cells\":[],\"targets\":[{}]}}],\"budget_ms\":{LONG}}}",
+            worlds(100),
+            worlds(900)
+        ),
+        "too_many",
+        "$.starts[1].targets",
+    );
+}
+
+#[test]
+fn c3_a_zero_border_check_at_the_host_memory_limit_runs_and_one_past_it_is_refused() {
+    let Some(host) = device("law_check c3 memory zero") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let law = quoted(&learned(&mut server, &life(), false));
+    let most = grit::serve3::check::HOST_MOST;
+    let mib = 1_u64 << 20;
+    let made = ok(
+        &mut server,
+        "grit_world_create",
+        &format!(
+            "{{\"wide\":128,\"deep\":64,\"tall\":64,\"law\":{law},\"params\":[],\"alternate\":[0,1],\"budget_ms\":{LONG}}}"
+        ),
+    );
+    let world = int_at(&made, "world");
+    served::write(&mut server, world, 0, &[([3, 4, 5], 1), ([4, 4, 5], 1)]);
+    let ask = |many: usize, aimed: usize| {
+        let target = format!("{{\"world\":{world},\"from\":[0,0,0],\"plane\":0}}");
+        let targets = vec![target.as_str(); aimed].join(",");
+        let mut starts = vec![format!(
+            "{{\"cells\":[[1,1,1,1],[2,1,1,1],[3,1,1,1]],\"targets\":[{targets}]}}"
+        )];
+        starts.extend((1..many).map(|_| "{\"cells\":[[1,1,1,1]]}".to_owned()));
+        format!(
+            "{{\"law\":{law},\"alternate\":[0,1],\"size\":[128,64,64],\"border\":\"zero\",\"frames\":1,\"starts\":[{}],\"budget_ms\":{LONG}}}",
+            starts.join(",")
+        )
+    };
+    assert_eq!((66 * 8 + 2 * 58 + 380) * mib, most);
+    let got = ok(&mut server, "grit_law_check", &ask(8, 58));
+    assert_eq!(run_of(&got), ("apart".to_owned(), 8));
+    let totals = got.get("totals").unwrap();
+    assert_eq!(int_at(totals, "starts"), 8);
+    assert_eq!(int_at(totals, "targets"), 58);
+    assert_eq!(int_at(totals, "cells"), 58 * 128 * 64 * 64);
+    assert_eq!(int_at(totals, "wrong"), 58 * 5);
+    let got = refused_with(&mut server, &ask(8, 59), "too_many", "$.starts");
+    assert_eq!(int_at(&got, "limit") as u64, most);
+    let counted = (66 * 8 + 2 * 59 + 380) * mib;
+    assert!(
+        text_at(&got, "message").contains(&counted.to_string()),
+        "{}",
+        written(&got)
     );
 }

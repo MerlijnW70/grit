@@ -288,10 +288,11 @@ A check holds every buffer it needs on the host, and the sum is refused past 2^3
 | a `cells` target | 12 a listed cell: it is held as its listed cells (index and word, 8 bytes), not as a box, plus a sort's scratch |
 | end states, with `return` | 4BN |
 | reading boxes of worlds | 512 a cell of one piece of 2^15 cells: a box is read a piece at a time |
-| running a world | its cells times 4P for the read back, 4B for one box, and 48 a written cell for the cells the world is given (its whole size when tiled, B when apart) |
+| running a world | its cells times 4P for the read back, 8B for one box and its fingerprint, and 48 a written cell for the cells the world is given (its whole size when tiled, B when apart) |
+| the worlds it builds | 2^28, plus 16 a cell and plane of the largest world, plus 8 a cell and plane of every other world: what the engine and the driver hold for a world, measured on the RTX 4080 with headroom, and what they keep of a world after it is dropped |
 | answering | 1024 a start and a target, and with `return` one page of 16384 cells |
 
-The sum is the starts, the targets and the end states, plus the largest of reading, running and answering, as they are held one after another. `cells` targets are held sparse because a box of 2^22 cells is 16 MiB a target from a request of a few bytes; a `dense` target already costs its box in the request. The world a check builds holds host memory of its own, as `grit_world_create` of that world does; it is not counted here.
+The sum is the starts, the targets, the end states and the worlds it builds, plus the largest of reading, running and answering, as they are held one after another. Under `border` `zero` a world is 8 times the box of a 3D start, and counted so. The refusal names `$.starts[k].targets` of the start with the most target bytes when targets are the largest part, else `$.starts`. `cells` targets are held sparse because a box of 2^22 cells is 16 MiB a target from a request of a few bytes; a `dense` target already costs its box in the request.
 
 Refusals, before any device work except `outside` at `$.page`:
 
