@@ -873,7 +873,7 @@ def from_logs(pairs):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="select.py")
+    parser = argparse.ArgumentParser(prog="reach.py")
     parser.add_argument("--root", default=".")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check")
@@ -902,7 +902,7 @@ def main(argv=None):
         for line in found:
             print(line)
         if found:
-            print("python3 ci/select.py write updates ci/reach.txt and adds rows to ci/skips.txt")
+            print("python3 ci/reach.py write updates ci/reach.txt and adds rows to ci/skips.txt")
             return 1
         print("ci/reach.txt and ci/skips.txt know every test target and src module")
         return 0
