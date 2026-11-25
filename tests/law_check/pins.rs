@@ -147,3 +147,53 @@ pub fn described(server: &mut Server<'_>) -> String {
     ]);
     bytes_hash(written(&kept).as_bytes())
 }
+
+pub fn c1_case(server: &mut Server<'_>) -> String {
+    let law = learned(server, &life(), false);
+    let mut rng = Rng(11);
+    let size = [32, 32, 2];
+    let starts: Vec<Vec<u32>> = (0..5)
+        .map(|_| crate::soup(&mut rng, size, 350, false))
+        .collect();
+    let made = crate::case("life 2d wrapped", &law, size, 6);
+    let checked = super::long::compared(server, &made, &starts, 100);
+    bytes_hash(written(&checked.answer).as_bytes())
+}
+
+pub fn cells_targets(server: &mut Server<'_>) -> String {
+    let law = learned(server, &life(), false);
+    let mut rng = Rng(12);
+    let size = [32, 32, 2];
+    let given: Vec<String> = (0..3)
+        .map(|at| {
+            let start = crate::soup(&mut rng, size, 350, false);
+            let mut picked: Vec<String> = set_of(size, &start)
+                .iter()
+                .step_by(3 + at)
+                .map(|(spot, word)| format!("[{},{},{},{word}]", spot[0], spot[1], spot[2]))
+                .collect();
+            picked.push("[31,31,1,5]".to_owned());
+            picked.push("[3,4,0,1]".to_owned());
+            picked.push("[3,4,0,0]".to_owned());
+            picked.push("[0,0,0,9]".to_owned());
+            picked.push("[0,0,0,1]".to_owned());
+            format!(
+                "{{\"cells\":{},\"targets\":[{{\"frame\":4,\"cells\":[{}]}},{{\"cells\":[]}},{{\"frame\":0,\"cells\":{}}},{{\"frame\":2,\"dense\":{}}}]}}",
+                cells_text(&set_of(size, &start)),
+                picked.join(","),
+                cells_text(&set_of(size, &start)),
+                super::served::listed(&start)
+            )
+        })
+        .collect();
+    let got = ok(
+        server,
+        "grit_law_check",
+        &format!(
+            "{{\"law\":{},\"alternate\":[0,1],\"size\":[32,32,2],\"frames\":6,\"starts\":[{}],\"return\":true,\"budget_ms\":{LONG}}}",
+            quoted(&law),
+            given.join(",")
+        ),
+    );
+    bytes_hash(written(&got).as_bytes())
+}

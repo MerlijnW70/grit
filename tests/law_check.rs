@@ -23,7 +23,7 @@ use served::{
     ok, quoted, text_at,
 };
 
-const RECORDED: [(&str, &str); 4] = [
+const RECORDED: [(&str, &str); 6] = [
     (
         "life-session",
         "f28a61b82d17b0f8a63425dc34878db3dbb86519632aa11798239188a0472e15",
@@ -39,6 +39,14 @@ const RECORDED: [(&str, &str); 4] = [
     (
         "describe",
         "509d638b1e5e43b212b347a6a22fc54d3c665e06791e3dd97159d22949a56c9c",
+    ),
+    (
+        "c1-life-tiled",
+        "35232fbf8231bdabe7494b4a3fdd721b81e6daa4928747747aefab2df91c9529",
+    ),
+    (
+        "cells-targets",
+        "c6f5f7425fa51ef8aba41a7c0c07cdd5b4eeb42b07b71e43a406c47f2fa4d40c",
     ),
 ];
 
@@ -743,6 +751,8 @@ fn c4_base_answers_are_the_bytes_recorded_on_base() {
         ("heat-session", pins::heat_session(&mut server)),
         ("tools-list", pins::listing(&mut Server::new(None))),
         ("describe", pins::described(&mut Server::new(None))),
+        ("c1-life-tiled", pins::c1_case(&mut server)),
+        ("cells-targets", pins::cells_targets(&mut server)),
     ];
     for (name, hash) in &got {
         println!("RECORD {name} {hash}");
