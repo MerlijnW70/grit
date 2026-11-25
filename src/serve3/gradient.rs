@@ -1,6 +1,7 @@
 use crate::law::Law;
-use crate::law::adjoint::{self, Aim, Descender, Fault, Next, Reversible, Settled};
+use crate::law::adjoint::{self, Aim, Descender, Fault, Next, Settled};
 use crate::law::dag::{FIRST_PARAM, Node};
+use crate::law::kept::Walker;
 use crate::question::Region;
 use crate::sand3::Grid3;
 use crate::wire::{Json, counted, map, text};
@@ -38,7 +39,7 @@ pub const LOOK_UNITS: u64 = 3 * crate::halo::BOX as u64;
 
 pub const SIDE_MOST: u32 = 1024;
 
-pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string: the derivative of every add, sub, mul, div, shift and sel arm on the way from params[i] to a cell, carried back by recomputing every frame with the inverse, where a compare (and so a sel's choice) counts as constant; a look (halo 1) reads a frozen plane, so it moves with no param, and the walk back reads the same neighbour at the same frame and carries the look's share back to that cell; a walk that does not come home answers strayed. A law is refused no_gradient, at the path of the first such node, when a not, and, or, xor, dot_s or dot_u takes a value that moves with a param (directly or through a cell an earlier frame moved) and its result reaches a cell other than through a compare. A look at a plane the law writes is refused when the law compiles (halo_written). A descent walks its start, then walks one trial point per step: the secant step of the gradients of its last walks, after a trial that is not lower one retry at most as long and then each at most half as long, then moves of 1 in one param against its gradient. It keeps a trial only when its objective is lower than the kept point's, so its answer is never worse than its start and the kept objectives fall strictly; it finds a local optimum, not the global one. It stops converged (objective 0), local (no trial it can make is lower), steps, or on budget or cancelled before a walk, and answers the last kept point; the trail holds every point walked, with kept. A walk costs its octs times frames times (the nodes of the law and its inverse plus 128, plus 192 for each plane the law looks at); it may cost at most walk_work, on a start of at most walk_cells words, and cannot stop part way, so an answer can come one walk late. Refused before any walk: not_reversible (with the lifting refusal as law), no_gradient (with its path as law), params, outside, reversed, target_size, aim, start, walk_limit, and budget when the fastest of the last three walks the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
+pub const GRADIENT: &str = "grit_law_gradient and grit_law_descend run on the CPU, exactly as the library's Reversible::walk and Reversible::descend. The start is a world's cells on every plane at its frame, or law, size and cells given inline from frame first (0 if left out). The objective is the sum over the aim's box, on plane 0, of |cell - target| after frames frames. gradient[i] is d objective / d params[i] times 2^64, a decimal string: the derivative of every add, sub, mul, div, shift and sel arm on the way from params[i] to a cell, carried back by recomputing every frame with the inverse, where a compare (and so a sel's choice) counts as constant; a look (halo 1) reads a frozen plane, so it moves with no param, and the walk back reads the same neighbour at the same frame and carries the look's share back to that cell; a walk that does not come home answers strayed. A law that iterates (alternate) is never reversible: it is walked by keeping every frame's cells, the adjoint carried back through each kept frame with each pair's planes swapped on odd frames, and its walk costs the law's nodes twice in place of the law and its inverse. A law is refused no_gradient, at the path of the first such node, when a not, and, or, xor, dot_s or dot_u takes a value that moves with a param (directly or through a cell an earlier frame moved) and its result reaches a cell other than through a compare. A look at a plane the law writes is refused when the law compiles (halo_written). A descent walks its start, then walks one trial point per step: the secant step of the gradients of its last walks, after a trial that is not lower one retry at most as long and then each at most half as long, then moves of 1 in one param against its gradient. It keeps a trial only when its objective is lower than the kept point's, so its answer is never worse than its start and the kept objectives fall strictly; it finds a local optimum, not the global one. It stops converged (objective 0), local (no trial it can make is lower), steps, or on budget or cancelled before a walk, and answers the last kept point; the trail holds every point walked, with kept. A walk costs its octs times frames times (the nodes of the law and its inverse plus 128, plus 192 for each plane the law looks at); it may cost at most walk_work, on a start of at most walk_cells words, and cannot stop part way, so an answer can come one walk late. Refused before any walk: not_reversible (with the lifting refusal as law), no_gradient (with its path as law), params, outside, reversed, target_size, aim, start, walk_limit, and budget when the fastest of the last three walks the server measured at the largest size not above this one does not fit the time left. Neither writes a world or its journal: set learned params with grit_world_params";
 
 pub mod faults {
     #[cfg(feature = "faults")]
@@ -205,7 +206,7 @@ fn posed_shown() -> Vec<(&'static str, Json)> {
 fn gradient_shown() -> Json {
     tool(
         "grit_law_gradient",
-        "Exact gradient of a reversible law's params: the objective |cells - target| over a box after n frames, and d objective / d param times 2^64 per param.",
+        "Exact gradient of a reversible or iterating law's params: the objective |cells - target| over a box after n frames, and d objective / d param times 2^64 per param.",
         posed_shown(),
         &["frames", "aim"],
     )
@@ -223,7 +224,7 @@ fn descend_shown() -> Json {
     ));
     tool(
         "grit_law_descend",
-        "Descend a reversible law's params by exact gradients toward the aim, keeping only lower points: never worse than the start, a local optimum at best. Returns the best params, objective, trail and stop.",
+        "Descend a reversible or iterating law's params by exact gradients toward the aim, keeping only lower points: never worse than the start, a local optimum at best. Returns the best params, objective, trail and stop.",
         properties,
         &["frames", "aim", "steps"],
     )
@@ -241,7 +242,7 @@ impl std::fmt::Display for Told {
 impl std::error::Error for Told {}
 
 struct Posed {
-    reversible: Reversible,
+    reversible: Walker,
     grid: Grid3,
     start: Vec<u32>,
     first: u32,
@@ -374,8 +375,8 @@ fn started(server: &mut Server<'_>, held: &Json) -> Result<Start, Failed> {
     }
 }
 
-fn reversible_of(start: &Start) -> Result<Reversible, Failed> {
-    let reversible = Reversible::of(&start.law).map_err(|why| not_reversible(start.field, &why))?;
+fn reversible_of(start: &Start) -> Result<Walker, Failed> {
+    let reversible = Walker::of(&start.law).map_err(|why| not_reversible(start.field, &why))?;
     if let Some((node, op)) = cut(reversible.forward()) {
         let path = start
             .law
@@ -571,12 +572,12 @@ pub(super) fn points_of(region: Region) -> Vec<[u32; 3]> {
     points
 }
 
-fn looked(reversible: &Reversible) -> u64 {
+fn looked(reversible: &Walker) -> u64 {
     u64::try_from(reversible.forward().halo().looking()).unwrap_or(u64::MAX)
 }
 
-fn units_of(reversible: &Reversible, grid: Grid3, frames: u32) -> u64 {
-    let nodes = u64::try_from(reversible.forward().len() + reversible.inverse().len())
+fn units_of(reversible: &Walker, grid: Grid3, frames: u32) -> u64 {
+    let nodes = u64::try_from(reversible.forward().len() + reversible.back_nodes())
         .unwrap_or(u64::MAX)
         .saturating_add(OCT_UNITS)
         .saturating_add(LOOK_UNITS.saturating_mul(looked(reversible)));
@@ -711,7 +712,7 @@ fn posed(server: &mut Server<'_>, held: &Json) -> Result<Posed, Failed> {
                 "a walk of {frames} frames over {} octs of a law of {} nodes with an inverse of {} is {units} units of work (octs times frames times the nodes of both plus {OCT_UNITS}{looks}), more than the {WORK_MOST} one walk may take; at most {fits} frames fit",
                 grid.octs(),
                 reversible.forward().len(),
-                reversible.inverse().len()
+                reversible.back_nodes()
             ),
             counted(fits),
         ));
@@ -803,7 +804,10 @@ fn fault(grid: Grid3, why: Fault) -> Failed {
 }
 
 #[cfg(feature = "faults")]
-fn walker(server: &Server<'_>, posed: &Posed) -> Reversible {
+fn walker(server: &Server<'_>, posed: &Posed) -> Walker {
+    let Walker::Back(reversible) = &posed.reversible else {
+        return posed.reversible.clone();
+    };
     let armed = server
         .book
         .faults
@@ -813,24 +817,24 @@ fn walker(server: &Server<'_>, posed: &Posed) -> Reversible {
     if !armed {
         return posed.reversible.clone();
     }
-    let mut steps = posed.reversible.steps().to_vec();
+    let mut steps = reversible.steps().to_vec();
     if let Some(first) = steps.first_mut() {
         first.how = match first.how {
             adjoint::Lifting::Add => adjoint::Lifting::Sub,
             adjoint::Lifting::Sub | adjoint::Lifting::Xor => adjoint::Lifting::Add,
         };
     }
-    Reversible::from_steps(posed.reversible.forward(), steps)
+    Walker::Back(adjoint::Reversible::from_steps(reversible.forward(), steps))
 }
 
 #[cfg(not(feature = "faults"))]
-fn walker(_: &Server<'_>, posed: &Posed) -> Reversible {
+fn walker(_: &Server<'_>, posed: &Posed) -> Walker {
     posed.reversible.clone()
 }
 
 fn walk(
     server: &mut Server<'_>,
-    reversible: &Reversible,
+    reversible: &Walker,
     posed: &Posed,
     params: &[u32],
 ) -> Result<adjoint::Walked, Failed> {

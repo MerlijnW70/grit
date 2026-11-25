@@ -99,6 +99,7 @@ pub enum Code {
     IllConditioned,
     FixedRange,
     LinearRule,
+    CoefficientBits,
     ParallelBit,
     ParallelRule,
     ClampRange,
@@ -108,7 +109,7 @@ pub enum Code {
     CheckTarget,
 }
 
-pub const CODES: [Code; 102] = [
+pub const CODES: [Code; 103] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -204,6 +205,7 @@ pub const CODES: [Code; 102] = [
     Code::IllConditioned,
     Code::FixedRange,
     Code::LinearRule,
+    Code::CoefficientBits,
     Code::ParallelBit,
     Code::ParallelRule,
     Code::ClampRange,
@@ -312,6 +314,7 @@ impl Code {
             Self::IllConditioned => "ill_conditioned",
             Self::FixedRange => "fixed_range",
             Self::LinearRule => "linear_rule",
+            Self::CoefficientBits => "coefficient_bits",
             Self::ParallelBit => "parallel_bit",
             Self::ParallelRule => "parallel_rule",
             Self::ClampRange => "clamp_range",
@@ -573,6 +576,9 @@ impl Code {
             }
             Self::LinearRule => {
                 "Drop poly, frac, clamp and range, or use rule linear; only a fixed-point law reads them."
+            }
+            Self::CoefficientBits => {
+                "Narrow range, lower poly or give law_frac: no frac keeps 12 fractional bits in every coefficient; limit names the most any frac keeps."
             }
             Self::ParallelBit => {
                 "Give every read and write bit 0 with parallel true: each is the whole word of its plane, bit j of it copy j; or drop parallel."

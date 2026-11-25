@@ -10,6 +10,7 @@ pub mod alternation;
 pub mod chip;
 pub mod dag;
 pub mod expand;
+pub mod kept;
 pub mod learn;
 pub mod limits;
 pub mod parse;
@@ -207,7 +208,7 @@ pub struct Law {
     channels: u32,
     halo: u32,
     reversible: bool,
-    alternate: Option<[u32; 2]>,
+    alternate: Vec<[u32; 2]>,
     dag: Dag,
     places: Places,
     canonical: String,
@@ -254,8 +255,8 @@ impl Law {
         } else {
             None
         };
-        if let Some(pair) = program.alternate {
-            alternation::checked(pair, &program, &expanded.dag)?;
+        if !program.alternate.is_empty() {
+            alternation::checked(&program.alternate, &program, &expanded.dag)?;
         }
         let hash = crate::branch::sha256(canonical.as_bytes());
         Ok(Self {
@@ -263,7 +264,7 @@ impl Law {
             channels: program.channels,
             halo: program.halo,
             reversible: program.reversible,
-            alternate: program.alternate,
+            alternate: program.alternate.clone(),
             dag: expanded.dag,
             places,
             canonical,
@@ -316,16 +317,20 @@ impl Law {
     }
 
     #[must_use]
-    pub const fn alternate(&self) -> Option<[u32; 2]> {
-        self.alternate
+    pub fn alternate(&self) -> Option<[u32; 2]> {
+        self.alternate.first().copied()
     }
 
     #[must_use]
-    pub const fn current(&self, frame: u32) -> Option<u32> {
-        match self.alternate {
-            Some([even, odd]) => Some(if frame & 1 == 0 { even } else { odd }),
-            None => None,
-        }
+    pub fn pairs(&self) -> &[[u32; 2]] {
+        &self.alternate
+    }
+
+    #[must_use]
+    pub fn current(&self, frame: u32) -> Option<u32> {
+        self.alternate
+            .first()
+            .map(|&[even, odd]| if frame & 1 == 0 { even } else { odd })
     }
 
     #[must_use]
@@ -383,10 +388,7 @@ impl Declared for Law {
     }
 
     fn looks(&self) -> crate::halo::Halo {
-        match self.alternate {
-            Some(pair) => alternation::mirrored(self.dag.halo(), pair),
-            None => self.dag.halo(),
-        }
+        alternation::mirrored(self.dag.halo(), &self.alternate)
     }
 }
 
@@ -401,9 +403,10 @@ impl OneStep for Law {
         oct: Oct<'_, O::Word>,
         planes: &[[O::Word; CORNERS]],
     ) -> Planed<O::Word> {
-        match self.alternate {
-            Some(pair) => alternation::stepped(&self.dag, pair, ops, oct, planes, &[]),
-            None => self.dag.replay_planes(ops, oct, planes),
+        if self.alternate.is_empty() {
+            self.dag.replay_planes(ops, oct, planes)
+        } else {
+            alternation::stepped(&self.dag, &self.alternate, ops, oct, planes, &[])
         }
     }
 
@@ -414,9 +417,10 @@ impl OneStep for Law {
         planes: &[[O::Word; CORNERS]],
         halo: &[[O::Word; crate::halo::BOX]],
     ) -> Planed<O::Word> {
-        match self.alternate {
-            Some(pair) => alternation::stepped(&self.dag, pair, ops, oct, planes, halo),
-            None => self.dag.replay_halo(ops, oct, planes, halo),
+        if self.alternate.is_empty() {
+            self.dag.replay_halo(ops, oct, planes, halo)
+        } else {
+            alternation::stepped(&self.dag, &self.alternate, ops, oct, planes, halo)
         }
     }
 }

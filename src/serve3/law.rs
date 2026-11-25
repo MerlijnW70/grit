@@ -86,8 +86,18 @@ impl Lawful {
         if let Some(why) = self.class.why() {
             told.push(("quiet_why", text(&why)));
         }
-        if let Some(pair) = self.law.alternate() {
-            told.push(("alternate", Json::List(pair.map(counted).to_vec())));
+        match self.law.pairs() {
+            [] => {}
+            [pair] => told.push(("alternate", Json::List(pair.map(counted).to_vec()))),
+            pairs => told.push((
+                "alternate",
+                Json::List(
+                    pairs
+                        .iter()
+                        .map(|pair| Json::List(pair.map(counted).to_vec()))
+                        .collect(),
+                ),
+            )),
         }
         told
     }
