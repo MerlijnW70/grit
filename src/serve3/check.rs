@@ -444,10 +444,10 @@ fn checked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let host = server.host.ok_or(crate::host::Error::NoComputeDevice)?;
     let ask = asked(server, host, held)?;
     let listed_starts = starts_of(&ask, held)?;
-    let giving = matches!(held.get("return"), Some(Json::Bool(true)));
+    let give = matches!(held.get("return"), Some(Json::Bool(true)));
     let tiles = tiled(host, &ask, listed_starts.len());
     let groups = grouped(&ask, tiles.as_ref(), listed_starts.len());
-    bounded(&ask, listed_starts, (&groups, tiles.is_some()), giving)?;
+    bounded(&ask, listed_starts, (&groups, tiles.is_some()), give)?;
     let starts = started(server, &ask, listed_starts)?;
     let page = match held.get("page") {
         Some(_) => usize::try_from(int(held, "page")?).unwrap_or(usize::MAX),
@@ -469,12 +469,12 @@ fn checked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ran(
             server,
             host,
-            (&ask, &starts, giving),
+            (&ask, &starts, give),
             (*shape, *absorb, placed, tiles.as_ref()),
             &mut ended,
         )?;
     }
-    answered(&ask, &starts, &ended, (tiles.as_ref(), all), (giving, page))
+    answered(&ask, &starts, &ended, (tiles.as_ref(), all), (give, page))
 }
 
 fn side_of(held: &Json, key: &str) -> Result<Option<u32>, Failed> {
