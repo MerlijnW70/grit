@@ -714,6 +714,14 @@ fn c3_requests_past_a_limit_are_refused_by_name_with_the_limit() {
         "malformed",
         "$.frac",
     );
+    for more in [",\"page\":0", ",\"return\":false,\"page\":1"] {
+        refused_with(
+            &mut server,
+            &ask("[4,4,2]", 1, empty, more),
+            "malformed",
+            "$.page",
+        );
+    }
     refused_with(
         &mut server,
         &ask("[4,4,2]", 1, "{\"world\":999,\"from\":[0,0,0]}", ""),
@@ -878,4 +886,251 @@ fn c5_scores_equal_scores_counted_on_the_host() {
     );
     assert!(!text_at(&answer, "format").is_empty());
     assert_eq!(int_at(&answer, "frac"), i64::from(FRAC));
+}
+
+const SAND: &str = include_str!("law/sand.law.json");
+
+const MIX: &str = include_str!("law/mix.law.json");
+
+const EMBED: &str = include_str!("law/embed.law.json");
+
+const BLUR: &str = include_str!("halo3/blur2.law.json");
+
+fn in_place(label: &str, law: &str, params: Vec<u32>, size: [u32; 3], steps: u32) -> Case {
+    Case {
+        alternate: false,
+        params,
+        planes: 1,
+        sides: Some((0, 0)),
+        ..case(label, law, size, steps)
+    }
+}
+
+fn filled(rng: &mut Rng, size: [u32; 3], permille: u64, cell: fn(&mut Rng) -> u32) -> Vec<u32> {
+    (0..count(size))
+        .map(|_| {
+            if rng.below(1000) < permille {
+                cell(rng)
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+type Planted = (Case, u64, fn(&mut Rng) -> u32, u32);
+
+fn sand_cell(rng: &mut Rng) -> u32 {
+    [grit::sand::SAND, grit::sand::WATER, grit::sand::WALL][rng.below(3) as usize]
+}
+
+fn embed_cell(rng: &mut Rng) -> u32 {
+    let roll = rng.next();
+    match roll % 4 {
+        0 => grit::rule3::embed::embedding([(roll >> 8) as i8, (roll >> 16) as i8, 0, 0]),
+        1 => ((roll >> 24) % 5) as u32,
+        _ => (roll >> 16) as u32,
+    }
+}
+
+fn byte_cell(rng: &mut Rng) -> u32 {
+    rng.below(256) as u32
+}
+
+fn word_cell(rng: &mut Rng) -> u32 {
+    rng.word()
+}
+
+#[test]
+fn c1_tiled_laws_that_read_frame_step_octs_or_look_equal_their_own_worlds() {
+    let Some(host) = device("law_check c1 laws") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let cube = [16, 16, 16];
+    let mut rng = Rng(41);
+    let embed = vec![grit::rule3::embed::embedding([1, -1, 2, -2])];
+    for steps in [1_u32, 2, 5, 9] {
+        let made: [Planted; 4] = [
+            (
+                in_place("sand", SAND, Vec::new(), cube, steps),
+                450,
+                sand_cell,
+                0,
+            ),
+            (
+                in_place("mix", MIX, vec![3, 1 << 20], cube, steps),
+                700,
+                word_cell,
+                0,
+            ),
+            (
+                in_place("embed", EMBED, embed.clone(), cube, steps),
+                500,
+                embed_cell,
+                0,
+            ),
+            (
+                Case {
+                    planes: 3,
+                    sides: Some((steps % 2, 2)),
+                    ..in_place("blur2", BLUR, Vec::new(), cube, steps)
+                },
+                600,
+                byte_cell,
+                1,
+            ),
+        ];
+        for (at, (made, permille, cell, halo)) in made.into_iter().enumerate() {
+            let starts: Vec<Vec<u32>> = (0..4)
+                .map(|_| filled(&mut rng, made.size, permille, cell))
+                .collect();
+            let seed = 300 + u64::from(steps) * 10 + at as u64;
+            let checked = compared(&mut server, &made, &starts, seed);
+            let run = checked.answer.get("run").unwrap();
+            let label = format!("{} k={steps}", made.label);
+            assert_eq!(text_at(run, "layout"), "tiled", "{label}");
+            assert_eq!(int_at(run, "worlds"), 1, "{label}");
+            assert_eq!(
+                int_at(run, "margin"),
+                i64::from(((1 + halo) * steps).next_multiple_of(2)),
+                "{label}"
+            );
+            println!("C1 {label}: 4 tiled starts equal to the long way");
+        }
+    }
+}
+
+#[test]
+fn c1_a_zero_border_start_steps_as_life_with_a_dead_outside() {
+    let Some(host) = device("law_check c1 zero") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let law = learned(&mut server, &life(), false);
+    let mut rng = Rng(17);
+    for (size, steps) in [
+        ([32, 32, 2], 1_u32),
+        ([32, 32, 2], 2),
+        ([32, 32, 2], 5),
+        ([64, 16, 2], 9),
+    ] {
+        let plane = [size[0], size[1], 1];
+        let start = layer(&mut rng, size, 400);
+        let mut dead = start[..count(plane)].to_vec();
+        let mut torus = dead.clone();
+        let mut states = Vec::new();
+        for at in 0..=steps {
+            let mut whole = dead.clone();
+            whole.resize(count(size), 0);
+            states.push((at, whole));
+            dead = counted_step(&life(), plane, &dead, false);
+            torus = counted_step(&life(), plane, &torus, true);
+        }
+        let label = format!("life zero {size:?} k={steps}");
+        let end = states.last().unwrap().1.clone();
+        let mut wrapped_end = states[0].1[..count(plane)].to_vec();
+        for _ in 0..steps {
+            wrapped_end = counted_step(&life(), plane, &wrapped_end, true);
+        }
+        assert_ne!(
+            wrapped_end,
+            end[..count(plane)],
+            "{label}: the border must matter"
+        );
+        let made = Case {
+            zero: true,
+            ..case(&label, &law, size, steps)
+        };
+        let given = [Given {
+            start,
+            targets: states.clone(),
+        }];
+        let asked = arguments(&made, &given, ",\"return\":true");
+        let answer = ok(&mut server, "grit_law_check", &asked);
+        assert_eq!(run_of(&answer), ("apart".to_owned(), 1), "{label}");
+        let shown = &answer.get("starts").and_then(Json::list).unwrap()[0];
+        let scores = shown.get("targets").and_then(Json::list).unwrap();
+        assert_eq!(scores.len(), states.len(), "{label}");
+        for ((at, state), score) in states.iter().zip(scores) {
+            assert_eq!(int_at(score, "frame"), i64::from(*at), "{label}");
+            assert_score(
+                &format!("{label} frame {at}"),
+                score,
+                &host_score(size, state, state, None),
+            );
+        }
+        let got = long::returned(&mut server, &asked, &answer);
+        let wanted: Vec<(u32, [u32; 3], u32)> = served::set_of(size, &end)
+            .into_iter()
+            .map(|(spot, word)| (0, spot, word))
+            .collect();
+        assert!(got == wanted, "{label}: returned cells differ");
+        let _ = torus;
+    }
+}
+
+#[test]
+fn c3_targets_of_every_form_count_against_the_host_memory_limit() {
+    let Some(host) = device("law_check c3 memory") else {
+        return;
+    };
+    let mut server = Server::new(Some(&host));
+    let law = quoted(&learned(&mut server, &life(), false));
+    let most = grit::serve3::check::HOST_MOST;
+    let mib = 1_u64 << 20;
+    let ask = |size: &str, targets: &str, more: &str| {
+        format!(
+            "{{\"law\":{law},\"alternate\":[0,1],\"size\":{size},\"frames\":1,\"starts\":[{{\"cells\":[],\"targets\":[{targets}]}}]{more},\"budget_ms\":{LONG}}}"
+        )
+    };
+    let from_world = "{\"world\":999,\"from\":[0,0,0]}";
+    let worlds = |many: usize| vec![from_world; many].join(",");
+    let big = "[256,128,128]";
+    assert_eq!(256 * mib + 48 * 16 * mib, most);
+    let got = no(&mut server, "grit_law_check", &ask(big, &worlds(48), ""));
+    assert_eq!(
+        (text_at(&got, "code"), text_at(&got, "field")),
+        (
+            "no_world".to_owned(),
+            "$.starts[0].targets[0].world".to_owned()
+        ),
+        "{}",
+        written(&got)
+    );
+    let got = refused_with(
+        &mut server,
+        &ask(big, &worlds(49), ""),
+        "too_many",
+        "$.starts",
+    );
+    assert_eq!(int_at(&got, "limit") as u64, most);
+    let counted = (256 + 49 * 16) * mib;
+    assert!(
+        text_at(&got, "message").contains(&counted.to_string()),
+        "{}",
+        written(&got)
+    );
+    let got = refused_with(
+        &mut server,
+        &ask(big, &worlds(48), ",\"return\":true"),
+        "too_many",
+        "$.starts",
+    );
+    assert_eq!(int_at(&got, "limit") as u64, most);
+    let empty = vec!["{\"cells\":[]}"; 1024].join(",");
+    let got = ok(
+        &mut server,
+        "grit_law_check",
+        &ask("[64,64,64]", &empty, ""),
+    );
+    let totals = got.get("totals").unwrap();
+    assert_eq!(int_at(totals, "targets"), 1024);
+    assert_eq!(int_at(totals, "wrong"), 0);
+    refused_with(
+        &mut server,
+        &ask("[64,64,64]", &worlds(1024), ""),
+        "too_many",
+        "$.starts",
+    );
 }

@@ -35,6 +35,20 @@ pub const SHARED_MOST: u64 = 1 << 22;
 
 pub const SPREAD_MOST: u64 = 8;
 
+pub const HOST_MOST: u64 = 1 << 30;
+
+pub const PIECE_CELLS: usize = 1 << 15;
+
+pub const WORD_BYTES: u64 = 4;
+
+pub const ENTRY_BYTES: u64 = 12;
+
+pub const POINT_BYTES: u64 = 512;
+
+pub const WRITTEN_BYTES: u64 = 48;
+
+pub const SHOWN_BYTES: u64 = 1024;
+
 pub const CHECK: &str = "grit_law_check runs a law or rule on many starts for frames frames on the device and scores each start against its targets, in one call. A start is a box of the world's shape (size, as grit_world_create answers it), written to the plane reads, or the current plane at frame 0; its end state and its targets are on the plane writes, or the current plane at each target's frame. Under border wrapped a start is a torus of its own size; under border zero every cell outside its box reads 0 at every frame, as a world twice its size on every axis above 2 with that half absorbed. Each start equals, bit for bit, a world of its own made by grit_world_create with the same law, params, size, sparse, alternate and absorb, written, stepped and read. Starts share one dense world when the border wraps, no absorb is given and the law reads no at: each start is a tile with a margin of its own torus copies, (1 + halo) times frames cells wide on each side of one axis, so no tile reaches another within frames frames; every other start runs in a world of its own. Scores per target: cells, right, wrong and the first wrong cell (x fastest, then y, then z); under values real also the max and rms error in words and decoded with frac. Priced as the worlds it builds (bytes), the cells it writes, margins included, and the frames it steps (world cells times frames, held bricks on sparse worlds); its reads are not priced, as no read is. It stops only on budget or cancel before a build or a step, and then answers nothing";
 
 pub const FINGERPRINT: &str = "sha256 of the start's end state: the box's words on every plane, plane 0 first, x fastest, then y, then z, each word 4 bytes little-endian";
@@ -75,9 +89,44 @@ impl Ask {
     }
 }
 
+enum Boxed {
+    Dense(Vec<u32>),
+    Cells(Vec<(u32, u32)>),
+}
+
+impl Boxed {
+    fn into_dense(self, count: usize) -> Vec<u32> {
+        match self {
+            Self::Dense(words) => words,
+            Self::Cells(cells) => {
+                let mut words = vec![0_u32; count];
+                for (at, value) in cells {
+                    if let Some(slot) = words.get_mut(at as usize) {
+                        *slot = value;
+                    }
+                }
+                words
+            }
+        }
+    }
+
+    fn word(&self, at: usize, next: &mut usize) -> Option<u32> {
+        match self {
+            Self::Dense(words) => words.get(at).copied(),
+            Self::Cells(cells) => match cells.get(*next) {
+                Some(&(held, value)) if held as usize == at => {
+                    *next += 1;
+                    Some(value)
+                }
+                _ => Some(0),
+            },
+        }
+    }
+}
+
 struct Goal {
     when: u32,
-    words: Vec<u32>,
+    words: Boxed,
 }
 
 struct Start {
@@ -126,6 +175,8 @@ struct Placed {
     start: usize,
     origin: [u32; 3],
 }
+
+type Group = ([u32; 3], Option<Absorb>, Vec<Placed>);
 
 fn along(held: [u32; 3], axis: usize) -> u32 {
     held.get(axis).copied().unwrap_or_default()
@@ -386,14 +437,16 @@ fn check_shown() -> Json {
 fn checked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let host = server.host.ok_or(crate::host::Error::NoComputeDevice)?;
     let ask = asked(server, host, held)?;
-    let starts = started(server, &ask, held)?;
+    let listed_starts = starts_of(&ask, held)?;
     let giving = matches!(held.get("return"), Some(Json::Bool(true)));
+    let tiles = tiled(host, &ask, listed_starts.len());
+    let groups = grouped(&ask, tiles.as_ref(), listed_starts.len());
+    bounded(&ask, listed_starts, (&groups, tiles.is_some()), giving)?;
+    let starts = started(server, &ask, listed_starts)?;
     let page = match held.get("page") {
         Some(_) => usize::try_from(int(held, "page")?).unwrap_or(usize::MAX),
         None => 0,
     };
-    let tiles = tiled(host, &ask, starts.len());
-    let groups = grouped(&ask, tiles.as_ref(), starts.len());
     let mut ended: Vec<Ended> = (0..starts.len()).map(|_| Ended::default()).collect();
     let all = groups.len();
     for (done, (shape, absorb, placed)) in groups.iter().enumerate() {
@@ -536,6 +589,13 @@ fn asked(server: &Server<'_>, host: &Host, held: &Json) -> Result<Ask, Failed> {
         )
     };
     let numeric = held.get("values").and_then(Json::text) == Some("real");
+    if held.get("page").is_some() && !matches!(held.get("return"), Some(Json::Bool(true))) {
+        return Err(refused(
+            Code::Malformed,
+            "$.page",
+            "page is read only with return true".to_owned(),
+        ));
+    }
     let frac = match (numeric, held.get("frac")) {
         (true, None) => Some(16),
         (true, Some(_)) => Some(int(held, "frac")?),
@@ -571,7 +631,7 @@ fn boxed(
     field: &str,
     size: [u32; 3],
     code: Code,
-) -> Result<Vec<u32>, Failed> {
+) -> Result<Boxed, Failed> {
     let given: Vec<&str> = FORMS
         .into_iter()
         .filter(|key| held.get(key).is_some())
@@ -580,8 +640,8 @@ fn boxed(
     let largest = sized(size.map(|side| side.saturating_sub(1)));
     match given.as_slice() {
         ["cells"] => {
-            let mut words = vec![0_u32; count];
             let listed_cells = held.get("cells").and_then(Json::list).ok_or("cells")?;
+            let mut cells = Vec::with_capacity(listed_cells.len());
             for (at, one) in listed_cells.iter().enumerate() {
                 let got = ints(one, "cells")?;
                 let [x, y, z, value] = <[u32; 4]>::try_from(got.as_slice()).map_err(|_| "cells")?;
@@ -596,11 +656,13 @@ fn boxed(
                         largest,
                     ));
                 }
-                if let Some(slot) = words.get_mut(index_of(size, [x, y, z])) {
-                    *slot = value;
-                }
+                cells.push((u32::try_from(index_of(size, [x, y, z]))?, value));
             }
-            Ok(words)
+            cells.reverse();
+            cells.sort_by_key(|(at, _)| *at);
+            cells.dedup_by_key(|(at, _)| *at);
+            cells.retain(|(_, value)| *value != 0);
+            Ok(Boxed::Cells(cells))
         }
         ["dense"] => {
             let words = ints(held.get("dense").ok_or("dense")?, "dense")?;
@@ -615,7 +677,7 @@ fn boxed(
                     counted(u32::try_from(count).unwrap_or(u32::MAX)),
                 ));
             }
-            Ok(words)
+            Ok(Boxed::Dense(words))
         }
         ["world"] => {
             let number = int(held, "world")?;
@@ -659,10 +721,17 @@ fn boxed(
                 Some(plane) => plane,
                 None => live.world.current().unwrap_or_default(),
             };
-            let points: Vec<[u32; 3]> = (0..count)
-                .map(|at| plus(from, point_of(size, at)))
-                .collect();
-            live.world.cells_at_plane(&points, plane)
+            let mut words = Vec::with_capacity(count);
+            let mut low = 0;
+            while low < count {
+                let high = low.saturating_add(PIECE_CELLS).min(count);
+                let points: Vec<[u32; 3]> = (low..high)
+                    .map(|at| plus(from, point_of(size, at)))
+                    .collect();
+                words.extend(live.world.cells_at_plane(&points, plane)?);
+                low = high;
+            }
+            Ok(Boxed::Dense(words))
         }
         _ => Err(refused(
             code,
@@ -672,7 +741,7 @@ fn boxed(
     }
 }
 
-fn started(server: &mut Server<'_>, ask: &Ask, held: &Json) -> Result<Vec<Start>, Failed> {
+fn starts_of<'held>(ask: &Ask, held: &'held Json) -> Result<&'held [Json], Failed> {
     let listed_starts = held.get("starts").and_then(Json::list).ok_or("starts")?;
     if listed_starts.is_empty() {
         return Err(refused(
@@ -717,11 +786,109 @@ fn started(server: &mut Server<'_>, ask: &Ask, held: &Json) -> Result<Vec<Start>
             Json::Int(i64::try_from(WORK_MOST / cells.max(1))?),
         ));
     }
+    Ok(listed_starts)
+}
+
+fn form_bytes(held: &Json, box_bytes: u64) -> (u64, bool) {
+    let given: Vec<&str> = FORMS
+        .into_iter()
+        .filter(|key| held.get(key).is_some())
+        .collect();
+    match given.as_slice() {
+        ["cells"] => {
+            let entries = held
+                .get("cells")
+                .and_then(Json::list)
+                .map_or(0, <[Json]>::len);
+            (
+                u64::try_from(entries)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(ENTRY_BYTES),
+                false,
+            )
+        }
+        ["dense"] => (box_bytes, false),
+        ["world"] => (box_bytes, true),
+        _ => (0, false),
+    }
+}
+
+fn bounded(
+    ask: &Ask,
+    listed_starts: &[Json],
+    (groups, tiling): (&[Group], bool),
+    giving: bool,
+) -> Result<(), Failed> {
+    let per = count_of(ask.size);
+    let box_bytes = per.saturating_mul(WORD_BYTES);
+    let many = u64::try_from(listed_starts.len()).unwrap_or(u64::MAX);
+    let starts = many.saturating_mul(box_bytes);
+    let mut targets = 0_u64;
+    let mut scores = 0_u64;
+    let mut from_worlds = listed_starts.iter().any(|one| one.get("world").is_some());
+    for one in listed_starts {
+        for target in one.get("targets").and_then(Json::list).unwrap_or_default() {
+            let (bytes, world) = form_bytes(target, box_bytes);
+            targets = targets.saturating_add(bytes);
+            scores = scores.saturating_add(1);
+            from_worlds |= world;
+        }
+    }
+    let ends = if giving { starts } else { 0 };
+    let reads = if from_worlds {
+        per.min(u64::try_from(PIECE_CELLS).unwrap_or(u64::MAX))
+            .saturating_mul(POINT_BYTES)
+    } else {
+        0
+    };
+    let runs = groups
+        .iter()
+        .map(|(size, _, _)| {
+            let cells = count_of(*size);
+            let written = if tiling { cells } else { per };
+            cells
+                .saturating_mul(u64::from(ask.planes))
+                .saturating_mul(WORD_BYTES)
+                .saturating_add(box_bytes)
+                .saturating_add(written.saturating_mul(WRITTEN_BYTES))
+        })
+        .max()
+        .unwrap_or_default();
+    let shown = many
+        .saturating_add(scores)
+        .saturating_mul(SHOWN_BYTES)
+        .saturating_add(if giving {
+            u64::try_from(PAGE_CELLS * 6 * std::mem::size_of::<Json>()).unwrap_or(u64::MAX)
+        } else {
+            0
+        });
+    let held = starts.saturating_add(targets).saturating_add(ends);
+    let total = held.saturating_add(reads.max(runs).max(shown));
+    if total > HOST_MOST {
+        return Err(limited(
+            Code::TooMany,
+            "$.starts",
+            format!(
+                "the check would hold {total} bytes of host memory, past the {HOST_MOST} one check holds: starts {starts}, targets {targets}, end states {ends}, and at most {} at once to read boxes of worlds, run a world or answer; nothing ran",
+                reads.max(runs).max(shown)
+            ),
+            Json::Int(i64::try_from(HOST_MOST)?),
+        ));
+    }
+    Ok(())
+}
+
+fn started(
+    server: &mut Server<'_>,
+    ask: &Ask,
+    listed_starts: &[Json],
+) -> Result<Vec<Start>, Failed> {
     let mut targets = 0_usize;
     let mut starts = Vec::with_capacity(listed_starts.len());
     for (at, one) in listed_starts.iter().enumerate() {
         let field = format!("$.starts[{at}]");
-        let words = boxed(server, one, &field, ask.size, Code::CheckStart)?;
+        let words = boxed(server, one, &field, ask.size, Code::CheckStart)?
+            .into_dense(usize::try_from(count_of(ask.size))?);
         let mut goals = Vec::new();
         if let Some(given) = one.get("targets").and_then(Json::list) {
             targets = targets.saturating_add(given.len());
@@ -831,11 +998,7 @@ fn tiled(host: &Host, ask: &Ask, many: usize) -> Option<Tiles> {
     best.map(|(_, tiles)| tiles)
 }
 
-fn grouped(
-    ask: &Ask,
-    tiles: Option<&Tiles>,
-    many: usize,
-) -> Vec<([u32; 3], Option<Absorb>, Vec<Placed>)> {
+fn grouped(ask: &Ask, tiles: Option<&Tiles>, many: usize) -> Vec<Group> {
     if let Some(tiles) = tiles {
         let mut out = Vec::new();
         let mut at = 0;
@@ -999,19 +1162,23 @@ fn box_words(
         .collect()
 }
 
-fn scored(when: u32, got: &[u32], want: &[u32], decoding: bool) -> Score {
+fn scored(when: u32, got: &[u32], want: &Boxed, decoding: bool) -> Score {
     let mut score = Score {
         when,
         count: u64::try_from(got.len()).unwrap_or(u64::MAX),
         ..Score::default()
     };
-    for (at, (one, other)) in got.iter().zip(want).enumerate() {
-        if one == other {
+    let mut next = 0_usize;
+    for (at, one) in got.iter().enumerate() {
+        let Some(other) = want.word(at, &mut next) else {
+            break;
+        };
+        if *one == other {
             continue;
         }
         score.wrong += 1;
         if score.earliest.is_none() {
-            score.earliest = Some((at, *other, *one));
+            score.earliest = Some((at, other, *one));
         }
         if decoding {
             let gap = i128::from(one.cast_signed()) - i128::from(other.cast_signed());
