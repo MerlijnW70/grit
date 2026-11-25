@@ -34,11 +34,11 @@ const RECORDED: [(&str, &str); 4] = [
     ),
     (
         "tools-list",
-        "1bbe99cd4b4b27f9cdb7eb9bd2c38c9fe0b1921b31357158feab6e15e6c7c5fa",
+        "0f40f4b3ef3138e21906bd00d2e4affd95400bd7a0e6364eda0646fc0c401eb0",
     ),
     (
         "describe",
-        "509d638b1e5e43b212b347a6a22fc54d3c665e06791e3dd97159d22949a56c9c",
+        "842c296d9547cdb3993c516fd062a42a1877266fceb679e9fe5078160e639a66",
     ),
 ];
 
