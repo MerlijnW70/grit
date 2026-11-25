@@ -92,7 +92,8 @@ def lex(text):
 
 class Source:
     def __init__(self, text):
-        self.code, self.strings = lex(text)
+        code, self.strings = lex(text)
+        self.code = re.sub(r"(?<![\w:>])::\s*(?=[A-Za-z_])", "", code)
 
 
 class Tree:
@@ -564,6 +565,9 @@ def problems(root, repo=None):
     for name in CORE:
         if name not in repo.targets:
             out.append("core target %s is not a test target" % name)
+    for path in sorted({p for c in [repo.lib, *repo.crates.values()] for p in c.files()}):
+        if re.search(r"(?<![\w!])include\s*!", repo.tree.source(path).code):
+            out.append("%s uses include!, which ci/reach.py does not follow" % path)
     for path in repo.src_files:
         if re.search(r"#\s*\[\s*(test\b|cfg\s*\(\s*test\b)", repo.tree.source(path).code):
             out.append("src file %s holds unit tests, which a selected run leaves out" % path)

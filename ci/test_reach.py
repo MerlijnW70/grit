@@ -135,6 +135,15 @@ class Selection(unittest.TestCase):
         self.fake.write("src/b.rs", "/// ```\n/// assert!(true);\n/// ```\npub fn step() -> u32 { 1 }\n")
         self.assertIn("src file src/b.rs holds a doc test, which a selected run leaves out", reach.problems(self.root))
 
+    def test_an_include_fails_the_check(self):
+        self.fake.write("tests/uses_a.rs", 'include!("../src/b.rs");\n#[test]\nfn t() {}\n')
+        self.assertIn("tests/uses_a.rs uses include!, which ci/reach.py does not follow", reach.problems(self.root))
+
+    def test_a_path_from_the_extern_root_is_followed(self):
+        self.fake.write("tests/uses_c.rs", "#[test]\nfn t() { ::grit::a::go(); }\n")
+        self.assertIn("uses_c", reach.Repo(self.root).owners("tests/uses_c.rs"))
+        self.assertIn("src/b.rs", reach.Repo(self.root).reach("uses_c"))
+
     def test_a_json_block_in_a_doc_comment_is_no_doc_test(self):
         self.fake.write("src/b.rs", "/// ```json\n/// {}\n/// ```\npub fn step() -> u32 { 1 }\n")
         self.assertEqual(reach.problems(self.root), [])
