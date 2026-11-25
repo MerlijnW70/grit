@@ -445,6 +445,8 @@ class Repo:
                 bin_crate = self.bin_crate(used)
                 out |= set(bin_crate.files())
                 out |= self.library.closure(self.lib_entries(bin_crate))
+            if out & set(self.lib.files()):
+                out.add(self.lib.root)
         self.held_reach[name] = out
         return out
 

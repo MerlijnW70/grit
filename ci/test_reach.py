@@ -89,6 +89,9 @@ class Selection(unittest.TestCase):
         self.assertIn("uses_c", self.picked("src/c/extra.rs"))
         self.assertNotIn("uses_a", self.picked("src/c/extra.rs"))
 
+    def test_every_target_that_uses_the_library_reaches_its_root(self):
+        self.assertIn("uses_c", self.picked("src/lib.rs"))
+
     def test_a_root_reexport_reaches_its_module(self):
         self.assertIn("uses_root", self.picked("src/d.rs"))
         self.assertNotIn("uses_a", self.picked("src/d.rs"))
