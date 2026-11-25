@@ -487,7 +487,7 @@ pub const fn constant(bias: i32, scale: u32) -> u32 {
         .wrapping_add(1 << 31)
 }
 
-fn clamp_bounds(clamp: [i32; 2], scale: u32) -> [u32; 2] {
+pub(super) fn clamp_bounds(clamp: [i32; 2], scale: u32) -> [u32; 2] {
     let top = (1_i64 << (32 - scale)) - 1;
     clamp.map(|one| {
         let moved = (i64::from(one) + i64::from(offset(scale))).clamp(0, top);
@@ -564,7 +564,7 @@ fn quantised(value: f64, scale: u32) -> Option<i32> {
     i32::try_from(whole).ok()
 }
 
-fn scaled(bounds: &[u128], fit: &[f64], bias: f64) -> Option<Fixed> {
+pub(super) fn scaled(bounds: &[u128], fit: &[f64], bias: f64) -> Option<Fixed> {
     for scale in (1..=SCALE_MOST).rev() {
         let Some(coefficients) = fit
             .iter()
