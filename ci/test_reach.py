@@ -186,6 +186,10 @@ class Planning(unittest.TestCase):
         self.assertEqual(items, ["big@0/2", "big@1/2", "small"])
         self.assertTrue(all(m["estimate"] <= 540 for m in matrix))
 
+    def test_each_target_in_a_shard_pays_its_link(self):
+        matrix = reach.plan(self.dir, ["small"], 540, 8)
+        self.assertEqual(matrix[0]["estimate"], 100 + reach.LINK_SECS)
+
     def test_the_shard_cap_raises_the_budget(self):
         matrix = reach.plan(self.dir, ["big", "small"], 100, 2)
         self.assertEqual(len([m for m in matrix if m["width"] == 4]), 2)

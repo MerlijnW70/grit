@@ -18,6 +18,7 @@ LIBRARY = "grit"
 BUDGET = 540
 MOST_SHARDS = 4
 UNKNOWN_SECS = 300
+LINK_SECS = 20
 CARGO = ["cargo", "test", "--release", "--locked", "--no-default-features", "--features", "deep,faults"]
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 STAMP = re.compile(r"^\d{4}-\d\d-\d\dT[0-9:.]+Z ")
@@ -660,7 +661,7 @@ def pack(costs, budget):
         parts = max(1, math.ceil(secs / budget))
         for part in range(parts):
             item = name if parts == 1 else "%s@%d/%d" % (name, part, parts)
-            items.append((secs / parts, item))
+            items.append((secs / parts + LINK_SECS, item))
     items.sort(key=lambda x: (-x[0], x[1]))
     shards = []
     for secs, item in items:
@@ -682,7 +683,7 @@ def plan(root, picked, budget=BUDGET, most=MOST_SHARDS):
             matrix.append({"width": width, "vector": VECTORS[width], "shard": "whole", "work": "*"})
             continue
         costs = {name: times.get(name, {}).get(width, UNKNOWN_SECS) for name in picked}
-        wide = max(budget, math.ceil(sum(costs.values()) / most))
+        wide = max(budget, math.ceil((sum(costs.values()) + LINK_SECS * len(costs)) / most))
         shards = pack(costs, wide)
         while len(shards) > most:
             wide = math.ceil(wide * 1.05)
