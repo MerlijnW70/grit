@@ -75,7 +75,7 @@ law_parallel 0 0 0
 law_real 0 0 0
 law_rules 0 0 0
 law_steps 0 0 0
-law_steps_large 0 0 0
+law_steps_large 4 4 4
 law_warm 0 0 0
 law_world 0 0 0
 leaking 2 2 2
