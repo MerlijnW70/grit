@@ -70,8 +70,20 @@ impl Kept {
             let next = reference(&self.law, grid, at, &cells, params);
             held.push(std::mem::replace(&mut cells, next));
         }
-        let objective = aim.measured(grid, &cells);
-        let mut weights = aim.weights(grid, &cells);
+        let plane = self
+            .law
+            .current(first.wrapping_add(count))
+            .map_or(0, |one| usize::try_from(one).unwrap_or(0));
+        let aimed = cells.get(plane * stride..).unwrap_or(&[]);
+        let objective = aim.measured(grid, aimed);
+        let mut weights = vec![0_i128; cells.len()];
+        for (slot, one) in weights
+            .iter_mut()
+            .skip(plane * stride)
+            .zip(aim.weights(grid, aimed))
+        {
+            *slot = one;
+        }
         let mut told = vec![0_i128; params.len()];
         for (done, before) in held.iter().enumerate().rev() {
             let at = first.wrapping_add(u32::try_from(done).unwrap_or(u32::MAX));

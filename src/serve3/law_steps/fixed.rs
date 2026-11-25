@@ -95,6 +95,7 @@ pub fn automatic(
     range: [f64; 2],
     coefficients: &[Vec<f64>],
     biases: &[f64],
+    wanted: u32,
 ) -> Result<Chosen, u32> {
     let mut best: Option<Chosen> = None;
     let mut most_bits = 0;
@@ -104,7 +105,7 @@ pub fn automatic(
         };
         let least = chosen.fixed.iter().map(|one| one.scale).min().unwrap_or(0);
         most_bits = most_bits.max(least);
-        if least < BITS_LEAST {
+        if least < wanted {
             continue;
         }
         if best

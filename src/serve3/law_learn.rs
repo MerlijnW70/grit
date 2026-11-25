@@ -722,6 +722,14 @@ fn learn_shown() -> Json {
                 ),
             ),
             (
+                "holdout",
+                whole(
+                    "rule linear with steps or hidden: shots at the end of each example kept out of the fit; the answer's baselines forecast them from the last fitted shot and judge beats there; 0 if left out, and then nothing is judged",
+                    0,
+                    i64::from(u32::MAX),
+                ),
+            ),
+            (
                 "law_frac",
                 whole(
                     "rule linear with steps or hidden: the law's frac, from 0 to 30; frac if left out. The examples stay at frac",
@@ -2083,10 +2091,11 @@ const LINEAR_KEYS: [&str; 4] = ["poly", "frac", "clamp", "range"];
 
 pub const SHOTS_MOST: u32 = 64;
 
-const STEPS_KEYS: [&str; 5] = [
+const STEPS_KEYS: [&str; 6] = [
     "law_frac",
     "auto_frac",
     "settle",
+    "holdout",
     "params",
     "coefficient_frac",
 ];
@@ -2236,16 +2245,26 @@ fn linear_law(
                 .and_then(Json::int)
                 .and_then(|one| u32::try_from(one).ok()),
         };
-        let mut answer = law_steps::learned(&request, held)?;
-        let cells: u64 = 0;
-        let _ = cells;
+        let mut watch = Watch {
+            guard: server.guard(),
+            host: server.host,
+            stop: None,
+            crowd_most: u32::MAX,
+            #[cfg(feature = "faults")]
+            faults: server.faults(),
+        };
+        let mut halt = || {
+            watch
+                .braked(Point::Search)
+                .then(|| watch.stop.unwrap_or(Stop::Budget))
+        };
+        let mut answer = law_steps::learned(&request, held, &mut halt)?;
         answer.extend([
             ("stencil", text(stencil.name())),
             ("row_order", text(stencil::ORDER)),
             ("border", text(border_name(asked.border))),
             ("runs_as", text(STEPS_RUNS)),
             ("ladder", Json::List(Vec::new())),
-            ("stopped", text(NO_SEARCH)),
         ]);
         if let Some(one) = &given {
             let counting = Counting {
@@ -2304,7 +2323,7 @@ fn linear_law(
                 .collect()
         })
         .unwrap_or_default();
-    let warned = law_steps::bits_warning(&scales);
+    let warned = law_steps::bits_warning(&scales, law_steps::bits_least(1));
     let cells: u64 = owned.iter().map(|one| cells_of(one.inner)).sum();
     let iterate = match (reads.as_slice(), writes.as_slice()) {
         ([read], [write]) => map(vec![(

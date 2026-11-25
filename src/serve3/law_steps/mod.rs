@@ -7,6 +7,7 @@ use crate::stencil::{self, Border, Stencil};
 use crate::wire::{Json, counted, map, text};
 
 use super::Failed;
+use super::budget::Stop;
 use super::errors::{Code, Refusal};
 use super::gradient::Told;
 use super::law_real::{self, Fixed, Term};
@@ -20,9 +21,9 @@ pub const STEPS_MOST: u32 = 64;
 
 pub const HIDDEN_MOST: u32 = 1;
 
-pub const HORIZON_MOST: usize = 16;
+pub const HORIZON_MOST: usize = 64;
 
-pub const CELL_STEPS_MOST: u64 = 1 << 26;
+pub const FIT_WORK_MOST: u64 = 1 << 27;
 
 pub const MARGIN: f64 = 0.8;
 
@@ -30,7 +31,7 @@ pub const START: &str = "each hidden plane starts at 0 on an example's first sho
 
 pub const METHOD: &str = "the observed reads' one-shot least squares fit, split into k equal sub-steps (each coefficient's distance from the identity divided by k), with each hidden plane started as a leaky copy of the observed centre less its mean over the examples, fed back into it, the 3 best of 12 such starts on one-shot rollouts each fitted at horizon 1 and the lowest kept; then Levenberg-Marquardt on the f64 form of the law (no rounding), whose residuals are the observed planes of rollouts of 1, 2, 4 and up to 16 shots of k sub-steps each, from every shot, the hidden planes run as start says; the Jacobian is carried forward through every sub-step exactly, so the fit runs on the host and needs no device; the hidden planes are then scaled so their run spans half the range, and the coefficients rounded to k fractional bits";
 
-pub const SCALES: &str = "the law is unchanged when hidden plane h is multiplied by any a other than 0 and every coefficient is multiplied by a to the power scales_as[h]; a coefficient whose scales_as is 0 for every hidden plane is pinned by the examples, the others only in products whose powers sum to 0, such as the coefficient of a hidden centre in an observed write times the coefficient of the observed centre in that hidden write; the hidden planes' scale is fixed by the scaling to half the range, their offset by the start at 0";
+pub const SCALES: &str = "two families of hidden planes give the same observed planes: scale, hidden plane h times any a other than 0 with every coefficient times a to the power scales_as[h]; and offset, hidden plane h plus any c, which moves the coefficients and biases whose offset_moves[h] is true (each bias of a write the hidden centre enters, the hidden write's own bias, and the read centre's coefficient in a write where that read times the hidden centre enters); a coefficient with scales_as 0 and offset_moves false for every hidden plane is pinned by the examples, the others only in combinations both families keep, such as the coefficient of a hidden centre in a read write times the read centre's coefficient in that hidden write; the fit fixes the scale by scaling the hidden run to half the range and the offset by the start at 0, so these are a choice, not a finding";
 
 pub struct Request<'a> {
     pub stencil: Stencil,
@@ -363,13 +364,18 @@ fn frac_asked(held: &Json) -> Result<Option<FracAsked>, Failed> {
     }
 }
 
-pub fn bits_refused(most: u32) -> Failed {
+#[must_use]
+pub fn bits_least(steps: u32) -> u32 {
+    BITS_LEAST + (u32::BITS - steps.max(1).saturating_sub(1).leading_zeros())
+}
+
+pub fn bits_refused(most: u32, least: u32) -> Failed {
     Box::new(
         Refusal::new(
             Code::CoefficientBits,
             "$.auto_frac",
             format!(
-                "no frac from 0 to {} keeps {BITS_LEAST} fractional bits in every coefficient over the range; the most any frac keeps is {most}; narrow range, lower poly or give law_frac",
+                "no frac from 0 to {} keeps {least} fractional bits (12 plus log2 of steps, rounded up) in every coefficient over the range; the most any frac keeps is {most}; narrow range, lower poly or give law_frac",
                 fixed::FRAC_MOST
             ),
         )
@@ -377,17 +383,17 @@ pub fn bits_refused(most: u32) -> Failed {
     )
 }
 
-pub fn bits_warning(scales: &[u32]) -> Option<Json> {
+pub fn bits_warning(scales: &[u32], wanted: u32) -> Option<Json> {
     let least = scales.iter().copied().min()?;
-    (least < BITS_LEAST).then(|| {
+    (least < wanted).then(|| {
         map(vec![
             ("code", text("coefficient_bits")),
             ("coefficient_frac", counted(least)),
-            ("least", counted(BITS_LEAST)),
+            ("least", counted(wanted)),
             (
                 "message",
                 text(&format!(
-                    "a coefficient keeps {least} fractional bits, fewer than {BITS_LEAST}: each is rounded to 2^-{least}, which shows as drift over many steps; lower frac or give auto_frac true"
+                    "a coefficient keeps {least} fractional bits, fewer than {wanted} (12, plus log2 of steps rounded up, for the rounding that k steps add): each is rounded to 2^-{least}, which shows as drift over many steps; lower frac or give auto_frac true"
                 )),
             ),
         ])
@@ -491,7 +497,11 @@ impl Sums {
     }
 }
 
-pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, Json)>, Failed> {
+pub fn learned(
+    request: &Request<'_>,
+    held: &Json,
+    halt: &mut dyn FnMut() -> Option<Stop>,
+) -> Result<Vec<(&'static str, Json)>, Failed> {
     let plan = planned(request, held)?;
     let basis = &plan.basis;
     let asked_frac = frac_asked(held)?;
@@ -563,19 +573,23 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
         None => 0,
         Some(_) => int(held, "settle")? as usize,
     };
+    let holdout = match held.get("holdout") {
+        None => 0,
+        Some(_) => int(held, "holdout")? as usize,
+    };
     let shortest = examples
         .iter()
         .map(|one| one.shots.len())
         .min()
         .unwrap_or(2);
-    if settle + 2 > shortest {
+    if settle + holdout + 2 > shortest {
         return Err(limited(
-            Code::Example,
-            "$.settle",
+            Code::TooFewShots,
+            if holdout > 0 { "$.holdout" } else { "$.settle" },
             format!(
-                "settle is {settle}, and the shortest example has {shortest} shots: at least one rollout must start after the settled shots and reach a shot"
+                "settle {settle} and holdout {holdout} leave the shortest example, of {shortest} shots, no rollout that starts after the settled shots and reaches a fitted shot"
             ),
-            counted(u32::try_from(shortest.saturating_sub(2)).unwrap_or(0)),
+            counted(u32::try_from(shortest.saturating_sub(2 + holdout)).unwrap_or(0)),
         ));
     }
     let frac = request.frac;
@@ -623,25 +637,28 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
         f64::from(observed_range[1]) / unit,
     ];
     let reach = range_real[0].abs().max(range_real[1].abs());
-    let cell_steps: u64 = examples
+    let tangents = u64::try_from(basis.params()).unwrap_or(u64::MAX) + 1;
+    let pass: u64 = examples
         .iter()
         .map(|one| {
             one.size
                 .iter()
                 .map(|side| u64::from(*side))
                 .product::<u64>()
-                * one.shots.len() as u64
+                .saturating_mul(one.shots.len().saturating_sub(holdout) as u64)
         })
         .sum::<u64>()
-        .saturating_mul(u64::from(plan.steps));
-    if cell_steps > CELL_STEPS_MOST {
+        .saturating_mul(u64::from(plan.steps))
+        .saturating_mul(tangents);
+    if pass > FIT_WORK_MOST {
         return Err(limited(
             Code::LearnLimit,
             "$.steps",
             format!(
-                "the examples' cells times their shots times steps make {cell_steps} cell steps, more than the {CELL_STEPS_MOST} one fit takes"
+                "one pass of the fit steps the examples' cells over their fitted shots times steps, carrying the law and its {} params: {pass} units, more than the {FIT_WORK_MOST} one pass may take",
+                basis.params()
             ),
-            Json::Int(i64::try_from(CELL_STEPS_MOST).unwrap_or(i64::MAX)),
+            Json::Int(i64::try_from(FIT_WORK_MOST).unwrap_or(i64::MAX)),
         ));
     }
     let clips: Vec<Clip> = examples
@@ -651,6 +668,7 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
             shots: example
                 .shots
                 .iter()
+                .take(example.shots.len().saturating_sub(holdout))
                 .map(|shot| real_planes(shot, frac))
                 .collect(),
         })
@@ -673,6 +691,7 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
     };
     let mut run = Run::new(&setup);
     let mut stages: Vec<Stage> = Vec::new();
+    let mut stopped: Option<Stop> = None;
     let longest = clips.iter().map(|one| one.shots.len()).max().unwrap_or(2);
     let (theta, scales_given) = match (&kept_params, &kept_scales) {
         (Some(params), Some(scales)) => {
@@ -696,27 +715,44 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
             let horizons = fit::horizons(longest, HORIZON_MOST);
             let mut best: Option<(Vec<f64>, Stage)> = None;
             for mut candidate in fit::hidden_starts(&mut run, &begun) {
-                let stage = run.descend(&mut candidate, 1);
-                if stage.cost.is_finite()
+                let stage = run.descend(&mut candidate, 1, halt);
+                if let Some(stop) = stage.stopped {
+                    stopped = Some(stop);
+                }
+                if stage.rounds > 0
+                    && stage.cost.is_finite()
                     && best.as_ref().is_none_or(|(_, held)| stage.cost < held.cost)
                 {
                     best = Some((candidate, stage));
                 }
+                if stopped.is_some() {
+                    break;
+                }
             }
-            let (mut theta, first_stage) = best.unwrap_or_else(|| {
-                (
-                    begun.clone(),
-                    Stage {
-                        horizon: 1,
-                        rounds: 0,
-                        cost: f64::INFINITY,
-                        count: 0,
+            let Some((theta_found, first_stage)) = best else {
+                let stop = stopped.unwrap_or(Stop::Budget);
+                return Err(refused(
+                    stop.code(),
+                    if stop == Stop::Budget {
+                        "$.budget_ms"
+                    } else {
+                        "$"
                     },
-                )
-            });
+                    format!(
+                        "the fit stopped on {} before its first round of Levenberg-Marquardt; nothing was learned",
+                        stop.name()
+                    ),
+                ));
+            };
+            let mut theta = theta_found;
             stages.push(first_stage);
             for horizon in horizons.into_iter().skip(1) {
-                stages.push(run.descend(&mut theta, horizon));
+                if stopped.is_some() {
+                    break;
+                }
+                let stage = run.descend(&mut theta, horizon, halt);
+                stopped = stage.stopped;
+                stages.push(stage);
             }
             for hidden in 0..basis.hidden {
                 let mut most = 0.0_f64;
@@ -736,11 +772,18 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
     };
     let reals = reals_of(basis, &theta);
     let mut warnings = Vec::new();
+    let scales_checked = scales_given.is_some();
     let (law_frac, fixed_list, mode): (u32, Vec<Fixed>, &str) = match (scales_given, asked_frac) {
         (Some(fixed), _) => (frac, fixed, "params"),
         (None, Some(FracAsked::Automatic)) => {
-            let chosen = fixed::automatic(basis, range_real, &reals.coefficients, &reals.biases)
-                .map_err(bits_refused)?;
+            let chosen = fixed::automatic(
+                basis,
+                range_real,
+                &reals.coefficients,
+                &reals.biases,
+                bits_least(plan.steps),
+            )
+            .map_err(|most| bits_refused(most, bits_least(plan.steps)))?;
             (chosen.frac, chosen.fixed, "auto")
         }
         (None, given) => {
@@ -777,8 +820,49 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
         }
     };
     let scales: Vec<u32> = fixed_list.iter().map(|one| one.scale).collect();
-    if let Some(warning) = bits_warning(&scales) {
+    if let Some(warning) = bits_warning(&scales, bits_least(plan.steps)) {
         warnings.push(warning);
+    }
+    if law_frac < frac {
+        warnings.push(map(vec![
+            ("code", text("frac_below_examples")),
+            ("frac", counted(law_frac)),
+            ("example_frac", counted(frac)),
+            (
+                "message",
+                text(&format!(
+                    "the law's frac {law_frac} is below the examples' frac {frac}: a world under the law holds each value to 2^-{law_frac}, coarser than the examples; narrow range or give law_frac"
+                )),
+            ),
+        ]));
+    }
+    if scales_checked {
+        let bound = fixed::bounds(basis, law_frac, fixed::reach_of(range_real, law_frac));
+        let fits = bound.as_ref().is_some_and(|bound| {
+            fixed_list.iter().all(|one| {
+                let reach = one
+                    .coefficients
+                    .iter()
+                    .zip(bound)
+                    .fold(0_u128, |sum, (coefficient, term)| {
+                        sum.saturating_add(
+                            u128::from(coefficient.unsigned_abs()).saturating_mul(*term),
+                        )
+                    })
+                    .saturating_add(u128::from(one.bias.unsigned_abs()))
+                    .saturating_add(1_u128 << (one.scale - 1));
+                reach < 1_u128 << 31
+            })
+        });
+        if !fits {
+            return Err(refused(
+                Code::FixedRange,
+                "$.params",
+                format!(
+                    "the params' coefficients times the terms over range, at frac {law_frac} and their coefficient_frac, need more than the 32 bits one word holds, so the law could wrap inside range; narrow range or give params that fit"
+                ),
+            ));
+        }
     }
     let law_unit = f64::from(1_u32 << law_frac);
     let observed_words = fixed::word_range(range_real, law_frac);
@@ -845,18 +929,14 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
     let hidden_planes: Vec<usize> = (basis.observed..basis.reads()).collect();
     let all_planes: Vec<usize> = (0..basis.reads()).collect();
     let mut residual_sums: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); basis.observed];
-    let horizon_last = fit::horizons(longest, HORIZON_MOST)
-        .last()
-        .copied()
-        .unwrap_or(1);
-    let checked = [1_usize, horizon_last];
+    let checked = [1_usize, holdout.max(1)];
     let mut scored: Vec<[Sums; 3]> = checked
         .iter()
         .map(|_| [Sums::new(), Sums::new(), Sums::new()])
         .collect();
     let linear = linear_baseline(basis, &clips, range_real);
     let mut states = Vec::with_capacity(examples.len());
-    for ((example, shots), clip) in examples.iter().zip(&word_examples).zip(&clips) {
+    for (shots, clip) in word_examples.iter().zip(&clips) {
         let grid = &clip.grid;
         let mut hidden: Vec<Vec<u32>> = vec![vec![0; grid.cells]; basis.hidden];
         let mut watched = vec![hidden.clone()];
@@ -894,57 +974,75 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
                 })
                 .collect(),
         ));
-        for begin in settle..shots.len().saturating_sub(1) {
-            let (Some(shot), Some(hidden_now)) = (shots.get(begin), watched.get(begin)) else {
+        let fitted = shots.len().saturating_sub(holdout);
+        for begin in settle..fitted.saturating_sub(1) {
+            let (Some(shot), Some(hidden_now), Some(wanted)) =
+                (shots.get(begin), watched.get(begin), shots.get(begin + 1))
+            else {
                 continue;
             };
             let mut planes = shot.clone();
             planes.extend(hidden_now.iter().cloned());
-            let mut line: Planes = clip.shots.get(begin).cloned().unwrap_or_default();
-            for ahead in 1..=horizon_last {
-                let Some(wanted) = shots.get(begin + ahead) else {
-                    break;
-                };
-                for _ in 0..plan.steps {
-                    planes = words.advance(grid, &planes, &all_planes);
+            for _ in 0..plan.steps {
+                planes = words.advance(grid, &planes, &all_planes);
+            }
+            for (read, (now, target)) in planes.iter().zip(wanted).enumerate() {
+                for (one, other) in now.iter().zip(target) {
+                    let missed = f64::from(one.cast_signed()) / law_unit
+                        - f64::from(other.cast_signed()) / law_unit;
+                    if let Some(slot) = residual_sums.get_mut(read) {
+                        slot.0 += missed * missed;
+                        slot.1 = slot.1.max(missed.abs());
+                        slot.2 += 1.0;
+                    }
                 }
-                line = linear.advanced(grid, &line);
-                for read in 0..basis.observed {
-                    let (Some(now), Some(target), Some(first_shot), Some(lined)) = (
-                        planes.get(read),
-                        wanted.get(read),
-                        shot.get(read),
-                        line.get(read),
-                    ) else {
-                        continue;
-                    };
-                    for (((one, other), still), guess) in
-                        now.iter().zip(target).zip(first_shot).zip(lined)
-                    {
-                        let got = f64::from(one.cast_signed()) / law_unit;
-                        let aim = f64::from(other.cast_signed()) / law_unit;
-                        if ahead == 1
-                            && let Some(slot) = residual_sums.get_mut(read)
+            }
+        }
+        if holdout == 0 {
+            continue;
+        }
+        let begin = fitted.saturating_sub(1);
+        let (Some(shot), Some(hidden_now)) = (shots.get(begin), watched.get(begin)) else {
+            continue;
+        };
+        let mut planes = shot.clone();
+        planes.extend(hidden_now.iter().cloned());
+        let mut line: Planes = real_planes(shot, law_frac);
+        for ahead in 1..=holdout {
+            let Some(wanted) = shots.get(begin + ahead) else {
+                break;
+            };
+            for _ in 0..plan.steps {
+                planes = words.advance(grid, &planes, &all_planes);
+            }
+            line = linear.advanced(grid, &line);
+            for read in 0..basis.observed {
+                let (Some(now), Some(target), Some(still_shot), Some(lined)) = (
+                    planes.get(read),
+                    wanted.get(read),
+                    shot.get(read),
+                    line.get(read),
+                ) else {
+                    continue;
+                };
+                for (((one, other), still), guess) in
+                    now.iter().zip(target).zip(still_shot).zip(lined)
+                {
+                    let got = f64::from(one.cast_signed()) / law_unit;
+                    let aim = f64::from(other.cast_signed()) / law_unit;
+                    for (at, horizon) in checked.iter().enumerate() {
+                        if *horizon == ahead
+                            && let Some(three) = scored.get_mut(at)
                         {
-                            slot.0 += (got - aim) * (got - aim);
-                            slot.1 = slot.1.max((got - aim).abs());
-                            slot.2 += 1.0;
-                        }
-                        for (at, horizon) in checked.iter().enumerate() {
-                            if *horizon == ahead
-                                && let Some(three) = scored.get_mut(at)
-                            {
-                                let [model, persistence, linear_sums] = three;
-                                model.take(got, aim);
-                                persistence.take(f64::from(still.cast_signed()) / law_unit, aim);
-                                linear_sums.take(*guess, aim);
-                            }
+                            let [model, persistence, linear_sums] = three;
+                            model.take(got, aim);
+                            persistence.take(f64::from(still.cast_signed()) / law_unit, aim);
+                            linear_sums.take(*guess, aim);
                         }
                     }
                 }
             }
         }
-        let _ = example;
     }
     let mut fit_rms = vec![0.0; basis.observed];
     {
@@ -955,31 +1053,44 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
         fit_rms.iter_mut().for_each(|one| *one = each);
         run.work = run.work.saturating_add(check.work);
     }
-    let results: Vec<Scored> = vec![Scored {
+    let result = Scored {
         model: scored.iter().map(|one| one[0].nrmse()).collect(),
         persistence: scored.iter().map(|one| one[1].nrmse()).collect(),
         linear: scored.iter().map(|one| one[2].nrmse()).collect(),
-    }];
-    let result = results.into_iter().next().unwrap_or(Scored {
-        model: Vec::new(),
-        persistence: Vec::new(),
-        linear: Vec::new(),
-    });
+    };
     let at_last = |list: &[f64]| list.iter().last().copied().unwrap_or(0.0);
     let best_baseline = at_last(&result.persistence).min(at_last(&result.linear));
-    let beats = at_last(&result.model) <= MARGIN * best_baseline;
-    if !beats {
-        warnings.push(map(vec![
+    let beats = (holdout > 0).then(|| at_last(&result.model) <= MARGIN * best_baseline);
+    match beats {
+        Some(false) => warnings.push(map(vec![
             ("code", text("baselines_not_beaten")),
             (
                 "message",
                 text(&format!(
-                    "over {horizon_last} shots the law's rollouts on the examples have NRMSE {:.4}, not below {MARGIN} times the better baseline's {:.4}: the process may lie outside the law's class (radius 1, k sub-steps, the terms of poly and hidden)",
+                    "on the {holdout} held-out shots the law's forecast has NRMSE {:.4}, not below {MARGIN} times the better baseline's {:.4}: the process may lie outside the law's class (radius 1, k sub-steps, the terms of poly and hidden)",
                     at_last(&result.model),
                     best_baseline
                 )),
             ),
-        ]));
+        ])),
+        Some(true) => warnings.push(map(vec![
+            ("code", text("forecast_unchecked")),
+            ("checked", counted(u32::try_from(holdout).unwrap_or(0))),
+            (
+                "message",
+                text(&format!(
+                    "the forecast is checked {holdout} shots ahead and no further; a horizon past {holdout} shots is not judged"
+                )),
+            ),
+        ])),
+        None => warnings.push(map(vec![
+            ("code", text("forecast_unchecked")),
+            ("checked", counted(0)),
+            (
+                "message",
+                text("no shots were held out, so the law's forecast is not judged against the baselines; give holdout"),
+            ),
+        ])),
     }
     let class = super::law::background_class(&law, &params);
     let mut answer = vec![
@@ -999,6 +1110,44 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
         .zip(&plan.writes)
         .map(|(read, write)| Json::List(vec![counted(*read), counted(*write)]))
         .collect();
+    let term_at = |wanted: Term| basis.terms.iter().position(|term| *term == wanted);
+    let centre_place = basis.stencil.place([0, 0, 0]);
+    let held_fixed = |write: usize, term: Option<usize>| {
+        term.and_then(|at| {
+            fixed_list
+                .get(write)
+                .and_then(|one| one.coefficients.get(at))
+        })
+        .is_some_and(|one| *one != 0)
+    };
+    let coefficient_moves = |write: usize, term: usize, hidden: usize| -> bool {
+        let plane = basis.observed + hidden;
+        match basis.terms.get(term) {
+            Some(Term::Place { read, place })
+                if *read < basis.observed && *place == centre_place =>
+            {
+                held_fixed(
+                    write,
+                    term_at(Term::Pair {
+                        left: *read,
+                        right: plane,
+                    }),
+                )
+            }
+            _ => false,
+        }
+    };
+    let bias_moves = |write: usize, hidden: usize| -> bool {
+        let plane = basis.observed + hidden;
+        write == plane
+            || held_fixed(
+                write,
+                term_at(Term::Place {
+                    read: plane,
+                    place: centre_place,
+                }),
+            )
+    };
     let coefficients_shown: Vec<Json> = fixed_list
         .iter()
         .enumerate()
@@ -1038,6 +1187,24 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
                         ];
                         if basis.hidden > 0 {
                             fields.push(("scales_as", Json::List(scales_as)));
+                            fields.push((
+                                "offset_moves",
+                                Json::List(
+                                    (0..basis.hidden)
+                                        .map(|hidden| Json::Bool(bias_moves(write, hidden)))
+                                        .collect(),
+                                ),
+                            ));
+                            fields.push((
+                                "offset_moves",
+                                Json::List(
+                                    (0..basis.hidden)
+                                        .map(|hidden| {
+                                            Json::Bool(coefficient_moves(write, term, hidden))
+                                        })
+                                        .collect(),
+                                ),
+                            ));
                         }
                         map(fields)
                     })
@@ -1100,11 +1267,12 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
         ("persistence", given_list(&result.persistence)),
         ("linear", given_list(&result.linear)),
         ("margin", scientific(MARGIN)),
-        ("beats", Json::Bool(beats)),
+        ("held_out", counted(u32::try_from(holdout).unwrap_or(0))),
+        ("beats", beats.map_or(Json::Null, Json::Bool)),
         (
             "means",
             text(
-                "NRMSE (root mean square error over the standard deviation of the wanted words) of the observed planes, in sample, on rollouts from every shot of every example: law, the answer's fixed-point law with the hidden planes run as start says; persistence, the starting shot unchanged; linear, the best one-shot linear fit on the observed reads alone (their counted places and a bias, least squares, clamped to the range) applied once a shot; beats when the law's NRMSE at the longest horizon is at most margin times the better baseline's",
+                "NRMSE (root mean square error over the standard deviation of the wanted words) of the observed planes on the held_out shots at the end of each example, which the fit never saw, forecast from the last fitted shot shots_ahead shots on: law, the answer's fixed-point law with the hidden planes run as start says; persistence, that shot unchanged; linear, the best one-shot linear fit on the observed reads alone (their counted places and a bias, least squares on the fitted shots, clamped to the range) applied once a shot; beats when the law's NRMSE at the last horizon is at most margin times the better baseline's, null when nothing is held out; horizons past held_out are not judged",
             ),
         ),
     ]);
@@ -1165,6 +1333,7 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
         ("poly", counted(request.poly)),
         ("steps", counted(plan.steps)),
         ("settle", counted(u32::try_from(settle).unwrap_or(0))),
+        ("holdout", counted(u32::try_from(holdout).unwrap_or(0))),
         ("params", Json::List(params.iter().map(|one| counted(*one)).collect())),
         (
             "iterate",
@@ -1187,7 +1356,7 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
                 ("example_frac", counted(frac)),
                 ("frac_from", text(mode)),
                 ("coefficient_frac", Json::List(scales.iter().map(|one| counted(*one)).collect())),
-                ("coefficient_frac_least", counted(BITS_LEAST)),
+                ("coefficient_frac_least", counted(bits_least(plan.steps))),
                 ("format", text(law_real::FORMAT)),
                 ("rounding", text(law_real::ROUNDING)),
                 ("range", range_words),
@@ -1223,6 +1392,10 @@ pub fn learned(request: &Request<'_>, held: &Json) -> Result<Vec<(&'static str, 
         ),
         ("method", text(if kept_params.is_some() { "params given: no fit; the hidden planes are run as start says" } else { METHOD })),
         ("stages", Json::List(stages_shown)),
+        (
+            "stopped",
+            text(stopped.map_or("complete", Stop::name)),
+        ),
         ("work", Json::Int(i64::try_from(run.work).unwrap_or(i64::MAX))),
         ("state", Json::List(states)),
     ]);

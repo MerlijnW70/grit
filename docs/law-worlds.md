@@ -220,7 +220,7 @@ It answers the last kept `params` and their `objective` (also the earliest lowes
 
 The gradient only sees the optimum where the objective is smooth around it. A `mul` that wraps makes it ripple: with mix, 256 cells spread over all 32 bits and the same guess, the objective rises only within 12 of `[3000,1700]` along each param, and the descent stops `local` at `[232,0]`, objective 553884330929 against 588373928375 at its start. On such starts `grit_learn_params` often ends lower for the same number of runs; on calm starts the descent does.
 
-A law that iterates (`alternate`) is never reversible, so it is walked by keeping every frame's cells: the frames are run forward and kept, and the adjoint is carried back through each kept frame with the same derivative rules, the planes of each pair swapped on odd frames as the law runs them. Such a walk always comes home; its cost counts the law's nodes twice in place of the law and its inverse. Other laws that are not reversible are refused as before.
+A law that iterates (`alternate`) is never reversible, so it is walked by keeping every frame's cells, and its aim is on the first pair's current plane after the last frame (`grit_law_score` and `grit_learn_params` aim there too): the frames are run forward and kept, and the adjoint is carried back through each kept frame with the same derivative rules, the planes of each pair swapped on odd frames as the law runs them. Such a walk always comes home; its cost counts the law's nodes twice in place of the law and its inverse. Other laws that are not reversible are refused as before.
 
 Neither tool writes a world or its journal. Refused before any walk: `not_reversible` (with the lifting refusal as `law`), `no_gradient` (above), `params`, `outside`, `reversed`, `target_size`, `aim`, `start`, `walk_limit` (a start past `walk_cells` words, a walk past `walk_work`), `budget`. A walk costs octs times frames times (the nodes of the law and its inverse plus 128, plus 192 for each plane the law looks at). A walk that does not come home answers `strayed` with the cell; one past 128 bits answers `overflow`. `grit_describe` names the limits under `law_gradient`.
 
@@ -711,6 +711,7 @@ Heat from four 64x64 pairs, `alpha` 0.15: `stencil` `3x3`, `reads` `[{"plane":0,
 | `steps` | k, from 1 to 64: the law's applications between two shots |
 | `hidden` | 0 or 1: planes the examples do not show, run by the law beside the reads |
 | `settle` | shots at the start of each example from which no rollout is scored, so the hidden planes settle; 0 if left out |
+| `holdout` | shots at the end of each example kept out of the fit and used to judge the forecast (`baselines`); 0 if left out, and then nothing is judged |
 | `law_frac` | the law's frac, 0 to 30; `frac` if left out. The examples stay at `frac` |
 | `auto_frac` | `true`: the server chooses the law's frac (below); not with `law_frac` |
 | `params`, `coefficient_frac` | an earlier answer's params and `fixed.coefficient_frac`: no fit, only the hidden planes are run (for a start state) |
@@ -721,8 +722,8 @@ The terms are those of the one-step rule over the reads. A hidden plane enters a
 
 The fit, on the host with no device:
 
-1. The reads' one-shot least squares fit (as the one-step rule), split into k equal sub-steps: each coefficient's distance from the identity divided by k. Each hidden plane starts as a leaky copy of the read centre, fed back into it; the best of 12 such starts on one-shot rollouts is kept.
-2. Levenberg–Marquardt on the law in f64 (no rounding). Its residuals are the read planes of rollouts of 1, 2, 4 and up to 16 shots. Rollouts start every horizon shots after `settle`; each start's read words are fitted too (a few L-BFGS rounds between steps, scored against the shot), so noise in a start does not bias the coefficients. The hidden planes of a start are the law's own run over the shots before it, from 0 at the example's first shot, with the reads interpolated linearly across the k sub-steps. The Jacobian is carried forward exactly through every sub-step.
+1. The reads' one-shot least squares fit (as the one-step rule), split into k equal sub-steps: each coefficient's distance from the identity divided by k. Each hidden plane starts as a leaky copy of the read centre less its mean, fed back into it; the 3 best of 12 such starts on one-shot rollouts are each fitted at horizon 1 and the lowest kept.
+2. Levenberg–Marquardt on the law in f64 (no rounding). Its residuals are the read planes of rollouts of 1, 2, 4 and so on up to 64 shots, or the fitted shots, at most 24 rounds a horizon. Rollouts start every horizon shots after `settle`; each start's read words are fitted too (a few L-BFGS rounds at each horizon's start and every 4 rounds, scored against the shot), so noise in a start does not bias the coefficients. The hidden planes of a start are the law's own run over the shots before it, from 0 at the example's first shot, with the reads interpolated linearly across the k sub-steps. The Jacobian is carried forward exactly through every sub-step.
 3. Each hidden plane is scaled so its run spans half the range; the coefficients are rounded to k fractional bits, as the one-step rule does.
 
 The answer has the one-step rule's fields and:
@@ -733,21 +734,22 @@ The answer has the one-step rule's fields and:
 | `params` | the words to create the world with |
 | `iterate` | `alternate` and `frames` k |
 | `hidden` | `count`, `planes` (`read`, `write`), `start` (the rule above) and `identifiable` |
-| `coefficients`, `bias` | per write: `value`, `fixed`, `fit`, `param`; with hidden planes `scales_as`: the law is unchanged when hidden plane h is multiplied by a and each coefficient by a^scales_as[h]. A coefficient whose `scales_as` is 0 is pinned by the examples; the others only in products whose powers sum to 0 |
-| `fixed` | `frac` (the law's), `example_frac`, `frac_from` (`frac`, `given`, `auto` or `params`), `coefficient_frac`, `coefficient_frac_least` (12), `clamp` per write, `param_format` |
+| `coefficients`, `bias` | per write: `value`, `fixed`, `fit`, `param`; with hidden planes `scales_as` and `offset_moves`: the law gives the same read planes when hidden plane h is multiplied by a and each coefficient by a^scales_as[h], and when h has c added and the coefficients whose `offset_moves[h]` is true move to match. A coefficient with `scales_as` 0 and `offset_moves` false is pinned by the examples; the others only in combinations both families keep |
+| `fixed` | `frac` (the law's), `example_frac`, `frac_from` (`frac`, `given`, `auto` or `params`), `coefficient_frac`, `coefficient_frac_least` (12 plus log2 of `steps`, rounded up), `clamp` per write, `param_format` |
 | `residual` | per read: `rms_real` and `max_real` of the fixed-point law one shot ahead from every scored shot, `fit_rms_real` of the f64 fit |
-| `baselines` | in sample, NRMSE at `shots_ahead` 1 and the longest horizon of the law against `persistence` and `linear` (the reads' one-shot linear fit, clamped); `beats` when the law's is at most `margin` (0.8) times the better one |
+| `baselines` | on the `held_out` shots, which the fit never saw: NRMSE of the forecast from the last fitted shot at `shots_ahead` 1 and `held_out`, for the law, `persistence` and `linear` (the reads' one-shot linear fit on the fitted shots, clamped); `beats` when the law's at the last horizon is at most `margin` (0.8) times the better baseline's, `null` with no holdout |
 | `stability` | per read write, the largest gain of its place coefficients over spatial waves |
 | `stages` | per horizon, its LM rounds and rms |
+| `stopped` | `complete`, or `budget` or `cancelled` when the fit stopped between rounds; the answer is then the best so far |
 | `work` | cell sub-steps evaluated, times 1 plus params for those that carry a Jacobian |
 | `state` | per example, every plane at its last shot: the reads' words and the hidden planes' run; write them to continue on a world |
-| `warnings` | `coefficient_bits`, `baselines_not_beaten`, `unstable_linear_part`, each with a message |
+| `warnings` | `coefficient_bits`, `frac_below_examples`, `baselines_not_beaten`, `forecast_unchecked` (no holdout, or `checked` shots ahead and no further), `unstable_linear_part`, each with a message |
 
-`auto_frac` `true` takes, of the fracs from 0 to 30 whose coefficients over `range` keep at least 12 fractional bits in every write, the one with the least rounding a step (half a unit of the frac, plus the term bounds times half a coefficient unit); none is refused `coefficient_bits` at `$.auto_frac` with `limit` the most bits any frac keeps. A one-step or k-step answer whose coefficients keep fewer than 12 bits adds the warning `coefficient_bits`; other answers are unchanged.
+`auto_frac` `true` takes, of the fracs from 0 to 30 whose coefficients over `range` keep at least 12 plus log2 of `steps` (rounded up) fractional bits in every write, the one with the least rounding a step (half a unit of the frac, plus the term bounds times half a coefficient unit); none is refused `coefficient_bits` at `$.auto_frac` with `limit` the most bits any frac keeps. A one-step or k-step answer whose coefficients keep fewer bits than that adds the warning `coefficient_bits`; other answers are unchanged. A law frac below the examples' `frac` adds `frac_below_examples`. Given `params` are checked against the 32-bit sum bound over `range` and refused `fixed_range` at `$.params` when they could wrap.
 
-Run it: `grit_world_create` with the answer's `law` and `params`, write each read (and each hidden plane, 0 or `state`) on its read plane, step `iterate.frames` frames: the read planes hold the next shot. To start mid-run, pass the shots before the start with `params` and `coefficient_frac`: the answer's `state` is the start.
+Run it: `grit_world_create` with the answer's `law` and `params`, write each read (and each hidden plane, 0 or `state`) on its read plane, step `iterate.frames` frames: the current planes hold the next shot (each pair's read plane after an even count of frames, its write plane after an odd one; `grit_world_read` with `current` true reads the first pair's). To start mid-run, pass the shots before the start with `params` and `coefficient_frac`: the answer's `state` is the start.
 
-Each step of the law's rounding is counted in `work`, EPF1's unit (a cell stepped once); the call has no brake. More than 2^26 cell sub-steps over the examples is refused `learn_limit` at `$.steps`.
+`work` counts cell sub-steps evaluated, times 1 plus params for those that carry a Jacobian (EPF1's unit, a cell stepped once). One pass of the fit, the fitted shots' cells times `steps` times 1 plus params, past 2^27 is refused `learn_limit` at `$.steps`. The fit checks budget and cancel before each round of Levenberg–Marquardt: a stop answers the best so far with `stopped`, and a stop before the first round is refused `budget` or `cancelled`. Too few shots for `settle` and `holdout` is refused `too_few_shots`.
 
 ### 32 copies in one word
 
