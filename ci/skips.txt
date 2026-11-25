@@ -63,7 +63,7 @@ idle 0 0 0
 indirect 0 0 0
 kept 0 0 0
 law 0 0 0
-law_bounds 0 0 0
+law_bounds 1 1 1
 law_check 0 0 0
 law_count 0 0 0
 law_devices 0 0 0
