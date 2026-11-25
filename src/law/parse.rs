@@ -357,7 +357,7 @@ pub struct Program<'p> {
     pub halo: u32,
     pub tally: Tally,
     pub reversible: bool,
-    pub alternate: Option<[u32; 2]>,
+    pub alternate: Vec<[u32; 2]>,
     pub consts: Vec<(&'p str, u32)>,
     pub defs: Vec<Def<'p>>,
     pub named: HashMap<&'p str, usize>,
@@ -535,6 +535,31 @@ fn paired(json: &Json, path: &Path<'_>) -> Result<[u32; 2], Refusal> {
     Ok([plane(first, 0)?, plane(second, 1)?])
 }
 
+fn pairs(json: &Json, path: &Path<'_>) -> Result<Vec<[u32; 2]>, Refusal> {
+    let Json::List(items) = json else {
+        return paired(json, path).map(|pair| vec![pair]);
+    };
+    if !items.iter().any(|item| matches!(item, Json::List(_))) {
+        return paired(json, path).map(|pair| vec![pair]);
+    }
+    let most = usize::try_from(limits::CHANNELS / 2).unwrap_or(2);
+    if items.len() < 2 || items.len() > most {
+        return Err(refused(
+            Code::Shape,
+            path,
+            format!(
+                "two planes [a, b], or from 2 to {most} such pairs [[a, b], [c, d]], each swapped on odd frames"
+            ),
+            format!("a list of {} pairs", items.len()),
+        ));
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(at, item)| paired(item, &path.index(at)))
+        .collect()
+}
+
 fn named<'p>(json: &'p Json, path: &Path<'_>, what: &str) -> Result<&'p str, Refusal> {
     match json {
         Json::Text(held) => short(held, path).map(|()| held.as_str()),
@@ -617,8 +642,8 @@ pub fn program(json: &Json) -> Result<Program<'_>, Refusal> {
         }
     };
     let alternate = match fields_of(top, "alternate") {
-        None => None,
-        Some(held) => Some(paired(held, &root.key("alternate"))?),
+        None => Vec::new(),
+        Some(held) => pairs(held, &root.key("alternate"))?,
     };
     let consts_path = root.key("consts");
     let Json::Map(const_fields) = field(top, "consts") else {

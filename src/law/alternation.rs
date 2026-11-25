@@ -104,75 +104,97 @@ pub fn read(dag: &Dag, plane: u32) -> bool {
     false
 }
 
-pub fn checked(pair: [u32; 2], program: &Program<'_>, dag: &Dag) -> Result<(), Refusal> {
+pub fn checked(pairs: &[[u32; 2]], program: &Program<'_>, dag: &Dag) -> Result<(), Refusal> {
     let root = Path::root();
-    let path = root.key("alternate");
-    let at = |which: usize| path.index(which).shown();
-    let [looked, target] = pair;
+    let base = root.key("alternate");
+    let single = pairs.len() == 1;
     let channels = program.channels.max(1);
-    if looked == target || looked >= channels || target >= channels {
-        return Err(refusal(
-            Code::AlternatePlane,
-            &path.shown(),
-            format!("two different planes below the law's {channels} channels"),
-            format!("[{looked}, {target}]"),
-        ));
-    }
-    if program.reversible {
-        return Err(refusal(
-            Code::AlternateReversible,
-            &path.shown(),
-            String::from("a law that is not reversible: an iterating world is not walked back"),
-            String::from("\"reversible\": true"),
-        ));
-    }
-    if written(dag, looked) {
-        return Err(refusal(
-            Code::AlternateWritten,
-            &at(0),
-            format!(
-                "plane {looked} frozen as the law is written: it is the plane even frames look at"
-            ),
-            format!("a law that writes plane {looked}"),
-        ));
-    }
-    if !written(dag, target) {
-        return Err(refusal(
-            Code::AlternateUnwritten,
-            &at(1),
-            format!("a law that writes plane {target}, the plane even frames write"),
-            format!("a law that leaves plane {target} unchanged"),
-        ));
-    }
-    if let Some(other) = (0..channels).find(|&plane| plane != target && written(dag, plane)) {
-        return Err(refusal(
-            Code::AlternateOther,
-            &path.shown(),
-            format!("a law whose only written plane is {target}"),
-            format!("a law that also writes plane {other}, which would not alternate"),
-        ));
-    }
-    if !read(dag, looked) {
-        return Err(refusal(
-            Code::AlternateUnread,
-            &at(0),
-            format!("a law that reads plane {looked}"),
-            format!("a law that never reads plane {looked}"),
-        ));
+    let targets: Vec<u32> = pairs.iter().map(|pair| pair[1]).collect();
+    for (which, &[looked, target]) in pairs.iter().enumerate() {
+        let path = if single { base } else { base.index(which) };
+        let at = |side: usize| path.index(side).shown();
+        let twice = pairs
+            .iter()
+            .take(which)
+            .any(|other| other.contains(&looked) || other.contains(&target));
+        if looked == target || looked >= channels || target >= channels || twice {
+            return Err(refusal(
+                Code::AlternatePlane,
+                &path.shown(),
+                if single {
+                    format!("two different planes below the law's {channels} channels")
+                } else {
+                    format!(
+                        "two different planes below the law's {channels} channels, named in no other pair"
+                    )
+                },
+                format!("[{looked}, {target}]"),
+            ));
+        }
+        if program.reversible {
+            return Err(refusal(
+                Code::AlternateReversible,
+                &path.shown(),
+                String::from("a law that is not reversible: an iterating world is not walked back"),
+                String::from("\"reversible\": true"),
+            ));
+        }
+        if written(dag, looked) {
+            return Err(refusal(
+                Code::AlternateWritten,
+                &at(0),
+                format!(
+                    "plane {looked} frozen as the law is written: it is the plane even frames look at"
+                ),
+                format!("a law that writes plane {looked}"),
+            ));
+        }
+        if !written(dag, target) {
+            return Err(refusal(
+                Code::AlternateUnwritten,
+                &at(1),
+                format!("a law that writes plane {target}, the plane even frames write"),
+                format!("a law that leaves plane {target} unchanged"),
+            ));
+        }
+        if let Some(other) =
+            (0..channels).find(|&plane| !targets.contains(&plane) && written(dag, plane))
+        {
+            return Err(refusal(
+                Code::AlternateOther,
+                &base.shown(),
+                if single {
+                    format!("a law whose only written plane is {target}")
+                } else {
+                    format!("a law whose only written planes are {targets:?}")
+                },
+                format!("a law that also writes plane {other}, which would not alternate"),
+            ));
+        }
+        if !read(dag, looked) {
+            return Err(refusal(
+                Code::AlternateUnread,
+                &at(0),
+                format!("a law that reads plane {looked}"),
+                format!("a law that never reads plane {looked}"),
+            ));
+        }
     }
     Ok(())
 }
 
 #[must_use]
-pub fn mirrored(halo: Halo, [looked, target]: [u32; 2]) -> Halo {
-    let (looked, target) = (index_of(looked), index_of(target));
+pub fn mirrored(halo: Halo, pairs: &[[u32; 2]]) -> Halo {
     let mut out = halo;
-    for cell in 0..BOX {
-        if (halo.cells(looked) >> cell) & 1 == 1 {
-            out = out.with(target, cell);
-        }
-        if (halo.cells(target) >> cell) & 1 == 1 {
-            out = out.with(looked, cell);
+    for &[looked, target] in pairs {
+        let (looked, target) = (index_of(looked), index_of(target));
+        for cell in 0..BOX {
+            if (halo.cells(looked) >> cell) & 1 == 1 {
+                out = out.with(target, cell);
+            }
+            if (halo.cells(target) >> cell) & 1 == 1 {
+                out = out.with(looked, cell);
+            }
         }
     }
     out
@@ -211,13 +233,12 @@ fn swapped<W: Copy, const N: usize, O: Ops<Word = W>>(
 
 pub fn stepped<O: Ops>(
     dag: &Dag,
-    pair: [u32; 2],
+    pairs: &[[u32; 2]],
     ops: &mut O,
     oct: Oct<'_, O::Word>,
     planes: &[[O::Word; CORNERS]],
     halo: &[[O::Word; BOX]],
 ) -> Planed<O::Word> {
-    let pair = pair.map(index_of);
     let one = ops.constant(1);
     let low = ops.and(oct.frame, one);
     let zero = ops.constant(0);
@@ -225,10 +246,15 @@ pub fn stepped<O: Ops>(
     let mut words = Vec::with_capacity(planes.len() + 1);
     words.push(oct.words);
     words.extend_from_slice(planes);
-    swapped(ops, odd, &mut words, pair, None);
+    for pair in pairs {
+        swapped(ops, odd, &mut words, pair.map(index_of), None);
+    }
     let mut boxes = halo.to_vec();
-    let looked = dag.halo().cells(pair[0]);
-    swapped(ops, odd, &mut boxes, pair, Some(looked));
+    for pair in pairs {
+        let pair = pair.map(index_of);
+        let looked = dag.halo().cells(pair[0]);
+        swapped(ops, odd, &mut boxes, pair, Some(looked));
+    }
     let (first, upper) = words
         .split_first()
         .map_or((oct.words, &[][..]), |(first, upper)| (*first, upper));
@@ -244,7 +270,9 @@ pub fn stepped<O: Ops>(
     let mut outs = Vec::with_capacity(ran.planes.len() + 1);
     outs.push(ran.ruled.out);
     outs.extend(ran.planes);
-    swapped(ops, odd, &mut outs, pair, None);
+    for pair in pairs {
+        swapped(ops, odd, &mut outs, pair.map(index_of), None);
+    }
     let mut outs = outs.into_iter();
     let out = outs.next().unwrap_or(oct.words);
     Planed {

@@ -274,7 +274,7 @@ fn word_of(word: usize) -> u32 {
     u32::try_from(word).unwrap_or(u32::MAX)
 }
 
-fn spread(dag: &Dag) -> usize {
+pub(crate) fn spread(dag: &Dag) -> usize {
     CORNERS * (dag.planes().len() + 1)
 }
 
@@ -998,36 +998,7 @@ impl Reversible {
         told: &mut [i128],
         looked: &mut [[i128; BOX]],
     ) -> Result<Vec<i128>, Fault> {
-        let dag = &self.forward;
-        let values = evaluated(dag, &oct, planes, boxes);
-        let mut adjoint = vec![0_i128; values.len()];
-        for (word, &weight) in weights.iter().enumerate().take(spread(dag)) {
-            added(&mut adjoint, word_out(dag, word), weight)?;
-        }
-        let mut before = vec![0_i128; spread(dag)];
-        for (index, &node) in dag.nodes().iter().enumerate().rev() {
-            let weight = adjoint.get(index).copied().unwrap_or(0);
-            if weight == 0 {
-                continue;
-            }
-            if let Node::Input(which) = node {
-                if let Some(word) = input_word(dag, which) {
-                    added(&mut before, word_of(word), weight)?;
-                } else if let Some((plane, cell)) = halo_input(dag, which) {
-                    if let Some(slot) = looked.get_mut(plane).and_then(|boxed| boxed.get_mut(cell))
-                    {
-                        *slot = slot.checked_add(weight).ok_or(Fault::Overflow)?;
-                    }
-                } else if let Some(param) = which.checked_sub(FIRST_PARAM) {
-                    added(told, param, weight)?;
-                }
-                continue;
-            }
-            for (id, share) in shares(node, weight, &values)?.into_iter().flatten() {
-                added(&mut adjoint, id, share)?;
-            }
-        }
-        Ok(before)
+        carried_in(&self.forward, oct, planes, boxes, weights, told, looked)
     }
 
     pub fn walk(
@@ -1209,7 +1180,46 @@ impl Reversible {
     }
 }
 
-fn added(held: &mut [i128], id: u32, weight: i128) -> Result<(), Fault> {
+pub(crate) fn carried_in(
+    dag: &Dag,
+    oct: Oct<'_, u32>,
+    planes: &[[u32; CORNERS]],
+    boxes: &[[u32; BOX]],
+    weights: &[i128],
+    told: &mut [i128],
+    looked: &mut [[i128; BOX]],
+) -> Result<Vec<i128>, Fault> {
+    let values = evaluated(dag, &oct, planes, boxes);
+    let mut adjoint = vec![0_i128; values.len()];
+    for (word, &weight) in weights.iter().enumerate().take(spread(dag)) {
+        added(&mut adjoint, word_out(dag, word), weight)?;
+    }
+    let mut before = vec![0_i128; spread(dag)];
+    for (index, &node) in dag.nodes().iter().enumerate().rev() {
+        let weight = adjoint.get(index).copied().unwrap_or(0);
+        if weight == 0 {
+            continue;
+        }
+        if let Node::Input(which) = node {
+            if let Some(word) = input_word(dag, which) {
+                added(&mut before, word_of(word), weight)?;
+            } else if let Some((plane, cell)) = halo_input(dag, which) {
+                if let Some(slot) = looked.get_mut(plane).and_then(|boxed| boxed.get_mut(cell)) {
+                    *slot = slot.checked_add(weight).ok_or(Fault::Overflow)?;
+                }
+            } else if let Some(param) = which.checked_sub(FIRST_PARAM) {
+                added(told, param, weight)?;
+            }
+            continue;
+        }
+        for (id, share) in shares(node, weight, &values)?.into_iter().flatten() {
+            added(&mut adjoint, id, share)?;
+        }
+    }
+    Ok(before)
+}
+
+pub(crate) fn added(held: &mut [i128], id: u32, weight: i128) -> Result<(), Fault> {
     if let Some(slot) = usize::try_from(id)
         .ok()
         .and_then(|index| held.get_mut(index))
@@ -1722,7 +1732,7 @@ const fn size(grid: Grid3) -> [u32; 3] {
 }
 
 impl Aim<'_> {
-    fn fits(&self, grid: Grid3) -> Result<(), Fault> {
+    pub(crate) fn fits(&self, grid: Grid3) -> Result<(), Fault> {
         let inside = self
             .region
             .to

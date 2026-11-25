@@ -13,6 +13,7 @@ use super::budget::{Guard, Stop};
 use super::errors::{Code, Refusal};
 use super::gradient::Told;
 use super::law_real;
+use super::law_steps;
 use super::schema::{choice, object, property, whole, with, word};
 use super::tools::{int, ints, limited, refused, tool, unread};
 use super::{Failed, Server, Tool};
@@ -502,6 +503,15 @@ fn learn_shown() -> Json {
                 ),
             ),
             (
+                "sequence",
+                list_shown(
+                    words_shown("one shot: one list of words for each read, in order"),
+                    "rule linear with steps or hidden: shots k steps apart, each one list of words for each read; give this or input and output",
+                    2,
+                    4096,
+                ),
+            ),
+            (
                 "world",
                 whole(
                     "a world whose read planes hold the input; give this or size, input and output",
@@ -683,7 +693,7 @@ fn learn_shown() -> Json {
             (
                 "steps",
                 whole(
-                    "rule totalistic or outer: k, how many applications of the law lie between each example's input and output; 1 if left out, at most 8; above 1 the tables of the rule are searched",
+                    "k, how many applications of the law lie between each example's input and output: rule totalistic or outer, 1 if left out, at most 8, above 1 the tables of the rule are searched; rule linear, at most 64, the law is fitted through k steps on rollouts of its shots and answered with params",
                     1,
                     i64::from(u32::MAX),
                 ),
@@ -693,6 +703,49 @@ fn learn_shown() -> Json {
                 choice(
                     "rule totalistic or outer: how the tables are searched; exhaustive, every table, at most 18 classes, the default up to 18; local, the default past 18, the best interval tables then single and pair flips kept only when they lower the wrong cells",
                     &["exhaustive", "local"],
+                ),
+            ),
+            (
+                "hidden",
+                whole(
+                    "rule linear: planes the examples do not show, each run by the law beside the reads and fitted through its effect on them; 0 if left out, at most 1",
+                    0,
+                    i64::from(u32::MAX),
+                ),
+            ),
+            (
+                "settle",
+                whole(
+                    "rule linear with steps or hidden: shots at the start of each example from which no rollout is scored, so the hidden planes settle; 0 if left out",
+                    0,
+                    i64::from(u32::MAX),
+                ),
+            ),
+            (
+                "law_frac",
+                map(vec![(
+                    "description",
+                    text(
+                        "rule linear with steps or hidden: the law's frac, a whole number from 0 to 30, or auto for the frac with the least rounding a step whose every coefficient keeps at least 12 fractional bits over range; frac if left out. The examples stay at frac",
+                    ),
+                )]),
+            ),
+            (
+                "params",
+                list_shown(
+                    word(),
+                    "rule linear with steps or hidden: the params of an earlier answer of the same request; no fit is made and only the hidden planes are run; give coefficient_frac with it",
+                    1,
+                    i64::try_from(crate::law::limits::PARAMS).unwrap_or(32),
+                ),
+            ),
+            (
+                "coefficient_frac",
+                list_shown(
+                    whole("a write's coefficient fractional bits", 1, 30),
+                    "with params: the fixed.coefficient_frac of the answer that gave them",
+                    1,
+                    8,
                 ),
             ),
             (
@@ -2022,6 +2075,8 @@ fn counted_law(
 
 const LINEAR_KEYS: [&str; 4] = ["poly", "frac", "clamp", "range"];
 
+const STEPS_KEYS: [&str; 4] = ["law_frac", "settle", "params", "coefficient_frac"];
+
 pub const LINEAR_ITERATE: &str = "after each frame write each written plane's words back to the read plane at the same position in reads, then step again";
 
 fn signed_pair(held: &Json, key: &str) -> Result<Option<[i32; 2]>, Failed> {
@@ -2143,6 +2198,51 @@ fn linear_law(
     }
     let channels = channels_of(held, asked)?;
     plane_checks(asked, channels)?;
+    if held.get("steps").is_some() || held.get("hidden").is_some() {
+        if held.get("clamp").is_some() {
+            return Err(refused(
+                Code::LinearRule,
+                "$.clamp",
+                "under steps or hidden every written word is clamped to range, so the law never wraps as it iterates; drop clamp and give range".to_owned(),
+            ));
+        }
+        let name = held.get("name").and_then(Json::text).unwrap_or("learned");
+        let request = law_steps::Request {
+            stencil,
+            reads: &reads,
+            writes: &writes,
+            mask,
+            poly,
+            frac,
+            range,
+            border: asked.border,
+            name,
+            channels: held
+                .get("channels")
+                .and_then(Json::int)
+                .and_then(|one| u32::try_from(one).ok()),
+        };
+        let mut answer = law_steps::learned(&request, held)?;
+        let cells: u64 = 0;
+        let _ = cells;
+        answer.extend([
+            ("stencil", text(stencil.name())),
+            ("row_order", text(stencil::ORDER)),
+            ("border", text(border_name(asked.border))),
+            ("runs_as", text(STEPS_RUNS)),
+            ("ladder", Json::List(Vec::new())),
+            ("stopped", text(NO_SEARCH)),
+        ]);
+        if let Some(one) = &given {
+            let counting = Counting {
+                tally: Tally::Totalistic,
+                stencil,
+                mask,
+            };
+            answer.push(("places", places_shown(counting, one.preset)));
+        }
+        return Ok(map(answer));
+    }
     let owned = examples_of(server, asked, held)?;
     if let Some([least, most]) = range {
         for (at, example) in owned.iter().enumerate() {
@@ -2179,6 +2279,18 @@ fn linear_law(
         name,
     };
     let mut answer = law_real::learned(&plan, &samples)?;
+    let scales: Vec<u32> = answer
+        .iter()
+        .find(|(key, _)| *key == "fixed")
+        .and_then(|(_, one)| one.get("coefficient_frac"))
+        .and_then(Json::list)
+        .map(|list| {
+            list.iter()
+                .filter_map(|one| one.int().and_then(|value| u32::try_from(value).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let warned = law_steps::bits_warning(&scales);
     let cells: u64 = owned.iter().map(|one| cells_of(one.inner)).sum();
     let iterate = match (reads.as_slice(), writes.as_slice()) {
         ([read], [write]) => map(vec![(
@@ -2218,8 +2330,13 @@ fn linear_law(
         };
         answer.push(("places", places_shown(counting, one.preset)));
     }
+    if let Some(warning) = warned {
+        answer.push(("warnings", Json::List(vec![warning])));
+    }
     Ok(map(answer))
 }
+
+pub const STEPS_RUNS: &str = "create a world with the answer's law, whose text carries its alternate, and params; write each read's words, and each hidden plane's (the answer's state, or 0), on its read plane, step iterate.frames frames, and read the read planes again (the current planes): one shot later";
 
 fn deviation_shown(one: &Deviation, tally: Tally, counts: u32) -> Json {
     let mut fields = vec![
@@ -2382,6 +2499,29 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
                     ),
                 ));
             }
+        }
+    }
+    if linear && (held.get("steps").is_some() || held.get("hidden").is_some()) {
+        return linear_law(server, held, &asked, vote);
+    }
+    for key in STEPS_KEYS {
+        if held.get(key).is_some() {
+            return Err(refused(
+                if linear {
+                    Code::StepsRule
+                } else {
+                    Code::LinearRule
+                },
+                &format!("$.{key}"),
+                if linear {
+                    format!("{key} shapes a fit through k steps; give steps or hidden with it")
+                } else {
+                    format!(
+                        "{key} shapes a fixed-point law fitted through k steps, and rule {} learns a law over bits; {key} goes with rule linear and steps or hidden",
+                        held.get("rule").and_then(Json::text).unwrap_or("")
+                    )
+                },
+            ));
         }
     }
     let steps = steps_of(held)?;
