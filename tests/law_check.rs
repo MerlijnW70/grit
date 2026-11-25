@@ -65,13 +65,13 @@ fn soup(rng: &mut Rng, size: [u32; 3], permille: u64, wide: bool) -> Vec<u32> {
 }
 
 fn layer(rng: &mut Rng, size: [u32; 3], permille: u64) -> Vec<u32> {
-    let mut words = vec![0; count(size)];
+    let mut cells = vec![0; count(size)];
     for y in 0..size[1] {
         for x in 0..size[0] {
-            words[index(size, [x, y, 0])] = u32::from(rng.below(1000) < permille);
+            cells[index(size, [x, y, 0])] = u32::from(rng.below(1000) < permille);
         }
     }
-    words
+    cells
 }
 
 fn case(label: &str, law: &str, size: [u32; 3], steps: u32) -> Case {
