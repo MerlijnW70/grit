@@ -255,7 +255,7 @@ A run costs octs times frames times (law nodes + 128), at most `run_work` (2^26)
 | `values`, `frac` | `binary` (default) or `real`; `frac`, 16 if left out, the fractional bits of a `real` word |
 | `starts` | each one of `cells` (`[x, y, z, word]`, every other cell 0), `dense` (every word of the box, x fastest) or `world` and `from` (a box of an open world, on its `plane`, its current plane if it iterates, else 0), with `targets` |
 | `targets` | each a box in the same forms, at `frame`, 0 to k; k if left out |
-| `return`, `page` | true: also answer the end states, a page at a time |
+| `return`, `page` | true: also answer the end states, a page at a time; `page` only with `return` true |
 
 Each start equals, bit for bit, a world of its own: `grit_world_create` with the same law, params, size, `sparse`, `alternate` and `absorb`, the start written, stepped k frames and read. Under `border` `zero` that world is twice the start's size on every axis above 2, absorbs half the start's side there (plus `absorb`), and holds the start in its middle; an axis of side 2, the z of a 2D world, wraps.
 
@@ -277,18 +277,34 @@ A check is priced as the worlds it builds (their bytes), the cells it writes (ma
 
 X1's held check of p1, four 64 by 64 starts 8 frames on, is one call; so are its 12 training pairs, each a start with a target at frame 1.
 
+### Host memory
+
+A check holds every buffer it needs on the host, and the sum is refused past 2^30 bytes (`HOST_MOST`) before any device work. With a box of B cells, N starts, P planes and 4-byte words, it counts:
+
+| Buffer | Bytes |
+|---|---|
+| starts | 4B each, whatever their form |
+| a `dense` or `world` target | 4B |
+| a `cells` target | 12 a listed cell: it is held as its listed cells (index and word, 8 bytes), not as a box, plus a sort's scratch |
+| end states, with `return` | 4BN |
+| reading boxes of worlds | 512 a cell of one piece of 2^15 cells: a box is read a piece at a time |
+| running a world | its cells times 4P for the read back, 4B for one box, and 48 a written cell for the cells the world is given (its whole size when tiled, B when apart) |
+| answering | 1024 a start and a target, and with `return` one page of 16384 cells |
+
+The sum is the starts, the targets and the end states, plus the largest of reading, running and answering, as they are held one after another. `cells` targets are held sparse because a box of 2^22 cells is 16 MiB a target from a request of a few bytes; a `dense` target already costs its box in the request. The world a check builds holds host memory of its own, as `grit_world_create` of that world does; it is not counted here.
+
 Refusals, before any device work except `outside` at `$.page`:
 
 | Code | When | `field` |
 |---|---|---|
-| `too_many` | more than 256 starts, more than 2^22 start cells (`limit` the most starts of this size), more than 1024 targets | `$.starts`, `$.starts[k].targets` |
+| `too_many` | more than 256 starts, more than 2^22 start cells (`limit` the most starts of this size), more than 1024 targets, more host memory than 2^30 bytes (`limit` the bytes) | `$.starts`, `$.starts[k].targets` |
 | `frames` | k past 4096, or start cells times k past 2^32 (`limit` the most frames) | `$.frames` |
 | `check_start` | a `size` no world has (`limit` the shape it would be), no start, a start with other than one form, a cell outside the box, a `dense` of the wrong length (`limit` the box's words) | `$.size`, `$.starts`, `$.starts[k]...` |
 | `check_target` | a target with other than one form, a cell outside the box, a `dense` of the wrong length, a `frame` past k (`limit` k) | `$.starts[k].targets[j]...` |
 | `outside` | `reads` or `writes` past the law's planes (`limit` the last), a `world` box past that world, `page` past the pages | the field |
 | `not_iterating`, `plane_or_current` | `current` without `alternate`; `current` with `reads` or `writes` | `$.current`, `$.reads`, `$.writes` |
 | `params`, `quiet_refused`, `absorb_wide`, `rule_or_law`, `law_refused` | as `grit_world_create` | as there |
-| `malformed` | `frac` without `values` `real` | `$.frac` |
+| `malformed` | `frac` without `values` `real`; `page` without `return` true | `$.frac`, `$.page` |
 
 Nothing is cut short: a request past a limit runs nothing.
 
