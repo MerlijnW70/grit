@@ -4,6 +4,7 @@ mod common;
 
 use common::device;
 
+use grit::Host;
 use grit::serve3::Server;
 use grit::stencil::{Border, Counting, Sample, Stencil};
 use grit::steps::Stepping;
@@ -387,7 +388,7 @@ fn base_requests() -> Vec<(&'static str, String)> {
 
 #[test]
 fn k4_requests_that_worked_before_give_the_recorded_bytes() {
-    let mut server = Server::new(None);
+    let mut server = quiet(None);
     let mut got = Vec::new();
     for (name, arguments) in base_requests() {
         let (refused, held) = content(&heard(&mut server, &arguments));
@@ -546,6 +547,36 @@ fn answered(server: &mut Server<'_>, arguments: &str) -> Json {
     held
 }
 
+fn finished(label: &str, got: &Json) {
+    let stopped = got.get("stopped").and_then(Json::text).unwrap_or("absent");
+    let hint = got.get("hint").and_then(Json::text).unwrap_or("");
+    assert!(
+        stopped == "complete" && got.get("complete") == Some(&Json::Bool(true)),
+        "{label}: the answer stopped {stopped}, so it claims no table: {hint}"
+    );
+}
+
+#[cfg(feature = "faults")]
+fn quiet(host: Option<&Host>) -> Server<'_> {
+    let time: std::sync::Arc<dyn grit::clock::Time> = std::sync::Arc::new(grit::clock::Fake::new());
+    Server::timed(host, &grit::serve3::Options::default(), time).unwrap()
+}
+
+#[cfg(not(feature = "faults"))]
+fn quiet(host: Option<&Host>) -> Server<'_> {
+    Server::new(host)
+}
+
+fn reference_only(name: &str) -> bool {
+    if std::env::var_os("CI").is_none() {
+        return false;
+    }
+    common::skip(format_args!(
+        "{name} is sized for the reference machine's host CPU, skipped under CI; its small case runs at every width"
+    ));
+    true
+}
+
 fn refused_as(server: &mut Server<'_>, arguments: &str, code: &str, field: &str) -> Json {
     let (refused, held) = content(&heard(server, arguments));
     assert!(
@@ -597,7 +628,7 @@ fn entries_of(rule: &Rule, held: &Json) -> Vec<u32> {
 
 #[test]
 fn k5_what_is_still_out_of_reach_is_refused_by_name() {
-    let mut server = Server::new(None);
+    let mut server = quiet(None);
     let life = Rule::of(Tally::Outer, false, &moore(false), &[3], &[2, 3]);
     let pairs = pairs_of(35_001, &[350, 300], Size([16, 16, 1]), &life, (2, true, 0));
     let swapped = |rule: &str| {
@@ -710,6 +741,12 @@ const NOISES: [u64; 3] = [0, 5_000, 10_000];
 
 const CORE_USED: u64 = 1_000;
 
+const SMALL_SIDE: usize = 16;
+
+const SMALL_RECOVERED: [(u32, usize); 3] = [(2, 1), (3, 0), (4, 0)];
+
+const SMALL_PINS: [usize; 4] = [0, 3, 10, 16];
+
 const SOUPS: [u64; 4] = [100, 250, 150, 300];
 
 fn bays() -> Rule {
@@ -737,10 +774,14 @@ fn likely_learned(rule: &Rule, pairs: &[Pair], steps: u32, search: least::Search
 }
 
 fn matrix_pairs(rule: &Rule, seed: u64, steps: u32, noise: u64) -> Vec<Pair> {
+    sized_pairs(rule, seed, steps, noise, 32)
+}
+
+fn sized_pairs(rule: &Rule, seed: u64, steps: u32, noise: u64, side: usize) -> Vec<Pair> {
     let size = if rule.cube {
-        Size([32, 32, 32])
+        Size([side, side, side])
     } else {
-        Size([96, 96, 1])
+        Size([side * 3, side * 3, 1])
     };
     pairs_of(seed, &SOUPS, size, rule, (steps, true, noise))
 }
@@ -761,48 +802,69 @@ fn recovered(label: &str, rule: &Rule, pairs: &[Pair], steps: u32, got: &Learned
     );
 }
 
-#[test]
-fn k1_large_rules_seen_every_k_steps_are_recovered_on_every_pinned_entry() {
-    let families = [
+fn families() -> [(&'static str, Rule, least::Search); 4] {
+    [
         ("b56_s456", x1_rule(), least::Search::Local),
         ("bays_5766", bays(), least::Search::Local),
         ("totalistic_3d", total3(), least::Search::Local),
         ("life_2d", life(), least::Search::Exhaustive),
-    ];
-    for (name, rule, search) in &families {
-        for steps in [2_u32, 3, 4] {
-            for (at, noise) in NOISES.iter().enumerate() {
-                let label = format!("{name} k {steps} noise {noise} per million");
-                let seed = 41_000 + u64::from(steps) * 10 + at as u64;
-                let pairs = matrix_pairs(rule, seed, steps, *noise);
-                let got = likely_learned(rule, &pairs, steps, *search);
-                recovered(&label, rule, &pairs, steps, &got);
-                if *noise == 0 {
-                    assert_eq!(got.wrong, 0, "{label}");
-                    assert_eq!(got.rate, None, "{label}: no noise, no likelihood pass");
-                } else {
-                    assert!(got.rate.is_some(), "{label}");
-                }
-                let doubt = got.doubt.as_ref().unwrap();
-                let core: Vec<u32> = (0..rule.classes())
-                    .filter(|class| {
-                        (rule.code >> class) & 1 == 1 && doubt.used[*class as usize] >= CORE_USED
-                    })
-                    .collect();
+    ]
+}
+
+fn rules_recovered(side: usize, cases: &[(u32, usize)]) {
+    for (name, rule, search) in &families() {
+        for (steps, at) in cases {
+            let (steps, at) = (*steps, *at);
+            let noise = NOISES[at];
+            let label = format!("{name} side {side} k {steps} noise {noise} per million");
+            let seed = 41_000 + u64::from(steps) * 10 + at as u64;
+            let pairs = sized_pairs(rule, seed, steps, noise, side);
+            let got = likely_learned(rule, &pairs, steps, *search);
+            recovered(&label, rule, &pairs, steps, &got);
+            if noise == 0 {
+                assert_eq!(got.wrong, 0, "{label}");
+                assert_eq!(got.rate, None, "{label}: no noise, no likelihood pass");
+            } else {
+                assert!(got.rate.is_some(), "{label}");
+            }
+            let doubt = got.doubt.as_ref().unwrap();
+            let core: Vec<u32> = (0..rule.classes())
+                .filter(|class| {
+                    (rule.code >> class) & 1 == 1 && doubt.used[*class as usize] >= CORE_USED
+                })
+                .collect();
+            assert!(
+                !core.is_empty(),
+                "{label}: the data reaches no live entry of the rule"
+            );
+            for class in &core {
                 assert!(
-                    !core.is_empty(),
-                    "{label}: the data reaches no live entry of the rule"
+                    doubt.pinned[*class as usize] && (got.code >> class) & 1 == 1,
+                    "{label}: live entry {class}, used {} times, is not learned",
+                    doubt.used[*class as usize]
                 );
-                for class in &core {
-                    assert!(
-                        doubt.pinned[*class as usize] && (got.code >> class) & 1 == 1,
-                        "{label}: live entry {class}, used {} times, is not learned",
-                        doubt.used[*class as usize]
-                    );
-                }
             }
         }
     }
+}
+
+#[test]
+fn k1_large_rules_seen_every_k_steps_are_recovered_on_every_pinned_entry() {
+    if reference_only("k1_large_rules_seen_every_k_steps_are_recovered_on_every_pinned_entry") {
+        return;
+    }
+    let mut cases = Vec::new();
+    for steps in [2_u32, 3, 4] {
+        for at in 0..NOISES.len() {
+            cases.push((steps, at));
+        }
+    }
+    rules_recovered(32, &cases);
+}
+
+#[test]
+fn k1_small_rules_seen_every_k_steps_are_recovered_on_every_pinned_entry() {
+    rules_recovered(SMALL_SIDE, &SMALL_RECOVERED);
 }
 
 #[test]
@@ -827,6 +889,7 @@ fn margins_of(rule: &Rule, held: &Json) -> Vec<i64> {
 }
 
 fn doubt_checked(label: &str, rule: &Rule, pairs: &[Pair], steps: u32, got: &Json) {
+    finished(label, got);
     let code = code_of(got.get("tables").unwrap());
     let answer = rule.with(code);
     let wrong = wrong_of(&answer, pairs, steps);
@@ -901,6 +964,7 @@ fn doubt_checked(label: &str, rule: &Rule, pairs: &[Pair], steps: u32, got: &Jso
 }
 
 fn moves_checked(label: &str, rule: &Rule, pairs: &[Pair], steps: u32, got: &Json) {
+    finished(label, got);
     let family = got.get("family").unwrap();
     let mut code = code_of(family.get("tables").unwrap());
     let mut wrong = wrong_of(&rule.with(code), pairs, steps);
@@ -934,7 +998,7 @@ fn moves_checked(label: &str, rule: &Rule, pairs: &[Pair], steps: u32, got: &Jso
 
 #[test]
 fn k2_margins_and_unreached_entries_match_a_host_check_of_single_flips() {
-    let mut server = Server::new(None);
+    let mut server = quiet(None);
     let cube = x1_rule();
     for (steps, noise) in [(2, 5_000), (3, 0)] {
         let label = format!("3x3x3 k {steps} noise {noise}");
@@ -956,7 +1020,6 @@ fn k2_margins_and_unreached_entries_match_a_host_check_of_single_flips() {
             ),
         );
         assert_eq!(text_at(&got, "search"), "local", "{label}");
-        assert_eq!(text_at(&got, "stopped"), "complete", "{label}");
         doubt_checked(&label, &cube, &pairs, steps, &got);
         moves_checked(&label, &cube, &pairs, steps, &got);
     }
@@ -1076,12 +1139,13 @@ fn k3_noise_near_the_estimate_gives_the_true_table_and_another_family_is_far_abo
     let estimate = got.noise.unwrap();
     assert!(estimate.far_above, "{estimate:?} wrong {}", got.wrong);
     assert!(got.wrong > 2 * estimate.expected);
-    let mut server = Server::new(None);
+    let mut server = quiet(None);
     let pairs = directed_pairs(44_200, Size([16, 16, 16]), 1, 5_000);
     let got = answered(
         &mut server,
         &learn_args(&rule, "wrapped", &pairs, 1, ",\"noise\":\"least_wrong\""),
     );
+    finished("another family", &got);
     let estimate = got.get("noise_estimate").unwrap();
     assert_eq!(
         estimate.get("far_above"),
@@ -1164,24 +1228,20 @@ fn law_of(held: &Json) -> String {
     written(&Json::Text(text_at(held, "law")))
 }
 
-#[test]
-fn k1_an_x1_sized_case_learned_from_world_examples_runs_on_a_world_within_the_noise() {
-    let host = device("law_steps_large world");
-    let Some(host) = host.as_ref() else {
-        return;
-    };
-    let mut server = Server::new(Some(host));
+fn world_learned(host: &Host, size: Size, densities: &[u64], cases: &[(u32, &str)]) {
+    let mut server = quiet(Some(host));
     let rule = x1_rule();
+    let [wide, deep, tall] = size.0;
     let carrier_pairs = pairs_of(45_000, &[200], Size([8, 8, 8]), &rule, (1, true, 0));
     let carrier = answered(
         &mut server,
         &learn_args(&rule, "wrapped", &carrier_pairs, 1, "").replace(",\"steps\":1", ""),
     );
-    let size = Size([32, 32, 32]);
-    for (steps, search) in [(2_u32, "least_wrong"), (4, "likely")] {
+    for (steps, search) in cases {
+        let steps = *steps;
         let pairs = pairs_of(
             45_000 + u64::from(steps),
-            &[100, 250, 150, 300, 200, 120],
+            densities,
             size,
             &rule,
             (steps, true, 5_000),
@@ -1192,7 +1252,7 @@ fn k1_an_x1_sized_case_learned_from_world_examples_runs_on_a_world_within_the_no
                 &mut server,
                 "grit_world_create",
                 &format!(
-                    "{{\"wide\":32,\"deep\":32,\"tall\":32,\"law\":{},\"budget_ms\":{LONG}}}",
+                    "{{\"wide\":{wide},\"deep\":{deep},\"tall\":{tall},\"law\":{},\"budget_ms\":{LONG}}}",
                     law_of(&carrier)
                 ),
             );
@@ -1209,16 +1269,16 @@ fn k1_an_x1_sized_case_learned_from_world_examples_runs_on_a_world_within_the_no
             "{{\"stencil\":\"3x3x3\",\"reads\":[{{\"plane\":0,\"bit\":0}}],\"writes\":[{{\"plane\":1,\"bit\":0}}],\"border\":\"wrapped\",\"rule\":\"outer\",\"places\":\"moore\",\"steps\":{steps},\"noise\":\"{search}\",\"examples\":[{}],\"budget_ms\":{LONG}}}",
             examples.join(",")
         );
-        let clock = std::time::Instant::now();
         let got = answered(&mut server, &arguments);
-        eprintln!("x1-sized k {steps} {search}: {:?}", clock.elapsed());
-        let label = format!("world examples k {steps} {search}");
+        let label = format!("world examples {wide}x{deep}x{tall} k {steps} {search}");
+        finished(&label, &got);
         assert_eq!(text_at(&got, "search"), "local", "{label}");
         let code = code_of(got.get("tables").unwrap());
         let margins: Vec<u64> = flat_of(got.get("pinned").unwrap())
             .iter()
             .map(|one| u64::from(*one != Json::Null))
             .collect();
+        assert!(margins.contains(&1), "{label}: no entry is pinned");
         assert!(
             against(&rule, code, &margins).is_empty(),
             "{label}: {}",
@@ -1236,7 +1296,7 @@ fn k1_an_x1_sized_case_learned_from_world_examples_runs_on_a_world_within_the_no
                 &mut server,
                 "grit_world_create",
                 &format!(
-                    "{{\"wide\":32,\"deep\":32,\"tall\":32,\"law\":{},\"alternate\":[0,1],\"budget_ms\":{LONG}}}",
+                    "{{\"wide\":{wide},\"deep\":{deep},\"tall\":{tall},\"law\":{},\"alternate\":[0,1],\"budget_ms\":{LONG}}}",
                     law_of(&got)
                 ),
             );
@@ -1273,6 +1333,38 @@ fn k1_an_x1_sized_case_learned_from_world_examples_runs_on_a_world_within_the_no
             );
         }
     }
+}
+
+const SMALL_WORLDS: [u64; 6] = [100, 250, 150, 300, 200, 120];
+
+const X1_CASES: [(u32, &str); 2] = [(2, "least_wrong"), (4, "likely")];
+
+#[test]
+fn k1_an_x1_sized_case_learned_from_world_examples_runs_on_a_world_within_the_noise() {
+    let host = device("law_steps_large world");
+    let Some(host) = host.as_ref() else {
+        return;
+    };
+    if reference_only(
+        "k1_an_x1_sized_case_learned_from_world_examples_runs_on_a_world_within_the_noise",
+    ) {
+        return;
+    }
+    world_learned(
+        host,
+        Size([32, 32, 32]),
+        &[100, 250, 150, 300, 200, 120],
+        &X1_CASES,
+    );
+}
+
+#[test]
+fn k1_a_small_case_learned_from_world_examples_runs_on_a_world_within_the_noise() {
+    let host = device("law_steps_large small world");
+    let Some(host) = host.as_ref() else {
+        return;
+    };
+    world_learned(host, Size([16, 16, 16]), &SMALL_WORLDS, &X1_CASES);
 }
 
 #[cfg(feature = "faults")]
@@ -1357,6 +1449,31 @@ mod braked {
             "a complete search is the same bytes"
         );
     }
+
+    #[test]
+    fn a_stopped_answer_fails_the_check_by_name() {
+        let (mut server, _fake) = timed();
+        disarm();
+        let whole = answered(&mut server, &arguments());
+        finished("a complete search", &whole);
+        for ordinal in [2, 3] {
+            let (mut server, fake) = timed();
+            disarm();
+            deadline_passed_at(Point::Search, ordinal, Arc::clone(&fake), LONG + 1);
+            let late = answered(&mut server, &arguments());
+            disarm();
+            assert_eq!(text_at(&late, "stopped"), "budget");
+            let caught = std::panic::catch_unwind(|| finished("late", &late));
+            let told = caught
+                .err()
+                .and_then(|held| held.downcast::<String>().ok())
+                .map_or_else(String::new, |held| *held);
+            assert!(
+                told.contains("late: the answer stopped budget"),
+                "a stopped answer at brake {ordinal} passed the check: {told:?}"
+            );
+        }
+    }
 }
 
 fn falsely_pinned(rule: &Rule, got: &Learned) -> Vec<u32> {
@@ -1374,8 +1491,7 @@ fn pinned_count(got: &Learned) -> usize {
         .map_or(0, |doubt| doubt.pinned.iter().filter(|one| **one).count())
 }
 
-#[test]
-fn k2_no_entry_is_pinned_against_the_rule_on_sparse_or_dense_inputs_in_either_mode() {
+fn pin_cases() -> Vec<(String, Rule, Vec<u64>, u32)> {
     let odd = Rule::of(Tally::Outer, true, &moore(true), &[5, 6, 10], &[4, 5, 6]);
     let sparse = [20_u64, 30, 40, 50, 20, 30, 40, 50];
     let dense = [100_u64, 250, 150, 300];
@@ -1403,11 +1519,17 @@ fn k2_no_entry_is_pinned_against_the_rule_on_sparse_or_dense_inputs_in_either_mo
         1,
     ));
     cases.push(("b5_6_10_s456 8% k 1".to_owned(), odd, vec![80; 8], 1));
-    for (at, (label, rule, densities, steps)) in cases.iter().enumerate() {
+    cases
+}
+
+fn nothing_pinned_against(side: usize, picked: &[usize]) {
+    let cases = pin_cases();
+    for at in picked {
+        let (label, rule, densities, steps) = &cases[*at];
         let pairs = pairs_of(
-            47_000 + at as u64,
+            47_000 + *at as u64,
             densities,
-            Size([32, 32, 32]),
+            Size([side, side, side]),
             rule,
             (*steps, true, 10_000),
         );
@@ -1416,7 +1538,7 @@ fn k2_no_entry_is_pinned_against_the_rule_on_sparse_or_dense_inputs_in_either_mo
         let wrongly = falsely_pinned(rule, &fewest);
         let wrongly_likely = falsely_pinned(rule, &likely);
         eprintln!(
-            "PINS {label}: least_wrong pinned {} false {:?} far_above {} | likely pinned {} false {:?} rate {:?} recovered {}",
+            "PINS {label} side {side}: least_wrong pinned {} false {:?} far_above {} | likely pinned {} false {:?} rate {:?} recovered {}",
             pinned_count(&fewest),
             wrongly,
             fewest.noise.is_some_and(|one| one.far_above),
@@ -1435,6 +1557,22 @@ fn k2_no_entry_is_pinned_against_the_rule_on_sparse_or_dense_inputs_in_either_mo
             "{label}: likely pins {wrongly_likely:?} against the rule"
         );
     }
+}
+
+#[test]
+fn k2_no_entry_is_pinned_against_the_rule_on_sparse_or_dense_inputs_in_either_mode() {
+    if reference_only(
+        "k2_no_entry_is_pinned_against_the_rule_on_sparse_or_dense_inputs_in_either_mode",
+    ) {
+        return;
+    }
+    let every: Vec<usize> = (0..pin_cases().len()).collect();
+    nothing_pinned_against(32, &every);
+}
+
+#[test]
+fn k2_no_entry_is_pinned_against_the_rule_in_a_small_case_of_either_mode() {
+    nothing_pinned_against(SMALL_SIDE, &SMALL_PINS);
 }
 
 #[cfg(feature = "faults")]
@@ -1532,37 +1670,63 @@ mod stopped_everywhere {
     }
 }
 
-#[test]
-fn k3_the_fewest_wrong_cells_pin_nothing_false_or_are_far_above_in_the_noisy_cells_past_two_steps()
-{
-    for (name, rule) in [
-        ("b56_s456", x1_rule()),
-        ("bays_5766", bays()),
-        ("totalistic_3d", total3()),
-    ] {
+fn fewest_cases() -> Vec<(usize, u32, usize)> {
+    let mut cases = Vec::new();
+    for family in 0..3 {
         for steps in [3_u32, 4] {
-            for (at, noise) in NOISES.iter().enumerate().skip(1) {
-                let label = format!("{name} k {steps} noise {noise} per million");
-                let seed = 41_000 + u64::from(steps) * 10 + at as u64;
-                let pairs = matrix_pairs(&rule, seed, steps, *noise);
-                let got = local_learned(&rule, &pairs, steps, true);
-                let noise = got.noise.unwrap();
-                let wrongly = falsely_pinned(&rule, &got);
-                eprintln!(
-                    "FEWEST {label}: pinned {} false {wrongly:?} estimate {} far_above {}",
-                    pinned_count(&got),
-                    noise.per_million,
-                    noise.far_above
-                );
-                assert!(got.complete, "{label}");
-                assert!(
-                    wrongly.is_empty(),
-                    "{label}: pins {wrongly:?} against the rule"
-                );
-                if noise.far_above {
-                    assert_eq!(pinned_count(&got), 0, "{label}: far above yet pinned");
-                }
+            for at in 1..NOISES.len() {
+                cases.push((family, steps, at));
             }
         }
     }
+    cases
+}
+
+fn fewest_honest(side: usize, cases: &[(usize, u32, usize)]) {
+    let rules = [
+        ("b56_s456", x1_rule()),
+        ("bays_5766", bays()),
+        ("totalistic_3d", total3()),
+    ];
+    for (family, steps, at) in cases {
+        let (name, rule) = &rules[*family];
+        let (steps, at) = (*steps, *at);
+        let noise = NOISES[at];
+        let label = format!("{name} side {side} k {steps} noise {noise} per million");
+        let seed = 41_000 + u64::from(steps) * 10 + at as u64;
+        let pairs = sized_pairs(rule, seed, steps, noise, side);
+        let got = local_learned(rule, &pairs, steps, true);
+        let estimate = got.noise.unwrap();
+        let wrongly = falsely_pinned(rule, &got);
+        eprintln!(
+            "FEWEST {label}: pinned {} false {wrongly:?} estimate {} far_above {}",
+            pinned_count(&got),
+            estimate.per_million,
+            estimate.far_above
+        );
+        assert!(got.complete, "{label}");
+        assert!(
+            wrongly.is_empty(),
+            "{label}: pins {wrongly:?} against the rule"
+        );
+        if estimate.far_above {
+            assert_eq!(pinned_count(&got), 0, "{label}: far above yet pinned");
+        }
+    }
+}
+
+#[test]
+fn k3_the_fewest_wrong_cells_pin_nothing_false_or_are_far_above_in_the_noisy_cells_past_two_steps()
+{
+    if reference_only(
+        "k3_the_fewest_wrong_cells_pin_nothing_false_or_are_far_above_in_the_noisy_cells_past_two_steps",
+    ) {
+        return;
+    }
+    fewest_honest(32, &fewest_cases());
+}
+
+#[test]
+fn k3_the_fewest_wrong_cells_pin_nothing_false_or_are_far_above_in_a_small_case() {
+    fewest_honest(SMALL_SIDE, &fewest_cases());
 }
