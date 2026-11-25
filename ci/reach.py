@@ -11,14 +11,15 @@ from pathlib import Path
 WIDTHS = (4, 8, 16)
 VECTORS = {4: 128, 8: 256, 16: 512}
 CORE = ("bricks", "golden", "law", "law_devices", "listed3", "one_step", "sparse3", "sparse_halo")
-WHOLE_PATHS = ("Cargo.toml", "Cargo.lock", "build.rs", ".gitattributes")
-WHOLE_DIRS = (".github/", "tests/common/", "ci/")
+WHOLE_DIRS = ("tests/common/",)
+QUIET_FILES = (".gitignore",)
+QUIET_DIRS = ("docs/", "demos/", "front/")
 INERT = ("ci/reach.txt",)
 LIBRARY = "grit"
 BUDGET = 540
 MOST_SHARDS = 4
 UNKNOWN_SECS = 300
-LINK_SECS = 20
+LINK_SECS = 23
 CARGO = ["cargo", "test", "--release", "--locked", "--no-default-features", "--features", "deep,faults"]
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 STAMP = re.compile(r"^\d{4}-\d\d-\d\dT[0-9:.]+Z ")
@@ -300,6 +301,19 @@ def strip_generics(text):
     return " " + text + " "
 
 
+def impl_names(header):
+    bare = None
+    while bare != header:
+        bare, header = header, re.sub(r"<[^<>]*>", " ", header)
+    qualified = r"(?:" + IDENT + r"\s*::\s*)+" + IDENT
+    names = set(re.findall(IDENT, re.sub(qualified, " ", header)))
+    for found in re.finditer(qualified, header):
+        parts = re.findall(IDENT, found.group(0))
+        if parts[0] in ("crate", "self", "super"):
+            names.add(parts[-1])
+    return names
+
+
 class Library:
     def __init__(self, tree, crate):
         self.crate = crate
@@ -334,9 +348,13 @@ class Library:
             header = re.split(r"\bwhere\b", strip_generics(found.group(1)))[0]
             trait, _, own = header.rpartition(" for ")
             homes = self.named(resolver, module, own, aliases, items, globs, local, path)
+            named = homes | self.named(resolver, module, trait, aliases, items, globs, local, path)
             if not homes and trait:
-                homes = self.named(resolver, module, trait, aliases, items, globs, local, path)
+                homes = named
             out |= homes
+            for name in impl_names(header):
+                if not named & self.defined.get(name, set()):
+                    out |= self.defined.get(name, set())
         out.discard(path)
         return out
 
@@ -596,6 +614,12 @@ def changed(root, base, head):
     return sorted(p for p in out.splitlines() if p)
 
 
+def quiet(path):
+    if path in QUIET_FILES or path.startswith(QUIET_DIRS):
+        return True
+    return "/" not in path and (path.endswith(".md") or path.startswith("LICENSE-"))
+
+
 def select(root, paths):
     root = Path(root)
     repo = Repo(root)
@@ -611,7 +635,7 @@ def select(root, paths):
         if path in INERT:
             reasons.append("%s: checked by library" % path)
             continue
-        if path in WHOLE_PATHS or path.startswith(WHOLE_DIRS):
+        if path.startswith(WHOLE_DIRS):
             reasons.append("%s: every target" % path)
             whole = True
             continue
@@ -645,6 +669,10 @@ def select(root, paths):
             continue
         if any(path_matches(s, path) for s in repo.strings(repo.lib)):
             reasons.append("%s: named in src, every target" % path)
+            whole = True
+            continue
+        if not quiet(path):
+            reasons.append("%s: outside src and tests, every target" % path)
             whole = True
             continue
         hits = repo.naming(path, repo.crates)
@@ -821,6 +849,16 @@ def tally(root, matrix, results):
         if sorted(r["work"] for r in mine) != planned:
             errors.append("width %d: %d of %d shards reported" % (width, len(mine), len(planned)))
             continue
+        for r in mine:
+            for key in r.get("failed", []):
+                errors.append("width %d: %s failed" % (width, key))
+        reported = {key for r in mine for key in r["skips"]}
+        if planned == ["*"]:
+            wanted = set(table)
+        else:
+            wanted = {item for work in planned for item in work.split()}
+        for item in sorted(wanted - reported):
+            errors.append("width %d: %s reported no result" % (width, item))
         observed = {}
         for r in mine:
             for key, count in r["skips"].items():

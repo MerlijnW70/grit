@@ -10,12 +10,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import reach
 
 LIB = {
-    "src/lib.rs": "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub use d::Held;\n",
+    "src/lib.rs": "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub use d::Held;\npub mod types;\nmod ext;\npub use types::Foo;\n",
     "src/a.rs": "use crate::b::step;\npub fn go() -> u32 { step() }\n",
     "src/b.rs": "pub fn step() -> u32 { 1 }\n",
     "src/c.rs": "pub struct Kind;\nmod extra;\n",
     "src/c/extra.rs": "use super::Kind;\nimpl Kind { pub fn more(&self) -> u32 { 2 } }\n",
     "src/d.rs": "pub struct Held;\n",
+    "src/types.rs": "pub struct Foo;\n",
+    "src/ext.rs": "use crate::Foo;\nimpl Foo { pub fn m(&self) {} }\n",
     "src/bin/tool.rs": "fn main() { let _ = grit::b::step(); }\n",
 }
 
@@ -29,6 +31,7 @@ class Fake:
             files["tests/%s.rs" % name] = "#[test]\nfn holds() {}\n"
         files["tests/uses_a.rs"] = "use grit::a;\n#[test]\nfn t() { a::go(); }\n"
         files["tests/uses_c.rs"] = "use grit::c::Kind;\n#[test]\nfn t() { Kind.more(); }\n"
+        files["tests/uses_m.rs"] = "use grit::types::Foo;\n#[test]\nfn t() { Foo.m(); }\n"
         files["tests/uses_root.rs"] = "use grit::*;\n#[test]\nfn t() { let _ = Held; let _ = b::step(); }\n"
         files["tests/reads.rs"] = '#[test]\nfn t() { let _ = std::fs::read("tests/data/table.txt"); }\n'
         files["tests/scans.rs"] = '#[test]\nfn t() { let _ = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"); }\n'
@@ -78,6 +81,9 @@ class Selection(unittest.TestCase):
             "src/kernel.spv",
             "src/gone.rs",
             ".gitattributes",
+            ".cargo/config.toml",
+            "rust-toolchain.toml",
+            "clippy.toml",
         ):
             self.assertIsNone(self.picked(path), path)
 
@@ -108,6 +114,18 @@ class Selection(unittest.TestCase):
 
     def test_an_unnamed_file_adds_only_the_core(self):
         self.assertEqual(set(self.picked("README.md")), set(reach.CORE))
+
+    def test_each_quiet_path_adds_only_the_core(self):
+        for path in ("CONTRIBUTING.md", "LICENSE-MIT", "docs/guide.md", "demos/x.txt", "front/a.js", ".gitignore"):
+            self.assertEqual(set(self.picked(path)), set(reach.CORE), path)
+
+    def test_an_unknown_top_level_path_selects_every_target(self):
+        self.assertIsNone(self.picked(".cargo/config.toml"))
+        self.assertIsNone(self.picked("rust-toolchain.toml"))
+
+    def test_an_impl_of_a_reexported_type_is_reached(self):
+        self.assertIn("uses_m", self.picked("src/ext.rs"))
+        self.assertNotIn("uses_a", self.picked("src/ext.rs"))
 
     def test_a_touched_target_is_selected(self):
         self.assertIn("uses_a", self.picked("tests/uses_a.rs"))
@@ -214,6 +232,28 @@ class Planning(unittest.TestCase):
         matrix = [{"width": 4, "work": "big@0/2"}, {"width": 4, "work": "big@1/2 small"}]
         errors = reach.tally(self.dir, matrix, [self.result(4, "big@0/2", {"big@0/2": 1})])[1]
         self.assertEqual(errors, ["width 4: 1 of 2 shards reported"])
+
+    def test_a_failed_shard_fails(self):
+        matrix = [{"width": 4, "work": "small"}]
+        result = dict(self.result(4, "small", {"small": 0}), failed=["small"])
+        self.assertEqual(reach.tally(self.dir, matrix, [result])[1], ["width 4: small failed"])
+
+    def test_a_shard_whose_build_failed_does_not_match_zero(self):
+        matrix = [{"width": 8, "work": "small"}]
+        result = dict(self.result(8, "small", {}), failed=["build"])
+        errors = reach.tally(self.dir, matrix, [result])[1]
+        self.assertIn("width 8: build failed", errors)
+        self.assertIn("width 8: small reported no result", errors)
+
+    def test_a_planned_part_with_no_result_fails(self):
+        matrix = [{"width": 4, "work": "big@0/2 big@1/2"}]
+        errors = reach.tally(self.dir, matrix, [self.result(4, "big@0/2 big@1/2", {"big@0/2": 1})])[1]
+        self.assertEqual(errors, ["width 4: big@1/2 reported no result"])
+
+    def test_a_whole_run_missing_a_target_fails(self):
+        matrix = [{"width": 4, "work": "*"}]
+        errors = reach.tally(self.dir, matrix, [self.result(4, "*", {"big": 1})])[1]
+        self.assertEqual(errors, ["width 4: small reported no result"])
 
     def test_a_whole_run_is_held_to_every_row(self):
         matrix = [{"width": 16, "work": "*"}]
