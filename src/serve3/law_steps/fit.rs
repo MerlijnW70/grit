@@ -1,3 +1,4 @@
+use super::super::budget::Stop;
 use super::super::law_real::Term;
 use super::model::{Basis, Grid, Law, Planes};
 
@@ -519,6 +520,7 @@ pub struct Stage {
     pub rounds: u32,
     pub cost: f64,
     pub count: u64,
+    pub stopped: Option<Stop>,
 }
 
 pub const ROUNDS: u32 = 24;
@@ -530,13 +532,33 @@ pub const DAMPING_MOST: f64 = 1e10;
 pub const SETTLED: f64 = 1e-7;
 
 impl Run<'_> {
-    pub fn descend(&mut self, theta: &mut Vec<f64>, horizon: usize) -> Stage {
+    pub fn descend(
+        &mut self,
+        theta: &mut Vec<f64>,
+        horizon: usize,
+        halt: &mut dyn FnMut() -> Option<Stop>,
+    ) -> Stage {
         let mut damping = DAMPING;
+        let mut stopped = halt();
+        if stopped.is_some() {
+            return Stage {
+                horizon,
+                rounds: 0,
+                cost: f64::INFINITY,
+                count: 0,
+                stopped,
+            };
+        }
         self.reset(horizon);
         self.refine(theta, horizon);
         let mut here = self.normal(theta, horizon, true);
         let mut rounds = 0;
-        while rounds < ROUNDS {
+        let mut settled = false;
+        while rounds < ROUNDS && !settled {
+            if let Some(stop) = halt() {
+                stopped = Some(stop);
+                break;
+            }
             rounds += 1;
             let mut moved = false;
             while damping < DAMPING_MOST {
@@ -551,20 +573,18 @@ impl Run<'_> {
                     *theta = trial;
                     damping = (damping / 3.0).max(1e-9);
                     moved = true;
-                    if gain < SETTLED {
-                        rounds = ROUNDS;
-                    }
+                    settled = gain < SETTLED;
                     break;
                 }
                 damping *= 4.0;
             }
-            if !moved {
+            if !moved || settled || rounds >= ROUNDS {
                 break;
             }
-            if rounds < ROUNDS {
+            if rounds % REFINE_EVERY == 0 {
                 self.refine(theta, horizon);
             }
-            here = self.normal(theta, horizon, rounds < ROUNDS);
+            here = self.normal(theta, horizon, true);
         }
         let last = self.normal(theta, horizon, false);
         Stage {
@@ -572,9 +592,12 @@ impl Run<'_> {
             rounds,
             cost: last.cost,
             count: last.count,
+            stopped,
         }
     }
 }
+
+pub const REFINE_EVERY: u32 = 4;
 
 pub fn least_squares(rows: &[Vec<f64>], wanted: &[f64]) -> Option<Vec<f64>> {
     let side = rows.iter().next().map_or(0, Vec::len);

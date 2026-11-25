@@ -256,12 +256,10 @@ fn reals(words: &[i32], frac: u32) -> Vec<f64> {
     words.iter().map(|one| f64::from(*one) / unit).collect()
 }
 
-#[test]
-fn v1_a_drift_law_fitted_through_k_steps_rolls_out_within_one_and_a_half_of_the_true_law() {
-    let side = 64;
+fn v1_case(side: usize, steps: u32, sigma: f64) {
     let frac = 16;
-    for steps in [1_u32, 4, 8] {
-        for sigma in [0.005, 0.01] {
+    {
+        {
             let mut rng = Rng(100 + u64::from(steps) * 10 + (sigma * 1000.0) as u64);
             let mut clean = smooth_field(&mut rng, side);
             let shots_count = 12;
@@ -351,6 +349,24 @@ fn v1_a_drift_law_fitted_through_k_steps_rolls_out_within_one_and_a_half_of_the_
                 learned_error <= 1.5 * true_error,
                 "k {steps} sigma {sigma}: {learned_error} against {true_error}"
             );
+        }
+    }
+}
+
+#[test]
+fn v1_a_drift_law_fitted_through_four_steps_rolls_out_within_one_and_a_half_of_the_true_law() {
+    v1_case(32, 4, 0.01);
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "quiet"),
+    ignore = "minutes of host fitting: the nightly full check runs it with --features faults,quiet"
+)]
+fn v1_a_drift_law_fitted_through_k_steps_rolls_out_within_one_and_a_half_of_the_true_law() {
+    for steps in [1_u32, 4, 8] {
+        for sigma in [0.005, 0.01] {
+            v1_case(64, steps, sigma);
         }
     }
 }
@@ -482,13 +498,31 @@ fn linear_rolled(linear: &Json, side: usize, start: &[i32], ahead: u32) -> Vec<i
         .collect()
 }
 
-fn excited(steps: u32, side: usize, shots_count: usize, settle: usize, seed: u64) -> Excited {
-    let frac = 10;
+struct Shape {
+    steps: u32,
+    shots: usize,
+    settle: usize,
+    holdout: usize,
+    frac: u32,
+    warm: usize,
+    seed: u64,
+}
+
+fn excited(shape: &Shape) -> Excited {
+    let Shape {
+        steps,
+        shots: shots_count,
+        settle,
+        holdout,
+        frac,
+        warm,
+        seed,
+    } = *shape;
+    let side = 64;
     let sigma = 0.01;
     let mut rng = Rng(seed);
     let mut medium = Medium::spiral(side);
     let mut truth = Vec::new();
-    let warm = 24;
     let total = shots_count + warm + 60;
     for _ in 0..total {
         truth.push(medium.voltage());
@@ -514,7 +548,7 @@ fn excited(steps: u32, side: usize, shots_count: usize, settle: usize, seed: u64
             side,
             &training,
             &format!(
-                ",\"steps\":{steps},\"hidden\":1,\"poly\":3,\"frac\":{frac},\"range\":{range},\"settle\":{settle},\"auto_frac\":true"
+                ",\"steps\":{steps},\"hidden\":1,\"poly\":3,\"frac\":{frac},\"range\":{range},\"settle\":{settle},\"holdout\":{holdout},\"auto_frac\":true"
             ),
         ),
     );
@@ -598,54 +632,98 @@ fn excited(steps: u32, side: usize, shots_count: usize, settle: usize, seed: u64
     }
 }
 
+fn shown(found: &Excited, steps: u32) {
+    let baselines = found.answer.get("baselines").unwrap();
+    println!(
+        "v2 k {steps}: held-out NRMSE 10/50 law {:.3}/{:.3}, persistence {:.3}/{:.3}, linear {:.3}/{:.3}; answer's held-out check: ahead {} law {} persistence {} linear {} beats {}; frac {}; coefficient_frac {}; stages {}; stopped {}; work {}; fit {:.2?}",
+        found.model[0],
+        found.model[1],
+        found.persistence[0],
+        found.persistence[1],
+        found.linear[0],
+        found.linear[1],
+        written(baselines.get("shots_ahead").unwrap()),
+        written(baselines.get("law").unwrap()),
+        written(baselines.get("persistence").unwrap()),
+        written(baselines.get("linear").unwrap()),
+        written(baselines.get("beats").unwrap()),
+        written(found.answer.get("fixed").unwrap().get("frac").unwrap()),
+        written(
+            found
+                .answer
+                .get("fixed")
+                .unwrap()
+                .get("coefficient_frac")
+                .unwrap()
+        ),
+        written(found.answer.get("stages").unwrap()),
+        written(found.answer.get("stopped").unwrap()),
+        written(found.answer.get("work").unwrap()),
+        found.spent
+    );
+}
+
+fn margins(found: &Excited, steps: u32, horizons: &[usize]) -> Vec<String> {
+    let mut failed = Vec::new();
+    for &slot in horizons {
+        let better = found.persistence[slot].min(found.linear[slot]);
+        if found.model[slot] > MARGIN_HELD * better {
+            failed.push(format!(
+                "k {steps} at {} shots: law {} against baselines {} and {}",
+                [10, 50][slot],
+                found.model[slot],
+                found.persistence[slot],
+                found.linear[slot]
+            ));
+        }
+    }
+    if found.answer.get("baselines").unwrap().get("beats") != Some(&Json::Bool(true)) {
+        failed.push(format!(
+            "k {steps}: the answer's held-out check does not say beats"
+        ));
+    }
+    failed
+}
+
 #[test]
+#[cfg_attr(
+    not(feature = "quiet"),
+    ignore = "tens of minutes of host fitting: the nightly full check runs it with --features faults,quiet"
+)]
 fn v2_a_hidden_recovery_plane_predicts_held_out_voltage_past_both_baselines() {
     let mut failed = Vec::new();
     for steps in [8_u32, 4, 1] {
-        let found = excited(steps, 64, 32, 8, 900 + u64::from(steps));
-        let baselines = found.answer.get("baselines").unwrap();
-        println!(
-            "v2 k {steps}: held-out NRMSE 10/50 law {:.3}/{:.3}, persistence {:.3}/{:.3}, linear {:.3}/{:.3}; in-sample law {} persistence {} linear {} beats {}; frac {}; coefficient_frac {}; stages {}; work {}; fit {:.2?}",
-            found.model[0],
-            found.model[1],
-            found.persistence[0],
-            found.persistence[1],
-            found.linear[0],
-            found.linear[1],
-            written(baselines.get("law").unwrap()),
-            written(baselines.get("persistence").unwrap()),
-            written(baselines.get("linear").unwrap()),
-            written(baselines.get("beats").unwrap()),
-            written(found.answer.get("fixed").unwrap().get("frac").unwrap()),
-            written(
-                found
-                    .answer
-                    .get("fixed")
-                    .unwrap()
-                    .get("coefficient_frac")
-                    .unwrap()
-            ),
-            written(found.answer.get("stages").unwrap()),
-            written(found.answer.get("work").unwrap()),
-            found.spent
-        );
-        let better = found.persistence[0].min(found.linear[0]);
-        if found.model[0] > MARGIN_HELD * better {
-            failed.push(format!(
-                "k {steps} at 10 shots: law {} against baselines {} and {}",
-                found.model[0], found.persistence[0], found.linear[0]
-            ));
-        }
-        let beaten = found.model[1] < found.persistence[1].min(found.linear[1]);
-        println!(
-            "v2 k {steps}: at 50 shots the law {} both baselines (reported, not asserted: see notes)",
-            if beaten { "beats" } else { "does not beat" }
-        );
-        if baselines.get("beats") != Some(&Json::Bool(true)) {
-            failed.push(format!("k {steps}: the answer does not say beats"));
-        }
+        let found = excited(&Shape {
+            steps,
+            shots: 56,
+            settle: 6,
+            holdout: 6,
+            frac: 8,
+            warm: 24,
+            seed: 900 + u64::from(steps),
+        });
+        shown(&found, steps);
+        failed.extend(margins(&found, steps, &[0, 1]));
     }
     assert!(failed.is_empty(), "{failed:?}");
+}
+
+#[test]
+fn v2_a_small_hidden_fit_beats_both_baselines_ten_shots_ahead_and_its_params_refine() {
+    let found = excited(&Shape {
+        steps: 1,
+        shots: 14,
+        settle: 3,
+        holdout: 3,
+        frac: 8,
+        warm: 12,
+        seed: 777,
+    });
+    shown(&found, 1);
+    let failed = margins(&found, 1, &[0]);
+    assert!(failed.is_empty(), "{failed:?}");
+    assert!(found.spent.as_secs() < 60, "{:?}", found.spent);
+    refined_hidden(&found.answer);
 }
 
 const MARGIN_HELD: f64 = 0.5;
@@ -829,8 +907,8 @@ fn v3_the_kept_walk_gradient_of_an_iterating_law_matches_its_own_differences() {
     let params = ints(answer.get("params").unwrap());
     let mut posed = posed_of(&answer, 34);
     let lift = 1_u32 << (posed.frac - 2);
-    for one in &mut posed.target {
-        *one = one.wrapping_add(lift);
+    for (at, one) in posed.target.iter_mut().enumerate() {
+        *one = one.wrapping_add(lift + 97 * (at as u32 % 211));
     }
     let mut server = Server::new(None);
     let graded = result(
@@ -881,7 +959,7 @@ fn v3_the_kept_walk_gradient_of_an_iterating_law_matches_its_own_differences() {
         );
         assert!(difference.signum() == slope.signum(), "param {at}");
         assert!(
-            (difference - slope).abs() <= 0.25 * slope.abs(),
+            (difference - slope).abs() <= 0.02 * slope.abs(),
             "param {at}: {difference} against {slope}"
         );
         checked += 1;
@@ -930,7 +1008,14 @@ fn v4_automatic_frac_keeps_twelve_coefficient_bits_or_refuses_and_a_low_frac_is_
     );
     assert!(scales.iter().all(|one| *one >= 12));
     assert_eq!(text_at(fixed, "frac_from"), "auto");
-    assert!(automatic.get("warnings").is_none());
+    assert!(
+        automatic
+            .get("warnings")
+            .and_then(Json::list)
+            .is_none_or(|list| list
+                .iter()
+                .all(|one| text_at(one, "code") != "coefficient_bits"))
+    );
     let low = result(
         &learn_line(
             side,
@@ -957,6 +1042,72 @@ fn v4_automatic_frac_keeps_twelve_coefficient_bits_or_refuses_and_a_low_frac_is_
     println!("v4 wide range: {}", written(&refused));
     assert_eq!(text_at(&refused, "code"), "coefficient_bits");
     assert_eq!(text_at(&refused, "field"), "$.auto_frac");
+    let many = result(
+        &learn_line(
+            side,
+            &shots,
+            ",\"steps\":64,\"frac\":16,\"range\":[-6554,72090],\"law_frac\":18",
+        ),
+        false,
+    );
+    let codes: Vec<String> = many
+        .get("warnings")
+        .unwrap()
+        .list()
+        .unwrap()
+        .iter()
+        .map(|one| text_at(one, "code"))
+        .collect();
+    let least = many
+        .get("fixed")
+        .unwrap()
+        .get("coefficient_frac_least")
+        .and_then(Json::int);
+    println!(
+        "v4 steps 64 at law_frac 18: coefficient_frac {}, least {least:?}, warnings {codes:?}",
+        written(many.get("fixed").unwrap().get("coefficient_frac").unwrap())
+    );
+    assert_eq!(least, Some(18));
+    assert!(codes.iter().any(|one| one == "coefficient_bits"));
+    let coarse_law = result(
+        &learn_line(
+            side,
+            &shots,
+            ",\"steps\":2,\"frac\":16,\"range\":[-67108864,67108864],\"auto_frac\":true",
+        ),
+        false,
+    );
+    let codes: Vec<String> = coarse_law
+        .get("warnings")
+        .unwrap()
+        .list()
+        .unwrap()
+        .iter()
+        .map(|one| text_at(one, "code"))
+        .collect();
+    println!(
+        "v4 auto_frac over +-2^26 words: frac {}, warnings {codes:?}",
+        written(coarse_law.get("fixed").unwrap().get("frac").unwrap())
+    );
+    assert!(codes.iter().any(|one| one == "frac_below_examples"));
+    let half = 1_u64 << 31;
+    let params: Vec<u64> = (0..6)
+        .map(|at| if at < 5 { half + (1 << 20) } else { half })
+        .collect();
+    let wrapping = result(
+        &learn_line(
+            side,
+            &shots,
+            &format!(
+                ",\"steps\":2,\"frac\":16,\"range\":[-6554,72090],\"params\":{},\"coefficient_frac\":[16]",
+                listed(&params)
+            ),
+        ),
+        true,
+    );
+    println!("v4 params past the 32-bit sum: {}", written(&wrapping));
+    assert_eq!(text_at(&wrapping, "code"), "fixed_range");
+    assert_eq!(text_at(&wrapping, "field"), "$.params");
     let x1 = {
         let frac = 24;
         let pairs: Vec<String> = drift_shots(side, frac, 4, 42)
@@ -1013,7 +1164,7 @@ fn v6_a_process_outside_the_class_is_reported_as_not_beating_the_baselines() {
                 side,
                 &shots,
                 &format!(
-                    ",\"steps\":1,\"hidden\":{hidden},\"poly\":2,\"frac\":{frac},\"range\":[-2048,6144]"
+                    ",\"steps\":1,\"hidden\":{hidden},\"poly\":2,\"frac\":{frac},\"range\":[-2048,6144],\"holdout\":3"
                 ),
             ),
             false,
@@ -1082,8 +1233,20 @@ fn v2_a_hidden_plane_starts_at_zero_and_not_at_the_observed_plane() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "quiet"),
+    ignore = "a timing report: the nightly full check runs it with --features faults,quiet"
+)]
 fn v2_timing_of_a_hidden_fit_at_64_by_64_with_k_7_and_20_shots() {
-    let found = excited(7, 64, 20, 5, 977);
+    let found = excited(&Shape {
+        steps: 7,
+        shots: 20,
+        settle: 5,
+        holdout: 0,
+        frac: 8,
+        warm: 12,
+        seed: 977,
+    });
     println!(
         "v2 timing: 64x64, k 7, 20 shots, settle 5: fit {:.2?}, work {} cell sub-steps; held-out NRMSE 10/50 law {:.3}/{:.3}, persistence {:.3}/{:.3}, linear {:.3}/{:.3}",
         found.spent,
@@ -1379,4 +1542,291 @@ fn v3_a_two_pair_answer_law_steps_on_the_device_as_its_cpu_twin() {
         "v3 device: a two-pair law of {} nodes steps {frames} frames on the device equal to its CPU twin on all 4 planes",
         law.nodes()
     );
+}
+
+fn refined_hidden(answer: &Json) {
+    let side = 16;
+    let law = text_at(answer, "law");
+    let compiled = grit::law::Law::compile(&law).unwrap();
+    assert_eq!(compiled.pairs(), &[[0, 1], [2, 3]]);
+    let state = answer.get("state").unwrap().list().unwrap()[0]
+        .list()
+        .unwrap();
+    let full = 64;
+    let grid = Grid3::new(side as u32, side as u32, 2).unwrap();
+    let mut cells = vec![0_u32; grid.cells() * 4];
+    for (plane, words) in [(0_usize, &state[0]), (2, &state[1])] {
+        let words: Vec<u32> = signed(words)
+            .iter()
+            .map(|one| one.cast_unsigned())
+            .collect();
+        for layer in 0..2 {
+            for y in 0..side {
+                for x in 0..side {
+                    cells[plane * grid.cells() + layer * side * side + y * side + x] =
+                        words[(y + 20) * full + x + 20];
+                }
+            }
+        }
+    }
+    let params = ints(answer.get("params").unwrap());
+    let mut world = cells.clone();
+    for frame in 0..64 {
+        world = reference(&compiled, grid, frame, &world, &params);
+    }
+    let target: Vec<u32> = world[..grid.cells()].to_vec();
+    let mut moved = params.clone();
+    let bias = answer.get("bias").unwrap().list().unwrap()[0]
+        .get("param")
+        .unwrap()
+        .int()
+        .unwrap() as usize;
+    moved[bias] += 3000;
+    let args = |params: &[u32], more: &str| {
+        format!(
+            "{{\"law\":{},\"size\":[{side},{side},2],\"cells\":{},\"params\":{},\"frames\":64,\"aim\":{{\"from\":[0,0,0],\"to\":[{},{},1],\"target\":{}}},\"budget_ms\":{LONG}{more}}}",
+            written(&Json::Text(law.clone())),
+            listed(&cells),
+            listed(params),
+            side - 1,
+            side - 1,
+            listed(&target)
+        )
+    };
+    let mut server = Server::new(None);
+    let start = objective(&result(
+        &heard(&mut server, "grit_law_score", &args(&moved, "")),
+        false,
+    ));
+    let bounds: Vec<String> = moved
+        .iter()
+        .map(|one| format!("[{},{}]", one - 4096, one + 4096))
+        .collect();
+    let searched = result(
+        &heard(
+            &mut server,
+            "grit_learn_params",
+            &args(
+                &moved,
+                &format!(
+                    ",\"bounds\":[{}],\"seed\":7,\"population\":8,\"generations\":20",
+                    bounds.join(",")
+                ),
+            ),
+        ),
+        false,
+    );
+    let descended = result(
+        &heard(
+            &mut server,
+            "grit_law_descend",
+            &args(&moved, ",\"steps\":12"),
+        ),
+        false,
+    );
+    println!(
+        "v3 hidden law: objective {start} with the bias moved by 3000 -> learn_params {} -> descend {} ({})",
+        objective(&searched),
+        objective(&descended),
+        text_at(&descended, "stopped")
+    );
+    assert!(objective(&searched) < start);
+    assert!(objective(&descended) < start);
+}
+
+const PAIRS_LAW: &str = r#"{"law":1,"name":"pairs","params":2,"channels":4,"halo":1,"alternate":[[0,1],[2,3]],"tally":{"counts":1,"weighted":false},"consts":{},"defs":{},"step":["let",[["out",["map","c",["range",8],["vec",["at",["at","cells","c"],0],["add",["add",["at",["at","cells","c"],0],["param",0]],["look",2,1,0,0,"c"]],["at",["at","cells","c"],2],["add",["add",["at",["at","cells","c"],2],["param",1]],["look",0,0,1,0,"c"]]]]]],["vec","out",["vec",0]]]}"#;
+
+fn pairs_args(cells: &[u32], params: &[u32], first: u32, count: u32) -> String {
+    let side = 8;
+    let target: Vec<u32> = (0..side * side * 2)
+        .map(|at| 1_000_000 + 37 * at as u32)
+        .collect();
+    format!(
+        "{{\"law\":{},\"size\":[{side},{side},2],\"cells\":{},\"params\":{},\"first\":{first},\"frames\":{count},\"aim\":{{\"from\":[0,0,0],\"to\":[{},{},1],\"target\":{}}},\"budget_ms\":{LONG}}}",
+        written(&Json::Text(PAIRS_LAW.to_owned())),
+        listed(cells),
+        listed(params),
+        side - 1,
+        side - 1,
+        listed(&target)
+    )
+}
+
+#[test]
+fn v3_the_kept_walk_of_a_two_pair_law_equals_its_exact_differences_on_every_frame_count() {
+    let side = 8;
+    let mut rng = Rng(91);
+    let mut cells = vec![0_u32; side * side * 2 * 4];
+    for plane in [0_usize, 2] {
+        for at in 0..side * side * 2 {
+            cells[plane * side * side * 2 + at] = (rng.unit() * 100.0) as u32;
+        }
+    }
+    let params = [3_u32, 11];
+    let mut server = Server::new(None);
+    let mut checked = 0;
+    let mut moving = 0;
+    for first in [0_u32, 1] {
+        for count in [1_u32, 2, 3, 5, 6] {
+            let graded = result(
+                &heard(
+                    &mut server,
+                    "grit_law_gradient",
+                    &pairs_args(&cells, &params, first, count),
+                ),
+                false,
+            );
+            let base = objective(&graded) as i128;
+            let gradient: Vec<i128> = graded
+                .get("gradient")
+                .unwrap()
+                .list()
+                .unwrap()
+                .iter()
+                .map(|one| one.text().unwrap().parse().unwrap())
+                .collect();
+            for at in 0..2 {
+                let mut moved = params;
+                moved[at] += 1;
+                let up = objective(&result(
+                    &heard(
+                        &mut server,
+                        "grit_law_score",
+                        &pairs_args(&cells, &moved, first, count),
+                    ),
+                    false,
+                )) as i128;
+                println!(
+                    "v3 two pairs, first {first}, frames {count}, param {at}: gradient {}, exact difference {}",
+                    gradient[at] >> 64,
+                    up - base
+                );
+                if up != base {
+                    moving += 1;
+                }
+                assert_eq!(
+                    gradient[at],
+                    (up - base) << 64,
+                    "first {first} frames {count} param {at}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 20);
+    assert!(moving >= 16, "{moving}");
+}
+
+const PAIRS_SHA: &str = "62a70287c3b66385aefdcac5ebb112378608e1776d8cff2193a76de0fc401cdd";
+
+#[test]
+fn v3_an_iterating_law_is_answered_a_gradient_where_it_was_refused_not_reversible() {
+    let side = 8;
+    let cells: Vec<u32> = (0..side * side * 2 * 4)
+        .map(|at| (at % 17) as u32)
+        .collect();
+    let mut server = Server::new(None);
+    let got = heard(
+        &mut server,
+        "grit_law_gradient",
+        &pairs_args(&cells, &[3, 11], 0, 4),
+    );
+    let told = result(&got, false);
+    assert_eq!(told.get("home"), Some(&Json::Bool(true)));
+    let sha = sha_of(&got);
+    eprintln!("PAIRS {sha}");
+    assert_eq!(sha, PAIRS_SHA);
+}
+
+#[test]
+fn v2_the_fit_starts_its_hidden_plane_at_zero_and_not_at_the_observed_plane() {
+    let side = 16;
+    let frac = 12;
+    let sigma = 0.005;
+    let mut rng = Rng(93);
+    let mut v = smooth_field(&mut rng, side);
+    let mut h = vec![0.0; v.len()];
+    let mut shots = Vec::new();
+    for _ in 0..12 {
+        shots.push(vec![words(&noisy(&mut rng, &v, sigma), frac)]);
+        let next_v: Vec<f64> = v
+            .iter()
+            .zip(&h)
+            .map(|(one, other)| 0.9 * one + 0.2 * other + 0.05)
+            .collect();
+        let next_h: Vec<f64> = v
+            .iter()
+            .zip(&h)
+            .map(|(one, other)| 0.9 * other - 0.1 * one)
+            .collect();
+        v = next_v;
+        h = next_h;
+    }
+    let answer = result(
+        &learn_line(
+            side,
+            &shots,
+            &format!(",\"steps\":1,\"hidden\":1,\"frac\":{frac},\"range\":[-4096,8192]"),
+        ),
+        false,
+    );
+    let residual = answer.get("residual").unwrap().list().unwrap()[0].clone();
+    let fitted = real(residual.get("fit_rms_real").unwrap());
+    println!("v2 hidden start in the fit: fit_rms_real {fitted:.3e} against noise {sigma}");
+    assert!(fitted <= 2.0 * sigma, "{fitted}");
+}
+
+#[test]
+fn v4_one_pass_past_the_work_cap_is_refused_by_name() {
+    let side = 64;
+    let shots: Vec<Vec<Vec<i32>>> = (0..24).map(|_| vec![vec![1; side * side]]).collect();
+    let refused = result(
+        &learn_line(
+            side,
+            &shots,
+            ",\"steps\":64,\"hidden\":1,\"poly\":3,\"frac\":4,\"range\":[-16,32]",
+        ),
+        true,
+    );
+    println!("v4 work cap: {}", written(&refused));
+    assert_eq!(text_at(&refused, "code"), "learn_limit");
+    assert_eq!(text_at(&refused, "field"), "$.steps");
+    assert_eq!(refused.get("limit").and_then(Json::int), Some(1 << 27));
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn v4_a_stop_between_rounds_answers_the_best_so_far_and_one_before_any_round_is_refused() {
+    use grit::clock::{Fake, Time};
+    use grit::serve3::Options;
+    use grit::serve3::law_learn::Point;
+    use grit::serve3::law_learn::faults::{deadline_passed_at, disarm};
+    use std::sync::Arc;
+    let side = 32;
+    let shots = drift_shots(side, 16, 8, 95);
+    let args = learn_args(side, &shots, ",\"steps\":1,\"frac\":16,\"range\":[0,65536]");
+    let stopped_at = |ordinal: u64| {
+        let fake = Arc::new(Fake::new());
+        let time: Arc<dyn Time> = fake.clone();
+        let mut server = Server::timed(None, &Options::default(), time).unwrap();
+        disarm();
+        deadline_passed_at(Point::Search, ordinal, Arc::clone(&fake), LONG + 1);
+        let got = heard(&mut server, "grit_law_learn", &args);
+        disarm();
+        got
+    };
+    let early = result(&stopped_at(1), true);
+    println!("v4 budget gone at the first check: {}", written(&early));
+    assert_eq!(text_at(&early, "code"), "budget");
+    assert_eq!(text_at(&early, "field"), "$.budget_ms");
+    let late = result(&stopped_at(4), false);
+    println!(
+        "v4 budget gone at the fourth check: stopped {} stages {}",
+        written(late.get("stopped").unwrap()),
+        written(late.get("stages").unwrap())
+    );
+    assert_eq!(text_at(&late, "stopped"), "budget");
+    let mut server = Server::new(None);
+    let whole = result(&heard(&mut server, "grit_law_learn", &args), false);
+    assert_eq!(text_at(&whole, "stopped"), "complete");
 }

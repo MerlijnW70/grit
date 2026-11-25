@@ -100,6 +100,7 @@ pub enum Code {
     FixedRange,
     LinearRule,
     CoefficientBits,
+    TooFewShots,
     ParallelBit,
     ParallelRule,
     ClampRange,
@@ -109,7 +110,7 @@ pub enum Code {
     CheckTarget,
 }
 
-pub const CODES: [Code; 103] = [
+pub const CODES: [Code; 104] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -206,6 +207,7 @@ pub const CODES: [Code; 103] = [
     Code::FixedRange,
     Code::LinearRule,
     Code::CoefficientBits,
+    Code::TooFewShots,
     Code::ParallelBit,
     Code::ParallelRule,
     Code::ClampRange,
@@ -315,6 +317,7 @@ impl Code {
             Self::FixedRange => "fixed_range",
             Self::LinearRule => "linear_rule",
             Self::CoefficientBits => "coefficient_bits",
+            Self::TooFewShots => "too_few_shots",
             Self::ParallelBit => "parallel_bit",
             Self::ParallelRule => "parallel_rule",
             Self::ClampRange => "clamp_range",
@@ -545,9 +548,11 @@ impl Code {
             Self::MarkUnlike => {
                 "Read with the from, to and plane or current of the read that took the mark, or take a new mark."
             }
-            Self::StepsLimit => "Give steps from 1 to 8; grit_describe names law_steps_most.",
+            Self::StepsLimit => {
+                "Give steps from 1 to 8 for rule totalistic or outer, from 1 to 64 for rule linear; limit names the most this request takes."
+            }
             Self::StepsRule => {
-                "Drop steps or give it 1, or use rule totalistic or outer; only a counting law is searched over its tables."
+                "Give steps with rule totalistic, outer or linear, or drop it; under rule linear, law_frac, auto_frac, settle, holdout, params and coefficient_frac go with steps or hidden."
             }
             Self::StepsNoise => {
                 "Drop noise or give it refuse, or give steps 1; a vote over examples k steps apart is not offered."
@@ -577,8 +582,11 @@ impl Code {
             Self::LinearRule => {
                 "Drop poly, frac, clamp and range, or use rule linear; only a fixed-point law reads them."
             }
+            Self::TooFewShots => {
+                "Give fewer settle or holdout shots, or longer examples: a fitted rollout must start after the settled shots and end before the held-out ones; limit names the most that fit."
+            }
             Self::CoefficientBits => {
-                "Narrow range, lower poly or give law_frac: no frac keeps 12 fractional bits in every coefficient; limit names the most any frac keeps."
+                "Narrow range, lower poly or give law_frac: no frac keeps 12 fractional bits (plus log2 of steps) in every coefficient; limit names the most any frac keeps."
             }
             Self::ParallelBit => {
                 "Give every read and write bit 0 with parallel true: each is the whole word of its plane, bit j of it copy j; or drop parallel."
