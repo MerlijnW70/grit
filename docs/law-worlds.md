@@ -694,10 +694,11 @@ Heat from four 64x64 pairs, `alpha` 0.15: `stencil` `3x3`, `reads` `[{"plane":0,
 | `steps` | k, from 1 to 64: the law's applications between two shots |
 | `hidden` | 0 or 1: planes the examples do not show, run by the law beside the reads |
 | `settle` | shots at the start of each example from which no rollout is scored, so the hidden planes settle; 0 if left out |
-| `law_frac` | the law's frac: a whole number from 0 to 30, or `auto`; `frac` if left out. The examples stay at `frac` |
+| `law_frac` | the law's frac, 0 to 30; `frac` if left out. The examples stay at `frac` |
+| `auto_frac` | `true`: the server chooses the law's frac (below); not with `law_frac` |
 | `params`, `coefficient_frac` | an earlier answer's params and `fixed.coefficient_frac`: no fit, only the hidden planes are run (for a start state) |
 
-An example is `{size, input, output}` (two shots) or `{size, sequence}`, where `sequence` lists the shots, each one word list per read. World examples are refused `example`. Each write is the next value of the read at its position, so `reads` and `writes` have the same length, else `steps_writes`. Every written word is clamped to `range` (a hidden plane to minus to plus its largest magnitude), so an iterated law never wraps; `clamp` is refused `linear_rule`.
+An example is `{size, input, output}` (two shots) or `{size, sequence}`, where `sequence` lists 2 to 64 shots, each one word list per read. World examples are refused `example`. Each write is the next value of the read at its position, so `reads` and `writes` have the same length, else `steps_writes`. Every written word is clamped to `range` (a hidden plane to minus to plus its largest magnitude), so an iterated law never wraps; `clamp` is refused `linear_rule`.
 
 The terms are those of the one-step rule over the reads. A hidden plane enters as its centre word and, under `poly` 2 or 3, as its product with each read's centre (Aliev–Panfilov's u·w); it has no other places and no square or cube. Each write has its terms and a bias. More than 32 params (the law limit) is refused `learn_limit` at `$.poly`; more than 4 planes (reads, hidden and their writes) at `$.hidden`. Hidden planes take the lowest free planes: first their read planes, then their write planes.
 
@@ -725,7 +726,7 @@ The answer has the one-step rule's fields and:
 | `state` | per example, every plane at its last shot: the reads' words and the hidden planes' run; write them to continue on a world |
 | `warnings` | `coefficient_bits`, `baselines_not_beaten`, `unstable_linear_part`, each with a message |
 
-`law_frac` `auto` takes, of the fracs from 0 to 30 whose coefficients over `range` keep at least 12 fractional bits in every write, the one with the least rounding a step (half a unit of the frac, plus the term bounds times half a coefficient unit); none is refused `coefficient_bits` at `$.law_frac` with `limit` the most bits any frac keeps. A one-step or k-step answer whose coefficients keep fewer than 12 bits adds the warning `coefficient_bits`; other answers are unchanged.
+`auto_frac` `true` takes, of the fracs from 0 to 30 whose coefficients over `range` keep at least 12 fractional bits in every write, the one with the least rounding a step (half a unit of the frac, plus the term bounds times half a coefficient unit); none is refused `coefficient_bits` at `$.auto_frac` with `limit` the most bits any frac keeps. A one-step or k-step answer whose coefficients keep fewer than 12 bits adds the warning `coefficient_bits`; other answers are unchanged.
 
 Run it: `grit_world_create` with the answer's `law` and `params`, write each read (and each hidden plane, 0 or `state`) on its read plane, step `iterate.frames` frames: the read planes hold the next shot. To start mid-run, pass the shots before the start with `params` and `coefficient_frac`: the answer's `state` is the start.
 

@@ -508,7 +508,7 @@ fn learn_shown() -> Json {
                     words_shown("one shot: one list of words for each read, in order"),
                     "rule linear with steps or hidden: shots k steps apart, each one list of words for each read; give this or input and output",
                     2,
-                    4096,
+                    i64::from(SHOTS_MOST),
                 ),
             ),
             (
@@ -723,12 +723,18 @@ fn learn_shown() -> Json {
             ),
             (
                 "law_frac",
-                map(vec![(
-                    "description",
-                    text(
-                        "rule linear with steps or hidden: the law's frac, a whole number from 0 to 30, or auto for the frac with the least rounding a step whose every coefficient keeps at least 12 fractional bits over range; frac if left out. The examples stay at frac",
-                    ),
-                )]),
+                whole(
+                    "rule linear with steps or hidden: the law's frac, from 0 to 30; frac if left out. The examples stay at frac",
+                    0,
+                    i64::from(u32::MAX),
+                ),
+            ),
+            (
+                "auto_frac",
+                property(
+                    "boolean",
+                    "rule linear with steps or hidden: true chooses the law's frac, the one with the least rounding a step whose every coefficient keeps at least 12 fractional bits over range; false if left out",
+                ),
             ),
             (
                 "params",
@@ -2075,7 +2081,15 @@ fn counted_law(
 
 const LINEAR_KEYS: [&str; 4] = ["poly", "frac", "clamp", "range"];
 
-const STEPS_KEYS: [&str; 4] = ["law_frac", "settle", "params", "coefficient_frac"];
+pub const SHOTS_MOST: u32 = 64;
+
+const STEPS_KEYS: [&str; 5] = [
+    "law_frac",
+    "auto_frac",
+    "settle",
+    "params",
+    "coefficient_frac",
+];
 
 pub const LINEAR_ITERATE: &str = "after each frame write each written plane's words back to the read plane at the same position in reads, then step again";
 
