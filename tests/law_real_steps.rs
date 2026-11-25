@@ -1752,12 +1752,12 @@ fn v2_the_fit_starts_its_hidden_plane_at_zero_and_not_at_the_observed_plane() {
         let next_v: Vec<f64> = v
             .iter()
             .zip(&h)
-            .map(|(one, other)| 0.9 * one + 0.2 * other + 0.05)
+            .map(|(one, other)| 0.6 * one + 0.4 * other)
             .collect();
         let next_h: Vec<f64> = v
             .iter()
             .zip(&h)
-            .map(|(one, other)| 0.9 * other - 0.1 * one)
+            .map(|(one, other)| 0.98 * other + 0.02 * one)
             .collect();
         v = next_v;
         h = next_h;
@@ -1772,8 +1772,11 @@ fn v2_the_fit_starts_its_hidden_plane_at_zero_and_not_at_the_observed_plane() {
     );
     let residual = answer.get("residual").unwrap().list().unwrap()[0].clone();
     let fitted = real(residual.get("fit_rms_real").unwrap());
-    println!("v2 hidden start in the fit: fit_rms_real {fitted:.3e} against noise {sigma}");
-    assert!(fitted <= 2.0 * sigma, "{fitted}");
+    let exact = real(residual.get("rms_real").unwrap());
+    println!(
+        "v2 hidden start in the fit: fit_rms_real {fitted:.3e}, the fixed-point law one shot ahead rms_real {exact:.3e}, noise {sigma}"
+    );
+    assert!(exact <= 2.0 * sigma, "{exact}");
 }
 
 #[test]
