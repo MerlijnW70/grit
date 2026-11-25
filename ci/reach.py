@@ -301,17 +301,34 @@ def strip_generics(text):
     return " " + text + " "
 
 
+IMPL = re.compile(r"(?m)^[ \t]*(?:unsafe\s+)?impl\b([^{;]*)\{")
+QUALIFIED = r"(?:" + IDENT + r"\s*::\s*)+" + IDENT
+
+
+def impl_header(found):
+    return re.split(r"\bwhere\b", strip_generics(found.group(1)))[0]
+
+
 def impl_names(header):
     bare = None
     while bare != header:
         bare, header = header, re.sub(r"<[^<>]*>", " ", header)
-    qualified = r"(?:" + IDENT + r"\s*::\s*)+" + IDENT
-    names = set(re.findall(IDENT, re.sub(qualified, " ", header)))
-    for found in re.finditer(qualified, header):
+    names = {(name, name) for name in re.findall(IDENT, re.sub(QUALIFIED, " ", header))}
+    for found in re.finditer(QUALIFIED, header):
         parts = re.findall(IDENT, found.group(0))
         if parts[0] in ("crate", "self", "super"):
-            names.add(parts[-1])
+            names.add((parts[-1], found.group(0)))
     return names
+
+
+def renames(code):
+    out = {}
+    for leaf in use_leaves(code):
+        path, _, alias = leaf.partition("@")
+        segments = [s for s in path.split("::") if s]
+        if alias and segments:
+            out[alias] = segments[-1]
+    return out
 
 
 class Library:
@@ -344,17 +361,17 @@ class Library:
         _, aliases, items, globs = resolver.scope(module, code)
         local = {name for name, homes in self.defined.items() if path in homes}
         out = set()
-        for found in re.finditer(r"(?m)^[ \t]*(?:unsafe\s+)?impl\b([^{;]*)\{", code):
-            header = re.split(r"\bwhere\b", strip_generics(found.group(1)))[0]
+        for found in IMPL.finditer(code):
+            header = impl_header(found)
             trait, _, own = header.rpartition(" for ")
             homes = self.named(resolver, module, own, aliases, items, globs, local, path)
-            named = homes | self.named(resolver, module, trait, aliases, items, globs, local, path)
             if not homes and trait:
-                homes = named
+                homes = self.named(resolver, module, trait, aliases, items, globs, local, path)
             out |= homes
-            for name in impl_names(header):
-                if not named & self.defined.get(name, set()):
-                    out |= self.defined.get(name, set())
+            for name, text in impl_names(header):
+                definers = self.defined.get(name, set())
+                if definers and not self.named(resolver, module, text, aliases, items, globs, local, path) & definers:
+                    out |= definers
         out.discard(path)
         return out
 
@@ -373,6 +390,24 @@ class Library:
                 if self.crate.modules[at] in self.defined.get(name, ()):
                     homes.add(self.crate.modules[at])
         return homes
+
+    def unfollowed(self, tree):
+        out = []
+        for path in sorted(self.crate.files()):
+            code = tree.source(path).code
+            renamed = renames(code)
+            for found in IMPL.finditer(code):
+                names = {renamed.get(name, name) for name in re.findall(IDENT, impl_header(found))}
+                known = sorted(name for name in names if name in self.defined)
+                if any(path in self.defined[name] for name in known):
+                    continue
+                for name in known:
+                    if not any(path in self.edges[home] for home in self.defined[name]):
+                        out.append(
+                            "%s has an impl naming %s, whose definition in %s does not reach it; ci/reach.py does not follow this impl"
+                            % (path, name, " ".join(sorted(self.defined[name])))
+                        )
+        return out
 
     def macro_homes(self, code):
         out = set()
@@ -589,6 +624,7 @@ def problems(root, repo=None):
     for path in sorted({p for c in [repo.lib, *repo.crates.values()] for p in c.files()}):
         if re.search(r"(?<![\w!])include\s*!", repo.tree.source(path).code):
             out.append("%s uses include!, which ci/reach.py does not follow" % path)
+    out.extend(repo.library.unfollowed(repo.tree))
     for path in repo.src_files:
         if re.search(r"#\s*\[\s*(test\b|cfg\s*\(\s*test\b)", repo.tree.source(path).code):
             out.append("src file %s holds unit tests, which a selected run leaves out" % path)

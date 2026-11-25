@@ -170,6 +170,36 @@ class Selection(unittest.TestCase):
         self.assertEqual(reach.problems(self.root), [])
 
 
+class Unfollowed(unittest.TestCase):
+    def refusals(self, ext):
+        lib = LIB["src/lib.rs"] + "pub mod hub;\nmod ext2;\npub trait Tg {}\n"
+        fake = Fake({"src/lib.rs": lib, "src/hub.rs": "pub use crate::types::*;\n", "src/ext2.rs": ext})
+        try:
+            return [p for p in reach.problems(fake.dir) if "does not follow this impl" in p]
+        finally:
+            fake.close()
+
+    def assert_refused(self, ext):
+        found = self.refusals(ext)
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith("src/ext2.rs has an impl naming Foo, whose definition in src/types.rs"), found)
+
+    def test_an_impl_through_an_alias_fails_the_check(self):
+        self.assert_refused("use crate::Foo as Bar;\nimpl Bar { pub fn m2(&self) {} }\n")
+
+    def test_an_impl_through_a_glob_reexport_path_fails_the_check(self):
+        self.assert_refused("use crate::hub;\nimpl hub::Foo { pub fn m2(&self) {} }\n")
+
+    def test_an_impl_on_a_generic_of_a_crate_type_fails_the_check(self):
+        self.assert_refused("use crate::Foo;\nuse crate::Tg;\nimpl Tg for Vec<Foo> {}\n")
+
+    def test_an_impl_with_a_crate_type_as_generic_argument_fails_the_check(self):
+        self.assert_refused("use crate::Foo;\nimpl From<Foo> for u32 { fn from(_: Foo) -> u32 { 0 } }\n")
+
+    def test_a_followed_reexport_impl_passes_the_check(self):
+        self.assertEqual(self.refusals("use crate::Foo;\nimpl Foo { pub fn m2(&self) {} }\n"), [])
+
+
 class Lexing(unittest.TestCase):
     def test_strings_and_comments_leave_the_code(self):
         code, strings = reach.lex('let a = "x::y"; // crate::z\nlet b = r#"q"#; /* crate::w */ let c = \'"\';')
