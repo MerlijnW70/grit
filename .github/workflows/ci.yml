@@ -2,16 +2,27 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches: [main]
   schedule:
-    - cron: "0 3 * * 1"
+    - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      whole:
+        description: Run the whole suite at every width
+        type: boolean
+        default: true
+      base:
+        description: Without whole, run the targets the change since this branch can reach
+        type: string
+        default: main
 
 env:
   CARGO_TERM_COLOR: always
   # The simdr commit every job builds against, and the only place it is
   # recorded. To move it: set the new full SHA here, run the lavapipe test
   # step locally at each width with the environment it sets, and update
-  # `skips` in the matrix to the counts those runs print.
+  # ci/skips.txt to the counts those runs print.
   SIMDR_REV: 9dec3b766b0ac14c8507a338502cf8b0a37b6136
 
 jobs:
@@ -60,22 +71,53 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps
 
+      - name: reach
+        working-directory: grit
+        run: |
+          python3 -m unittest discover -s ci -p "test_*.py"
+          python3 ci/reach.py check
+
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: grit
+          fetch-depth: 0
+      - name: plan
+        id: plan
+        working-directory: grit
+        env:
+          EVENT: ${{ github.event_name }}
+          WHOLE: ${{ inputs.whole }}
+          BASE: ${{ inputs.base }}
+        run: |
+          case "$EVENT" in
+            pull_request) set -- --base HEAD^1 ;;
+            workflow_dispatch)
+              if [ "$WHOLE" = "true" ]; then
+                set -- --whole
+              else
+                set -- --base "$(git merge-base "origin/$BASE" HEAD)"
+              fi
+              ;;
+            *) set -- --whole ;;
+          esac
+          python3 ci/reach.py plan "$@" > "$RUNNER_TEMP/matrix.json"
+          cat "$RUNNER_TEMP/matrix.json"
+          echo "matrix=$(cat "$RUNNER_TEMP/matrix.json")" >> "$GITHUB_OUTPUT"
+
   device:
-    name: lavapipe
+    name: lavapipe ${{ matrix.width }} ${{ matrix.shard }}
+    needs: plan
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - vector: 128
-            width: 4
-            skips: 20
-          - vector: 256
-            width: 8
-            skips: 13
-          - vector: 512
-            width: 16
-            skips: 10
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -119,19 +161,38 @@ jobs:
           # search that is working crosses it: the last run took 2h12m where the
           # one before took 37m, and three suites reported Wedged { after: 10s }.
           GRIT_PATIENCE_SECS: 300
+          WORK: ${{ matrix.work }}
+          OUT: ${{ runner.temp }}/result-${{ matrix.width }}-${{ strategy.job-index }}.json
+        run: python3 -u ci/reach.py run --width ${{ matrix.width }} --work "$WORK" --out "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.width }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/result-${{ matrix.width }}-${{ strategy.job-index }}.json
+          if-no-files-found: ignore
+
+  skips:
+    name: lavapipe skips
+    needs: [plan, device]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: grit
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: ${{ runner.temp }}/results
+          merge-multiple: true
+      - name: tally
+        working-directory: grit
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
         run: |
-          set -o pipefail
-          cargo test --release --locked --no-default-features --features deep,faults --no-fail-fast -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/suite.log"
-          # Every SKIPPED counts, a bare one with no reason after it too. awk
-          # exits 0 when there is none, so the count needs no guard.
-          awk '/SKIPPED/ { print "skip: " $0 }' "$RUNNER_TEMP/suite.log"
-          skipped=$(awk '{ n += gsub(/SKIPPED/, "") } END { print n + 0 }' "$RUNNER_TEMP/suite.log")
-          echo "skipped $skipped, expected ${{ matrix.skips }}"
-          if [ "$skipped" -ne "${{ matrix.skips }}" ]; then
-            echo "::error::$skipped != ${{ matrix.skips }}"
-            exit 1
-          fi
+          printf '%s' "$MATRIX" > "$RUNNER_TEMP/matrix.json"
+          python3 ci/reach.py tally --matrix "$RUNNER_TEMP/matrix.json" "$RUNNER_TEMP"/results/*.json
 
   msrv:
     name: msrv
