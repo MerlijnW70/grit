@@ -671,7 +671,7 @@ A brake before each round of at most 64 batches of 64 tables, each pass of singl
 | `frac` | the fractional bits of every read and written word |
 | `places`, `place_list` | the counted places, as for the counting rules |
 | `clamp` | `[least, greatest]` signed words each written word is clamped to; it must meet the words the law can write, else `clamp_range` |
-| `range` | `[least, greatest]` signed words of every read the law never wraps on; it must hold every example input word, else `plane_format` at `$.range`. The examples' own least and greatest if left out |
+| `range` | `[least, greatest]` signed words of every read the law never wraps on; it must hold every example input word, else `plane_format` at `$.range`. The examples' own least and greatest if left out; with `holdout`, of the fitted shots only |
 
 The fit is exact least squares over every example cell. The normal equations are summed in integers, centred and scaled, and solved in f64 by Cholesky; the answer's `condition` is the ratio of the largest to the smallest eigenvalue of the centred, scaled normal matrix. Past 1e10, or with a term the same on every cell, the request is refused `ill_conditioned` at `$.examples`, with `condition`.
 
@@ -737,7 +737,7 @@ The answer has the one-step rule's fields and:
 | `coefficients`, `bias` | per write: `value`, `fixed`, `fit`, `param`; with hidden planes `scales_as` and `offset_moves`: the law gives the same read planes when hidden plane h is multiplied by a and each coefficient by a^scales_as[h], and when h has c added and the coefficients whose `offset_moves[h]` is true move to match. A coefficient with `scales_as` 0 and `offset_moves` false is pinned by the examples; the others only in combinations both families keep |
 | `fixed` | `frac` (the law's), `example_frac`, `frac_from` (`frac`, `given`, `auto` or `params`), `coefficient_frac`, `coefficient_frac_least` (12 plus log2 of `steps`, rounded up), `clamp` per write, `param_format` |
 | `residual` | per read: `rms_real` and `max_real` of the fixed-point law one shot ahead from every scored shot, `fit_rms_real` of the f64 fit |
-| `baselines` | on the `held_out` shots, which the fit never saw: NRMSE of the forecast from the last fitted shot at `shots_ahead` 1 and `held_out`, for the law, `persistence` and `linear` (the reads' one-shot linear fit on the fitted shots, clamped); `beats` when the law's at the last horizon is at most `margin` (0.8) times the better baseline's, `null` with no holdout |
+| `baselines` | on the `held_out` shots, which a fit never sees (with `params` there is no fit): NRMSE of the forecast from the last fitted shot at `shots_ahead` 1 and `held_out`, for the law, `persistence` and `linear` (the reads' one-shot linear fit on the fitted shots, clamped), `null` where the held-out observed planes do not vary; `beats` when the law's at the last horizon is below `margin` (0.8) times the better baseline's, `null` with no holdout or when the held-out observed planes do not vary (warning `forecast_unchecked` with `checked` 0) |
 | `stability` | per read write, the largest gain of its place coefficients over spatial waves |
 | `stages` | per horizon, its LM rounds and rms |
 | `stopped` | `complete`, or `budget` or `cancelled` when the fit stopped between rounds; the answer is then the best so far |

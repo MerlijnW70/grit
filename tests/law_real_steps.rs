@@ -1803,8 +1803,9 @@ fn v4_a_stop_between_rounds_answers_the_best_so_far_and_one_before_any_round_is_
     use grit::clock::{Fake, Time};
     use grit::serve3::Options;
     use grit::serve3::law_learn::Point;
-    use grit::serve3::law_learn::faults::{deadline_passed_at, disarm};
+    use grit::serve3::law_learn::faults::{cancel_after, deadline_passed_at, disarm};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     let side = 32;
     let shots = drift_shots(side, 16, 8, 95);
     let args = learn_args(side, &shots, ",\"steps\":1,\"frac\":16,\"range\":[0,65536]");
@@ -1832,4 +1833,292 @@ fn v4_a_stop_between_rounds_answers_the_best_so_far_and_one_before_any_round_is_
     let mut server = Server::new(None);
     let whole = result(&heard(&mut server, "grit_law_learn", &args), false);
     assert_eq!(text_at(&whole, "stopped"), "complete");
+    let rounds = |answer: &Json| -> i64 {
+        answer
+            .get("stages")
+            .unwrap()
+            .list()
+            .unwrap()
+            .iter()
+            .map(|one| one.get("rounds").and_then(Json::int).unwrap())
+            .sum()
+    };
+    println!(
+        "v4 rounds: stopped at the fourth check {}, complete {}",
+        rounds(&late),
+        rounds(&whole)
+    );
+    assert_eq!(rounds(&late), 3);
+    assert!(rounds(&late) < rounds(&whole));
+    let cancelled_at = |checks: u64| {
+        let fake = Arc::new(Fake::new());
+        let time: Arc<dyn Time> = fake.clone();
+        let mut server = Server::timed(None, &Options::default(), time).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        server.arriving(None, Some(Arc::clone(&flag)));
+        disarm();
+        cancel_after(checks);
+        let got = heard(&mut server, "grit_law_learn", &args);
+        disarm();
+        got
+    };
+    let early = result(&cancelled_at(0), true);
+    println!("v4 cancelled at the first check: {}", written(&early));
+    assert_eq!(text_at(&early, "code"), "cancelled");
+    let late = result(&cancelled_at(3), false);
+    println!(
+        "v4 cancelled at the fourth check: stopped {} rounds {}",
+        written(late.get("stopped").unwrap()),
+        rounds(&late)
+    );
+    assert_eq!(text_at(&late, "stopped"), "cancelled");
+    assert!(rounds(&late) >= 1);
+    assert!(rounds(&late) < rounds(&whole));
+}
+
+fn persistent_hidden_shots(side: usize, frac: u32, seed: u64) -> Vec<Vec<Vec<i32>>> {
+    let sigma = 0.005;
+    let mut rng = Rng(seed);
+    let mut v = smooth_field(&mut rng, side);
+    let mut h = vec![0.0; v.len()];
+    let mut shots = Vec::new();
+    for _ in 0..12 {
+        shots.push(vec![words(&noisy(&mut rng, &v, sigma), frac)]);
+        let next_v: Vec<f64> = v
+            .iter()
+            .zip(&h)
+            .map(|(one, other)| 0.6 * one + 0.4 * other)
+            .collect();
+        let next_h: Vec<f64> = v
+            .iter()
+            .zip(&h)
+            .map(|(one, other)| 0.98 * other + 0.02 * one)
+            .collect();
+        v = next_v;
+        h = next_h;
+    }
+    shots
+}
+
+fn named_once(held: &Json, key: &str) -> usize {
+    written(held).matches(&format!("\"{key}\"")).count()
+}
+
+#[test]
+fn v2_each_coefficient_and_each_bias_names_its_offset_family_once() {
+    let side = 16;
+    let frac = 12;
+    let answer = result(
+        &learn_line(
+            side,
+            &persistent_hidden_shots(side, frac, 93),
+            &format!(",\"steps\":1,\"hidden\":1,\"poly\":2,\"frac\":{frac},\"range\":[-4096,8192]"),
+        ),
+        false,
+    );
+    let terms = answer.get("terms").unwrap().list().unwrap().to_vec();
+    let coefficients = answer.get("coefficients").unwrap().list().unwrap().to_vec();
+    let biases = answer.get("bias").unwrap().list().unwrap().to_vec();
+    assert_eq!(coefficients.len(), 2);
+    assert_eq!(biases.len(), 2);
+    let is_place = |term: &Json, read: i64| {
+        text_at(term, "term") == "place"
+            && term.get("read").and_then(Json::int) == Some(read)
+            && written(term.get("at").unwrap()) == "[0,0,0]"
+    };
+    let is_product = |term: &Json| {
+        text_at(term, "term") == "product" && {
+            let mut reads: Vec<i64> = term
+                .get("reads")
+                .unwrap()
+                .list()
+                .unwrap()
+                .iter()
+                .map(|one| one.int().unwrap())
+                .collect();
+            reads.sort_unstable();
+            reads == [0, 1]
+        }
+    };
+    let fixed_of = |write: usize, wanted: &dyn Fn(&Json) -> bool| -> i64 {
+        terms.iter().position(wanted).map_or(0, |at| {
+            coefficients[write].list().unwrap()[at]
+                .get("fixed")
+                .and_then(Json::int)
+                .unwrap()
+        })
+    };
+    let mut moving_coefficients = 0;
+    for (write, row) in coefficients.iter().enumerate() {
+        let product = fixed_of(write, &is_product);
+        for (term, one) in terms.iter().zip(row.list().unwrap()) {
+            assert_eq!(named_once(one, "offset_moves"), 1, "{}", written(one));
+            assert_eq!(named_once(one, "scales_as"), 1, "{}", written(one));
+            let wanted = is_place(term, 0) && product != 0;
+            moving_coefficients += usize::from(wanted);
+            assert_eq!(
+                one.get("offset_moves"),
+                Some(&Json::List(vec![Json::Bool(wanted)])),
+                "write {write} term {}",
+                written(term)
+            );
+        }
+    }
+    for (write, one) in biases.iter().enumerate() {
+        assert_eq!(named_once(one, "offset_moves"), 1, "{}", written(one));
+        let wanted = write == 1 || fixed_of(write, &|term| is_place(term, 1)) != 0;
+        assert_eq!(
+            one.get("offset_moves"),
+            Some(&Json::List(vec![Json::Bool(wanted)])),
+            "bias {write}"
+        );
+    }
+    println!(
+        "v2 offset family: {moving_coefficients} coefficients move, biases {}",
+        written(&Json::List(
+            biases
+                .iter()
+                .map(|one| one.get("offset_moves").unwrap().clone())
+                .collect()
+        ))
+    );
+    assert!(moving_coefficients >= 1);
+    assert_eq!(
+        biases[1].get("offset_moves"),
+        Some(&Json::List(vec![Json::Bool(true)]))
+    );
+}
+
+#[test]
+fn v6_held_out_shots_that_do_not_vary_are_not_judged_and_a_tie_is_not_a_win() {
+    let side = 16;
+    let frac = 12;
+    let shots: Vec<Vec<Vec<i32>>> = (0..10).map(|_| vec![vec![1000; side * side]]).collect();
+    let answer = result(
+        &learn_line(
+            side,
+            &shots,
+            &format!(",\"steps\":1,\"frac\":{frac},\"range\":[-4096,8192],\"holdout\":3"),
+        ),
+        false,
+    );
+    let baselines = answer.get("baselines").unwrap();
+    let warnings = answer.get("warnings").unwrap().list().unwrap();
+    println!(
+        "v6 constant world: {}; warnings {}",
+        written(baselines),
+        written(answer.get("warnings").unwrap())
+    );
+    assert_eq!(baselines.get("beats"), Some(&Json::Null));
+    for name in ["law", "persistence", "linear"] {
+        assert_eq!(
+            baselines.get(name),
+            Some(&Json::List(vec![Json::Null, Json::Null])),
+            "{name}"
+        );
+    }
+    let unchecked: Vec<&Json> = warnings
+        .iter()
+        .filter(|one| text_at(one, "code") == "forecast_unchecked")
+        .collect();
+    assert_eq!(unchecked.len(), 1);
+    assert_eq!(unchecked[0].get("checked").and_then(Json::int), Some(0));
+    assert!(text_at(unchecked[0], "message").contains("do not vary"));
+    assert!(
+        !warnings
+            .iter()
+            .any(|one| text_at(one, "code") == "baselines_not_beaten")
+    );
+}
+
+#[test]
+fn v4_without_range_the_clamp_range_comes_from_the_fitted_shots_alone() {
+    let side = 16;
+    let frac = 12;
+    let mut shots = drift_shots(side, frac, 10, 97);
+    let fitted = &shots[..7];
+    let least = fitted.iter().flatten().flatten().copied().min().unwrap();
+    let most = fitted.iter().flatten().flatten().copied().max().unwrap();
+    shots[9][0][5] = most + 4096;
+    shots[8][0][9] = least - 4096;
+    let answer = result(
+        &learn_line(
+            side,
+            &shots,
+            &format!(",\"steps\":1,\"frac\":{frac},\"holdout\":3"),
+        ),
+        false,
+    );
+    let range = answer.get("fixed").unwrap().get("range").unwrap();
+    println!(
+        "v4 range without range, holdout 3: {}; fitted shots span [{least}, {most}]",
+        written(range)
+    );
+    assert_eq!(
+        range,
+        &Json::List(vec![
+            Json::Int(i64::from(least)),
+            Json::Int(i64::from(most))
+        ])
+    );
+}
+
+const ONE_PAIR_LAW: &str = r#"{"law":1,"name":"one_pair","params":1,"channels":2,"halo":0,"alternate":[0,1],"tally":{"counts":1,"weighted":false},"consts":{},"defs":{},"step":["let",[["out",["map","c",["range",8],["vec",["at",["at","cells","c"],0],["add",["at",["at","cells","c"],0],["param",0]]]]]],["vec","out",["vec",0]]]}"#;
+
+const ONE_PAIR_SHA: &str = "b50f6fac5dcc2bc36b47f05d4e65417740e3bc49bbb81d5741d0bd1c8b2f05a5";
+
+fn one_pair_args(cells: &[u32], count: u32, target: &[u32]) -> String {
+    let side = 8;
+    format!(
+        "{{\"law\":{},\"size\":[{side},{side},2],\"cells\":{},\"params\":[5],\"first\":0,\"frames\":{count},\"aim\":{{\"from\":[0,0,0],\"to\":[{},{},1],\"target\":{}}},\"budget_ms\":{LONG}}}",
+        written(&Json::Text(ONE_PAIR_LAW.to_owned())),
+        listed(cells),
+        side - 1,
+        side - 1,
+        listed(target)
+    )
+}
+
+#[test]
+fn v3_a_one_pair_iterating_law_is_scored_on_its_current_plane_after_an_odd_frame_count() {
+    let side = 8;
+    let cells_per = side * side * 2;
+    let read: Vec<u32> = (0..cells_per).map(|at| (at % 13) as u32 * 7).collect();
+    let stale: Vec<u32> = (0..cells_per).map(|at| 500 + (at % 5) as u32).collect();
+    let target: Vec<u32> = (0..cells_per).map(|at| 40 + (at % 11) as u32 * 3).collect();
+    let mut cells = read.clone();
+    cells.extend(&stale);
+    let missed = |plane: &[u32]| -> u128 {
+        plane
+            .iter()
+            .zip(&target)
+            .map(|(one, other)| u128::from(one.abs_diff(*other)))
+            .sum()
+    };
+    let shifted = |by: u32| -> Vec<u32> { read.iter().map(|one| one + by).collect() };
+    let mut server = Server::new(None);
+    let mut answers = Vec::new();
+    for (count, current, other) in [
+        (1_u32, shifted(5), read.clone()),
+        (2, shifted(10), shifted(5)),
+        (3, shifted(15), shifted(10)),
+    ] {
+        let got = heard(
+            &mut server,
+            "grit_law_score",
+            &one_pair_args(&cells, count, &target),
+        );
+        let scored = objective(&result(&got, false));
+        println!(
+            "v3 one pair, frames {count}: objective {scored}, current plane {}, the other plane {}",
+            missed(&current),
+            missed(&other)
+        );
+        assert_eq!(scored, missed(&current), "frames {count}");
+        assert_ne!(scored, missed(&other), "frames {count}");
+        answers.push(got);
+    }
+    let sha = sha_of(&answers[0]);
+    eprintln!("ONE_PAIR {sha}");
+    assert_eq!(sha, ONE_PAIR_SHA);
 }

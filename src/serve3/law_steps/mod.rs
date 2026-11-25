@@ -29,7 +29,7 @@ pub const MARGIN: f64 = 0.8;
 
 pub const START: &str = "each hidden plane starts at 0 on an example's first shot and is run by the law over the example's shots, with the observed planes interpolated linearly across the k sub-steps of each shot; a rollout from shot t starts from the hidden planes so run up to t and from observed words fitted so the rollout meets the shots (scored also against shot t itself); state is the last shot's observed words with the hidden planes so run to it";
 
-pub const METHOD: &str = "the observed reads' one-shot least squares fit, split into k equal sub-steps (each coefficient's distance from the identity divided by k), with each hidden plane started as a leaky copy of the observed centre less its mean over the examples, fed back into it, the 3 best of 12 such starts on one-shot rollouts each fitted at horizon 1 and the lowest kept; then Levenberg-Marquardt on the f64 form of the law (no rounding), whose residuals are the observed planes of rollouts of 1, 2, 4 and up to 16 shots of k sub-steps each, from every shot, the hidden planes run as start says; the Jacobian is carried forward through every sub-step exactly, so the fit runs on the host and needs no device; the hidden planes are then scaled so their run spans half the range, and the coefficients rounded to k fractional bits";
+pub const METHOD: &str = "the observed reads' one-shot least squares fit, split into k equal sub-steps (each coefficient's distance from the identity divided by k), with each hidden plane started as a leaky copy of the observed centre less its mean over the examples, fed back into it, the 3 best of 12 such starts on one-shot rollouts each fitted at horizon 1 and the lowest kept; then Levenberg-Marquardt on the f64 form of the law (no rounding), whose residuals are the observed planes of rollouts of 1, 2, 4 and up to 64 shots of k sub-steps each, from every shot, the hidden planes run as start says; the Jacobian is carried forward through every sub-step exactly, so the fit runs on the host and needs no device; the hidden planes are then scaled so their run spans half the range, and the coefficients rounded to k fractional bits";
 
 pub const SCALES: &str = "two families of hidden planes give the same observed planes: scale, hidden plane h times any a other than 0 with every coefficient times a to the power scales_as[h]; and offset, hidden plane h plus any c, which moves the coefficients and biases whose offset_moves[h] is true (each bias of a write the hidden centre enters, the hidden write's own bias, and the read centre's coefficient in a write where that read times the hidden centre enters); a coefficient with scales_as 0 and offset_moves false for every hidden plane is pinned by the examples, the others only in combinations both families keep, such as the coefficient of a hidden centre in a read write times the read centre's coefficient in that hidden write; the fit fixes the scale by scaling the hidden run to half the range and the offset by the start at 0, so these are a choice, not a finding";
 
@@ -485,15 +485,21 @@ impl Sums {
         self.count += 1.0;
     }
 
-    fn nrmse(&self) -> f64 {
+    fn spread(&self) -> f64 {
         if self.count == 0.0 {
             return 0.0;
         }
         let mean = self.target / self.count;
-        let spread = (self.target_square / self.count - mean * mean)
+        (self.target_square / self.count - mean * mean)
             .max(0.0)
-            .sqrt();
-        (self.error / self.count).sqrt() / spread.max(f64::MIN_POSITIVE)
+            .sqrt()
+    }
+
+    fn nrmse(&self) -> f64 {
+        if self.count == 0.0 {
+            return 0.0;
+        }
+        (self.error / self.count).sqrt() / self.spread().max(f64::MIN_POSITIVE)
     }
 }
 
@@ -622,7 +628,11 @@ pub fn learned(
             let mut least = i32::MAX;
             let mut most = i32::MIN;
             for example in &examples {
-                for shot in &example.shots {
+                for shot in example
+                    .shots
+                    .iter()
+                    .take(example.shots.len().saturating_sub(holdout))
+                {
                     for word in shot.iter().flatten() {
                         least = least.min(word.cast_signed());
                         most = most.max(word.cast_signed());
@@ -1060,7 +1070,11 @@ pub fn learned(
     };
     let at_last = |list: &[f64]| list.iter().last().copied().unwrap_or(0.0);
     let best_baseline = at_last(&result.persistence).min(at_last(&result.linear));
-    let beats = (holdout > 0).then(|| at_last(&result.model) <= MARGIN * best_baseline);
+    let flat = scored
+        .iter()
+        .last()
+        .is_none_or(|three| three[0].spread() == 0.0);
+    let beats = (holdout > 0 && !flat).then(|| at_last(&result.model) < MARGIN * best_baseline);
     match beats {
         Some(false) => warnings.push(map(vec![
             ("code", text("baselines_not_beaten")),
@@ -1080,6 +1094,16 @@ pub fn learned(
                 "message",
                 text(&format!(
                     "the forecast is checked {holdout} shots ahead and no further; a horizon past {holdout} shots is not judged"
+                )),
+            ),
+        ])),
+        None if holdout > 0 => warnings.push(map(vec![
+            ("code", text("forecast_unchecked")),
+            ("checked", counted(0)),
+            (
+                "message",
+                text(&format!(
+                    "the observed planes do not vary over the {holdout} held-out shots, so their NRMSE has no scale and the law's forecast is not judged against the baselines"
                 )),
             ),
         ])),
@@ -1191,14 +1215,6 @@ pub fn learned(
                                 "offset_moves",
                                 Json::List(
                                     (0..basis.hidden)
-                                        .map(|hidden| Json::Bool(bias_moves(write, hidden)))
-                                        .collect(),
-                                ),
-                            ));
-                            fields.push((
-                                "offset_moves",
-                                Json::List(
-                                    (0..basis.hidden)
                                         .map(|hidden| {
                                             Json::Bool(coefficient_moves(write, term, hidden))
                                         })
@@ -1239,6 +1255,14 @@ pub fn learned(
                     .map(|hidden| Json::Int(i64::from(u8::from(write == basis.observed + hidden))))
                     .collect();
                 fields.push(("scales_as", Json::List(scales_as)));
+                fields.push((
+                    "offset_moves",
+                    Json::List(
+                        (0..basis.hidden)
+                            .map(|hidden| Json::Bool(bias_moves(write, hidden)))
+                            .collect(),
+                    ),
+                ));
             }
             map(fields)
         })
@@ -1260,7 +1284,18 @@ pub fn learned(
             .map(|one| counted(u32::try_from(*one).unwrap_or(0)))
             .collect(),
     );
-    let given_list = |list: &[f64]| Json::List(list.iter().map(|one| scientific(*one)).collect());
+    let unscaled: Vec<bool> = scored
+        .iter()
+        .map(|three| three[0].count > 0.0 && three[0].spread() == 0.0)
+        .collect();
+    let given_list = |list: &[f64]| {
+        Json::List(
+            list.iter()
+                .zip(&unscaled)
+                .map(|(one, flat)| if *flat { Json::Null } else { scientific(*one) })
+                .collect(),
+        )
+    };
     let baselines = map(vec![
         ("shots_ahead", horizons_shown),
         ("law", given_list(&result.model)),
@@ -1272,7 +1307,7 @@ pub fn learned(
         (
             "means",
             text(
-                "NRMSE (root mean square error over the standard deviation of the wanted words) of the observed planes on the held_out shots at the end of each example, which the fit never saw, forecast from the last fitted shot shots_ahead shots on: law, the answer's fixed-point law with the hidden planes run as start says; persistence, that shot unchanged; linear, the best one-shot linear fit on the observed reads alone (their counted places and a bias, least squares on the fitted shots, clamped to the range) applied once a shot; beats when the law's NRMSE at the last horizon is at most margin times the better baseline's, null when nothing is held out; horizons past held_out are not judged",
+                "NRMSE (root mean square error over the standard deviation of the wanted words) of the observed planes on the held_out shots at the end of each example, which a fit never sees (with params there is no fit), forecast from the last shot before them shots_ahead shots on (null where those shots' observed planes do not vary, so NRMSE has no scale): law, the answer's fixed-point law with the hidden planes run as start says; persistence, that shot unchanged; linear, the best one-shot linear fit on the observed reads alone (their counted places and a bias, least squares on the fitted shots, clamped to the range) applied once a shot; beats when the law's NRMSE at the last horizon is below margin times the better baseline's, null when nothing is held out or the held-out observed planes do not vary; horizons past held_out are not judged",
             ),
         ),
     ]);
