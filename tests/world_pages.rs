@@ -543,7 +543,7 @@ const RECORDED: [(&str, &str); 4] = [
     ),
     (
         "describe",
-        "b23f10dcb4126c3aecb6111d29a61e8630fb871e0532a16b4a3b318622bfd7a1",
+        "bcf10acbd0c0753b3904d535490ce7b5fc911c775583b2292a3939d505776c09",
     ),
 ];
 
