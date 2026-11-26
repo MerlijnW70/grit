@@ -8,12 +8,13 @@ use crate::wire::{Json, counted, map, text};
 
 use super::Failed;
 use super::budget::Stop;
+use super::driven::{self, Side};
 use super::errors::{Code, Refusal};
 use super::gradient::Told;
 use super::law_real::{self, Fixed, Term};
 use super::tools::{int, ints, limited, refused, unread};
 
-use fit::{Clip, Run, Setup, Stage};
+use fit::{Clip, Drive, Rewrite, Run, Setup, Stage};
 use fixed::{BITS_LEAST, Text, Words};
 use model::{Basis, Grid, Planes};
 
@@ -33,6 +34,8 @@ pub const METHOD: &str = "the observed reads' one-shot least squares fit, split 
 
 pub const SCALES: &str = "two families of hidden planes give the same observed planes: scale, hidden plane h times any a other than 0 with every coefficient times a to the power scales_as[h]; and offset, hidden plane h plus any c, which moves the coefficients and biases whose offset_moves[h] is true (each bias of a write the hidden centre enters, the hidden write's own bias, and the read centre's coefficient in a write where that read times the hidden centre enters); a coefficient with scales_as 0 and offset_moves false for every hidden plane is pinned by the examples, the others only in combinations both families keep, such as the coefficient of a hidden centre in a read write times the read centre's coefficient in that hidden write; the fit fixes the scale by scaling the hidden run to half the range and the offset by the start at 0, so these are a choice, not a finding";
 
+pub const FIT_DRIVEN: &str = "a driven example's cells on its driven read take that sub-step's words before every law sub-step: in every rollout of the fit, in the hidden planes' run, in residual and in the forecast of baselines, as a world stepped with driven takes them; they are left out of the fit's residuals, of stages, residual and baselines, and their rows of the one-shot start and of the linear baseline";
+
 pub struct Request<'a> {
     pub stencil: Stencil,
     pub reads: &'a [u32],
@@ -46,9 +49,98 @@ pub struct Request<'a> {
     pub channels: Option<u32>,
 }
 
+struct Fed {
+    read: usize,
+    cells: Vec<usize>,
+    values: Vec<Vec<u32>>,
+}
+
 struct Example {
     size: [u32; 3],
     shots: Vec<Vec<Vec<u32>>>,
+    fed: Option<Fed>,
+}
+
+fn fed_of(
+    given: driven::Driven,
+    request: &Request<'_>,
+    field: &str,
+    size: [u32; 3],
+) -> Result<Fed, Failed> {
+    let path = format!("{field}.driven");
+    let plane = match given.side {
+        None => request.reads.iter().copied().next().unwrap_or_default(),
+        Some(Side::Plane(plane)) => plane,
+        Some(Side::Current) => {
+            return Err(refused(
+                Code::Malformed,
+                &format!("{path}.current"),
+                "a fit names its driven read by plane; current belongs to a world or a check"
+                    .to_owned(),
+            ));
+        }
+    };
+    let Some(read) = request.reads.iter().position(|one| *one == plane) else {
+        if request.writes.contains(&plane) {
+            return Err(refused(
+                Code::DrivenWritten,
+                &format!("{path}.plane"),
+                format!(
+                    "plane {plane} is a write of this fit, which the law writes at every sub-step; a fit rewrites a read before each sub-step, so name one of reads {:?}",
+                    request.reads
+                ),
+            ));
+        }
+        return Err(limited(
+            Code::Outside,
+            &format!("{path}.plane"),
+            format!(
+                "plane {plane} is none of the reads {:?}; a fit drives one of its reads",
+                request.reads
+            ),
+            Json::List(request.reads.iter().map(|one| counted(*one)).collect()),
+        ));
+    };
+    let wide = size[0] as usize;
+    let deep = size[1] as usize;
+    let cells = given
+        .cells
+        .iter()
+        .map(|cell| (cell[2] as usize * deep + cell[1] as usize) * wide + cell[0] as usize)
+        .collect();
+    Ok(Fed {
+        read,
+        cells,
+        values: given.values,
+    })
+}
+
+fn fed_reals(fed: Option<&Fed>, at: usize, planes: &mut [Vec<f64>], unit: f64) {
+    let Some(fed) = fed else {
+        return;
+    };
+    let (Some(row), Some(plane)) = (fed.values.get(at), planes.get_mut(fed.read)) else {
+        return;
+    };
+    for (cell, word) in fed.cells.iter().zip(row) {
+        if let Some(slot) = plane.get_mut(*cell) {
+            *slot = f64::from(word.cast_signed()) / unit;
+        }
+    }
+}
+
+fn fed_words(fed: Option<&Fed>, at: usize, planes: &mut [Vec<u32>]) {
+    let Some(fed) = fed else {
+        return;
+    };
+    let (Some(row), Some(plane)) = (fed.values.get(at), planes.get_mut(fed.read)) else {
+        return;
+    };
+    for (cell, word) in fed.cells.iter().zip(row) {
+        if let Some(slot) = plane.get_mut(*cell) {
+            *slot = *word;
+        }
+    }
 }
 
 fn example_refused(at: usize, key: &str, message: String) -> Failed {
@@ -60,12 +152,10 @@ fn example_refused(at: usize, key: &str, message: String) -> Failed {
     refused(Code::Example, &field, message)
 }
 
-fn examples_of(
-    held: &Json,
-    reads: usize,
-    border: Border,
-    stencil: Stencil,
-) -> Result<Vec<Example>, Failed> {
+fn examples_of(held: &Json, request: &Request<'_>, steps: u32) -> Result<Vec<Example>, Failed> {
+    let reads = request.reads.len();
+    let border = request.border;
+    let stencil = request.stencil;
     let given_list = held
         .get("examples")
         .and_then(Json::list)
@@ -174,7 +264,14 @@ fn examples_of(
                 Json::Int(i64::try_from(super::law_learn::CELLS_MOST).unwrap_or(i64::MAX)),
             ));
         }
-        out.push(Example { size, shots });
+        let count = shots.len().saturating_sub(1).saturating_mul(steps as usize);
+        let field = format!("$.examples[{at}]");
+        let fed =
+            match driven::driven_of(one, &field, size, u32::try_from(count).unwrap_or(u32::MAX))? {
+                None => None,
+                Some(given) => Some(fed_of(given, request, &field, size)?),
+            };
+        out.push(Example { size, shots, fed });
     }
     Ok(out)
 }
@@ -574,7 +671,7 @@ pub fn learned(
             ));
         }
     }
-    let examples = examples_of(held, basis.observed, request.border, request.stencil)?;
+    let examples = examples_of(held, request, plan.steps)?;
     let settle = match held.get("settle") {
         None => 0,
         Some(_) => int(held, "settle")? as usize,
@@ -621,6 +718,22 @@ pub fn learned(
                         }
                     }
                 }
+                if let Some(word) = example
+                    .fed
+                    .iter()
+                    .flat_map(|fed| fed.values.iter().flatten())
+                    .map(|one| one.cast_signed())
+                    .find(|one| *one < range[0] || *one > range[1])
+                {
+                    return Err(refused(
+                        Code::PlaneFormat,
+                        "$.range",
+                        format!(
+                            "example {at} drives word {word}, outside range [{}, {}]; range must hold every example and driven word",
+                            range[0], range[1]
+                        ),
+                    ));
+                }
             }
             range
         }
@@ -637,6 +750,20 @@ pub fn learned(
                         least = least.min(word.cast_signed());
                         most = most.max(word.cast_signed());
                     }
+                }
+                let fitted_subs = example
+                    .shots
+                    .len()
+                    .saturating_sub(holdout)
+                    .saturating_sub(1)
+                    .saturating_mul(plan.steps as usize);
+                for word in example
+                    .fed
+                    .iter()
+                    .flat_map(|fed| fed.values.iter().take(fitted_subs).flatten())
+                {
+                    least = least.min(word.cast_signed());
+                    most = most.max(word.cast_signed());
                 }
             }
             [least.min(most), most]
@@ -673,14 +800,26 @@ pub fn learned(
     }
     let clips: Vec<Clip> = examples
         .iter()
-        .map(|example| Clip {
-            grid: Grid::new(example.size, basis, request.border),
-            shots: example
-                .shots
-                .iter()
-                .take(example.shots.len().saturating_sub(holdout))
-                .map(|shot| real_planes(shot, frac))
-                .collect(),
+        .map(|example| {
+            let grid = Grid::new(example.size, basis, request.border);
+            let drive = example.fed.as_ref().map(|fed| {
+                Box::new(Rewrite::new(
+                    fed.read,
+                    fed.cells.clone(),
+                    real_planes(&fed.values, frac),
+                    grid.cells,
+                )) as Box<dyn Drive>
+            });
+            Clip {
+                shots: example
+                    .shots
+                    .iter()
+                    .take(example.shots.len().saturating_sub(holdout))
+                    .map(|shot| real_planes(shot, frac))
+                    .collect(),
+                grid,
+                drive,
+            }
         })
         .collect();
     let fitting_limits: Vec<[f64; 2]> = (0..basis.reads())
@@ -702,7 +841,6 @@ pub fn learned(
     let mut run = Run::new(&setup);
     let mut stages: Vec<Stage> = Vec::new();
     let mut stopped: Option<Stop> = None;
-    let longest = clips.iter().map(|one| one.shots.len()).max().unwrap_or(2);
     let (theta, scales_given) = match (&kept_params, &kept_scales) {
         (Some(params), Some(scales)) => {
             let fixed = fixed::fixed_of(basis, scales, params);
@@ -721,27 +859,8 @@ pub fn learned(
             (theta, Some(fixed))
         }
         _ => {
-            let begun = fit::macro_start(&setup);
-            let horizons = fit::horizons(longest, HORIZON_MOST);
-            let mut best: Option<(Vec<f64>, Stage)> = None;
-            for mut candidate in fit::hidden_starts(&mut run, &begun) {
-                let stage = run.descend(&mut candidate, 1, halt);
-                if let Some(stop) = stage.stopped {
-                    stopped = Some(stop);
-                }
-                if stage.rounds > 0
-                    && stage.cost.is_finite()
-                    && best.as_ref().is_none_or(|(_, held)| stage.cost < held.cost)
-                {
-                    best = Some((candidate, stage));
-                }
-                if stopped.is_some() {
-                    break;
-                }
-            }
-            let Some((theta_found, first_stage)) = best else {
-                let stop = stopped.unwrap_or(Stop::Budget);
-                return Err(refused(
+            let found = fitted(&setup, reach, halt).map_err(|stop| {
+                refused(
                     stop.code(),
                     if stop == Stop::Budget {
                         "$.budget_ms"
@@ -752,31 +871,12 @@ pub fn learned(
                         "the fit stopped on {} before its first round of Levenberg-Marquardt; nothing was learned",
                         stop.name()
                     ),
-                ));
-            };
-            let mut theta = theta_found;
-            stages.push(first_stage);
-            for horizon in horizons.into_iter().skip(1) {
-                if stopped.is_some() {
-                    break;
-                }
-                let stage = run.descend(&mut theta, horizon, halt);
-                stopped = stage.stopped;
-                stages.push(stage);
-            }
-            for hidden in 0..basis.hidden {
-                let mut most = 0.0_f64;
-                for clip in &clips {
-                    for (planes, _) in run.observed(&theta, clip, false) {
-                        if let Some(plane) = planes.get(hidden) {
-                            most = plane.iter().fold(most, |held, one| held.max(one.abs()));
-                        }
-                    }
-                }
-                if most > 0.0 && reach > 0.0 {
-                    rescaled(basis, &mut theta, hidden, 0.5 * reach / most);
-                }
-            }
+                )
+            })?;
+            stages = found.stages;
+            stopped = found.stopped;
+            run.work = found.work;
+            let theta = found.theta;
             (theta, None)
         }
     };
@@ -944,13 +1044,29 @@ pub fn learned(
         .iter()
         .map(|_| [Sums::new(), Sums::new(), Sums::new()])
         .collect();
-    let linear = linear_baseline(basis, &clips, range_real);
+    let linear = linear_baseline(basis, &clips, range_real, plan.steps);
+    let steps = plan.steps as usize;
+    let fed_law: Vec<Option<Fed>> = examples
+        .iter()
+        .map(|example| {
+            example.fed.as_ref().map(|fed| Fed {
+                read: fed.read,
+                cells: fed.cells.clone(),
+                values: fed
+                    .values
+                    .iter()
+                    .map(|row| row.iter().map(|one| rescale(*one)).collect())
+                    .collect(),
+            })
+        })
+        .collect();
     let mut states = Vec::with_capacity(examples.len());
-    for (shots, clip) in word_examples.iter().zip(&clips) {
+    for ((shots, clip), fed) in word_examples.iter().zip(&clips).zip(&fed_law) {
         let grid = &clip.grid;
+        let fed = fed.as_ref();
         let mut hidden: Vec<Vec<u32>> = vec![vec![0; grid.cells]; basis.hidden];
         let mut watched = vec![hidden.clone()];
-        for pair in shots.windows(2) {
+        for (pair_at, pair) in shots.windows(2).enumerate() {
             let [from, to] = pair else {
                 continue;
             };
@@ -960,6 +1076,7 @@ pub fn learned(
                     .zip(to)
                     .map(|(one, other)| fixed::between(one, other, sub, plan.steps))
                     .collect();
+                fed_words(fed, pair_at * steps + sub as usize, &mut planes);
                 planes.extend(hidden.iter().cloned());
                 hidden = words
                     .advance(grid, &planes, &hidden_planes)
@@ -993,11 +1110,15 @@ pub fn learned(
             };
             let mut planes = shot.clone();
             planes.extend(hidden_now.iter().cloned());
-            for _ in 0..plan.steps {
+            for sub in 0..steps {
+                fed_words(fed, begin * steps + sub, &mut planes);
                 planes = words.advance(grid, &planes, &all_planes);
             }
             for (read, (now, target)) in planes.iter().zip(wanted).enumerate() {
-                for (one, other) in now.iter().zip(target) {
+                for (cell, (one, other)) in now.iter().zip(target).enumerate() {
+                    if !clip.scored(read, cell) {
+                        continue;
+                    }
                     let missed = f64::from(one.cast_signed()) / law_unit
                         - f64::from(other.cast_signed()) / law_unit;
                     if let Some(slot) = residual_sums.get_mut(read) {
@@ -1022,9 +1143,11 @@ pub fn learned(
             let Some(wanted) = shots.get(begin + ahead) else {
                 break;
             };
-            for _ in 0..plan.steps {
+            for sub in 0..steps {
+                fed_words(fed, (begin + ahead - 1) * steps + sub, &mut planes);
                 planes = words.advance(grid, &planes, &all_planes);
             }
+            fed_reals(fed, (begin + ahead - 1) * steps, &mut line, law_unit);
             line = linear.advanced(grid, &line);
             for read in 0..basis.observed {
                 let (Some(now), Some(target), Some(still_shot), Some(lined)) = (
@@ -1035,9 +1158,16 @@ pub fn learned(
                 ) else {
                     continue;
                 };
-                for (((one, other), still), guess) in
-                    now.iter().zip(target).zip(still_shot).zip(lined)
+                for (cell, (((one, other), still), guess)) in now
+                    .iter()
+                    .zip(target)
+                    .zip(still_shot)
+                    .zip(lined)
+                    .enumerate()
                 {
+                    if !clip.scored(read, cell) {
+                        continue;
+                    }
                     let got = f64::from(one.cast_signed()) / law_unit;
                     let aim = f64::from(other.cast_signed()) / law_unit;
                     for (at, horizon) in checked.iter().enumerate() {
@@ -1434,10 +1564,102 @@ pub fn learned(
         ("work", Json::Int(i64::try_from(run.work).unwrap_or(i64::MAX))),
         ("state", Json::List(states)),
     ]);
+    let fed_count = examples.iter().filter(|one| one.fed.is_some()).count();
+    if fed_count > 0 {
+        let fed_cells: usize = examples
+            .iter()
+            .filter_map(|one| one.fed.as_ref())
+            .map(|fed| fed.cells.len())
+            .sum();
+        answer.push((
+            "driven",
+            map(vec![
+                (
+                    "examples",
+                    Json::Int(i64::try_from(fed_count).unwrap_or(i64::MAX)),
+                ),
+                (
+                    "cells",
+                    Json::Int(i64::try_from(fed_cells).unwrap_or(i64::MAX)),
+                ),
+                ("means", text(FIT_DRIVEN)),
+            ]),
+        ));
+    }
     if !warnings.is_empty() {
         answer.push(("warnings", Json::List(warnings)));
     }
     Ok(answer)
+}
+
+pub struct Fitted {
+    pub theta: Vec<f64>,
+    pub stages: Vec<Stage>,
+    pub stopped: Option<Stop>,
+    pub work: u64,
+}
+
+pub fn fitted(
+    setup: &Setup<'_>,
+    reach: f64,
+    halt: &mut dyn FnMut() -> Option<Stop>,
+) -> Result<Fitted, Stop> {
+    let basis = setup.basis;
+    let clips = setup.clips;
+    let mut run = Run::new(setup);
+    let mut stages: Vec<Stage> = Vec::new();
+    let mut stopped: Option<Stop> = None;
+    let longest = clips.iter().map(|one| one.shots.len()).max().unwrap_or(2);
+    let begun = fit::macro_start(setup);
+    let horizons = fit::horizons(longest, HORIZON_MOST);
+    let mut best: Option<(Vec<f64>, Stage)> = None;
+    for mut candidate in fit::hidden_starts(&mut run, &begun) {
+        let stage = run.descend(&mut candidate, 1, halt);
+        if let Some(stop) = stage.stopped {
+            stopped = Some(stop);
+        }
+        if stage.rounds > 0
+            && stage.cost.is_finite()
+            && best.as_ref().is_none_or(|(_, held)| stage.cost < held.cost)
+        {
+            best = Some((candidate, stage));
+        }
+        if stopped.is_some() {
+            break;
+        }
+    }
+    let Some((theta_found, first_stage)) = best else {
+        return Err(stopped.unwrap_or(Stop::Budget));
+    };
+    let mut theta = theta_found;
+    stages.push(first_stage);
+    for horizon in horizons.into_iter().skip(1) {
+        if stopped.is_some() {
+            break;
+        }
+        let stage = run.descend(&mut theta, horizon, halt);
+        stopped = stage.stopped;
+        stages.push(stage);
+    }
+    for hidden in 0..basis.hidden {
+        let mut most = 0.0_f64;
+        for clip in clips {
+            for (planes, _) in run.observed(&theta, clip, false) {
+                if let Some(plane) = planes.get(hidden) {
+                    most = plane.iter().fold(most, |held, one| held.max(one.abs()));
+                }
+            }
+        }
+        if most > 0.0 && reach > 0.0 {
+            rescaled(basis, &mut theta, hidden, 0.5 * reach / most);
+        }
+    }
+    Ok(Fitted {
+        theta,
+        stages,
+        stopped,
+        work: run.work,
+    })
 }
 
 fn amplification(basis: &Basis, reals: &Reals, write: usize) -> f64 {
@@ -1517,17 +1739,23 @@ impl Linear {
     }
 }
 
-fn linear_baseline(basis: &Basis, clips: &[Clip], range: [f64; 2]) -> Linear {
+fn linear_baseline(basis: &Basis, clips: &[Clip], range: [f64; 2], steps: u32) -> Linear {
     let mut coefficients = Vec::with_capacity(basis.observed);
     for read in 0..basis.observed {
         let mut rows = Vec::new();
         let mut wanted = Vec::new();
         for clip in clips {
-            for pair in clip.shots.windows(2) {
+            for (pair_at, pair) in clip.shots.windows(2).enumerate() {
                 let [from, to] = pair else {
                     continue;
                 };
+                let mut put = from.clone();
+                clip.put(pair_at * steps as usize, &mut put);
+                let from = &put;
                 for cell in 0..clip.grid.cells {
+                    if !clip.scored(read, cell) {
+                        continue;
+                    }
                     let mut row: Vec<f64> = (0..basis.places.len())
                         .map(|at| {
                             let near = clip.grid.near(cell, at);

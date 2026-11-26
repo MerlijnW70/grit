@@ -231,6 +231,58 @@ A request line longer than `limits.line_bytes` is answered with a JSON-RPC error
 
 2D examples of one size share one world as z layers, since a 3x3 stencil reads no z neighbour: twelve 64 by 64 pairs are one 64 by 64 by 16 world, example k `{"world":<it>,"from":[0,0,k],"to":[63,63,k]}`. X1r's data (training pairs and held starts of p1, p2 and p3) loads in 18 calls this way, where X1r took 40 for a part of it (`tests/world_pages.rs`).
 
+## Driven cells: known input fed in every frame
+
+Some cells are not run by any local rule: a pacing electrode, a source, a boundary held from outside. Their words at each frame are known input. `driven` names them and their words for every frame a call runs, and the engine writes them before each frame.
+
+| Field | Meaning |
+|---|---|
+| `plane`, `current` | the plane written; `current` true writes each frame's current plane, the plane an iterating law reads at that frame. If neither is given: `current` on an iterating law, else plane 0 (`grit_world_step`), the check's `reads` plane or `current` (`grit_law_check`), the first of `reads` (`grit_law_learn`) |
+| `cells` | `[x, y, z]` of each driven cell, each named once |
+| `from`, `to` | instead of `cells`: every cell of the box, x fastest, then y, then z |
+| `values` | one word list a frame, one word a cell in the order of the cells |
+| `data`, `format` | instead of `values`: one page (see [Pages](#pages-a-box-in-one-call)) of the cells of frame 0, then of frame 1, and so on; `format` `words` (default) or `bits` |
+
+The cells times the frames are at most one page, `limits.page.words` (97536) words, so a request with driven input stays under the line limit.
+
+### Stepping a world
+
+`grit_world_step` with `driven` runs each frame as `grit_world_write` of that frame's words to the driven cells, then `grit_world_step` of 1 frame. The world after k frames equals, bit for bit, k such rounds, on dense and sparse worlds, 2D and 3D, at every word format, with `alternate`, wrapped borders and `absorb` (`tests/law_driven.rs`, D1). The law sees the driven words as that frame's state. After the step the plane driven at the last frame holds that frame's words, except where `absorb` zeroed them: the absorbing border zeroes a driven cell after its frame as it zeroes a written one. With `current` true on an iterating law that plane is not the new current plane: the step's own write is on the other plane of the pair.
+
+Each frame's write is priced, journaled and replayed as the `grit_world_write` it replaces: one write unit a cell, `write_cells` chunks a submission. Each frame is stepped and priced alone, as `grit_world_step` of 1 frame, so a driven step costs what the long way costs, less the calls. A stop on budget or cancel ends between frames; `ran` names the frames that ran, each with its words written. The answer adds `driven`: `cells`, `plane` or `current`, `words` (the words written) and `means`.
+
+A driven plane the law writes is refused `driven_written`: the step would replace the driven words in the same frame. An iterating law writes both planes of a pair, one at each parity, so on such a law drive `current`, which is never the plane written in its frame. A rule world is refused `driven_written` too, since a rule names no plane it leaves unwritten.
+
+### Checking a law
+
+A start of `grit_law_check` takes `driven`, its cells inside the start's box (placed in the start's world, so under `border` `zero` in its middle). It equals, bit for bit, the start's own world stepped with that `driven`. A check with any driven start runs every start apart (`run.layout` `apart`), one frame at a time. A start's driven cells are left out of each target's `cells`, `right`, `wrong` and `first_wrong` and of `totals`, at every target frame and on the scored plane; the start's answer adds `driven`, the count of its cells, and the answer adds `driven`, what it means. Each driven write is priced as `grit_world_write` of its cells, and the driven words are counted with the starts in the host memory limit (4 bytes a word and 12 a cell).
+
+### Fitting through k steps
+
+Under `rule` `linear` with `steps` or `hidden`, an example takes `driven` on one of `reads`, one word list a law sub-step: the example's shots less one, times `steps`, its holdout included. Sub-step `s` of the run from shot `t` to shot `t + 1` is entry `t × steps + s`. Before every sub-step the driven cells take that entry's words, in every rollout of the fit, the hidden planes' run, `residual` and the forecast of `baselines`, as a world stepped with `driven` takes them. Their Jacobian rows are 0 there, so no coefficient is moved by them. They are left out of the fit's residuals, `stages`, `residual` and `baselines` (law, persistence and linear alike), and their rows of the one-shot start and of the linear baseline; `range`, given or derived, holds the driven words as it holds the examples'. The answer adds `driven`: `examples`, `cells` and `means`. A rewrite is no work unit: `work` counts the sub-steps it precedes, as before.
+
+`plane` names a read plane of the request; `current` is refused `malformed` at `$.examples[k].driven.current`. `driven` on any other learning request (a one-step `linear` fit or a counting rule) is refused `steps_rule` or `linear_rule` at `$.examples[k].driven`.
+
+A 2D diffusion with a pulsed source cell, alpha 0.15, sampled every 2 sub-steps with the source's recorded word the pulse itself (D2): the fit with the source driven equals, coefficient for coefficient, the fit through `law_steps::fitted` on the same clips with the source rewritten by a hand-written `Drive` each sub-step, and recovers the law within 2.4e-5 (fit rms 3.5e-6). Without `driven` the same data fits with an error of 1.7e-2 (fit rms 2.1e-2).
+
+### Refusals
+
+Nothing runs and nothing is written, padded or cut short:
+
+| Code | When | `field` |
+|---|---|---|
+| `outside` | a driven cell or box corner past the world, start box or example; a `plane` past the law's planes or none of a fit's reads (`limit` the largest corner, last plane or the reads) | `...driven.cells[k]`, `.from`, `.to`, `.plane` |
+| `driven_frames` | `values` with other than one list a frame (a sub-step in a fit), or `data` of `words` holding whole frames of another count; `limit` the count wanted | `...driven.values`, `...driven.data` |
+| `driven_length` | a frame of `values` with other than one word a cell, or `data` of another length (`limit` the words or bytes wanted) | `...driven.values[j]`, `...driven.data` |
+| `driven_written` | a plane the law writes at either parity, a fit's write plane, or a rule world | `...driven.plane`, `...driven` |
+| `not_iterating` | `current` on a law without `alternate` | `...driven.current` |
+| `page_limit` | the cells times the frames past one page; `limit` the most | `...driven` |
+| `malformed` | a cell named twice, no cell, both or neither of `cells` and `from`/`to`, both or neither of `values` and `data`, `format` with `values`, data not base64 | the field named |
+
+### One held start in three calls
+
+A2's held starts each needed one `grit_world_write` per frame, 50 per start and 586 of its 600 calls. With pages and `driven` a start is `grit_world_create` with `pages` (its last frame and hidden plane), `grit_world_step` of 50 frames times the sub-steps with the pacing cells driven, and `grit_world_read` of the page: 3 calls for one frame (D3). Each further frame read is one step and one read more: frames 1, 10 and 50 are 7 calls. Starts of one shape run as z layers of one world (a 3x3 law reads no z neighbour), so 15 held starts with frames 1, 10 and 50 are 7 calls together, 0.47 a start, as long as their driven cells times frames fit one page.
+
 ## Reversible laws
 
 A law with `"reversible": true` must be a sequence of lifting steps over its words, 8 a plane: each step adds, subtracts or xors to one word, wrapping, a value made only of other words, params, `frame`, `at`, constants and looks at frozen planes. The compiler checks the form, derives the inverse (the steps undone in reverse order) as an ordinary law named with `_back` and its own hash, and refuses anything else with `not_lifting` at the offending step's path: a step that reads its own word, one node written to two words, a word made by another op (`b = f(a)`, `b | f`, `b * 3`).

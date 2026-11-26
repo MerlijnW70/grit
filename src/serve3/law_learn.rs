@@ -537,6 +537,16 @@ fn learn_shown() -> Json {
                     "with world: the box's greatest corner; the world's last cell if left out",
                 ),
             ),
+            (
+                "driven",
+                property(
+                    "object",
+                    &format!(
+                        "rule linear with steps or hidden: {}, one word list a law sub-step (the shots less one, times steps), on plane, one of reads (the first if left out); its cells are left out of the fit's residuals. Refused: driven_frames, driven_length, driven_written, outside, page_limit",
+                        super::driven::DRIVEN
+                    ),
+                ),
+            ),
         ],
         &[],
     );
@@ -2556,6 +2566,21 @@ fn learned(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
                 },
             ));
         }
+    }
+    if let Some(at) = held
+        .get("examples")
+        .and_then(Json::list)
+        .and_then(|list| list.iter().position(|one| one.get("driven").is_some()))
+    {
+        return Err(refused(
+            if linear {
+                Code::StepsRule
+            } else {
+                Code::LinearRule
+            },
+            &format!("$.examples[{at}].driven"),
+            "driven feeds known words to cells before each law sub-step of a fit's rollouts, and only rule linear with steps or hidden fits through rollouts; give steps or hidden with rule linear, or drop driven".to_owned(),
+        ));
     }
     let steps = steps_of(held)?;
     let search = search_of(held)?;

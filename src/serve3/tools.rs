@@ -11,6 +11,7 @@ use super::budget::{
     self, BATCH_MOST, BUDGET_MOST_MS, BUDGET_MS, Pace, SUBMIT_MOST_MS, Stop, Work, world_cost,
 };
 use super::cost::{Cost, Priced};
+use super::driven::{self, Driven, Side};
 use super::errors::{self, Code, Refusal};
 use super::journal::{self, Entry, Ledger, Made};
 use super::page::{self, PAGE_WORDS};
@@ -536,6 +537,16 @@ fn step_shown() -> Json {
                 with(
                     whole("how many frames; 1 if left out", 1, i64::from(STEP_MOST)),
                     vec![("default", Json::Int(1))],
+                ),
+            ),
+            (
+                "driven",
+                property(
+                    "object",
+                    &format!(
+                        "{}; plane 0, or current true on an iterating law, if neither is given. Refused: driven_frames, driven_length, driven_written, outside, page_limit",
+                        driven::DRIVEN
+                    ),
                 ),
             ),
         ],
@@ -1594,8 +1605,10 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
     let frames = int(held, "frames")?;
     page::lawful_checked(&server.world(held)?.world, number, "$.world")?;
+    let driving = driven_asked(server, held, frames)?;
     forgotten(server, held)?;
     let cells = world_frame_cells(&server.world(held)?.world);
+    let sparse = server.world(held)?.world.pool().is_some();
     let (key, fallback) = {
         let live = server.world(held)?;
         (frame_key(live), by_fallback(&live.world))
@@ -1621,7 +1634,9 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             stopped = Some(stop);
             break;
         }
-        let step = if batch == 0 {
+        let step = if driving.is_some() {
+            1
+        } else if batch == 0 {
             pace.opening(frames - done, server.clock.left())
         } else {
             pace.batch(frames - done, server.clock.left())
@@ -1633,6 +1648,27 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         if let Err(why) = faults::batch() {
             failure = Some(why);
             break;
+        }
+        if let Some(one) = &driving {
+            if pending > 0 {
+                journal = server
+                    .journaled(
+                        number,
+                        Entry::Step(pending),
+                        spent,
+                        frames_cost(cells, pending),
+                    )
+                    .or(journal);
+                pending = 0;
+                spent = Duration::ZERO;
+            }
+            match drive_once(server, held, (number, one, done), sparse) {
+                Ok(note) => journal = note.or(journal),
+                Err(why) => {
+                    failure = Some(why);
+                    break;
+                }
+            }
         }
         let began = server.now();
         faults::stall(server.time(), step);
@@ -1771,10 +1807,81 @@ fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         answer.push(("ran", counted(done)));
         answer.push(("hint", text(stop.code().hint())));
     }
+    if let Some(one) = &driving {
+        answer.push(("driven", driven_shown(one, done)));
+    }
     if let Some(note) = journal.or(snapshot) {
         answer.push(("journal", note));
     }
     Ok(map(answer))
+}
+
+fn driven_asked(
+    server: &mut Server<'_>,
+    held: &Json,
+    frames: u32,
+) -> Result<Option<Driven>, Failed> {
+    if held.get("driven").is_none() {
+        return Ok(None);
+    }
+    let live = server.world(held)?;
+    let Some(mut one) = driven::driven_of(held, "$", live.world.size(), frames)? else {
+        return Ok(None);
+    };
+    let law = live.rule.lawful().map(super::law::Lawful::law);
+    let side = one.side.unwrap_or_else(|| {
+        if law.is_some_and(|known| known.alternate().is_some()) {
+            Side::Current
+        } else {
+            Side::Plane(0)
+        }
+    });
+    driven::side_checked(side, law, live.world.planes(), "$.driven")?;
+    one.side = Some(side);
+    Ok(Some(one))
+}
+
+fn drive_once(
+    server: &mut Server<'_>,
+    held: &Json,
+    (number, one, at): (u32, &Driven, u32),
+    sparse: bool,
+) -> Result<Option<Json>, Failed> {
+    let plane = match one.side {
+        Some(Side::Plane(plane)) => plane,
+        _ => server.world(held)?.world.current().unwrap_or_default(),
+    };
+    let points = one.points(at as usize, [0, 0, 0]);
+    let count = points.len();
+    let began = server.now();
+    server.world(held)?.world.write_plane(plane, &points)?;
+    let took = server.since(began);
+    let entry = if plane == 0 {
+        Entry::Write(points)
+    } else {
+        Entry::WritePlane(plane, points)
+    };
+    Ok(server.journaled(number, entry, took, write_cost(count, sparse)))
+}
+
+fn driven_shown(one: &Driven, done: u32) -> Json {
+    let mut shown = vec![(
+        "cells",
+        Json::Int(i64::try_from(one.cells.len()).unwrap_or(i64::MAX)),
+    )];
+    match one.side {
+        Some(Side::Plane(plane)) => shown.push(("plane", counted(plane))),
+        _ => shown.push(("current", Json::Bool(true))),
+    }
+    shown.push((
+        "words",
+        Json::Int(
+            i64::try_from((one.cells.len() as u64).saturating_mul(u64::from(done)))
+                .unwrap_or(i64::MAX),
+        ),
+    ));
+    shown.push(("means", text(driven::DRIVEN_STEP)));
+    map(shown)
 }
 
 #[derive(Debug)]

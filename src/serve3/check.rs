@@ -4,6 +4,7 @@ use crate::host::Host;
 use crate::law::Law;
 use crate::wire::{Json, counted, map, text};
 
+use super::driven::{self, Driven};
 use super::errors::{Code, Refusal};
 use super::journal::Made;
 use super::schema::{choice, object, property, whole, with, word};
@@ -54,6 +55,8 @@ pub const ENGINE_FIXED: u64 = 256 << 20;
 pub const ENGINE_LARGEST: u64 = 16;
 
 pub const ENGINE_KEPT: u64 = 8;
+
+pub const DRIVEN_CHECK: &str = "a start's driven cells are written with that frame's words before each frame, on its driven plane, as grit_world_write would write them, and are left out of every target's cells, right and wrong and of totals; the start's own driven names how many. A check with a driven start runs every start apart, a frame at a time";
 
 pub const CHECK: &str = "grit_law_check runs a law or rule on many starts for frames frames on the device and scores each start against its targets, in one call. A start is a box of the world's shape (size, as grit_world_create answers it), written to the plane reads, or the current plane at frame 0; its end state and its targets are on the plane writes, or the current plane at each target's frame. Under border wrapped a start is a torus of its own size; under border zero every cell outside its box reads 0 at every frame, as a world twice its size on every axis above 2 with that half absorbed. Each start equals, bit for bit, a world of its own made by grit_world_create with the same law, params, size, sparse, alternate and absorb, written, stepped and read. Starts share one dense world when the border wraps, no absorb is given and the law reads no at: each start is a tile with a margin of its own torus copies, (1 + halo) times frames cells wide on each side of one axis, so no tile reaches another within frames frames; every other start runs in a world of its own. Scores per target: cells, right, wrong and the first wrong cell (x fastest, then y, then z); under values real also the max and rms error in words and decoded with frac. Priced as the worlds it builds (bytes), the cells it writes, margins included, and the frames it steps (world cells times frames, held bricks on sparse worlds); its reads are not priced, as no read is. It stops only on budget or cancel before a build or a step, and then answers nothing";
 
@@ -394,27 +397,42 @@ fn check_shown() -> Json {
                         "items",
                         box_shown(
                             "a start: exactly one of cells, dense and world, and its targets",
-                            vec![(
-                                "targets",
-                                map(vec![
-                                    ("type", text("array")),
-                                    (
-                                        "items",
-                                        box_shown(
-                                            "a state the start should reach: exactly one of cells, dense and world, at frame",
-                                            vec![(
-                                                "frame",
-                                                whole(
-                                                    "the frame it is compared at, 0 to frames; frames if left out",
-                                                    0,
-                                                    i64::from(u32::MAX),
-                                                ),
-                                            )],
+                            vec![
+                                (
+                                    "driven",
+                                    property(
+                                        "object",
+                                        &format!(
+                                            "{}; the check's reads plane, or current, if neither is given. Its cells are left out of every target's scores. Refused: driven_frames, driven_length, driven_written, outside, page_limit",
+                                            driven::DRIVEN
                                         ),
                                     ),
-                                    ("description", text("the start's targets; none if left out")),
-                                ]),
-                            )],
+                                ),
+                                (
+                                    "targets",
+                                    map(vec![
+                                        ("type", text("array")),
+                                        (
+                                            "items",
+                                            box_shown(
+                                                "a state the start should reach: exactly one of cells, dense and world, at frame",
+                                                vec![(
+                                                    "frame",
+                                                    whole(
+                                                        "the frame it is compared at, 0 to frames; frames if left out",
+                                                        0,
+                                                        i64::from(u32::MAX),
+                                                    ),
+                                                )],
+                                            ),
+                                        ),
+                                        (
+                                            "description",
+                                            text("the start's targets; none if left out"),
+                                        ),
+                                    ]),
+                                ),
+                            ],
                         ),
                     ),
                     ("description", text(CHECK)),
@@ -445,9 +463,28 @@ fn checked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let ask = asked(server, host, held)?;
     let listed_starts = starts_of(&ask, held)?;
     let giving = matches!(held.get("return"), Some(Json::Bool(true)));
-    let tiles = tiled(host, &ask, listed_starts.len());
+    let drivens = drivens_of(&ask, listed_starts)?;
+    let held_driven = drivens
+        .iter()
+        .flatten()
+        .map(|one| {
+            one.words()
+                .saturating_mul(WORD_BYTES)
+                .saturating_add((one.cells.len() as u64).saturating_mul(ENTRY_BYTES))
+        })
+        .fold(0_u64, u64::saturating_add);
+    let tiles = if drivens.iter().any(Option::is_some) {
+        None
+    } else {
+        tiled(host, &ask, listed_starts.len())
+    };
     let groups = grouped(&ask, tiles.as_ref(), listed_starts.len());
-    bounded(&ask, listed_starts, (&groups, tiles.is_some()), giving)?;
+    bounded(
+        &ask,
+        listed_starts,
+        (&groups, tiles.is_some()),
+        (giving, held_driven),
+    )?;
     let starts = started(server, &ask, listed_starts)?;
     let page = match held.get("page") {
         Some(_) => usize::try_from(int(held, "page")?).unwrap_or(usize::MAX),
@@ -469,12 +506,36 @@ fn checked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         ran(
             server,
             host,
-            (&ask, &starts, giving),
+            (&ask, &starts, &drivens, giving),
             (*shape, *absorb, placed, tiles.as_ref()),
             &mut ended,
         )?;
     }
-    answered(&ask, &starts, &ended, (tiles.as_ref(), all), (giving, page))
+    answered(
+        (&ask, &starts, &drivens),
+        &ended,
+        (tiles.as_ref(), all),
+        (giving, page),
+    )
+}
+
+fn drivens_of(ask: &Ask, listed_starts: &[Json]) -> Result<Vec<Option<Driven>>, Failed> {
+    let mut out = Vec::with_capacity(listed_starts.len());
+    for (at, one) in listed_starts.iter().enumerate() {
+        let field = format!("$.starts[{at}]");
+        let Some(mut given) = driven::driven_of(one, &field, ask.size, ask.steps)? else {
+            out.push(None);
+            continue;
+        };
+        let side = given.side.unwrap_or(match ask.reads {
+            Side::Current => driven::Side::Current,
+            Side::Plane(plane) => driven::Side::Plane(plane),
+        });
+        driven::side_checked(side, ask.law(), ask.planes, &format!("{field}.driven"))?;
+        given.side = Some(side);
+        out.push(Some(given));
+    }
+    Ok(out)
 }
 
 fn side_of(held: &Json, key: &str) -> Result<Option<u32>, Failed> {
@@ -823,12 +884,12 @@ fn bounded(
     ask: &Ask,
     listed_starts: &[Json],
     (groups, tiling): (&[Group], bool),
-    giving: bool,
+    (giving, held_driven): (bool, u64),
 ) -> Result<(), Failed> {
     let per = count_of(ask.size);
     let box_bytes = per.saturating_mul(WORD_BYTES);
     let many = u64::try_from(listed_starts.len()).unwrap_or(u64::MAX);
-    let starts = many.saturating_mul(box_bytes);
+    let starts = many.saturating_mul(box_bytes).saturating_add(held_driven);
     let mut targets = 0_u64;
     let mut scores = 0_u64;
     let mut heaviest = (0_usize, 0_u64);
@@ -1195,17 +1256,23 @@ fn box_words(
         .collect()
 }
 
-fn scored(when: u32, got: &[u32], want: &Boxed, decoding: bool) -> Score {
+fn scored(when: u32, got: &[u32], want: &Boxed, (decoding, skip): (bool, &[usize])) -> Score {
     let mut score = Score {
         when,
         count: u64::try_from(got.len()).unwrap_or(u64::MAX),
         ..Score::default()
     };
     let mut next = 0_usize;
+    let mut skipped = skip.iter().peekable();
+    let mut left = 0_u64;
     for (at, one) in got.iter().enumerate() {
         let Some(other) = want.word(at, &mut next) else {
             break;
         };
+        if skipped.next_if(|held| **held == at).is_some() {
+            left += 1;
+            continue;
+        }
         if *one == other {
             continue;
         }
@@ -1221,6 +1288,7 @@ fn scored(when: u32, got: &[u32], want: &Boxed, decoding: bool) -> Score {
                 .max(u64::try_from(gap.unsigned_abs()).unwrap_or(u64::MAX));
         }
     }
+    score.count = score.count.saturating_sub(left);
     score
 }
 
@@ -1243,7 +1311,7 @@ fn fingerprint(
 fn ran<'host>(
     server: &mut Server<'host>,
     host: &'host Host,
-    (ask, starts, giving): (&Ask, &[Start], bool),
+    (ask, starts, drivens, giving): (&Ask, &[Start], &[Option<Driven>], bool),
     (size, absorb, placed, tiles): ([u32; 3], Option<Absorb>, &[Placed], Option<&Tiles>),
     ended: &mut [Ended],
 ) -> Result<(), Failed> {
@@ -1263,6 +1331,15 @@ fn ran<'host>(
     stops.sort_unstable();
     stops.dedup();
     let decoding = ask.frac.is_some();
+    let driving: Vec<(&Placed, &Driven)> = placed
+        .iter()
+        .filter_map(|one| {
+            drivens
+                .get(one.start)
+                .and_then(Option::as_ref)
+                .map(|given| (one, given))
+        })
+        .collect();
     let mut now = 0_u32;
     for stop in stops {
         while now < stop {
@@ -1276,7 +1353,20 @@ fn ran<'host>(
                     ),
                 )));
             }
-            let piece = (stop - now).min(super::budget::BATCH_MOST);
+            let piece = if driving.is_empty() {
+                (stop - now).min(super::budget::BATCH_MOST)
+            } else {
+                1
+            };
+            for (one, given) in &driving {
+                let plane = match given.side {
+                    Some(driven::Side::Plane(plane)) => plane,
+                    _ => ask.plane(Side::Current, now),
+                };
+                let points = given.points(now as usize, one.origin);
+                world.write_plane(plane, &points)?;
+                server.priced(write_cost(points.len(), ask.sparse));
+            }
             world.step(piece)?;
             now += piece;
         }
@@ -1287,10 +1377,15 @@ fn ran<'host>(
                 continue;
             };
             let got = box_words(&all, size, plane, one.origin, ask.size);
+            let skip = drivens
+                .get(one.start)
+                .and_then(Option::as_ref)
+                .map(|given| given.indices(ask.size))
+                .unwrap_or_default();
             for (place, goal) in start.goals.iter().enumerate() {
                 if goal.when == stop {
                     end.scores
-                        .push((place, scored(stop, &got, &goal.words, decoding)));
+                        .push((place, scored(stop, &got, &goal.words, (decoding, &skip))));
                 }
             }
             if stop == ask.steps {
@@ -1355,8 +1450,7 @@ fn score_shown(
 }
 
 fn answered(
-    ask: &Ask,
-    starts: &[Start],
+    (ask, starts, drivens): (&Ask, &[Start], &[Option<Driven>]),
     ended: &[Ended],
     (tiles, worlds): (Option<&Tiles>, usize),
     (giving, page): (bool, usize),
@@ -1407,6 +1501,9 @@ fn answered(
     }
     answer.push(("run", map(run)));
     answer.push(("fingerprint", text(FINGERPRINT)));
+    if drivens.iter().any(Option::is_some) {
+        answer.push(("driven", text(DRIVEN_CHECK)));
+    }
     let mut total = Score::default();
     let mut targets = 0_u64;
     let mut shown_starts = Vec::with_capacity(starts.len());
@@ -1419,11 +1516,18 @@ fn answered(
                 *slot = map(score_shown(score, ask.size, ask.frac, true));
             }
         }
-        shown_starts.push(map(vec![
+        let mut shown = vec![
             ("start", counted(u32::try_from(at).unwrap_or(u32::MAX))),
             ("fingerprint", text(&end.fingerprint)),
-            ("targets", Json::List(shown_scores)),
-        ]));
+        ];
+        if let Some(given) = drivens.get(at).and_then(Option::as_ref) {
+            shown.push((
+                "driven",
+                Json::Int(i64::try_from(given.cells.len()).unwrap_or(i64::MAX)),
+            ));
+        }
+        shown.push(("targets", Json::List(shown_scores)));
+        shown_starts.push(map(shown));
     }
     answer.push(("starts", Json::List(shown_starts)));
     let mut totals = vec![

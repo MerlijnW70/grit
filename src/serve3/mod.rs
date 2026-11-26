@@ -36,6 +36,7 @@ pub mod branch;
 pub mod budget;
 pub mod check;
 pub mod cost;
+pub mod driven;
 pub mod errors;
 pub mod exec;
 pub mod gradient;

@@ -2,9 +2,86 @@ use super::super::budget::Stop;
 use super::super::law_real::Term;
 use super::model::{Basis, Grid, Law, Planes};
 
+pub trait Drive: Send + Sync {
+    fn put(&self, sub: usize, planes: &mut [Vec<f64>]);
+
+    fn driven(&self, read: usize, cell: usize) -> bool;
+}
+
+pub struct Rewrite {
+    pub read: usize,
+    pub cells: Vec<usize>,
+    pub values: Vec<Vec<f64>>,
+    pub mask: Vec<bool>,
+}
+
+impl Rewrite {
+    #[must_use]
+    pub fn new(read: usize, cells: Vec<usize>, values: Vec<Vec<f64>>, count: usize) -> Self {
+        let mut mask = vec![false; count];
+        for cell in &cells {
+            if let Some(slot) = mask.get_mut(*cell) {
+                *slot = true;
+            }
+        }
+        Self {
+            read,
+            cells,
+            values,
+            mask,
+        }
+    }
+}
+
+impl Drive for Rewrite {
+    fn put(&self, sub: usize, planes: &mut [Vec<f64>]) {
+        let (Some(row), Some(plane)) = (self.values.get(sub), planes.get_mut(self.read)) else {
+            return;
+        };
+        for (cell, value) in self.cells.iter().zip(row) {
+            if let Some(slot) = plane.get_mut(*cell) {
+                *slot = *value;
+            }
+        }
+    }
+
+    fn driven(&self, read: usize, cell: usize) -> bool {
+        read == self.read && self.mask.get(cell).copied().unwrap_or(false)
+    }
+}
+
 pub struct Clip {
     pub grid: Grid,
     pub shots: Vec<Planes>,
+    pub drive: Option<Box<dyn Drive>>,
+}
+
+impl Clip {
+    pub fn put(&self, sub: usize, planes: &mut [Vec<f64>]) {
+        if let Some(drive) = &self.drive {
+            drive.put(sub, planes);
+        }
+    }
+
+    #[must_use]
+    pub fn scored(&self, read: usize, cell: usize) -> bool {
+        self.drive
+            .as_ref()
+            .is_none_or(|drive| !drive.driven(read, cell))
+    }
+
+    pub fn still(&self, planes: &mut [Vec<f64>], width: usize, reads: usize) {
+        let Some(drive) = &self.drive else {
+            return;
+        };
+        for (read, plane) in planes.iter_mut().enumerate().take(reads) {
+            for (cell, row) in plane.chunks_mut(width.max(1)).enumerate() {
+                if drive.driven(read, cell) {
+                    row.iter_mut().for_each(|one| *one = 0.0);
+                }
+            }
+        }
+    }
 }
 
 pub struct Setup<'a> {
@@ -121,13 +198,15 @@ impl<'a> Run<'a> {
         let mut moved: Option<Planes> = slopes.then(|| vec![flat.clone(); basis.hidden]);
         let mut out = Vec::with_capacity(clip.shots.len());
         out.push((held.clone(), moved.clone()));
-        for pair in clip.shots.windows(2) {
+        let steps = self.setup.steps as usize;
+        for (pair_at, pair) in clip.shots.windows(2).enumerate() {
             let [from, to] = pair else {
                 continue;
             };
             for sub in 0..self.setup.steps {
                 let share = f64::from(sub) / f64::from(self.setup.steps.max(1));
                 let mut planes = interpolated(from, to, share);
+                clip.put(pair_at * steps + sub as usize, &mut planes);
                 planes.extend(held.iter().cloned());
                 let tangents: Option<Planes> = moved.as_ref().map(|one| {
                     let mut all = vec![flat.clone(); basis.observed];
@@ -185,11 +264,14 @@ impl<'a> Run<'a> {
                     .and_then(|one| one.get(segment))
                     .cloned()
                     .unwrap_or_else(|| shot.clone());
-                for (now, target) in start.iter().zip(shot) {
-                    for (one, other) in now.iter().zip(target) {
-                        normal.take(one - other, None);
+                for (read, (now, target)) in start.iter().zip(shot).enumerate() {
+                    for (cell, (one, other)) in now.iter().zip(target).enumerate() {
+                        if clip.scored(read, cell) {
+                            normal.take(one - other, None);
+                        }
                     }
                 }
+                let steps = self.setup.steps as usize;
                 let mut planes: Planes = start;
                 planes.extend(hidden.iter().cloned());
                 let mut tangents: Option<Planes> = hidden_moved.as_ref().map(|one| {
@@ -201,7 +283,11 @@ impl<'a> Run<'a> {
                     let Some(wanted) = clip.shots.get(begin + ahead) else {
                         break;
                     };
-                    for _ in 0..self.setup.steps {
+                    for sub in 0..steps {
+                        clip.put((begin + ahead - 1) * steps + sub, &mut planes);
+                        if let Some(moving) = tangents.as_mut() {
+                            clip.still(moving, count, basis.observed);
+                        }
                         self.count(cells, slopes);
                         let (next, next_moved) =
                             self.law(theta)
@@ -211,6 +297,9 @@ impl<'a> Run<'a> {
                     }
                     for (read, (now, target)) in planes.iter().zip(wanted).enumerate() {
                         for (cell, (one, other)) in now.iter().zip(target).enumerate() {
+                            if !clip.scored(read, cell) {
+                                continue;
+                            }
                             let row = tangents
                                 .as_ref()
                                 .and_then(|all_moved| all_moved.get(read))
@@ -240,29 +329,38 @@ impl<'a> Run<'a> {
         planes.extend(piece.hidden.iter().cloned());
         let mut held: Vec<Planes> = Vec::new();
         let mut targets: Vec<(usize, &Planes)> = Vec::new();
+        let steps = self.setup.steps as usize;
+        let base = piece.begin * steps;
+        let mut index = 0_usize;
         for ahead in 1..=piece.horizon {
             let Some(wanted) = clip.shots.get(piece.begin + ahead) else {
                 break;
             };
-            for _ in 0..self.setup.steps {
+            for _ in 0..steps {
                 self.count(cells, false);
+                clip.put(base + index, &mut planes);
                 if slope {
                     held.push(planes.clone());
                 }
                 planes = self.law(theta).advance(&clip.grid, &planes, None, &all).0;
+                index += 1;
             }
-            for (now, target) in planes.iter().zip(wanted) {
-                for (one, other) in now.iter().zip(target) {
-                    cost += (one - other) * (one - other);
+            for (read, (now, target)) in planes.iter().zip(wanted).enumerate() {
+                for (cell, (one, other)) in now.iter().zip(target).enumerate() {
+                    if clip.scored(read, cell) {
+                        cost += (one - other) * (one - other);
+                    }
                 }
             }
-            targets.push((held.len(), wanted));
+            targets.push((index, wanted));
         }
         let shot = clip.shots.get(piece.begin);
         if let Some(shot) = shot {
-            for (now, target) in start.iter().zip(shot) {
-                for (one, other) in now.iter().zip(target) {
-                    cost += (one - other) * (one - other);
+            for (read, (now, target)) in start.iter().zip(shot).enumerate() {
+                for (cell, (one, other)) in now.iter().zip(target).enumerate() {
+                    if clip.scored(read, cell) {
+                        cost += (one - other) * (one - other);
+                    }
                 }
             }
         }
@@ -278,8 +376,12 @@ impl<'a> Run<'a> {
                 }
                 for (read, (now, target)) in current.iter().zip(*wanted).enumerate() {
                     if let Some(slot) = given.get_mut(read) {
-                        for ((add, one), other) in slot.iter_mut().zip(now).zip(target) {
-                            *add += 2.0 * (one - other);
+                        for (cell, ((add, one), other)) in
+                            slot.iter_mut().zip(now).zip(target).enumerate()
+                        {
+                            if clip.scored(read, cell) {
+                                *add += 2.0 * (one - other);
+                            }
                         }
                     }
                 }
@@ -289,13 +391,19 @@ impl<'a> Run<'a> {
             };
             self.count(cells, false);
             given = self.law(theta).back(&clip.grid, before, &all, &given);
+            clip.still(&mut given, 1, basis.observed);
             current.clone_from(before);
         }
         let mut gradient: Planes = given.into_iter().take(basis.observed).collect();
         if let Some(shot) = shot {
-            for ((plane, now), target) in gradient.iter_mut().zip(start).zip(shot) {
-                for ((add, one), other) in plane.iter_mut().zip(now).zip(target) {
-                    *add += 2.0 * (one - other);
+            for (read, ((plane, now), target)) in
+                gradient.iter_mut().zip(start).zip(shot).enumerate()
+            {
+                for (cell, ((add, one), other)) in plane.iter_mut().zip(now).zip(target).enumerate()
+                {
+                    if clip.scored(read, cell) {
+                        *add += 2.0 * (one - other);
+                    }
                 }
             }
         }
@@ -654,13 +762,17 @@ pub fn macro_start(setup: &Setup<'_>) -> Vec<f64> {
         let mut wanted = Vec::new();
         let mut values = Vec::new();
         for clip in setup.clips {
-            for pair in clip.shots.windows(2) {
+            for (pair_at, pair) in clip.shots.windows(2).enumerate() {
                 let [from, to] = pair else {
                     continue;
                 };
                 let mut planes = from.clone();
+                clip.put(pair_at * setup.steps as usize, &mut planes);
                 planes.extend((0..basis.hidden).map(|_| vec![0.0; clip.grid.cells]));
                 for cell in 0..clip.grid.cells {
+                    if !clip.scored(write, cell) {
+                        continue;
+                    }
                     law.values(&clip.grid, &planes, cell, &mut values);
                     let mut row: Vec<f64> = seen
                         .iter()

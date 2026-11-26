@@ -112,9 +112,12 @@ pub enum Code {
     PageFormat,
     PageLength,
     NoLaw,
+    DrivenFrames,
+    DrivenLength,
+    DrivenWritten,
 }
 
-pub const CODES: [Code; 108] = [
+pub const CODES: [Code; 111] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -223,6 +226,9 @@ pub const CODES: [Code; 108] = [
     Code::PageFormat,
     Code::PageLength,
     Code::NoLaw,
+    Code::DrivenFrames,
+    Code::DrivenLength,
+    Code::DrivenWritten,
 ];
 
 impl Code {
@@ -337,6 +343,9 @@ impl Code {
             Self::PageFormat => "page_format",
             Self::PageLength => "page_length",
             Self::NoLaw => "no_law",
+            Self::DrivenFrames => "driven_frames",
+            Self::DrivenLength => "driven_length",
+            Self::DrivenWritten => "driven_written",
         }
     }
 
@@ -632,6 +641,15 @@ impl Code {
             }
             Self::NoLaw => {
                 "A data-only world holds data and runs nothing: create a world with a rule or a law, and write these cells to it, to step it."
+            }
+            Self::DrivenFrames => {
+                "Give driven one word list a frame, exactly as many as the frames run (under a fit, one a law sub-step: the shots less one, times steps); limit names that count."
+            }
+            Self::DrivenLength => {
+                "Give each frame of driven one word a driven cell, in the order of cells or of the box, or data as base64 of exactly the cells times the frames; limit names the words or bytes wanted."
+            }
+            Self::DrivenWritten => {
+                "Drive a plane the law only reads, or give current true on an iterating law: a plane the step writes would replace the driven words."
             }
         }
     }
