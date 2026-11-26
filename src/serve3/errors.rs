@@ -108,9 +108,13 @@ pub enum Code {
     WriteForm,
     CheckStart,
     CheckTarget,
+    PageLimit,
+    PageFormat,
+    PageLength,
+    NoLaw,
 }
 
-pub const CODES: [Code; 104] = [
+pub const CODES: [Code; 108] = [
     Code::Parse,
     Code::LineTooLong,
     Code::InvalidRequest,
@@ -215,6 +219,10 @@ pub const CODES: [Code; 104] = [
     Code::WriteForm,
     Code::CheckStart,
     Code::CheckTarget,
+    Code::PageLimit,
+    Code::PageFormat,
+    Code::PageLength,
+    Code::NoLaw,
 ];
 
 impl Code {
@@ -325,6 +333,10 @@ impl Code {
             Self::WriteForm => "write_form",
             Self::CheckStart => "check_start",
             Self::CheckTarget => "check_target",
+            Self::PageLimit => "page_limit",
+            Self::PageFormat => "page_format",
+            Self::PageLength => "page_length",
+            Self::NoLaw => "no_law",
         }
     }
 
@@ -608,6 +620,18 @@ impl Code {
             }
             Self::CheckTarget => {
                 "Give each target exactly one of cells inside the box, dense with every word of the box, or world with from, at a frame from 0 to frames."
+            }
+            Self::PageLimit => {
+                "Split the box into boxes of at most limit cells, the most one page of this format holds; grit_describe names them under limits.page."
+            }
+            Self::PageFormat => {
+                "Give format bits only for a plane whose every cell of the box is 0 or 1, and words for any other; format is bits or words."
+            }
+            Self::PageLength => {
+                "Give data as base64 of exactly the box's words, 4 bytes each little-endian; with format bits one bit a cell, 32 cells a word, the unused bits of the last word 0. limit names the bytes or cells wanted."
+            }
+            Self::NoLaw => {
+                "A data-only world holds data and runs nothing: create a world with a rule or a law, and write these cells to it, to step it."
             }
         }
     }

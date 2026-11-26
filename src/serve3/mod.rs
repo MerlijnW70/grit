@@ -45,6 +45,7 @@ pub mod law_learn;
 pub mod law_real;
 pub mod law_steps;
 pub mod learn;
+pub mod page;
 pub mod schema;
 pub mod tools;
 pub mod transport;

@@ -13,6 +13,7 @@ use super::budget::{
 use super::cost::{Cost, Priced};
 use super::errors::{self, Code, Refusal};
 use super::journal::{self, Entry, Ledger, Made};
+use super::page::{self, PAGE_WORDS};
 use super::schema::{choice, object, property, whole, with, word};
 use super::transport::{ANSWER_MOST, DEPTH_MOST, ID_MOST, LINE_MOST, PROTOCOL};
 use super::{
@@ -367,6 +368,55 @@ fn create_shown() -> Json {
                 ]),
             ),
             (
+                "planes",
+                whole(
+                    "with neither rule nor law: a data-only world of this many planes, which holds examples, starts and targets and runs nothing; grit_describe says more under limits.data_world",
+                    1,
+                    i64::from(crate::law::limits::CHANNELS),
+                ),
+            ),
+            (
+                "pages",
+                map(vec![
+                    ("type", text("array")),
+                    (
+                        "items",
+                        object(
+                            vec![
+                                (
+                                    "plane",
+                                    whole(
+                                        "the plane the page fills",
+                                        0,
+                                        i64::from(crate::law::limits::CHANNELS - 1),
+                                    ),
+                                ),
+                                ("format", format_shown("the page's format")),
+                                (
+                                    "data",
+                                    property(
+                                        "string",
+                                        "every cell of the world as answered, x fastest, as one page: base64 of little-endian words",
+                                    ),
+                                ),
+                            ],
+                            &["plane", "data"],
+                        ),
+                    ),
+                    ("minItems", Json::Int(1)),
+                    (
+                        "maxItems",
+                        Json::Int(i64::from(crate::law::limits::CHANNELS)),
+                    ),
+                    (
+                        "description",
+                        text(
+                            "planes to fill once the world is made, each a page of the whole world at the size it answers, each plane once; written, priced and journaled as grit_world_write with form page. The answer adds pages, each plane's written cells",
+                        ),
+                    ),
+                ]),
+            ),
+            (
                 "params",
                 map(vec![
                     ("type", text("array")),
@@ -399,19 +449,27 @@ fn write_shown() -> Json {
                 "form",
                 with(
                     choice(
-                        "cells: set the cells listed; clear: zero the bits named in bits of every cell of the box from to to, corners included, on the planes named in planes (every plane if left out, the current one with current true), and wake what changed. A box whose from is past its to on an axis wraps across the world's seam there. cells if left out",
-                        &["cells", "clear"],
+                        "cells: set the cells listed; clear: zero the bits named in bits of every cell of the box from to to, corners included, on the planes named in planes (every plane if left out, the current one with current true), and wake what changed. A box whose from is past its to on an axis wraps across the world's seam there. page: set every cell of the box from to to, corners included, from data, as writing all of them as cells does. cells if left out",
+                        &["cells", "clear", "page"],
                     ),
                     vec![("default", text("cells"))],
                 ),
             ),
             (
                 "from",
-                corner_shown("for form clear: the box's first corner, [x, y, z]"),
+                corner_shown("for form clear or page: the box's first corner, [x, y, z]"),
             ),
             (
                 "to",
-                corner_shown("for form clear: the box's last corner, [x, y, z]"),
+                corner_shown("for form clear or page: the box's last corner, [x, y, z]"),
+            ),
+            ("format", format_shown("for form page")),
+            (
+                "data",
+                property(
+                    "string",
+                    "for form page: the box's cells as one page, base64 of little-endian words; grit_describe names the format and the most cells under limits.page",
+                ),
             ),
             (
                 "planes",
@@ -502,13 +560,14 @@ fn read_shown() -> Json {
                 with(
                     choice(
                         &format!(
-                            "dense: every cell's word, at most {READ_MOST} cells; set: only the cells whose word is not 0, as [x, y, z, word]; changed: only the cells whose word differs from the mark since names, the same way; tally: for each bit bits names, the count of cells with that bit set and the least and greatest corner of those cells. A set, changed or tally box may be any size; at most {SET_MOST} cells are listed. dense if left out"
+                            "dense: every cell's word, at most {READ_MOST} cells; set: only the cells whose word is not 0, as [x, y, z, word]; changed: only the cells whose word differs from the mark since names, the same way; tally: for each bit bits names, the count of cells with that bit set and the least and greatest corner of those cells; page: every cell's word as one page in data, base64 of little-endian words, at most {PAGE_WORDS} words. A set, changed or tally box may be any size; at most {SET_MOST} cells are listed. dense if left out"
                         ),
-                        &["dense", "set", "changed", "tally"],
+                        &["dense", "set", "changed", "tally", "page"],
                     ),
                     vec![("default", text("dense"))],
                 ),
             ),
+            ("format", format_shown("for form page")),
             (
                 "since",
                 property(
@@ -594,6 +653,15 @@ fn plane_shown() -> Json {
             i64::from(crate::law::limits::CHANNELS - 1),
         ),
         vec![("default", Json::Int(0))],
+    )
+}
+
+fn format_shown(what: &str) -> Json {
+    choice(
+        &format!(
+            "{what}: bits, one bit a cell, each 0 or 1, 32 cells a word; words, one 32-bit word a cell. words if left out"
+        ),
+        &["bits", "words"],
     )
 }
 
@@ -750,8 +818,107 @@ pub(super) fn chosen(server: &Server<'_>, held: &Json) -> Result<Box<dyn Listed>
     }
 }
 
+fn data_chosen(held: &Json) -> Result<Option<Box<dyn Listed>>, Failed> {
+    if held.get("planes").is_none() {
+        return Ok(None);
+    }
+    if let Some(key) = ["rule", "law", "alternate"]
+        .iter()
+        .find(|key| held.get(key).is_some())
+    {
+        return Err(refused(
+            Code::RuleOrLaw,
+            "$.planes",
+            format!(
+                "planes makes a data-only world, which runs no rule or law; give planes or {key}, not both"
+            ),
+        ));
+    }
+    let law = super::law::compiled(&page::data_law(int(held, "planes")?))?;
+    Ok(Some(Box::new(super::law::Lawful::new(
+        law,
+        crate::law::quiet::Class::Proved,
+    ))))
+}
+
+fn rule_planes(rule: &dyn Listed) -> u32 {
+    rule.lawful().map_or(1, |lawful| lawful.law().channels())
+}
+
+fn pages_checked(held: &Json, planes: u32, size: [u32; 3]) -> Result<(), Failed> {
+    let Some(listed) = held.get("pages").and_then(Json::list) else {
+        return Ok(());
+    };
+    let cells = size.iter().map(|side| u64::from(*side)).product::<u64>();
+    let mut seen = 0_u32;
+    for (at, one) in listed.iter().enumerate() {
+        let plane = int(one, "plane")?;
+        let field = format!("$.pages[{at}]");
+        if plane >= planes {
+            return Err(limited(
+                Code::Outside,
+                &format!("{field}.plane"),
+                format!("plane {plane} is past the world's {planes} planes"),
+                counted(planes.saturating_sub(1)),
+            ));
+        }
+        if seen & (1 << plane) != 0 {
+            return Err(refused(
+                Code::Malformed,
+                &format!("{field}.plane"),
+                format!("plane {plane} is named twice"),
+            ));
+        }
+        seen |= 1 << plane;
+        let format = page::format_of(one, &format!("{field}.format"))?;
+        page::limit_checked(format, cells, &field)?;
+        page::words_from(one, format, cells, &format!("{field}.data"))?;
+    }
+    Ok(())
+}
+
+fn pages_written(server: &mut Server<'_>, id: u32, held: &Json) -> Result<Option<Json>, Failed> {
+    let Some(listed) = held.get("pages").and_then(Json::list) else {
+        return Ok(None);
+    };
+    let size = server.world_at(id, "$.pages")?.world.size();
+    let mut told = Vec::with_capacity(listed.len());
+    for one in listed {
+        let plane = int(one, "plane")?;
+        let asked = map(vec![
+            ("world", counted(id)),
+            ("plane", counted(plane)),
+            ("form", text("page")),
+            ("from", sized([0; 3])),
+            ("to", largest(size)),
+            (
+                "format",
+                one.get("format").cloned().unwrap_or_else(|| text("words")),
+            ),
+            ("data", one.get("data").cloned().unwrap_or(Json::Null)),
+        ]);
+        let answer = written(server, &asked)?;
+        let mut entry = vec![("plane", counted(plane))];
+        for key in ["written", "stopped", "asked"] {
+            if let Some(value) = answer.get(key) {
+                entry.push((key, value.clone()));
+            }
+        }
+        let stopped = answer.get("stopped").is_some();
+        told.push(map(entry));
+        if stopped {
+            break;
+        }
+    }
+    Ok(Some(Json::List(told)))
+}
+
 fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
-    let rule = chosen(server, held)?;
+    let data = data_chosen(held)?;
+    let rule = match data {
+        Some(rule) => rule,
+        None => chosen(server, held)?,
+    };
     let params = ints(
         held.get("params").ok_or_else(|| unread("params"))?,
         "params",
@@ -804,6 +971,7 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let (grid, sizes) = shaped(host, rule.as_ref(), &made)?;
     made.size = [grid.wide, grid.deep, grid.tall];
     let absorb = absorb_of(held, made.size)?;
+    pages_checked(held, rule_planes(rule.as_ref()), made.size)?;
     let bytes = admitted(server, host, &sizes, "the world")?;
     server.fits(Work::build(sparse), bytes, "building the world")?;
     let began = server.now();
@@ -854,6 +1022,10 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if let Some(lawful) = live.rule.lawful() {
         answer.extend(lawful.told());
     }
+    if held.get("planes").is_some() {
+        answer.push(("data", Json::Bool(true)));
+        answer.push(("planes", counted(live.world.planes())));
+    }
     if let Some(absorb) = absorb {
         answer.push(("absorb", absorb_shown(absorb)));
     }
@@ -864,6 +1036,9 @@ fn created(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let ledger = Ledger::created(made).with_law(law).with_absorb(absorb);
     if let Some(note) = server.adopt(id, live, ledger, bytes, pace) {
         answer.push(("journal", note));
+    }
+    if let Some(pages) = pages_written(server, id, held)? {
+        answer.push(("pages", pages));
     }
     Ok(map(answer))
 }
@@ -901,28 +1076,57 @@ fn clearing(held: &Json) -> bool {
     held.get("form").and_then(Json::text) == Some("clear")
 }
 
-fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
-    if clearing(held) {
-        return cleared(server, held);
-    }
-    if let Some(key) = CLEARING.iter().find(|key| held.get(key).is_some()) {
-        return Err(refused(
+const PAGING: [&str; 2] = ["format", "data"];
+
+fn paging(held: &Json) -> bool {
+    held.get("form").and_then(Json::text) == Some("page")
+}
+
+fn page_form_refused(held: &Json) -> Option<Failed> {
+    if let Some(key) = ["cells", "planes", "bits"]
+        .iter()
+        .find(|key| held.get(key).is_some())
+    {
+        return Some(refused(
             Code::WriteForm,
             &format!("$.{key}"),
-            format!("{key} belongs to form clear; form cells takes cells"),
+            format!(
+                "{key} does not go with form page; a page sets every cell of its box from data"
+            ),
         ));
     }
-    if held.get("cells").is_none() {
+    ["from", "to", "data"]
+        .iter()
+        .find(|key| held.get(key).is_none())
+        .map(|key| {
+            refused(
+                Code::WriteForm,
+                &format!("$.{key}"),
+                format!("form page needs {key}: from and to name the box, data its cells"),
+            )
+        })
+}
+
+fn paged_cells(held: &Json, size: [u32; 3]) -> Result<Vec<([u32; 3], u32)>, Failed> {
+    let from = corner(held, "from")?;
+    let to = corner(held, "to")?;
+    inside(size, from, "from", "$.from")?;
+    inside(size, to, "to", "$.to")?;
+    if from.iter().zip(to).any(|(one, other)| *one > other) {
         return Err(refused(
-            Code::WriteForm,
-            "$.cells",
-            "form cells needs cells, each [x, y, z, word]; form clear zeroes a box".to_owned(),
+            Code::Reversed,
+            "$.to",
+            format!("the box from {from:?} to {to:?} has its first corner past its last"),
         ));
     }
-    let number = int(held, "world")?;
-    let live = server.world(held)?;
-    let size = live.world.size();
-    let plane = plane_of(held, &live.world)?;
+    let format = page::format_of(held, "$.format")?;
+    let cells = page::box_cells(from, to);
+    page::limit_checked(format, cells, "$.to")?;
+    let words = page::words_from(held, format, cells, "$.data")?;
+    Ok(page::box_points(from, to).into_iter().zip(words).collect())
+}
+
+fn listed_cells(held: &Json, size: [u32; 3]) -> Result<Vec<([u32; 3], u32)>, Failed> {
     let list = held
         .get("cells")
         .and_then(Json::list)
@@ -939,6 +1143,52 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
         )?;
         points.push(([x, y, z], word));
     }
+    Ok(points)
+}
+
+fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
+    if clearing(held) {
+        return cleared(server, held);
+    }
+    let paged = paging(held);
+    if paged {
+        if let Some(why) = page_form_refused(held) {
+            return Err(why);
+        }
+    } else {
+        if let Some(key) = CLEARING
+            .iter()
+            .chain(&PAGING)
+            .find(|key| held.get(key).is_some())
+        {
+            let form = if PAGING.contains(key) {
+                "form page"
+            } else {
+                "form clear"
+            };
+            return Err(refused(
+                Code::WriteForm,
+                &format!("$.{key}"),
+                format!("{key} belongs to {form}; form cells takes cells"),
+            ));
+        }
+        if held.get("cells").is_none() {
+            return Err(refused(
+                Code::WriteForm,
+                "$.cells",
+                "form cells needs cells, each [x, y, z, word]; form clear zeroes a box".to_owned(),
+            ));
+        }
+    }
+    let number = int(held, "world")?;
+    let live = server.world(held)?;
+    let size = live.world.size();
+    let plane = plane_of(held, &live.world)?;
+    let mut points = if paged {
+        paged_cells(held, size)?
+    } else {
+        listed_cells(held, size)?
+    };
     let owed = server.owed(number)?;
     let sparse = server.world(held)?.world.pool().is_some();
     let total = points.len();
@@ -1033,6 +1283,9 @@ fn written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if plane > 0 || current(held) {
         answer.insert(1, ("plane", counted(plane)));
     }
+    if paged {
+        answer.insert(1, ("form", text("page")));
+    }
     if let Some(used) = live.world.pool_use()? {
         answer.push(("sparse", Json::Bool(true)));
         answer.push(("pool_use", super::pooled(used)));
@@ -1099,6 +1352,13 @@ fn cleared(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
             Code::WriteForm,
             "$.cells",
             "form clear zeroes a box and takes no cells; give from and to".to_owned(),
+        ));
+    }
+    if let Some(key) = PAGING.iter().find(|key| held.get(key).is_some()) {
+        return Err(refused(
+            Code::WriteForm,
+            &format!("$.{key}"),
+            format!("{key} belongs to form page; form clear zeroes a box"),
         ));
     }
     if let Some(key) = ["from", "to"].iter().find(|key| held.get(key).is_none()) {
@@ -1333,6 +1593,7 @@ const fn forgotten(_: &mut Server<'_>, _: &Json) -> Result<(), Failed> {
 fn stepped(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let number = int(held, "world")?;
     let frames = int(held, "frames")?;
+    page::lawful_checked(&server.world(held)?.world, number, "$.world")?;
     forgotten(server, held)?;
     let cells = world_frame_cells(&server.world(held)?.world);
     let (key, fallback) = {
@@ -1552,6 +1813,9 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if form == "tally" || held.get("bits").is_some() {
         return tallied(live, held, number, now, (from, to), form);
     }
+    if form == "page" || held.get("format").is_some() {
+        return paged_read(live, held, number, now, (from, to), form);
+    }
     if form != "dense" || held.get("since").is_some() || marking(held) {
         return scanned(live, held, number, now, (from, to), form);
     }
@@ -1604,6 +1868,44 @@ fn read(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     if current(held) {
         answer.insert(2, ("plane", counted(plane)));
     }
+    Ok(map(answer))
+}
+
+fn paged_read(
+    live: &mut Live<'_>,
+    held: &Json,
+    world: u32,
+    now: u32,
+    (from, to): ([u32; 3], [u32; 3]),
+    form: &str,
+) -> Result<Json, Failed> {
+    if form != "page" {
+        return Err(refused(
+            Code::ReadForm,
+            "$.format",
+            "format is for form page".to_owned(),
+        ));
+    }
+    if held.get("since").is_some() {
+        return Err(refused(
+            Code::ReadForm,
+            "$.since",
+            "since is for form changed, not page".to_owned(),
+        ));
+    }
+    if marking(held) {
+        return Err(refused(
+            Code::ReadForm,
+            "$.mark",
+            "mark is for form set or changed, not page".to_owned(),
+        ));
+    }
+    let plane = plane_of(held, &live.world)?;
+    let mut answer = vec![("world", counted(world)), ("frame", counted(now))];
+    if current(held) {
+        answer.push(("plane", counted(plane)));
+    }
+    answer.extend(page::page_answer(&mut live.world, held, (from, to), plane)?);
     Ok(map(answer))
 }
 
@@ -2037,6 +2339,8 @@ pub fn describe(status: &Status) -> Json {
                 ("set_read", text(SET_READ)),
                 ("tally_read", text(TALLY_READ)),
                 ("write_cells", number(READ_MOST)),
+                ("page", page::limits_shown()),
+                ("data_world", text(page::DATA)),
                 ("slice_cells", number(SLICE_MOST)),
                 ("step_frames", number(STEP_MOST)),
                 ("pool_least_cells", number(POOL_LEAST_CELLS)),

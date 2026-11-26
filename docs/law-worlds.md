@@ -108,6 +108,7 @@ The quiet class is decided on the law as written, with every uniform value check
 | `dense` (default) | every cell's word, as before | at most 4096 cells |
 | `set` | `[x, y, z, word]` of each cell whose word is not 0 | any size |
 | `changed` | `[x, y, z, word]` of each cell whose word differs from the mark `since` names; a cleared cell is listed with 0 | the mark's |
+| `page` | every cell's word as one page, see [Pages](#pages-a-box-in-one-call) | at most `limits.page.words` words |
 
 Cells come x fastest, then y, then z; `count` is how many. `plane` and `current` work as for a dense read. One call lists at most 16384 cells (`limits.set_cells`); past that it is refused `too_many` at `$.to`, with `limit` and `count`, the cells it would list. Nothing is cut short. A box that full reads cheaper with `form` `dense`, at most 4096 cells a call: a listed cell carries its place as well as its word, so dense reads cost less once about a quarter of a box is set. The refusal's `hint` says so.
 
@@ -182,6 +183,53 @@ Copy 7 of a 32-copy `parallel` world is then empty; the other 31 step on as if n
 | `bit_past` | a bit above 31 | `$.bits[k]` |
 | `malformed` | a bit or plane named twice | `$.bits[k]` or `$.planes[k]` |
 | `write_form` | `cells` with form `clear`, or neither `cells` nor form `clear` (a write without `cells` was `malformed` before `cells` became optional); `from`, `to`, `planes` or `bits` with form `cells`; `from` or `to` left out; `planes` with `current` true; `plane` with form `clear` | the field named |
+
+## Pages: a box in one call
+
+A page is every cell of one box of one plane, corners included, x fastest, then y, then z, packed in one string. `grit_world_write` with `form` `page` sets the box from a page, and `grit_world_read` with `form` `page` answers one.
+
+| Field | Meaning |
+|---|---|
+| `from`, `to` | the box, both required; `from` may not be past `to` on any axis |
+| `format` | `words`: one 32-bit word a cell (real, fixed-point and any other plane). `bits`: one bit a cell, cell i at bit i % 32 of word i / 32; every cell is 0 or 1 and the unused bits of the last word are 0. `words` if left out |
+| `data` | the page's words, each 4 bytes little-endian, in standard base64 with `=` padding |
+| `plane`, `current` | as for the other forms |
+
+```json
+{"world":1,"form":"page","from":[0,0,0],"to":[31,31,31],"format":"bits","data":"AAAAAA..."}
+```
+
+A page holds at most `limits.page.words` (97536) words: 97536 cells as `words`, 3121152 as `bits`. A 32 by 32 by 32 1-bit plane is 1024 words, a 256 by 256 real plane 65536 words, and a 64 by 64 by 2 real world 8192, so each is one call. The limit is set so that a page fits the 1 MiB request line (`limits.line_bytes`) and the 1 MiB answer (`limits.answer_bytes`, which carries the result twice) with room to spare; a page read can be written back as it came.
+
+A page write is the cell list of every cell of its box: it writes, wakes, is journaled and comes back after a restart exactly as `cells` listing each of them in page order would. It is priced by its cells, as a cell list is: one write unit a cell (`write_cells` per call does not apply to it). The answer is a write's, with `form` `page`. A page read answers what a dense read of the box answers, with `form`, `format`, `cells` (the box's cells), `words` (the page's words) and `data`; like every read it is not priced.
+
+Refusals; nothing is written, padded or cut short:
+
+| Code | When | `field` |
+|---|---|---|
+| `page_limit` | the box holds more cells than one page of its format; `limit` the most | `$.to` |
+| `outside` | a corner past the world, or a plane past its planes | `$.from`, `$.to`, `$.plane` |
+| `reversed` | `from` past `to` on an axis | `$.to` |
+| `page_length` | `data` holds other than exactly the box's words, or sets a bit past the box's last cell; `limit` the bytes wanted, or the box's cells | `$.data` |
+| `malformed` | `data` is not base64 with padding | `$.data` |
+| `page_format` | a `bits` read of a box holding a word other than 0 or 1; the message names the first such cell | `$.format` |
+| `write_form` | `cells`, `planes` or `bits` with form `page`; `from`, `to` or `data` left out; `format` or `data` with another form | the field named |
+| `read_form` | `format` with another form, or `since` or `mark` true with `page` | `$.format`, `$.since`, `$.mark` |
+
+A request line longer than `limits.line_bytes` is answered with a JSON-RPC error `line_too_long` (code -32600) whose `id` is null, since the server reads no id from a line it does not read; nothing in it runs. A client that waits for the answer to its own id should also take an answer with id null as the answer to its last request.
+
+### Data-only worlds
+
+`grit_world_create` with `planes` (1 to 4) and neither `rule` nor `law` makes a world that only holds data: every cell 0, under the data law of that many planes, whose step keeps every cell. It holds examples for `grit_law_learn` and starts and targets for `grit_law_check`, so no placeholder law is needed. It is dense or `sparse` as asked, and writes, reads, slices, forks, saves, opens and restores as any world. The answer adds `data` true and `planes`.
+
+`grit_world_step`, `grit_world_back`, `grit_world_params`, and a `world` start of `grit_law_gradient`, `grit_law_descend`, `grit_law_score` or `grit_learn_params`, refuse it `no_law` at `$.world`: nothing runs on it. `planes` with `rule`, `law` or `alternate` is `rule_or_law` at `$.planes`. A world whose law text is exactly the data law of its planes is a data-only world however it was made.
+
+`grit_world_create` also takes `pages`: up to 4 pages `{plane, format, data}`, each every cell of the world at the size the answer names, each plane once. They are checked before the world is built (`outside` or `malformed` at `$.pages[k].plane`, `page_length`, `page_limit`, `page_format` at `$.pages[k]...`), then written as `grit_world_write` with `form` `page` writes them, and the answer adds `pages`: each plane's `written` cells, and `stopped` and `asked` if the budget or a cancel stopped it. With a data-only world one call loads an example set:
+
+1. `grit_world_create` with `wide` 32, `deep` 32, `tall` 32, `planes` 2 and `pages` `[{"plane":0,"format":"bits","data":<input>},{"plane":1,"format":"bits","data":<output>}]`.
+2. `grit_law_learn` with the example `{"world":<it>}`, `reads` plane 0 and `writes` plane 1.
+
+2D examples of one size share one world as z layers, since a 3x3 stencil reads no z neighbour: twelve 64 by 64 pairs are one 64 by 64 by 16 world, example k `{"world":<it>,"from":[0,0,k],"to":[63,63,k]}`. X1r's data (training pairs and held starts of p1, p2 and p3) loads in 18 calls this way, where X1r took 40 for a part of it (`tests/world_pages.rs`).
 
 ## Reversible laws
 
@@ -397,7 +445,7 @@ A table row, a chip input and a learned law's stencil all use one order:
 | `writes` | `{plane, bit}`, written at the cell itself |
 | `border` | `zero`: a neighbour past an example's edge reads 0. `wrapped`: an inline example wraps on itself, and a world example's box reads its neighbours from that world |
 | `rule` | `minimal`, `symmetric`, `totalistic`, `outer` or `linear`, below |
-| `examples` | inline `{size, input, output}`, with one word list per read and per write, x fastest, at most 4096 words a list; or `{world, output_world, from, to}` for larger ones, up to 2^20 cells over all examples |
+| `examples` | inline `{size, input, output}`, with one word list per read and per write, x fastest, at most 4096 words a list; or `{world, output_world, from, to}` for larger ones, up to 2^20 cells over all examples. A [data-only world](#data-only-worlds) holds examples without a law |
 | `gates`, `crowd`, `rounds`, `seed` | the search's effort, as `grit_least` |
 | `start` | under `minimal` and `symmetric`, a circuit to begin from; see [A start](#a-start) |
 | `noise` | under `totalistic` and `outer`: `refuse` (the default) or `vote`; see [Noisy examples](#noisy-examples) |

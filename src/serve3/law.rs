@@ -361,6 +361,7 @@ fn params_written(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> 
         "params",
     )?;
     let live = server.world(held)?;
+    super::page::lawful_checked(&live.world, number, "$.world")?;
     let wanted = live.rule.params();
     if params.len() != wanted {
         return Err(limited(

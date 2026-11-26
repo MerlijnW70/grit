@@ -161,6 +161,7 @@ windows 0 0 0
 world3 0 0 0
 world_absorb 0 0 0
 world_clear 0 0 0
+world_pages 0 0 0
 world_read 0 0 0
 world_tally 0 0 0
 world_write 0 0 0

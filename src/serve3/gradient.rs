@@ -297,6 +297,7 @@ fn started(server: &mut Server<'_>, held: &Json) -> Result<Start, Failed> {
             }
             let number = int(held, "world")?;
             let live = server.world(held)?;
+            super::page::lawful_checked(&live.world, number, "$.world")?;
             let Some(law) = live.world.law().cloned() else {
                 return Err(refused(
                     Code::NotReversible,

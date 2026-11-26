@@ -247,6 +247,7 @@ fn walked(server: &mut Server<'_>, held: &Json) -> Result<Json, Failed> {
     let frames = int(held, "frames")?;
     let home = matches!(held.get("home"), Some(Json::Bool(true)));
     let live = server.world(held)?;
+    super::page::lawful_checked(&live.world, number, "$.world")?;
     let rule = live.world.rule().to_owned();
     if live.world.absorb().is_some() {
         return Err(refused(
