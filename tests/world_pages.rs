@@ -686,11 +686,10 @@ fn p5_learn_and_check_on_data_only_examples_equal_the_placeholder_law_way() {
         &[(0, "words", &inputs), (1, "words", &outputs)],
     );
     let linear = |world: i64| {
-        let args = pinned::learn_args(world, 4, "wrapped").replace(
+        pinned::learn_args(world, 4, "wrapped").replace(
             "\"rule\":\"outer\"",
             "\"rule\":\"linear\",\"places\":\"von_neumann\",\"frac\":16",
-        );
-        args
+        )
     };
     let by_placeholder = ok(&mut server, "grit_law_learn", &linear(placeholder));
     let by_data = ok(&mut server, "grit_law_learn", &linear(data));
@@ -744,6 +743,8 @@ struct Set {
 
 const X1R_LOADING_CALLS: u32 = 40;
 
+type Loaded = (String, i64, [u32; 3], u32, Vec<u32>);
+
 #[test]
 fn p2_the_x1r_data_loads_in_one_call_per_example_set() {
     let Some(host) = device("world pages p2") else {
@@ -778,7 +779,7 @@ fn p2_the_x1r_data_loads_in_one_call_per_example_set() {
         server: &mut server,
         calls: 0,
     };
-    let mut checks: Vec<(String, i64, [u32; 3], u32, Vec<u32>)> = Vec::new();
+    let mut checks: Vec<Loaded> = Vec::new();
     for (index, set) in sets.iter().enumerate() {
         let mut rng = Rng(0x0D1A_0000 + index as u64);
         let cells = (set.shape[0] * set.shape[1] * set.shape[2]) as usize;
