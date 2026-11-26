@@ -943,9 +943,16 @@ fn d5_base_answers_keep_their_bytes() {
     for (name, hash) in &got {
         println!("RECORD {name} {hash}");
     }
+    let mut differing = Vec::new();
     for ((name, hash), (pinned, wanted)) in got.iter().zip(pins::RECORDED) {
         assert_eq!(*name, pinned);
-        assert_eq!(hash, wanted, "{name}: the answers differ from the base's");
+        if hash != wanted {
+            differing.push(*name);
+        }
     }
+    assert!(
+        differing.is_empty(),
+        "the answers differ from the base's: {differing:?}"
+    );
     pins::new_forms_described(&mut Server::new(None));
 }

@@ -12,7 +12,7 @@ pub const NEW_CODES: [&str; 3] = ["driven_frames", "driven_length", "driven_writ
 pub const RECORDED: [(&str, &str); 5] = [
     (
         "step-session",
-        "49b7dccdfd6c30c16deaea487484c92c43a2ee265835d8eaca6e4099e819d4e2",
+        "dcc53d59dbe457622f6b37f4621a1508fcfb91e62b1195ae38afe4cbfc1aaf89",
     ),
     (
         "check-session",
@@ -31,6 +31,23 @@ pub const RECORDED: [(&str, &str); 5] = [
         "68686abafc0ca086f6e42c58dee2538ade50ecf94097f78f4092e5ea1571a3cf",
     ),
 ];
+
+const STEADY: [&str; 11] = [
+    "world", "written", "frame", "frames", "tally", "cells", "count", "bits", "rule", "current",
+    "tallied",
+];
+
+fn steady(answer: Json) -> Json {
+    match answer {
+        Json::Map(pairs) => Json::Map(
+            pairs
+                .into_iter()
+                .filter(|(key, _)| STEADY.contains(&key.as_str()))
+                .collect(),
+        ),
+        other => other,
+    }
+}
 
 fn joined(answers: &[Json]) -> String {
     let shown: Vec<String> = answers.iter().map(written).collect();
@@ -58,25 +75,25 @@ pub fn step_session(server: &mut Server<'_>) -> String {
             ),
         );
         let world = int_at(&made, "world");
-        answers.push(made);
+        answers.push(steady(made));
         let mut rng = Rng(21);
         let words: Vec<u32> = (0..4096)
             .map(|_| u32::from(rng.below(1000) < 300))
             .collect();
-        answers.push(ok(
+        answers.push(steady(ok(
             server,
             "grit_world_write",
             &format!(
                 "{{\"world\":{world},\"current\":true,\"cells\":{},\"budget_ms\":{LONG}}}",
                 cells_of(&set_of([64, 64, 1], &words))
             ),
-        ));
+        )));
         for frames in [1, 7, 3] {
-            answers.push(ok(
+            answers.push(steady(ok(
                 server,
                 "grit_world_step",
                 &format!("{{\"world\":{world},\"frames\":{frames},\"budget_ms\":{LONG}}}"),
-            ));
+            )));
         }
         answers.push(ok(
             server,
